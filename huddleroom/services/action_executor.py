@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+import logging
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from huddleroom.models.protocol import ProtocolInstance
+from huddleroom.services.channel_service import ChannelService
+from huddleroom.services.event_bus import EventBusService, emit_event
+from huddleroom.services.message_service import MessageService
+from huddleroom.services.template_resolver import TemplateResolver
+
+logger = logging.getLogger(__name__)
+
+
+class ActionExecutor:
+    def __init__(self, _bus: EventBusService | None = None) -> None:
+        self._bus = _bus
+        self._resolver = TemplateResolver()
+        self._message_service = MessageService()
+        self._channel_service = ChannelService()
+
+    async def _r(self, db: AsyncSession, value: str | None, instance: ProtocolInstance) -> str:
+        """Resolve template variables in an action parameter string."""
+        if not value or "{{" not in value:
+            return value or ""
+        return await self._resolver.resolve(db, value, instance)
+
+    async def execute(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        action_type = action.get("action_type")
+        resolved = await self._resolver.resolve_dict(db, action, instance)
+
+        handler = {
+            "emit_event": self._emit_event,
+            "assign_task": self._assign_task,
+            "create_session": self._create_session,
+            "post_message": self._post_message,
+            "notify_actor": self._notify_actor,
+            "record_decision": self._record_decision,
+            "complete_task": self._complete_task,
+            "update_protocol_context": self._update_context,
+            "set_artifact_status": self._set_artifact_status,
+            "trigger_escalation": self._trigger_escalation,
+            "start_meeting": self._start_meeting_stub,
+        }.get(action_type)
+        if handler is None:
+            logger.warning("Unknown protocol action_type: %s", action_type)
+            return {"action_type": action_type, "status": "unknown"}
+        return await handler(db, resolved, instance)
+
+    async def execute_all(self, db: AsyncSession, actions: list[dict], instance: ProtocolInstance) -> list[dict]:
+        results = []
+        for action in actions:
+            results.append(await self.execute(db, action, instance))
+        return results
+
+    async def _emit_event(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.models.artifact import Artifact
+        from huddleroom.models.protocol import Protocol
+        from huddleroom.models.task import Task
+
+        payload = dict(action.get("payload_overrides") or {})
+        metadata = dict(payload.get("metadata") or {})
+
+        protocol_result = await db.execute(select(Protocol).where(Protocol.id == instance.protocol_id))
+        protocol = protocol_result.scalar_one_or_none()
+        if protocol is not None:
+            metadata.setdefault("protocol", protocol.name)
+
+        if instance.linked_task_id is not None:
+            task_result = await db.execute(select(Task).where(Task.id == instance.linked_task_id))
+            task = task_result.scalar_one_or_none()
+            if task is not None:
+                metadata = {**(task.metadata_ or {}), **metadata}
+            metadata["task_id"] = str(instance.linked_task_id)
+            payload["task_id"] = str(instance.linked_task_id)
+
+        if instance.artifact_id is not None:
+            artifact_result = await db.execute(select(Artifact).where(Artifact.id == instance.artifact_id))
+            artifact = artifact_result.scalar_one_or_none()
+            if artifact is not None:
+                artifact_metadata = dict(artifact.metadata_ or {})
+                artifact_metadata.setdefault("type", artifact.artifact_type)
+                metadata = {**artifact_metadata, **metadata}
+            metadata["artifact_id"] = str(instance.artifact_id)
+            payload["artifact_id"] = str(instance.artifact_id)
+
+        metadata["protocol_instance_id"] = str(instance.id)
+        payload["protocol_instance_id"] = str(instance.id)
+        payload["metadata"] = metadata
+        await emit_event(
+            db,
+            instance.project_id,
+            action["event_type"],
+            payload,
+            source="protocol",
+            _bus=self._bus,
+        )
+        return {"action_type": "emit_event", "event_type": action["event_type"]}
+
+    async def _assign_task(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.models.task import Task
+
+        assigned_to = self._actor_uuid(instance, action.get("to_actor"))
+        task_title = await self._r(db, action.get("task_title", "Protocol task"), instance)
+        task_description = await self._r(db, action.get("task_description"), instance)
+        task = Task(
+            project_id=instance.project_id,
+            title=task_title,
+            description=task_description,
+            assigned_to=assigned_to,
+            protocol_instance_id=instance.id,
+            status="ready",
+        )
+        db.add(task)
+        await db.flush()
+        await emit_event(
+            db,
+            instance.project_id,
+            "task.created",
+            {
+                "task_id": str(task.id),
+                "title": task.title,
+                "protocol_instance_id": str(instance.id),
+                "project_id": str(instance.project_id),
+            },
+            _bus=self._bus,
+        )
+        return {"action_type": "assign_task", "task_id": str(task.id)}
+
+    async def _create_session(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.models.task import Task
+        from huddleroom.schemas.session import SessionCreate
+        from huddleroom.services.session_service import SessionService
+
+        assigned_to = self._actor_uuid(instance, action.get("actor"))
+        if assigned_to is None:
+            return {"action_type": "create_session", "status": "actor_not_found"}
+
+        task_title = await self._r(db, action.get("task_title", "Protocol session"), instance)
+        task_description = await self._r(db, action.get("task_description"), instance)
+        task = Task(
+            project_id=instance.project_id,
+            title=task_title,
+            description=task_description,
+            assigned_to=assigned_to,
+            protocol_instance_id=instance.id,
+            status="ready",
+        )
+        db.add(task)
+        await db.flush()
+
+        result = {"action_type": "create_session", "task_id": str(task.id)}
+        session = await SessionService().create(
+            db,
+            SessionCreate(
+                agent_id=assigned_to,
+                task_id=task.id,
+                project_id=instance.project_id,
+                protocol_instance_id=instance.id,
+                origin="protocol",
+            ),
+        )
+        result["session_id"] = str(session.id)
+        return result
+
+    async def _post_message(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.schemas.channel import ChannelCreate
+
+        channel_name = action.get("channel", "general")
+        from huddleroom.models.channel import Channel
+
+        channel_result = await db.execute(
+            select(Channel).where(
+                Channel.project_id == instance.project_id,
+                Channel.name == channel_name,
+            )
+        )
+        channel = channel_result.scalar_one_or_none()
+        if channel is None:
+            channel = await self._channel_service.create(
+                db,
+                instance.project_id,
+                ChannelCreate(name=channel_name, channel_type="general"),
+            )
+        content = await self._r(db, action.get("template", ""), instance)
+        message = await self._message_service.create(
+            db,
+            channel.id,
+            content,
+            sender_user_id=await self._ensure_system_user_id(db, instance),
+            metadata={"protocol_instance_id": str(instance.id)},
+        )
+        return {"action_type": "post_message", "channel": channel_name, "message_id": str(message.id)}
+
+    async def _notify_actor(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.schemas.channel import ChannelCreate
+
+        actor_role = action.get("actor")
+        slot = (instance.actor_assignments or {}).get(actor_role) if actor_role else None
+        if not slot:
+            return {"action_type": "notify_actor", "status": "actor_not_found"}
+
+        dm_name = f"dm-{slot['id']}"
+        from huddleroom.models.channel import Channel
+
+        result = await db.execute(
+            select(Channel).where(
+                Channel.project_id == instance.project_id,
+                Channel.name == dm_name,
+            )
+        )
+        channel = result.scalar_one_or_none()
+        if channel is None:
+            channel = await self._channel_service.create(
+                db,
+                instance.project_id,
+                ChannelCreate(name=dm_name, channel_type="general"),
+            )
+        message_text = await self._r(db, action.get("message", ""), instance)
+        await self._message_service.create(
+            db,
+            channel.id,
+            message_text,
+            sender_user_id=await self._ensure_system_user_id(db, instance),
+            metadata={"protocol_instance_id": str(instance.id), "actor_role": actor_role},
+        )
+        return {"action_type": "notify_actor", "actor_role": actor_role, "channel": dm_name}
+
+    async def _record_decision(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.models.knowledge_item import KnowledgeItem
+
+        summary = await self._r(db, action.get("summary", ""), instance)
+        rationale = await self._r(db, action.get("rationale", ""), instance)
+        item = KnowledgeItem(
+            project_id=instance.project_id,
+            title=summary[:200] or None,
+            content=f"Decision: {summary}\n\nRationale: {rationale}",
+            content_type="decision",
+            provenance_type="protocol",
+            provenance_protocol_instance_id=instance.id,
+            metadata_={"protocol_instance_id": str(instance.id)},
+        )
+        db.add(item)
+        await db.flush()
+        return {"action_type": "record_decision", "knowledge_item_id": str(item.id)}
+
+    async def _complete_task(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from fastapi import HTTPException
+        from huddleroom.models.task import Task
+        from huddleroom.services.task_service import TaskService
+
+        task_id_str = await self._r(db, action.get("task_id"), instance)
+        if not task_id_str:
+            task_id_str = str(instance.linked_task_id) if instance.linked_task_id else ""
+        if not task_id_str:
+            return {"action_type": "complete_task", "status": "no_task_id"}
+        try:
+            task_id = uuid.UUID(task_id_str)
+        except ValueError:
+            return {"action_type": "complete_task", "status": "invalid_task_id"}
+
+        result = await db.execute(select(Task).where(Task.id == task_id))
+        task = result.scalar_one_or_none()
+        if task is None:
+            return {"action_type": "complete_task", "status": "task_not_found", "task_id": task_id_str}
+        if task.status in ("done", "cancelled"):
+            return {"action_type": "complete_task", "task_id": task_id_str}
+
+        task_service = TaskService()
+        try:
+            if task.status == "backlog":
+                task = await task_service.transition_status(db, task.project_id, task.id, "ready")
+            if task.status in ("failed", "blocked", "ready"):
+                task = await task_service.transition_status(db, task.project_id, task.id, "in_progress")
+            if task.status == "in_progress":
+                await task_service.transition_status(db, task.project_id, task.id, "done")
+            else:
+                return {"action_type": "complete_task", "status": "invalid_transition", "task_id": task_id_str}
+        except HTTPException as exc:
+            from huddleroom.services.session_service import SessionClaimAttention, SessionService
+            if isinstance(exc, SessionClaimAttention):
+                await SessionService.persist_claim_attention(db, exc)
+                return {"action_type": "complete_task", "status": "claim_refused", "task_id": task_id_str}
+            if exc.status_code == 409:
+                return {"action_type": "complete_task", "status": "invalid_transition", "task_id": task_id_str}
+            raise
+        return {"action_type": "complete_task", "task_id": task_id_str}
+
+    async def _update_context(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        key = action.get("key")
+        if key:
+            instance.context = {**(instance.context or {}), key: action.get("value")}
+            await db.flush()
+        return {"action_type": "update_protocol_context", "key": key}
+
+    async def _set_artifact_status(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        from huddleroom.models.artifact import Artifact
+
+        artifact_id_str = action.get("artifact_id") or (str(instance.artifact_id) if instance.artifact_id else "")
+        try:
+            artifact_id = uuid.UUID(artifact_id_str)
+        except (TypeError, ValueError):
+            return {"action_type": "set_artifact_status", "status": "invalid_id"}
+
+        result = await db.execute(select(Artifact).where(Artifact.id == artifact_id))
+        artifact = result.scalar_one_or_none()
+        if artifact is not None:
+            artifact.status = action.get("status", artifact.status)
+            await db.flush()
+        return {"action_type": "set_artifact_status", "artifact_id": artifact_id_str}
+
+    async def _trigger_escalation(self, db: AsyncSession, action: dict, instance: ProtocolInstance) -> dict:
+        await emit_event(
+            db,
+            instance.project_id,
+            "protocol.escalated",
+            {
+                "protocol_instance_id": str(instance.id),
+                "chain_name": action.get("chain_name"),
+                "current_state": instance.current_state,
+            },
+            _bus=self._bus,
+        )
+        return {"action_type": "trigger_escalation", "chain_name": action.get("chain_name")}
+
+    async def _start_meeting_stub(self, _db: AsyncSession, _action: dict, instance: ProtocolInstance) -> dict:
+        logger.info("start_meeting deferred for protocol instance %s", instance.id)
+        return {"action_type": "start_meeting", "status": "deferred_m4"}
+
+    def _actor_uuid(self, instance: ProtocolInstance, actor_role: str | None) -> uuid.UUID | None:
+        if not actor_role:
+            return None
+        slot = (instance.actor_assignments or {}).get(actor_role)
+        if not slot or slot.get("kind") != "agent":
+            return None
+        try:
+            return uuid.UUID(str(slot["id"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _system_user_id(self, instance: ProtocolInstance) -> uuid.UUID | None:
+        raw_id = (instance.context or {}).get("system_user_id")
+        if raw_id is None:
+            return None
+        try:
+            return uuid.UUID(str(raw_id))
+        except (TypeError, ValueError):
+            return None
+
+    async def _ensure_system_user_id(self, db: AsyncSession, instance: ProtocolInstance) -> uuid.UUID:
+        existing_id = self._system_user_id(instance)
+        if existing_id is not None:
+            return existing_id
+
+        from huddleroom.models.user import User
+
+        result = await db.execute(select(User).where(User.email == "protocol-system@local"))
+        user = result.scalar_one_or_none()
+        if user is None:
+            user = User(
+                email="protocol-system@local",
+                hashed_password="!",
+                display_name="Protocol System",
+                role="system",
+            )
+            db.add(user)
+            try:
+                await db.flush()
+            except IntegrityError:
+                await db.rollback()
+                result = await db.execute(select(User).where(User.email == "protocol-system@local"))
+                user = result.scalar_one()
+        instance.context = {**(instance.context or {}), "system_user_id": str(user.id)}
+        await db.flush()
+        return user.id

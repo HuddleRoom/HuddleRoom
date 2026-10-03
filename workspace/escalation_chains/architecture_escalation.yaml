@@ -1,0 +1,34 @@
+name: architecture_escalation
+description: >
+  Escalation for architecture decisions. Less time pressure, but human
+  judgment is explicitly expected at step 2.
+
+steps:
+  - step: 1
+    label: "Architect + PM pair session"
+    timeout: 4h
+    action: pair_session
+    participants:
+      - role: architect
+      - role: pm
+    message_template: >
+      ADR protocol for {{task.title}} is stuck in state {{current_state}}.
+      Architect and PM have been scheduled for a pair session to resolve.
+    on_timeout: next_step
+
+  - step: 2
+    label: "Human decision required"
+    timeout: 24h
+    action: human_notify
+    participants:
+      - kind: human
+    message_template: >
+      Architecture decision {{task.title}} requires human judgment.
+      Automated escalation has not resolved the blockage.
+      Please review at: {{dashboard_url}}/protocol-instances/{{protocol_instance.id}}
+      Agents have been paused pending your input.
+    on_timeout: fail
+
+terminal_action_on_fail: >
+  ADR marked DEFERRED by escalation timeout. Task transitioned to blocked.
+  Human must restart the decision process.

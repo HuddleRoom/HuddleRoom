@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/dashboard/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HuddleRoom</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="err" style="display:none;position:fixed;top:0;left:0;right:0;background:#DC2626;color:#fff;font-family:monospace;font-size:12px;padding:8px;z-index:100;white-space:pre-wrap"></div>
+    <script>
+      window.addEventListener('error', function(e) {
+        var el = document.getElementById('err');
+        el.style.display = 'block';
+        el.textContent = 'JS ERROR: ' + e.message + '\n' + (e.filename || '') + ':' + e.lineno;
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        var el = document.getElementById('err');
+        el.style.display = 'block';
+        el.textContent = 'PROMISE ERROR: ' + (e.reason?.message || e.reason || 'unknown');
+      });
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

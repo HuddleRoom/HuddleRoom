@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass
+import json
+import re
+from typing import Any, Awaitable, Callable, Mapping, Protocol
+from uuid import UUID
+
+import litellm
+
+from huddleroom.config import settings
+from huddleroom.services.orchestration_decision_validator import ALLOWED_ACTION_SCHEMAS, OPTIONAL_ACTION_FIELDS
+from huddleroom.services.secret_redaction import redact_secrets
+
+
+CompletionFn = Callable[..., Awaitable[Any]]
+INVALID_LLM_OUTPUT_ACTION_TYPE = "invalid_llm_output"
+_MAX_ERROR_MESSAGE_LEN = 120
+# ponytail: backward compatibility alias for code that may import _redact_secrets directly
+_redact_secrets = redact_secrets
+
+
+@dataclass(frozen=True)
+class OrchestrationDecisionAdapterResult:
+    input_snapshot: dict
+    llm_output: dict
+    parsed_decision: dict
+
+
+class LLMDecisionAdapter(Protocol):
+    async def decide(self, context: Mapping[str, Any]) -> OrchestrationDecisionAdapterResult:
+        ...
+
+
+def orchestrator_preamble(project=None, *, goal=None, meeting=None) -> str:
+    """Shared framing for every control-plane orchestrator LLM call: one platform
+    sentence, plus optional project + (goal headline | meeting headline). All args
+    optional so callers that pass nothing get only the platform sentence
+    (preserves prior behavior). goal and meeting are mutually exclusive by caller
+    convention."""
+    lines = [
+        "You are the orchestration control plane of a multi-agent software-delivery platform: "
+        "a team of AI agents self-organizes to build and operate software while you make only "
+        "the coordination judgments — you never produce the work artifacts yourself."
+    ]
+
+    if project and isinstance(project, Mapping):
+        name = project.get("name")
+        description = project.get("description")
+        if name:
+            name_redacted = redact_secrets(str(name))
+            if description:
+                desc_redacted = redact_secrets(str(description))
+                lines.append(f"Project: {name_redacted} — {desc_redacted}")
+            else:
+                lines.append(f"Project: {name_redacted}")
+
+    # goal and meeting are mutually exclusive by caller convention; meeting takes precedence if both provided
+    if meeting and isinstance(meeting, Mapping):
+        title = meeting.get("title")
+        meeting_type = meeting.get("meeting_type")
+        if title and meeting_type:
+            title_redacted = redact_secrets(str(title))
+            type_redacted = redact_secrets(str(meeting_type))
+            lines.append(f"Meeting: {title_redacted} ({type_redacted})")
+    elif goal and isinstance(goal, Mapping):
+        objective = goal.get("objective")
+        if objective:
+            parts = [redact_secrets(str(objective))]
+            meta = []
+            weight = goal.get("weight")
+            if weight:
+                meta.append(f"weight: {redact_secrets(str(weight))}")
+            status = goal.get("status")
+            if status:
+                meta.append(f"status: {redact_secrets(str(status))}")
+            if meta:
+                lines.append(f"Goal: {parts[0]} ({', '.join(meta)})")
+            else:
+                lines.append(f"Goal: {parts[0]}")
+
+    return "\n".join(lines)
+
+
+def build_orchestration_decision_messages(context: Mapping[str, Any], *, project=None, goal=None) -> list[dict[str, str]]:
+    allowed_actions = {
+        action_type: {
+            "required": sorted(required_fields),
+            "optional": sorted(OPTIONAL_ACTION_FIELDS.get(action_type, frozenset())),
+        }
+        for action_type, required_fields in ALLOWED_ACTION_SCHEMAS.items()
+    }
+    system_text = (
+        "You are the orchestrator's control-plane decision assistant. "
+        "You choose coordination actions only. Agents produce all work artifacts and HuddleRoom code executes side effects "
+        "after validation. You must not write plans, must not write code, must not write tests, must not write reviews, "
+        "must not write validation reports, must not write meeting decisions, must not write project artifacts, "
+        "must not write file content, must not write diffs or patches, and must not write final summaries. "
+        "Return exactly one JSON object with this shape: "
+        '{"decision":{"action_type":"noop","reason":"short coordination reason"}}. '
+        "The decision object must use one allowed action schema. "
+        "Top-level reason is optional for every action. "
+        f"Allowed action schemas: {json.dumps(allowed_actions, sort_keys=True)}"
+    )
+    preamble = orchestrator_preamble(project, goal=goal)
+    system_text = preamble + "\n\n" + system_text
+    return [
+        {"role": "system", "content": system_text},
+        {
+            "role": "user",
+            "content": json.dumps(context, sort_keys=True, default=str),
+        },
+    ]
+
+
+def parse_decision_content(raw_content: str) -> dict:
+    try:
+        payload = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return _invalid_decision("LLM output was not valid JSON")
+
+    if not isinstance(payload, Mapping):
+        return _invalid_decision("LLM output JSON root must be an object")
+
+    if "decision" not in payload:
+        return _invalid_decision("LLM output must contain a decision object")
+    decision = payload.get("decision")
+    if not isinstance(decision, Mapping):
+        return _invalid_decision("LLM output decision must be an object")
+
+    return dict(decision)
+
+
+class OrchestrationDecisionAdapter:
+    def __init__(self, model: str | None = None, completion_fn: CompletionFn | None = None) -> None:
+        self.model = model or settings.orchestration_model
+        self._completion_fn = completion_fn or litellm.acompletion
+
+    async def decide(self, context: Mapping[str, Any], *, project=None, goal=None) -> OrchestrationDecisionAdapterResult:
+        from huddleroom.services.llm_structured_repair import complete_with_repair
+        from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
+
+        input_snapshot = deepcopy(dict(context))
+        messages = build_orchestration_decision_messages(input_snapshot, project=project, goal=goal)
+
+        request = {
+            "model": self.model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+        }
+
+        _holder = {}
+
+        def _observe_response(response: Any) -> None:
+            try:
+                _holder["raw"] = _extract_content(response)
+            except ValueError:
+                pass
+
+        def _parse(raw: str) -> dict:
+            decision = parse_decision_content(raw)
+            if decision.get("action_type") == INVALID_LLM_OUTPUT_ACTION_TYPE:
+                raise ValueError(decision.get("reason") or "invalid decision output")
+            return decision
+
+        try:
+            try:
+                project_id = (
+                    UUID(str(project.get("id")))
+                    if isinstance(project, Mapping) and project.get("id")
+                    else None
+                )
+            except (TypeError, ValueError):
+                project_id = None
+            invocation = (
+                AgentResponseInvocation(InvocationContext(
+                    project_id, "system", "orchestrator", "Orchestrator", "api",
+                    "decision", self.model,
+                    "Choose the next orchestration action for this goal.",
+                ))
+                if project_id is not None else None
+            )
+            decision = await complete_with_repair(
+                self._completion_fn, request, _parse, response_observer=_observe_response,
+                **({"invocation": invocation} if invocation else {})
+            )
+        except ValueError as exc:
+            return _invalid_adapter_result(
+                input_snapshot,
+                str(exc),
+                response_error=str(exc),
+                raw_content=_holder.get("raw"),
+            )
+        except Exception as exc:
+            # ponytail: pure function, no db/goal_id in scope. No warning is currently
+            # emitted for provider errors on this test-only path; wiring is explicitly
+            # deferred. This returns invalid_llm_output decision.
+            safe_error = _safe_completion_error(exc)
+            return _invalid_adapter_result(
+                input_snapshot,
+                f"LLM completion failed: {safe_error}",
+                completion_error=safe_error,
+                raw_content=_holder.get("raw"),
+            )
+
+        return OrchestrationDecisionAdapterResult(
+            input_snapshot=input_snapshot,
+            llm_output={"raw_content": _holder.get("raw")},
+            parsed_decision=decision,
+        )
+
+
+def _invalid_decision(reason: str) -> dict:
+    return {"action_type": INVALID_LLM_OUTPUT_ACTION_TYPE, "reason": reason}
+
+
+def _safe_completion_error(exc: Exception) -> str:
+    error = _full_completion_error(exc)
+    if len(error) <= _MAX_ERROR_MESSAGE_LEN:
+        return error
+    return f"{error[:_MAX_ERROR_MESSAGE_LEN - 3]}..."
+
+
+def _full_completion_error(exc: Exception) -> str:
+    name = type(exc).__name__
+    message = redact_secrets(" ".join(str(exc).split()))
+    if not message:
+        return name
+    return f"{name}: {message}"
+
+
+def _invalid_adapter_result(
+    input_snapshot: dict,
+    reason: str,
+    *,
+    response_error: str | None = None,
+    completion_error: str | None = None,
+    raw_content: str | None = None,
+) -> OrchestrationDecisionAdapterResult:
+    llm_output = {"raw_content": raw_content}
+    if response_error is not None:
+        llm_output["response_error"] = response_error
+    if completion_error is not None:
+        llm_output["completion_error"] = completion_error
+    return OrchestrationDecisionAdapterResult(
+        input_snapshot=input_snapshot,
+        llm_output=llm_output,
+        parsed_decision=_invalid_decision(reason),
+    )
+
+
+def _extract_content(response: Any) -> str:
+    choices = _response_field(response, "choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("LLM response did not include choices[0]")
+
+    choice = choices[0]
+    message = _response_field(choice, "message")
+    content = _response_field(message, "content")
+    if not isinstance(content, str):
+        raise ValueError("LLM response content must be a string")
+    return content
+
+
+def _response_field(value: Any, field: str) -> Any:
+    if isinstance(value, Mapping):
+        if field not in value:
+            raise ValueError(f"LLM response missing '{field}'")
+        return value[field]
+    if not hasattr(value, field):
+        raise ValueError(f"LLM response missing '{field}'")
+    return getattr(value, field)

@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+MSG_FILE="$1"
+
+# Remove lines starting with "Co-Authored-By:" (ignore leading/trailing spaces)
+sed -i.bak '/^[[:space:]]*Co-Authored-By:[[:space:]]*/d' "$MSG_FILE"
+
+# Cleanup backup file (macOS compatibility)
+rm -f "${MSG_FILE}.bak"

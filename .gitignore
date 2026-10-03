@@ -1,0 +1,49 @@
+# Runtime
+.env
+logs/
+
+# SQLite databases (runtime + test artifacts)
+*.db
+*.db-shm
+*.db-wal
+*.bak
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+huddleroom/static/dashboard/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+uv.lock
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python tools
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Test artifacts
+test-results/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,176 @@
+/* Global focus-visible: keyboard users get a clear ring; mouse users don't */
+*:focus {
+  outline: none;
+}
+*:focus-visible {
+  outline: 2px solid #2563EB;
+  outline-offset: 2px;
+}
+
+.huddleroom-shell {
+  display: grid;
+  grid-template-columns: var(--huddleroom-sidebar-width, 15rem) minmax(0, 1fr);
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  color: var(--huddleroom-text);
+  transition: grid-template-columns 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.huddleroom-shell-main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  flex-direction: column;
+}
+
+.huddleroom-shell-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.huddleroom-shell-content {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  background: var(--huddleroom-bg);
+}
+
+.huddleroom-sidebar-scrim {
+  display: none;
+}
+
+.huddleroom-menu-button {
+  display: none;
+}
+
+.huddleroom-shell-content .monaco-editor,
+.huddleroom-shell-content .monaco-editor .overflow-guard {
+  min-height: 200px;
+}
+
+@media (max-width: 767px) {
+  .huddleroom-shell {
+    display: flex;
+  }
+
+  .huddleroom-menu-button {
+    display: inline-flex !important;
+  }
+
+  .huddleroom-sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 40;
+    width: min(82vw, 280px) !important;
+    transform: translateX(-100%);
+    box-shadow: 16px 0 36px rgba(0, 0, 0, 0.35);
+  }
+
+  .huddleroom-sidebar-open {
+    transform: translateX(0);
+  }
+
+  .huddleroom-sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    border: 0;
+    background: rgba(0, 0, 0, 0.45);
+    cursor: pointer;
+  }
+
+  .huddleroom-sidebar-collapse {
+    display: none !important;
+  }
+}
+
+@media (max-width: 1023px) {
+  .huddleroom-logout-label { display: none; }
+}
+
+/* Agent Activity Panel: persistent rail at 1280px+, always visible (idle shows "No activity yet.") */
+@media (min-width: 1280px) {
+  .agent-activity-panel-container {
+    display: flex;
+    flex-direction: column;
+    width: 440px;
+    flex-shrink: 0;
+    min-width: 0;
+    border-left: 1px solid #E2E8F0;
+  }
+
+  .agent-activity-panel-container > * {
+    flex: 1;
+  }
+
+  .agent-activity-strip-container,
+  .agent-activity-overlay {
+    display: none !important;
+  }
+}
+
+/* Agent Activity Strip button: base appearance applies at all widths. */
+.agent-activity-strip {
+  width: 48px;
+  height: 48px;
+  border-radius: 6px;
+  border: 1px solid #E2E8F0;
+  background: white;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Agent Activity Strip + Overlay: below 1280px, strip is always visible */
+@media (max-width: 1279px) {
+  .agent-activity-panel-container {
+    display: none !important;
+  }
+
+  .agent-activity-strip-container {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 20;
+  }
+
+  .agent-activity-overlay {
+    position: fixed;
+    bottom: 80px;
+    right: 24px;
+    width: 360px;
+    height: 480px;
+    background: white;
+    border: 1px solid #E2E8F0;
+    border-radius: 6px;
+    z-index: 19;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .agent-activity-overlay > * {
+    flex: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .huddleroom-shell,
+  .huddleroom-sidebar {
+    transition: none !important;
+  }
+
+  .agent-activity-overlay {
+    animation: none !important;
+  }
+}

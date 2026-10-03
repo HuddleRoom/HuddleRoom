@@ -1,0 +1,1381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HuddleRoom Dashboard</title>
+    <style>
+        /* Dark theme, monospace, card borders */
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: #1a1a2e; color: #e0e0e0; font-family: monospace; font-size: 14px; }
+
+        /* Layout */
+        header { background: #16213e; padding: 12px 20px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #0f3460; }
+        h1 { color: #e94560; font-size: 18px; }
+        section { margin: 16px; }
+        h2 { color: #a8dadc; margin-bottom: 10px; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+
+        /* Cards */
+        .card { background: #16213e; border: 1px solid #0f3460; border-radius: 4px; padding: 12px; margin: 6px 0; }
+        .agents-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+        .agent-card { background: #16213e; border: 1px solid #0f3460; border-radius: 4px; padding: 10px; min-width: 150px; cursor: default; }
+
+        /* Task board */
+        .task-board { display: flex; gap: 10px; overflow-x: auto; }
+        .task-col { flex: 1; min-width: 180px; background: #0d1b2a; border-radius: 4px; padding: 8px; }
+        .col-header { font-size: 12px; font-weight: bold; margin-bottom: 8px; padding: 4px; text-align: center; border-radius: 2px; }
+        .col-backlog .col-header { color: #888; background: #222; }
+        .col-ready .col-header { color: #4fc3f7; background: #1a3a5c; }
+        .col-in_progress .col-header { color: #ffb74d; background: #3a2a10; }
+        .col-done .col-header { color: #81c784; background: #1a3a1a; }
+        .col-cancelled .col-header { color: #ef5350; background: #3a1a1a; }
+        .col-blocked .col-header { color: #ce93d8; background: #2a1a3a; }
+        .col-failed .col-header { color: #ef5350; background: #3a1a1a; }
+        .task-card { background: #16213e; border: 1px solid #0f3460; border-radius: 3px; padding: 8px; margin: 4px 0; cursor: pointer; }
+        .task-card:hover { border-color: #a8dadc; }
+
+        /* Protocols / artifacts */
+        .panel-empty { color: #666; font-size: 12px; padding: 8px 0; }
+        .panel-error { color: #ef5350; font-size: 12px; padding: 8px 0; }
+        .protocol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+        .protocol-card { background: #16213e; border: 1px solid #0f3460; border-radius: 4px; padding: 10px; }
+        .protocol-card .meta { color: #666; font-size: 11px; margin-top: 4px; }
+        .artifact-inventory td { vertical-align: top; }
+        .artifact-muted { color: #666; font-size: 11px; }
+
+        /* Sessions table */
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #0f3460; color: #a8dadc; font-size: 12px; }
+        td { padding: 6px 8px; border-bottom: 1px solid #0d1b2a; font-size: 12px; }
+
+        /* Status colors */
+        .status-pending { color: #888; }
+        .status-running { color: #ffb74d; }
+        .status-completed { color: #81c784; }
+        .status-failed { color: #ef5350; }
+        .status-cancelled { color: #888; }
+
+        /* Buttons */
+        button { background: #0f3460; color: #e0e0e0; border: 1px solid #a8dadc; border-radius: 3px; padding: 4px 10px; cursor: pointer; font-family: monospace; font-size: 12px; }
+        button:hover { background: #1a5c9e; }
+        button.primary { background: #e94560; border-color: #e94560; }
+        button.primary:hover { background: #c73652; }
+
+        /* Forms / Modals */
+        input, select, textarea { background: #0d1b2a; color: #e0e0e0; border: 1px solid #0f3460; border-radius: 3px; padding: 6px 8px; font-family: monospace; font-size: 13px; width: 100%; margin-bottom: 8px; }
+        label { display: block; margin-bottom: 4px; color: #a8dadc; font-size: 12px; }
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+        .modal-overlay.open { display: flex; }
+        .modal { background: #16213e; border: 1px solid #0f3460; border-radius: 6px; padding: 20px; min-width: 360px; max-width: 520px; width: 90%; }
+        .modal h3 { color: #e94560; margin-bottom: 14px; }
+        .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+        /* Login */
+        #login-screen { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #1a1a2e; display: flex; align-items: center; justify-content: center; z-index: 200; }
+        .login-box { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 32px; width: 320px; }
+        .login-box h2 { color: #e94560; margin-bottom: 20px; text-align: center; }
+
+        /* Misc */
+        .refresh-indicator { font-size: 11px; color: #666; margin-left: auto; }
+        select.project-select { width: auto; margin-bottom: 0; }
+        .error-msg { color: #ef5350; font-size: 12px; margin-top: 4px; }
+
+        /* Event Stream Panel */
+        #event-stream-panel {
+          background: #16213e;
+          border: 1px solid #0f3460;
+          border-radius: 4px;
+          padding: 12px;
+        }
+        #event-stream-panel h2 { color: #a8dadc; margin-bottom: 10px; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; display: flex; align-items: center; gap: 8px; }
+        #health-dot { width: 10px; height: 10px; border-radius: 50%; background: #666; display: inline-block; }
+        #health-dot.green { background: #22c55e; }
+        #health-dot.yellow { background: #eab308; }
+        #health-dot.red { background: #ef4444; }
+        #event-feed {
+          height: 200px;
+          overflow-y: auto;
+          font-family: monospace;
+          font-size: 12px;
+          color: #a0aec0;
+        }
+        .event-row { padding: 2px 0; border-bottom: 1px solid #222; }
+        .event-type { color: #63b3ed; font-weight: bold; }
+        .event-time { color: #718096; margin-left: 8px; }
+        #ws-status { font-size: 11px; color: #718096; margin-left: auto; }
+    </style>
+</head>
+<body>
+
+<!-- Login Screen -->
+<div id="login-screen">
+    <div class="login-box">
+        <h2>HuddleRoom Dashboard</h2>
+        <label>Email</label>
+        <input type="email" id="login-email" value="admin@example.com" />
+        <label>Password</label>
+        <input type="password" id="login-password" value="password" />
+        <div id="login-error" class="error-msg"></div>
+        <button class="primary" onclick="login()" style="width:100%;margin-top:8px;">Login</button>
+    </div>
+</div>
+
+<!-- Main App -->
+<div id="app" style="display:none">
+    <header>
+        <h1>HuddleRoom</h1>
+        <select id="project-select" class="project-select" onchange="onProjectChange()">
+            <option value="">-- select project --</option>
+        </select>
+        <button onclick="openNewProjectModal()">+ New Project</button>
+        <button onclick="openNewTaskModal()">+ New Task</button>
+        <span class="refresh-indicator" id="refresh-indicator">Auto-refresh: ON</span>
+        <button id="logout-btn" onclick="logout()" style="margin-left:auto;">Logout</button>
+    </header>
+
+    <section>
+        <h2>Agents <button onclick="openNewAgentModal()" style="font-size:12px;padding:4px 10px;margin-left:10px;">+ Create Agent</button></h2>
+        <div class="agents-grid" id="agents-grid">Loading...</div>
+    </section>
+
+    <section>
+        <h2>Tasks</h2>
+        <div class="task-board" id="task-board">Loading...</div>
+    </section>
+
+    <section>
+        <h2>Protocols</h2>
+        <div class="protocol-grid" id="protocols-panel">Loading...</div>
+    </section>
+
+    <section>
+        <h2>Artifacts</h2>
+        <table class="artifact-inventory">
+            <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Version</th><th>Location</th></tr></thead>
+            <tbody id="artifacts-body"><tr><td colspan="5" class="panel-empty">Loading...</td></tr></tbody>
+        </table>
+    </section>
+
+    <section>
+        <details>
+            <summary style="cursor:pointer;color:#a8dadc;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Advanced: Sessions</summary>
+            <table id="sessions-table">
+                <thead><tr><th>ID</th><th>Agent</th><th>Status</th><th>Adapter</th><th>Output</th></tr></thead>
+                <tbody id="sessions-body">Loading...</tbody>
+            </table>
+        </details>
+    </section>
+
+    <section id="meetings-panel">
+      <h2>Meetings <button onclick="openNewMeetingModal()" style="font-size:12px;padding:4px 10px;margin-left:10px;">+ Schedule</button></h2>
+      <div id="meetings-list">Loading...</div>
+      <div id="active-meeting-view" style="display:none;margin-top:16px;border-top:1px solid #2d3748;padding-top:16px;">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+          <h3 id="active-meeting-title" style="margin:0;color:#a8dadc;"></h3>
+          <span id="active-meeting-status" style="font-size:11px;background:#2d3748;padding:2px 8px;border-radius:4px;"></span>
+          <button onclick="copyActiveMeeting()" style="font-size:12px;">Copy Meeting</button>
+          <button onclick="endActiveMeeting()" style="margin-left:auto;font-size:12px;">End Meeting</button>
+        </div>
+        <div style="font-size:11px;color:#718096;margin-bottom:8px;">
+          <div>Meeting ID: <span id="active-meeting-id"></span></div>
+          <div>Project ID: <span id="active-meeting-project-id"></span></div>
+        </div>
+        <div id="meeting-transcript" style="max-height:300px;overflow-y:auto;font-size:12px;padding:8px;background:#1a202c;border-radius:4px;margin-bottom:8px;"></div>
+        <div id="meeting-organizer-controls" style="display:none;margin-bottom:8px;padding:8px;background:#1f2937;border:1px solid #374151;border-radius:4px;">
+          <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
+            <div style="flex:1;min-width:220px;">
+              <label>Grant Next Turn</label>
+              <select id="meeting-grant-turn-agent"></select>
+            </div>
+            <button type="button" onclick="grantMeetingTurn()">Grant Turn</button>
+          </div>
+        </div>
+        <div id="meeting-verbose-log" style="max-height:260px;overflow-y:auto;font-size:12px;padding:8px;background:#111827;border-radius:4px;margin-bottom:8px;">
+          <span style="color:#4a5568;">Verbose meeting trace will appear here.</span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <textarea id="human-turn-input" placeholder="Add your turn..." style="flex:1;padding:8px;background:#2d3748;color:#e2e8f0;border:1px solid #4a5568;border-radius:4px;font-size:13px;resize:vertical;min-height:60px;"></textarea>
+          <button onclick="submitHumanTurn()" style="padding:8px 16px;align-self:flex-end;">Submit Turn</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div id="event-stream-panel">
+        <h2>
+          <span id="health-dot"></span>
+          Live Events
+          <span id="ws-status">disconnected</span>
+        </h2>
+        <div id="event-feed"><span style="color:#4a5568;font-size:11px">Waiting for events…</span></div>
+      </div>
+    </section>
+</div>
+
+<!-- New Project Modal -->
+<div class="modal-overlay" id="new-project-modal">
+    <div class="modal">
+        <h3>New Project</h3>
+        <label>Name</label><input type="text" id="project-name" />
+        <label>Description</label><textarea id="project-desc" rows="3"></textarea>
+        <div class="modal-footer">
+            <button onclick="closeNewProjectModal()">Cancel</button>
+            <button class="primary" onclick="createProject()">Create</button>
+        </div>
+    </div>
+</div>
+
+<!-- New Agent Modal -->
+<div class="modal-overlay" id="new-agent-modal">
+    <div class="modal">
+        <h3>Create Agent</h3>
+        <label>Name</label><input type="text" id="agent-name" />
+        <label>Role</label><input type="text" id="agent-role" value="developer" />
+        <label>Provider</label><input type="text" id="agent-provider" value="openai" />
+        <label>Model</label><input type="text" id="agent-model" value="gpt-4o-mini" />
+        <label>Adapter Type</label>
+        <select id="agent-adapter-type">
+            <option value="api">api</option>
+            <option value="cli">cli</option>
+            <option value="routine">routine</option>
+        </select>
+        <label>Description</label><textarea id="agent-description" rows="3"></textarea>
+        <div class="modal-footer">
+            <button onclick="closeNewAgentModal()">Cancel</button>
+            <button class="primary" onclick="createAgent()">Create</button>
+        </div>
+    </div>
+</div>
+
+<!-- New Task Modal -->
+<div class="modal-overlay" id="new-task-modal">
+    <div class="modal">
+        <h3>New Task</h3>
+        <label>Title</label><input type="text" id="task-title" />
+        <label>Description</label><textarea id="task-desc" rows="3"></textarea>
+        <label>Priority (0-100)</label><input type="number" id="task-priority" value="50" min="0" max="100" />
+        <label>Assign To</label>
+        <select id="task-agent">
+            <option value="">-- unassigned --</option>
+        </select>
+        <div class="modal-footer">
+            <button onclick="closeNewTaskModal()">Cancel</button>
+            <button class="primary" onclick="createTask()">Create</button>
+        </div>
+    </div>
+</div>
+
+<!-- New Meeting Modal -->
+<div class="modal-overlay" id="new-meeting-modal">
+    <div class="modal">
+        <h3>Schedule Meeting</h3>
+        <label>Title</label><input type="text" id="meeting-title" />
+        <label>Meeting Type</label>
+        <select id="meeting-type">
+            <option value="adhoc">adhoc</option>
+            <option value="decision">decision</option>
+            <option value="review">review</option>
+            <option value="standup">standup</option>
+            <option value="escalation">escalation</option>
+        </select>
+        <label>Agent Participants</label>
+        <select id="meeting-agent-select" multiple size="5"></select>
+        <label>Max Duration (minutes)</label><input type="number" id="meeting-duration" value="30" min="5" max="240" />
+        <label>Turn Strategy</label>
+        <select id="meeting-turn-strategy" onchange="updateMeetingOrganizerControls()">
+            <option value="round_robin">round_robin</option>
+            <option value="agenda_driven">agenda_driven</option>
+            <option value="moderated">moderated</option>
+            <option value="organizer_controlled">organizer_controlled</option>
+        </select>
+        <div id="meeting-organizer-config" style="display:none;">
+            <label>Organizer Type</label>
+            <select id="meeting-organizer-mode" onchange="updateMeetingOrganizerControls()">
+                <option value="">-- select organizer --</option>
+                <option value="human">Human organizer (me)</option>
+                <option value="agent">Organizer agent</option>
+            </select>
+            <div id="meeting-organizer-user-note" style="display:none;font-size:11px;color:#718096;margin-top:6px;">
+                The current signed-in user will be assigned as the organizer.
+            </div>
+            <div id="meeting-organizer-agent-wrap" style="display:none;">
+                <label>Organizer Agent</label>
+                <select id="meeting-organizer-agent-select"></select>
+            </div>
+        </div>
+        <label>Deadlock Strategy</label>
+        <select id="meeting-deadlock-strategy">
+            <option value="human_intervention">human_intervention</option>
+            <option value="majority_rules">majority_rules</option>
+            <option value="table_item">table_item</option>
+            <option value="escalate">escalate</option>
+        </select>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+            <input type="checkbox" id="meeting-auto-start" checked />
+            <span>Auto-start meeting</span>
+        </label>
+        <div style="margin-top:12px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                <label style="margin:0;">Agenda Items</label>
+                <button type="button" onclick="addMeetingAgendaItemRow()">+ Add Agenda Item</button>
+            </div>
+            <div id="meeting-agenda-list" style="display:flex;flex-direction:column;gap:10px;"></div>
+        </div>
+        <div class="modal-footer">
+            <button onclick="closeNewMeetingModal()">Cancel</button>
+            <button class="primary" onclick="createMeeting()">Create</button>
+        </div>
+    </div>
+</div>
+
+<!-- Task Detail Modal -->
+<div class="modal-overlay" id="task-detail-modal">
+    <div class="modal">
+        <h3 id="detail-title">Task</h3>
+        <p id="detail-desc" style="color:#aaa;font-size:12px;margin-bottom:12px;"></p>
+        <div id="detail-info" style="font-size:12px;margin-bottom:12px;"></div>
+        <div id="status-buttons" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
+        <label>Assign To</label>
+        <select id="detail-agent" onchange="assignTask()">
+            <option value="">-- unassigned --</option>
+        </select>
+        <details style="margin-top:10px;">
+            <summary style="cursor:pointer;color:#a8dadc;font-size:12px;">Run History</summary>
+            <div id="detail-runs" style="margin-top:8px;font-size:11px;"></div>
+        </details>
+        <div class="modal-footer">
+            <button onclick="closeTaskDetail()">Close</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const API = '';  // same origin
+let token = localStorage.getItem('rally_token') || '';
+let currentProjectId = localStorage.getItem('rally_project') || '';
+let authEnabled = true;
+let currentTaskId = null;
+let agentMap = {};  // id -> agent obj
+let currentUser = null;
+let refreshTimer = null;
+let reconnectTimer = null;
+
+const VALID_TRANSITIONS = {
+    backlog: ['ready', 'cancelled'],
+    ready: ['in_progress', 'cancelled'],
+    in_progress: ['blocked', 'done', 'cancelled', 'failed'],
+    blocked: ['in_progress', 'cancelled'],
+    done: [],
+    failed: ['in_progress', 'cancelled'],
+    cancelled: [],
+};
+
+const STATUS_LABELS = {
+    backlog: 'Backlog', ready: 'Ready', in_progress: 'In Progress',
+    done: 'Done', cancelled: 'Cancelled', blocked: 'Blocked', failed: 'Failed',
+};
+
+function headers() {
+    const h = { 'Content-Type': 'application/json' };
+    if (authEnabled && token) h['Authorization'] = 'Bearer ' + token;
+    return h;
+}
+
+async function apiFetch(path, opts = {}) {
+    const res = await fetch(API + path, { ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+    if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+    if (!res.ok) {
+        let message = `Request failed (${res.status})`;
+        try {
+            const data = await res.json();
+            if (data && typeof data.detail === 'string' && data.detail.trim()) {
+                message = data.detail;
+            } else if (data && typeof data.error === 'string' && data.error.trim()) {
+                message = data.error;
+            }
+        } catch (_err) {
+            const text = await res.text();
+            if (text && text.trim()) message = text;
+        }
+        throw new Error(message);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+}
+
+async function login() {
+    const email = document.getElementById('login-email').value;
+    const password = document.getElementById('login-password').value;
+    document.getElementById('login-error').textContent = '';
+    try {
+        const data = await fetch(API + '/api/v1/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+        });
+        if (!data.ok) { document.getElementById('login-error').textContent = 'Invalid credentials'; return; }
+        const json = await data.json();
+        token = json.access_token;
+        localStorage.setItem('rally_token', token);
+        showApp();
+    } catch (e) {
+        document.getElementById('login-error').textContent = 'Login failed: ' + e.message;
+    }
+}
+
+function logout() {
+    token = '';
+    currentUser = null;
+    localStorage.removeItem('rally_token');
+    document.getElementById('app').style.display = 'none';
+    document.getElementById('login-screen').style.display = 'flex';
+    if (refreshTimer) {
+        clearInterval(refreshTimer);
+        refreshTimer = null;
+    }
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    if (eventWs) {
+        eventWs.onclose = null;
+        eventWs.close();
+        eventWs = null;
+    }
+    if (activeMeetingWs) {
+        activeMeetingWs.onclose = null;
+        activeMeetingWs.close();
+        activeMeetingWs = null;
+    }
+}
+
+async function showApp() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    await loadCurrentUser();
+    await loadProjects();
+    await refreshAll();
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(loadHealth, 30000);
+}
+
+async function loadCurrentUser() {
+    try {
+        currentUser = await apiFetch('/api/v1/auth/me');
+    } catch (e) {
+        currentUser = null;
+        console.error('Current user load failed:', e);
+    }
+}
+
+async function loadProjects() {
+    try {
+        const data = await apiFetch('/api/v1/projects');
+        const select = document.getElementById('project-select');
+        select.innerHTML = '<option value="">-- select project --</option>';
+        (data.items || []).forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p.id;
+            opt.textContent = p.name;
+            select.appendChild(opt);
+        });
+        if (currentProjectId) {
+            select.value = currentProjectId;
+            connectEventStream(currentProjectId);
+            loadHealth();
+        } else if (data.items && data.items.length > 0) {
+            currentProjectId = data.items[0].id;
+            select.value = currentProjectId;
+            localStorage.setItem('rally_project', currentProjectId);
+            connectEventStream(currentProjectId);
+            loadHealth();
+        }
+    } catch (e) { console.error('Projects load failed:', e); }
+}
+
+function onProjectChange() {
+    currentProjectId = document.getElementById('project-select').value;
+    localStorage.setItem('rally_project', currentProjectId);
+    activeMeetingId = null;
+    activeMeetingData = null;
+    document.getElementById('active-meeting-view').style.display = 'none';
+    if (activeMeetingWs) {
+        activeMeetingWs.onclose = null;
+        activeMeetingWs.close();
+        activeMeetingWs = null;
+    }
+    refreshAll();
+    if (currentProjectId) {
+        connectEventStream(currentProjectId);
+        loadHealth();
+    }
+}
+
+function openNewProjectModal() {
+    document.getElementById('project-name').value = '';
+    document.getElementById('project-desc').value = '';
+    document.getElementById('new-project-modal').classList.add('open');
+}
+
+function closeNewProjectModal() {
+    document.getElementById('new-project-modal').classList.remove('open');
+}
+
+function openNewAgentModal() {
+    document.getElementById('agent-name').value = '';
+    document.getElementById('agent-role').value = 'developer';
+    document.getElementById('agent-provider').value = 'openai';
+    document.getElementById('agent-model').value = 'gpt-4o-mini';
+    document.getElementById('agent-adapter-type').value = 'api';
+    document.getElementById('agent-description').value = '';
+    document.getElementById('new-agent-modal').classList.add('open');
+}
+
+function closeNewAgentModal() {
+    document.getElementById('new-agent-modal').classList.remove('open');
+}
+
+async function createProject() {
+    const name = document.getElementById('project-name').value.trim();
+    if (!name) { alert('Project name required'); return; }
+    const description = document.getElementById('project-desc').value.trim();
+    try {
+        const project = await apiFetch('/api/v1/projects', {
+            method: 'POST',
+            body: JSON.stringify({
+                name,
+                description: description || null,
+            }),
+        });
+        currentProjectId = project.id;
+        localStorage.setItem('rally_project', currentProjectId);
+        await loadProjects();
+        document.getElementById('project-select').value = currentProjectId;
+        closeNewProjectModal();
+        await refreshAll();
+        connectEventStream(currentProjectId);
+        loadHealth();
+    } catch (e) {
+        alert('Failed to create project: ' + e.message);
+    }
+}
+
+async function createAgent() {
+    const name = document.getElementById('agent-name').value.trim();
+    if (!name) { alert('Agent name required'); return; }
+    try {
+        await apiFetch('/api/v1/agents', {
+            method: 'POST',
+            body: JSON.stringify({
+                name,
+                role: document.getElementById('agent-role').value.trim() || 'developer',
+                description: document.getElementById('agent-description').value.trim() || null,
+                provider: document.getElementById('agent-provider').value.trim() || 'openai',
+                model: document.getElementById('agent-model').value.trim() || 'gpt-4o-mini',
+                adapter_type: document.getElementById('agent-adapter-type').value || 'api',
+            }),
+        });
+        closeNewAgentModal();
+        await loadAgents();
+    } catch (e) {
+        alert('Failed to create agent: ' + e.message);
+    }
+}
+
+async function refreshAll() {
+    await Promise.all([loadAgents(), loadTasks(), loadProtocolInstances(), loadArtifacts(), loadSessions(), loadMeetings()]);
+}
+
+async function loadAgents() {
+    try {
+        const data = await apiFetch('/api/v1/agents');
+        agentMap = {};
+        const grid = document.getElementById('agents-grid');
+        grid.innerHTML = '';
+        (data.items || []).forEach(a => {
+            agentMap[a.id] = a;
+            const card = document.createElement('div');
+            card.className = 'agent-card';
+            card.innerHTML = `<strong>${esc(a.name)}</strong><br><span style="color:#a8dadc">${esc(a.role)}</span><br><span style="color:#666">${esc(a.adapter_type)} · ${esc(a.model)}</span>`;
+            grid.appendChild(card);
+        });
+        // Update task-agent and detail-agent selects
+        ['task-agent', 'detail-agent'].forEach(id => {
+            const sel = document.getElementById(id);
+            const current = sel.value;
+            sel.innerHTML = '<option value="">-- unassigned --</option>';
+            Object.values(agentMap).forEach(a => {
+                const opt = document.createElement('option');
+                opt.value = a.id;
+                opt.textContent = a.name;
+                sel.appendChild(opt);
+            });
+            sel.value = current;
+        });
+        populateMeetingAgentSelect();
+        if (activeMeetingData) {
+            renderMeetingOrganizerControls(activeMeetingData);
+        }
+    } catch (e) { console.error('Agents load failed:', e); }
+}
+
+async function loadTasks() {
+    if (!currentProjectId) { document.getElementById('task-board').innerHTML = '<p style="color:#666">Select a project</p>'; return; }
+    try {
+        const data = await apiFetch(`/api/v1/projects/${currentProjectId}/tasks?limit=200`);
+        const board = document.getElementById('task-board');
+        const cols = { backlog: [], ready: [], in_progress: [], blocked: [], done: [], failed: [], cancelled: [] };
+        (data.items || []).forEach(t => {
+            const col = cols[t.status] || cols.backlog;
+            col.push(t);
+        });
+        board.innerHTML = '';
+        Object.entries(cols).forEach(([status, tasks]) => {
+            const col = document.createElement('div');
+            col.className = `task-col col-${status}`;
+            col.innerHTML = `<div class="col-header">${STATUS_LABELS[status] || status} (${tasks.length})</div>`;
+            tasks.forEach(t => {
+                const card = document.createElement('div');
+                card.className = 'task-card';
+                const agentName = t.assigned_to ? (agentMap[t.assigned_to]?.name || '?') : 'unassigned';
+                let runBtn = '';
+                if ((t.status === 'ready' || t.status === 'failed') && t.assigned_to) {
+                    runBtn = `<br><button style="margin-top:4px;font-size:10px;" onclick="event.stopPropagation();runTask('${t.id}')">▶ Run</button>`;
+                }
+                card.innerHTML = `<strong>${esc(t.title)}</strong><br><span style="color:#666;font-size:11px">P${t.priority} · ${esc(agentName)}</span>${runBtn}`;
+                card.onclick = () => openTaskDetail(t);
+                col.appendChild(card);
+            });
+            board.appendChild(col);
+        });
+    } catch (e) { console.error('Tasks load failed:', e); }
+}
+
+async function loadProtocolInstances() {
+    const panel = document.getElementById('protocols-panel');
+    if (!currentProjectId) {
+        panel.innerHTML = '<div class="panel-empty">Select a project</div>';
+        return;
+    }
+    try {
+        const data = await apiFetch(`/api/v1/projects/${currentProjectId}/protocol-instances`);
+        panel.innerHTML = '';
+        if (!data || data.length === 0) {
+            panel.innerHTML = '<div class="panel-empty">No protocol instances</div>';
+            return;
+        }
+        data.forEach(instance => {
+            const card = document.createElement('div');
+            card.className = 'protocol-card';
+            const linked = instance.linked_task_id ? `Task ${esc(instance.linked_task_id.slice(0, 8))}` : 'No task';
+            const artifact = instance.artifact_id ? `Artifact ${esc(instance.artifact_id.slice(0, 8))}` : 'No artifact';
+            card.innerHTML = `
+                <strong>${esc(instance.current_state)}</strong>
+                <div><span style="color:#666">Status:</span> ${esc(instance.status)}</div>
+                <div class="meta">${linked} · ${artifact}</div>
+                <div class="meta">Protocol ${esc(instance.protocol_id.slice(0, 8))}</div>
+            `;
+            panel.appendChild(card);
+        });
+    } catch (e) {
+        console.error('Protocol instances load failed:', e);
+        panel.innerHTML = '<div class="panel-error">Failed to load protocol instances</div>';
+    }
+}
+
+async function loadArtifacts() {
+    const tbody = document.getElementById('artifacts-body');
+    if (!currentProjectId) {
+        tbody.innerHTML = '<tr><td colspan="5" class="panel-empty">Select a project</td></tr>';
+        return;
+    }
+    try {
+        const data = await apiFetch(`/api/v1/projects/${currentProjectId}/artifacts`);
+        tbody.innerHTML = '';
+        if (!data || data.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="panel-empty">No artifacts</td></tr>';
+            return;
+        }
+        data.forEach(artifact => {
+            const location = artifact.url || artifact.path || '';
+            const breaking = artifact.is_breaking ? ' · breaking' : '';
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td><strong>${esc(artifact.name)}</strong><div class="artifact-muted">${esc(artifact.id.slice(0, 8))}</div></td>
+                <td>${esc(artifact.artifact_type)}</td>
+                <td>${esc(artifact.status)}</td>
+                <td>${esc(artifact.version)}<span class="artifact-muted">${breaking}</span></td>
+                <td style="color:#888">${esc(location || '-')}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    } catch (e) {
+        console.error('Artifacts load failed:', e);
+        tbody.innerHTML = '<tr><td colspan="5" class="panel-error">Failed to load artifacts</td></tr>';
+    }
+}
+
+async function loadSessions() {
+    try {
+        const params = currentProjectId ? `?project_id=${currentProjectId}&limit=20` : '?limit=20';
+        const data = await apiFetch(`/api/v1/sessions${params}`);
+        const tbody = document.getElementById('sessions-body');
+        tbody.innerHTML = '';
+        (data.items || []).forEach(s => {
+            const agentName = agentMap[s.agent_id]?.name || s.agent_id.slice(0,8);
+            const output = (s.output || '').slice(0, 80).replace(/\n/g, ' ');
+            const tr = document.createElement('tr');
+            const idTd = document.createElement('td');
+            idTd.style.color = '#666';
+            idTd.textContent = s.id.slice(0, 8);
+            const agentTd = document.createElement('td');
+            agentTd.textContent = agentName;
+            const statusTd = document.createElement('td');
+            statusTd.className = 'status-' + cssToken(s.status);
+            statusTd.textContent = s.status || '';
+            const adapterTd = document.createElement('td');
+            adapterTd.textContent = s.adapter_type || '';
+            const outputTd = document.createElement('td');
+            outputTd.style.color = '#888';
+            outputTd.textContent = output;
+            tr.append(idTd, agentTd, statusTd, adapterTd, outputTd);
+            tbody.appendChild(tr);
+        });
+    } catch (e) { console.error('Sessions load failed:', e); }
+}
+
+function openNewTaskModal() {
+    if (!currentProjectId) { alert('Select a project first'); return; }
+    document.getElementById('task-title').value = '';
+    document.getElementById('task-desc').value = '';
+    document.getElementById('task-priority').value = '50';
+    document.getElementById('task-agent').value = '';
+    document.getElementById('new-task-modal').classList.add('open');
+}
+function closeNewTaskModal() { document.getElementById('new-task-modal').classList.remove('open'); }
+
+function populateMeetingAgentSelect() {
+    const sel = document.getElementById('meeting-agent-select');
+    if (!sel) return;
+    const selected = new Set(Array.from(sel.selectedOptions || []).map(opt => opt.value));
+    sel.innerHTML = '';
+    Object.values(agentMap).forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = `${a.name} (${a.role})`;
+        if (selected.has(a.id)) opt.selected = true;
+        sel.appendChild(opt);
+    });
+    populateMeetingOrganizerAgentSelect();
+}
+
+function populateMeetingOrganizerAgentSelect() {
+    const sel = document.getElementById('meeting-organizer-agent-select');
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = '<option value="">-- select organizer agent --</option>';
+    Object.values(agentMap).forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = `${a.name} (${a.role})`;
+        sel.appendChild(opt);
+    });
+    sel.value = current;
+}
+
+function populateMeetingGrantTurnSelect(meeting = null) {
+    const sel = document.getElementById('meeting-grant-turn-agent');
+    if (!sel) return;
+    const current = sel.value;
+    const participantIds = meeting?.participant_agent_ids || [];
+    sel.innerHTML = '<option value="">-- choose participant --</option>';
+    participantIds.forEach(agentId => {
+        const agent = agentMap[agentId];
+        const opt = document.createElement('option');
+        opt.value = agentId;
+        opt.textContent = agent ? `${agent.name} (${agent.role})` : agentId;
+        sel.appendChild(opt);
+    });
+    sel.value = participantIds.includes(current) ? current : '';
+}
+
+function updateMeetingOrganizerControls() {
+    const strategy = document.getElementById('meeting-turn-strategy')?.value;
+    const mode = document.getElementById('meeting-organizer-mode')?.value;
+    const config = document.getElementById('meeting-organizer-config');
+    const userNote = document.getElementById('meeting-organizer-user-note');
+    const agentWrap = document.getElementById('meeting-organizer-agent-wrap');
+    const organizerEnabled = strategy === 'organizer_controlled';
+    if (config) config.style.display = organizerEnabled ? 'block' : 'none';
+    if (userNote) userNote.style.display = organizerEnabled && mode === 'human' ? 'block' : 'none';
+    if (agentWrap) agentWrap.style.display = organizerEnabled && mode === 'agent' ? 'block' : 'none';
+}
+
+function addMeetingAgendaItemRow(item = {}) {
+    const list = document.getElementById('meeting-agenda-list');
+    const row = document.createElement('div');
+    row.className = 'card';
+    row.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <strong style="color:#a8dadc;font-size:12px;">Agenda Item</strong>
+            <button type="button" onclick="this.closest('.card').remove()">Remove</button>
+        </div>
+        <label>Title</label><input type="text" class="meeting-agenda-title" value="${esc(item.title || '')}" />
+        <label>Description</label><textarea class="meeting-agenda-description" rows="2">${esc(item.description || '')}</textarea>
+        <label>Question</label><input type="text" class="meeting-agenda-question" value="${esc(item.question || '')}" />
+        <label>Options (comma separated)</label><input type="text" class="meeting-agenda-options" value="${esc((item.options || []).join(', '))}" />
+        <label>Max Rounds</label><input type="number" class="meeting-agenda-rounds" value="${item.max_rounds || 3}" min="1" max="10" />
+    `;
+    list.appendChild(row);
+}
+
+function resetMeetingForm() {
+    document.getElementById('meeting-title').value = '';
+    document.getElementById('meeting-type').value = 'adhoc';
+    document.getElementById('meeting-duration').value = '30';
+    document.getElementById('meeting-turn-strategy').value = 'round_robin';
+    document.getElementById('meeting-organizer-mode').value = '';
+    document.getElementById('meeting-organizer-agent-select').value = '';
+    document.getElementById('meeting-deadlock-strategy').value = 'human_intervention';
+    document.getElementById('meeting-auto-start').checked = true;
+    populateMeetingAgentSelect();
+    updateMeetingOrganizerControls();
+    document.getElementById('meeting-agenda-list').innerHTML = '';
+    addMeetingAgendaItemRow();
+}
+
+function openNewMeetingModal() {
+    if (!currentProjectId) { alert('Select a project first'); return; }
+    resetMeetingForm();
+    document.getElementById('new-meeting-modal').classList.add('open');
+}
+
+function closeNewMeetingModal() {
+    document.getElementById('new-meeting-modal').classList.remove('open');
+}
+
+function buildMeetingAgendaItems() {
+    const rows = Array.from(document.querySelectorAll('#meeting-agenda-list .card'));
+    return rows.map((row, index) => {
+        const title = row.querySelector('.meeting-agenda-title').value.trim();
+        const description = row.querySelector('.meeting-agenda-description').value.trim();
+        const question = row.querySelector('.meeting-agenda-question').value.trim();
+        const options = row.querySelector('.meeting-agenda-options').value
+            .split(',')
+            .map(part => part.trim())
+            .filter(Boolean);
+        const maxRounds = Number(row.querySelector('.meeting-agenda-rounds').value || 3);
+        if (!title) return null;
+        return {
+            order: index + 1,
+            title,
+            description: description || null,
+            question: question || null,
+            options: options.length ? options : null,
+            max_rounds: maxRounds,
+        };
+    }).filter(Boolean);
+}
+
+async function createTask() {
+    const title = document.getElementById('task-title').value.trim();
+    if (!title) { alert('Title required'); return; }
+    const body = {
+        title,
+        description: document.getElementById('task-desc').value,
+        priority: parseInt(document.getElementById('task-priority').value) || 50,
+        assigned_to: document.getElementById('task-agent').value || null,
+    };
+    try {
+        await apiFetch(`/api/v1/projects/${currentProjectId}/tasks`, { method: 'POST', body: JSON.stringify(body) });
+        closeNewTaskModal();
+        await loadTasks();
+    } catch (e) { alert('Failed to create task: ' + e.message); }
+}
+
+function openTaskDetail(task) {
+    currentTaskId = task.id;
+    document.getElementById('detail-title').textContent = task.title;
+    document.getElementById('detail-desc').textContent = task.description || '';
+    document.getElementById('detail-info').innerHTML = `<span style="color:#666">Status: </span><strong class="status-${task.status}">${task.status}</strong> &nbsp; <span style="color:#666">Priority: </span>${task.priority}`;
+    document.getElementById('detail-agent').value = task.assigned_to || '';
+    loadTaskRuns(task.id);
+    // Status buttons
+    const btns = document.getElementById('status-buttons');
+    btns.innerHTML = '';
+    (VALID_TRANSITIONS[task.status] || []).forEach(s => {
+        const btn = document.createElement('button');
+        btn.textContent = '→ ' + (STATUS_LABELS[s] || s);
+        btn.onclick = () => transitionTask(task.id, s);
+        btns.appendChild(btn);
+    });
+    document.getElementById('task-detail-modal').classList.add('open');
+}
+function closeTaskDetail() { document.getElementById('task-detail-modal').classList.remove('open'); currentTaskId = null; }
+
+async function transitionTask(taskId, newStatus) {
+    try {
+        await apiFetch(`/api/v1/projects/${currentProjectId}/tasks/${taskId}/status`, {
+            method: 'PATCH', body: JSON.stringify({ status: newStatus }),
+        });
+        closeTaskDetail();
+        await loadTasks();
+    } catch (e) { alert('Transition failed: ' + e.message); }
+}
+
+async function assignTask() {
+    if (!currentTaskId) return;
+    const agentId = document.getElementById('detail-agent').value;
+    if (!agentId) return;
+    try {
+        await apiFetch(`/api/v1/projects/${currentProjectId}/tasks/${currentTaskId}/assign`, {
+            method: 'POST', body: JSON.stringify({ agent_id: agentId }),
+        });
+        await loadTasks();
+    } catch (e) { alert('Assign failed: ' + e.message); }
+}
+
+async function runTask(taskId) {
+    if (!currentProjectId) return;
+    try {
+        await apiFetch(`/api/v1/projects/${currentProjectId}/tasks/${taskId}/run`, {
+            method: 'POST', body: JSON.stringify({}),
+        });
+        await loadTasks();
+    } catch (e) { alert('Run failed: ' + e.message); }
+}
+
+async function loadTaskRuns(taskId) {
+    try {
+        const data = await apiFetch(`/api/v1/projects/${currentProjectId}/tasks/${taskId}/runs`);
+        const div = document.getElementById('detail-runs');
+        if (!data.items || data.items.length === 0) {
+            div.innerHTML = '<span style="color:#666">No runs yet</span>';
+            return;
+        }
+        div.innerHTML = '';
+        data.items.slice(0, 5).forEach(s => {
+            const out = (s.output || s.error || '').slice(0, 60).replace(/\n/g, ' ');
+            const origin = s.origin ? `[${s.origin}] ` : '';
+            const row = document.createElement('div');
+            row.style.marginBottom = '4px';
+            const status = document.createElement('span');
+            status.className = 'status-' + cssToken(s.status);
+            status.textContent = s.status || '';
+            const detail = document.createElement('span');
+            detail.style.color = '#666';
+            detail.textContent = ` ${origin}${out}`;
+            row.append(status, detail);
+            div.appendChild(row);
+        });
+    } catch (e) { /* ignore */ }
+}
+
+function esc(str) {
+    return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function cssToken(str) {
+    return String(str || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+let eventWs = null;
+let activeMeetingWs = null;
+
+function connectEventStream(projectId) {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (eventWs) {
+    eventWs.onclose = null;
+    eventWs.close();
+  }
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let wsUrl = `${proto}//${window.location.host}/ws/projects/${projectId}/events`;
+  if (authEnabled && token) {
+    wsUrl += `?token=${encodeURIComponent(token)}`;
+  }
+  eventWs = new WebSocket(wsUrl);
+
+  eventWs.onopen = () => {
+    document.getElementById('ws-status').textContent = 'connected';
+  };
+
+  eventWs.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'ping') return;
+    const eventTypeName = String(data.event_type || '');
+    const feed = document.getElementById('event-feed');
+    const row = document.createElement('div');
+    row.className = 'event-row';
+    const time = new Date(data.emitted_at).toLocaleTimeString();
+    const eventType = document.createElement('span');
+    eventType.className = 'event-type';
+    eventType.textContent = eventTypeName;
+    const eventTime = document.createElement('span');
+    eventTime.className = 'event-time';
+    eventTime.textContent = time;
+    row.appendChild(eventType);
+    row.appendChild(eventTime);
+    feed.insertBefore(row, feed.firstChild);
+    while (feed.children.length > 100) { feed.removeChild(feed.lastChild); }
+
+    if (eventTypeName === 'session.completed' || eventTypeName === 'session.failed' || eventTypeName === 'session.started' || eventTypeName === 'session.created' || eventTypeName === 'session.cancelled') {
+      loadSessions();
+    }
+    if (eventTypeName === 'task.status_changed' || eventTypeName === 'task.created' || eventTypeName === 'task.assigned') {
+      loadTasks();
+    }
+    if (eventTypeName === 'task.status_changed' || eventTypeName.startsWith('protocol.')) {
+      loadProtocolInstances();
+    }
+    if (eventTypeName.startsWith('artifact.')) {
+      loadArtifacts();
+    }
+  };
+
+  eventWs.onclose = (event) => {
+    document.getElementById('ws-status').textContent = 'disconnected';
+    if (event.code !== 4001 && currentProjectId === projectId) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (currentProjectId === projectId) connectEventStream(projectId);
+      }, 5000);
+    }
+  };
+
+  eventWs.onerror = () => {
+    document.getElementById('ws-status').textContent = 'error';
+  };
+}
+
+async function loadHealth() {
+  try {
+    const data = await apiFetch('/api/v1/orchestration/health');
+    const dot = document.getElementById('health-dot');
+    const consumers = Object.values(data.consumers);
+    const runningCount = consumers.filter(c => c.running).length;
+    if (runningCount === consumers.length) dot.className = 'green';
+    else if (runningCount > 0) dot.className = 'yellow';
+    else dot.className = 'red';
+  } catch (e) {
+    // ignore
+  }
+}
+
+    // ===== Meetings Panel =====
+    let activeMeetingId = null;
+    let activeMeetingData = null;
+
+    function escMtg(str) {
+      return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function loadMeetings() {
+      if (!currentProjectId) return;
+      const meetings = await apiFetch(`/api/v1/projects/${currentProjectId}/meetings`);
+      const el = document.getElementById('meetings-list');
+      if (!meetings || meetings.length === 0) {
+        el.innerHTML = '<p style="color:#4a5568;font-size:13px;">No meetings.</p>';
+        return;
+      }
+      el.innerHTML = meetings.map(m => `
+        <div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #2d3748;cursor:pointer;" onclick="openMeeting('${m.id}')">
+          <span style="flex:1;font-size:13px;">
+            ${escMtg(m.title)}
+            <div style="font-size:10px;color:#718096;margin-top:2px;">Meeting ID: ${escMtg(m.id)} · Project ID: ${escMtg(m.project_id)}</div>
+          </span>
+          <span style="font-size:11px;background:#2d3748;padding:2px 8px;border-radius:4px;">${escMtg(m.status)}</span>
+          <span style="font-size:11px;color:#718096;">${escMtg(m.meeting_type)}</span>
+        </div>
+      `).join('');
+    }
+
+    async function openMeeting(meetingId) {
+      activeMeetingId = meetingId;
+      if (activeMeetingWs) {
+        activeMeetingWs.onclose = null;
+        activeMeetingWs.close();
+        activeMeetingWs = null;
+      }
+      const meeting = await apiFetch(`/api/v1/meetings/${meetingId}`);
+      activeMeetingData = meeting;
+      document.getElementById('active-meeting-title').textContent = meeting.title;
+      document.getElementById('active-meeting-status').textContent = meeting.status;
+      document.getElementById('active-meeting-id').textContent = meeting.id;
+      document.getElementById('active-meeting-project-id').textContent = meeting.project_id;
+      document.getElementById('active-meeting-view').style.display = 'block';
+      renderMeetingOrganizerControls(meeting);
+      resetMeetingVerboseLog();
+      await refreshTranscript(meetingId);
+      if (['active', 'preparing'].includes(meeting.status)) {
+        subscribeToMeeting(meetingId);
+      }
+    }
+
+    async function refreshTranscript(meetingId) {
+      const turns = await apiFetch(`/api/v1/meetings/${meetingId}/turns`);
+      const el = document.getElementById('meeting-transcript');
+      if (!turns || turns.length === 0) {
+        el.innerHTML = '<span style="color:#4a5568;">No turns yet.</span>';
+        return;
+      }
+      el.innerHTML = turns.map(t => `
+        <div style="margin-bottom:8px;padding:6px;background:${t.is_human_turn ? '#2c3e50' : '#1e2a3a'};border-radius:4px;">
+          <div style="font-size:10px;color:#718096;margin-bottom:2px;">${t.is_human_turn ? 'Human' : 'Agent'} · Turn ${t.turn_number}</div>
+          <div>${escMtg(t.content)}</div>
+        </div>
+      `).join('');
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function resetMeetingVerboseLog() {
+      const el = document.getElementById('meeting-verbose-log');
+      el.innerHTML = '<span style="color:#4a5568;">Verbose meeting trace will appear here.</span>';
+    }
+
+    function renderMeetingOrganizerControls(meeting) {
+      const panel = document.getElementById('meeting-organizer-controls');
+      const canGrant = Boolean(
+        meeting &&
+        meeting.turn_strategy === 'organizer_controlled' &&
+        meeting.organizer_user_id &&
+        currentUser &&
+        meeting.organizer_user_id === currentUser.id
+      );
+      panel.style.display = canGrant ? 'block' : 'none';
+      populateMeetingGrantTurnSelect(meeting);
+    }
+
+    function formatTraceValue(value) {
+      if (value === null || value === undefined || value === '') return '';
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch (_err) {
+        return String(value);
+      }
+    }
+
+    function appendMeetingVerboseEvent(data) {
+      const el = document.getElementById('meeting-verbose-log');
+      if (!el) return;
+      const trace = data.payload?.trace;
+      const row = document.createElement('div');
+      row.style.marginBottom = '10px';
+      row.style.padding = '8px';
+      row.style.background = '#1f2937';
+      row.style.borderRadius = '4px';
+
+      const title = document.createElement('div');
+      title.style.fontSize = '11px';
+      title.style.color = '#93c5fd';
+      const emittedAt = data.emitted_at ? new Date(data.emitted_at).toLocaleTimeString() : '';
+      title.textContent = trace
+        ? `${trace.kind || 'trace'} · ${trace.stage || 'event'} · ${trace.actor_name || trace.actor_id || trace.model || 'meeting'} · ${emittedAt}`
+        : `${data.event_type || 'meeting.event'} · ${emittedAt}`;
+      row.appendChild(title);
+
+      if (trace?.messages) {
+        const req = document.createElement('pre');
+        req.style.whiteSpace = 'pre-wrap';
+        req.style.margin = '6px 0 0';
+        req.style.color = '#d1fae5';
+        req.textContent = formatTraceValue(trace.messages);
+        row.appendChild(req);
+      }
+
+      if (trace && ('raw_response' in trace || 'parsed_result' in trace || 'error' in trace)) {
+        const resp = document.createElement('pre');
+        resp.style.whiteSpace = 'pre-wrap';
+        resp.style.margin = '6px 0 0';
+        resp.style.color = trace.error ? '#fecaca' : '#e5e7eb';
+        const parts = [];
+        if (trace.raw_response) parts.push(`raw_response:\n${formatTraceValue(trace.raw_response)}`);
+        if (trace.parsed_result) parts.push(`parsed_result:\n${formatTraceValue(trace.parsed_result)}`);
+        if (trace.error) parts.push(`error:\n${trace.error}`);
+        resp.textContent = parts.join('\n\n');
+        row.appendChild(resp);
+      } else if (!trace) {
+        const payload = document.createElement('pre');
+        payload.style.whiteSpace = 'pre-wrap';
+        payload.style.margin = '6px 0 0';
+        payload.style.color = '#e5e7eb';
+        payload.textContent = formatTraceValue(data.payload || {});
+        row.appendChild(payload);
+      }
+
+      if (el.firstChild && el.firstChild.textContent === 'Verbose meeting trace will appear here.') {
+        el.innerHTML = '';
+      }
+      el.insertBefore(row, el.firstChild);
+      while (el.children.length > 100) el.removeChild(el.lastChild);
+    }
+
+    function subscribeToMeeting(meetingId) {
+      if (activeMeetingWs) {
+        activeMeetingWs.onclose = null;
+        activeMeetingWs.close();
+        activeMeetingWs = null;
+      }
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      let wsUrl = `${proto}//${window.location.host}/ws/meetings/${meetingId}`;
+      if (authEnabled && token) {
+        wsUrl += `?token=${encodeURIComponent(token)}`;
+      }
+      activeMeetingWs = new WebSocket(wsUrl);
+      activeMeetingWs.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type === 'ping' || data.meeting_id !== meetingId || activeMeetingId !== meetingId) return;
+          appendMeetingVerboseEvent(data);
+          if (data.event_type === 'meeting.turn_complete' || data.event_type === 'meeting.human_turn') {
+            refreshTranscript(meetingId);
+          }
+          if (data.event_type === 'meeting.deadlocked') {
+            alert('Meeting deadlocked. Please intervene.');
+          }
+        } catch (e) { /* ignore */ }
+      };
+    }
+
+    async function grantMeetingTurn() {
+      if (!activeMeetingId) return;
+      const participantAgentId = document.getElementById('meeting-grant-turn-agent').value;
+      if (!participantAgentId) {
+        alert('Select a participant to grant the turn.');
+        return;
+      }
+      await apiFetch(`/api/v1/meetings/${activeMeetingId}/grant-turn`, {
+        method: 'POST',
+        body: JSON.stringify({ participant_agent_id: participantAgentId }),
+      });
+    }
+
+    async function submitHumanTurn() {
+      if (!activeMeetingId) return;
+      const content = document.getElementById('human-turn-input').value.trim();
+      if (!content) return;
+      await apiFetch(`/api/v1/meetings/${activeMeetingId}/human-turn`, {
+        method: 'POST',
+        body: JSON.stringify({ content }),
+      });
+      document.getElementById('human-turn-input').value = '';
+      await refreshTranscript(activeMeetingId);
+    }
+
+    async function endActiveMeeting() {
+      if (!activeMeetingId) return;
+      if (!confirm('End this meeting early?')) return;
+      await apiFetch(`/api/v1/meetings/${activeMeetingId}/end`, { method: 'POST' });
+      activeMeetingId = null;
+      activeMeetingData = null;
+      if (activeMeetingWs) {
+        activeMeetingWs.onclose = null;
+        activeMeetingWs.close();
+        activeMeetingWs = null;
+      }
+      document.getElementById('active-meeting-view').style.display = 'none';
+      await loadMeetings();
+    }
+
+    async function copyActiveMeeting() {
+      if (!activeMeetingId) return;
+      try {
+        const meeting = await apiFetch(`/api/v1/meetings/${activeMeetingId}/copy`, {
+          method: 'POST',
+        });
+        await loadMeetings();
+        if (meeting && meeting.id) {
+          await openMeeting(meeting.id);
+        }
+      } catch (e) {
+        alert('Failed to copy meeting: ' + e.message);
+      }
+    }
+
+    async function createMeeting() {
+      const title = document.getElementById('meeting-title').value.trim();
+      if (!title) {
+        alert('Meeting title required');
+        return;
+      }
+      const agendaItems = buildMeetingAgendaItems();
+      if (agendaItems.length === 0) {
+        alert('Add at least one agenda item with a title');
+        return;
+      }
+      const participantAgentIds = Array.from(
+        document.getElementById('meeting-agent-select').selectedOptions
+      ).map(opt => opt.value);
+      const turnStrategy = document.getElementById('meeting-turn-strategy').value;
+      const organizerMode = document.getElementById('meeting-organizer-mode').value;
+      let organizerAgentId = null;
+      let organizerUserId = null;
+      if (turnStrategy === 'organizer_controlled') {
+        if (organizerMode === 'human') {
+          organizerUserId = currentUser?.id || null;
+          if (!organizerUserId) {
+            alert('Unable to resolve the current user for organizer mode.');
+            return;
+          }
+        } else if (organizerMode === 'agent') {
+          organizerAgentId = document.getElementById('meeting-organizer-agent-select').value || null;
+          if (!organizerAgentId) {
+            alert('Select an organizer agent.');
+            return;
+          }
+        } else {
+          alert('Select a human or agent organizer.');
+          return;
+        }
+      }
+      const payload = {
+        title,
+        meeting_type: document.getElementById('meeting-type').value,
+        participant_agent_ids: participantAgentIds,
+        agenda_items: agendaItems,
+        max_duration_minutes: parseInt(document.getElementById('meeting-duration').value, 10) || 30,
+        turn_strategy: turnStrategy,
+        deadlock_strategy: document.getElementById('meeting-deadlock-strategy').value,
+        auto_start: document.getElementById('meeting-auto-start').checked,
+        organizer_agent_id: organizerAgentId,
+        organizer_user_id: organizerUserId,
+      };
+      try {
+        const meeting = await apiFetch(`/api/v1/projects/${currentProjectId}/meetings`, {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        closeNewMeetingModal();
+        await loadMeetings();
+        if (meeting && meeting.id) {
+          await openMeeting(meeting.id);
+        }
+      } catch (e) {
+        alert('Failed to create meeting: ' + e.message);
+      }
+    }
+
+// Auto-start if already logged in
+(async () => {
+    try {
+        const cfg = await fetch(API + '/api/v1/config').then(r => {
+            if (!r.ok) throw new Error('config fetch failed');
+            return r.json();
+        });
+        if (cfg.auth_enabled === false) {
+            authEnabled = false;
+            document.getElementById('logout-btn').style.display = 'none';
+            document.getElementById('login-screen').style.display = 'none';
+            showApp();
+            return;
+        }
+    } catch (_) {}
+    if (token) { showApp(); } else {
+        document.getElementById('login-screen').style.display = 'flex';
+    }
+})();
+</script>
+</body>
+</html>

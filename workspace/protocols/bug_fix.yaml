@@ -1,0 +1,164 @@
+name: bug_fix
+version: "1.0"
+description: >
+  Governs a bug report from triage through fix implementation, verification, and close.
+
+triggers:
+  - event_type: task.created
+    conditions:
+      metadata.type: bug
+
+actors:
+  triager:
+    description: Agent who assesses severity and assigns the bug
+    required_capabilities: [planning]
+    assignment: role
+    role_value: pm
+  developer:
+    description: Developer who implements the fix
+    required_capabilities: [code_write, debugging]
+    assignment: role
+    role_value: developer
+  verifier:
+    description: Agent who verifies the fix resolves the bug
+    required_capabilities: [code_review, testing]
+    assignment: role
+    role_value: tester
+
+states:
+  triage:
+    description: Bug received. Triager assesses severity and confirms it is reproducible.
+    actor: triager
+    timeout:
+      duration: 1h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: triager
+        task_title: "Triage bug: {{task.title}}"
+        task_description: "Assess severity (low/medium/high/critical). Confirm reproducibility. Set task.priority and update metadata.severity. Report done when triage is complete."
+    transitions:
+      - name: triaged_valid
+        to: assigned_to_developer
+        trigger_event: task.priority_changed
+        guard:
+          task_id: "{{protocol_instance.linked_task_id}}"
+      - name: triaged_invalid
+        to: closed_invalid
+        trigger_event: task.cancelled
+        guard:
+          task_id: "{{protocol_instance.linked_task_id}}"
+
+  assigned_to_developer:
+    description: Bug confirmed. Developer implements fix.
+    actor: developer
+    timeout:
+      duration: 8h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: developer
+        task_title: "Fix bug: {{task.title}}"
+        task_description: >
+          Reproduce the bug. Implement a fix. Add a regression test.
+          Push a branch and open a PR. Tag the PR with metadata.task_id.
+    transitions:
+      - name: fix_pr_opened
+        to: fix_in_review
+        trigger_event: code.pr_opened
+        guard:
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+
+  fix_in_review:
+    description: Fix PR open. Verifier reviews and runs tests.
+    actor: verifier
+    timeout:
+      duration: 4h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: verifier
+        task_title: "Verify fix for: {{task.title}}"
+        task_description: >
+          Review the fix PR. Confirm the regression test covers the bug.
+          Confirm all existing tests pass. Approve or request changes.
+    transitions:
+      - name: fix_approved
+        to: awaiting_merge
+        trigger_event: review.approved
+        guard:
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+      - name: fix_rejected
+        to: assigned_to_developer
+        trigger_event: review.changes_requested
+        guard:
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+
+  awaiting_merge:
+    description: Fix approved. Waiting for merge.
+    actor: triager
+    timeout:
+      duration: 2h
+      action: escalate
+    transitions:
+      - name: merged
+        to: verification
+        trigger_event: code.pr_merged
+        guard:
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+
+  verification:
+    description: Fix merged. Verifier confirms bug is gone in main.
+    actor: verifier
+    timeout:
+      duration: 2h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: verifier
+        task_title: "Final verification: {{task.title}}"
+        task_description: "Confirm the bug no longer reproduces on main branch. Report pass or fail."
+    transitions:
+      - name: verified_fixed
+        to: closed_fixed
+        trigger_event: session.completed
+        guard:
+          metadata.verification_result: pass
+      - name: regression
+        to: assigned_to_developer
+        trigger_event: session.completed
+        guard:
+          metadata.verification_result: fail
+
+  closed_fixed:
+    description: Bug verified fixed.
+    actor: null
+    on_enter:
+      - action_type: complete_task
+        task_id: "{{protocol_instance.linked_task_id}}"
+      - action_type: record_decision
+        summary: "Bug {{task.title}} fixed and verified"
+        rationale: "Fix reviewed, merged, and confirmed working on main."
+    transitions: []
+
+  closed_invalid:
+    description: Bug was not a valid issue.
+    actor: null
+    on_enter:
+      - action_type: post_message
+        channel: general
+        template: "Bug {{task.title}} closed as invalid after triage."
+    transitions: []
+
+  escalation_terminal:
+    description: Bug fix stalled after full escalation chain exhausted.
+    actor: null
+    transitions: []
+
+initial_state: triage
+
+terminal_states:
+  success: [closed_fixed, closed_invalid]
+  failure: [escalation_terminal]
+
+escalation_chain: standard_dev_escalation

@@ -1,0 +1,126 @@
+name: feature_development
+version: "1.0"
+description: >
+  Governs a feature from task creation through implementation, review, and deployment.
+
+triggers:
+  - event_type: task.created
+    conditions:
+      metadata.protocol: feature_development
+
+actors:
+  pm:
+    description: Product manager who owns the feature spec
+    required_capabilities: [planning, spec_writing]
+    assignment: role
+    role_value: pm
+  developer:
+    description: Developer agent who implements the feature
+    required_capabilities: [code_write]
+    assignment: role
+    role_value: developer
+  reviewer:
+    description: Reviewer who approves the implementation
+    required_capabilities: [code_review]
+    assignment: role
+    role_value: reviewer
+
+states:
+  spec_required:
+    description: Feature task created. PM must write the spec artifact.
+    actor: pm
+    timeout:
+      duration: 2h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: pm
+        task_title: "Write spec for: {{task.title}}"
+        task_description: "Write a feature spec artifact for task {{task.id}}. Include acceptance criteria, data model changes, and API changes. Post as artifact type: feature_spec."
+    transitions:
+      - name: spec_written
+        to: development
+        trigger_event: artifact.created
+        guard:
+          metadata.type: feature_spec
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+
+  development:
+    description: Spec available. Developer implements.
+    actor: developer
+    timeout:
+      duration: 24h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: developer
+        task_title: "Implement: {{task.title}}"
+        task_description: "Implement the feature per spec artifact {{artifact.id}}. Push a branch and open a PR when ready."
+      - action_type: post_message
+        channel: general
+        template: "Development started on: {{task.title}}"
+    transitions:
+      - name: pr_opened
+        to: in_review
+        trigger_event: code.pr_opened
+        guard:
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+
+  in_review:
+    description: PR opened. code_review sub-protocol handles review.
+    actor: reviewer
+    timeout:
+      duration: 8h
+      action: escalate
+    on_enter:
+      - action_type: emit_event
+        event_type: code.pr_opened
+    transitions:
+      - name: pr_merged
+        to: deployment_ready
+        trigger_event: code.pr_merged
+        guard:
+          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+
+  deployment_ready:
+    description: Code merged. Deployment trigger or manual deploy needed.
+    actor: pm
+    timeout:
+      duration: 4h
+      action: escalate
+    on_enter:
+      - action_type: post_message
+        channel: general
+        template: "{{task.title}} merged and ready to deploy."
+      - action_type: notify_actor
+        actor: pm
+        message: "Feature ready for deployment sign-off: {{task.title}}"
+    transitions:
+      - name: deployed
+        to: complete
+        trigger_event: task.status_changed
+        guard:
+          task_id: "{{protocol_instance.linked_task_id}}"
+          new_status: done
+
+  complete:
+    description: Feature shipped.
+    actor: null
+    on_enter:
+      - action_type: record_decision
+        summary: "Feature {{task.title}} shipped"
+        rationale: "Spec written, implemented, reviewed, and deployed."
+    transitions: []
+
+  failed:
+    description: Feature development stalled and escalation exhausted.
+    actor: null
+    transitions: []
+
+initial_state: spec_required
+
+terminal_states:
+  success: [complete]
+  failure: [failed]
+
+escalation_chain: standard_dev_escalation

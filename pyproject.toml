@@ -1,0 +1,70 @@
+[project]
+name = "huddleroom"
+version = "0.1.0"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "alembic>=1.15",
+    "pydantic-settings>=2.8",
+    "python-jose[cryptography]>=3.3",
+    "bcrypt>=4.0",
+    "litellm>=1.60",
+    "httpx>=0.28",
+    "croniter>=2.0",
+    "apscheduler>=3.10,<4",
+    "numpy>=1.26",
+    "click>=8.1",
+    "pylint>=4.0.6",
+]
+
+[project.scripts]
+huddleroom = "huddleroom.cli:main"
+rally = "huddleroom.cli:main"
+
+[project.optional-dependencies]
+postgres = [
+    "asyncpg>=0.30",
+    "celery[redis]>=5.4",
+    "redis>=5.2",
+    "pgvector>=0.3",
+]
+
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+    "httpx>=0.28",
+    "pytest-cov>=6.0",
+    "pytest-xdist>=3.6",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["huddleroom*"]
+
+[tool.setuptools.data-files]
+"huddleroom/migrations" = [
+    "huddleroom/migrations/alembic.ini",
+    "alembic/env.py",
+    "alembic/script.py.mako",
+]
+"huddleroom/migrations/versions" = ["alembic/versions/*.py"]
+
+[tool.setuptools.package-data]
+huddleroom = ["static/dev-dashboard/*", "static/dashboard/**/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: real-LLM integration test, requires live API credentials, excluded from default run",
+    "unsupported_mode: relies on authentication, PostgreSQL, Redis, or Celery and is excluded from the default run",
+]
+addopts = "-m \"not integration and not unsupported_mode\""

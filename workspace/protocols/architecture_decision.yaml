@@ -1,0 +1,171 @@
+name: architecture_decision
+version: "1.0"
+description: >
+  Governs a significant architecture decision from proposal through team deliberation,
+  decision recording, and affected artifact updates.
+
+triggers:
+  - event_type: task.created
+    conditions:
+      metadata.type: architecture_decision_request
+
+actors:
+  proposer:
+    description: Agent or human who submitted the architecture proposal
+    required_capabilities: []
+    assignment: auto
+  architect:
+    description: Senior technical agent who evaluates proposals
+    required_capabilities: [architecture_review, planning]
+    assignment: role
+    role_value: architect
+  pm:
+    description: PM who owns the product impact assessment
+    required_capabilities: [planning]
+    assignment: role
+    role_value: pm
+  affected_agents:
+    description: Any agent whose work is affected by the decision
+    required_capabilities: []
+    assignment: manual
+
+states:
+  proposal_submitted:
+    description: ADR task created. Architect must review the proposal.
+    actor: architect
+    timeout:
+      duration: 4h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: architect
+        task_title: "Review ADR proposal: {{task.title}}"
+        task_description: >
+          Review the architecture proposal. Assess feasibility, risks, and alternatives.
+          Create a proposal artifact (type: adr_draft) with your assessment.
+          If the proposal warrants team discussion, report: recommend_meeting.
+          If the proposal is clearly infeasible, report: reject.
+    transitions:
+      - name: recommend_meeting
+        to: meeting_scheduled
+        trigger_event: session.completed
+        guard:
+          metadata.recommendation: recommend_meeting
+      - name: architect_rejects
+        to: rejected
+        trigger_event: session.completed
+        guard:
+          metadata.recommendation: reject
+
+  meeting_scheduled:
+    description: Architect recommends a deliberation meeting.
+    actor: null
+    on_enter:
+      - action_type: start_meeting
+        participants: [architect, pm, affected_agents]
+        agenda_template: |
+          1. Proposer presents the ADR: {{task.title}}
+          2. Architect presents technical assessment and alternatives
+          3. PM presents product impact
+          4. Affected agents raise concerns
+          5. Vote: accept / reject / defer with modifications
+          Meeting ends when a decision is reached or deferred.
+    transitions:
+      - name: meeting_ended
+        to: decision_pending
+        trigger_event: meeting.concluded
+        guard:
+          metadata.linked_task_id: "{{protocol_instance.linked_task_id}}"
+
+  decision_pending:
+    description: Meeting concluded. Architect records the formal decision.
+    actor: architect
+    timeout:
+      duration: 2h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: architect
+        task_title: "Record decision for: {{task.title}}"
+        task_description: >
+          Review the meeting transcript. Record the formal architecture decision:
+          accepted / rejected / deferred. Write the ADR knowledge item with
+          rationale and rejected alternatives. Update the ADR artifact status.
+          If accepted, list any follow-up implementation tasks.
+    transitions:
+      - name: decision_accepted
+        to: implementation_tasks_created
+        trigger_event: artifact.content_changed
+        guard:
+          metadata.adr_status: accepted
+      - name: decision_rejected
+        to: rejected
+        trigger_event: artifact.content_changed
+        guard:
+          metadata.adr_status: rejected
+      - name: decision_deferred
+        to: deferred
+        trigger_event: artifact.content_changed
+        guard:
+          metadata.adr_status: deferred
+
+  implementation_tasks_created:
+    description: Decision accepted. PM creates follow-up tasks.
+    actor: pm
+    timeout:
+      duration: 4h
+      action: escalate
+    on_enter:
+      - action_type: notify_actor
+        actor: pm
+        message: "ADR accepted: {{task.title}}. Please create implementation tasks."
+    transitions:
+      - name: tasks_created
+        to: complete
+        trigger_event: task.subtask_created
+        guard:
+          parent_id: "{{protocol_instance.linked_task_id}}"
+
+  complete:
+    description: ADR accepted and implementation tasks created.
+    actor: null
+    on_enter:
+      - action_type: record_decision
+        summary: "Architecture decision accepted: {{task.title}}"
+        rationale: "Deliberated in meeting, recorded in ADR artifact."
+      - action_type: complete_task
+        task_id: "{{protocol_instance.linked_task_id}}"
+    transitions: []
+
+  rejected:
+    description: ADR rejected.
+    actor: null
+    on_enter:
+      - action_type: complete_task
+        task_id: "{{protocol_instance.linked_task_id}}"
+      - action_type: record_decision
+        summary: "Architecture decision rejected: {{task.title}}"
+        rationale: "See ADR artifact for rationale and alternatives considered."
+    transitions: []
+
+  deferred:
+    description: ADR deferred for future consideration.
+    actor: null
+    on_enter:
+      - action_type: post_message
+        channel: general
+        template: "ADR deferred: {{task.title}}. Will be revisited at next architecture review."
+    transitions: []
+
+  escalation_terminal:
+    description: Decision process stalled.
+    actor: null
+    transitions: []
+
+initial_state: proposal_submitted
+
+terminal_states:
+  success: [complete, rejected, deferred]
+  failure: [escalation_terminal]
+
+escalation_chain: architecture_escalation

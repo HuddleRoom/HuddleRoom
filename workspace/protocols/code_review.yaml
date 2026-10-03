@@ -1,0 +1,145 @@
+name: code_review
+version: "1.0"
+description: >
+  Governs a pull request from open through review, revision if needed, and merge.
+  Assumes code is already pushed to a branch and a PR artifact has been created.
+
+triggers:
+  - event_type: code.pr_opened
+
+actors:
+  author:
+    description: The agent or human who opened the PR
+    required_capabilities: []
+    assignment: auto
+  reviewer:
+    description: Agent responsible for reviewing the PR
+    required_capabilities: [code_review]
+    assignment: role
+    role_value: reviewer
+  merger:
+    description: Agent authorized to merge approved PRs
+    required_capabilities: [code_merge]
+    assignment: role
+    role_value: pm
+
+states:
+  opened:
+    description: PR has been opened. Waiting for CI to run.
+    actor: null
+    timeout:
+      duration: 2h
+      action: escalate
+    on_enter:
+      - action_type: post_message
+        channel: general
+        template: "PR opened: {{artifact.name}}. Waiting for CI."
+    transitions:
+      - name: ci_passed
+        to: ready_for_review
+        trigger_event: test.passed
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+      - name: ci_failed
+        to: ci_failure
+        trigger_event: test.failed
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+
+  ci_failure:
+    description: CI failed. Author must fix.
+    actor: author
+    timeout:
+      duration: 4h
+      action: escalate
+    on_enter:
+      - action_type: notify_actor
+        actor: author
+        message: "CI failed on your PR {{artifact.name}}. Please fix and push."
+    transitions:
+      - name: fix_pushed
+        to: opened
+        trigger_event: code.pr_updated
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+
+  ready_for_review:
+    description: CI passed. Reviewer must submit a review.
+    actor: reviewer
+    timeout:
+      duration: 4h
+      action: escalate
+    on_enter:
+      - action_type: create_session
+        actor: reviewer
+        task_title: "Review PR: {{artifact.name}}"
+        task_description: "Review the pull request at branch {{artifact.metadata.branch}}. Approve, request changes, or comment."
+    transitions:
+      - name: approved
+        to: approved
+        trigger_event: review.approved
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+      - name: changes_requested
+        to: awaiting_revision
+        trigger_event: review.changes_requested
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+
+  awaiting_revision:
+    description: Reviewer requested changes. Author must revise.
+    actor: author
+    timeout:
+      duration: 8h
+      action: escalate
+    on_enter:
+      - action_type: notify_actor
+        actor: author
+        message: "Review requested changes on {{artifact.name}}. See review comments."
+    transitions:
+      - name: revision_pushed
+        to: ready_for_review
+        trigger_event: code.pr_updated
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+
+  approved:
+    description: PR is approved. Merger must merge.
+    actor: merger
+    timeout:
+      duration: 2h
+      action: escalate
+    on_enter:
+      - action_type: notify_actor
+        actor: merger
+        message: "PR {{artifact.name}} is approved and ready to merge."
+    transitions:
+      - name: merged
+        to: merged
+        trigger_event: code.pr_merged
+        guard:
+          artifact_id: "{{protocol_instance.artifact_id}}"
+
+  merged:
+    description: PR merged. Protocol complete.
+    actor: null
+    on_enter:
+      - action_type: complete_task
+        task_id: "{{protocol_instance.linked_task_id}}"
+      - action_type: record_decision
+        summary: "PR {{artifact.name}} merged"
+        rationale: "CI passed, reviewer approved."
+    transitions: []
+
+  ci_blocked_terminal:
+    description: CI kept failing after escalation. Protocol failed.
+    actor: null
+    transitions: []
+
+initial_state: opened
+
+terminal_states:
+  success: [merged]
+  failure: [ci_blocked_terminal]
+
+escalation_chain: standard_dev_escalation

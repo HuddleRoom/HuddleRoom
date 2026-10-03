@@ -1,0 +1,35 @@
+[MASTER]
+# Run in parallel
+jobs=1
+
+[MESSAGES CONTROL]
+disable=
+     # Docstrings not required in this codebase
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+     # Intentional: optional dependencies and circular import avoidance
+    import-outside-toplevel,
+     # Intentional: broad catches in error boundaries and optional-import guards
+    broad-exception-caught,
+     # Intentional: global state in scheduler module
+    global-statement,
+     # Models/adapters are minimal by design (SQLAlchemy models, abstract base)
+    too-few-public-methods,
+     # FastAPI routes and service methods naturally take many injected parameters
+    too-many-arguments,
+    too-many-positional-arguments,
+     # Managed code similarity across Celery/asyncio execution paths
+    duplicate-code
+
+[FORMAT]
+# Project uses 120-char lines
+max-line-length=120
+
+[DESIGN]
+# Allow up to 20 local variables (complex async methods with many DB loads)
+max-locals=20
+# Allow up to 30 statements (adapter run() methods are inherently long)
+max-statements=120
+# Allow up to 20 branches (LLM error handling has many exception types)
+max-branches=20
