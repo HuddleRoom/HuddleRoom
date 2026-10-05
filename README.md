@@ -8,39 +8,64 @@ your own machine; it has no access control.
 
 ## Install and run
 
-Install from the current source repository, initialize its local SQLite database, then start a loopback-only server:
+Install a published release with [pipx](https://pipx.pypa.io/). pipx creates an
+isolated Python environment and exposes the `huddleroom` command; there is no
+separate pipx package format or registry. The package includes the dashboard and
+database migrations, so this path needs neither Git nor Node. These commands apply
+after the first PyPI release is published; until then, install a built local wheel.
 
 ```bash
-git clone https://github.com/HuddleRoom/HuddleRoom.git
-cd HuddleRoom
-npm ci --prefix frontend
-make build-frontend
-pipx install .
-cp .env.example .env
-huddleroom init-db
+pipx install huddleroom
+huddleroom setup       # optional, recommended for guided configuration
 huddleroom serve
 # open http://127.0.0.1:8000/dashboard/
 ```
 
-HuddleRoom defaults to a local `huddleroom.db` SQLite file and binds to `127.0.0.1:8000`. The scheduler (APScheduler) and API server share the same process. Docker, PostgreSQL, Redis, and authentication are unsupported in this release.
+`serve` applies pending migrations before it starts and never prompts. It is valid
+to start without a provider key when using authenticated CLI agents; API-backed
+agents, orchestration, meeting control, and embeddings need their configured
+provider credential when those operations run. `huddleroom init-db` remains an
+idempotent diagnostic command for running the same migrations manually.
+
+New installations store their database, workspace, and optional configuration in
+`~/.huddleroom`. An existing `./huddleroom.db`, legacy `./rally.db`, or
+`./workspace` is retained when present. HuddleRoom binds to `127.0.0.1:8000` by
+default. The scheduler (APScheduler) and API server share one process. Docker,
+PostgreSQL, Redis, and authentication are unsupported in this release.
+
+### Upgrade and uninstall
+
+```bash
+pipx upgrade huddleroom
+huddleroom serve
+
+pipx uninstall huddleroom
+```
+
+Uninstalling the application retains `~/.huddleroom`, including its database and
+configuration. Remove that data only when it is no longer needed:
+
+```bash
+rm -rf ~/.huddleroom
+```
 
 Existing Rally installations can continue to use `rally` and `RALLY_*` settings for one release. They are deprecated; switch to `huddleroom` and `HUDDLEROOM_*` before the next release.
 
 ### Develop from source
 
-From that checkout:
+The published-package flow above is for users. Contributors who need a checkout
+can instead use this source setup:
 
 ```bash
 git config core.hooksPath .githooks
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env
+# Optional: configure ~/.huddleroom/config.toml or .env; see Configuration below.
 make build-frontend
-huddleroom init-db
 make serve
 ```
 
-> To call LLMs from API adapter agents, edit `.env` and set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
+> To call LLMs from API adapter agents, set a provider credential in `~/.huddleroom/config.toml`, `.env`, or the process environment.
 
 ---
 
@@ -59,22 +84,119 @@ make serve
 
 ## Configuration
 
-Settings use the `HUDDLEROOM_` prefix and can be set in `.env`. The `RALLY_` equivalents remain accepted for one release with a deprecation warning.
+Run `huddleroom setup` for guided configuration, or configure HuddleRoom directly.
+Setup writes only its own keys in `~/.huddleroom/config.toml`, preserves unrelated
+TOML/comments, and asks for direct provider credentials with hidden input. It is
+safe to rerun. Non-secret setup options are available for automation; provider
+secrets are deliberately not accepted as command arguments.
+
+Direct mode never requires or probes OneCLI. HuddleRoom automatically reads
+`~/.huddleroom/config.toml` when it exists. Copy `config.toml.example` there to
+start with every supported option when working from a source checkout. Pipx users
+can create the file directly; it uses flat, lowercase application keys such as
+`database_url`, while provider names remain uppercase, such as `OPENAI_API_KEY`.
+
+```bash
+mkdir -p ~/.huddleroom
+cp config.toml.example ~/.huddleroom/config.toml
+```
+
+The working directory's `.env` remains supported. Its application settings use the
+`HUDDLEROOM_` prefix; legacy `RALLY_` names remain accepted for one release with a
+deprecation warning. Values resolve in this order: explicit `Settings(...)` values,
+process environment, `.env`, `~/.huddleroom/config.toml`, then built-in defaults.
+Provider credentials can be in either file or the process environment and use the
+same process environment, `.env`, TOML precedence.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HUDDLEROOM_DATABASE_URL` | `sqlite+aiosqlite:///huddleroom.db` | Local SQLite database file |
+| `HUDDLEROOM_DATABASE_URL` | `sqlite+aiosqlite:///$HOME/.huddleroom/huddleroom.db` | Local SQLite database file; an existing CWD database wins when no value is supplied |
 | `HUDDLEROOM_DEBUG` | `false` | Enable SQLAlchemy query logging and full redacted LLM completion exchanges. Debug logs may contain sensitive prompt/response data; use only in trusted environments. |
 | `HUDDLEROOM_EMBEDDING_MODEL` | `text-embedding-3-small` | litellm embedding model for knowledge search |
 | `HUDDLEROOM_ORCHESTRATION_MODEL` | `openai/gpt-4o-mini` | Model for orchestration decisions and meeting control |
 | `HUDDLEROOM_MEETING_CONTROL_MODEL` | `HUDDLEROOM_ORCHESTRATION_MODEL` | Optional meeting-control override |
 
-For API adapter agents to call LLMs, add provider credentials to `.env`:
+For API adapter agents to call LLMs, add provider credentials to either configuration file:
 
 ```bash
+# ~/.huddleroom/config.toml
+OPENAI_API_KEY = "sk-..."
+ANTHROPIC_API_KEY = "sk-ant-..."
+
+# or .env
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+### OneCLI mode
+
+OneCLI is optional. Select it in `huddleroom setup` only when a supported OneCLI
+CLI, management service, and gateway are already available. Setup verifies
+`/v1/health`, `/v1/agents`, `/v1/agents/{id}/effective-credentials`,
+`/v1/agents/{id}/grants`, secret metadata at `/v1/secrets`, and gateway `/healthz`;
+it then lets you select or create a gateway agent. The selected `onecli_agent` is a
+OneCLI gateway identifier, not a HuddleRoom database agent.
+
+The supported contract uses `onecli agents credentials`, `onecli agents grants
+list`, `onecli agents grants attach-secret`, and `onecli run --agent --gateway`.
+It reads only secret metadata and effective access, preserves existing grants, and
+rechecks effective access after an additive grant. Automatic onboarding is limited
+to verified OpenAI API-key (`api.openai.com`, Bearer) and Anthropic API-key
+(`api.anthropic.com`, `x-api-key`) recipes. OAuth, OpenRouter, Gemini, Ollama,
+and unknown credential types remain manual configuration paths.
+
+OneCLI secrets are not stored in HuddleRoom TOML, logs, or command arguments.
+The HuddleRoom CLI agent executable owns its own authentication and can run
+without a provider API key. API-backed agents and control-plane operations still
+need an effective provider credential through the selected gateway. OneCLI mode
+fails closed if the CLI/service/gateway, selected agent, or required modern schema
+is unavailable; it does not fall back to direct credentials.
+
+The verified development CLI is OneCLI 2.11.0, but support is capability/schema
+based rather than a claimed server-version floor. A management server that lacks
+the required effective-credentials or grants endpoints is intentionally rejected
+until it is upgraded.
+
+### Troubleshooting
+
+- If `huddleroom` is not found after `pipx install`, ensure pipx's binary directory
+  is on `PATH` (`pipx ensurepath`, then open a new shell).
+- If an API-backed operation reports missing credentials, add its provider key in
+  the process environment, `.env`, or `~/.huddleroom/config.toml`, or configure
+  effective access through the selected OneCLI gateway. Startup itself does not
+  require a provider key.
+- If setup or serve reports an unwritable data path, choose writable
+  `--database-path`/`--workspace-dir` values in setup or fix permissions for
+  `~/.huddleroom`; do not delete an existing database to recover.
+- If migration fails, `serve` stops before opening the server. Correct the reported
+  configuration/path issue and rerun `huddleroom init-db` or `huddleroom serve`.
+- If OneCLI setup reports an unsupported CLI or management response, upgrade the
+  CLI/service together to the supported capability/schema contract. HuddleRoom
+  will not replace grants or retrieve secrets to work around that error.
+
+### Maintainer release runbook
+
+Publishing is intentionally not configured here. Before an approved release,
+verify the PyPI `huddleroom` project name and ownership immediately before use,
+register a PyPI trusted publisher for the exact repository, workflow, and
+environment, choose a new unpublished package version, and create the matching
+release tag. The package name/ownership check is still outstanding because its
+PyPI lookup was deferred; do not assume the name is available.
+
+From the release checkout, build the dashboard and distribution once, then inspect
+and test those exact wheel and sdist artifacts:
+
+```bash
+rtk make build-frontend
+rtk .venv/bin/python -m build
+rtk .venv/bin/python -m pytest tests/test_distribution.py -q --tb=short
+```
+
+After the trusted-publisher setup has separately been approved, GitHub Actions
+should run the focused distribution checks and publish those exact built artifacts
+through PyPI OIDC. It must not rebuild the frontend on a user's machine. Finally,
+verify `pipx install huddleroom` and `pipx upgrade huddleroom` against PyPI. Never
+reuse an already published version.
 
 ---
 
@@ -252,6 +374,8 @@ Assign an agent, set status to `ready`. Cron triggers are evaluated by APSchedul
 ---
 
 ## Testing
+
+The distribution acceptance test also requires a separately installed native [pipx](https://pipx.pypa.io/stable/installation/); it is not an application dependency.
 
 ```bash
 # Local

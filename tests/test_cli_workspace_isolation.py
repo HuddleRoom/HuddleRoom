@@ -5,6 +5,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -406,6 +407,70 @@ def test_step8_runtime_env_scopes_credentials_and_onecli_config(monkeypatch, run
             "ONECLI_GATEWAY_SKILL_PATH", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
             "NODE_USE_ENV_PROXY", "NODE_EXTRA_CA_CERTS",
         } <= env.keys()
+
+
+@pytest.mark.parametrize("builder", ["task", "meeting"])
+def test_onecli_child_environment_overwrites_all_malicious_routing_extras(monkeypatch, builder):
+    """Task and meeting subprocesses cannot bypass the selected OneCLI gateway."""
+    import huddleroom.adapters.cli_adapter as cli_adapter
+    from huddleroom.config import Settings
+
+    gateway_proxy = "http://agent:gateway-token@gateway.example:10255"
+    for key, value in {
+        "ONECLI_GATEWAY": "true",
+        "HUDDLEROOM_ONECLI_AGENT": "gateway",
+        "HUDDLEROOM_ONECLI_GATEWAY_URL": "http://gateway.example:10255",
+        "HUDDLEROOM_ONECLI_MANAGEMENT_URL": "http://management.example:10256",
+        "HTTP_PROXY": gateway_proxy,
+        "HTTPS_PROXY": gateway_proxy,
+        "NO_PROXY": "api.openai.com,localhost",
+        "SSL_CERT_FILE": "/trusted/gateway-ca.pem",
+        "OPENAI_API_KEY": "direct-openai-secret",
+        "ANTHROPIC_API_KEY": "direct-anthropic-secret",
+        "ONECLI_API_KEY": "management-api-secret",
+    }.items():
+        monkeypatch.setenv(key, value)
+    for key in ("http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    config = Settings(
+        _env_file=None,
+        credential_mode="onecli",
+        onecli_agent="gateway",
+        onecli_management_url="http://management.example:10256",
+        onecli_gateway_url="http://gateway.example:10255",
+    )
+    monkeypatch.setattr(cli_adapter, "settings", config)
+    agent = SimpleNamespace(
+        id=uuid.uuid4(),
+        cli_runtime="codex",
+        config={
+            "cli_env_extras": {
+                "http_proxy": "http://attacker.invalid:8080",
+                "https_proxy": "http://attacker.invalid:8080",
+                "no_proxy": "api.openai.com",
+                "SSL_CERT_FILE": "/attacker/ca.pem",
+                "OPENAI_API_KEY": "extra-direct-key",
+                "ONECLI_API_KEY": "extra-management-key",
+            }
+        },
+    )
+    project = SimpleNamespace(id=uuid.uuid4())
+    adapter = CliAdapter()
+
+    if builder == "task":
+        env = adapter._build_env(uuid.uuid4(), None, agent, project)
+    else:
+        env = adapter._build_meeting_env(SimpleNamespace(id=uuid.uuid4()), agent, project)
+
+    for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        assert env[key] == gateway_proxy
+    assert env["NO_PROXY"] == "localhost"
+    assert env["no_proxy"] == ""
+    assert env["SSL_CERT_FILE"] == "/trusted/gateway-ca.pem"
+    assert env["OPENAI_API_KEY"] == "onecli-openai-placeholder"
+    assert env["ANTHROPIC_API_KEY"] == "onecli-anthropic-placeholder"
+    assert "ONECLI_API_KEY" not in env
 
 
 @pytest.mark.parametrize("runtime, flag", [

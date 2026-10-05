@@ -346,6 +346,8 @@ class CliAdapter:
             for key in self._OPENROUTER_API_KEYS:
                 if key in os.environ:
                     env[key] = os.environ[key]
+        from huddleroom.onecli import apply_onecli_environment
+        apply_onecli_environment(env, settings)
         return env
 
     async def run(self, session_id: uuid.UUID, db: AsyncSession, runner_task_id: str | None = None) -> None:
@@ -873,6 +875,8 @@ class CliAdapter:
             for key in self._OPENROUTER_API_KEYS:
                 if key in os.environ:
                     env[key] = os.environ[key]
+        from huddleroom.onecli import apply_onecli_environment
+        apply_onecli_environment(env, settings)
         return env
 
     async def _resume_raw(

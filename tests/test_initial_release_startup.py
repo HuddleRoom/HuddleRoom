@@ -146,8 +146,8 @@ def test_cli_rejects_before_calling_uvicorn(monkeypatch):
 
     result = CliRunner().invoke(cli.main, ["serve"])
 
-    assert isinstance(result.exception, RuntimeError)
-    assert "HUDDLEROOM_AUTH_ENABLED" in str(result.exception)
+    assert result.exit_code != 0
+    assert "huddleroom setup" in result.output
     run.assert_not_called()
 
 
@@ -161,8 +161,8 @@ def test_init_db_rejects_before_calling_alembic(monkeypatch):
 
     result = CliRunner().invoke(cli.main, ["init-db"])
 
-    assert isinstance(result.exception, RuntimeError)
-    assert "HUDDLEROOM_AUTH_ENABLED" in str(result.exception)
+    assert result.exit_code != 0
+    assert "huddleroom setup" in result.output
     upgrade.assert_not_called()
 
 
@@ -245,5 +245,4 @@ def test_celery_entry_points_reject_unsupported_settings(command):
 
     assert result.returncode != 0
     assert "RALLY_AUTH_ENABLED" in result.stderr
-
 

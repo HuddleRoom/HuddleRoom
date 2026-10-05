@@ -548,6 +548,68 @@ async def test_cli_task_resume_launch_uses_resume_flag_and_continue_prompt(test_
 
 
 @pytest.mark.asyncio
+async def test_onecli_resume_reuses_safe_child_environment(test_engine, tmp_path, monkeypatch):
+    """Resuming cannot restore extras that bypass the selected OneCLI wrapper."""
+    import huddleroom.adapters.cli_adapter as cli_adapter
+    from huddleroom.adapters.cli_adapter import CliAdapter
+    from huddleroom.config import Settings
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"result": "resumed ok"}', b""
+
+    captured: dict = {}
+
+    async def fake_subprocess_exec(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    proxy = "http://agent:gateway-token@gateway.example:10255"
+    for key, value in {
+        "ONECLI_GATEWAY": "true",
+        "HUDDLEROOM_ONECLI_AGENT": "gateway",
+        "HUDDLEROOM_ONECLI_GATEWAY_URL": "http://gateway.example:10255",
+        "HUDDLEROOM_ONECLI_MANAGEMENT_URL": "http://management.example:10256",
+        "HTTP_PROXY": proxy,
+        "HTTPS_PROXY": proxy,
+        "NO_PROXY": "api.openai.com,localhost",
+        "SSL_CERT_FILE": "/trusted/gateway-ca.pem",
+        "ONECLI_API_KEY": "management-secret",
+    }.items():
+        monkeypatch.setenv(key, value)
+    for key in ("http_proxy", "https_proxy", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        cli_adapter,
+        "settings",
+        Settings(
+            _env_file=None, credential_mode="onecli", onecli_agent="gateway",
+            onecli_management_url="http://management.example:10256",
+            onecli_gateway_url="http://gateway.example:10255",
+        ),
+    )
+
+    async with _cli_task_fixture(test_engine, tmp_path, provider_session_id="abcDEF1234567890") as (db, session, agent, _project):
+        agent.config = {
+            "cli_env_extras": {
+                "http_proxy": "http://attacker.invalid:8080",
+                "OPENAI_API_KEY": "direct-secret",
+                "ONECLI_API_KEY": "extra-management-secret",
+            }
+        }
+        adapter = CliAdapter()
+        with patch.object(adapter, "_setup_sandbox", return_value=None):
+            with patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec", new=fake_subprocess_exec):
+                await adapter.run(session.id, db)
+
+    assert captured["env"]["http_proxy"] == proxy
+    assert captured["env"]["OPENAI_API_KEY"] == "onecli-openai-placeholder"
+    assert "ONECLI_API_KEY" not in captured["env"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("runtime", "resume_args", "stdout"),
     [

@@ -1,0 +1,59 @@
+# Copy this file to ~/.huddleroom/config.toml to configure HuddleRoom for your user.
+# Values in the working directory's .env override this file; process environment
+# variables override both. Application keys use these lowercase names.
+
+# ── Database ──────────────────────────────────────────────────────────────────
+# Omit this to use ~/.huddleroom/huddleroom.db (or an existing local database).
+# database_url = "sqlite+aiosqlite:///huddleroom.db"
+# redis_url = "redis://localhost:6379/0"
+
+# ── API ───────────────────────────────────────────────────────────────────────
+jwt_secret = "change-me-in-production"
+jwt_algorithm = "HS256"
+jwt_expire_minutes = 60
+api_key_prefix = "rly_"
+cors_origins = ["*"]
+debug = false
+# log_file = "logs/huddleroom-debug.log"
+auth_enabled = false
+api_base_url = "http://localhost:8000"
+# Omit this to use ~/.huddleroom/workspace (or an existing local workspace).
+# workspace_dir = "workspace"
+
+# ── Knowledge / Embeddings ────────────────────────────────────────────────────
+embedding_model = "text-embedding-3-small"
+
+# ── Orchestration / Meeting Control ───────────────────────────────────────────
+orchestration_model = "openai/gpt-4o-mini"
+orchestration_conversation_allowance_tokens = 50000
+orchestration_advisor_allowance_tokens = -1
+orchestration_conversation_investigation_enabled = true
+orchestration_conversation_steering_enabled = true
+orchestration_checkpoint_max_questions = 5
+orchestration_reconcile_interval_seconds = 30
+orchestration_event_coalesce_seconds = 1
+orchestration_semantic_progress_seconds = 120
+orchestration_sweep_goal_limit = 100
+orchestration_sweep_seconds_limit = 5
+effectiveness_recovery_threshold = 2
+effectiveness_failed_session_threshold = 3
+effectiveness_inactivity_hours = 24
+# meeting_control_model = "openai/gpt-4o-mini"
+
+# ── LLM Provider Keys ─────────────────────────────────────────────────────────
+# Select "onecli" to keep provider credentials in OneCLI. The selected agent
+# is a OneCLI gateway identifier, never a HuddleRoom database agent ID.
+# credential_mode = "direct"
+# onecli_agent = "huddleroom"
+# onecli_management_url = "http://127.0.0.1:10256"
+# onecli_gateway_url = "http://127.0.0.1:10255"
+# Provider keys may be set here, in .env, or in the process environment.
+# OPENAI_API_KEY = "sk-..."
+# ANTHROPIC_API_KEY = "sk-ant-..."
+# GEMINI_API_KEY = "..."
+# OPENROUTER_API_KEY = "..."
+# OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+# OR_API_KEY = "..."
+# OR_APP_NAME = "..."
+# OR_SITE_URL = "https://example.com"
+# OLLAMA_API_BASE = "http://localhost:11434"

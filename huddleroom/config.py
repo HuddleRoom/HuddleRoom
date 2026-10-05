@@ -1,9 +1,20 @@
 from pathlib import Path
 import os
+import tomllib
 import warnings
+from typing import Any, Literal
+from urllib.parse import urlsplit
+
 from dotenv import dotenv_values
-from pydantic import Field, PrivateAttr
-from pydantic_settings import BaseSettings, DotEnvSettingsSource, EnvSettingsSource, SettingsConfigDict
+from pydantic import Field, PrivateAttr, ValidationError, field_validator
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    EnvSettingsSource,
+    SettingsConfigDict,
+    SettingsError,
+    TomlConfigSettingsSource,
+)
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.engine import make_url
 
@@ -17,22 +28,55 @@ PROVIDER_ENV_KEYS = {
     "OR_API_KEY",
     "OR_APP_NAME",
     "OR_SITE_URL",
+    "OLLAMA_API_BASE",
 }
+DEFAULT_CONFIG_FILE = Path.home() / ".huddleroom" / "config.toml"
+DEFAULT_DATA_DIR = Path.home() / ".huddleroom"
 
 
-def load_provider_env(env_file: str | os.PathLike = ".env") -> None:
-    for key, value in dotenv_values(env_file).items():
-        if key in PROVIDER_ENV_KEYS and value is not None:
-            os.environ.setdefault(key, value)
+def _toml_values(config_file: Path) -> dict[str, Any]:
+    if not config_file.is_file():
+        return {}
+    try:
+        with config_file.open("rb") as file:
+            return tomllib.load(file)
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"Invalid TOML configuration in {config_file}: {error}") from error
 
 
-load_provider_env()
-
+def load_provider_env(
+    env_file: str | os.PathLike = ".env", config_file: str | os.PathLike | None = None, *, credential_mode: str = "direct"
+) -> None:
+    config_file = DEFAULT_CONFIG_FILE if config_file is None else Path(config_file)
+    toml = _toml_values(config_file)
+    dotenv = dotenv_values(env_file)
+    if credential_mode == "onecli":
+        for key in PROVIDER_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update({"OPENAI_API_KEY": "onecli-openai-placeholder", "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder"})
+        return
+    for key in PROVIDER_ENV_KEYS:
+        if key in toml and not isinstance(toml[key], str):
+            raise ValueError(f"Invalid provider value in {config_file}:{key}; expected a string.")
+        if key not in os.environ:
+            value = dotenv.get(key)
+            if value is None:
+                value = toml.get(key)
+            if value is not None:
+                os.environ[key] = value
 
 def _default_database_url() -> str:
-    if not Path("huddleroom.db").exists() and Path("rally.db").exists():
+    if Path("huddleroom.db").exists():
+        return "sqlite+aiosqlite:///huddleroom.db"
+    if Path("rally.db").exists():
         return "sqlite+aiosqlite:///rally.db"
-    return "sqlite+aiosqlite:///huddleroom.db"
+    return f"sqlite+aiosqlite:///{DEFAULT_DATA_DIR / 'huddleroom.db'}"
+
+
+def _default_workspace_dir() -> str:
+    if Path("workspace").is_dir():
+        return "workspace"
+    return str(DEFAULT_DATA_DIR / "workspace")
 
 
 class _CompatibilitySettingsSource(EnvSettingsSource):
@@ -52,6 +96,14 @@ class _CompatibilityDotEnvSettingsSource(DotEnvSettingsSource, _CompatibilitySet
     pass
 
 
+class _TomlSettingsSource(TomlConfigSettingsSource):
+    def _read_file(self, file_path):
+        try:
+            return super()._read_file(file_path)
+        except tomllib.TOMLDecodeError as error:
+            raise SettingsError(f"Invalid TOML configuration in {file_path}: {error}") from error
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
@@ -67,7 +119,7 @@ class Settings(BaseSettings):
     auth_enabled: bool = False
     api_base_url: str = "http://localhost:8000"
     embedding_model: str = "text-embedding-3-small"
-    workspace_dir: str = "workspace"
+    workspace_dir: str = Field(default_factory=_default_workspace_dir)
     orchestration_model: str = "openai/gpt-4o-mini"
     orchestration_conversation_allowance_tokens: int = Field(default=50000, ge=0)
     # -1 = unlimited (default), 0 = disabled, >0 = lifetime token cap
@@ -84,7 +136,33 @@ class Settings(BaseSettings):
     effectiveness_failed_session_threshold: int = Field(default=3, ge=1)
     effectiveness_inactivity_hours: int = Field(default=24, ge=1)
     meeting_control_model: str | None = None
+    credential_mode: Literal["direct", "onecli"] = "direct"
+    onecli_agent: str | None = None
+    onecli_management_url: str = "http://127.0.0.1:10256"
+    onecli_gateway_url: str = "http://127.0.0.1:10255"
     _setting_names: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @field_validator("onecli_management_url", "onecli_gateway_url")
+    @classmethod
+    def validate_onecli_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("must have a usable HTTP(S) authority") from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not parsed.hostname
+            or port is not None and not 1 <= port <= 65535
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("must be an HTTP(S) origin without credentials, path, query, or fragment")
+        return value.rstrip("/")
 
     @classmethod
     def settings_customise_sources(
@@ -98,11 +176,24 @@ class Settings(BaseSettings):
                 env_file=dotenv_settings.env_file,
                 env_file_encoding=dotenv_settings.env_file_encoding,
             ),
+            _TomlSettingsSource(settings_cls, toml_file=DEFAULT_CONFIG_FILE),
             file_secret_settings,
         )
 
     def __init__(self, **values):
-        super().__init__(**values)
+        try:
+            super().__init__(**values)
+        except ValidationError as error:
+            supplied_names = self._supplied_setting_names(values)
+            invalid_toml_names = sorted({
+                supplied_names[item["loc"][0]]
+                for item in error.errors(include_input=False)
+                if item["loc"]
+                and supplied_names.get(item["loc"][0], "").startswith(f"{DEFAULT_CONFIG_FILE}:")
+            })
+            if invalid_toml_names:
+                raise ValueError(f"Invalid configuration value for {', '.join(invalid_toml_names)}.") from error
+            raise
         self._setting_names = self._supplied_setting_names(values)
         legacy_names = [name for name in self._setting_names.values() if name.startswith("RALLY_")]
         if legacy_names:
@@ -118,10 +209,12 @@ class Settings(BaseSettings):
         names = {field: f"HUDDLEROOM_{field.upper()}" for field in values}
         env_file = values.get("_env_file", ".env")
         dotenv = {} if env_file is None else dotenv_values(env_file)
+        sources = [{key.upper(): value for key, value in source.items()} for source in (os.environ, dotenv)]
+        toml = _toml_values(DEFAULT_CONFIG_FILE)
         for field in Settings.model_fields:  # pylint: disable=not-an-iterable
             if field in names:
                 continue
-            for source in (os.environ, dotenv):
+            for source in sources:
                 for prefix in ("HUDDLEROOM_", "RALLY_"):
                     name = f"{prefix}{field.upper()}"
                     if source.get(name) is not None:
@@ -129,6 +222,8 @@ class Settings(BaseSettings):
                         break
                 if field in names:
                     break
+            if field not in names and field in toml:
+                names[field] = f"{DEFAULT_CONFIG_FILE}:{field}"
         return names
 
     def setting_name(self, field: str) -> str:
@@ -151,6 +246,9 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+# Resolve the mode from validated configuration before importing any plaintext
+# provider values from TOML or dotenv files.
+load_provider_env(credential_mode=settings.credential_mode)
 
 
 def validate_supported_settings(config: Settings = settings) -> None:

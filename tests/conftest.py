@@ -15,6 +15,9 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+# Keep collection independent of a developer's ~/.huddleroom/config.toml.
+os.environ["HOME"] = tempfile.mkdtemp(prefix="huddleroom-test-home-")
+
 from huddleroom.config import settings
 from huddleroom.database import get_db
 

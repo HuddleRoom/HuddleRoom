@@ -106,8 +106,8 @@ async def lifespan(_app: FastAPI):
             except Exception as _exc:
                 await _s.rollback()
                 _logger.warning("Workspace YAML load failed (non-fatal): %s", _exc)
-    except Exception:
-        _logger.warning("Database tables missing. Run 'huddleroom init-db' before starting the server.")
+    except Exception as _exc:
+        _logger.warning("Database startup check failed after migrations: %s", _exc)
 
     # Postgres deployments use Celery which manages its own task lifecycle;
     # orphan recovery is only needed in SQLite/asyncio mode.
