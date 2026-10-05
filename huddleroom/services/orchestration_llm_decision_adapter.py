@@ -7,9 +7,11 @@ import re
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 from uuid import UUID
 
-import litellm
-
 from huddleroom.config import settings
+from huddleroom.services.orchestration_completion import (
+    get_orchestration_completion,
+    orchestration_runtime_metadata,
+)
 from huddleroom.services.orchestration_decision_validator import ALLOWED_ACTION_SCHEMAS, OPTIONAL_ACTION_FIELDS
 from huddleroom.services.secret_redaction import redact_secrets
 
@@ -135,7 +137,7 @@ def parse_decision_content(raw_content: str) -> dict:
 class OrchestrationDecisionAdapter:
     def __init__(self, model: str | None = None, completion_fn: CompletionFn | None = None) -> None:
         self.model = model or settings.orchestration_model
-        self._completion_fn = completion_fn or litellm.acompletion
+        self._completion_fn = get_orchestration_completion(completion_fn)
 
     async def decide(self, context: Mapping[str, Any], *, project=None, goal=None) -> OrchestrationDecisionAdapterResult:
         from huddleroom.services.llm_structured_repair import complete_with_repair
@@ -174,10 +176,11 @@ class OrchestrationDecisionAdapter:
                 )
             except (TypeError, ValueError):
                 project_id = None
+            invocation_kind, runtime_model = orchestration_runtime_metadata(self._completion_fn, self.model)
             invocation = (
                 AgentResponseInvocation(InvocationContext(
-                    project_id, "system", "orchestrator", "Orchestrator", "api",
-                    "decision", self.model,
+                    project_id, "system", "orchestrator", "Orchestrator", invocation_kind,
+                    "decision", runtime_model,
                     "Choose the next orchestration action for this goal.",
                 ))
                 if project_id is not None else None

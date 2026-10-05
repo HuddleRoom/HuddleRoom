@@ -29,18 +29,22 @@ class ProjectAdvisorTurn(Base):
     answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     citations: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     off_topic: Mapped[bool] = mapped_column(nullable=False, default=False)
-    tokens_used: Mapped[int] = mapped_column(nullable=False, default=0)
+    tokens_used: Mapped[int | None] = mapped_column(nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
-async def advisor_allowance_used(db: AsyncSession, project_id, actor_id) -> int:
-    value = await db.scalar(
-        select(func.coalesce(func.sum(ProjectAdvisorTurn.tokens_used), 0)).where(
+async def advisor_allowance_used(db: AsyncSession, project_id, actor_id) -> int | None:
+    result = await db.execute(
+        select(
+            func.count(), func.count(ProjectAdvisorTurn.tokens_used),  # pylint: disable=not-callable
+            func.coalesce(func.sum(ProjectAdvisorTurn.tokens_used), 0),
+        ).where(
             ProjectAdvisorTurn.project_id == project_id,
             ProjectAdvisorTurn.actor_id == actor_id,
             ProjectAdvisorTurn.status.in_(("completed", "failed")),
         )
     )
-    return int(value)
+    count, known_count, total = result.one()
+    return int(total) if count == known_count else None

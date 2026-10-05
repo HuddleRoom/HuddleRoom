@@ -4,9 +4,11 @@ import os
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import UUID
 
-import litellm
-
 from huddleroom.config import settings
+from huddleroom.services.orchestration_completion import (
+    get_orchestration_completion,
+    orchestration_runtime_metadata,
+)
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_llm_decision_adapter import (
     _extract_content,
@@ -97,7 +99,7 @@ def _unfence_json(raw: str) -> str:
 
 class GoalClarificationAnalyzer:
     def __init__(self, completion_fn: Callable[..., Awaitable[Any]] | None = None) -> None:
-        self._completion_fn = completion_fn or litellm.acompletion
+        self._completion_fn = get_orchestration_completion(completion_fn)
 
     def _existing_messages_for(self, goal_snapshot: Mapping[str, Any], project=None) -> list[dict[str, str]]:
         system_content = (
@@ -155,10 +157,12 @@ class GoalClarificationAnalyzer:
             if project_id is None:
                 return await complete_with_repair(self._completion_fn, request, _parse)
             from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
+            invocation_kind, runtime_model = orchestration_runtime_metadata(self._completion_fn, model)
             return await complete_with_repair(
                 self._completion_fn, request, _parse,
                 invocation=AgentResponseInvocation(InvocationContext(
-                    project_id, "system", "orchestrator", "Orchestrator", "api", "goal_analysis", model,
+                    project_id, "system", "orchestrator", "Orchestrator", invocation_kind, "goal_analysis",
+                    runtime_model,
                     "Identify safe assumptions and material clarification questions for this goal.",
                 )),
             )

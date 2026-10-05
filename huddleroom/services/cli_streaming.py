@@ -2,12 +2,51 @@
 import asyncio
 import codecs
 import json
+import logging
+import os
+import signal
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import JsonValue
 
 from huddleroom.services.secret_redaction import redact_secrets
+
+logger = logging.getLogger(__name__)
+
+
+async def terminate_process_group(proc: Any, grace_seconds: float = 0.5) -> None:
+    """Stop a process group created with ``start_new_session=True``."""
+    process_group_id = proc.pid
+
+    async def group_exited() -> bool:
+        deadline = asyncio.get_running_loop().time() + grace_seconds
+        while True:
+            try:
+                os.killpg(process_group_id, 0)
+            except ProcessLookupError:
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(min(0.05, grace_seconds))
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    else:
+        if not await group_exited():
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if not await group_exited():
+                logger.warning("CLI process group %s did not exit after SIGKILL", process_group_id)
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
+        except asyncio.TimeoutError:
+            logger.warning("CLI group leader %s did not reap after termination", proc.pid)
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import sysconfig
 import tempfile
 import tomllib
@@ -106,7 +107,7 @@ def _inline_comment(value: str) -> str:
     return ""
 
 
-def _update_config(updates: dict[str, str]) -> None:
+def _update_config(updates: dict[str, str | None]) -> None:
     """Validate a flat TOML candidate, then atomically replace only setup keys."""
     from huddleroom.config import DEFAULT_CONFIG_FILE, Settings, validate_supported_settings
 
@@ -138,9 +139,12 @@ def _update_config(updates: dict[str, str]) -> None:
             )
         comment = _inline_comment(match["value"])
         newline = match["newline"] or source_newline
+        value = remaining.pop(match["key"])
+        if value is None:
+            continue
         rewritten.append(
             f'{match["before"]}{match["key"]}{match["equals"]}'
-            f'{_toml_string(remaining.pop(match["key"]))}{comment}{newline}'
+            f'{_toml_string(value)}{comment}{newline}'
         )
     if set(remaining).intersection(existing):
         raise click.ClickException(
@@ -149,7 +153,9 @@ def _update_config(updates: dict[str, str]) -> None:
     if remaining:
         if rewritten and not rewritten[-1].endswith(("\n", "\r")):
             rewritten.append(source_newline)
-        rewritten.extend(f"{key} = {_toml_string(value)}{source_newline}" for key, value in remaining.items())
+        rewritten.extend(
+            f"{key} = {_toml_string(value)}{source_newline}" for key, value in remaining.items() if value is not None
+        )
 
     rendered = "".join(rewritten)
     try:
@@ -187,12 +193,69 @@ def _database_path(database_url: str) -> str:
     return database_url[len(prefix):] if database_url.startswith(prefix) else database_url
 
 
+def _orchestration_backend_availability() -> dict[str, tuple[bool, bool]]:
+    """Report PATH installation separately from the verified safe contract."""
+    from huddleroom.services.orchestration_completion import is_orchestration_backend_supported
+
+    return {
+        "api": (True, True),
+        "claude": (shutil.which("claude") is not None, is_orchestration_backend_supported("claude")),
+        "codex": (shutil.which("codex") is not None, is_orchestration_backend_supported("codex")),
+    }
+
+
+def _supported_orchestration_efforts(backend: str, model: str | None) -> frozenset[str]:
+    try:
+        from huddleroom.services.orchestration_completion import supported_orchestration_efforts
+
+        return supported_orchestration_efforts(backend, model)
+    except Exception as error:
+        raise click.ClickException(str(error)) from None
+
+
+def _resolve_orchestration_effort(
+    backend: str,
+    model: str | None,
+    explicit_effort: str | None,
+    saved_effort: str | None,
+    *,
+    interactive: bool,
+) -> tuple[str | None, bool]:
+    """Return the validated effort and whether setup must remove a saved override."""
+    if explicit_effort == "default":
+        return None, True
+    supported = _supported_orchestration_efforts(backend, model)
+    if explicit_effort is not None:
+        if explicit_effort in supported:
+            return explicit_effort, False
+        raise click.ClickException(f"{explicit_effort!r} is not supported by the {backend} orchestration backend.")
+    if interactive:
+        choices = ["default", *sorted(supported)]
+        effort = click.prompt(
+            "Orchestration effort (default keeps the backend default)",
+            type=click.Choice(choices),
+            default=saved_effort if saved_effort in supported else "default",
+        )
+        return (None, True) if effort == "default" else (effort, False)
+    if saved_effort in supported:
+        return saved_effort, False
+    if not interactive:
+        if saved_effort is not None:
+            raise click.ClickException(
+                f"Saved orchestration effort {saved_effort!r} is not supported by the selected backend/model. "
+                "Pass --orchestration-effort default to remove it. No changes were written."
+            )
+        return None, False
+
+
 @main.command()
 @click.option("--provider", type=click.Choice([*_PROVIDER_KEYS, "skip"], case_sensitive=False))
 @click.option("--credential-mode", type=click.Choice(["direct", "onecli"], case_sensitive=False))
 @click.option("--onecli-agent")
 @click.option("--onecli-management-url")
 @click.option("--onecli-gateway-url")
+@click.option("--orchestration-backend", type=click.Choice(["api", "claude", "codex"], case_sensitive=False))
+@click.option("--orchestration-effort")
 @click.option("--orchestration-model")
 @click.option("--database-path")
 @click.option("--workspace-dir")
@@ -202,9 +265,11 @@ def setup(
     onecli_agent: str | None,
     onecli_management_url: str | None,
     onecli_gateway_url: str | None,
-    orchestration_model: str | None,
-    database_path: str | None,
-    workspace_dir: str | None,
+    orchestration_backend: str | None = None,
+    orchestration_effort: str | None = None,
+    orchestration_model: str | None = None,
+    database_path: str | None = None,
+    workspace_dir: str | None = None,
 ):
     """Save local direct or OneCLI gateway settings without exposing secrets."""
     try:
@@ -214,6 +279,58 @@ def setup(
         raise click.ClickException(
             f"Could not read {config_file}. Please manually repair it before running huddleroom setup."
         ) from None
+
+    availability = _orchestration_backend_availability()
+    backend_was_prompted = orchestration_backend is None and provider is None and credential_mode is None
+    if orchestration_backend is None:
+        default_backend = settings.orchestration_backend if availability[settings.orchestration_backend][1] else "api"
+        if backend_was_prompted:
+            choices = [backend for backend, (_installed, supported) in availability.items() if supported]
+            if not availability[settings.orchestration_backend][1]:
+                click.echo(f"Configured {settings.orchestration_backend} orchestration backend is unavailable.")
+            orchestration_backend = click.prompt(
+                "Orchestration backend", type=click.Choice(choices), default=default_backend
+            )
+        else:
+            orchestration_backend = "api"
+    orchestration_backend = orchestration_backend.lower()
+    if orchestration_backend != "api" and any(
+        value is not None
+        for value in (provider, credential_mode, onecli_agent, onecli_management_url, onecli_gateway_url, orchestration_model)
+    ):
+        raise click.ClickException(
+            "CLI orchestration setup cannot be combined with provider, credential, or orchestration-model options. "
+            "Configure those separately. No changes were written."
+        )
+    installed, supported = availability[orchestration_backend]
+    if not installed:
+        raise click.ClickException(
+            f"The {orchestration_backend} CLI is not installed. Install it, then rerun setup. No changes were written."
+        )
+    if not supported:
+        raise click.ClickException(
+            f"The {orchestration_backend} CLI is installed (authentication is not verified) but unsupported because "
+            "its safe no-tools contract is not verified. No changes were written."
+        )
+
+    if orchestration_backend != "api":
+        orchestration_effort, remove_effort = _resolve_orchestration_effort(
+            orchestration_backend, None, orchestration_effort, settings.orchestration_effort, interactive=backend_was_prompted
+        )
+        database_path = database_path or click.prompt("Database path", default=_database_path(settings.database_url))
+        workspace_dir = workspace_dir or click.prompt("Workspace directory", default=settings.workspace_dir)
+        updates: dict[str, str | None] = {
+            "orchestration_backend": orchestration_backend,
+            "database_url": f"sqlite+aiosqlite:///{database_path}",
+            "workspace_dir": workspace_dir,
+        }
+        if orchestration_effort is not None or remove_effort:
+            updates["orchestration_effort"] = orchestration_effort
+        _update_config(updates)
+        click.echo(f"Saved setup values to {DEFAULT_CONFIG_FILE}.")
+        click.echo(f"{orchestration_backend.title()} was found on PATH; authentication is not verified.")
+        click.echo("Embeddings and API agents may still need separately configured provider credentials.")
+        return
 
     # Existing non-interactive --provider invocations are direct setup for
     # compatibility.  Interactive setup asks mode before every other prompt.
@@ -252,13 +369,20 @@ def setup(
     orchestration_model = orchestration_model or click.prompt(
         "Orchestration model", default=settings.orchestration_model
     )
+    orchestration_effort, remove_effort = _resolve_orchestration_effort(
+        "api", orchestration_model, orchestration_effort, settings.orchestration_effort, interactive=backend_was_prompted
+    )
     database_path = database_path or click.prompt("Database path", default=_database_path(settings.database_url))
     workspace_dir = workspace_dir or click.prompt("Workspace directory", default=settings.workspace_dir)
-    updates = {
+    updates: dict[str, str | None] = {
         "orchestration_model": orchestration_model,
         "database_url": f"sqlite+aiosqlite:///{database_path}",
         "workspace_dir": workspace_dir,
     }
+    if backend_was_prompted or orchestration_backend != settings.orchestration_backend:
+        updates["orchestration_backend"] = orchestration_backend
+    if orchestration_effort is not None or remove_effort:
+        updates["orchestration_effort"] = orchestration_effort
     updates.update(onecli_updates)
     if credential_mode == "direct" and (provider is not None) and provider != "skip":
         secret = click.prompt(f"{provider.title()} credential (leave blank to keep existing)", default="", hide_input=True, show_default=False)
@@ -301,6 +425,12 @@ def setup(
 def serve(host: str, port: int, reload: bool):
     """Start HuddleRoom server (API + task runner + scheduler)."""
     from huddleroom.config import settings as configured_settings
+    try:
+        from huddleroom.services.orchestration_completion import validate_orchestration_backend
+
+        validate_orchestration_backend(configured_settings)
+    except Exception as error:
+        raise click.ClickException(str(error)) from None
     if configured_settings.credential_mode == "onecli":
         from huddleroom.onecli import launch_onecli, resolve_management_url, validate_onecli_context
         configured_settings = configured_settings.model_copy(update={

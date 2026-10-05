@@ -30,6 +30,7 @@ PROVIDER_ENV_KEYS = {
     "OR_SITE_URL",
     "OLLAMA_API_BASE",
 }
+OrchestrationEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 DEFAULT_CONFIG_FILE = Path.home() / ".huddleroom" / "config.toml"
 DEFAULT_DATA_DIR = Path.home() / ".huddleroom"
 
@@ -145,6 +146,8 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     workspace_dir: str = Field(default_factory=_default_workspace_dir)
     orchestration_model: str = "openai/gpt-4o-mini"
+    orchestration_backend: Literal["api", "claude", "codex"] = "api"
+    orchestration_effort: OrchestrationEffort | None = None
     orchestration_conversation_allowance_tokens: int = Field(default=50000, ge=0)
     # -1 = unlimited (default), 0 = disabled, >0 = lifetime token cap
     orchestration_advisor_allowance_tokens: int = Field(default=-1, ge=-1)

@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import signal
 import time
 import uuid
 from decimal import Decimal
@@ -25,7 +24,7 @@ from huddleroom.services.llm_structured_repair import cli_complete_with_repair
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.secret_redaction import redact_secrets
 from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
-from huddleroom.services.cli_streaming import collect_cli_process
+from huddleroom.services.cli_streaming import collect_cli_process, terminate_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -118,37 +117,7 @@ class CliAdapter:
     @staticmethod
     async def _terminate_process_group(proc, grace_seconds: float = 0.5) -> None:
         """Stop a CLI and every child it started, escalating after a bounded grace period."""
-        process_group_id = proc.pid  # start_new_session=True makes the launch PID the process-group ID.
-
-        async def group_exited() -> bool:
-            deadline = asyncio.get_running_loop().time() + grace_seconds
-            while True:
-                try:
-                    os.killpg(process_group_id, 0)
-                except ProcessLookupError:
-                    return True
-                if asyncio.get_running_loop().time() >= deadline:
-                    return False
-                await asyncio.sleep(min(0.05, grace_seconds))
-
-        try:
-            os.killpg(process_group_id, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        else:
-            if not await group_exited():
-                try:
-                    os.killpg(process_group_id, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                if not await group_exited():
-                    logger.warning("CLI process group %s did not exit after SIGKILL", process_group_id)
-
-        if proc.returncode is None:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
-            except asyncio.TimeoutError:
-                logger.warning("CLI group leader %s did not reap after termination", proc.pid)
+        await terminate_process_group(proc, grace_seconds)
 
     @staticmethod
     async def _watch_project_status(

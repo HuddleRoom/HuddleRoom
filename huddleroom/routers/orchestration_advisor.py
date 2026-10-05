@@ -44,7 +44,7 @@ async def _allowance(db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUI
     limit = settings.orchestration_advisor_allowance_tokens
     unlimited = limit < 0
     used = await advisor_allowance_used(db, project_id, actor_id)
-    remaining = -1 if unlimited else max(0, limit - used)
+    remaining = -1 if unlimited else max(0, limit - used) if used is not None else 0
     return ProjectAdvisorAllowance(
         enabled=limit != 0, unlimited=unlimited, limit=limit, remaining=remaining
     )

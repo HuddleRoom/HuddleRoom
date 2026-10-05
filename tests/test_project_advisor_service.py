@@ -93,6 +93,63 @@ async def test_ask_succeeds_under_allowance(advisor_session, advisor_user, advis
 
 
 @pytest.mark.asyncio
+async def test_unknown_usage_is_persisted_and_blocks_a_finite_allowance(
+    advisor_session, advisor_user, advisor_project, monkeypatch
+):
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1_000)
+    payload = {"answer": "All good.", "citations": [], "off_topic": False}
+    response = _canned_response(payload)
+    response.pop("usage")
+    service = OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(response))
+
+    turn = await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What changed?")
+
+    assert turn.tokens_used is None
+    with pytest.raises(ConversationDomainError, match="allowance"):
+        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What next?")
+
+
+@pytest.mark.asyncio
+async def test_completion_failure_before_a_response_persists_unknown_usage(
+    advisor_session, advisor_user, advisor_project, monkeypatch
+):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1_000)
+
+    async def fail_before_response(**_kwargs):
+        raise RuntimeError("backend unavailable")
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        await OrchestrationProjectAdvisorService(completion_fn=fail_before_response).ask(
+            advisor_session, advisor_project.id, advisor_user.id, "What changed?"
+        )
+
+    turn = (await advisor_session.scalars(select(ProjectAdvisorTurn))).one()
+    assert turn.tokens_used is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_completion_persists_unknown_usage(
+    advisor_session, advisor_user, advisor_project, monkeypatch
+):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1_000)
+
+    async def cancelled(**_kwargs):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await OrchestrationProjectAdvisorService(completion_fn=cancelled).ask(
+            advisor_session, advisor_project.id, advisor_user.id, "What changed?"
+        )
+
+    turn = (await advisor_session.scalars(select(ProjectAdvisorTurn))).one()
+    assert (turn.tokens_used, turn.status, turn.error) == (None, "failed", "cancelled")
+
+
+@pytest.mark.asyncio
 async def test_ask_accepts_fenced_json_response(advisor_session, advisor_user, advisor_project, monkeypatch):
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1000)
     response = _canned_response({"answer": "Two goals are active.", "citations": [], "off_topic": False})
@@ -269,6 +326,51 @@ async def test_ask_repairs_invalid_decision_citation_and_counts_each_attempt(
 
     assert turn.citations == [{"type": "decision", "id": "decision-1", "goal_id": "goal-1", "label": "Decision"}]
     assert turn.tokens_used == 18
+
+
+@pytest.mark.asyncio
+async def test_repair_then_backend_failure_persists_unknown_and_blocks_finite_allowance(
+    advisor_session, advisor_user, advisor_project, monkeypatch
+):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1_000)
+    responses = iter([_canned_response({"answer": "missing fields"}, 3, 4)])
+
+    async def completion(**_kwargs):
+        try:
+            return next(responses)
+        except StopIteration as error:
+            raise RuntimeError("backend unavailable") from error
+
+    service = OrchestrationProjectAdvisorService(completion_fn=completion)
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What changed?")
+
+    assert (await advisor_session.scalars(select(ProjectAdvisorTurn))).one().tokens_used is None
+    with pytest.raises(ConversationDomainError, match="allowance"):
+        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What next?")
+
+
+@pytest.mark.asyncio
+async def test_repair_then_cancellation_persists_unknown_usage(advisor_session, advisor_user, advisor_project, monkeypatch):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1_000)
+    responses = iter([_canned_response({"answer": "missing fields"}, 3, 4)])
+
+    async def completion(**_kwargs):
+        try:
+            return next(responses)
+        except StopIteration:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await OrchestrationProjectAdvisorService(completion_fn=completion).ask(
+            advisor_session, advisor_project.id, advisor_user.id, "What changed?"
+        )
+
+    assert (await advisor_session.scalars(select(ProjectAdvisorTurn))).one().tokens_used is None
 
 
 @pytest.mark.asyncio

@@ -5,9 +5,8 @@ import json
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-import litellm
-
 from huddleroom.config import settings
+from huddleroom.services.orchestration_completion import get_orchestration_completion
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_agent_definition_analyzer import _unfence_json, redact_semantic_payload
 from huddleroom.services.orchestration_supervision import DISPOSITIONS, SupervisionAssessment
@@ -46,7 +45,7 @@ def parse_supervision_assessment(payload: Any) -> SupervisionAssessment:
 
 class OrchestrationSupervisionAnalyzer:
     def __init__(self, completion_fn: Callable[..., Awaitable[Any]] | None = None) -> None:
-        self._completion_fn = completion_fn or litellm.acompletion
+        self._completion_fn = get_orchestration_completion(completion_fn)
 
     @staticmethod
     def build_request(payload: Mapping[str, Any]) -> dict[str, Any]:

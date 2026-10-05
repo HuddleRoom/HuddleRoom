@@ -67,6 +67,120 @@ def test_setup_skip_writes_durable_settings_without_provider_marker(setup_home):
     assert "API-backed orchestration" in result.output
 
 
+def test_setup_explicit_missing_cli_leaves_config_unchanged(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    original = 'custom = "keep"\n'
+    setup_home.write_text(original)
+    cli = importlib.import_module("huddleroom.cli")
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+
+    result = _invoke(
+        ["--orchestration-backend", "claude", "--database-path", "state.db", "--workspace-dir", "workspace"]
+    )
+
+    assert result.exit_code != 0
+    assert setup_home.read_text() == original
+    assert "claude" in result.output.lower()
+
+
+def test_setup_rejects_cli_backend_with_provider_flags_without_writing(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    original = 'custom = "keep"\n'
+    setup_home.write_text(original)
+    cli = importlib.import_module("huddleroom.cli")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}" if name == "claude" else None)
+
+    result = _invoke(
+        ["--orchestration-backend", "claude", "--provider", "openai", "--database-path", "state.db", "--workspace-dir", "workspace"]
+    )
+
+    assert result.exit_code != 0
+    assert setup_home.read_text() == original
+    assert "provider" in result.output.lower()
+
+
+def test_setup_cli_backend_preserves_api_model_and_saves_default_effort_removal(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    setup_home.write_text('orchestration_model = "openai/saved"\norchestration_effort = "high"\n')
+    cli = importlib.import_module("huddleroom.cli")
+    completion = importlib.import_module("huddleroom.services.orchestration_completion")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(completion, "is_orchestration_backend_supported", lambda _backend: True)
+
+    result = _invoke(
+        [
+            "--orchestration-backend", "codex", "--orchestration-effort", "default",
+            "--database-path", "state.db", "--workspace-dir", "workspace",
+        ]
+    )
+
+    assert result.exit_code == 0, result.output
+    saved = setup_home.read_text()
+    assert 'orchestration_backend = "codex"' in saved
+    assert "orchestration_effort" not in saved
+    assert 'orchestration_model = "openai/saved"' in saved
+
+
+def test_setup_rejects_installed_but_unsupported_cli_without_writing(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    original = 'custom = "keep"\n'
+    setup_home.write_text(original)
+    cli = importlib.import_module("huddleroom.cli")
+    completion = importlib.import_module("huddleroom.services.orchestration_completion")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(completion, "is_orchestration_backend_supported", lambda _backend: False)
+
+    result = _invoke(["--orchestration-backend", "codex", "--database-path", "state.db", "--workspace-dir", "workspace"])
+
+    assert result.exit_code != 0
+    assert setup_home.read_text() == original
+    assert "installed" in result.output.lower()
+    assert "unsupported" in result.output.lower()
+
+
+def test_setup_switch_preserves_compatible_saved_effort(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    setup_home.write_text('orchestration_effort = "high"\n')
+    cli = importlib.import_module("huddleroom.cli")
+    completion = importlib.import_module("huddleroom.services.orchestration_completion")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(completion, "is_orchestration_backend_supported", lambda _backend: True)
+    monkeypatch.setattr(completion, "supported_orchestration_efforts", lambda *_args: frozenset({"high"}))
+
+    result = _invoke(["--orchestration-backend", "codex", "--database-path", "state.db", "--workspace-dir", "workspace"])
+
+    assert result.exit_code == 0, result.output
+    assert 'orchestration_effort = "high"' in setup_home.read_text()
+
+
+def test_setup_rejects_incompatible_saved_effort_on_noninteractive_switch(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    original = 'orchestration_effort = "none"\n'
+    setup_home.write_text(original)
+    cli = importlib.import_module("huddleroom.cli")
+    completion = importlib.import_module("huddleroom.services.orchestration_completion")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
+    monkeypatch.setattr(completion, "is_orchestration_backend_supported", lambda _backend: True)
+    monkeypatch.setattr(completion, "supported_orchestration_efforts", lambda *_args: frozenset({"high"}))
+
+    result = _invoke(["--orchestration-backend", "codex", "--database-path", "state.db", "--workspace-dir", "workspace"])
+
+    assert result.exit_code != 0
+    assert setup_home.read_text() == original
+    assert "default" in result.output.lower()
+
+
+def test_interactive_setup_reprompts_for_a_compatible_saved_effort(monkeypatch):
+    import huddleroom.cli as cli
+
+    monkeypatch.setattr(cli, "_supported_orchestration_efforts", lambda *_args: frozenset({"high"}))
+    seen = {}
+    monkeypatch.setattr(cli.click, "prompt", lambda *_args, **kwargs: seen.setdefault("default", kwargs["default"]) and "default")
+
+    assert cli._resolve_orchestration_effort("api", "model", None, "high", interactive=True) == (None, True)
+    assert seen["default"] == "high"
+
+
 def test_setup_keeps_blank_existing_secret_and_preserves_unrelated_toml(setup_home):
     setup_home.parent.mkdir()
     original = '# keep this comment\ncustom = "line\\nvalue" # keep inline\nOPENAI_API_KEY = "old-secret" # keep secret comment\n'
@@ -356,6 +470,33 @@ def test_serve_reports_startup_failure_before_uvicorn_without_credentials(monkey
     assert "private path" not in result.output
 
 
+def test_serve_preflights_orchestration_backend_before_onecli_or_database(monkeypatch, tmp_path):
+    import huddleroom.cli as cli
+    import huddleroom.config as config
+    import huddleroom.onecli as onecli
+    import huddleroom.services.orchestration_completion as completion
+
+    configured = config.Settings(
+        _env_file=None,
+        orchestration_backend="codex",
+        credential_mode="onecli",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'huddleroom.db'}",
+    )
+    monkeypatch.setattr(config, "settings", configured)
+    monkeypatch.setattr(
+        completion,
+        "validate_orchestration_backend",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("unsupported backend")),
+    )
+    monkeypatch.setattr(onecli, "launch_onecli", lambda *_args: pytest.fail("OneCLI must not launch"))
+    monkeypatch.setattr(cli, "_prepare_database", lambda *_args: pytest.fail("database must not be prepared"))
+
+    result = CliRunner().invoke(cli.main, ["serve"])
+
+    assert result.exit_code != 0
+    assert "unsupported backend" in result.output
+
+
 def test_serve_sanitizes_invalid_configuration_before_uvicorn(monkeypatch):
     import huddleroom.cli as cli
     import huddleroom.config as config
@@ -442,7 +583,7 @@ def test_run_migrations_upgrades_an_old_database_without_losing_sentinel(tmp_pat
 
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve me",)
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("046",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("047",)
 
 
 def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
@@ -467,7 +608,7 @@ def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
 
     assert 0 in results
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("046",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("047",)
         assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve me",)
     for returncode, output in zip(results, outcomes):
         if returncode:

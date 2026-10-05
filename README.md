@@ -16,7 +16,7 @@ after the first PyPI release is published; until then, install a built local whe
 
 ```bash
 pipx install huddleroom
-huddleroom setup       # optional, recommended for guided configuration
+huddleroom setup       # required guided backend/configuration step
 huddleroom serve
 # open http://127.0.0.1:8000/dashboard/
 ```
@@ -115,6 +115,29 @@ same process environment, `.env`, TOML precedence.
 | `HUDDLEROOM_EMBEDDING_MODEL` | `text-embedding-3-small` | litellm embedding model for knowledge search |
 | `HUDDLEROOM_ORCHESTRATION_MODEL` | `openai/gpt-4o-mini` | Model for orchestration decisions and meeting control |
 | `HUDDLEROOM_MEETING_CONTROL_MODEL` | `HUDDLEROOM_ORCHESTRATION_MODEL` | Optional meeting-control override |
+
+### Orchestration backend
+
+`huddleroom setup` is the backend-selection step after `pipx install`. This
+release runs orchestration through **API via LiteLLM** only. The Claude and
+Codex CLIs may be detected on `PATH`, but they are intentionally unavailable:
+their versioned no-tools and configuration-isolation contracts have not been
+proven. A manually configured `orchestration_backend = "claude"` or `"codex"`
+fails at `serve` before any database or workspace work, and never falls back
+to an API provider.
+
+This backend setting affects orchestration decisions, analysis, conversation,
+and the project advisor. It does not change worker agents, embeddings, meeting
+intelligence/outcomes, or OneCLI.
+
+`orchestration_effort` is optional. Leave it unset, or pass
+`--orchestration-effort default`, to preserve the selected model's default.
+An explicit API effort is accepted only when LiteLLM metadata proves that exact
+level for the selected `orchestration_model`; unknown metadata fails safely and
+does not silently downgrade. Categorical effort is separate from provider
+numeric thinking budgets. A future supported CLI backend will require its own
+login/status contract (`claude auth status` or `codex login status`) before it
+can be selected; setup itself does not authenticate or make a model request.
 
 For API adapter agents to call LLMs, add provider credentials to either configuration file:
 

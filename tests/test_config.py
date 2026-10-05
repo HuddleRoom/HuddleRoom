@@ -394,6 +394,48 @@ def test_huddleroom_settings_prefer_current_names_and_keep_rally_aliases(monkeyp
     assert Settings(_env_file=None, database_url="sqlite+aiosqlite:///init.db").database_url.endswith("init.db")
 
 
+def test_orchestration_backend_and_effort_defaults_and_legacy_alias(monkeypatch):
+    from huddleroom.config import Settings
+
+    assert Settings(_env_file=None).orchestration_backend == "api"
+    assert Settings(_env_file=None).orchestration_effort is None
+
+    monkeypatch.setenv("RALLY_ORCHESTRATION_BACKEND", "codex")
+    monkeypatch.setenv("RALLY_ORCHESTRATION_EFFORT", "high")
+    with pytest.warns(FutureWarning, match="RALLY_ORCHESTRATION_BACKEND"):
+        configured = Settings(_env_file=None)
+    assert configured.orchestration_backend == "codex"
+    assert configured.orchestration_effort == "high"
+
+
+def test_orchestration_effort_is_a_literal_union():
+    from typing import get_args
+    from huddleroom.config import Settings
+
+    assert set(get_args(Settings.model_fields["orchestration_effort"].annotation)[0].__args__) == {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    }
+
+
+@pytest.mark.parametrize("effort", ("none", "minimal", "low", "medium", "high", "xhigh", "max"))
+def test_orchestration_effort_accepts_documented_values(effort):
+    from huddleroom.config import Settings
+
+    assert Settings(_env_file=None, orchestration_effort=effort).orchestration_effort == effort
+
+
+@pytest.mark.parametrize(
+    ("values", "name"),
+    (({"orchestration_backend": "other"}, "orchestration_backend"), ({"orchestration_effort": "ultra"}, "orchestration_effort")),
+)
+def test_orchestration_settings_reject_invalid_values(values, name):
+    from pydantic import ValidationError
+    from huddleroom.config import Settings
+
+    with pytest.raises(ValidationError, match=name):
+        Settings(_env_file=None, **values)
+
+
 def test_legacy_aliases_emit_one_warning(monkeypatch):
     from huddleroom.config import Settings
 

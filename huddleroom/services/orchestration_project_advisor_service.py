@@ -10,9 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, Awaitable, Callable, Mapping
-
-import litellm
+from typing import Any, Mapping
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,9 +21,8 @@ from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_conversation_service import ConversationDomainError
 from huddleroom.services.orchestration_llm_decision_adapter import orchestrator_preamble
 from huddleroom.services.orchestration_project_advisor_context import build_advisor_context
+from huddleroom.services.orchestration_completion import CompletionFn, get_orchestration_completion
 from huddleroom.services.secret_redaction import redact_secrets
-
-CompletionFn = Callable[..., Awaitable[Any]]
 
 _CITATION_TYPES = {"goal", "decision", "meeting"}
 _HISTORY_LIMIT = 20
@@ -116,7 +113,7 @@ def _extract_usage(response: Any) -> int | None:
 class OrchestrationProjectAdvisorService:
     def __init__(self, model: str | None = None, completion_fn: CompletionFn | None = None) -> None:
         self.model = model or settings.orchestration_model
-        self._completion_fn = completion_fn or litellm.acompletion
+        self._completion_fn = get_orchestration_completion(completion_fn)
 
     async def ask(
         self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str
@@ -140,7 +137,7 @@ class OrchestrationProjectAdvisorService:
     ) -> ProjectAdvisorTurn:
         if limit > 0:
             used = await advisor_allowance_used(db, project_id, actor_id)
-            if used >= limit:
+            if used is None or used >= limit:
                 raise ConversationDomainError(
                     "advisor_allowance_exhausted", 429, "Project advisor allowance is exhausted"
                 )
@@ -169,47 +166,72 @@ class OrchestrationProjectAdvisorService:
             "temperature": 0,
         }
 
-        usage_holder = {"tokens": 0}
+        usage_holder = {"tokens": 0, "unknown": False, "started": 0, "observed": 0}
+
+        async def _counted_completion(**completion_request: Any) -> Any:
+            usage_holder["started"] += 1
+            return await self._completion_fn(**completion_request)
 
         def _observe(response: Any) -> None:
+            usage_holder["observed"] += 1
             usage = _extract_usage(response)
-            if usage is not None:
+            if usage is None:
+                usage_holder["unknown"] = True
+            else:
                 usage_holder["tokens"] += usage
+
+        def _tokens_used() -> int | None:
+            if usage_holder["unknown"] or usage_holder["started"] != usage_holder["observed"]:
+                return None
+            return usage_holder["tokens"]
 
         try:
             parsed = await complete_with_repair(
-                self._completion_fn,
+                _counted_completion,
                 request,
                 lambda content: _parse_advisor_response(content, context),
                 response_observer=_observe,
             )
+        except asyncio.CancelledError:
+            await self._persist_failed_turn(
+                db, project_id, actor_id, question,
+                _tokens_used(),
+                "cancelled",
+            )
+            raise
         except Exception as exc:
             error_text = redact_secrets(" ".join(str(exc).split()))
             if len(error_text) > _MAX_ERROR_LEN:
                 error_text = error_text[: _MAX_ERROR_LEN - 3] + "..."
-            turn = ProjectAdvisorTurn(
-                project_id=project_id, actor_id=actor_id, question=question,
-                answer=None, citations=[], off_topic=False,
-                tokens_used=usage_holder["tokens"], status="failed", error=error_text,
+            await self._persist_failed_turn(
+                db, project_id, actor_id, question,
+                _tokens_used(),
+                error_text,
             )
-            db.add(turn)
-            # Commit explicitly (mirrors _settle/_fail_known in
-            # orchestration_conversation_service.py): the failed turn must
-            # be durably persisted even though we re-raise right after —
-            # relying on the router's request-scoped session to commit
-            # would lose this row, since raising rolls that session back.
-            await db.commit()
             raise
 
         turn = ProjectAdvisorTurn(
             project_id=project_id, actor_id=actor_id, question=question,
             answer=parsed["answer"], citations=parsed["citations"], off_topic=parsed["off_topic"],
-            tokens_used=usage_holder["tokens"], status="completed",
+            tokens_used=_tokens_used(), status="completed",
         )
         db.add(turn)
         await db.commit()
         await db.refresh(turn)
         return turn
+
+    @staticmethod
+    async def _persist_failed_turn(
+        db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str,
+        tokens_used: int | None, error: str,
+    ) -> None:
+        db.add(ProjectAdvisorTurn(
+            project_id=project_id, actor_id=actor_id, question=question,
+            answer=None, citations=[], off_topic=False, tokens_used=tokens_used,
+            status="failed", error=error,
+        ))
+        commit_task = asyncio.create_task(db.commit())
+        await asyncio.shield(commit_task)
 
     async def history(
         self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID

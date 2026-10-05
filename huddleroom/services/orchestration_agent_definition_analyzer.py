@@ -7,9 +7,11 @@ import re
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import UUID
 
-import litellm
-
 from huddleroom.config import settings
+from huddleroom.services.orchestration_completion import (
+    get_orchestration_completion,
+    orchestration_runtime_metadata,
+)
 from huddleroom.services.llm_structured_repair import complete_with_repair, _default_fix_prompt
 from huddleroom.services.orchestration_llm_decision_adapter import (
     _full_completion_error,
@@ -147,7 +149,7 @@ def parse_semantic_agent_assessment(
 
 class AgentDefinitionSemanticAnalyzer:
     def __init__(self, completion_fn: Callable[..., Awaitable[Any]] | None = None) -> None:
-        self._completion_fn = completion_fn or litellm.acompletion
+        self._completion_fn = get_orchestration_completion(completion_fn)
 
     async def review(
         self,
@@ -222,9 +224,10 @@ class AgentDefinitionSemanticAnalyzer:
                 result = await complete_with_repair(*args, fix_prompt_fn=_repair_instruction)
             else:
                 from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
+                invocation_kind, runtime_model = orchestration_runtime_metadata(self._completion_fn, model)
                 result = await complete_with_repair(*args, fix_prompt_fn=_repair_instruction, invocation=AgentResponseInvocation(InvocationContext(
-                    project_id, "system", "orchestrator", "Orchestrator", "api", "agent_definition_review",
-                    model, "Review this agent definition for the proposed work functions.",
+                    project_id, "system", "orchestrator", "Orchestrator", invocation_kind, "agent_definition_review",
+                    runtime_model, "Review this agent definition for the proposed work functions.",
                 )))
             return result
         except Exception as exc:

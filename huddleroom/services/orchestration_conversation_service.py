@@ -13,7 +13,6 @@ from datetime import timedelta
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-import litellm
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -34,6 +33,7 @@ from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import OrchestrationGoal
 from huddleroom.models.orchestration_steering import OrchestrationSteeringProposal, steering_proposal_id
 from huddleroom.services.orchestration_conversation_dossier import ConversationDossierBuilder
+from huddleroom.services.orchestration_completion import get_orchestration_completion
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_steering import (
     OrchestrationSteeringService,
@@ -112,20 +112,20 @@ class OrchestrationConversationService:
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal,
-        completion_fn: Callable[..., Any] = litellm.acompletion,
+        completion_fn: Callable[..., Any] | None = None,
         lookup_fn: Callable[[str], Any] | None = None,
         orchestration_service: OrchestrationService | None = None,
         investigation_service: Any | None = None,
     ):
         self._session_factory = session_factory
-        self._completion_fn = completion_fn
+        self._completion_fn = get_orchestration_completion(completion_fn)
         self._lookup_fn = lookup_fn
         self._orchestration = orchestration_service or OrchestrationService()
         if investigation_service is None:
             # The investigation module imports ConversationDomainError from here.
             from huddleroom.services.orchestration_conversation_investigation import ConversationInvestigationService
             investigation_service = ConversationInvestigationService(
-                session_factory, completion_fn, lookup_fn, self._orchestration
+                session_factory, self._completion_fn, lookup_fn, self._orchestration
             )
         self._investigations = investigation_service
 
