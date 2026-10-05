@@ -889,14 +889,23 @@ def test_onecli_environment_keeps_only_loopback_bypass_in_both_casings(monkeypat
     assert env["no_proxy"] == "127.0.0.1"
 
 
-def test_launch_onecli_execs_native_wrapper_with_current_interpreter_and_env_auth(monkeypatch):
+@pytest.mark.parametrize(
+    ("gateway_url", "native_gateway"),
+    [
+        ("http://gateway.example:10255", "gateway.example"),
+        ("http://[::1]:10255", "[::1]"),
+    ],
+)
+def test_launch_onecli_execs_native_wrapper_with_current_interpreter_and_env_auth(
+    monkeypatch, gateway_url, native_gateway,
+):
     from huddleroom.config import Settings
     import huddleroom.onecli as onecli
 
     captured = {}
     config = Settings(
         _env_file=None, credential_mode="onecli", onecli_agent="gateway",
-        onecli_management_url="http://management.example:10256", onecli_gateway_url="http://gateway.example:10255",
+        onecli_management_url="http://management.example:10256", onecli_gateway_url=gateway_url,
     )
     monkeypatch.setenv("ONECLI_API_KEY", "environment-only-management-key")
     monkeypatch.setattr(onecli, "verify_onecli", lambda *_args: {"id": "id", "identifier": "gateway", "name": "Gateway"})
@@ -907,14 +916,37 @@ def test_launch_onecli_execs_native_wrapper_with_current_interpreter_and_env_aut
 
     assert captured["executable"] == "onecli"
     assert captured["argv"] == [
-        "onecli", "run", "--agent", "gateway", "--gateway", "gateway.example:10255", "--", sys.executable,
+        "onecli", "run", "--agent", "gateway", "--gateway", native_gateway, "--", sys.executable,
         "-m", "huddleroom.cli", "serve", "--host", "0.0.0.0", "--port", "8123", "--reload",
     ]
     assert captured["env"]["ONECLI_API_KEY"] == "environment-only-management-key"
     assert captured["env"]["ONECLI_API_HOST"] == "http://management.example:10256"
 
 
-def test_wrapped_context_requires_all_matching_ca_variables_and_safe_bypass(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("gateway_url", "runtime_proxy", "normalized_proxy"),
+    [
+        (
+            "http://127.0.0.1:10255",
+            "http://agent:token@127.0.0.1:10255",
+            "http://agent:token@127.0.0.1:10255",
+        ),
+        (
+            "http://127.0.0.1:10255",
+            "http://agent:token@gateway:10255",
+            "http://agent:token@127.0.0.1:10255",
+        ),
+        (
+            "http://127.0.0.1:18443",
+            "http://agent:token@127.0.0.1:10255",
+            "http://agent:token@127.0.0.1:18443",
+        ),
+    ],
+)
+def test_wrapped_context_accepts_server_or_native_gateway_and_normalizes_routing(
+    monkeypatch, tmp_path, gateway_url, runtime_proxy, normalized_proxy,
+):
+    """The server's internal gateway hostname is valid only for the selected wrapper."""
     from huddleroom.config import Settings
     import huddleroom.onecli as onecli
 
@@ -922,23 +954,87 @@ def test_wrapped_context_requires_all_matching_ca_variables_and_safe_bypass(monk
     system_bundle = Path(ssl.get_default_verify_paths().cafile)
     ca_file.write_bytes(system_bundle.read_bytes())
     gateway_certificate = ca_file.read_text(encoding="utf-8")
-    config = Settings(_env_file=None, credential_mode="onecli", onecli_agent="gateway", onecli_gateway_url="http://gateway:10255")
-    proxy = "http://agent:token@gateway:10255"
+    config = Settings(
+        _env_file=None,
+        credential_mode="onecli",
+        onecli_agent="gateway",
+        onecli_gateway_url=gateway_url,
+    )
+    server_proxy = "http://agent:token@gateway:10255"
     for key, value in {
         "ONECLI_GATEWAY": "true", "HUDDLEROOM_ONECLI_AGENT": "gateway",
-        "HUDDLEROOM_ONECLI_GATEWAY_URL": "http://gateway:10255",
+        "HUDDLEROOM_ONECLI_GATEWAY_URL": gateway_url,
         "HUDDLEROOM_ONECLI_MANAGEMENT_URL": config.onecli_management_url,
-        "HTTP_PROXY": proxy, "http_proxy": proxy, "HTTPS_PROXY": proxy, "https_proxy": proxy,
+        "HTTP_PROXY": runtime_proxy, "http_proxy": runtime_proxy,
+        "HTTPS_PROXY": runtime_proxy, "https_proxy": runtime_proxy,
         "NO_PROXY": "localhost", "no_proxy": "127.0.0.1",
         **{key: str(ca_file) for key in onecli._CA_ENV_KEYS},
     }.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.setattr(onecli, "_container_config", lambda *_args: {"env": {"HTTP_PROXY": proxy}, "caCertificate": gateway_certificate, "caCertificateContainerPath": "/tmp/onecli-gateway-ca.pem"})
+    monkeypatch.setattr(
+        onecli,
+        "_container_config",
+        lambda *_args: {
+            "env": {"HTTP_PROXY": server_proxy},
+            "caCertificate": gateway_certificate,
+            "caCertificateContainerPath": "/tmp/onecli-gateway-ca.pem",
+        },
+    )
 
     onecli.validate_onecli_context(config)
 
     assert os.environ["NO_PROXY"] == onecli._SAFE_NO_PROXY
     assert os.environ["no_proxy"] == onecli._SAFE_NO_PROXY
+    assert {os.environ[key] for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")} == {
+        normalized_proxy
+    }
+
+
+@pytest.mark.parametrize(
+    ("runtime_proxy", "error"),
+    [
+        ("http://agent:token@other-gateway:10255", "selected gateway"),
+        ("http://agent:token@127.0.0.1:10256", "selected gateway"),
+        ("http://agent:token@127.0.0.1", "selected gateway"),
+        ("http://agent:other-token@gateway:10255", "selected agent"),
+    ],
+)
+def test_wrapped_context_rejects_unselected_gateway_destination(monkeypatch, tmp_path, runtime_proxy, error):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    ca_file = tmp_path / "gateway-ca.pem"
+    ca_file.write_text("certificate")
+    config = Settings(
+        _env_file=None,
+        credential_mode="onecli",
+        onecli_agent="gateway",
+        onecli_gateway_url="http://127.0.0.1:10255",
+    )
+    for key, value in {
+        "ONECLI_GATEWAY": "true",
+        "HUDDLEROOM_ONECLI_AGENT": "gateway",
+        "HUDDLEROOM_ONECLI_GATEWAY_URL": "http://127.0.0.1:10255",
+        "HUDDLEROOM_ONECLI_MANAGEMENT_URL": config.onecli_management_url,
+        "HTTP_PROXY": runtime_proxy,
+        "http_proxy": runtime_proxy,
+        "HTTPS_PROXY": runtime_proxy,
+        "https_proxy": runtime_proxy,
+        "SSL_CERT_FILE": str(ca_file),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        onecli,
+        "_container_config",
+        lambda *_args: {
+            "env": {"HTTP_PROXY": "http://agent:token@gateway:10255"},
+            "caCertificate": "pem",
+            "caCertificateContainerPath": str(ca_file),
+        },
+    )
+
+    with pytest.raises(onecli.OneCliError, match=error):
+        onecli.validate_onecli_context(config)
 
 
 def test_wrapped_context_uses_one_canonical_local_gateway_ca_bundle(monkeypatch, tmp_path):

@@ -45,6 +45,7 @@ _CA_ENV_KEYS = (
     "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "DENO_CERT", "NODE_EXTRA_CA_CERTS",
 )
 _SAFE_NO_PROXY = "127.0.0.1,localhost,::1"
+_INTERNAL_GATEWAY_HOSTS = frozenset({"gateway", "host.docker.internal", "gateway.docker.internal"})
 _PEM_CERTIFICATE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
 _SAFE_VERSION = re.compile(r"^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})$")
 _NATIVE_MANAGEMENT_DEFAULT = "https://api.onecli.sh"
@@ -107,14 +108,48 @@ def _container_config(config: Settings) -> dict[str, Any]:
     return value
 
 
-def _gateway_proxy(value: str, config: Settings) -> tuple[str, str | None, str | None]:
-    parsed = urlsplit(value)
-    target = urlsplit(config.onecli_gateway_url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname != target.hostname or parsed.port != target.port:
-        raise OneCliError("OneCLI runtime context does not use the selected gateway.")
-    return f"{parsed.hostname}:{parsed.port}", (
+def _gateway_proxy(
+    value: str, config: Settings, *, allow_internal_gateway: bool = False, allow_gateway_port: int | None = None
+) -> tuple[str | None, int | None, str | None, str | None]:
+    """Parse a proxy without exposing its credentials in validation errors."""
+    try:
+        parsed = urlsplit(value)
+        target = urlsplit(config.onecli_gateway_url)
+        proxy_port, target_port = parsed.port, target.port
+    except ValueError:
+        raise OneCliError("OneCLI runtime context contains an invalid proxy endpoint.") from None
+    allowed_hosts = {target.hostname}
+    if allow_internal_gateway:
+        allowed_hosts.update(_INTERNAL_GATEWAY_HOSTS)
+    internal_gateway = allow_internal_gateway and parsed.hostname in _INTERNAL_GATEWAY_HOSTS
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.hostname not in allowed_hosts
+        or (
+            not internal_gateway
+            and proxy_port != target_port
+            and not (
+                allow_gateway_port is not None
+                and parsed.hostname == target.hostname
+                and proxy_port == allow_gateway_port
+            )
+        )
+    ):
+        raise OneCliError(
+            f"OneCLI runtime context does not use the selected gateway endpoint {target.hostname}:{target_port}."
+        )
+    return parsed.hostname, proxy_port, (
         unquote(parsed.username) if parsed.username is not None else None
     ), (unquote(parsed.password) if parsed.password is not None else None)
+
+
+def _normalise_proxy_gateway(value: str, config: Settings) -> str:
+    """Keep verified proxy credentials while replacing only Docker routing."""
+    parsed = urlsplit(value)
+    userinfo, separator, _ = parsed.netloc.rpartition("@")
+    target_netloc = urlsplit(config.onecli_gateway_url).netloc
+    return parsed._replace(netloc=f"{userinfo}{separator}{target_netloc}").geturl()
 
 
 def _safe_no_proxy(value: str | None) -> str:
@@ -165,14 +200,32 @@ def validate_onecli_context(config: Settings) -> None:
     expected_proxy = expected.get("HTTP_PROXY") or expected.get("http_proxy")
     if not isinstance(expected_proxy, str):
         raise OneCliError("OneCLI returned an unsupported runtime context.")
-    _, expected_user, expected_password = _gateway_proxy(expected_proxy, config)
+    expected_host, expected_port, expected_user, expected_password = _gateway_proxy(
+        expected_proxy, config, allow_internal_gateway=True
+    )
+    expected_is_internal = expected_host in _INTERNAL_GATEWAY_HOSTS
+    selected_host = urlsplit(config.onecli_gateway_url).hostname
     for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
         value = os.environ.get(key)
         if not value:
             raise OneCliError("OneCLI runtime context is missing proxy routing.")
-        _, actual_user, actual_password = _gateway_proxy(value, config)
+        actual_host, actual_port, actual_user, actual_password = _gateway_proxy(
+            value,
+            config,
+            allow_internal_gateway=True,
+            allow_gateway_port=expected_port if expected_is_internal else None,
+        )
         if (actual_user, actual_password) != (expected_user, expected_password):
             raise OneCliError("OneCLI runtime context does not match the selected agent.")
+        # Native OneCLI may leave the management service's Docker authority in
+        # its child environment.  Replace only that verified authority before
+        # strict validation, preserving the exact proxy credentials.
+        if expected_is_internal and (actual_host, actual_port) in {
+            (expected_host, expected_port), (selected_host, expected_port)
+        }:
+            value = _normalise_proxy_gateway(value, config)
+            os.environ[key] = value
+        _gateway_proxy(value, config)
     ca_certificate = container["caCertificate"]
     try:
         canonical_ca = Path(os.environ["SSL_CERT_FILE"]).expanduser().resolve(strict=True)
@@ -213,7 +266,9 @@ def launch_onecli(config: Settings, host: str, port: int, reload: bool) -> None:
         "HUDDLEROOM_ONECLI_GATEWAY_URL": config.onecli_gateway_url,
         "HUDDLEROOM_ONECLI_MANAGEMENT_URL": config.onecli_management_url,
     })
-    gateway = urlsplit(config.onecli_gateway_url).netloc
+    gateway = urlsplit(config.onecli_gateway_url).hostname
+    if gateway and ":" in gateway:
+        gateway = f"[{gateway}]"
     command = ["onecli", "run", "--agent", agent["identifier"], "--gateway", gateway, "--", os.sys.executable,
                "-m", "huddleroom.cli", "serve", "--host", host, "--port", str(port)]
     if reload:
