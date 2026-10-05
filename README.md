@@ -180,32 +180,6 @@ they never include API keys or response bodies.
   CLI/service together to the supported capability/schema contract. HuddleRoom
   will not replace grants or retrieve secrets to work around that error.
 
-### Maintainer release runbook
-
-Publishing is intentionally not configured here. Before an approved release,
-verify the PyPI `huddleroom` project name and ownership immediately before use,
-register a PyPI trusted publisher for the exact repository, workflow, and
-environment, choose a new unpublished package version, and create the matching
-release tag. The package name/ownership check is still outstanding because its
-PyPI lookup was deferred; do not assume the name is available.
-
-From the release checkout, build the dashboard and distribution once, then inspect
-and test those exact wheel and sdist artifacts:
-
-```bash
-rtk make build-frontend
-rtk .venv/bin/python -m build
-rtk .venv/bin/python -m pytest tests/test_distribution.py -q --tb=short
-```
-
-After the trusted-publisher setup has separately been approved, GitHub Actions
-should run the focused distribution checks and publish those exact built artifacts
-through PyPI OIDC. It must not rebuild the frontend on a user's machine. Finally,
-verify `pipx install huddleroom` and `pipx upgrade huddleroom` against PyPI. Never
-reuse an already published version.
-
----
-
 ## API Overview
 
 Base URL: `http://127.0.0.1:8000/api/v1`

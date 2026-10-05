@@ -12,7 +12,9 @@ import time
 import tomllib
 import venv
 import zipfile
+from configparser import ConfigParser
 from contextlib import contextmanager
+from email import message_from_string
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.error import URLError
@@ -41,6 +43,8 @@ RUNTIME_CREDENTIAL_ENVIRONMENT = {
 BUILD_TIMEOUT = 180
 COMMAND_TIMEOUT = 120
 SERVER_TIMEOUT = 30
+TEST_DIST_DIR_ENVIRONMENT = "HUDDLEROOM_TEST_DIST_DIR"
+PRIVATE_DISTRIBUTION_PATHS = (".agents/", ".claude/", ".codex/", "features/", "bugs.db")
 
 
 def _run(
@@ -65,6 +69,31 @@ def _run(
 def _build_artifacts(output: Path) -> tuple[Path, Path]:
     _run([sys.executable, "-m", "build", "--outdir", str(output)], cwd=ROOT, timeout=BUILD_TIMEOUT)
     return next(output.glob("*.whl")), next(output.glob("*.tar.gz"))
+
+
+def _supplied_artifacts() -> tuple[Path, Path] | None:
+    value = os.environ.get(TEST_DIST_DIR_ENVIRONMENT)
+    if value is None:
+        return None
+    output = Path(value).resolve()
+    assert output.is_dir(), f"{TEST_DIST_DIR_ENVIRONMENT} is not a directory: {output}"
+    wheels = list(output.glob("*.whl"))
+    sdists = list(output.glob("*.tar.gz"))
+    assert len(wheels) == 1, f"expected one wheel in {output}, found {wheels}"
+    assert len(sdists) == 1, f"expected one sdist in {output}, found {sdists}"
+    return wheels[0], sdists[0]
+
+
+def _distribution_artifacts(output: Path) -> tuple[Path, Path]:
+    return _supplied_artifacts() or _build_artifacts(output)
+
+
+def _build_dashboard_if_needed() -> None:
+    if _supplied_artifacts() is not None:
+        return
+    if shutil.which("npm") is None:
+        raise RuntimeError("npm is required to build the dashboard before testing the distribution")
+    _run(["make", "build-frontend"], cwd=ROOT, timeout=BUILD_TIMEOUT)
 
 
 def _expected_static_files() -> set[str]:
@@ -94,6 +123,45 @@ def _archive_names(sdist: Path) -> set[str]:
     with tarfile.open(sdist) as archive:
         prefix = archive.getnames()[0].split("/", 1)[0] + "/"
         return {name.removeprefix(prefix) for name in archive.getnames()}
+
+
+def _project_metadata() -> dict[str, object]:
+    with (ROOT / "pyproject.toml").open("rb") as project_file:
+        return tomllib.load(project_file)["project"]
+
+
+def _assert_no_private_distribution_files(names: set[str]) -> None:
+    for name in names:
+        assert not name.startswith(PRIVATE_DISTRIBUTION_PATHS), name
+        assert not Path(name).name.startswith(".env"), name
+
+
+def _assert_distribution_metadata(wheel: Path, sdist: Path) -> None:
+    project = _project_metadata()
+    expected_name = project["name"]
+    expected_version = project["version"]
+    assert expected_name == "huddleroom"
+    assert expected_version == "0.1.0a1"
+    assert project["description"]
+    assert project["readme"] == "README.md"
+    assert project["urls"].get("Repository")
+
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+        metadata = message_from_string(archive.read(metadata_name).decode())
+        entries_name = next(name for name in archive.namelist() if name.endswith(".dist-info/entry_points.txt"))
+        entries = ConfigParser()
+        entries.read_string(archive.read(entries_name).decode())
+    assert metadata["Name"] == expected_name
+    assert metadata["Version"] == expected_version
+    assert metadata["Summary"] == project["description"]
+    assert dict(entries["console_scripts"]) == {"huddleroom": "huddleroom.cli:main"}
+
+    with tarfile.open(sdist) as archive:
+        pyproject = next(member for member in archive.getmembers() if member.name.endswith("/pyproject.toml"))
+        sdist_project = tomllib.loads(archive.extractfile(pyproject).read().decode())["project"]
+    assert sdist_project["name"] == expected_name
+    assert sdist_project["version"] == expected_version
 
 
 def _isolated_environment(home: Path) -> dict[str, str]:
@@ -258,8 +326,10 @@ def _wheel_version(wheel: Path) -> str:
 
 
 def _next_release_version(version: str) -> str:
-    match = re.fullmatch(r"(\d+(?:\.\d+)*)", version)
+    match = re.fullmatch(r"(\d+(?:\.\d+)*)(?:a(\d+))?", version)
     assert match, f"cannot derive a higher local release from {version!r}"
+    if match.group(2) is not None:
+        return f"{match.group(1)}a{int(match.group(2)) + 1}"
     components = match.group(1).split(".")
     components[-1] = str(int(components[-1]) + 1)
     return ".".join(components)
@@ -480,18 +550,23 @@ def test_stop_server_rejects_sigterm_without_graceful_shutdown_marker():
     assert f"status {-signal.SIGTERM}" in message
 
 
+def test_next_release_version_supports_stable_and_alpha_versions():
+    assert _next_release_version("0.1.0") == "0.1.1"
+    assert _next_release_version("0.1.0a1") == "0.1.0a2"
+
+
 def test_distribution_contains_runtime_files_and_installs(tmp_path):
-    if shutil.which("npm") is None:
-        raise RuntimeError("npm is required to build the dashboard before testing the distribution")
-    _run(["make", "build-frontend"], cwd=ROOT, timeout=BUILD_TIMEOUT)
+    _build_dashboard_if_needed()
     expected_static = _expected_static_files()
 
     build_output = tmp_path / "dist"
     build_output.mkdir()
-    wheel, sdist = _build_artifacts(build_output)
+    wheel, sdist = _distribution_artifacts(build_output)
+    _assert_distribution_metadata(wheel, sdist)
 
     with zipfile.ZipFile(wheel) as archive:
         wheel_names = set(archive.namelist())
+    _assert_no_private_distribution_files(wheel_names)
     _assert_static_contents(wheel_names, expected_static)
     migration_config = next(
         name for name in wheel_names if name.endswith("/data/huddleroom/migrations/alembic.ini")
@@ -499,6 +574,7 @@ def test_distribution_contains_runtime_files_and_installs(tmp_path):
     _assert_migration_contents(wheel_names, migration_config, migration_config.removesuffix("/alembic.ini"))
 
     sdist_names = _archive_names(sdist)
+    _assert_no_private_distribution_files(sdist_names)
     _assert_static_contents(sdist_names, expected_static)
     _assert_migration_contents(sdist_names, "huddleroom/migrations/alembic.ini", "alembic")
     _install_and_exercise(wheel, tmp_path / "wheel-install")
@@ -526,12 +602,10 @@ def test_distribution_contains_runtime_files_and_installs(tmp_path):
 
 
 def test_distribution_clean_pipx_install_serves_restarts_and_upgrades(tmp_path):
-    if shutil.which("npm") is None:
-        raise RuntimeError("npm is required to build the dashboard before testing the distribution")
-    _run(["make", "build-frontend"], cwd=ROOT, timeout=BUILD_TIMEOUT)
+    _build_dashboard_if_needed()
     build_output = tmp_path / "dist"
     build_output.mkdir()
-    wheel, sdist = _build_artifacts(build_output)
+    wheel, sdist = _distribution_artifacts(build_output)
     upgraded_wheel, upgraded_version = _build_upgraded_wheel(sdist, tmp_path / "upgrade")
 
     root = tmp_path / "end-user"
