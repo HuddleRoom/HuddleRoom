@@ -1,3 +1,4 @@
+import json
 import os
 import ssl
 import sys
@@ -220,7 +221,10 @@ def test_create_secret_rejects_non_created_success_response(monkeypatch):
             return False
 
         def request(self, _method, _url, **_kwargs):
-            return _response(200, {"id": "secret-created-with-wrong-status"})
+            return _response(
+                200,
+                {"id": "secret-created-with-wrong-status", "preview": "secret-preview-must-not-appear"},
+            )
 
     prompts = iter(("OpenAI", "sk-hidden-key"))
     monkeypatch.setattr(onecli.httpx, "Client", Client)
@@ -228,9 +232,15 @@ def test_create_secret_rejects_non_created_success_response(monkeypatch):
     monkeypatch.setattr(onecli.click, "prompt", lambda *_args, **_kwargs: next(prompts))
     onecli._RETAINED_RESOURCE_IDS.set(())
 
-    with pytest.raises(onecli.OneCliError):
+    with pytest.raises(onecli.OneCliError) as error:
         onecli._create_secret(Settings(_env_file=None), "openai", None)
     assert onecli.retained_resource_ids() == ()
+    message = str(error.value)
+    assert "http://127.0.0.1:10256" in message
+    assert "POST /secrets" in message
+    assert "HTTP 200" in message
+    assert "inventory" in message.lower()
+    assert "secret-preview-must-not-appear" not in message
 
 
 def test_attach_secret_is_bodyless_and_does_not_replace_existing_grants(monkeypatch):
@@ -968,6 +978,327 @@ def test_wrapped_context_uses_one_canonical_local_gateway_ca_bundle(monkeypatch,
     assert {
         Path(os.environ[key]).resolve() for key in onecli._CA_ENV_KEYS
     } == {canonical_bundle}
+
+
+def test_management_url_uses_native_environment_when_huddleroom_did_not_set_one(monkeypatch):
+    """An implicit HuddleRoom default must not hide OneCLI's configured API host."""
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    monkeypatch.setenv("ONECLI_API_HOST", "http://native-onecli.test:10254")
+
+    assert onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli")) == (
+        "http://native-onecli.test:10254"
+    )
+
+
+def test_management_url_reads_native_dev_config_when_environment_is_absent(monkeypatch, tmp_path):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    onecli_directory = tmp_path / ".onecli"
+    onecli_directory.mkdir()
+    (onecli_directory / "config-dev.json").write_text('{"api-host": "http://native-file.test:10254"}')
+    monkeypatch.setattr(onecli.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("ONECLI_API_HOST", "")
+    monkeypatch.setenv("ONECLI_ENV", "dev")
+
+    assert onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli")) == (
+        "http://native-file.test:10254"
+    )
+
+
+@pytest.mark.parametrize("source", ["init", "environment", "toml"])
+def test_management_url_preserves_explicit_huddleroom_value_over_native_onecli(monkeypatch, tmp_path, source):
+    from huddleroom import config as config_module
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    configured = "http://huddleroom-override.test:18443"
+    monkeypatch.setenv("ONECLI_API_HOST", "http://native-onecli.test:10254")
+    if source == "init":
+        settings = Settings(
+            _env_file=None,
+            credential_mode="onecli",
+            onecli_management_url=configured,
+        )
+    elif source == "environment":
+        monkeypatch.setenv("HUDDLEROOM_ONECLI_MANAGEMENT_URL", configured)
+        settings = Settings(_env_file=None, credential_mode="onecli")
+    else:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(f'onecli_management_url = "{configured}"\n')
+        monkeypatch.setattr(config_module, "DEFAULT_CONFIG_FILE", config_file)
+        settings = Settings(_env_file=None, credential_mode="onecli")
+
+    assert onecli.resolve_management_url(settings) == configured
+
+
+def test_management_url_rejects_malformed_native_origin_without_echoing_it(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    invalid_origin = "https://key@native-onecli.test/path?leak=1"
+    monkeypatch.setenv("ONECLI_API_HOST", invalid_origin)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli"))
+
+    assert invalid_origin not in str(error.value)
+    assert "ONECLI_API_HOST" in str(error.value)
+
+
+@pytest.mark.parametrize("api_host", [None, 10254, ["http://native-onecli.test:10254"]])
+def test_management_url_rejects_nonstring_native_file_origin_without_echoing_it(monkeypatch, tmp_path, api_host):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    onecli_directory = tmp_path / ".onecli"
+    onecli_directory.mkdir()
+    (onecli_directory / "config.json").write_text(json.dumps({"api-host": api_host}))
+    monkeypatch.setattr(onecli.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ONECLI_API_HOST", raising=False)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli"))
+
+    message = str(error.value)
+    assert "config.json api-host" in message
+    assert str(api_host) not in message
+
+
+@pytest.mark.parametrize("contents", ["{not-json secret-malformed-config", "[\"secret-nonmapping-config\"]"])
+def test_management_url_rejects_unusable_existing_native_config_without_echoing_contents(monkeypatch, tmp_path, contents):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    onecli_directory = tmp_path / ".onecli"
+    onecli_directory.mkdir()
+    (onecli_directory / "config.json").write_text(contents)
+    monkeypatch.setattr(onecli.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ONECLI_API_HOST", raising=False)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli"))
+
+    message = str(error.value)
+    assert "config.json" in message
+    assert "secret-" not in message
+
+
+def test_management_url_rejects_unreadable_existing_native_config_without_echoing_os_error(monkeypatch, tmp_path):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    onecli_directory = tmp_path / ".onecli"
+    onecli_directory.mkdir()
+    config_file = onecli_directory / "config.json"
+    config_file.write_text('{"api-host": "http://native-onecli.test:10254"}')
+    original_read_text = onecli.Path.read_text
+    monkeypatch.setattr(onecli.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ONECLI_API_HOST", raising=False)
+
+    def unreadable(path, *args, **kwargs):
+        if path == config_file:
+            raise PermissionError("private-native-config-path")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(onecli.Path, "read_text", unreadable)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli"))
+
+    assert "config.json" in str(error.value)
+    assert "private-native-config-path" not in str(error.value)
+
+
+@pytest.mark.parametrize("contents", [None, "{}"])
+def test_management_url_uses_cloud_only_when_native_config_is_absent_or_has_no_api_host(monkeypatch, tmp_path, contents):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    onecli_directory = tmp_path / ".onecli"
+    onecli_directory.mkdir()
+    if contents is not None:
+        (onecli_directory / "config.json").write_text(contents)
+    monkeypatch.setattr(onecli.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ONECLI_API_HOST", raising=False)
+
+    assert onecli.resolve_management_url(Settings(_env_file=None, credential_mode="onecli")) == "https://api.onecli.sh"
+
+
+def test_direct_setup_never_resolves_or_probes_native_onecli_management(monkeypatch):
+    import huddleroom.cli as cli
+    import huddleroom.onecli as onecli
+
+    updates = {}
+    monkeypatch.setattr(cli, "_update_config", lambda values: updates.update(values))
+    monkeypatch.setattr(
+        onecli,
+        "resolve_management_url",
+        lambda *_args: pytest.fail("direct setup must not read native OneCLI configuration"),
+        raising=False,
+    )
+
+    cli.setup.callback(
+        provider="skip",
+        credential_mode="direct",
+        onecli_agent=None,
+        onecli_management_url=None,
+        onecli_gateway_url=None,
+        orchestration_model="openai/model",
+        database_path="state.db",
+        workspace_dir="workspace",
+    )
+
+    assert updates["credential_mode"] == "direct"
+
+
+def test_management_outage_names_selected_origin_without_transport_details(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, *_args, **_kwargs):
+            raise onecli.httpx.ConnectError("private-connect-detail?token=must-not-appear")
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    config = Settings(_env_file=None, onecli_management_url="http://127.0.0.1:10254")
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli._request(config, "GET", "/health")
+
+    message = str(error.value)
+    assert "http://127.0.0.1:10254" in message
+    assert "unavailable" in message
+    assert "private-connect-detail" not in message
+    assert "must-not-appear" not in message
+
+
+def test_management_denial_names_selected_origin_and_status_without_response_body(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, *_args, **_kwargs):
+            return _response(401, {"error": "body-token-must-not-appear"})
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    monkeypatch.setattr(onecli, "_api_key", lambda: "management-auth-must-not-appear")
+    config = Settings(_env_file=None, onecli_management_url="http://127.0.0.1:10254")
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli._request(config, "GET", "/health")
+
+    message = str(error.value)
+    assert "http://127.0.0.1:10254" in message
+    assert "401" in message
+    assert "body-token-must-not-appear" not in message
+    assert "management-auth-must-not-appear" not in message
+
+
+def test_missing_required_grants_endpoint_requests_management_upgrade_without_echoing_body(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, *_args, **_kwargs):
+            return _response(404, {"error": "old-server-secret-body"})
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    config = Settings(_env_file=None, onecli_management_url="http://127.0.0.1:10254")
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli._request(config, "GET", "/agents/agent-id/grants")
+
+    message = str(error.value).lower()
+    assert "http://127.0.0.1:10254" in message
+    assert "upgrade" in message
+    assert "old-server-secret-body" not in message
+
+
+def test_gateway_outage_names_selected_origin_without_transport_details(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, *_args, **_kwargs):
+            raise onecli.httpx.ConnectError("private-gateway-detail?token=must-not-appear")
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli._gateway_health(Settings(_env_file=None, onecli_gateway_url="http://127.0.0.1:10255"))
+
+    message = str(error.value)
+    assert "http://127.0.0.1:10255" in message
+    assert "unavailable" in message
+    assert "private-gateway-detail" not in message
+    assert "must-not-appear" not in message
+
+
+def test_gateway_non_success_names_selected_origin_and_status_without_response_body(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, *_args, **_kwargs):
+            return _response(503, {"error": "gateway-response-secret"})
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli._gateway_health(Settings(_env_file=None, onecli_gateway_url="http://127.0.0.1:10255"))
+
+    message = str(error.value)
+    assert "http://127.0.0.1:10255" in message
+    assert "503" in message
+    assert "gateway-response-secret" not in message
 
 
 @pytest.mark.asyncio

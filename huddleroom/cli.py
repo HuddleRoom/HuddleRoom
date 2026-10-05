@@ -56,17 +56,19 @@ def _run_migrations(config: "Settings") -> None:
     command.upgrade(migration_config, "head")
 
 
-def _prepare_database() -> "Settings":
+def _prepare_database(config: "Settings | None" = None) -> "Settings":
     try:
-        from huddleroom.config import settings, validate_supported_settings
+        from huddleroom.config import settings as default_settings, validate_supported_settings
     except Exception:
         raise click.ClickException(
             "Could not prepare the local database. Run 'huddleroom setup', check "
             "~/.huddleroom/config.toml, or set HUDDLEROOM_ environment variables."
         ) from None
     try:
-        validate_supported_settings(settings)
-        _run_migrations(settings)
+        if config is None:
+            config = default_settings
+        validate_supported_settings(config)
+        _run_migrations(config)
     except click.ClickException:
         raise
     except Exception:
@@ -74,7 +76,7 @@ def _prepare_database() -> "Settings":
             "Could not prepare the local database. Run 'huddleroom setup', check "
             "~/.huddleroom/config.toml, or set HUDDLEROOM_ environment variables."
         ) from None
-    return settings
+    return config
 
 
 @click.group()
@@ -225,15 +227,23 @@ def setup(
     onecli_updates: dict[str, str] = {}
     if credential_mode == "onecli":
         from huddleroom.config import Settings
-        from huddleroom.onecli import setup_onecli
+        from huddleroom.onecli import resolve_management_url, setup_onecli
 
-        candidate = Settings(
+        candidate_values = dict(
             _env_file=None,
             credential_mode="onecli",
             onecli_agent=onecli_agent if onecli_agent is not None else settings.onecli_agent,
-            onecli_management_url=onecli_management_url or settings.onecli_management_url,
-            onecli_gateway_url=onecli_gateway_url or settings.onecli_gateway_url,
         )
+        if onecli_management_url is not None:
+            candidate_values["onecli_management_url"] = onecli_management_url
+        elif settings.setting_was_supplied("onecli_management_url"):
+            candidate_values["onecli_management_url"] = settings.onecli_management_url
+        if onecli_gateway_url is not None:
+            candidate_values["onecli_gateway_url"] = onecli_gateway_url
+        elif settings.setting_was_supplied("onecli_gateway_url"):
+            candidate_values["onecli_gateway_url"] = settings.onecli_gateway_url
+        candidate = Settings(**candidate_values)
+        candidate = candidate.model_copy(update={"onecli_management_url": resolve_management_url(candidate)})
         onecli_updates = setup_onecli(candidate, prompt_agent=onecli_agent is None)
         provider = "skip"
     else:
@@ -292,12 +302,15 @@ def serve(host: str, port: int, reload: bool):
     """Start HuddleRoom server (API + task runner + scheduler)."""
     from huddleroom.config import settings as configured_settings
     if configured_settings.credential_mode == "onecli":
-        from huddleroom.onecli import launch_onecli, validate_onecli_context
+        from huddleroom.onecli import launch_onecli, resolve_management_url, validate_onecli_context
+        configured_settings = configured_settings.model_copy(update={
+            "onecli_management_url": resolve_management_url(configured_settings)
+        })
         if os.environ.get("ONECLI_GATEWAY") == "true":
             validate_onecli_context(configured_settings)
         else:
             launch_onecli(configured_settings, host, port, reload)
-    settings = _prepare_database()
+    settings = _prepare_database(configured_settings)
 
     click.echo(f"Starting HuddleRoom on http://{host}:{port}")
     click.echo("Database: " + _get_db_url_display())

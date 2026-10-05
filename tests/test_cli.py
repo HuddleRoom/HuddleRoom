@@ -414,7 +414,11 @@ def test_onecli_wrapped_serve_validates_then_migrates_without_rewrapping(monkeyp
     result = CliRunner().invoke(cli.main, ["serve"])
 
     assert result.exit_code == 0, result.output
-    assert calls == [("validate", configured), ("migrate", configured), ("uvicorn", None)]
+    assert [entry[0] for entry in calls] == ["validate", "migrate", "uvicorn"]
+    validated = calls[0][1]
+    migrated = calls[1][1]
+    assert validated is migrated
+    assert validated.onecli_management_url == onecli.resolve_management_url(configured)
 
 
 def test_run_migrations_upgrades_an_old_database_without_losing_sentinel(tmp_path, monkeypatch):

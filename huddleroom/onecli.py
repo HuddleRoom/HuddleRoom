@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlsplit
 import click
 import httpx
 
-from huddleroom.config import Settings
+from huddleroom.config import Settings, validate_onecli_origin
 
 _TIMEOUT = 5.0
 _RECIPES = {
@@ -46,6 +46,46 @@ _CA_ENV_KEYS = (
 )
 _SAFE_NO_PROXY = "127.0.0.1,localhost,::1"
 _PEM_CERTIFICATE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
+_NATIVE_MANAGEMENT_DEFAULT = "https://api.onecli.sh"
+
+
+def resolve_management_url(config: Settings) -> str:
+    """Use an explicit HuddleRoom origin, otherwise OneCLI's native API host."""
+    if config.setting_was_supplied("onecli_management_url"):
+        return config.onecli_management_url
+    native = os.environ.get("ONECLI_API_HOST")
+    source = "ONECLI_API_HOST"
+    if not native:
+        filename = "config-dev.json" if os.environ.get("ONECLI_ENV") == "dev" else "config.json"
+        source = f"~/.onecli/{filename} api-host"
+        try:
+            value = json.loads((Path.home() / ".onecli" / filename).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return _NATIVE_MANAGEMENT_DEFAULT
+        except (OSError, json.JSONDecodeError):
+            raise OneCliError(
+                f"OneCLI API host from {source} could not be read. Set a valid HTTP(S) origin or "
+                "HUDDLEROOM_ONECLI_MANAGEMENT_URL."
+            ) from None
+        if not isinstance(value, dict):
+            raise OneCliError(
+                f"OneCLI API host from {source} is invalid. Set a valid HTTP(S) origin or "
+                "HUDDLEROOM_ONECLI_MANAGEMENT_URL."
+            )
+        if "api-host" not in value:
+            return _NATIVE_MANAGEMENT_DEFAULT
+        native = value["api-host"]
+    try:
+        return validate_onecli_origin(native)
+    except (TypeError, ValueError):
+        raise OneCliError(
+            f"OneCLI API host from {source} is invalid. Set a valid HTTP(S) origin or "
+            "HUDDLEROOM_ONECLI_MANAGEMENT_URL."
+        ) from None
+
+
+def _safe_endpoint(path: str) -> str:
+    return path.split("?", 1)[0]
 
 
 def _container_config(config: Settings) -> dict[str, Any]:
@@ -242,6 +282,7 @@ def _request(
     project_id: str | None = None,
     expected_status: int | None = None,
 ) -> Any:
+    endpoint = _safe_endpoint(path)
     headers: dict[str, str] = {"Accept": "application/json"}
     if key := _api_key():
         headers["Authorization"] = f"Bearer {key}"
@@ -250,18 +291,43 @@ def _request(
     try:
         with httpx.Client(timeout=_TIMEOUT, trust_env=False, follow_redirects=False) as client:
             response = client.request(method, f"{config.onecli_management_url}/v1{path}", headers=headers, json=body)
+    except httpx.TimeoutException:
+        raise OneCliError(
+            f"OneCLI management request {method} {endpoint} at {config.onecli_management_url} timed out. "
+            "Check OneCLI is running and its API host, or set HUDDLEROOM_ONECLI_MANAGEMENT_URL."
+        ) from None
     except httpx.HTTPError:
-        raise OneCliError("OneCLI management service is unavailable.") from None
+        raise OneCliError(
+            f"OneCLI management service is unavailable: request {method} {endpoint} at {config.onecli_management_url} "
+            "(connection or TLS failed). Check OneCLI is running and its API host, or set "
+            "HUDDLEROOM_ONECLI_MANAGEMENT_URL."
+        ) from None
     if response.status_code in {401, 403}:
-        raise OneCliError("OneCLI management access was denied; log in or request permission.")
+        raise OneCliError(
+            f"OneCLI management request {method} {endpoint} at {config.onecli_management_url} was denied "
+            f"(HTTP {response.status_code}); log in or request permission. Run onecli auth login, then check project access."
+        )
+    if response.status_code == 404 and path.endswith(("/grants", "/effective-credentials")):
+        raise OneCliError(
+            f"OneCLI management request {method} {endpoint} at {config.onecli_management_url} returned HTTP 404. "
+            "Upgrade the OneCLI management service; HuddleRoom requires grants and effective-credentials APIs."
+        )
     if expected_status is not None and response.status_code != expected_status:
         if method == "POST":
             raise OneCliError(
-                "OneCLI did not confirm credential creation. Check OneCLI inventory before retrying; no local changes were written."
+                f"OneCLI did not confirm credential creation: request {method} {endpoint} at "
+                f"{config.onecli_management_url} returned HTTP {response.status_code}. Credential creation may have "
+                "succeeded; check OneCLI inventory before retrying; no local changes were written."
             )
-        raise OneCliError("OneCLI management service returned an unsupported response.")
+        raise OneCliError(
+            f"OneCLI management request {method} {endpoint} at {config.onecli_management_url} returned HTTP "
+            f"{response.status_code}; check the selected API host and service version."
+        )
     if not 200 <= response.status_code < 300:
-        raise OneCliError("OneCLI management request failed. Check the service and selected project.")
+        raise OneCliError(
+            f"OneCLI management request {method} {endpoint} at {config.onecli_management_url} failed "
+            f"(HTTP {response.status_code}). Check the service, selected project, and permissions."
+        )
     try:
         return response.json()
     except ValueError:
@@ -272,10 +338,21 @@ def _gateway_health(config: Settings) -> None:
     try:
         with httpx.Client(timeout=_TIMEOUT, trust_env=False, follow_redirects=False) as client:
             response = client.request("GET", f"{config.onecli_gateway_url}/healthz")
+    except httpx.TimeoutException:
+        raise OneCliError(
+            f"OneCLI gateway is unavailable: GET /healthz at {config.onecli_gateway_url} timed out. "
+            "Check the gateway is running or set HUDDLEROOM_ONECLI_GATEWAY_URL."
+        ) from None
     except httpx.HTTPError:
-        raise OneCliError("OneCLI gateway is unavailable.") from None
+        raise OneCliError(
+            f"OneCLI gateway is unavailable: GET /healthz at {config.onecli_gateway_url} failed "
+            "(connection or TLS failed). Check the gateway is running or set HUDDLEROOM_ONECLI_GATEWAY_URL."
+        ) from None
     if not 200 <= response.status_code < 300:
-        raise OneCliError("OneCLI gateway is unavailable.")
+        raise OneCliError(
+            f"OneCLI gateway is unavailable: GET /healthz at {config.onecli_gateway_url} returned HTTP "
+            f"{response.status_code}. Check the selected gateway and its status."
+        )
 
 
 def _project_id(config: Settings) -> str | None:

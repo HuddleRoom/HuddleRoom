@@ -34,6 +34,30 @@ DEFAULT_CONFIG_FILE = Path.home() / ".huddleroom" / "config.toml"
 DEFAULT_DATA_DIR = Path.home() / ".huddleroom"
 
 
+def validate_onecli_origin(value: str) -> str:
+    """Return a safe OneCLI HTTP(S) origin or reject it."""
+    if not isinstance(value, str):
+        raise ValueError("must have a usable HTTP(S) authority")
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("must have a usable HTTP(S) authority") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+        or port is not None and not 1 <= port <= 65535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("must be an HTTP(S) origin without credentials, path, query, or fragment")
+    return value.rstrip("/")
+
+
 def _toml_values(config_file: Path) -> dict[str, Any]:
     if not config_file.is_file():
         return {}
@@ -145,24 +169,7 @@ class Settings(BaseSettings):
     @field_validator("onecli_management_url", "onecli_gateway_url")
     @classmethod
     def validate_onecli_url(cls, value: str) -> str:
-        parsed = urlsplit(value)
-        try:
-            port = parsed.port
-        except ValueError as error:
-            raise ValueError("must have a usable HTTP(S) authority") from error
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or not parsed.hostname
-            or port is not None and not 1 <= port <= 65535
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in {"", "/"}
-        ):
-            raise ValueError("must be an HTTP(S) origin without credentials, path, query, or fragment")
-        return value.rstrip("/")
+        return validate_onecli_origin(value)
 
     @classmethod
     def settings_customise_sources(
@@ -228,6 +235,10 @@ class Settings(BaseSettings):
 
     def setting_name(self, field: str) -> str:
         return self._setting_names.get(field, f"HUDDLEROOM_{field.upper()}")
+
+    def setting_was_supplied(self, field: str) -> bool:
+        """Whether a configuration source set this field rather than its default."""
+        return field in self._setting_names
 
     @property
     def is_sqlite(self) -> bool:

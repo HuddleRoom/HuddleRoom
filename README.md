@@ -157,6 +157,13 @@ based rather than a claimed server-version floor. A management server that lacks
 the required effective-credentials or grants endpoints is intentionally rejected
 until it is upgraded.
 
+When HuddleRoom has no `onecli_management_url` configured, OneCLI mode uses
+`ONECLI_API_HOST`, then OneCLI's native `~/.onecli/config.json` (or
+`config-dev.json`) `api-host`, then `https://api.onecli.sh`. Set
+`HUDDLEROOM_ONECLI_MANAGEMENT_URL` or pass `--onecli-management-url` to override
+that discovery. Errors name the safe origin, method, endpoint, and HTTP status;
+they never include API keys or response bodies.
+
 ### Troubleshooting
 
 - If `huddleroom` is not found after `pipx install`, ensure pipx's binary directory
