@@ -25,6 +25,10 @@ embedding_model = "text-embedding-3-small"
 
 # ── Orchestration / Meeting Control ───────────────────────────────────────────
 orchestration_model = "openai/gpt-4o-mini"
+# This release supports API via LiteLLM only. Claude/Codex backend values fail closed.
+orchestration_backend = "api"
+# Omit this to preserve the API model default; explicit values need proven LiteLLM metadata.
+# orchestration_effort = "high"
 orchestration_conversation_allowance_tokens = 50000
 orchestration_advisor_allowance_tokens = -1
 orchestration_conversation_investigation_enabled = true

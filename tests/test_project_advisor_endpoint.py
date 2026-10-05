@@ -264,3 +264,23 @@ async def test_get_history_allowance_disabled_snapshot(
     allowance = response.json()["allowance"]
     assert allowance["enabled"] is False
     assert allowance["unlimited"] is False
+
+
+async def test_get_history_reports_zero_remaining_for_unknown_finite_usage(
+    advisor_client, advisor_project, monkeypatch
+):
+    monkeypatch.setattr(
+        "huddleroom.routers.orchestration_advisor.settings.orchestration_advisor_allowance_tokens", 1_000,
+    )
+
+    async def unknown_usage(*_args):
+        return None
+
+    monkeypatch.setattr(advisor_router, "advisor_allowance_used", unknown_usage)
+
+    response = await advisor_client.get(
+        f"/api/v1/projects/{advisor_project.id}/orchestration/conversation",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["allowance"]["remaining"] == 0

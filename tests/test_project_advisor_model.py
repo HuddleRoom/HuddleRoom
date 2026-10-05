@@ -37,6 +37,17 @@ def test_migration_045_round_trip_creates_advisor_table(tmp_path):
         assert "project_advisor_turns" not in tables
 
 
+def test_migration_047_allows_unknown_advisor_usage(tmp_path):
+    db_path = tmp_path / "project_advisor_usage.db"
+    env = {**os.environ, "RALLY_DATABASE_URL": f"sqlite+aiosqlite:///{db_path}"}
+
+    _alembic(env, "upgrade", "047")
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1]: row[3] for row in connection.execute("PRAGMA table_info(project_advisor_turns)")}
+
+    assert columns["tokens_used"] == 0
+
+
 @pytest.mark.asyncio
 async def test_advisor_allowance_used_sums_settled_rows(db_session, test_user, test_project):
     from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn, advisor_allowance_used
@@ -69,3 +80,18 @@ async def test_advisor_allowance_used_defaults_to_zero_with_no_rows(db_session, 
     from huddleroom.models.orchestration_advisor import advisor_allowance_used
 
     assert await advisor_allowance_used(db_session, test_project.id, test_user.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_advisor_allowance_used_is_unknown_when_a_settled_turn_lacks_usage(db_session, test_user, test_project):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn, advisor_allowance_used
+
+    db_session.add(
+        ProjectAdvisorTurn(
+            project_id=test_project.id, actor_id=test_user.id,
+            question="q", answer="a", status="completed", tokens_used=None,
+        )
+    )
+    await db_session.flush()
+
+    assert await advisor_allowance_used(db_session, test_project.id, test_user.id) is None

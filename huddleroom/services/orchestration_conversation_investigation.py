@@ -14,11 +14,11 @@ from datetime import timedelta
 from collections.abc import Mapping
 from typing import Any, Callable, Literal
 
-import litellm
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from huddleroom.config import settings
+from huddleroom.services.orchestration_completion import get_orchestration_completion
 from huddleroom.database import AsyncSessionLocal
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration_conversation import (
@@ -592,9 +592,11 @@ class ConversationInvestigationService:
     """One durable, bounded provider operation for an already-running response."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal,
-                 completion_fn: Callable[..., Any] = litellm.acompletion, lookup_fn=None,
+                 completion_fn: Callable[..., Any] | None = None, lookup_fn=None,
                  orchestration_service: OrchestrationService | None = None, reader=None):
-        self._session_factory, self._completion_fn, self._lookup_fn = session_factory, completion_fn, lookup_fn
+        self._session_factory, self._completion_fn, self._lookup_fn = (
+            session_factory, get_orchestration_completion(completion_fn), lookup_fn
+        )
         self._orchestration = orchestration_service or OrchestrationService()
         self._reader = reader or ProjectInvestigationReader()
 

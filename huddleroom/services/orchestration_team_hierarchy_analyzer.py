@@ -7,9 +7,11 @@ import os
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import UUID
 
-import litellm
-
 from huddleroom.config import settings
+from huddleroom.services.orchestration_completion import (
+    get_orchestration_completion,
+    orchestration_runtime_metadata,
+)
 from huddleroom.schemas.agent import AgentCreate
 from huddleroom.services.orchestration_agent_definition_analyzer import (
     _required_text,
@@ -211,7 +213,7 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
 
 class TeamHierarchyAnalyzer:
     def __init__(self, completion_fn: Callable[..., Awaitable[Any]] | None = None) -> None:
-        self._completion_fn = completion_fn or litellm.acompletion
+        self._completion_fn = get_orchestration_completion(completion_fn)
 
     @staticmethod
     def build_request(payload: Mapping[str, Any], project=None) -> dict[str, Any]:
@@ -263,8 +265,10 @@ class TeamHierarchyAnalyzer:
             if project_id is None:
                 return await complete_with_repair(*args)
             from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
+            invocation_kind, runtime_model = orchestration_runtime_metadata(self._completion_fn, request["model"])
             return await complete_with_repair(*args, invocation=AgentResponseInvocation(InvocationContext(
-                project_id, "system", "orchestrator", "Orchestrator", "api", "team_hierarchy", request["model"],
+                project_id, "system", "orchestrator", "Orchestrator", invocation_kind, "team_hierarchy",
+                runtime_model,
                 "Design the smallest team and reporting structure that covers the required work.",
             )))
         except Exception as exc:
