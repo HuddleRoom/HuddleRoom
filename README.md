@@ -152,10 +152,9 @@ need an effective provider credential through the selected gateway. OneCLI mode
 fails closed if the CLI/service/gateway, selected agent, or required modern schema
 is unavailable; it does not fall back to direct credentials.
 
-The verified development CLI is OneCLI 2.11.0, but support is capability/schema
-based rather than a claimed server-version floor. A management server that lacks
-the required effective-credentials or grants endpoints is intentionally rejected
-until it is upgraded.
+The verified development CLI is OneCLI 2.11.0. HuddleRoom requires management
+server 1.44.0 or later with the effective-credentials and grants API contract;
+it still verifies those capabilities rather than trusting a version number alone.
 
 When HuddleRoom has no `onecli_management_url` configured, OneCLI mode uses
 `ONECLI_API_HOST`, then OneCLI's native `~/.onecli/config.json` (or

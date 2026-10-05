@@ -1244,6 +1244,280 @@ def test_missing_required_grants_endpoint_requests_management_upgrade_without_ec
     assert "old-server-secret-body" not in message
 
 
+def test_setup_reports_known_incompatible_server_version_for_missing_grants(monkeypatch):
+    """A pre-grants server version makes a required-endpoint 404 actionable."""
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    private_body = "grants-error-body-must-stay-private"
+    responses = {
+        ("GET", "http://management/v1/health"): _response(200, {"version": "1.41.0"}),
+        ("GET", "http://management/v1/agents"): _response(
+            200, [{"id": "agent-id", "identifier": "gateway", "name": "Gateway"}]
+        ),
+        ("GET", "http://management/v1/agents/agent-id/grants"): _response(404, {"error": private_body}),
+    }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **_kwargs):
+            return responses[(method, url)]
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    monkeypatch.setattr(onecli, "_check_cli_capabilities", lambda: None)
+    monkeypatch.setattr(onecli, "_gateway_health", lambda *_args: None)
+    monkeypatch.setattr(onecli, "_project_id", lambda *_args: None)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.setup_onecli(
+            Settings(
+                _env_file=None,
+                onecli_agent="gateway",
+                onecli_management_url="http://management",
+                onecli_gateway_url="http://gateway",
+            ),
+            prompt_agent=False,
+        )
+
+    message = str(error.value)
+    assert "version error" in message.lower()
+    assert "incompatible" in message.lower()
+    assert "detected 1.41.0" in message
+    assert "requires 1.44.0 or later" in message
+    assert private_body not in message
+
+
+def test_verify_reports_known_incompatible_server_version_for_missing_effective_credentials(monkeypatch):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    private_body = "effective-error-body-must-stay-private"
+    responses = {
+        ("GET", "http://management/v1/health"): _response(200, {"version": "1.41.0"}),
+        ("GET", "http://management/v1/agents"): _response(
+            200, [{"id": "agent-id", "identifier": "gateway", "name": "Gateway"}]
+        ),
+        ("GET", "http://management/v1/agents/agent-id/effective-credentials"): _response(404, {"error": private_body}),
+    }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **_kwargs):
+            return responses[(method, url)]
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    monkeypatch.setattr(onecli, "_check_cli_capabilities", lambda: None)
+    monkeypatch.setattr(onecli, "_gateway_health", lambda *_args: None)
+    monkeypatch.setattr(onecli, "_project_id", lambda *_args: None)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.verify_onecli(
+            Settings(
+                _env_file=None,
+                onecli_agent="gateway",
+                onecli_management_url="http://management",
+                onecli_gateway_url="http://gateway",
+            )
+        )
+
+    message = str(error.value)
+    assert "version error" in message.lower()
+    assert "incompatible" in message.lower()
+    assert "detected 1.41.0" in message
+    assert "requires 1.44.0 or later" in message
+    assert private_body not in message
+
+
+def test_setup_reports_known_incompatible_server_version_for_effective_credentials(monkeypatch):
+    """Setup reaches effective access through _credentials after grants succeed."""
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    responses = {
+        ("GET", "http://management/v1/health"): _response(200, {"version": "1.41.0"}),
+        ("GET", "http://management/v1/agents"): _response(
+            200, [{"id": "agent-id", "identifier": "gateway", "name": "Gateway"}]
+        ),
+        ("GET", "http://management/v1/agents/agent-id/grants"): _response(
+            200, {"agentId": "agent-id", "mode": "grants", "connections": [], "secrets": []}
+        ),
+        ("GET", "http://management/v1/secrets"): _response(200, []),
+        ("GET", "http://management/v1/agents/agent-id/effective-credentials"): _response(
+            404, {"error": "credential-error-body-must-stay-private"}
+        ),
+    }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **_kwargs):
+            return responses[(method, url)]
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    monkeypatch.setattr(onecli, "_check_cli_capabilities", lambda: None)
+    monkeypatch.setattr(onecli, "_gateway_health", lambda *_args: None)
+    monkeypatch.setattr(onecli, "_project_id", lambda *_args: None)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.setup_onecli(
+            Settings(
+                _env_file=None,
+                onecli_agent="gateway",
+                onecli_management_url="http://management",
+                onecli_gateway_url="http://gateway",
+            ),
+            prompt_agent=False,
+        )
+
+    message = str(error.value)
+    assert "version error" in message.lower()
+    assert "incompatible" in message.lower()
+    assert "detected 1.41.0" in message
+    assert "requires 1.44.0 or later" in message
+    assert "credential-error-body-must-stay-private" not in message
+
+
+@pytest.mark.parametrize(
+    ("health", "reports_current_server"),
+    [
+        ({}, False),
+        ({"version": "1.41.0 private-version-must-not-appear"}, False),
+        ({"version": ["1.41.0"]}, False),
+        ({"version": "1.44.0"}, True),
+    ],
+)
+def test_missing_required_api_reports_only_safe_version_details(monkeypatch, health, reports_current_server):
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    responses = {
+        ("GET", "http://management/v1/health"): _response(200, health),
+        ("GET", "http://management/v1/agents"): _response(
+            200, [{"id": "agent-id", "identifier": "gateway", "name": "Gateway"}]
+        ),
+        ("GET", "http://management/v1/agents/agent-id/grants"): _response(404, {"error": "private-404-body"}),
+    }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **_kwargs):
+            return responses[(method, url)]
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    monkeypatch.setattr(onecli, "_check_cli_capabilities", lambda: None)
+    monkeypatch.setattr(onecli, "_gateway_health", lambda *_args: None)
+    monkeypatch.setattr(onecli, "_project_id", lambda *_args: None)
+
+    with pytest.raises(onecli.OneCliError) as error:
+        onecli.setup_onecli(
+            Settings(
+                _env_file=None,
+                onecli_agent="gateway",
+                onecli_management_url="http://management",
+                onecli_gateway_url="http://gateway",
+            ),
+            prompt_agent=False,
+        )
+
+    message = str(error.value)
+    assert "upgrade" in message.lower()
+    assert "incompatible" not in message.lower()
+    if reports_current_server:
+        assert "api compatibility error" in message.lower()
+        assert "detected server 1.44.0" in message
+        assert "api host" in message.lower()
+        assert "deployment" in message.lower()
+        assert "version error" not in message.lower()
+        assert "requires 1.44.0" not in message
+    else:
+        assert "detected" not in message.lower()
+        assert "1.44.0" not in message
+    assert "private-version-must-not-appear" not in message
+    assert "private-404-body" not in message
+
+
+def test_setup_accepts_old_server_when_required_apis_are_available(monkeypatch):
+    """Endpoint capability succeeds even when an older server reports a backport version."""
+    from huddleroom.config import Settings
+    import huddleroom.onecli as onecli
+
+    responses = {
+        ("GET", "http://management/v1/health"): _response(200, {"version": "1.41.0"}),
+        ("GET", "http://management/v1/agents"): _response(
+            200, [{"id": "agent-id", "identifier": "gateway", "name": "Gateway"}]
+        ),
+        ("GET", "http://management/v1/agents/agent-id/grants"): _response(
+            200, {"agentId": "agent-id", "mode": "grants", "connections": [], "secrets": []}
+        ),
+        ("GET", "http://management/v1/secrets"): _response(200, []),
+        ("GET", "http://management/v1/agents/agent-id/effective-credentials"): _response(
+            200, {"agentId": "agent-id", "mode": "selective", "secrets": [], "connections": []}
+        ),
+    }
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def request(self, method, url, **_kwargs):
+            return responses[(method, url)]
+
+    monkeypatch.setattr(onecli.httpx, "Client", Client)
+    monkeypatch.setattr(onecli, "_check_cli_capabilities", lambda: None)
+    monkeypatch.setattr(onecli, "_gateway_health", lambda *_args: None)
+    monkeypatch.setattr(onecli, "_project_id", lambda *_args: None)
+    monkeypatch.setattr(onecli.click, "confirm", lambda *_args, **_kwargs: False)
+
+    updates = onecli.setup_onecli(
+        Settings(
+            _env_file=None,
+            onecli_agent="gateway",
+            onecli_management_url="http://management",
+            onecli_gateway_url="http://gateway",
+        ),
+        prompt_agent=False,
+    )
+
+    assert updates["onecli_agent"] == "gateway"
+
+
 def test_gateway_outage_names_selected_origin_without_transport_details(monkeypatch):
     from huddleroom.config import Settings
     import huddleroom.onecli as onecli

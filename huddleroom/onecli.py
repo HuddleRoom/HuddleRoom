@@ -46,6 +46,7 @@ _CA_ENV_KEYS = (
 )
 _SAFE_NO_PROXY = "127.0.0.1,localhost,::1"
 _PEM_CERTIFICATE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL)
+_SAFE_VERSION = re.compile(r"^(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d{0,2})$")
 _NATIVE_MANAGEMENT_DEFAULT = "https://api.onecli.sh"
 
 
@@ -86,6 +87,15 @@ def resolve_management_url(config: Settings) -> str:
 
 def _safe_endpoint(path: str) -> str:
     return path.split("?", 1)[0]
+
+
+def _server_version(health: dict[str, Any]) -> str | None:
+    value = health.get("version")
+    return value if isinstance(value, str) and _SAFE_VERSION.fullmatch(value) else None
+
+
+def _server_predates_grants_api(version: str | None) -> bool:
+    return version is not None and tuple(map(int, version.split("."))) < (1, 44, 0)
 
 
 def _container_config(config: Settings) -> dict[str, Any]:
@@ -281,6 +291,7 @@ def _request(
     body: dict | None = None,
     project_id: str | None = None,
     expected_status: int | None = None,
+    server_version: str | None = None,
 ) -> Any:
     endpoint = _safe_endpoint(path)
     headers: dict[str, str] = {"Accept": "application/json"}
@@ -308,9 +319,21 @@ def _request(
             f"(HTTP {response.status_code}); log in or request permission. Run onecli auth login, then check project access."
         )
     if response.status_code == 404 and path.endswith(("/grants", "/effective-credentials")):
+        if _server_predates_grants_api(server_version):
+            version = (
+                f"OneCLI management server version error: detected {server_version} is incompatible; HuddleRoom "
+                "requires 1.44.0 or later. Upgrade the management service; 1.44.0 introduced these APIs. "
+            )
+        elif server_version:
+            version = (
+                f"OneCLI management API compatibility error: detected server {server_version} is missing the required API "
+                "contract; upgrade or repair the selected API host and management-server deployment. "
+            )
+        else:
+            version = "Upgrade the OneCLI management service; "
         raise OneCliError(
             f"OneCLI management request {method} {endpoint} at {config.onecli_management_url} returned HTTP 404. "
-            "Upgrade the OneCLI management service; HuddleRoom requires grants and effective-credentials APIs."
+            f"{version}HuddleRoom requires grants and effective-credentials APIs."
         )
     if expected_status is not None and response.status_code != expected_status:
         if method == "POST":
@@ -375,8 +398,12 @@ def _agents(config: Settings, project_id: str | None) -> list[dict[str, Any]]:
     return value
 
 
-def _effective(config: Settings, agent_id: str, project_id: str | None) -> dict[str, Any]:
-    value = _request(config, "GET", f"/agents/{agent_id}/effective-credentials", project_id=project_id)
+def _effective(
+    config: Settings, agent_id: str, project_id: str | None, server_version: str | None = None
+) -> dict[str, Any]:
+    value = _request(
+        config, "GET", f"/agents/{agent_id}/effective-credentials", project_id=project_id, server_version=server_version
+    )
     if (
         not isinstance(value, dict)
         or value.get("agentId") != agent_id
@@ -405,6 +432,7 @@ def verify_onecli(config: Settings, *, require_agent: bool = True) -> dict[str, 
     health = _request(config, "GET", "/health")
     if not isinstance(health, dict):
         raise OneCliError("OneCLI management service returned an unsupported response.")
+    server_version = _server_version(health)
     _gateway_health(config)
     project_id = _project_id(config)
     if not config.onecli_agent:
@@ -414,15 +442,17 @@ def verify_onecli(config: Settings, *, require_agent: bool = True) -> dict[str, 
     found = next((agent for agent in _agents(config, project_id) if agent.get("identifier") == config.onecli_agent), None)
     if not found or not all(isinstance(found.get(field), str) for field in ("id", "identifier", "name")):
         raise OneCliError("The selected OneCLI gateway agent was not found.")
-    _effective(config, found["id"], project_id)
+    _effective(config, found["id"], project_id, server_version)
     return {field: found[field] for field in ("id", "identifier", "name")}
 
 
-def _credentials(config: Settings, agent_id: str, project_id: str | None) -> list[dict[str, Any]]:
+def _credentials(
+    config: Settings, agent_id: str, project_id: str | None, server_version: str | None = None
+) -> list[dict[str, Any]]:
     metadata = _request(config, "GET", "/secrets", project_id=project_id)
     if not isinstance(metadata, list) or any(not isinstance(item, dict) for item in metadata):
         raise OneCliError("OneCLI management service returned an unsupported response.")
-    effective = _effective(config, agent_id, project_id)
+    effective = _effective(config, agent_id, project_id, server_version)
     statuses = {(item["id"], item["host"]): item["status"] for item in effective["secrets"]}
     results = []
     for item in metadata:
@@ -459,8 +489,10 @@ def _create_agent(config: Settings, identifier: str, project_id: str | None) -> 
     return {field: value[field] for field in ("id", "identifier", "name")}
 
 
-def _grants(config: Settings, agent_id: str, project_id: str | None) -> dict[str, Any]:
-    value = _request(config, "GET", f"/agents/{agent_id}/grants", project_id=project_id)
+def _grants(
+    config: Settings, agent_id: str, project_id: str | None, server_version: str | None = None
+) -> dict[str, Any]:
+    value = _request(config, "GET", f"/agents/{agent_id}/grants", project_id=project_id, server_version=server_version)
     if (
         not isinstance(value, dict)
         or value.get("agentId") != agent_id
@@ -477,10 +509,12 @@ def _grants(config: Settings, agent_id: str, project_id: str | None) -> dict[str
     return value
 
 
-def _attach_secret(config: Settings, agent_id: str, secret_id: str, project_id: str | None) -> None:
+def _attach_secret(
+    config: Settings, agent_id: str, secret_id: str, project_id: str | None, server_version: str | None = None
+) -> None:
     # The endpoint is explicitly additive and accepts no body.  Re-read
     # effective access below; a grant can still be blocked by policy.
-    _grants(config, agent_id, project_id)
+    _grants(config, agent_id, project_id, server_version)
     _request(config, "PUT", f"/agents/{agent_id}/grants/secrets/{secret_id}", project_id=project_id)
 
 
@@ -541,7 +575,10 @@ def setup_onecli(config: Settings, *, prompt_agent: bool = True) -> dict[str, st
     """Interactively choose a gateway identity and report conservative provider access."""
     _RETAINED_RESOURCE_IDS.set(())
     _check_cli_capabilities()
-    _request(config, "GET", "/health")
+    health = _request(config, "GET", "/health")
+    if not isinstance(health, dict):
+        raise OneCliError("OneCLI management service returned an unsupported response.")
+    server_version = _server_version(health)
     _gateway_health(config)
     project_id = _project_id(config)
     identifier = (
@@ -559,9 +596,9 @@ def setup_onecli(config: Settings, *, prompt_agent: bool = True) -> dict[str, st
         selected = _create_agent(config, identifier, project_id)
     if not all(isinstance(selected.get(field), str) for field in ("id", "identifier", "name")):
         raise OneCliError("OneCLI management service returned an unsupported response.")
-    grants = _grants(config, selected["id"], project_id)
+    grants = _grants(config, selected["id"], project_id, server_version)
     granted_ids = {item["secretId"] for item in grants["secrets"]}
-    available = _credentials(config, selected["id"], project_id)
+    available = _credentials(config, selected["id"], project_id, server_version)
     for provider in _RECIPES:
         status = next(
             (item["status"] for item in available if item["type"] == provider and not item.get("manual")),
@@ -580,9 +617,9 @@ def setup_onecli(config: Settings, *, prompt_agent: bool = True) -> dict[str, st
             click.echo(f"{item['type'].title()} credential {item['id']} is granted but {item['status']}; policy was not changed.")
             continue
         if click.confirm(f"Attach existing {item['type'].title()} credential {item['id']} additively?", default=False):
-            _attach_secret(config, selected["id"], item["id"], project_id)
-            available = _credentials(config, selected["id"], project_id)
-            grants = _grants(config, selected["id"], project_id)
+            _attach_secret(config, selected["id"], item["id"], project_id, server_version)
+            available = _credentials(config, selected["id"], project_id, server_version)
+            grants = _grants(config, selected["id"], project_id, server_version)
             granted_ids = {entry["secretId"] for entry in grants["secrets"]}
     for provider in _RECIPES:
         if any(item["type"] == provider and not item.get("manual") for item in available):
@@ -591,14 +628,14 @@ def setup_onecli(config: Settings, *, prompt_agent: bool = True) -> dict[str, st
             secret_id = _create_secret(config, provider, project_id)
             # Server settings may auto-attach.  Never retry POST after an
             # uncertain result; inspect inventory/effective access instead.
-            available = _credentials(config, selected["id"], project_id)
-            grants = _grants(config, selected["id"], project_id)
+            available = _credentials(config, selected["id"], project_id, server_version)
+            grants = _grants(config, selected["id"], project_id, server_version)
             granted_ids = {entry["secretId"] for entry in grants["secrets"]}
             if secret_id not in granted_ids and click.confirm(
                 f"Attach credential {secret_id} additively?", default=False
             ):
-                _attach_secret(config, selected["id"], secret_id, project_id)
-                available = _credentials(config, selected["id"], project_id)
+                _attach_secret(config, selected["id"], secret_id, project_id, server_version)
+                available = _credentials(config, selected["id"], project_id, server_version)
     click.echo("Credential access is representative; path or method policy may still deny model or embedding requests.")
     return {
         "credential_mode": "onecli",
