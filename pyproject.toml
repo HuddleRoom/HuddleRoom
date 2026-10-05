@@ -24,7 +24,6 @@ dependencies = [
 
 [project.scripts]
 huddleroom = "huddleroom.cli:main"
-rally = "huddleroom.cli:main"
 
 [project.optional-dependencies]
 postgres = [

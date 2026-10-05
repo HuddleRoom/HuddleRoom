@@ -331,6 +331,7 @@ def _install_and_exercise(wheel: Path, root: Path) -> None:
         timeout=COMMAND_TIMEOUT,
     )
     assert "Usage:" in help_result.stdout
+    assert not (install_root / "bin" / "rally").exists()
     _run(
         [str(install_root / "bin" / "huddleroom"), "init-db"],
         cwd=empty_cwd,

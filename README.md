@@ -49,7 +49,7 @@ configuration. Remove that data only when it is no longer needed:
 rm -rf ~/.huddleroom
 ```
 
-Existing Rally installations can continue to use `rally` and `RALLY_*` settings for one release. They are deprecated; switch to `huddleroom` and `HUDDLEROOM_*` before the next release.
+Legacy `RALLY_*` settings remain accepted for one release. They are deprecated; switch to `HUDDLEROOM_*` before the next release. The installed command is `huddleroom`.
 
 ### Develop from source
 
