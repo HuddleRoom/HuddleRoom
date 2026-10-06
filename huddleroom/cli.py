@@ -194,7 +194,7 @@ def _database_path(database_url: str) -> str:
 
 
 def _orchestration_backend_availability() -> dict[str, tuple[bool, bool]]:
-    """Report PATH installation separately from the verified safe contract."""
+    """Report PATH installation and backend availability separately."""
     from huddleroom.services.orchestration_completion import is_orchestration_backend_supported
 
     return {
@@ -283,10 +283,10 @@ def setup(
     availability = _orchestration_backend_availability()
     backend_was_prompted = orchestration_backend is None and provider is None and credential_mode is None
     if orchestration_backend is None:
-        default_backend = settings.orchestration_backend if availability[settings.orchestration_backend][1] else "api"
+        default_backend = settings.orchestration_backend if availability[settings.orchestration_backend][0] else "api"
         if backend_was_prompted:
-            choices = [backend for backend, (_installed, supported) in availability.items() if supported]
-            if not availability[settings.orchestration_backend][1]:
+            choices = [backend for backend, (installed, _supported) in availability.items() if installed]
+            if not availability[settings.orchestration_backend][0]:
                 click.echo(f"Configured {settings.orchestration_backend} orchestration backend is unavailable.")
             orchestration_backend = click.prompt(
                 "Orchestration backend", type=click.Choice(choices), default=default_backend
@@ -302,20 +302,18 @@ def setup(
             "CLI orchestration setup cannot be combined with provider, credential, or orchestration-model options. "
             "Configure those separately. No changes were written."
         )
-    installed, supported = availability[orchestration_backend]
+    installed, _supported = availability[orchestration_backend]
     if not installed:
         raise click.ClickException(
             f"The {orchestration_backend} CLI is not installed. Install it, then rerun setup. No changes were written."
         )
-    if not supported:
-        raise click.ClickException(
-            f"The {orchestration_backend} CLI is installed (authentication is not verified) but unsupported because "
-            "its safe no-tools contract is not verified. No changes were written."
-        )
-
     if orchestration_backend != "api":
         orchestration_effort, remove_effort = _resolve_orchestration_effort(
-            orchestration_backend, None, orchestration_effort, settings.orchestration_effort, interactive=backend_was_prompted
+            orchestration_backend,
+            None,
+            orchestration_effort,
+            settings.orchestration_effort,
+            interactive=backend_was_prompted,
         )
         database_path = database_path or click.prompt("Database path", default=_database_path(settings.database_url))
         workspace_dir = workspace_dir or click.prompt("Workspace directory", default=settings.workspace_dir)

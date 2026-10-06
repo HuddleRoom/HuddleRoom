@@ -438,8 +438,13 @@ def _assert_configured_cli_fails_closed(
     )
 
     assert result.returncode != 0
-    assert f"The {backend} orchestration backend is unsupported" in result.stdout + result.stderr
-    assert not marker.exists()
+    combined = result.stdout + result.stderr
+    if cli_is_on_path:
+        assert f"The {backend} CLI is not signed in" in combined
+        assert marker.exists()
+    else:
+        assert f"The {backend} CLI is not installed or is not on PATH" in combined
+        assert not marker.exists()
     assert not database.exists()
 
 

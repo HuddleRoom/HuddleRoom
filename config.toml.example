@@ -24,10 +24,10 @@ api_base_url = "http://localhost:8000"
 embedding_model = "text-embedding-3-small"
 
 # ── Orchestration / Meeting Control ───────────────────────────────────────────
-orchestration_model = "openai/gpt-4o-mini"
-# This release supports API via LiteLLM only. Claude/Codex backend values fail closed.
+orchestration_model = "openai/gpt-4o-mini" # API via LiteLLM only; CLI backends use their native default model.
+# API via LiteLLM, or an installed and authenticated Claude/Codex CLI.
 orchestration_backend = "api"
-# Omit this to preserve the API model default; explicit values need proven LiteLLM metadata.
+# Omit this to preserve the backend default; explicit values need backend metadata.
 # orchestration_effort = "high"
 orchestration_conversation_allowance_tokens = 50000
 orchestration_advisor_allowance_tokens = -1

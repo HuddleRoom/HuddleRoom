@@ -118,26 +118,26 @@ same process environment, `.env`, TOML precedence.
 
 ### Orchestration backend
 
-`huddleroom setup` is the backend-selection step after `pipx install`. This
-release runs orchestration through **API via LiteLLM** only. The Claude and
-Codex CLIs may be detected on `PATH`, but they are intentionally unavailable:
-their versioned no-tools and configuration-isolation contracts have not been
-proven. A manually configured `orchestration_backend = "claude"` or `"codex"`
-fails at `serve` before any database or workspace work, and never falls back
-to an API provider.
+`huddleroom setup` selects **API via LiteLLM**, or an installed **Claude** or
+**Codex** CLI. Authenticate the selected CLI first with `claude auth login` or
+`codex login`; setup only checks `PATH` and makes neither an authentication nor
+a model request. CLI orchestration uses the CLI's native default model, so it
+preserves API provider credentials and `orchestration_model` for later API use.
+Each completion uses a fresh noninteractive CLI process with structured output;
+HuddleRoom does not resume sessions or execute returned tool calls. The CLI's
+own practical restrictions apply, but they do not guarantee that every tool or
+managed hook is disabled. Failures never fall back to an API provider.
 
 This backend setting affects orchestration decisions, analysis, conversation,
 and the project advisor. It does not change worker agents, embeddings, meeting
 intelligence/outcomes, or OneCLI.
 
 `orchestration_effort` is optional. Leave it unset, or pass
-`--orchestration-effort default`, to preserve the selected model's default.
-An explicit API effort is accepted only when LiteLLM metadata proves that exact
-level for the selected `orchestration_model`; unknown metadata fails safely and
-does not silently downgrade. Categorical effort is separate from provider
-numeric thinking budgets. A future supported CLI backend will require its own
-login/status contract (`claude auth status` or `codex login status`) before it
-can be selected; setup itself does not authenticate or make a model request.
+`--orchestration-effort default`, to preserve the backend default. An explicit
+API effort needs exact LiteLLM metadata; an explicit CLI effort needs the
+selected CLI's native metadata for its default model. Unknown metadata fails
+safely and does not silently translate or downgrade. Categorical effort is
+separate from provider numeric thinking budgets.
 
 For API adapter agents to call LLMs, add provider credentials to either configuration file:
 
