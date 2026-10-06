@@ -124,10 +124,7 @@ def test_setup_cli_backend_preserves_api_model_and_saves_default_effort_removal(
     assert 'orchestration_model = "openai/saved"' in saved
 
 
-def test_setup_rejects_installed_but_unsupported_cli_without_writing(setup_home, monkeypatch):
-    setup_home.parent.mkdir()
-    original = 'custom = "keep"\n'
-    setup_home.write_text(original)
+def test_setup_accepts_an_installed_cli_without_a_static_support_probe(setup_home, monkeypatch):
     cli = importlib.import_module("huddleroom.cli")
     completion = importlib.import_module("huddleroom.services.orchestration_completion")
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/bin/{name}" if name == "codex" else None)
@@ -135,10 +132,8 @@ def test_setup_rejects_installed_but_unsupported_cli_without_writing(setup_home,
 
     result = _invoke(["--orchestration-backend", "codex", "--database-path", "state.db", "--workspace-dir", "workspace"])
 
-    assert result.exit_code != 0
-    assert setup_home.read_text() == original
-    assert "installed" in result.output.lower()
-    assert "unsupported" in result.output.lower()
+    assert result.exit_code == 0, result.output
+    assert 'orchestration_backend = "codex"' in setup_home.read_text()
 
 
 def test_setup_switch_preserves_compatible_saved_effort(setup_home, monkeypatch):

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -33,8 +34,8 @@ def _default_completion_services(completion_fn=None):
 
 
 @pytest.mark.asyncio
-async def test_all_control_plane_defaults_route_api_or_fail_closed_for_each_cli(monkeypatch):
-    """All ten control-plane constructors use one selected boundary, never LiteLLM in CLI mode."""
+async def test_all_control_plane_defaults_route_api_or_selected_cli_boundary(monkeypatch):
+    """All ten control-plane constructors retain one selected API or CLI boundary."""
     from huddleroom.config import settings
     from huddleroom.services import orchestration_completion
 
@@ -52,18 +53,14 @@ async def test_all_control_plane_defaults_route_api_or_fail_closed_for_each_cli(
         await service._completion_fn(model="provider/model", messages=[])
     assert len(api_calls) == 10
 
-    async def forbidden_api(**_request):
-        raise AssertionError("CLI orchestration must not fall back to LiteLLM")
-
-    monkeypatch.setattr(orchestration_completion.litellm, "acompletion", forbidden_api)
     for backend in ("claude", "codex"):
         monkeypatch.setattr(settings, "orchestration_backend", backend)
         cli_services = _default_completion_services()
         for service in cli_services:
             assert service._completion_fn is orchestration_completion.orchestration_completion
-            with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
-                await service._completion_fn(model="provider/model", messages=[])
-            assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
+            assert orchestration_completion.orchestration_runtime_metadata(
+                service._completion_fn, "provider/model"
+            ) == ("cli_main", f"{backend} CLI (configured CLI default)")
 
 
 def test_all_control_plane_constructors_preserve_explicit_completion_injection():
@@ -104,7 +101,7 @@ async def test_api_backend_delegates_request_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cli_backend_fails_closed_without_calling_api(monkeypatch):
+async def test_missing_cli_backend_never_falls_back_to_api(monkeypatch):
     from huddleroom.config import settings
     from huddleroom.services import orchestration_completion
 
@@ -115,10 +112,562 @@ async def test_cli_backend_fails_closed_without_calling_api(monkeypatch):
 
     monkeypatch.setattr(orchestration_completion.litellm, "acompletion", api_call)
 
-    with pytest.raises(orchestration_completion.OrchestrationBackendError, match="no-tools isolation") as error:
+    monkeypatch.setattr(orchestration_completion, "shutil", SimpleNamespace(which=lambda _name: None), raising=False)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
         await orchestration_completion.orchestration_completion(messages=[])
 
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MISSING
+
+
+@pytest.mark.asyncio
+async def test_claude_gateway_preflights_auth_and_normalizes_native_envelope(monkeypatch, tmp_path):
+    """Claude uses its authenticated print contract without model or effort overrides by default."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    calls = _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: (
+            b'{"loggedIn": true}' if argv[-2:] == ("auth", "status") else
+            b'{"structured_output":{"content":"Claude result","tool_calls":[]},'
+            b'"usage":{"input_tokens":3,"output_tokens":4,'
+            b'"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+        ),
+    )
+
+    orchestration_completion.validate_orchestration_backend()
+    result = await orchestration_completion.orchestration_completion(
+        model="ignored/request-model", messages=[{"role": "user", "content": "hello"}]
+    )
+
+    assert calls[0][0][-2:] == ("auth", "status")
+    argv, stdin = next((argv, stdin) for argv, stdin in calls if "--print" in argv)
+    assert {"--print", "--output-format", "json", "--no-session-persistence"} <= set(argv)
+    assert "--model" not in argv
+    assert "--effort" not in argv
+    assert b"hello" in stdin
+    assert result == {
+        "choices": [{"message": {"content": "Claude result", "tool_calls": []}}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_gateway_preflights_auth_reads_artifact_and_normalizes_one_known_tool(monkeypatch, tmp_path):
+    """Codex reads the ephemeral result artifact and permits one declared function call."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    envelope = {
+        "content": "",
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'}}],
+    }
+
+    def codex_response(argv):
+        if argv[-2:] == ("login", "status"):
+            return {"stderr": b"Logged in with ChatGPT", "returncode": 0}
+        output_path = Path(argv[argv.index("--output-last-message") + 1])
+        output_path.write_text(json.dumps(envelope))
+        return b'{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":2}}\n'
+
+    calls = _install_fake_cli(
+        monkeypatch, orchestration_completion, "codex", tmp_path / "codex", codex_response
+    )
+
+    orchestration_completion.validate_orchestration_backend()
+    result = await orchestration_completion.orchestration_completion(
+        model="ignored/request-model",
+        messages=[{"role": "user", "content": "lookup x"}],
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+    )
+
+    assert calls[0][0][-2:] == ("login", "status")
+    argv, stdin = next((argv, stdin) for argv, stdin in calls if "exec" in argv)
+    assert {"exec", "--ephemeral", "--json", "--output-schema", "--output-last-message"} <= set(argv)
+    assert "--model" not in argv
+    assert "model_reasoning_effort=" not in " ".join(argv)
+    assert b"lookup x" in stdin
+    message = result["choices"][0]["message"]
+    assert message["content"] == ""
+    assert message["tool_calls"][0] == {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+    }
+    assert result["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_omits_usage_when_native_output_cannot_prove_it(monkeypatch, tmp_path):
+    """CLI backends must not invent token usage from absent native accounting."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: (
+            b'{"loggedIn":true}' if argv[-2:] == ("auth", "status")
+            else b'{"structured_output":{"content":"No usage","tool_calls":[]}}'
+        ),
+    )
+
+    result = await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert result["choices"][0]["message"]["content"] == "No usage"
+    assert "usage" not in result
+
+
+def test_cli_gateway_rejects_failed_authentication_before_a_completion(monkeypatch, tmp_path):
+    """A present but logged-out native CLI is an authenticated-preflight failure."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    calls = _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda _argv: b'{"loggedIn":false}',
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        orchestration_completion.validate_orchestration_backend()
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNAUTHENTICATED
+    assert [argv for argv, _stdin in calls] == [(str(tmp_path / "claude"), "auth", "status")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        [{"id": "call-1", "type": "function", "function": {"name": "unknown", "arguments": "{}"}}],
+        [
+            {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+            {"id": "call-2", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+        ],
+        [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "[]"}}],
+    ],
+)
+async def test_cli_gateway_rejects_unknown_multiple_or_nonobject_tool_arguments(monkeypatch, tmp_path, tool_calls):
+    """Only one requested function with an object-valued JSON arguments string is accepted."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    envelope = json.dumps({"content": "", "tool_calls": tool_calls})
+    _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: (
+            b'{"loggedIn":true}' if argv[-2:] == ("auth", "status")
+            else json.dumps({"structured_output": json.loads(envelope)}).encode()
+        ),
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(
+            messages=[{"role": "user", "content": "lookup"}],
+            tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        )
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.PROTOCOL
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_redacts_native_failure_stderr(monkeypatch, tmp_path):
+    """Native failure diagnostics remain actionable without exposing process secrets."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: (
+            b'{"loggedIn":true}' if argv[-2:] == ("auth", "status")
+            else {"stderr": b"native failure OPENAI_API_KEY=super-secret", "returncode": 23}
+        ),
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.EXIT
+    assert "super-secret" not in str(error.value)
+    assert "native failure" not in str(error.value)
+    assert "23" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_rejects_oversized_native_output(monkeypatch, tmp_path):
+    """A CLI cannot force unbounded stdout retention in the orchestration process."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: b'{"loggedIn":true}' if argv[-2:] == ("auth", "status") else b"x" * (1024 * 1024 + 1),
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_rejects_oversized_encoded_request_before_spawning_completion(monkeypatch, tmp_path):
+    """The encoded orchestration prompt is capped before a CLI completion process starts."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    calls = _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda _argv: b'{"loggedIn":true}',
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(
+            messages=[{"role": "user", "content": "x" * (1024 * 1024 + 1)}]
+        )
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+    assert all("--print" not in argv for argv, _stdin in calls)
+
+
+@pytest.mark.asyncio
+async def test_codex_gateway_rejects_oversized_result_artifact(monkeypatch, tmp_path):
+    """A growing Codex result artifact cannot bypass the native-output limit."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+
+    def response(argv):
+        if argv[-2:] == ("login", "status"):
+            return {"stderr": b"Logged in with ChatGPT"}
+        path = Path(argv[argv.index("--output-last-message") + 1])
+        path.write_text(json.dumps({"content": "x" * (1024 * 1024 + 1), "tool_calls": []}))
+        return b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+
+    _install_fake_cli(monkeypatch, orchestration_completion, "codex", tmp_path / "codex", response)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_timeout_terminates_the_started_process_group(monkeypatch, tmp_path):
+    """A bounded CLI request terminates its process group before reporting timeout."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    terminated = []
+
+    async def record_termination(proc, *_args, **_kwargs):
+        terminated.append(proc.pid)
+        proc.release()
+
+    monkeypatch.setattr(orchestration_completion, "terminate_process_group", record_termination)
+    _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: b'{"loggedIn":true}' if argv[-2:] == ("auth", "status") else {"hang": True},
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(
+            messages=[{"role": "user", "content": "hello"}], timeout=0.01
+        )
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.TIMEOUT
+    assert terminated == [12345]
+
+
+@pytest.mark.asyncio
+async def test_cli_gateway_cancellation_terminates_the_started_process_group(monkeypatch, tmp_path):
+    """Caller cancellation terminates the spawned CLI group and remains cancelled."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    terminated = []
+
+    async def record_termination(proc, *_args, **_kwargs):
+        terminated.append(proc.pid)
+        proc.release()
+
+    monkeypatch.setattr(orchestration_completion, "terminate_process_group", record_termination)
+    calls = _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda argv: b'{"loggedIn":true}' if argv[-2:] == ("auth", "status") else {"hang": True},
+    )
+
+    task = asyncio.create_task(orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}]))
+    while len(calls) < 2:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert terminated and set(terminated) == {12345}
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_stops_a_growing_stdout_stream_before_the_request_timeout(monkeypatch):
+    """The shared runner must terminate on stream growth, instead of buffering until timeout."""
+    from huddleroom.services import orchestration_completion
+
+    proc = _GrowingCliProcess(stdout_chunks=[b"x" * (1024 * 1024 + 1)])
+    terminated = []
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        return proc
+
+    async def terminate(process, *_args, **_kwargs):
+        terminated.append(process.pid)
+        process.release()
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(orchestration_completion, "terminate_process_group", terminate)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01)
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+    assert terminated and set(terminated) == {12345}
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_times_out_when_output_reaches_eof_but_process_never_exits(monkeypatch):
+    """EOF from both pipes does not turn a still-running CLI into a successful response."""
+    from huddleroom.services import orchestration_completion
+
+    proc = _EofThenHangingCliProcess()
+    terminated = []
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        return proc
+
+    async def terminate(process, *_args, **_kwargs):
+        terminated.append(process.pid)
+        process.release()
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(orchestration_completion, "terminate_process_group", terminate)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await asyncio.wait_for(orchestration_completion._run(("fake-cli",), "hello", timeout=0.01), timeout=0.1)
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.TIMEOUT
+    assert terminated == [12345]
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_reads_output_while_stdin_backpressures(monkeypatch):
+    """A blocked stdin drain cannot prevent the runner from enforcing the output cap."""
+    from huddleroom.services import orchestration_completion
+
+    proc = _BackpressuredStdinGrowingOutputProcess()
+    terminated = []
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        return proc
+
+    async def terminate(process, *_args, **_kwargs):
+        terminated.append(process.pid)
+        process.release()
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(orchestration_completion, "terminate_process_group", terminate)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await asyncio.wait_for(orchestration_completion._run(("fake-cli",), "hello", timeout=0.01), timeout=0.1)
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+    assert terminated == [12345]
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_omits_only_onecli_placeholder_provider_keys_from_child_environment(monkeypatch):
+    """Native CLI login must not inherit synthetic OneCLI API-key placeholders."""
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "onecli-anthropic-placeholder")
+    monkeypatch.setenv("OPENAI_API_KEY", "onecli-openai-placeholder")
+    monkeypatch.setenv("PRESERVED_NATIVE_SETTING", "keep")
+    captured = {}
+    proc = SimpleNamespace(
+        returncode=0,
+        stdin=_RecordingCliStdin([None, None]),
+        stdout=_FiniteCliStream(b"{}"),
+        stderr=_FiniteCliStream(b""),
+    )
+
+    async def wait():
+        return 0
+
+    proc.wait = wait
+
+    async def create_subprocess_exec(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        return proc
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01)
+
+    assert "ANTHROPIC_API_KEY" not in captured
+    assert "OPENAI_API_KEY" not in captured
+    assert captured["PRESERVED_NATIVE_SETTING"] == "keep"
+
+
+@pytest.mark.asyncio
+async def test_codex_artifact_growth_stops_the_process_before_the_request_timeout(monkeypatch):
+    """Codex output-file growth is monitored while the native process is still running."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    proc = _GrowingCliProcess()
+    terminated = []
+
+    async def create_subprocess_exec(*argv, **_kwargs):
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_bytes(b"x" * (1024 * 1024 + 1))
+        return proc
+
+    async def terminate(process, *_args, **_kwargs):
+        terminated.append(process.pid)
+        process.release()
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(orchestration_completion, "terminate_process_group", terminate)
+    monkeypatch.setattr(orchestration_completion, "_timeout", lambda _request: 0.01)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion._complete_cli("fake-codex", "codex", {"messages": []})
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+    assert terminated == [12345]
+
+
+@pytest.mark.asyncio
+async def test_claude_explicit_effort_requires_exact_native_model_capability(monkeypatch, tmp_path):
+    """Claude's generic effort flag is insufficient proof for an explicit configured effort."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(settings, "orchestration_effort", "high")
+    calls = _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "claude",
+        tmp_path / "claude",
+        lambda _argv: b'{"loggedIn":true}',
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError, match="default") as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
     assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
+    assert all("--print" not in argv for argv, _stdin in calls)
+
+
+@pytest.mark.asyncio
+async def test_codex_explicit_effort_uses_only_the_exact_configured_model_catalog_entry(monkeypatch, tmp_path):
+    """Codex accepts an effort only when its configured default model advertises that exact level."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-6-luna"\n')
+    (codex_home / "models_cache.json").write_text(json.dumps({
+        "models": [{"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": "high"}]}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", "high")
+
+    def response(argv):
+        if argv[-2:] == ("login", "status"):
+            return {"stderr": b"Logged in with ChatGPT"}
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(json.dumps({"content": "OK", "tool_calls": []}))
+        return b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+
+    calls = _install_fake_cli(monkeypatch, orchestration_completion, "codex", tmp_path / "codex", response)
+    await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    argv, _stdin = next((argv, stdin) for argv, stdin in calls if "exec" in argv)
+    assert ("-c", "model_reasoning_effort=high") == (argv[argv.index("-c")], argv[argv.index("-c") + 1])
+
+
+@pytest.mark.asyncio
+async def test_codex_explicit_effort_rejects_an_unadvertised_level_without_spawning_completion(monkeypatch, tmp_path):
+    """An exact Codex catalog mismatch must advise default and leave no partial completion."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-6-luna"\n')
+    (codex_home / "models_cache.json").write_text(json.dumps({
+        "models": [{"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": "low"}]}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", "high")
+    calls = _install_fake_cli(
+        monkeypatch,
+        orchestration_completion,
+        "codex",
+        tmp_path / "codex",
+        lambda _argv: {"stderr": b"Logged in with ChatGPT"},
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError, match="default") as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
+    assert all("exec" not in argv for argv, _stdin in calls)
 
 
 @pytest.mark.asyncio
@@ -150,7 +699,42 @@ def test_api_efforts_are_empty_when_metadata_cannot_prove_the_level(monkeypatch)
     monkeypatch.setitem(orchestration_completion.litellm.model_cost, "provider/model", {"supports_reasoning": True})
 
     assert orchestration_completion.supported_orchestration_efforts("api", "provider/model") == frozenset()
-    assert not orchestration_completion.is_orchestration_backend_supported("codex")
+    assert orchestration_completion.is_orchestration_backend_supported("codex")
+
+
+def test_cli_effort_catalog_requires_native_model_capability(monkeypatch, tmp_path):
+    """CLI setup choices come from a configured native model, never a generic CLI enum."""
+    from huddleroom.services import orchestration_completion
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-6-luna"\n')
+    (codex_home / "models_cache.json").write_text(json.dumps({
+        "models": [{"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": "high"}]}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert orchestration_completion.supported_orchestration_efforts("claude") == frozenset()
+    assert orchestration_completion.supported_orchestration_efforts("codex") == frozenset({"high"})
+
+
+def test_cli_validation_rejects_explicit_effort_before_authentication(monkeypatch):
+    """An unsupported saved CLI effort fails at startup before it can authenticate or open state."""
+    from huddleroom.services import orchestration_completion
+
+    config = SimpleNamespace(orchestration_backend="claude", orchestration_effort="high", orchestration_model="ignored")
+    monkeypatch.setattr(orchestration_completion.shutil, "which", lambda _name: "/fake/claude")
+
+    async def authenticate(*_args):
+        pytest.fail("explicit effort must be validated before auth")
+
+    monkeypatch.setattr(orchestration_completion, "_authenticate", authenticate)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        orchestration_completion.validate_orchestration_backend(config)
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
+    assert "default" in str(error.value)
 
 
 def test_api_efforts_use_exact_model_metadata_levels(monkeypatch):
@@ -253,7 +837,174 @@ async def test_default_cli_route_emits_valid_cli_main_event_metadata(monkeypatch
     assert (started.invocation_kind, started.payload["model_or_runtime"]) == (
         "cli_main", "codex CLI (configured CLI default)"
     )
+    assert [event.payload for event in events if event.event_type == "agent_response.output"] == [
+        {
+            "stream": "output",
+            "text": json.dumps({"decision": {"action_type": "noop", "reason": "wait"}}),
+        }
+    ]
 
 
 async def _async_value(value):
     return value
+
+
+def _install_fake_cli(monkeypatch, completion_module, executable, path, response_for_argv):
+    """Install a fake native CLI process without invoking a host executable."""
+    import shutil
+
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self, call, stdout, stderr=b"", returncode=0, hang=False):
+            self._call = call
+            self._stdout = stdout
+            self._stderr = stderr
+            self._hang = hang
+            self.returncode = returncode
+            self.stdin = _RecordingCliStdin(call)
+            self._released = asyncio.Event()
+            self.stdout = _GrowingCliStream((stdout,), self._released) if hang else _FiniteCliStream(stdout)
+            self.stderr = _GrowingCliStream((stderr,), self._released) if hang else _FiniteCliStream(stderr)
+
+        async def communicate(self, input=None):
+            if input is not None:
+                self.stdin.write(input)
+            if self._hang:
+                await asyncio.Event().wait()
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            if self._hang:
+                await self._released.wait()
+            return self.returncode
+
+        def terminate(self):
+            self.release()
+
+        def kill(self):
+            self.returncode = -9
+            self._released.set()
+
+        def release(self):
+            self.returncode = -15
+            self._released.set()
+
+    async def create_subprocess_exec(*argv, **_kwargs):
+        call = [tuple(argv), None]
+        calls.append(call)
+        response = response_for_argv(tuple(argv))
+        if isinstance(response, dict):
+            return FakeProcess(
+                call,
+                response.get("stdout", b""),
+                response.get("stderr", b""),
+                response.get("returncode", 0),
+                response.get("hang", False),
+            )
+        return FakeProcess(call, response)
+
+    monkeypatch.setattr(completion_module, "asyncio", asyncio, raising=False)
+    monkeypatch.setattr(completion_module, "shutil", shutil, raising=False)
+    monkeypatch.setattr(completion_module.shutil, "which", lambda name: str(path) if name == executable else None)
+    monkeypatch.setattr(completion_module.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    return calls
+
+
+class _RecordingCliStdin:
+    def __init__(self, call):
+        self._call = call
+
+    def write(self, data):
+        self._call[1] = (self._call[1] or b"") + data
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+
+class _FiniteCliStream:
+    def __init__(self, content):
+        self._content = content
+
+    async def read(self, _size=-1):
+        content, self._content = self._content, b""
+        return content
+
+
+class _GrowingCliProcess:
+    pid = 12345
+    returncode = None
+
+    def __init__(self, stdout_chunks=(), stderr_chunks=()):
+        self._released = asyncio.Event()
+        self.stdin = _RecordingCliStdin([None, None])
+        self.stdout = _GrowingCliStream(stdout_chunks, self._released)
+        self.stderr = _GrowingCliStream(stderr_chunks, self._released)
+
+    async def communicate(self, _input=None):
+        await self._released.wait()
+        return b"", b""
+
+    async def wait(self):
+        await self._released.wait()
+        return self.returncode
+
+    def release(self):
+        self.returncode = -15
+        self._released.set()
+
+
+class _GrowingCliStream:
+    def __init__(self, chunks, released):
+        self._chunks = list(chunks)
+        self._released = released
+
+    async def read(self, _size=-1):
+        if self._chunks:
+            return self._chunks.pop(0)
+        await self._released.wait()
+        return b""
+
+
+class _EofThenHangingCliProcess:
+    pid = 12345
+    returncode = None
+
+    def __init__(self):
+        self._released = asyncio.Event()
+        self.stdin = _RecordingCliStdin([None, None])
+        self.stdout = _FiniteCliStream(b"{}")
+        self.stderr = _FiniteCliStream(b"")
+
+    async def wait(self):
+        await self._released.wait()
+        return self.returncode
+
+    def release(self):
+        self.returncode = -15
+        self._released.set()
+
+
+class _BackpressuredStdinGrowingOutputProcess(_GrowingCliProcess):
+    def __init__(self):
+        super().__init__(stdout_chunks=[b"x" * (1024 * 1024 + 1)])
+        self.stdin = _BlockingCliStdin([None, None], self._released)
+
+
+class _BlockingCliStdin(_RecordingCliStdin):
+    def __init__(self, call, released):
+        super().__init__(call)
+        self._released = released
+
+    async def drain(self):
+        await self._released.wait()

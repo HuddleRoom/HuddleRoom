@@ -685,12 +685,12 @@ class AgentResponseCall:
             return response
 
     async def _emit_response(self, response: Any) -> None:
-        choices = getattr(response, "choices", None) or []
-        message = getattr(choices[0], "message", None) if choices else None
+        choices = (response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)) or []
+        choice = choices[0] if choices else None
+        message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
         if message:
             await self._output.feed(
                 "reasoning",
-                getattr(message, "reasoning_content", None)
-                or getattr(message, "reasoning", None),
+                (message.get("reasoning_content") or message.get("reasoning")) if isinstance(message, dict) else (getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)),
             )
-            await self._output.feed("output", getattr(message, "content", None))
+            await self._output.feed("output", message.get("content") if isinstance(message, dict) else getattr(message, "content", None))
