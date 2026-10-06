@@ -21,13 +21,16 @@ PROVIDERS = {
 
 @pytest.fixture
 def setup_home(tmp_path, monkeypatch):
+    import huddleroom
+
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.chdir(tmp_path)
     for key in PROVIDERS.values():
         monkeypatch.delenv(key, raising=False)
-    sys.modules.pop("huddleroom.config", None)
+    monkeypatch.delitem(sys.modules, "huddleroom.config", raising=False)
+    monkeypatch.delattr(huddleroom, "config", raising=False)
     return home / ".huddleroom" / "config.toml"
 
 

@@ -411,6 +411,38 @@ def _install_and_exercise(wheel: Path, root: Path) -> None:
     _assert_initialized_database(home)
 
 
+def _assert_configured_cli_fails_closed(
+    command: Path, root: Path, empty_cwd: Path, backend: str, *, cli_is_on_path: bool
+) -> None:
+    home = root / "home"
+    database = root / "state" / "huddleroom.db"
+    config_directory = home / ".huddleroom"
+    config_directory.mkdir(parents=True)
+    (config_directory / "config.toml").write_text(
+        f'orchestration_backend = "{backend}"\ndatabase_url = "sqlite+aiosqlite:///{database}"\n'
+    )
+    environment = _isolated_environment(home)
+    path_directory = root / ("installed-cli" if cli_is_on_path else "missing-cli")
+    path_directory.mkdir()
+    marker = root / "cli-was-run"
+    if cli_is_on_path:
+        executable = path_directory / backend
+        executable.write_text('#!/bin/sh\nprintf invoked > "$HUDDLEROOM_TEST_CLI_MARKER"\n')
+        executable.chmod(0o755)
+        environment["HUDDLEROOM_TEST_CLI_MARKER"] = str(marker)
+    environment["PATH"] = str(path_directory)
+
+    result = subprocess.run(
+        [str(command), "serve"], cwd=empty_cwd, env=environment, text=True, capture_output=True,
+        timeout=COMMAND_TIMEOUT,
+    )
+
+    assert result.returncode != 0
+    assert f"The {backend} orchestration backend is unsupported" in result.stdout + result.stderr
+    assert not marker.exists()
+    assert not database.exists()
+
+
 def test_isolated_environment_removes_runtime_credentials_case_insensitively(monkeypatch, tmp_path):
     for name in RUNTIME_CREDENTIAL_ENVIRONMENT | {"OPENAI_API_KEY"}:
         monkeypatch.setenv(name.lower(), "must-not-reach-an-installed-command")
@@ -674,6 +706,7 @@ def test_distribution_clean_pipx_install_serves_restarts_and_upgrades(tmp_path):
                 "print(json.dumps({'database_url': settings.database_url, "
                 "'workspace_dir': settings.workspace_dir, "
                 "'orchestration_model': settings.orchestration_model, "
+                "'orchestration_backend': settings.orchestration_backend, "
                 "'credential_mode': settings.credential_mode}))"
             ),
         ],
@@ -686,6 +719,7 @@ def test_distribution_clean_pipx_install_serves_restarts_and_upgrades(tmp_path):
         "database_url": f"sqlite+aiosqlite:///{database}",
         "workspace_dir": str(workspace),
         "orchestration_model": model,
+        "orchestration_backend": "api",
         "credential_mode": "direct",
     }
 
@@ -696,6 +730,14 @@ def test_distribution_clean_pipx_install_serves_restarts_and_upgrades(tmp_path):
         connection.execute("INSERT INTO acceptance_sentinel VALUES ('preserved')")
     with _running_server([str(installed)], cwd=empty_cwd, env=environment, redact=redact):
         pass
+
+    for backend in ("claude", "codex"):
+        _assert_configured_cli_fails_closed(
+            installed, root / f"missing-{backend}", empty_cwd, backend, cli_is_on_path=False
+        )
+        _assert_configured_cli_fails_closed(
+            installed, root / f"installed-{backend}", empty_cwd, backend, cli_is_on_path=True
+        )
 
     _run(
         [str(pipx), "install", "--force", "--python", str(bootstrap_python), str(upgraded_wheel)],
