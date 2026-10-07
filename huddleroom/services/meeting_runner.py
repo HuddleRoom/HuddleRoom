@@ -99,7 +99,7 @@ class MeetingRunner:
         round_number = (item.current_round + 1) if item else 1
 
         provider = getattr(agent, "provider", None) or "openai"
-        model = getattr(agent, "model", None) or "gpt-4o-mini"
+        model = getattr(agent, "model", None) or "gpt-6.1-sol"
         litellm_model = build_litellm_model_name(provider, model)
 
         # Create invocation context for participant turn
@@ -402,7 +402,7 @@ class MeetingRunner:
         organizer_selection: dict | None = None,
         resume_cli_session_id: str | None = None,
     ) -> MeetingTurn | None:
-        from huddleroom.adapters.cli_adapter import CliAdapter
+        from huddleroom.adapters.cli_adapter import CliAdapter, CliResumeNotFound
         from huddleroom.models.project import Project
         from sqlalchemy import select
 
@@ -444,17 +444,34 @@ class MeetingRunner:
         adapter = CliAdapter()
         start = time.monotonic()
         new_session_id_from_run: str | None = None
-        try:
-            raw_content, new_session_id_from_run, latency_ms = await adapter.run_meeting_turn(
+        dropped_stale_id = False
+
+        async def run_turn(sid: str | None):
+            return await adapter.run_meeting_turn(
                 db=db,
                 meeting=meeting,
                 agent=agent,
                 project=project,
                 prompt_text=prompt_text,
-                existing_session_id=resume_cli_session_id or existing_session_id,
+                existing_session_id=sid,
                 agenda_title=item.title if item else None,
                 agenda_question=item.question if item else None,
             )
+
+        try:
+            try:
+                raw_content, new_session_id_from_run, latency_ms = await run_turn(
+                    resume_cli_session_id or existing_session_id)
+            except CliResumeNotFound:
+                # The CLI says the stored id is gone: start fresh once with the FULL prompt.
+                logger.warning("CLI session not found, starting fresh agent=%s meeting=%s", agent.id, meeting.id)
+                dropped_stale_id = True
+                existing_session_id = resume_cli_session_id = None
+                prompt_text, ctx_update = await self._ctx.build_cli_turn_prompt(
+                    db=db, meeting=meeting, agent=agent, current_item=item,
+                    turn_number=turn_number, existing_cli_session_id=None,
+                )
+                raw_content, new_session_id_from_run, latency_ms = await run_turn(None)
         except HTTPException:
             raise
         except Exception as exc:
@@ -503,7 +520,7 @@ class MeetingRunner:
         current_session_id = new_session_id_from_run or existing_session_id
 
         # Apply context updates in one flush (initial_ctx cache + session_id)
-        if ctx_update or (new_session_id_from_run and new_session_id_from_run != existing_session_id):
+        if ctx_update or dropped_stale_id or (new_session_id_from_run and new_session_id_from_run != existing_session_id):
             await db.refresh(meeting)
             fresh_contexts = dict(meeting.participant_contexts or {})
             fresh_agent_ctx = fresh_contexts.get(str(agent.id))
@@ -518,6 +535,8 @@ class MeetingRunner:
                 agent_ctx_current.update(ctx_update.get(str(agent.id), {}))
             if new_session_id_from_run and new_session_id_from_run != existing_session_id:
                 agent_ctx_current["cli_session_id"] = new_session_id_from_run
+            elif dropped_stale_id:
+                agent_ctx_current.pop("cli_session_id", None)
             meeting.participant_contexts = {**fresh_contexts, str(agent.id): agent_ctx_current}
             await db.flush()
 
@@ -1041,7 +1060,7 @@ class MeetingRunner:
         )
 
         provider = getattr(organizer, "provider", None) or "openai"
-        model = getattr(organizer, "model", None) or "gpt-4o-mini"
+        model = getattr(organizer, "model", None) or "gpt-6.1-sol"
         litellm_model = build_litellm_model_name(provider, model)
 
         # Create invocation context for organizer selection (before messages assembly)
@@ -1097,7 +1116,7 @@ class MeetingRunner:
                 ),
             },
         ]
-        _FALLBACK_ORCHESTRATION_MODEL = "openai/gpt-4o-mini"
+        _FALLBACK_ORCHESTRATION_MODEL = "openai/gpt-6.1-sol"
         models_to_try = [litellm_model]
         if litellm_model != _FALLBACK_ORCHESTRATION_MODEL:
             models_to_try.append(_FALLBACK_ORCHESTRATION_MODEL)
@@ -1269,7 +1288,7 @@ class MeetingRunner:
             if not agent:
                 continue
             provider = getattr(agent, "provider", None) or "openai"
-            model = getattr(agent, "model", None) or "gpt-4o-mini"
+            model = getattr(agent, "model", None) or "gpt-6.1-sol"
             litellm_model = build_litellm_model_name(provider, model)
 
             # Create invocation context for signal probe

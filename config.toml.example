@@ -24,7 +24,7 @@ api_base_url = "http://localhost:8000"
 embedding_model = "text-embedding-3-small"
 
 # ── Orchestration / Meeting Control ───────────────────────────────────────────
-orchestration_model = "openai/gpt-4o-mini" # API via LiteLLM only; CLI backends use their native default model.
+orchestration_model = "openai/gpt-6.1-sol" # API via LiteLLM only; CLI backends use their native default model.
 # API via LiteLLM, or an installed and authenticated Claude/Codex CLI.
 orchestration_backend = "api"
 # Omit this to preserve the backend default; explicit values need backend metadata.
@@ -42,7 +42,7 @@ orchestration_sweep_seconds_limit = 5
 effectiveness_recovery_threshold = 2
 effectiveness_failed_session_threshold = 3
 effectiveness_inactivity_hours = 24
-# meeting_control_model = "openai/gpt-4o-mini"
+# meeting_control_model = "openai/gpt-6.1-sol"
 
 # ── LLM Provider Keys ─────────────────────────────────────────────────────────
 # Select "onecli" to keep provider credentials in OneCLI. The selected agent
@@ -51,6 +51,8 @@ effectiveness_inactivity_hours = 24
 # onecli_agent = "huddleroom"
 # onecli_management_url = "http://127.0.0.1:10256"
 # onecli_gateway_url = "http://127.0.0.1:10255"
+# Native-auth CLIs (claude_code, codex) use local subscription logins by default; set to [] to route through OneCLI for API billing.
+# onecli_native_auth_runtimes = ["claude_code", "codex"]
 # Provider keys may be set here, in .env, or in the process environment.
 # OPENAI_API_KEY = "sk-..."
 # ANTHROPIC_API_KEY = "sk-ant-..."

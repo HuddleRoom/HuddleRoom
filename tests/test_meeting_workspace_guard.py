@@ -247,10 +247,12 @@ async def test_meeting_turn_unprintable_launch_failure_preserves_exception(db_se
             "codex",
             {},
             lambda workspace, context_path: (
-                "codex", "exec", "--sandbox", "workspace-write", "--cd", str(workspace),
-                "--ask-for-approval", "never", "--model", "gpt-4o-mini", "Discuss safely",
+                "codex", "exec", "--json", "--sandbox", "workspace-write", "--cd", str(workspace),
+                "--skip-git-repo-check", "-c", "sandbox_workspace_write.network_access=true",
+                "--model", "gpt-4o-mini", "Discuss safely",
             ),
-            b'{"result": "done"}',
+            b'{"type":"thread.started","thread_id":"t1"}\n'
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n',
         ),
         (
             "aider",

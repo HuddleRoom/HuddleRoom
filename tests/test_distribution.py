@@ -427,9 +427,9 @@ def _assert_configured_cli_fails_closed(
     marker = root / "cli-was-run"
     if cli_is_on_path:
         executable = path_directory / backend
-        executable.write_text('#!/bin/sh\nprintf invoked > "$HUDDLEROOM_TEST_CLI_MARKER"\n')
+        executable.write_text('#!/bin/sh\nprintf invoked > "$HR_E2E_CLI_MARKER"\n')
         executable.chmod(0o755)
-        environment["HUDDLEROOM_TEST_CLI_MARKER"] = str(marker)
+        environment["HR_E2E_CLI_MARKER"] = str(marker)
     environment["PATH"] = str(path_directory)
 
     result = subprocess.run(

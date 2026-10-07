@@ -327,9 +327,64 @@ def test_codex_command_is_bound_to_workspace(tmp_path):
     workspace = tmp_path / "workspace"
 
     assert CliAdapter._build_command("codex", "review this", {}, workspace, workspace / "task.md", model="gpt-4o") == [
-        "codex", "exec", "--sandbox", "workspace-write", "--cd", str(workspace),
-        "--ask-for-approval", "never", "--model", "gpt-4o", "review this",
+        "codex", "exec", "--json", "--sandbox", "workspace-write", "--cd", str(workspace),
+        "--skip-git-repo-check", "-c", "sandbox_workspace_write.network_access=true",
+        "--model", "gpt-4o", "review this",
     ]
+
+
+def test_codex_resume_command_uses_config_not_sandbox_flags(tmp_path):
+    workspace = tmp_path / "workspace"
+
+    assert CliAdapter._build_command(
+        "codex", "continue", {"reasoning_effort": "high"}, workspace, workspace / "task.md",
+        existing_session_id="thread-1", model="gpt-4o",
+    ) == [
+        "codex", "exec", "resume", "--json", "--skip-git-repo-check",
+        "-c", "sandbox_mode=workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+        "--model", "gpt-4o", "-c", "model_reasoning_effort=high", "thread-1", "continue",
+    ]
+
+
+def test_reasoning_effort_flags(tmp_path):
+    ws = tmp_path / "w"
+    def build(rt, cfg):
+        return CliAdapter._build_command(rt, "x", cfg, ws, ws / "task.md")
+    cmd = build("claude_code", {"reasoning_effort": "high"})
+    assert cmd[cmd.index("--effort") + 1] == "high"
+    cmd = build("codex", {"reasoning_effort": "xhigh"})
+    # Find the model_reasoning_effort config (not the network_access one)
+    for i, val in enumerate(cmd):
+        if val == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith("model_reasoning_effort"):
+            assert cmd[i + 1] == "model_reasoning_effort=xhigh"
+            break
+    else:
+        pytest.fail("model_reasoning_effort flag not found")
+    for rt in ("claude_code", "codex"):
+        for cfg in ({}, {"reasoning_effort": "bogus"}, {"reasoning_effort": None},
+                    {"reasoning_effort": ["high"]}, {"reasoning_effort": {"a": 1}}):
+            cmd = build(rt, cfg)
+            # Check that no model_reasoning_effort config is present
+            has_effort = any(i + 1 < len(cmd) and cmd[i] == "-c" and cmd[i + 1].startswith("model_reasoning_effort")
+                           for i in range(len(cmd)))
+            assert not has_effort
+    cmd = build("codex", {"reasoning_effort": "max"})
+    # For codex with max effort, no model_reasoning_effort should be present
+    has_effort = any(i + 1 < len(cmd) and cmd[i] == "-c" and cmd[i + 1].startswith("model_reasoning_effort")
+                   for i in range(len(cmd)))
+    assert not has_effort
+    assert "--effort" in build("claude_code", {"reasoning_effort": "max"})
+
+
+def test_claude_effort_argv_order_resume_and_context(tmp_path):
+    ws = tmp_path / "w"
+    cfg = {"reasoning_effort": "low"}
+    cmd = CliAdapter._build_command("claude_code", "P", cfg, ws, ws / "t.md", model="M", existing_session_id="sess12345")
+    assert cmd[cmd.index("--model"):cmd.index("--model") + 4] == ["--model", "M", "--effort", "low"]
+    assert cmd.index("--effort") < cmd.index("P")
+    assert cmd[cmd.index("--resume") + 1] == "sess12345"
+    cmd = CliAdapter._build_command("claude_code", "P", cfg, ws, ws / "t.md", context_path=ws / "c.md")
+    assert cmd[cmd.index("--effort") + 1] == "low"
 
 
 @pytest.mark.parametrize(
@@ -443,7 +498,7 @@ def test_onecli_child_environment_overwrites_all_malicious_routing_extras(monkey
     monkeypatch.setattr(cli_adapter, "settings", config)
     agent = SimpleNamespace(
         id=uuid.uuid4(),
-        cli_runtime="codex",
+        cli_runtime="copilot",
         config={
             "cli_env_extras": {
                 "http_proxy": "http://attacker.invalid:8080",
@@ -471,6 +526,123 @@ def test_onecli_child_environment_overwrites_all_malicious_routing_extras(monkey
     assert env["OPENAI_API_KEY"] == "onecli-openai-placeholder"
     assert env["ANTHROPIC_API_KEY"] == "onecli-anthropic-placeholder"
     assert "ONECLI_API_KEY" not in env
+
+
+@pytest.mark.parametrize("builder", ["task", "meeting"])
+@pytest.mark.parametrize("runtime", ["claude_code", "codex", "copilot"])
+def test_onecli_mode_native_auth_runtimes_skip_gateway(monkeypatch, builder, runtime):
+    """claude_code/codex use the user's own login: no placeholder keys or gateway proxy in onecli mode."""
+    import huddleroom.adapters.cli_adapter as cli_adapter
+    from huddleroom.config import Settings
+
+    proxy = "http://agent:tok@gateway.example:10255"
+    for key, value in {
+        "ONECLI_GATEWAY": "true", "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy,
+        "OPENAI_API_KEY": "onecli-openai-placeholder",
+        "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
+        "CODEX_HOME": "/home/u/.codex", "CLAUDE_CONFIG_DIR": "/home/u/.claude", "USER": "u", "HOME": "/home/u",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(cli_adapter, "settings", Settings(
+        _env_file=None, credential_mode="onecli", onecli_agent="gateway",
+        onecli_management_url="http://management.example:10256",
+        onecli_gateway_url="http://gateway.example:10255",
+    ))
+    agent = SimpleNamespace(id=uuid.uuid4(), cli_runtime=runtime, config={})
+    project = SimpleNamespace(id=uuid.uuid4())
+    adapter = CliAdapter()
+    if builder == "task":
+        env = adapter._build_env(uuid.uuid4(), None, agent, project)
+    else:
+        env = adapter._build_meeting_env(SimpleNamespace(id=uuid.uuid4()), agent, project)
+
+    if runtime == "copilot":
+        assert env["ANTHROPIC_API_KEY"] == "onecli-anthropic-placeholder"
+        assert env["HTTPS_PROXY"] == proxy
+        return
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "ONECLI_GATEWAY"):
+        assert key not in env
+    assert env["CODEX_HOME"] == "/home/u/.codex" and env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude"
+    assert env["HOME"] == "/home/u" and env["USER"] == "u"
+
+
+@pytest.mark.parametrize("builder", ["task", "meeting"])
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+def test_onecli_mode_native_auth_runtimes_drop_protected_extras(monkeypatch, builder, runtime):
+    """claude_code/codex drop protected keys and base URLs from cli_env_extras in onecli mode."""
+    import huddleroom.adapters.cli_adapter as cli_adapter
+    from huddleroom.config import Settings
+
+    for key, value in {
+        "USER": "u", "HOME": "/home/u",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(cli_adapter, "settings", Settings(
+        _env_file=None, credential_mode="onecli", onecli_agent="gateway",
+        onecli_management_url="http://management.example:10256",
+        onecli_gateway_url="http://gateway.example:10255",
+    ))
+    agent = SimpleNamespace(
+        id=uuid.uuid4(), cli_runtime=runtime,
+        config={
+            "cli_env_extras": {
+                "HTTPS_PROXY": "http://proxy.example:8080",
+                "ANTHROPIC_BASE_URL": "http://anthropic.example/api",
+                "OPENAI_BASE_URL": "http://openai.example/api",
+                "CUSTOM_VAR": "should_be_kept",
+            }
+        }
+    )
+    project = SimpleNamespace(id=uuid.uuid4())
+    adapter = CliAdapter()
+    if builder == "task":
+        env = adapter._build_env(uuid.uuid4(), None, agent, project)
+    else:
+        env = adapter._build_meeting_env(SimpleNamespace(id=uuid.uuid4()), agent, project)
+
+    # Protected keys and base URLs should be dropped
+    assert "HTTPS_PROXY" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert "OPENAI_BASE_URL" not in env
+    # Custom var should be kept (not protected, not a base URL)
+    assert env["CUSTOM_VAR"] == "should_be_kept"
+    assert env["HOME"] == "/home/u" and env["USER"] == "u"
+
+
+@pytest.mark.parametrize("builder", ["task", "meeting"])
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+def test_onecli_mode_routed_through_gateway(monkeypatch, builder, runtime):
+    """With empty onecli_native_auth_runtimes list, claude_code/codex route through OneCLI gateway."""
+    import huddleroom.adapters.cli_adapter as cli_adapter
+    from huddleroom.config import Settings
+
+    proxy = "http://agent:tok@gateway.example:10255"
+    for key, value in {
+        "ONECLI_GATEWAY": "true", "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy,
+        "OPENAI_API_KEY": "onecli-openai-placeholder",
+        "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
+        "CODEX_HOME": "/home/u/.codex", "CLAUDE_CONFIG_DIR": "/home/u/.claude", "USER": "u", "HOME": "/home/u",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(cli_adapter, "settings", Settings(
+        _env_file=None, credential_mode="onecli", onecli_agent="gateway",
+        onecli_management_url="http://management.example:10256",
+        onecli_gateway_url="http://gateway.example:10255",
+        onecli_native_auth_runtimes=[],  # Empty list = route all through gateway
+    ))
+    agent = SimpleNamespace(id=uuid.uuid4(), cli_runtime=runtime, config={})
+    project = SimpleNamespace(id=uuid.uuid4())
+    adapter = CliAdapter()
+    if builder == "task":
+        env = adapter._build_env(uuid.uuid4(), None, agent, project)
+    else:
+        env = adapter._build_meeting_env(SimpleNamespace(id=uuid.uuid4()), agent, project)
+
+    # When routed through gateway, keep placeholders and proxy
+    assert env["ANTHROPIC_API_KEY"] == "onecli-anthropic-placeholder"
+    assert env["OPENAI_API_KEY"] == "onecli-openai-placeholder"
+    assert env["HTTPS_PROXY"] == proxy
+    assert env["HTTP_PROXY"] == proxy
 
 
 @pytest.mark.parametrize("runtime, flag", [

@@ -89,12 +89,12 @@ async def test_api_backend_delegates_request_unchanged(monkeypatch):
         return {"choices": [{"message": {"content": "ok"}}]}
 
     result = await get_orchestration_completion(completion)(
-        model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "hello"}], temperature=0
+        model="openai/gpt-6.1-sol", messages=[{"role": "user", "content": "hello"}], temperature=0
     )
 
     assert result["choices"][0]["message"]["content"] == "ok"
     assert seen == {
-        "model": "openai/gpt-4o-mini",
+        "model": "openai/gpt-6.1-sol",
         "messages": [{"role": "user", "content": "hello"}],
         "temperature": 0,
     }
@@ -526,8 +526,10 @@ async def test_cli_runner_reads_output_while_stdin_backpressures(monkeypatch):
 @pytest.mark.asyncio
 async def test_cli_runner_omits_only_onecli_placeholder_provider_keys_from_child_environment(monkeypatch):
     """Native CLI login must not inherit synthetic OneCLI API-key placeholders."""
+    from huddleroom.config import settings
     from huddleroom.services import orchestration_completion
 
+    monkeypatch.setattr(settings, "credential_mode", "onecli")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "onecli-anthropic-placeholder")
     monkeypatch.setenv("OPENAI_API_KEY", "onecli-openai-placeholder")
     monkeypatch.setenv("PRESERVED_NATIVE_SETTING", "keep")
@@ -550,11 +552,118 @@ async def test_cli_runner_omits_only_onecli_placeholder_provider_keys_from_child
 
     monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01)
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01, backend="claude")
 
     assert "ANTHROPIC_API_KEY" not in captured
     assert "OPENAI_API_KEY" not in captured
     assert captured["PRESERVED_NATIVE_SETTING"] == "keep"
+
+
+_M1_KEYS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "DENO_CERT", "NODE_OPTIONS")
+_GATEWAY_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "ONECLI_GATEWAY",
+    "ONECLI_GATEWAY_SKILL_PATH", "NODE_USE_ENV_PROXY", "NODE_EXTRA_CA_CERTS", "ANTHROPIC_BASE_URL",
+) + _M1_KEYS
+
+
+async def _captured_child_env(monkeypatch, backend):
+    from huddleroom.services import orchestration_completion
+
+    for key in _GATEWAY_KEYS:
+        monkeypatch.setenv(key, "x-" + key)
+    monkeypatch.setenv("HUDDLEROOM_SECRET_KEY", "secret-value")
+    monkeypatch.setenv("RALLY_API_TOKEN", "token-value")
+    monkeypatch.setenv("HOME", "/home/user")
+    captured = {}
+    proc = SimpleNamespace(
+        returncode=0, stdin=_RecordingCliStdin([None, None]),
+        stdout=_FiniteCliStream(b"{}"), stderr=_FiniteCliStream(b""),
+    )
+
+    async def wait():
+        return 0
+
+    proc.wait = wait
+
+    async def create_subprocess_exec(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        return proc
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01, backend=backend)
+    return captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+async def test_cli_runner_omits_gateway_proxy_ca_and_context_keys_in_onecli_mode(monkeypatch, backend):
+    """Native CLI must not inherit proxy, OneCLI gateway, CA/node, base-URL or HuddleRoom context env vars."""
+    from huddleroom.config import settings
+
+    monkeypatch.setattr(settings, "credential_mode", "onecli")
+    captured = await _captured_child_env(monkeypatch, backend)
+
+    for key in _GATEWAY_KEYS + ("HUDDLEROOM_SECRET_KEY", "RALLY_API_TOKEN"):
+        assert key not in captured, key
+    assert captured["HOME"] == "/home/user"
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_direct_mode_keeps_proxy_but_strips_context_keys(monkeypatch):
+    from huddleroom.config import settings
+
+    monkeypatch.setattr(settings, "credential_mode", "direct")
+    captured = await _captured_child_env(monkeypatch, "claude")
+
+    for key in _GATEWAY_KEYS:
+        assert captured[key] == "x-" + key
+    assert "HUDDLEROOM_SECRET_KEY" not in captured and "RALLY_API_TOKEN" not in captured
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_keeps_proxy_when_native_runtimes_empty(monkeypatch):
+    """When onecli_native_auth_runtimes is empty, native CLIs keep gateway proxy in onecli mode."""
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "credential_mode", "onecli")
+    monkeypatch.setattr(settings, "onecli_native_auth_runtimes", [])  # Empty = route through gateway
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy.example.com:8080")
+    monkeypatch.setenv("ONECLI_GATEWAY", "gateway.example.com")
+    monkeypatch.setenv("HUDDLEROOM_SECRET_KEY", "secret-value")
+    monkeypatch.setenv("HOME", "/home/user")
+
+    captured = {}
+    proc = SimpleNamespace(
+        returncode=0,
+        stdin=_RecordingCliStdin([None, None]),
+        stdout=_FiniteCliStream(b"{}"),
+        stderr=_FiniteCliStream(b""),
+    )
+
+    async def wait():
+        return 0
+
+    proc.wait = wait
+
+    async def create_subprocess_exec(*_args, **kwargs):
+        captured.update(kwargs["env"])
+        return proc
+
+    monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01, backend="claude")
+
+    # Proxy should be kept
+    assert captured["HTTP_PROXY"] == "http://proxy.example.com:8080"
+    assert captured["HTTPS_PROXY"] == "https://proxy.example.com:8080"
+    # Gateway should be kept
+    assert captured["ONECLI_GATEWAY"] == "gateway.example.com"
+    # HuddleRoom context should still be dropped
+    assert "HUDDLEROOM_SECRET_KEY" not in captured
+    # Normal keys should be kept
+    assert captured["HOME"] == "/home/user"
 
 
 @pytest.mark.asyncio

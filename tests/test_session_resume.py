@@ -588,6 +588,7 @@ async def test_onecli_resume_reuses_safe_child_environment(test_engine, tmp_path
             _env_file=None, credential_mode="onecli", onecli_agent="gateway",
             onecli_management_url="http://management.example:10256",
             onecli_gateway_url="http://gateway.example:10255",
+            onecli_native_auth_runtimes=[],
         ),
     )
 
@@ -688,9 +689,6 @@ async def test_cli_resume_keeps_override_continuation_after_agent_model_change(t
     ) as (db, session, agent, _project):
         session.metadata_ = {
             "_run_config": {"model_override": "fixed-override"},
-            "_launch_config": {
-                "provider": "anthropic", "model": "fixed-override", "cli_runtime": "claude_code",
-            },
         }
         agent.model = "edited-agent-model"
         await db.commit()
@@ -706,58 +704,145 @@ async def test_cli_resume_keeps_override_continuation_after_agent_model_change(t
     argv = list(captured["argv"])
     assert argv[argv.index("--model") + 1] == "fixed-override"
     assert argv[argv.index("--resume") + 1] == "abcDEF1234567890"
-    assert session.metadata_["_launch_config"]["model"] == "fixed-override"
+
+
+CODEX_OK = (
+    b'{"type":"thread.started","thread_id":"thread-new"}\n'
+    b'{"type":"item.completed","item":{"type":"agent_message","text":"codex done"}}\n'
+    b'{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}\n'
+)
+CLAUDE_OK = b'{"result": "done", "session_id": "claude-new"}'
+NOT_FOUND = {
+    "claude_code": (b"", b"No conversation found with session ID: abcDEF1234567890"),
+    "codex": (b"", b"Error: thread/resume failed: no rollout found for thread id abcDEF1234567890 (code -32600)"),
+}
+OK_STDOUT = {"claude_code": CLAUDE_OK, "codex": CODEX_OK}
+
+
+class _Proc:
+    def __init__(self, returncode, stdout, stderr=b""):
+        self.returncode, self._out = returncode, (stdout, stderr)
+
+    async def communicate(self):
+        return self._out
+
+
+async def _run_scripted(test_engine, tmp_path, runtime, procs, *, metadata=None, mutate=None, prepare=None, after=None,
+                        provider_session_id="abcDEF1234567890"):
+    """Run a resumable CLI session against scripted fake processes; return (argvs, envs, session)."""
+    from huddleroom.adapters.cli_adapter import CliAdapter
+    from huddleroom.models.event_log import EventLog
+
+    argvs, kwargs_seen, queue = [], [], list(procs)
+
+    async def fake_exec(*args, **kwargs):
+        argvs.append(list(args))
+        kwargs_seen.append(kwargs)
+        return queue.pop(0)
+
+    async with _cli_task_fixture(
+        test_engine, tmp_path, provider_session_id=provider_session_id
+    ) as (db, session, agent, project):
+        agent.cli_runtime = runtime
+        agent.config = {"cli_runtime": runtime}
+        session.metadata_ = {"_run_config": {"_roadmap_budget_enforced": True}, **(metadata or {})}
+        if mutate:
+            mutate(agent)
+        if prepare:
+            await prepare(db, session, project)
+        await db.commit()
+        with patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec", new=fake_exec):
+            await CliAdapter().run(session.id, db)
+        await db.refresh(session)
+        if after:
+            await after(db, session)
+        started = (await db.execute(select(EventLog).where(
+            EventLog.project_id == project.id, EventLog.event_type == "session.started"))).scalars().all()
+    return argvs, kwargs_seen, session, len(started)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["provider", "model", "runtime"])
-async def test_cli_resume_with_changed_launch_config_starts_fresh(test_engine, tmp_path, change):
-    from huddleroom.adapters.cli_adapter import CliAdapter
-
-    class FakeProc:
-        returncode = 0
-
-        async def communicate(self):
-            return b'{"result": "fresh"}', b""
-
-    captured: dict = {}
-
-    async def fake_subprocess_exec(*args, **kwargs):
-        captured["argv"] = args
-        return FakeProc()
-
-    async with _cli_task_fixture(
-        test_engine, tmp_path, provider_session_id="abcDEF1234567890"
-    ) as (db, session, agent, _project):
-        session.metadata_ = {
-            "_run_config": {"timeout": 5},
-            "_launch_config": {"provider": "anthropic", "model": "claude", "cli_runtime": "claude_code"},
-            "keep": "value",
-        }
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+@pytest.mark.parametrize("change", ["provider", "model", "env"])
+async def test_cli_resume_is_attempted_despite_changed_launch_config(test_engine, tmp_path, runtime, change):
+    def mutate(agent):
         if change == "provider":
             agent.provider = "openai"
         elif change == "model":
             agent.model = "changed-model"
         else:
-            agent.cli_runtime = "codex"
+            agent.config = {**agent.config, "cli_env_extras": {"MY_FLAG": "1"}}
+
+    argvs, kw, session, _ = await _run_scripted(
+        test_engine, tmp_path, runtime, [_Proc(0, OK_STDOUT[runtime])], mutate=mutate)
+
+    assert len(argvs) == 1
+    argv = argvs[0]
+    if runtime == "claude_code":
+        assert argv[argv.index("--resume") + 1] == "abcDEF1234567890" and "continue" in argv
+    else:
+        assert argv[:5] == ["codex", "exec", "resume", "--json", "--skip-git-repo-check"]
+        assert argv[-2:] == ["abcDEF1234567890", "continue"]
+        assert "--cd" not in argv and "--sandbox" not in argv
+        assert kw[0]["cwd"] == str(tmp_path)
+    assert session.status == "completed"
+    assert session.metadata_["resume_outcome"] == "resumed"
+    assert session.provider_session_id == ("claude-new" if runtime == "claude_code" else "thread-new")
+
+
+@pytest.mark.asyncio
+async def test_codex_fresh_run_parses_jsonl_and_usage(test_engine, tmp_path):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _cli_task_fixture(test_engine, tmp_path) as (db, session, agent, _project):
+        agent.cli_runtime = "codex"
+        agent.config = {"cli_runtime": "codex"}
+        session.metadata_ = {"_run_config": {"_roadmap_budget_enforced": True}}
         await db.commit()
+        argvs = []
 
-        with patch.object(CliAdapter(), "_setup_sandbox", return_value=None):
-            with patch(
-                "huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec", new=fake_subprocess_exec
-            ):
-                await CliAdapter().run(session.id, db)
+        async def fake_exec(*args, **kwargs):
+            argvs.append(list(args))
+            return _Proc(0, CODEX_OK)
 
+        with patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec", new=fake_exec):
+            await CliAdapter().run(session.id, db)
         await db.refresh(session)
 
-    argv = list(captured["argv"])
-    assert "--resume" not in argv
-    assert argv[:2] == (["codex", "exec"] if change == "runtime" else ["claude", "--dangerously-skip-permissions"])
-    assert argv[argv.index("--model") + 1] == ("changed-model" if change == "model" else "claude")
+    assert argvs[0][:4] == ["codex", "exec", "--json", "--sandbox"] and "--cd" in argvs[0]
+    assert session.output == "codex done"
+    assert session.provider_session_id == "thread-new"
+    assert session.metadata_["token_usage_complete"] is True
+    assert (session.metadata_["token_count_in"], session.metadata_["token_count_out"]) == (7, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+async def test_cli_resume_not_found_falls_back_to_fresh_run(test_engine, tmp_path, runtime):
+    out, err = NOT_FOUND[runtime]
+    argvs, _, session, started = await _run_scripted(
+        test_engine, tmp_path, runtime, [_Proc(1, out, err), _Proc(0, OK_STDOUT[runtime])])
+
+    assert len(argvs) == 2
+    assert "resume" not in argvs[1] and "--resume" not in argvs[1] and "continue" not in argvs[1]
+    assert session.status == "completed"
+    assert session.metadata_["resume_outcome"] == "fallback_fresh"
+    assert session.provider_session_id == ("claude-new" if runtime == "claude_code" else "thread-new")
+    assert started == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+async def test_cli_exact_resume_not_found_fails_terminally_without_rerun(test_engine, tmp_path, runtime):
+    out, err = NOT_FOUND[runtime]
+    argvs, _, session, _ = await _run_scripted(
+        test_engine, tmp_path, runtime, [_Proc(1, out, err)], metadata={"_recovery_exact": True})
+
+    assert len(argvs) == 1
+    assert session.status == "failed"
+    assert session.error == "resume_conversation_not_found"
     assert session.provider_session_id is None
-    assert session.metadata_["_run_config"]["timeout"] == 5
-    assert session.metadata_["keep"] == "value"
-    assert session.metadata_["model_used"] == ("changed-model" if change == "model" else "claude")
+    assert session.resumable is False
 
 
 # ---------------------------------------------------------------------------
@@ -987,3 +1072,120 @@ async def test_meeting_resume_endpoint_requires_parked_state_and_dispatches_when
 
     assert resp.status_code == 200
     mock_dispatch.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Meeting turn: stale CLI session id -> one fresh retry with the FULL prompt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+async def test_meeting_stale_cli_session_retries_fresh_with_full_prompt(
+    db_session: AsyncSession, test_project, test_agent, runtime
+):
+    from huddleroom.adapters.cli_adapter import CliResumeNotFound
+    from huddleroom.models.meeting import Meeting, MeetingAgendaItem
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    test_agent.adapter_type = "cli"
+    test_agent.cli_runtime = runtime
+    test_agent.config = {**test_agent.config, "cli_runtime": runtime}
+    meeting = Meeting(
+        project_id=test_project.id, title="Stale", meeting_type="decision",
+        participant_agent_ids=[str(test_agent.id)], status="active",
+        participant_contexts={str(test_agent.id): {"cli_session_id": "stale-id"}},
+    )
+    db_session.add(meeting)
+    await db_session.flush()
+    db_session.add(MeetingAgendaItem(meeting_id=meeting.id, order=1, title="Q1", question="?", status="active"))
+    await db_session.flush()
+
+    with patch(
+        "huddleroom.adapters.cli_adapter.CliAdapter.run_meeting_turn",
+        new_callable=AsyncMock,
+        side_effect=[CliResumeNotFound("gone"), ("fresh answer", "new-id", 5)],
+    ) as run_mock:
+        turn = await MeetingRunner(bus=None)._execute_cli_agent_turn(db_session, meeting, test_agent)
+
+    assert turn is not None and turn.content == "fresh answer"
+    first, second = run_mock.await_args_list
+    assert first.kwargs["existing_session_id"] == "stale-id"
+    assert second.kwargs["existing_session_id"] is None
+    assert len(second.kwargs["prompt_text"]) > len(first.kwargs["prompt_text"])
+    assert meeting.participant_contexts[str(test_agent.id)]["cli_session_id"] == "new-id"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval", [False, True])
+async def test_exact_resume_not_found_settles_zero_budget_without_blocker(test_engine, tmp_path, approval):
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+    from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService  # noqa: F401
+    from huddleroom.services.session_sync import sync_task_from_session
+
+    state = {}
+
+    async def prepare(db, session, project):
+        goal = OrchestrationGoal(project_id=project.id, objective="b", original_request="b",
+                                 budget={"caps": {"max_tokens": 1000}})
+        db.add(goal)
+        await db.flush()
+        run = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized")
+        task = Task(project_id=project.id, title="t", status="in_progress")
+        db.add_all([run, task])
+        await db.flush()
+        action = OrchestrationAction(
+            run_id=run.id, idempotency_key=f"exact:{uuid.uuid4()}", action_type="create_delegation_task",
+            request={}, target_type="task", target_id=task.id, status="completed",
+            budget_ledger={"allocation": {"max_tokens": "500"}, "reserved": {}, "committed": {"max_tokens": "500"},
+                           "consumed": {}, "usage_state": "known", "enforceability": "enforceable"},
+        )
+        db.add(action)
+        await db.flush()
+        session.task_id = task.id
+        meta = {**session.metadata_,
+                "token_count_in": 40, "token_count_out": 60, "token_usage_complete": False}
+        if approval:
+            meta["_roadmap_cli_budget_approval"] = {"approved": True}
+            meta["_roadmap_cli_token_grants"] = ["100", "400"]
+        session.metadata_ = meta
+        state.update(goal=goal, run=run, action=action)
+
+    async def after(db, session):
+        # Link to the action only now: an orchestration lineage would make run() demand an attempt claim.
+        session.metadata_ = {**session.metadata_, "orchestration": {"action_id": str(state["action"].id)}}
+        await sync_task_from_session(db, session)
+        run = state["run"]
+        assert OrchestrationBudgetService._session_spend(session, "max_tokens") == 0
+        assert not [b for b in (run.active_blockers or []) if b.get("kind") == "budget_measurement"]
+        await db.refresh(state["action"])
+        ledger = state["action"].budget_ledger
+        assert ledger["committed"] == {} and ledger["consumed"] == {} and "final_observation" in ledger
+        assert run.budget_state["consumed"] == {"max_tokens": "0"}
+        assert run.budget_state["committed"] == {"max_tokens": "0"}
+
+    out, err = NOT_FOUND["claude_code"]
+    _, _, session, _ = await _run_scripted(
+        test_engine, tmp_path, "claude_code", [_Proc(1, out, err)],
+        metadata={"_recovery_exact": True}, prepare=prepare, after=after)
+
+    assert session.error == "resume_conversation_not_found" and session.resumable is False
+    assert session.metadata_["token_usage_complete"] is True
+    assert "_recovery_exact" not in session.metadata_  # L3: marker cleared on terminal outcome
+
+
+@pytest.mark.asyncio
+async def test_recovery_exact_marker_cleared_after_successful_exact_run(test_engine, tmp_path):
+    _, _, session, _ = await _run_scripted(
+        test_engine, tmp_path, "claude_code", [_Proc(0, CLAUDE_OK)], metadata={"_recovery_exact": True})
+    assert session.status == "completed" and "_recovery_exact" not in session.metadata_
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["--oops-flag-id", "short"])
+async def test_codex_invalid_thread_id_runs_fresh(test_engine, tmp_path, bad_id):
+    argvs, _, session, _ = await _run_scripted(
+        test_engine, tmp_path, "codex", [_Proc(0, CODEX_OK)], provider_session_id=bad_id)
+    assert len(argvs) == 1 and "resume" not in argvs[0] and bad_id not in argvs[0] and "continue" not in argvs[0]
+    assert session.provider_session_id == "thread-new"

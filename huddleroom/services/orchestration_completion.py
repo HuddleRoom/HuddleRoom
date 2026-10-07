@@ -103,7 +103,7 @@ def _executable(backend: str) -> str:
 
 async def _authenticate(executable: str, backend: str) -> None:
     command = (executable, "auth", "status") if backend == "claude" else (executable, "login", "status")
-    stdout, _ = await _run(command, None)
+    stdout, _ = await _run(command, None, backend=backend)
     if backend == "claude":
         try:
             authenticated = bool(json.loads(stdout).get("loggedIn"))
@@ -126,7 +126,7 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
             if settings.orchestration_effort is not None:
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("--effort", settings.orchestration_effort))
-            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request))
+            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), backend=backend)
             envelope, usage = _claude_result(stdout)
         else:
             result_path = Path(directory) / "result.json"
@@ -136,7 +136,7 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
             if settings.orchestration_effort is not None:
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("-c", f"model_reasoning_effort={settings.orchestration_effort}"))
-            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), artifact_path=result_path)
+            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), artifact_path=result_path, backend=backend)
             try:
                 if result_path.stat().st_size > _MAX_OUTPUT:
                     raise ValueError("oversized result")
@@ -155,13 +155,24 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
     return result
 
 
-async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None = None, timeout: float = _TIMEOUT, artifact_path: Path | None = None) -> tuple[str, str]:
+def strip_native_auth_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop OneCLI gateway/proxy/CA/placeholder-key vars and *_BASE_URL from env (native-login runtimes)."""
+    from huddleroom.onecli import _PROTECTED_ENV_KEYS  # lazy: onecli is heavy (click, httpx)
+    return {k: v for k, v in env.items() if k not in _PROTECTED_ENV_KEYS and not k.endswith("_BASE_URL")}
+
+
+async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None = None, timeout: float = _TIMEOUT, artifact_path: Path | None = None, backend: str | None = None) -> tuple[str, str]:
     proc = None
     tasks: list[asyncio.Task[Any]] = []
     environment = dict(os.environ)
-    for key, placeholder in (("ANTHROPIC_API_KEY", "onecli-anthropic-placeholder"), ("OPENAI_API_KEY", "onecli-openai-placeholder")):
-        if environment.get(key) == placeholder:
-            del environment[key]
+    # Map backend names to runtime names for settings lookup
+    runtime_map = {"claude": "claude_code", "codex": "codex"}
+    runtime = runtime_map.get(backend) if backend else None
+    # Native-auth runtimes in onecli mode run on the user's local login: strip gateway/proxy/placeholder keys
+    if settings.credential_mode == "onecli" and runtime in settings.onecli_native_auth_runtimes:
+        environment = strip_native_auth_env(environment)
+    # Always remove HuddleRoom/Rally context keys
+    environment = {k: v for k, v in environment.items() if not k.startswith(("HUDDLEROOM_", "RALLY_"))}
     try:
         proc = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd, env=environment, start_new_session=True)
         async def read(stream: Any) -> bytes:

@@ -18,6 +18,7 @@ from huddleroom.services.cli_streaming import (
     decoder_for_runtime,
     collect_cli_process,
     parse_jsonl_final,
+    is_resume_not_found,
 )
 
 
@@ -92,10 +93,10 @@ def test_claude_decoder_ignores_malformed_lines():
     assert updates == []
 
 
-# Test 6: Plain runtime decoder (codex)
+# Test 6: Plain runtime decoder (aider)
 def test_plain_runtime_decoder_publishes_text():
     """Test that plain runtimes publish stdout as readable output."""
-    decoder = decoder_for_runtime("codex")
+    decoder = decoder_for_runtime("aider")
     updates = decoder.feed_stdout(b"Hello\nWorld\n")
     assert len(updates) == 2
     assert updates[0] == CliDisplayUpdate(kind="output", text="Hello")
@@ -114,7 +115,7 @@ def test_plain_runtime_decoder_stderr():
 # Test 8: UTF-8 incremental decoding with chunks
 def test_incremental_utf8_decoding():
     """Test that incomplete UTF-8 sequences are handled correctly."""
-    decoder = decoder_for_runtime("codex")
+    decoder = decoder_for_runtime("aider")
     # UTF-8 for 🙂 is b'\xf0\x9f\x99\x82' - split across chunks
     updates = decoder.feed_stdout(b"Hi \xf0\x9f")
     # No newline yet, so no output
@@ -129,7 +130,7 @@ def test_incremental_utf8_decoding():
 # Test 9: Decoder finish with exact bytes
 def test_decoder_finish_retains_exact_bytes():
     """Test that finish includes accumulated content in decoded output."""
-    decoder = decoder_for_runtime("codex")
+    decoder = decoder_for_runtime("aider")
     stdout_bytes = b"Output line\n"
     stderr_bytes = b"Error line\n"
 
@@ -333,6 +334,18 @@ def test_parse_claude_final_raises_on_no_envelope():
     ("runtime", "raw", "expected_updates", "expected_final"),
     [
         (
+            "codex",
+            "\n".join((
+                '{"type":"thread.started","thread_id":"01a1152c-9d95-7910-b2e5-7ee397bb85b5"}',
+                '{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Codex is ignoring 2 unrecognized configuration settings."}}',
+                '{"type":"turn.started"}',
+                '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"hi"}}',
+                '{"type":"turn.completed","usage":{"input_tokens":18746,"cached_input_tokens":13184,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}',
+            )),
+            [CliDisplayUpdate(kind="output", text="hi")],
+            DecodedCliOutput("hi", "01a1152c-9d95-7910-b2e5-7ee397bb85b5"),
+        ),
+        (
             "copilot",
             "\n".join((
                 '{"type":"session.auto_mode_resolved","data":{"chosenModel":"gpt-6"}}',
@@ -383,6 +396,15 @@ def test_step8_json_runtime_streams_only_assistant_text(
 @pytest.mark.parametrize(
     ("runtime", "raw", "expected"),
     [
+        (
+            "codex",
+            "\n".join((
+                '{"type":"thread.started","thread_id":"01a1152c-9d95-7910-b2e5-7ee397bb85b5"}',
+                '{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Codex is ignoring 2 unrecognized configuration settings."}}',
+                '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"hi"}}',
+            )),
+            ("hi", "01a1152c-9d95-7910-b2e5-7ee397bb85b5"),
+        ),
         (
             "copilot",
             "\n".join((
@@ -914,3 +936,96 @@ async def test_meeting_seam_signal_probe_agent(db_session, test_project, test_ag
         "operation": "Decide whether to contribute",
     }
     assert all(e.operation == "meeting_signal_probe" for e in captured)
+
+
+# Tests for is_resume_not_found
+
+def test_is_resume_not_found_claude_not_found_in_stderr():
+    """claude_code: found not-found marker in stderr → True."""
+    assert is_resume_not_found(
+        "claude_code",
+        1,
+        "",
+        "No conversation found with session ID: 11111111-2222-3333-4444-555555555555"
+    ) is True
+
+
+def test_is_resume_not_found_claude_result_record_errors():
+    """claude_code: terminal stream-json result record listing the marker in errors → True."""
+    stdout = ('{"type":"result","subtype":"error_during_execution","is_error":true,'
+              '"errors":["No conversation found with session ID: 1111"]}\n')
+    assert is_resume_not_found("claude_code", 1, stdout, "") is True
+
+
+def test_is_resume_not_found_claude_ignores_assistant_text_in_stdout():
+    stdout = ('{"type":"assistant","message":{"content":[{"type":"text",'
+              '"text":"No conversation found with session ID: x"}]}}\n'
+              'No conversation found with session ID: raw\n')
+    assert is_resume_not_found("claude_code", 1, stdout, "") is False
+
+
+def test_is_resume_not_found_codex_not_found_in_stderr():
+    """codex: found not-found marker in stderr → True."""
+    assert is_resume_not_found(
+        "codex",
+        1,
+        "",
+        "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-0000-0000-000000000000 (code -32600)"
+    ) is True
+
+
+def test_is_resume_not_found_codex_stdout_ignored():
+    """codex: marker only counts on stderr."""
+    assert not is_resume_not_found(
+        "codex",
+        1,
+        "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-0000-0000-000000000000 (code -32600)",
+        ""
+    )
+
+
+def test_is_resume_not_found_success_exit():
+    """exit_code=0 → False (resume succeeded)."""
+    assert is_resume_not_found("claude_code", 0, "", "") is False
+    assert is_resume_not_found("codex", 0, "", "") is False
+
+
+def test_is_resume_not_found_none_exit():
+    """exit_code=None → False."""
+    assert is_resume_not_found("claude_code", None, "", "") is False
+    assert is_resume_not_found("codex", None, "", "") is False
+
+
+def test_is_resume_not_found_other_error():
+    """exit_code != 0 but no not-found marker → False."""
+    assert is_resume_not_found(
+        "claude_code",
+        1,
+        "some other error",
+        "more errors"
+    ) is False
+    assert is_resume_not_found(
+        "codex",
+        1,
+        "some other error",
+        "more errors"
+    ) is False
+
+
+def test_is_resume_not_found_unknown_runtime():
+    """unknown runtime → False."""
+    assert is_resume_not_found(
+        "unknown_runtime",
+        1,
+        "no rollout found for thread id abc",
+        ""
+    ) is False
+
+
+def test_parse_jsonl_final_codex_returns_last_agent_message_only():
+    raw = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"Let me look."}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\": true}"}}\n'
+    )
+    assert parse_jsonl_final(raw, "codex") == ('{"ok": true}', "t1")

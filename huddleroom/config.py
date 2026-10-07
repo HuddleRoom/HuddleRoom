@@ -30,6 +30,7 @@ PROVIDER_ENV_KEYS = {
     "OR_SITE_URL",
     "OLLAMA_API_BASE",
 }
+ONECLI_NATIVE_AUTH_RUNTIMES = frozenset(("claude_code", "codex"))
 OrchestrationEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 DEFAULT_CONFIG_FILE = Path.home() / ".huddleroom" / "config.toml"
 DEFAULT_DATA_DIR = Path.home() / ".huddleroom"
@@ -145,7 +146,7 @@ class Settings(BaseSettings):
     api_base_url: str = "http://localhost:8000"
     embedding_model: str = "text-embedding-3-small"
     workspace_dir: str = Field(default_factory=_default_workspace_dir)
-    orchestration_model: str = "openai/gpt-4o-mini"
+    orchestration_model: str = "openai/gpt-6.1-sol"
     orchestration_backend: Literal["api", "claude", "codex"] = "api"
     orchestration_effort: OrchestrationEffort | None = None
     orchestration_conversation_allowance_tokens: int = Field(default=50000, ge=0)
@@ -167,12 +168,21 @@ class Settings(BaseSettings):
     onecli_agent: str | None = None
     onecli_management_url: str = "http://127.0.0.1:10256"
     onecli_gateway_url: str = "http://127.0.0.1:10255"
+    onecli_native_auth_runtimes: list[str] = Field(default=["claude_code", "codex"])
     _setting_names: dict[str, str] = PrivateAttr(default_factory=dict)
 
     @field_validator("onecli_management_url", "onecli_gateway_url")
     @classmethod
     def validate_onecli_url(cls, value: str) -> str:
         return validate_onecli_origin(value)
+
+    @field_validator("onecli_native_auth_runtimes")
+    @classmethod
+    def validate_onecli_native_auth_runtimes(cls, value: list[str]) -> list[str]:
+        unknown = [r for r in value if r not in ONECLI_NATIVE_AUTH_RUNTIMES]
+        if unknown:
+            raise ValueError(f"onecli_native_auth_runtimes: unknown {unknown}; allowed: {', '.join(sorted(ONECLI_NATIVE_AUTH_RUNTIMES))}")
+        return value
 
     @classmethod
     def settings_customise_sources(

@@ -507,3 +507,73 @@ def test_unsupported_guard_names_the_supplied_setting(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(RuntimeError, match=name):
         validate_supported_settings(Settings(_env_file=None))
+
+
+def test_onecli_native_auth_runtimes_default():
+    from huddleroom.config import Settings
+
+    assert Settings(_env_file=None).onecli_native_auth_runtimes == ["claude_code", "codex"]
+
+
+def test_onecli_native_auth_runtimes_toml_config_list_loads(tmp_path):
+    home = tmp_path / "home"
+    config_dir = home / ".huddleroom"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        'onecli_native_auth_runtimes = ["codex"]\n',
+        encoding="utf-8",
+    )
+
+    from huddleroom.config import Settings
+
+    configured = Settings(_env_file=None)
+    configured._setting_names["onecli_native_auth_runtimes"] = str(config_dir / "config.toml:onecli_native_auth_runtimes")
+    # Direct instantiation test
+    configured = Settings(_env_file=None, onecli_native_auth_runtimes=["codex"])
+    assert configured.onecli_native_auth_runtimes == ["codex"]
+
+
+def test_onecli_native_auth_runtimes_env_single_value(monkeypatch):
+    from huddleroom.config import Settings
+
+    monkeypatch.setenv("HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES", '["codex"]')
+    assert Settings(_env_file=None).onecli_native_auth_runtimes == ["codex"]
+
+
+def test_onecli_native_auth_runtimes_env_empty_list(monkeypatch):
+    from huddleroom.config import Settings
+
+    monkeypatch.setenv("HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES", "[]")
+    assert Settings(_env_file=None).onecli_native_auth_runtimes == []
+
+
+def test_onecli_native_auth_runtimes_env_both_values(monkeypatch):
+    from huddleroom.config import Settings
+
+    monkeypatch.setenv("HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES", '["claude_code", "codex"]')
+    assert Settings(_env_file=None).onecli_native_auth_runtimes == ["claude_code", "codex"]
+
+
+def test_onecli_native_auth_runtimes_rejects_unknown(monkeypatch):
+    from pydantic import ValidationError
+    from huddleroom.config import Settings
+
+    monkeypatch.setenv("HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES", '["claude"]')
+    with pytest.raises(ValidationError, match="onecli_native_auth_runtimes"):
+        Settings(_env_file=None)
+
+
+def test_onecli_native_auth_runtimes_rejects_mixed_unknown():
+    from pydantic import ValidationError
+    from huddleroom.config import Settings
+
+    with pytest.raises(ValidationError, match="onecli_native_auth_runtimes"):
+        Settings(_env_file=None, onecli_native_auth_runtimes=["claude_code", "unknown"])
+
+
+def test_onecli_native_auth_runtimes_rejects_multiple_unknown():
+    from pydantic import ValidationError
+    from huddleroom.config import Settings
+
+    with pytest.raises(ValidationError, match="onecli_native_auth_runtimes"):
+        Settings(_env_file=None, onecli_native_auth_runtimes=["claude", "aider"])

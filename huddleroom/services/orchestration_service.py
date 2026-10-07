@@ -3463,13 +3463,11 @@ class OrchestrationService:
             agent = await db.get(Agent, session.agent_id) if session is not None else None
             metadata = session.metadata_ if session is not None and isinstance(session.metadata_, dict) else {}
             attempt = metadata.get("attempt") if isinstance(metadata.get("attempt"), dict) else {}
-            expected_launch = await self._current_exact_launch_fingerprint(db, session, task, agent)
             source = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))
             source_action_id = source.get("action_id")
             if (session is None or run is None or goal is None or agent is None or session.task_id != task.id
                     or goal.status != "active" or run.status != "running" or session.adapter_type != "cli"
-                    or (agent.config.get("cli_runtime", agent.cli_runtime or "claude_code") if agent is not None else None) != "claude_code"
-                    or metadata.get("_launch_fingerprint") != expected_launch
+                    or (agent.config.get("cli_runtime", agent.cli_runtime or "claude_code") if agent is not None else None) not in {"claude_code", "codex"}
                     or session.status != "failed" or not session.resumable or not session.provider_session_id
                     or metadata.get("token_usage_complete") is not True
                     or attempt.get("effect_state") != "started" or attempt.get("usage_complete") is not True
@@ -3515,10 +3513,7 @@ class OrchestrationService:
                 if "max_hours" in allocation:
                     config["timeout"] = int(Decimal(str(allocation["max_hours"])) * Decimal("3600"))
                 resumed.metadata_ = {**(resumed.metadata_ or {}), "_run_config": config}
-            resumed_launch = await self._current_exact_launch_fingerprint(db, resumed, task, agent)
-            resumed.metadata_ = {
-                **(resumed.metadata_ or {}), "_recovery_exact_launch_fingerprint": resumed_launch,
-            }
+            resumed.metadata_ = {**(resumed.metadata_ or {}), "_recovery_exact": True}
             resumed.metadata_ = {**resumed.metadata_, "orchestration": {"action_id": str(action.id)}}
             task.status = "in_progress"
             action.dispatch_contract = {
@@ -3534,7 +3529,7 @@ class OrchestrationService:
                 "session_id": str(resumed.id), "provider_session_id": resumed.provider_session_id,
                 "source_runner_task_id": source_runner_task_id, "current_runner_task_id": resumed.runner_task_id,
                 "runner_task_id": resumed.runner_task_id,
-                "proof": {"launch_fingerprint": expected_launch, "attempt": attempt,
+                "proof": {"attempt": attempt,
                           "proved_at": datetime.now(timezone.utc).isoformat()},
             }
             self._remember_task_recovery(run, task.id, "resume_exact", action.id)
@@ -3720,14 +3715,13 @@ class OrchestrationService:
         metadata = session.metadata_ if session is not None and isinstance(session.metadata_, dict) else {}
         attempt = metadata.get("attempt") if isinstance(metadata.get("attempt"), dict) else {}
         runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code") if agent is not None else None
-        expected_launch = await self._current_exact_launch_fingerprint(db, session, task, agent)
         source = self._json_object_or_empty(self._json_object_or_empty(task.metadata_ if task else {}).get("orchestration"))
         source_action = await db.get(OrchestrationAction, uuid.UUID(str(source["action_id"])), populate_existing=True) if source.get("action_id") else None
         counters = (attempt.get("token_count_in"), attempt.get("token_count_out"))
         if (run is None or goal is None or task is None or session is None or agent is None
                 or goal.status != "active" or run.status != "running" or session.task_id != task.id
                 or task.status != "failed" or task.assigned_to != session.agent_id or session.adapter_type != "cli"
-                or runtime != "claude_code" or metadata.get("_launch_fingerprint") != expected_launch
+                or runtime not in {"claude_code", "codex"}
                 or session.status != "failed" or not session.resumable or not session.provider_session_id
                 or metadata.get("token_usage_complete") is not True or attempt.get("effect_state") != "started"
                 or attempt.get("usage_complete") is not True or attempt.get("result_status") != "failed"
@@ -3737,28 +3731,6 @@ class OrchestrationService:
                 or source_action.run_id != run_id or source_action.status != "completed"):
             return "Exact continuation is not provable"
         return None
-
-    @staticmethod
-    async def _current_exact_launch_fingerprint(
-        db: AsyncSession, session: Session | None, task: Task | None, agent: Agent | None,
-    ) -> str | None:
-        if session is None or task is None or agent is None:
-            return None
-        roadmap = (session.input_context or {}).get("orchestrator_context", {}).get("roadmap", {})
-        try:
-            if isinstance(roadmap, dict) and roadmap.get("mutates_shared_state") and roadmap.get("staging_boundary"):
-                workspace = await ProjectService().require_frozen_roadmap_workspace(
-                    db, session.project_id, roadmap["staging_boundary"], (session.metadata_ or {}).get("_roadmap_workspace", ""),
-                )
-            else:
-                workspace = await ProjectService().require_runnable_project(db, session.project_id)
-        except HTTPException:
-            return None
-        project = await db.get(Project, session.project_id, populate_existing=True)
-        if project is None:
-            return None
-        from huddleroom.adapters.cli_adapter import CliAdapter
-        return CliAdapter.launch_fingerprint(session, task, agent, project, workspace)
 
     def _set_task_budget_action(self, task: Task, action_id: uuid.UUID) -> None:
         metadata = self._json_object_or_empty(task.metadata_)

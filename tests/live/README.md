@@ -20,7 +20,7 @@ End-to-end integration tests that run against a live Rally server using real LLM
 export OPENAI_API_KEY=your-key
 ```
 
-All live agents in `tests/live/live_test.py` currently use provider `openi` with model `openai/gpt-5-nano`.
+All live agents in `tests/live/live_test.py` currently use provider `openai` with model `openai/gpt-6-luna`.
 
 ### Python Dependencies
 
@@ -72,12 +72,33 @@ live call using that session. Add `--adapter-task` to run a persisted
 explicit model. Add `--verify-cancel` to verify live process-group cleanup.
 Use `--runtimes copilot` to isolate one.
 
+### CLI adapter end-to-end
+
+`tests/live/cli_adapter_e2e.py` drives the real HTTP API per CLI runtime:
+project (temporary workspace) -> CLI agent -> task -> assign -> run -> poll the
+session. A runtime passes when its session completes and `e2e_marker.txt` (or
+the output) contains the test token. This makes real LLM calls, except `custom`.
+
+```bash
+.venv/bin/python tests/live/cli_adapter_e2e.py --runtimes claude_code,codex
+.venv/bin/python tests/live/cli_adapter_e2e.py --runtimes custom   # free, no LLM
+.venv/bin/python tests/live/cli_adapter_e2e.py --runtimes claude_code,codex --resume  # + resume/poison rows
+```
+
+Flags: `--runtimes` (comma list of `claude_code,codex,aider,copilot,opencode,pi,custom`),
+`--model RUNTIME=MODEL` (repeatable per-runtime override), `--effort EFFORT`,
+`--port PORT`, `--no-start-server`, `--timeout TIMEOUT`.
+
+Runtimes whose binary is not installed are reported as SKIP. In onecli
+credential mode, `copilot`, `opencode`, and `pi` need the server started under
+`onecli run`; `claude_code` and `codex` use your local logins.
+
 ## What It Does
 
 1. Checks if Rally is already running on port 8001.
 2. If not, runs `.venv/bin/alembic upgrade head` then launches `.venv/bin/rally serve --port 8001`.
 3. Creates or reuses project `rally-live-test`.
-4. Creates or reuses 4 agents (`live-architect`, `live-pragmatist`, `live-security`, `live-pm`), all configured as `openi` / `openai/gpt-5-nano`.
+4. Creates or reuses 4 agents (`live-architect`, `live-pragmatist`, `live-security`, `live-pm`), all configured as `openai` / `openai/gpt-6-luna`.
 5. For each meeting test:
    - Creates the meeting with `auto_start=True`.
    - Opens a WebSocket to `/ws/meetings/{id}` and streams events to stdout.

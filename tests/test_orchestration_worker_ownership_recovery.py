@@ -1,7 +1,6 @@
 """Task 9 acceptance tests for durable orchestration-worker ownership."""
 from datetime import datetime, timedelta, timezone
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
@@ -49,10 +48,6 @@ async def _owned(db, project, agent, *, session_status="running", task_status="i
     action.request = {"task_id": str(task.id)}
     action.target_type, action.target_id = "session", session.id
     return goal, run, action, task, session
-
-
-def _launch_fingerprint(session, task, agent, project):
-    return CliAdapter.launch_fingerprint(session, task, agent, project, Path(project.workspace_path))
 
 
 async def _applied(db, project, agent, *, status="running", backend="active", attempt=None, resumable=False,
@@ -809,8 +804,7 @@ async def test_exact_resume_reuses_same_session_provider_and_retry_key_once(db_s
     goal, _, _, task, session = await _owned(db_session, test_project, test_agent, session_status="failed", task_status="failed",
         resumable=True, provider="provider", attempt={"effect_state": "started", "usage_complete": True,
             "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1})
-    session.metadata_ = {**session.metadata_, "token_usage_complete": True,
-                         "_launch_fingerprint": _launch_fingerprint(session, task, test_agent, test_project)}
+    session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     resumed = []
     original_resume = SessionService.resume
 
@@ -835,8 +829,7 @@ async def test_fully_proven_failed_cli_resumes_when_backend_is_unavailable(db_se
     goal, _, _, task, session = await _owned(db_session, test_project, test_agent, session_status="failed", task_status="failed",
         resumable=True, provider="provider", attempt={"effect_state": "started", "usage_complete": True,
             "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1})
-    session.metadata_ = {**session.metadata_, "token_usage_complete": True,
-                         "_launch_fingerprint": _launch_fingerprint(session, task, test_agent, test_project)}
+    session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     resumed = []
     original_resume = SessionService.resume
     async def resume_spy(service, db, session_id):
@@ -858,8 +851,7 @@ async def test_exact_resume_uses_existing_budget_accounting_and_complete_contrac
     goal.budget = {"caps": {"max_tokens": 100}}
     run.phase = "authorized"
     task.metadata_ = {**task.metadata_, "orchestration_contract": {"budget": {"caps": {"max_tokens": 10}}}}
-    session.metadata_ = {**session.metadata_, "token_usage_complete": True,
-                         "_launch_fingerprint": _launch_fingerprint(session, task, test_agent, test_project)}
+    session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
     result = await OrchestrationRecoveryService().apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "terminal_failure", datetime.now(timezone.utc))})
@@ -884,18 +876,20 @@ async def test_unproven_failed_attempt_reconciles_terminal_noop(db_session, test
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ("workspace", "path", "api_base", "openai_key"))
-async def test_exact_resume_refuses_launch_fingerprint_drift_without_dispatch_or_budget_mutation(
-    db_session, test_project, test_agent, monkeypatch, tmp_path, drift,
+@pytest.mark.parametrize("runtime,drift", (
+    ("claude_code", "workspace"), ("claude_code", "path"), ("claude_code", "api_base"),
+    ("claude_code", "openai_key"), ("codex", None),
+))
+async def test_exact_resume_is_provable_despite_env_drift_and_for_codex(
+    db_session, test_project, test_agent, monkeypatch, tmp_path, runtime, drift,
 ):
-    test_agent.cli_runtime = "claude_code"
-    goal, run, _, task, session = await _owned(
+    test_agent.cli_runtime = runtime
+    goal, _, _, task, session = await _owned(
         db_session, test_project, test_agent, session_status="failed", task_status="failed", resumable=True,
         provider="provider", attempt={"effect_state": "started", "usage_complete": True,
             "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1},
     )
-    session.metadata_ = {**session.metadata_, "token_usage_complete": True,
-                         "_launch_fingerprint": _launch_fingerprint(session, task, test_agent, test_project)}
+    session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     if drift == "workspace":
         moved = tmp_path / "moved-workspace"; moved.mkdir()
         test_project.workspace_path = str(moved)
@@ -903,24 +897,21 @@ async def test_exact_resume_refuses_launch_fingerprint_drift_without_dispatch_or
         monkeypatch.setenv("PATH", "/drifted-path")
     elif drift == "api_base":
         monkeypatch.setattr(settings, "api_base_url", "http://drifted-api")
-    else:
+    elif drift == "openai_key":
         monkeypatch.setenv("OPENAI_API_KEY", "drifted-key")
-    retry_state_before = run.retry_state
-    called = False
+    resumed = []
+    original_resume = SessionService.resume
 
-    async def never_resume(*_args):
-        nonlocal called
-        called = True
-        raise AssertionError("exact continuation dispatched")
+    async def resume_spy(service, db, session_id):
+        resumed.append(session_id)
+        return await original_resume(service, db, session_id)
 
-    monkeypatch.setattr(SessionService, "resume", never_resume)
+    monkeypatch.setattr(SessionService, "resume", resume_spy)
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
     result = await OrchestrationRecoveryService().apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "terminal_failure", datetime.now(timezone.utc))})
-    assert result.action_id is None and not called
-    assert session.status == "failed" and session.resumable is True
-    assert run.retry_state == retry_state_before
-    assert await db_session.scalar(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id)) is not None
+    assert result.classification == "resume_exact" and resumed == [session.id]
+    assert session.metadata_["_recovery_exact"] is True
 
 
 @pytest.mark.asyncio
@@ -1163,8 +1154,7 @@ async def test_resume_refusal_persists_actionable_attention(db_session, test_pro
         provider="provider", attempt={"effect_state": "started", "usage_complete": True,
             "result_status": "failed", "provider_session_id": "provider"},
     )
-    session.metadata_ = {**session.metadata_, "token_usage_complete": True,
-        "_launch_fingerprint": _launch_fingerprint(session, task, test_agent, test_project)}
+    session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     refused = []
     async def post_reservation_refusal(_service, db, run_id, *_args, **_kwargs):
         action = OrchestrationAction(run_id=run_id, idempotency_key=f"refused:{uuid.uuid4()}", action_type="retry_task", request={}, status="failed", budget_ledger={"reserved": {"max_tokens": "10"}})

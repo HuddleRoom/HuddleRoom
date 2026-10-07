@@ -100,10 +100,10 @@ class CliStreamDecoder:
         """Parse accumulated stdout buffer for updates."""
         if self.runtime == "claude_code":
             return self._parse_claude_output()
-        if self.runtime in {"copilot", "opencode", "pi"}:
+        if self.runtime in {"codex", "copilot", "opencode", "pi"}:
             return self._parse_json_output()
         else:
-            # Plain runtimes: codex, aider, custom
+            # Plain runtimes: aider, custom
             return self._parse_plain_output()
 
     def _parse_error_buffer(self) -> list[CliDisplayUpdate]:
@@ -231,7 +231,7 @@ class CliStreamDecoder:
         """Finalize decoding with complete stdout/stderr and extract session ID."""
         if self.runtime == "claude_code":
             content, session_id = self._parse_claude_final(stdout)
-        elif self.runtime in {"copilot", "opencode", "pi"}:
+        elif self.runtime in {"codex", "copilot", "opencode", "pi"}:
             try:
                 content, session_id = parse_jsonl_final(
                     stdout.decode("utf-8", errors="ignore"), self.runtime
@@ -322,6 +322,18 @@ def _pi_message_text(record: dict[str, Any]) -> str | None:
 def _json_live_text(record: dict[str, Any], runtime: str) -> str | None:
     """Return only assistant text from a documented runtime event."""
     event_type = record.get("type")
+    if runtime == "codex":
+        if event_type != "item.completed":
+            return None
+        item = record.get("item")
+        if not isinstance(item, dict):
+            return None
+        # Ignore error items (config warnings, etc.)
+        if item.get("type") == "error":
+            return None
+        if item.get("type") != "agent_message":
+            return None
+        return item.get("text") if isinstance(item.get("text"), str) else None
     if runtime == "copilot":
         data = record.get("data")
         if event_type != "assistant.message_delta" or not isinstance(data, dict):
@@ -342,6 +354,8 @@ def _json_live_text(record: dict[str, Any], runtime: str) -> str | None:
 
 def _json_session_id(record: dict[str, Any], runtime: str) -> str | None:
     event_type = record.get("type")
+    if runtime == "codex" and event_type == "thread.started":
+        return record.get("thread_id") if isinstance(record.get("thread_id"), str) else None
     if runtime == "pi" and event_type == "session":
         return record.get("id") if isinstance(record.get("id"), str) else None
     if runtime == "opencode":
@@ -392,11 +406,40 @@ def parse_jsonl_final(raw: str, runtime: str) -> tuple[str, str | None]:
             final_text = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), str) else None
         elif runtime == "pi" and record.get("type") in {"message_end", "turn_end"}:
             final_text = _pi_message_text(record) or final_text
+        elif runtime == "codex" and text:
+            # Earlier agent_messages are narration before tool calls; only the last is the answer.
+            final_text = text
 
     content = final_text or "".join(fragments)
     if not content:
         raise ValueError("no assistant output")
     return content, session_id
+
+
+def is_resume_not_found(runtime: str, exit_code: int | None, stdout: str, stderr: str) -> bool:
+    """True only when a failed CLI exit says the resumed session id does not exist.
+
+    codex: marker on stderr. claude_code: marker on stderr, or in the `errors` of the
+    terminal stream-json `result` record (never in arbitrary assistant/tool text).
+    """
+    if exit_code == 0 or exit_code is None:
+        return False
+    if runtime == "codex":
+        return "no rollout found for thread id" in stderr
+    if runtime == "claude_code":
+        marker = "No conversation found with session ID"
+        if marker in stderr:
+            return True
+        for line in stdout.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (isinstance(record, dict) and record.get("type") == "result"
+                    and isinstance(record.get("errors"), list)
+                    and any(isinstance(e, str) and marker in e for e in record["errors"])):
+                return True
+    return False
 
 
 def decoder_for_runtime(runtime: str) -> CliStreamDecoder:

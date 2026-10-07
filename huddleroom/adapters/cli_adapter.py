@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -20,11 +19,12 @@ from huddleroom.models.project import Project
 from huddleroom.config import settings
 from huddleroom.services.event_bus import emit_event
 from huddleroom.services.llm_debug_logging import log_cli_exchange
+from huddleroom.services.orchestration_completion import CLI_EFFORTS, strip_native_auth_env
 from huddleroom.services.llm_structured_repair import cli_complete_with_repair
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.secret_redaction import redact_secrets
 from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
-from huddleroom.services.cli_streaming import collect_cli_process, terminate_process_group
+from huddleroom.services.cli_streaming import collect_cli_process, is_resume_not_found, terminate_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,12 @@ class CliTurnFailed(RuntimeError):
         self.session_id = session_id
 
 
+class CliResumeNotFound(CliTurnFailed):
+    """The CLI reported that the stored session id does not exist (resume impossible)."""
+
+
 class CliAdapter:
+    _SESSION_ID_RE = re.compile(r"[a-zA-Z0-9_-]{8,128}")
     _LEGACY_CONTEXT_FILENAME = "rally_context.json"
     _CONTEXT_FILENAME = "huddleroom_context.json"
 
@@ -52,12 +57,12 @@ class CliAdapter:
         return sandbox_dir / filename
 
     @staticmethod
-    def _claude_usage(stdout: str) -> tuple[int, int] | None:
+    def _claude_usage(stdout: str, record_type: str = "result") -> tuple[int, int] | None:
         """Read the provider's terminal usage envelope; absence is explicitly incomplete."""
         for line in reversed(stdout.splitlines()):
             try:
                 record = json.loads(line)
-                if not isinstance(record, dict) or record.get("type") != "result":
+                if not isinstance(record, dict) or record.get("type") != record_type:
                     continue
                 usage = record.get("usage", {})
                 prompt, completion = usage.get("input_tokens"), usage.get("output_tokens")
@@ -67,6 +72,11 @@ class CliAdapter:
             except json.JSONDecodeError:
                 continue
         return None
+
+    @classmethod
+    def _codex_usage(cls, stdout: str) -> tuple[int, int] | None:
+        """Codex reports usage on its terminal `turn.completed` event."""
+        return cls._claude_usage(stdout, "turn.completed")
 
     @staticmethod
     def _store_roadmap_elapsed(session: Session) -> None:
@@ -167,10 +177,14 @@ class CliAdapter:
         cli_runtime: str, task_content: str, agent_config: dict, workspace: Path, task_path: Path,
         *, context_path: Path | None = None, existing_session_id: str | None = None, model: str | None = None,
     ) -> list[str] | None:
+        effort = (agent_config or {}).get("reasoning_effort")
+        effort = effort if isinstance(effort, str) and effort in (CLI_EFFORTS - {"max"} if cli_runtime == "codex" else CLI_EFFORTS) else None
         if cli_runtime == "claude_code":
             cmd = ["claude", "--dangerously-skip-permissions", "--print", "--verbose"]
             if model:
                 cmd += ["--model", model]
+            if effort:
+                cmd += ["--effort", effort]
             if context_path:
                 cmd += ["--output-format", "stream-json"]
             else:
@@ -182,9 +196,20 @@ class CliAdapter:
                     logger.warning("Ignoring invalid CLI session ID: %r", existing_session_id)
             return cmd + (["--file", str(context_path)] if context_path else [])
         elif cli_runtime == "codex":
+            model_args = [*(["--model", model] if model else []),
+                          *(["-c", f"model_reasoning_effort={effort}"] if effort else [])]
+            if existing_session_id and re.fullmatch(CliAdapter._SESSION_ID_RE, existing_session_id) \
+                    and not existing_session_id.startswith("-"):
+                # resume accepts neither --sandbox nor --cd: sandbox via -c, workspace via subprocess cwd.
+                return [
+                    "codex", "exec", "resume", "--json", "--skip-git-repo-check",
+                    "-c", "sandbox_mode=workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+                    *model_args, existing_session_id, task_content or "proceed",
+                ]
             return [
-                "codex", "exec", "--sandbox", "workspace-write", "--cd", str(workspace),
-                "--ask-for-approval", "never", *( ["--model", model] if model else []), task_content or "proceed",
+                "codex", "exec", "--json", "--sandbox", "workspace-write", "--cd", str(workspace),
+                "--skip-git-repo-check", "-c", "sandbox_workspace_write.network_access=true",
+                *model_args, task_content or "proceed",
             ]
         elif cli_runtime == "aider":
             return ["aider", "--yes", "--no-pretty", *( ["--model", model] if model else []), "--message", task_content or "proceed"]
@@ -219,30 +244,6 @@ class CliAdapter:
             return [script_path, str(task_path)]
         raise RuntimeError(f"unsupported_cli_runtime: {cli_runtime}")
 
-    @classmethod
-    def launch_fingerprint(cls, session: Session, task, agent, project, workspace: Path) -> str:
-        """Stable record of every persisted input to a CLI subprocess launch."""
-        run_config = (session.metadata_ or {}).get("_run_config", {})
-        runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code")
-        model = run_config.get("model_override") or agent.model
-        content = cls._compose_task_content(task, agent, session.id)
-        try:
-            command = cls._build_command(runtime, content, agent.config, workspace, Path("task.md"), model=model)
-        except RuntimeError as exc:
-            # Fingerprinting must not bypass the normal unsupported-runtime failure path.
-            command = [str(exc)]
-        launch = {
-            "provider": agent.provider,
-            "workspace": str(workspace),
-            "cwd": str(workspace),
-            "command": command,
-            "timeout": run_config.get("timeout") or agent.config.get("session_timeout_seconds", 3600),
-            "environment": hashlib.sha256(json.dumps(
-                cls()._build_env(session.id, task, agent, project), sort_keys=True, separators=(",", ":"),
-            ).encode()).hexdigest(),
-        }
-        return hashlib.sha256(json.dumps(launch, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
     def _setup_sandbox(self, sandbox_dir: Path, session_id: uuid.UUID, task, agent, project_id,
                        task_content: str = "") -> None:
         sandbox_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +262,7 @@ class CliAdapter:
     _ALLOWED_ENV_KEYS = frozenset({
         "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL",
         "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL",
+        "CODEX_HOME", "CLAUDE_CONFIG_DIR",  # native-login config locations
     })
     _TOOL_API_KEYS = (
         "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
@@ -287,22 +289,24 @@ class CliAdapter:
         }
 
     def _build_env(self, session_id: uuid.UUID, task, agent, project) -> dict:
+        return self._base_env(agent, project, SESSION_ID=str(session_id), TASK_ID=str(task.id) if task else "")
+
+    def _base_env(self, agent, project, **context: str) -> dict:
         env = {k: v for k, v in os.environ.items() if k in self._ALLOWED_ENV_KEYS}
         env.update(self._context_env(
-            SESSION_ID=str(session_id), TASK_ID=str(task.id) if task else "", AGENT_ID=str(agent.id),
-            PROJECT_ID=str(project.id) if project else "", API_KEY="", API_BASE=settings.api_base_url,
+            **context, AGENT_ID=str(agent.id), PROJECT_ID=str(project.id) if project else "",
+            API_KEY="", API_BASE=settings.api_base_url,
         ))
+        runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code")
         if agent.config.get("cli_env_extras"):
-            safe_extras = {
+            env.update({
                 k: v for k, v in agent.config["cli_env_extras"].items()
                 if k not in self._SECRET_KEY_PATTERNS and k not in self._RUNTIME_API_KEYS
-            }
-            env.update(safe_extras)
+            })
         # Apply tool API keys last so agent config cannot override them
         for key in self._TOOL_API_KEYS:
             if key in os.environ:
                 env[key] = os.environ[key]
-        runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code")
         if runtime in {"copilot", "opencode", "pi"}:
             for key in self._ONECLI_RUNTIME_ENV_KEYS:
                 if key in os.environ:
@@ -315,11 +319,23 @@ class CliAdapter:
             for key in self._OPENROUTER_API_KEYS:
                 if key in os.environ:
                     env[key] = os.environ[key]
+        if runtime in settings.onecli_native_auth_runtimes:
+            # Native runtimes use the user's local login: no gateway, proxy, placeholder keys or base URLs.
+            return strip_native_auth_env(env) if settings.credential_mode == "onecli" else env
         from huddleroom.onecli import apply_onecli_environment
         apply_onecli_environment(env, settings)
         return env
 
     async def run(self, session_id: uuid.UUID, db: AsyncSession, runner_task_id: str | None = None) -> None:
+        await self._run(session_id, db, runner_task_id)
+        # The exact-resume marker only governs the run it was set for; a later manual resume falls back normally.
+        session = await db.get(Session, session_id)
+        if session and session.status in {"completed", "failed", "cancelled"} \
+                and "_recovery_exact" in (session.metadata_ or {}):
+            session.metadata_ = {k: v for k, v in session.metadata_.items() if k != "_recovery_exact"}
+            await db.flush()
+
+    async def _run(self, session_id: uuid.UUID, db: AsyncSession, runner_task_id: str | None = None) -> None:
         # 1. Load session (idempotency check)
         result = await db.execute(select(Session).where(Session.id == session_id))
         session = result.scalar_one_or_none()
@@ -386,23 +402,6 @@ class CliAdapter:
         except HTTPException as exc:
             await self._fail_workspace_validation(db, session, exc, runner_task_id)
             return
-        launch_fingerprint = self.launch_fingerprint(session, task, agent, project, workspace)
-        proven_launch = (session.metadata_ or {}).get("_recovery_exact_launch_fingerprint")
-        if proven_launch is not None and proven_launch != launch_fingerprint:
-            session.status = "failed"
-            session.error = "exact_resume_launch_config_changed"
-            session.resumable = False
-            session.ended_at = datetime.now(timezone.utc)
-            if not await finish_if_owned():
-                return
-            await db.flush()
-            return
-        metadata = session.metadata_ or {}
-        prior_launch = metadata.get("_launch_config")
-        current_launch = {"provider": agent.provider, "model": effective_model, "cli_runtime": cli_runtime}
-        if (metadata.get("_launch_fingerprint") not in (None, launch_fingerprint)
-                or (isinstance(prior_launch, dict) and prior_launch != current_launch)):
-            session.provider_session_id = None
         sandbox_dir = self._sandbox_dir(workspace, "agents", str(agent.id), "sessions", str(session_id))
 
         # Build source-owned request display BEFORE composing task content
@@ -411,20 +410,23 @@ class CliAdapter:
         task_content = self._compose_task_content(task, agent, session_id)
         self._setup_sandbox(sandbox_dir, session_id, task, agent, session.project_id, task_content)
 
-        # Orchestration recovery retains its established Claude-only exact resume.
+        # Resume with the id the CLI reported; the CLI's "not found" answer triggers the fresh fallback.
         supports_resume = (
-            cli_runtime == "claude_code"
+            cli_runtime in {"claude_code", "codex"}
             or not orchestration and cli_runtime in {"copilot", "opencode", "pi"}
         )
-        if session.provider_session_id and supports_resume:
+        used_resume_id = session.provider_session_id if supports_resume else None
+        if (cli_runtime == "codex" and used_resume_id
+                and not (self._SESSION_ID_RE.fullmatch(used_resume_id) and not used_resume_id.startswith("-"))):
+            used_resume_id = None  # invalid thread id never reaches argv: run fresh
+        if used_resume_id:
             task_content = "continue"
 
         # 5. Build command
         try:
             cmd = self._build_command(
                 cli_runtime, task_content, agent.config, workspace, sandbox_dir / "task.md",
-                existing_session_id=session.provider_session_id if supports_resume else None,
-                model=effective_model,
+                existing_session_id=used_resume_id, model=effective_model,
             )
         except RuntimeError as exc:
             command_error = str(exc)
@@ -485,22 +487,11 @@ class CliAdapter:
         except HTTPException as exc:
             await self._fail_workspace_validation(db, session, exc, runner_task_id)
             return
-        launch_fingerprint = self.launch_fingerprint(session, task, agent, project, workspace)
-        if proven_launch is not None and proven_launch != launch_fingerprint:
-            await self._fail_workspace_validation(
-                db, session, HTTPException(status_code=409, detail="exact_resume_launch_config_changed"), runner_task_id,
-            )
-            return
-        session.metadata_ = {
-            **(session.metadata_ or {}), "_launch_fingerprint": launch_fingerprint,
-            "_launch_config": {"provider": agent.provider, "model": effective_model, "cli_runtime": cli_runtime},
-        }
-        # Release SQLite's writer lock after metadata update before subprocess/watcher race.
+        # Release SQLite's writer lock before the subprocess/watcher race.
         await db.commit()
         cmd = self._build_command(
             cli_runtime, task_content, agent.config, workspace, sandbox_dir / "task.md",
-            existing_session_id=session.provider_session_id if supports_resume else None,
-            model=effective_model,
+            existing_session_id=used_resume_id, model=effective_model,
         )
 
         try:
@@ -698,6 +689,45 @@ class CliAdapter:
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
         provider_session_id = session.provider_session_id
         repair_error = None
+        stderr_raw = stderr_bytes.decode("utf-8", errors="replace")
+        if used_resume_id and is_resume_not_found(cli_runtime, exit_code, stdout_text, stderr_raw):
+            if (session.metadata_ or {}).get("_recovery_exact"):
+                # Exact continuation cannot silently start fresh: fail terminally so the orchestrator retries.
+                session.status = "failed"
+                session.error = "resume_conversation_not_found"
+                session.provider_session_id = None
+                session.resumable = False
+                session.ended_at = datetime.now(timezone.utc)
+                self._store_roadmap_elapsed(session)
+                # The failed call spent nothing: record complete zero usage so neither the attempt
+                # ledger nor budget settlement reuses the earlier attempt's counters or approval grants.
+                metadata = {
+                    **(session.metadata_ or {}), "exit_code": exit_code, "model_used": effective_model,
+                    "token_count_in": 0, "token_count_out": 0, "token_usage_complete": True,
+                }
+                if "_roadmap_cli_token_grants" in metadata:
+                    metadata["_roadmap_cli_token_grants"] = []
+                session.metadata_ = metadata
+                if not await finish_if_owned():
+                    return
+                await db.flush()
+                await emit_event(db, session.project_id, "session.failed", {
+                    "session_id": str(session_id),
+                    "task_id": str(session.task_id) if session.task_id else None,
+                    "error": session.error, "project_id": str(session.project_id), "resumable": False,
+                })
+                from huddleroom.services.session_sync import sync_task_from_session
+                await sync_task_from_session(db, session)
+                log_cli_exchange(
+                    prompt=task_content, session_id=used_resume_id, error=session.error,
+                    runtime=cli_runtime, rally_session_id=str(session_id),
+                )
+                return
+            session.provider_session_id = None
+            session.metadata_ = {**(session.metadata_ or {}), "resume_outcome": "fallback_fresh"}
+            await db.commit()
+            # id is now None, so this re-entry builds the full prompt and cannot loop.
+            return await self._run(session_id, db, runner_task_id)
         if cli_runtime == "claude_code":
             # Wire envelope parsing through auto-repair loop
             from huddleroom.services.cli_streaming import parse_claude_final
@@ -734,7 +764,7 @@ class CliAdapter:
                 # A repair process cannot outlive this terminal session.
                 output = stdout_text
                 repair_error = redact_secrets(str(exc))
-        elif cli_runtime in {"copilot", "opencode", "pi"}:
+        elif cli_runtime in {"codex", "copilot", "opencode", "pi"}:
             from huddleroom.services.cli_streaming import parse_jsonl_final
 
             try:
@@ -747,7 +777,8 @@ class CliAdapter:
                 except ValueError:
                     pass
                 output = ""
-                repair_error = "invalid_cli_output"
+                # A failed codex exit (no JSON) is reported through its exit code instead.
+                repair_error = None if cli_runtime == "codex" and exit_code != 0 else "invalid_cli_output"
         else:
             output = stdout_text
 
@@ -767,9 +798,11 @@ class CliAdapter:
             **(session.metadata_ or {}),
             "exit_code": exit_code,
             "model_used": effective_model,
+            **({"resume_outcome": "resumed"} if used_resume_id and exit_code == 0 else {}),
         }
         if (session.metadata_ or {}).get("_run_config", {}).get("_roadmap_budget_enforced"):
-            usage = self._claude_usage(stdout_text) if cli_runtime == "claude_code" else None
+            usage = (self._claude_usage(stdout_text) if cli_runtime == "claude_code"
+                     else self._codex_usage(stdout_text) if cli_runtime == "codex" else None)
             session.metadata_ = {
                 **session.metadata_,
                 "token_usage_complete": usage is not None,
@@ -816,37 +849,7 @@ class CliAdapter:
 
     def _build_meeting_env(self, meeting, agent, project) -> dict:
         """Build environment for a meeting turn subprocess."""
-        env = {k: v for k, v in os.environ.items() if k in self._ALLOWED_ENV_KEYS}
-        env.update(self._context_env(
-            MEETING_ID=str(meeting.id), AGENT_ID=str(agent.id), PROJECT_ID=str(project.id) if project else "",
-            API_KEY="", API_BASE=settings.api_base_url,
-        ))
-        if agent.config.get("cli_env_extras"):
-            safe_extras = {
-                k: v for k, v in agent.config["cli_env_extras"].items()
-                if k not in self._SECRET_KEY_PATTERNS and k not in self._RUNTIME_API_KEYS
-            }
-            env.update(safe_extras)
-        # Apply tool API keys last so agent config cannot override them
-        for key in self._TOOL_API_KEYS:
-            if key in os.environ:
-                env[key] = os.environ[key]
-        runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code")
-        if runtime in {"copilot", "opencode", "pi"}:
-            for key in self._ONECLI_RUNTIME_ENV_KEYS:
-                if key in os.environ:
-                    env[key] = os.environ[key]
-        if runtime == "copilot":
-            for key in self._COPILOT_API_KEYS:
-                if key in os.environ:
-                    env[key] = os.environ[key]
-        if runtime in {"opencode", "pi"}:
-            for key in self._OPENROUTER_API_KEYS:
-                if key in os.environ:
-                    env[key] = os.environ[key]
-        from huddleroom.onecli import apply_onecli_environment
-        apply_onecli_environment(env, settings)
-        return env
+        return self._base_env(agent, project, MEETING_ID=str(meeting.id))
 
     async def _resume_raw(
         self, session_id: str, fix_prompt: str, *, cli_runtime: str, agent_config: dict,
@@ -865,7 +868,7 @@ class CliAdapter:
             raise RuntimeError("resume deadline exhausted")
         cmd = self._build_command(
             cli_runtime, fix_prompt, agent_config, workspace, task_path,
-            existing_session_id=session_id if cli_runtime in {"claude_code", "copilot", "opencode", "pi"} else None,
+            existing_session_id=session_id if cli_runtime in {"claude_code", "codex", "copilot", "opencode", "pi"} else None,
             model=model,
         )
         if cmd is None:
@@ -1078,7 +1081,7 @@ class CliAdapter:
                 # Best-effort parse stdout JSON/JSONL for a resumable session ID.
                 session_id_from_failure = None
                 stdout_text_from_failure = stdout_bytes.decode("utf-8", errors="replace")
-                if cli_runtime in {"copilot", "opencode", "pi"}:
+                if cli_runtime in {"codex", "copilot", "opencode", "pi"}:
                     from huddleroom.services.cli_streaming import parse_jsonl_session_id
                     try:
                         session_id_from_failure = parse_jsonl_session_id(stdout_text_from_failure, cli_runtime)
@@ -1091,7 +1094,13 @@ class CliAdapter:
                             session_id_from_failure = parsed.get("session_id")
                     except (json.JSONDecodeError, ValueError):
                         pass
-                raise CliTurnFailed(
+                from huddleroom.services.cli_streaming import is_resume_not_found
+                failure_cls = (
+                    CliResumeNotFound if existing_session_id and is_resume_not_found(
+                        cli_runtime, proc.returncode, stdout_text_from_failure, stderr_text)
+                    else CliTurnFailed
+                )
+                raise failure_cls(
                     f"CLI agent exit_code={proc.returncode}: {redact_secrets(stderr_text[:200])}",
                     session_id=session_id_from_failure
                 )
@@ -1107,7 +1116,7 @@ class CliAdapter:
             latency_ms = int((time.monotonic() - start) * 1000)
             stdout_text = stdout_bytes.decode("utf-8", errors="replace")
 
-            if cli_runtime in {"copilot", "opencode", "pi"}:
+            if cli_runtime in {"codex", "copilot", "opencode", "pi"}:
                 from huddleroom.services.cli_streaming import parse_jsonl_final
                 try:
                     content, new_session_id = parse_jsonl_final(stdout_text, cli_runtime)
@@ -1131,7 +1140,7 @@ class CliAdapter:
                 """Parse envelope based on runtime."""
                 if cli_runtime == "claude_code":
                     return parse_claude_final(raw)
-                if cli_runtime in {"copilot", "opencode", "pi"}:
+                if cli_runtime in {"codex", "copilot", "opencode", "pi"}:
                     from huddleroom.services.cli_streaming import parse_jsonl_final
                     return parse_jsonl_final(raw, cli_runtime)
                 else:
