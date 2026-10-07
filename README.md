@@ -51,6 +51,26 @@ rm -rf ~/.huddleroom
 
 Legacy `RALLY_*` settings remain accepted for one release. They are deprecated; switch to `HUDDLEROOM_*` before the next release. The installed command is `huddleroom`.
 
+### Upgrading (protocol → graph vocabulary)
+
+HuddleRoom 2.0 renames the "protocol" concept to "graph" throughout the platform for alignment with industry standards (ADK 2.0, MS Agent Framework, LangGraph). The database migrates automatically via alembic 048 on `huddleroom serve`; no manual steps are required.
+
+If you have custom YAML workflow definitions in `workspace/protocols/`:
+- Rename the directory to `workspace/graphs/`
+- Convert YAML keys in each file:
+  - `states:` → `nodes:`
+  - `initial_state:` → `start_node:`
+  - `terminal_states:` → `terminal_nodes:`
+  - Per-node `transitions:` → `edges:`
+  - `action_type: update_protocol_context` → `update_graph_context`
+- Update template variables in action values:
+  - `{{protocol_instance.X}}` → `{{graph_run.X}}`
+  - `{{protocol_instance_id}}` → `{{graph_run_id}}`
+  - `{{protocol_name}}` → `{{graph_name}}`
+  - `{{current_state}}` → `{{current_node}}`
+
+The REST API has changed: `/protocols` and `/protocol-instances` are replaced by `/graphs` and `/graph-runs` with no backward-compatible aliases. Update any client integrations accordingly.
+
 ### Develop from source
 
 The published-package flow above is for users. Contributors who need a checkout
@@ -451,7 +471,7 @@ tests/                      # Test suite
 alembic/                    # Database migrations
 └── versions/              # Migration files
 
-workspace/                  # Protocol and escalation YAML definitions
+workspace/                  # Graph and escalation YAML definitions
 
 scripts/                    # WebSocket stdout helper utilities
 

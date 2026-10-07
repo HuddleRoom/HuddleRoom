@@ -22,7 +22,7 @@ class AgendaItemCreate(BaseModel):
     turn_order: list[uuid.UUID] | None = None
     max_rounds: int = 3
     requires_approval: bool = False
-    creates_protocol: bool = False
+    creates_graph: bool = False
 
 
 class AgendaItemResponse(BaseModel):
@@ -42,7 +42,7 @@ class AgendaItemResponse(BaseModel):
     artifact_url: str | None
     turn_order: list | None
     requires_approval: bool
-    creates_protocol: bool
+    creates_graph: bool
     resolution_kind: str | None
     resolution_summary: str | None
     required_followup: str | None
@@ -67,7 +67,7 @@ class MeetingCreate(BaseModel):
     deadlock_strategy: DeadlockStrategy = "human_intervention"
     auto_start: bool = True
     source_task_id: uuid.UUID | None = None
-    source_protocol_instance_id: uuid.UUID | None = None
+    source_graph_run_id: uuid.UUID | None = None
     organizer_agent_id: uuid.UUID | None = None
     organizer_user_id: uuid.UUID | None = None
     planner_agent_id: uuid.UUID | None = None
@@ -97,7 +97,7 @@ class MeetingResponse(BaseModel):
     created_by_user_id: uuid.UUID | None
     created_by_trigger: bool
     trigger_reason: str | None
-    source_protocol_instance_id: uuid.UUID | None
+    source_graph_run_id: uuid.UUID | None
     source_task_id: uuid.UUID | None
     summary: str | None
     is_partial: bool

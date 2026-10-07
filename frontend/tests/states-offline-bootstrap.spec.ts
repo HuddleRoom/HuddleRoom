@@ -32,7 +32,7 @@ test('shows the shell instead of a blank page while /config is delayed', async (
   await expect(page.getByRole('combobox', { name: 'Project switcher' })).toBeVisible()
 })
 
-// Phase 8 Verify bar: hot query hooks (tasks/sessions/protocol-instances
+// Phase 8 Verify bar: hot query hooks (tasks/sessions/graph-runs
 // counts, recent events) gate refetchInterval on WS connection state — zero
 // polling requests should fire while the socket is connected.
 test('has zero polling requests to hot query endpoints while the socket is connected', async ({ page }) => {
@@ -40,7 +40,7 @@ test('has zero polling requests to hot query endpoints while the socket is conne
   await selectSeedProject(page)
   await expect(page.getByText('Live', { exact: true })).toBeVisible({ timeout: 15_000 })
 
-  const hotEndpoint = /\/tasks\/count|\/sessions\/count|\/protocol-instances\/count|\/api\/v1\/events\b/
+  const hotEndpoint = /\/tasks\/count|\/sessions\/count|\/graph-runs\/count|\/api\/v1\/events\b/
   const seen = new Set<string>()
   const repeated: string[] = []
   page.on('request', (request) => {

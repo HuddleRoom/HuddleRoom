@@ -1,7 +1,7 @@
 """Tests for dashboard API regressions:
   dry-run endpoint
   cost-metric date filters
-  protocol instances pagination (same-timestamp tiebreak)
+  graph runs pagination (same-timestamp tiebreak)
   user is_active filtering
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.user import User
 from huddleroom.security import hash_password
 
@@ -106,63 +106,63 @@ async def test_cost_metrics_valid_range(client, test_project):
 
 
 # ---------------------------------------------------------------------------
-# Protocol instances pagination (same-timestamp tiebreak)
+# Graph runs pagination (same-timestamp tiebreak)
 # ---------------------------------------------------------------------------
 
 
-async def _make_protocol(db: AsyncSession, project_id: uuid.UUID) -> Protocol:
-    """Helper: create a minimal Protocol for a given project."""
-    protocol = Protocol(
+async def _make_graph(db: AsyncSession, project_id: uuid.UUID) -> Graph:
+    """Helper: create a minimal Graph for a given project."""
+    graph = Graph(
         project_id=project_id,
-        name=f"proto-{uuid.uuid4()}",
+        name=f"graph-{uuid.uuid4()}",
         version="1.0",
         definition={},
         triggers=[],
         is_active=True,
     )
-    db.add(protocol)
+    db.add(graph)
     await db.flush()
-    return protocol
+    return graph
 
 
-async def _make_instance(
+async def _make_run(
     db: AsyncSession,
     project_id: uuid.UUID,
-    protocol_id: uuid.UUID,
+    graph_id: uuid.UUID,
     created_at: datetime,
-) -> ProtocolInstance:
-    """Helper: create a ProtocolInstance with an explicit created_at."""
-    instance = ProtocolInstance(
-        protocol_id=protocol_id,
+) -> GraphRun:
+    """Helper: create a GraphRun with an explicit created_at."""
+    run = GraphRun(
+        graph_id=graph_id,
         project_id=project_id,
-        current_state="start",
+        current_node="start",
         status="active",
         actor_assignments={},
         context={},
         started_at=datetime.now(timezone.utc),
     )
-    db.add(instance)
+    db.add(run)
     await db.flush()
     # Override created_at after flush
-    instance.created_at = created_at
+    run.created_at = created_at
     await db.flush()
-    return instance
+    return run
 
 
 @pytest.mark.asyncio
-async def test_protocol_instances_cursor_tiebreak(client, test_project, db_session):
-    """Two instances with identical created_at must not produce duplicates across pages."""
-    protocol = await _make_protocol(db_session, test_project.id)
+async def test_graph_runs_cursor_tiebreak(client, test_project, db_session):
+    """Two runs with identical created_at must not produce duplicates across pages."""
+    graph = await _make_graph(db_session, test_project.id)
 
-    # Use a fixed timestamp for both instances
+    # Use a fixed timestamp for both runs
     shared_ts = datetime(2025, 1, 15, 12, 0, 0)
 
-    inst1 = await _make_instance(db_session, test_project.id, protocol.id, shared_ts)
-    inst2 = await _make_instance(db_session, test_project.id, protocol.id, shared_ts)
+    run1 = await _make_run(db_session, test_project.id, graph.id, shared_ts)
+    run2 = await _make_run(db_session, test_project.id, graph.id, shared_ts)
 
     # Page 1: limit=1
     resp1 = await client.get(
-        f"/api/v1/projects/{test_project.id}/protocol-instances",
+        f"/api/v1/projects/{test_project.id}/graph-runs",
         params={"limit": 1},
     )
     assert resp1.status_code == 200
@@ -173,7 +173,7 @@ async def test_protocol_instances_cursor_tiebreak(client, test_project, db_sessi
 
     # Page 2: use cursor
     resp2 = await client.get(
-        f"/api/v1/projects/{test_project.id}/protocol-instances",
+        f"/api/v1/projects/{test_project.id}/graph-runs",
         params={"limit": 1, "cursor": next_cursor},
     )
     assert resp2.status_code == 200
@@ -187,10 +187,10 @@ async def test_protocol_instances_cursor_tiebreak(client, test_project, db_sessi
 
 
 @pytest.mark.asyncio
-async def test_protocol_instances_invalid_cursor(client, test_project):
+async def test_graph_runs_invalid_cursor(client, test_project):
     """A garbage cursor string should return 400."""
     resp = await client.get(
-        f"/api/v1/projects/{test_project.id}/protocol-instances",
+        f"/api/v1/projects/{test_project.id}/graph-runs",
         params={"cursor": "garbage"},
     )
     assert resp.status_code == 400
@@ -243,44 +243,44 @@ async def test_user_list_is_active_filter(client, db_session, filter_param, expe
 
 
 # ---------------------------------------------------------------------------
-# protocol-instances/count filtered by status query param
+# graph-runs/count filtered by status query param
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_protocol_instances_count_status_filter(client, test_project, db_session):
+async def test_graph_runs_count_status_filter(client, test_project, db_session):
     """?status=active must filter; total count must differ from filtered count."""
-    protocol = await _make_protocol(db_session, test_project.id)
+    graph = await _make_graph(db_session, test_project.id)
     ts = datetime.now(timezone.utc)
-    inst_active = ProtocolInstance(
-        protocol_id=protocol.id,
+    run_active = GraphRun(
+        graph_id=graph.id,
         project_id=test_project.id,
-        current_state="start",
+        current_node="start",
         status="active",
         actor_assignments={},
         context={},
         started_at=ts,
     )
-    inst_concluded = ProtocolInstance(
-        protocol_id=protocol.id,
+    run_concluded = GraphRun(
+        graph_id=graph.id,
         project_id=test_project.id,
-        current_state="end",
+        current_node="end",
         status="concluded",
         actor_assignments={},
         context={},
         started_at=ts,
     )
-    db_session.add(inst_active)
-    db_session.add(inst_concluded)
+    db_session.add(run_active)
+    db_session.add(run_concluded)
     await db_session.flush()
 
-    resp_all = await client.get(f"/api/v1/projects/{test_project.id}/protocol-instances/count")
+    resp_all = await client.get(f"/api/v1/projects/{test_project.id}/graph-runs/count")
     resp_active = await client.get(
-        f"/api/v1/projects/{test_project.id}/protocol-instances/count",
+        f"/api/v1/projects/{test_project.id}/graph-runs/count",
         params={"status": "active"},
     )
     resp_concluded = await client.get(
-        f"/api/v1/projects/{test_project.id}/protocol-instances/count",
+        f"/api/v1/projects/{test_project.id}/graph-runs/count",
         params={"status": "concluded"},
     )
 

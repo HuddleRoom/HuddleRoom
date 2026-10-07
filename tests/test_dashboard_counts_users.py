@@ -57,8 +57,8 @@ async def test_meeting_count(client, test_project, db_session):
 
 
 @pytest.mark.asyncio
-async def test_protocol_instance_count(client, test_project):
-    resp = await client.get(f"/api/v1/projects/{test_project.id}/protocol-instances/count")
+async def test_graph_run_count(client, test_project):
+    resp = await client.get(f"/api/v1/projects/{test_project.id}/graph-runs/count")
     assert resp.status_code == 200
     assert resp.json()["count"] >= 0
 

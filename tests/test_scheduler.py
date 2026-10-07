@@ -7,9 +7,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 
 @pytest.mark.asyncio
-async def test_scheduler_wires_recurring_protocol_timeout_processing_job(monkeypatch):
+async def test_scheduler_wires_recurring_graph_timeout_processing_job(monkeypatch):
     from huddleroom import database as database_module
-    from huddleroom.services import protocol_engine as protocol_engine_module
+    from huddleroom.services import graph_engine as graph_engine_module
     from huddleroom.workers import scheduler as scheduler_module
 
     class FakeDb:
@@ -42,12 +42,12 @@ async def test_scheduler_wires_recurring_protocol_timeout_processing_job(monkeyp
     fake_db = FakeDb()
     fake_engine = FakeEngine()
     monkeypatch.setattr(database_module, "AsyncSessionLocal", lambda: FakeSessionContext(fake_db))
-    monkeypatch.setattr(protocol_engine_module, "ProtocolEngineService", lambda: fake_engine)
+    monkeypatch.setattr(graph_engine_module, "GraphEngineService", lambda: fake_engine)
 
     sched = scheduler_module.create_scheduler()
     sched.start(paused=True)
     try:
-        job = sched.get_job("process_protocol_timeouts")
+        job = sched.get_job("process_graph_timeouts")
         assert job is not None
         assert isinstance(job.trigger, IntervalTrigger)
         assert job.trigger.interval.total_seconds() > 0

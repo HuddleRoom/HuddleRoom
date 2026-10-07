@@ -108,7 +108,7 @@ class OrchestrationDecisionDispatcher:
         "retry_task": "execute_retry_task_action",
         "reassign_task": "execute_reassign_task_action",
         "schedule_meeting": "execute_schedule_meeting_action",
-        "start_protocol": "execute_start_protocol_action",
+        "start_graph": "execute_start_graph_action",
         "ask_human": "execute_ask_human_action",
         "pause_run": "execute_pause_run_action",
         "record_warning": "execute_record_warning_action",

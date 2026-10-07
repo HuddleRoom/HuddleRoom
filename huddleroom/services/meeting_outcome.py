@@ -492,7 +492,7 @@ class MeetingOutcomeService:
             (planner.system_prompt or "You produce concise, actionable summaries.")
             + "\n\n"
             + "## HuddleRoom Planner Role\n"
-            + "Generate a structured summary for HuddleRoom's protocol engine to create tasks and trigger processes. "
+            + "Generate a structured summary for HuddleRoom's graph engine to create tasks and trigger processes. "
             + "Follow the format exactly. No extra text, markdown, or blank lines between sections."
         )
 
@@ -570,19 +570,19 @@ class MeetingOutcomeService:
         await db.flush()
         return summary
 
-    async def resolve_protocol(
+    async def resolve_graph_run(
         self, db: AsyncSession, meeting: Meeting, decisions: list[MeetingDecision]
     ) -> None:
-        if not meeting.source_protocol_instance_id or not decisions:
+        if not meeting.source_graph_run_id or not decisions:
             return
         from huddleroom.services.event_bus import emit_event
         primary = decisions[0]
         await emit_event(
             db=db,
             project_id=meeting.project_id,
-            event_type="protocol.external_resolution",
+            event_type="graph.run_external_resolution",
             payload={
-                "protocol_instance_id": str(meeting.source_protocol_instance_id),
+                "graph_run_id": str(meeting.source_graph_run_id),
                 "resolution": primary.chosen_option,
                 "rationale": primary.rationale,
                 "meeting_id": str(meeting.id),
@@ -708,12 +708,12 @@ class MeetingOutcomeService:
             if not meeting.summary:
                 meeting.summary = self._build_fallback_summary(meeting=meeting, decisions=decisions)
 
-        # Resolve originating protocol if applicable
+        # Resolve originating graph run if applicable
         try:
-            await self.resolve_protocol(db=db, meeting=meeting, decisions=decisions)
+            await self.resolve_graph_run(db=db, meeting=meeting, decisions=decisions)
         except Exception as exc:
-            logger.warning("resolve_protocol failed during finalization: %s", exc)
-            failures.append("resolve_protocol")
+            logger.warning("resolve_graph_run failed during finalization: %s", exc)
+            failures.append("resolve_graph_run")
 
         # Planner structured summary is skipped for standups to keep conclusion on the fast path.
         if meeting.planner_agent_id and meeting.meeting_type != "standup":

@@ -8,9 +8,11 @@ describe('humanizeEvent', () => {
     expect(humanizeEvent('meeting.trace')).toBe('Meeting trace')
     expect(humanizeEvent('task.created')).toBe('Task created')
     expect(humanizeEvent('task.status_changed')).toBe('Task status changed')
+    expect(humanizeEvent('graph.run_started')).toBe('Graph run started')
+    expect(humanizeEvent('graph.run_advanced')).toBe('Graph run advanced')
   })
   it('cleans unknown types, never raw-only', () => {
-    expect(humanizeEvent('protocol.step_failed')).toBe('Protocol step failed')
+    expect(humanizeEvent('graph.unknown_type')).toBe('Graph unknown type')
     expect(humanizeEvent('weird')).toBe('Weird')
   })
 })

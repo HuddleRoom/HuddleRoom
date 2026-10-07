@@ -150,14 +150,14 @@ select:focus-visible {
   outline-offset: 2px;
 }
 
-.protocol-detail-grid {
+.graph-detail-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
 }
 
 @media (max-width: 900px) {
-  .protocol-detail-grid {
+  .graph-detail-grid {
     grid-template-columns: 1fr;
   }
 }

@@ -25,7 +25,7 @@ actors:
     assignment: role
     role_value: tester
 
-states:
+nodes:
   triage:
     description: Bug received. Triager assesses severity and confirms it is reproducible.
     actor: triager
@@ -37,17 +37,17 @@ states:
         actor: triager
         task_title: "Triage bug: {{task.title}}"
         task_description: "Assess severity (low/medium/high/critical). Confirm reproducibility. Set task.priority and update metadata.severity. Report done when triage is complete."
-    transitions:
+    edges:
       - name: triaged_valid
         to: assigned_to_developer
         trigger_event: task.priority_changed
         guard:
-          task_id: "{{protocol_instance.linked_task_id}}"
+          task_id: "{{graph_run.linked_task_id}}"
       - name: triaged_invalid
         to: closed_invalid
         trigger_event: task.cancelled
         guard:
-          task_id: "{{protocol_instance.linked_task_id}}"
+          task_id: "{{graph_run.linked_task_id}}"
 
   assigned_to_developer:
     description: Bug confirmed. Developer implements fix.
@@ -62,12 +62,12 @@ states:
         task_description: >
           Reproduce the bug. Implement a fix. Add a regression test.
           Push a branch and open a PR. Tag the PR with metadata.task_id.
-    transitions:
+    edges:
       - name: fix_pr_opened
         to: fix_in_review
         trigger_event: code.pr_opened
         guard:
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
 
   fix_in_review:
     description: Fix PR open. Verifier reviews and runs tests.
@@ -82,17 +82,17 @@ states:
         task_description: >
           Review the fix PR. Confirm the regression test covers the bug.
           Confirm all existing tests pass. Approve or request changes.
-    transitions:
+    edges:
       - name: fix_approved
         to: awaiting_merge
         trigger_event: review.approved
         guard:
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
       - name: fix_rejected
         to: assigned_to_developer
         trigger_event: review.changes_requested
         guard:
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
 
   awaiting_merge:
     description: Fix approved. Waiting for merge.
@@ -100,12 +100,12 @@ states:
     timeout:
       duration: 2h
       action: escalate
-    transitions:
+    edges:
       - name: merged
         to: verification
         trigger_event: code.pr_merged
         guard:
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
 
   verification:
     description: Fix merged. Verifier confirms bug is gone in main.
@@ -118,7 +118,7 @@ states:
         actor: verifier
         task_title: "Final verification: {{task.title}}"
         task_description: "Confirm the bug no longer reproduces on main branch. Report pass or fail."
-    transitions:
+    edges:
       - name: verified_fixed
         to: closed_fixed
         trigger_event: session.completed
@@ -135,11 +135,11 @@ states:
     actor: null
     on_enter:
       - action_type: complete_task
-        task_id: "{{protocol_instance.linked_task_id}}"
+        task_id: "{{graph_run.linked_task_id}}"
       - action_type: record_decision
         summary: "Bug {{task.title}} fixed and verified"
         rationale: "Fix reviewed, merged, and confirmed working on main."
-    transitions: []
+    edges: []
 
   closed_invalid:
     description: Bug was not a valid issue.
@@ -148,16 +148,16 @@ states:
       - action_type: post_message
         channel: general
         template: "Bug {{task.title}} closed as invalid after triage."
-    transitions: []
+    edges: []
 
   escalation_terminal:
     description: Bug fix stalled after full escalation chain exhausted.
     actor: null
-    transitions: []
+    edges: []
 
-initial_state: triage
+start_node: triage
 
-terminal_states:
+terminal_nodes:
   success: [closed_fixed, closed_invalid]
   failure: [escalation_terminal]
 

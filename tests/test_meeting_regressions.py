@@ -1295,7 +1295,7 @@ async def test_finalize_meeting_blocks_only_when_followup_missing(
             outcome, "create_tasks_from_action_items", new_callable=AsyncMock
         ), patch.object(
             outcome, "write_knowledge_items", new_callable=AsyncMock
-        ), patch.object(outcome, "resolve_protocol", new_callable=AsyncMock):
+        ), patch.object(outcome, "resolve_graph_run", new_callable=AsyncMock):
             results = await asyncio.gather(*(finalize(session) for session in concurrent_sessions))
         assert [pending is not None for _concluded, pending in results].count(True) == 1
         assert all(concluded is False for concluded, _pending in results)
@@ -1337,7 +1337,7 @@ async def test_finalize_meeting_blocks_only_when_followup_missing(
         outcome, "create_tasks_from_action_items", new_callable=AsyncMock
     ) as create_tasks, patch.object(
         outcome, "write_knowledge_items", new_callable=AsyncMock
-    ) as write_knowledge, patch.object(outcome, "resolve_protocol", new_callable=AsyncMock) as resolve_protocol:
+    ) as write_knowledge, patch.object(outcome, "resolve_graph_run", new_callable=AsyncMock) as resolve_graph_run:
         result = await outcome.finalize_meeting(db=db_session, meeting=meeting)
         if scenario == "missing_followup":
             assert result[0] is False
@@ -1366,14 +1366,14 @@ async def test_finalize_meeting_blocks_only_when_followup_missing(
         assert len(events) == 1
         create_tasks.assert_not_awaited()
         write_knowledge.assert_not_awaited()
-        resolve_protocol.assert_not_awaited()
+        resolve_graph_run.assert_not_awaited()
     elif scenario == "concurrent_concluded":
         assert result == (False, None)
         assert meeting.status == "concluded"
         extract.assert_not_awaited()
         create_tasks.assert_not_awaited()
         write_knowledge.assert_not_awaited()
-        resolve_protocol.assert_not_awaited()
+        resolve_graph_run.assert_not_awaited()
     else:
         assert result == (True, None)
         assert meeting.status == "concluded"
@@ -1396,7 +1396,7 @@ async def test_complete_final_review_items_or_waiver(
     outcome = MeetingOutcomeService()
     with patch.object(outcome, "extract_action_items", new_callable=AsyncMock, return_value=[]), patch.object(
         outcome, "write_knowledge_items", new_callable=AsyncMock
-    ), patch.object(outcome, "resolve_protocol", new_callable=AsyncMock):
+    ), patch.object(outcome, "resolve_graph_run", new_callable=AsyncMock):
         assert (await outcome.finalize_meeting(db=db_session, meeting=meeting))[0] is False
 
     submitted = ["  Implement Redis cache  "] if completion == "items" else []
@@ -1428,7 +1428,7 @@ async def test_complete_final_review_items_or_waiver(
 
     with patch.object(outcome, "extract_action_items", new_callable=AsyncMock) as extract, patch.object(
         outcome, "write_knowledge_items", new_callable=AsyncMock
-    ), patch.object(outcome, "resolve_protocol", new_callable=AsyncMock):
+    ), patch.object(outcome, "resolve_graph_run", new_callable=AsyncMock):
         assert await outcome.finalize_meeting(db=db_session, meeting=meeting) == (True, None)
 
     extract.assert_not_awaited()

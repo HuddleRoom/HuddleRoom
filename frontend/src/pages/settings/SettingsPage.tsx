@@ -566,7 +566,7 @@ function ProjectConfigSection() {
                     This permanently deletes all operational history for this project — sessions, tasks, meetings, orchestration goals and decisions, memory, channels, artifacts, and the event log — and resets hook counters to zero.
                   </p>
                   <p className="text-xs text-huddleroom-text-secondary" style={{ lineHeight: 1.5, marginBottom: 10 }}>
-                    It does <strong>not</strong> touch the project name, description, config, API keys, users, agents, protocol and routing rules, or any file in the workspace directory — including <code className="font-mono">.huddleroom</code>.
+                    It does <strong>not</strong> touch the project name, description, config, API keys, users, agents, graph and routing rules, or any file in the workspace directory — including <code className="font-mono">.huddleroom</code>.
                   </p>
                   <p className="text-xs font-semibold text-huddleroom-danger" style={{ marginBottom: 12 }}>This cannot be undone.</p>
                   <div className="text-xs text-huddleroom-text-secondary" style={{ marginBottom: 8 }}>

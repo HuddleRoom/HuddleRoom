@@ -211,7 +211,7 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
     assert contract["forbidden_work"] == [
         "Do not implement the plan.",
         "Do not edit project artifacts.",
-        "Do not create tasks, meetings, protocols, rules, hooks, or automations.",
+        "Do not create tasks, meetings, graphs, rules, hooks, or automations.",
     ]
     assert contract["success_evidence"] == [
         "A plan artifact linked to this planning task.",

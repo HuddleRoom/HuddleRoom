@@ -36,7 +36,7 @@ from huddleroom.routers import (
     orchestration_processes,
     orchestration_warnings,
     projects,
-    protocols,
+    graphs,
     rules,
     sessions,
     tasks,
@@ -97,10 +97,10 @@ async def lifespan(_app: FastAPI):
             try:
                 from pathlib import Path
                 from huddleroom.services.escalation_service import EscalationChainService
-                from huddleroom.services.protocol_service import ProtocolService
+                from huddleroom.services.graph_service import GraphService
 
                 workspace_path = Path(settings.workspace_path)
-                await ProtocolService().load_all_from_workspace(_s, workspace_path)
+                await GraphService().load_all_from_workspace(_s, workspace_path)
                 await EscalationChainService().load_all_from_workspace(_s, workspace_path)
                 await _s.commit()
             except Exception as _exc:
@@ -197,14 +197,14 @@ async def lifespan(_app: FastAPI):
         from huddleroom.workers.consumers import get_consumer_tasks
         from huddleroom.workers.consumers.ws_hub import run_ws_hub
         from huddleroom.workers.consumers.rule_engine import run_rule_engine
-        from huddleroom.workers.consumers.protocol_engine import run_protocol_engine
+        from huddleroom.workers.consumers.graph_engine import run_graph_engine
         from huddleroom.workers.consumers.meeting_engine import run_meeting_engine
         from huddleroom.workers.consumers.optimizer import run_optimizer
 
         consumer_fns = {
             "ws_hub": run_ws_hub,
             "rule_engine": run_rule_engine,
-            "protocol_engine": run_protocol_engine,
+            "graph_engine": run_graph_engine,
             "meeting_engine": run_meeting_engine,
             "optimizer": run_optimizer,
         }
@@ -392,7 +392,7 @@ def create_app() -> FastAPI:
         prefix="/api/v1/projects/{project_id}/orchestration",
         tags=["orchestration"],
     )
-    app.include_router(protocols.router, prefix="/api/v1", tags=["protocols"])
+    app.include_router(graphs.router, prefix="/api/v1", tags=["graphs"])
     app.include_router(artifacts.router, prefix="/api/v1", tags=["artifacts"])
     app.include_router(escalations.router, prefix="/api/v1", tags=["escalations"])
     app.include_router(meetings.router, prefix="/api/v1", tags=["meetings"])

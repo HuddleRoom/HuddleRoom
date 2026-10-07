@@ -1,13 +1,13 @@
-# Protocol Live Test Run — Progress & Findings
+# Graph Live Test Run — Progress & Findings
 
 ## How to resume this session
 
 1. Read this file top to bottom — it is the single source of truth.
 2. Working directory: repository root
-3. Test file: `tests/live/live_test_protocols.py`
+3. Test file: `tests/live/live_test_graphs.py`
 4. Start server if not running: `.venv/bin/huddleroom serve --port 8001` (from project root)
-5. Run a single test: `python tests/live/live_test_protocols.py --no-start-server --tests PC1`
-6. Run all tests: `python tests/live/live_test_protocols.py --no-start-server --tests PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10`
+5. Run a single test: `python tests/live/live_test_graphs.py --no-start-server --tests PC1`
+6. Run all tests: `python tests/live/live_test_graphs.py --no-start-server --tests PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10`
 7. Note: PC9 requires ~35s for background scheduler (runs every 30s). Typical total runtime: ~60s.
 
 ---
@@ -48,13 +48,13 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 ### PC1 — Trigger & Actor Resolution (DONE, PASS)
 
-**Purpose:** Verify that emitting `code.pr_opened` creates a protocol instance with all three actors (author, reviewer, merger) correctly resolved.
+**Purpose:** Verify that emitting `code.pr_opened` creates a graph run with all three actors (author, reviewer, merger) correctly resolved.
 
-**Test quality:** Good. Uses real code_review protocol. Tests all 3 actor assignment strategies (auto, role=reviewer, role=pm). Checks actor IDs match expected agents.
+**Test quality:** Good. Uses real code_review graph. Tests all 3 actor assignment strategies (auto, role=reviewer, role=pm). Checks actor IDs match expected agents.
 
 **Rally result:** PASS
 
-**Test validity:** Sound. Guards are specific to artifact_id, `wait_for_instance` filters by artifact_id to avoid picking up stale instances from prior runs.
+**Test validity:** Sound. Guards are specific to artifact_id, `wait_for_run` filters by artifact_id to avoid picking up stale runs from prior runs.
 
 **Actions:** None.
 
@@ -62,9 +62,9 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 ### PC2 — Template Guard Resolution / Guard Specificity (DONE, PASS)
 
-**Purpose:** Verify that `{{protocol_instance.artifact_id}}` template in guards is resolved per-instance — two simultaneous instances only transition the one whose artifact_id matches the event.
+**Purpose:** Verify that `{{graph_run.artifact_id}}` template in guards is resolved per-run — two simultaneous runs only transition the one whose artifact_id matches the event.
 
-**Test quality:** Good. Creates 2 artifacts/instances, emits `test.passed` with only artifact_A's ID, verifies instance A transitions and instance B stays.
+**Test quality:** Good. Creates 2 artifacts/runs, emits `test.passed` with only artifact_A's ID, verifies run A transitions and run B stays.
 
 **Rally result:** PASS
 
@@ -86,16 +86,16 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 **Actions fixed:**
 - `MessageResponse` schema was returning `metadata_` not `metadata` — added `Field(serialization_alias="metadata")` to `rally/schemas/message.py` (both main and worktree).
-- `wait_for_instance` was returning stale instances from previous runs — fixed by adding `artifact_id` filter parameter.
+- `wait_for_run` was returning stale runs from previous runs — fixed by adding `artifact_id` filter parameter.
 - `_post` client method was silently returning `{}` on HTTP errors, causing cryptic `KeyError('id')` — fixed to raise `RuntimeError` with error details.
 
 ---
 
 ### PC4 — create_session Side Effect (DONE, PASS)
 
-**Purpose:** Verify that when instance enters `ready_for_review`, a Session is created for the reviewer agent with `origin=protocol`.
+**Purpose:** Verify that when run enters `ready_for_review`, a Session is created for the reviewer agent with `origin=graph`.
 
-**Test quality:** Good. Drives instance through `opened → ready_for_review`, verifies a session exists for the reviewer agent linked to the new task.
+**Test quality:** Good. Drives run through `opened → ready_for_review`, verifies a session exists for the reviewer agent linked to the new task.
 
 **Rally result:** PASS
 
@@ -109,7 +109,7 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 **Purpose:** Verify `notify_actor` action resolves `{{artifact.name}}` in the DM message.
 
-**Test quality:** Good. Drives to `ci_failure` state, finds DM channel `dm-{author_id}`, verifies message content has the resolved artifact name.
+**Test quality:** Good. Drives to `ci_failure` node, finds DM channel `dm-{author_id}`, verifies message content has the resolved artifact name.
 
 **Rally result:** PASS
 
@@ -121,9 +121,9 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 ### PC6 — CI Failure Back-Loop (DONE, PASS)
 
-**Purpose:** Verify the state machine loop: `opened → ci_failure → opened` (author fixes and pushes again).
+**Purpose:** Verify the graph loop: `opened → ci_failure → opened` (author fixes and pushes again).
 
-**Test quality:** Good. Emits `test.failed` then `code.pr_updated`, verifies state sequence in transition history.
+**Test quality:** Good. Emits `test.failed` then `code.pr_updated`, verifies node sequence in step history.
 
 **Rally result:** PASS
 
@@ -135,7 +135,7 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 ### PC7 — complete_task in Merged State (DONE, PASS)
 
-**Purpose:** Verify that the `complete_task` on_enter action in `merged` state marks the linked task as done.
+**Purpose:** Verify that the `complete_task` on_enter action in `merged` node marks the linked task as done.
 
 **Test quality:** Good. Creates task via `setup_pr` (status=backlog), drives to merged, verifies task.status=done.
 
@@ -152,29 +152,29 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 **Purpose:** Verify `record_decision` action creates a `KnowledgeItem` with resolved template values.
 
-**Test quality:** Good. Drives to merged, finds KnowledgeItem by `provenance_protocol_instance_id`, verifies content has artifact name.
+**Test quality:** Good. Drives to merged, finds KnowledgeItem by `provenance_graph_run_id`, verifies content has artifact name.
 
 **Rally result:** PASS (after fix)
 
 **Test validity:** Sound.
 
 **Actions fixed:**
-- `KnowledgeResponse` schema was missing `provenance_protocol_instance_id` field — added it to both `rally/schemas/knowledge.py` main and worktree.
+- `KnowledgeResponse` schema was missing `provenance_graph_run_id` field — added it to both `rally/schemas/knowledge.py` main and worktree.
 
 ---
 
 ### PC9 — Timeout Escalation (DONE, PASS)
 
-**Purpose:** Verify that a protocol instance with a short timeout triggers the background scheduler to fire `protocol.escalated` and increment `escalation_step`.
+**Purpose:** Verify that a graph run with a short timeout triggers the background scheduler to fire `graph.run_escalated` and increment `escalation_step`.
 
-**Test quality:** Good. Creates a protocol with `duration: "1s"` timeout, waits for `escalation_step >= 1`.
+**Test quality:** Good. Creates a graph with `duration: "1s"` timeout, waits for `escalation_step >= 1`.
 
 **Rally result:** PASS (after fixes)
 
 **Test validity:** Sound.
 
 **Actions fixed:**
-- `_DURATION_MAP` in `protocol_engine.py` was missing `"s"` key — `"1s"` fell through to 3600s default. Added `"s": 1`.
+- `_DURATION_MAP` in `graph_engine.py` was missing `"s"` key — `"1s"` fell through to 3600s default. Added `"s": 1`.
 - Timeout scheduler ran every 60s — changed to 30s in `rally/workers/scheduler.py`.
 - Test had hardcoded 40s wait — changed to 80s.
 
@@ -182,7 +182,7 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 ### PC10 — Awaiting Revision Loop (DONE, PASS)
 
-**Purpose:** Verify the revision loop: `ready_for_review → awaiting_revision → ready_for_review`, including `notify_actor` firing correctly in the `awaiting_revision` state.
+**Purpose:** Verify the revision loop: `ready_for_review → awaiting_revision → ready_for_review`, including `notify_actor` firing correctly in the `awaiting_revision` node.
 
 **Test quality:** Good. Drives through the full revision loop and verifies the DM notification was sent.
 
@@ -209,19 +209,19 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 - Added `Field(serialization_alias="metadata")` so API returns `metadata` not `metadata_`.
 
-### wait_for_instance artifact_id filter (PC3)
+### wait_for_run artifact_id filter (PC3)
 
-**Files:** `tests/live/live_test_protocols.py`
+**Files:** `tests/live/live_test_graphs.py`
 
-- Added `artifact_id` parameter to `wait_for_instance` to avoid returning stale instances from previous runs.
+- Added `artifact_id` parameter to `wait_for_run` to avoid returning stale runs from previous runs.
 
 ### _post raises on error (PC3 debug)
 
-**Files:** `tests/live/live_test_protocols.py`
+**Files:** `tests/live/live_test_graphs.py`
 
 - `_post` now raises `RuntimeError` with status+body on non-2xx instead of silently returning `{}`.
 
-### complete_task backlog state (PC7)
+### complete_task backlog node (PC7)
 
 **Files:** `rally/services/action_executor.py` (main + worktree)
 
@@ -231,11 +231,11 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 **Files:** `rally/schemas/knowledge.py` (main + worktree)
 
-- Added `provenance_protocol_instance_id: UUID | None = None` to `KnowledgeResponse`.
+- Added `provenance_graph_run_id: UUID | None = None` to `KnowledgeResponse`.
 
 ### Duration parser seconds support (PC9)
 
-**Files:** `rally/services/protocol_engine.py` (main + worktree)
+**Files:** `rally/services/graph_engine.py` (main + worktree)
 
 - Added `"s": 1` to `_DURATION_MAP` so `"1s"` resolves to 1 second not the 3600s fallback.
 
@@ -243,7 +243,7 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 
 **Files:** `rally/workers/scheduler.py`
 
-- Reduced `process_protocol_timeouts_job` interval from 60s to 30s for more responsive escalation.
+- Reduced `process_graph_timeouts_job` interval from 60s to 30s for more responsive escalation.
 
 ---
 
@@ -252,5 +252,5 @@ Status legend: PENDING | IN PROGRESS | DONE | BLOCKED
 **All 10 tests PASS.** Full suite runtime: ~60s (PC9 adds ~30s for scheduler).
 
 ```bash
-python tests/live/live_test_protocols.py --no-start-server --tests PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10
+python tests/live/live_test_graphs.py --no-start-server --tests PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10
 ```

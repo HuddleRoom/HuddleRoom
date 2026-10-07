@@ -19,11 +19,11 @@ const PRE_EXISTING_ALLOWLIST: Record<string, string[]> = {
   // pre-existing, tracked in ISSUES.md "UI / Accessibility"; markup untouched by Phase 10
   Hooks: ['button-name'],
   // pre-existing, tracked in ISSUES.md "UI / Accessibility"; markup untouched by Phase 10
-  Protocols: ['nested-interactive'],
+  Graphs: ['nested-interactive'],
   // pre-existing, tracked in ISSUES.md "UI / Accessibility"; markup untouched by Phase 10
   'meeting-detail': ['label', 'aria-required-children'],
   // pre-existing, tracked in ISSUES.md "UI / Accessibility"; markup untouched by Phase 10
-  'protocol-detail': ['nested-interactive'],
+  'graph-detail': ['nested-interactive'],
   // pre-existing, tracked in ISSUES.md "UI / Accessibility"; markup untouched by Phase 10
   'goal-detail': ['definition-list', 'dlitem', 'listitem', 'color-contrast'],
 }
@@ -65,14 +65,14 @@ test.describe('axe a11y — zero serious/critical violations', () => {
     await expectNoBlockingViolations(page, 'meeting-detail')
   })
 
-  test('protocol-detail', async ({ page }) => {
+  test('graph-detail', async ({ page }) => {
     await gotoDashboard(page)
     await selectSeedProject(page)
-    await page.getByRole('link', { name: 'Protocols', exact: true }).click()
-    await page.getByText(SEED.protocols.active).click()
-    await expect(page).toHaveURL(/\/dashboard\/protocols\/[^/]+$/)
-    await expect(page.getByTestId('protocol-graph')).toBeVisible()
-    await expectNoBlockingViolations(page, 'protocol-detail')
+    await page.getByRole('link', { name: 'Graphs', exact: true }).click()
+    await page.getByText(SEED.graphs.active).click()
+    await expect(page).toHaveURL(/\/dashboard\/graphs\/[^/]+$/)
+    await expect(page.getByTestId('graph-diagram')).toBeVisible()
+    await expectNoBlockingViolations(page, 'graph-detail')
   })
 
   test('goal-detail', async ({ page }) => {

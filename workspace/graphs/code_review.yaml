@@ -23,7 +23,7 @@ actors:
     assignment: role
     role_value: pm
 
-states:
+nodes:
   opened:
     description: PR has been opened. Waiting for CI to run.
     actor: null
@@ -34,17 +34,17 @@ states:
       - action_type: post_message
         channel: general
         template: "PR opened: {{artifact.name}}. Waiting for CI."
-    transitions:
+    edges:
       - name: ci_passed
         to: ready_for_review
         trigger_event: test.passed
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
       - name: ci_failed
         to: ci_failure
         trigger_event: test.failed
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
 
   ci_failure:
     description: CI failed. Author must fix.
@@ -56,12 +56,12 @@ states:
       - action_type: notify_actor
         actor: author
         message: "CI failed on your PR {{artifact.name}}. Please fix and push."
-    transitions:
+    edges:
       - name: fix_pushed
         to: opened
         trigger_event: code.pr_updated
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
 
   ready_for_review:
     description: CI passed. Reviewer must submit a review.
@@ -74,17 +74,17 @@ states:
         actor: reviewer
         task_title: "Review PR: {{artifact.name}}"
         task_description: "Review the pull request at branch {{artifact.metadata.branch}}. Approve, request changes, or comment."
-    transitions:
+    edges:
       - name: approved
         to: approved
         trigger_event: review.approved
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
       - name: changes_requested
         to: awaiting_revision
         trigger_event: review.changes_requested
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
 
   awaiting_revision:
     description: Reviewer requested changes. Author must revise.
@@ -96,12 +96,12 @@ states:
       - action_type: notify_actor
         actor: author
         message: "Review requested changes on {{artifact.name}}. See review comments."
-    transitions:
+    edges:
       - name: revision_pushed
         to: ready_for_review
         trigger_event: code.pr_updated
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
 
   approved:
     description: PR is approved. Merger must merge.
@@ -113,32 +113,32 @@ states:
       - action_type: notify_actor
         actor: merger
         message: "PR {{artifact.name}} is approved and ready to merge."
-    transitions:
+    edges:
       - name: merged
         to: merged
         trigger_event: code.pr_merged
         guard:
-          artifact_id: "{{protocol_instance.artifact_id}}"
+          artifact_id: "{{graph_run.artifact_id}}"
 
   merged:
-    description: PR merged. Protocol complete.
+    description: PR merged. Graph run complete.
     actor: null
     on_enter:
       - action_type: complete_task
-        task_id: "{{protocol_instance.linked_task_id}}"
+        task_id: "{{graph_run.linked_task_id}}"
       - action_type: record_decision
         summary: "PR {{artifact.name}} merged"
         rationale: "CI passed, reviewer approved."
-    transitions: []
+    edges: []
 
   ci_blocked_terminal:
-    description: CI kept failing after escalation. Protocol failed.
+    description: CI kept failing after escalation. Graph run failed.
     actor: null
-    transitions: []
+    edges: []
 
-initial_state: opened
+start_node: opened
 
-terminal_states:
+terminal_nodes:
   success: [merged]
   failure: [ci_blocked_terminal]
 

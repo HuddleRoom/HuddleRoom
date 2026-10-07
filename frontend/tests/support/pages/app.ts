@@ -30,9 +30,9 @@ export const SEED = {
     active: 'UI seed active meeting',
     concluded: 'UI seed concluded meeting',
   },
-  protocols: {
-    active: 'ui_seed_protocol',
-    inactive: 'ui_inactive_protocol',
+  graphs: {
+    active: 'ui_seed_graph',
+    inactive: 'ui_inactive_graph',
   },
   knowledge: {
     title: 'UI seed rollout policy',
@@ -58,7 +58,7 @@ export const ROUTES = [
   },
   { path: '/dashboard/tasks', navName: 'Tasks', heading: /Tasks|Task board/i },
   { path: '/dashboard/agents', navName: 'Agents', heading: /Agents/i },
-  { path: '/dashboard/protocols', navName: 'Protocols', heading: /Protocols/i },
+  { path: '/dashboard/graphs', navName: 'Graphs', heading: /Graphs/i },
   { path: '/dashboard/meetings', navName: 'Meetings', heading: /Meetings/i },
   { path: '/dashboard/knowledge', navName: 'Knowledge', heading: /Knowledge/i },
   { path: '/dashboard/memory', navName: 'Memory', heading: /Memory/i },

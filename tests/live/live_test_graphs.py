@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""HuddleRoom protocol live integration test suite — code_review protocol real-world tests.
+"""HuddleRoom graph live integration test suite — code_review graph real-world tests.
 
-This test suite uses the real `code_review` protocol loaded from the workspace
+This test suite uses the real `code_review` graph loaded from the workspace
 and verifies critical side effects: template resolution in actions, sessions,
 messages, knowledge items, task completion, and escalation.
 
 Usage:
-    python tests/live/live_test_protocols.py [options]
+    python tests/live/live_test_graphs.py [options]
 
 Options:
     --port PORT           Port to use (default: 8001)
@@ -38,7 +38,7 @@ import litellm
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-PROJECT_NAME = "huddleroom-protocol-live-test"
+PROJECT_NAME = "huddleroom-graph-live-test"
 DEFAULT_PAGE_LIMIT = 500
 OPENAI_READINESS_MODEL = "openai/gpt-6-luna"
 DEFAULT_PR_REPOSITORY = "acme/huddleroom-live-harness"
@@ -50,7 +50,7 @@ PROTO_AGENTS = [
         "role": "engineer",
         "provider": "openai",
         "model": "gpt-6-luna",
-        "system_prompt": "Protocol test author agent.",
+        "system_prompt": "Graph test author agent.",
         "capabilities": [],
     },
     {
@@ -70,7 +70,7 @@ PROTO_AGENTS = [
         "role": "pm",
         "provider": "openai",
         "model": "gpt-6-luna",
-        "system_prompt": "Protocol test merger agent.",
+        "system_prompt": "Graph test merger agent.",
         "capabilities": [],
     },
 ]
@@ -195,7 +195,7 @@ class HuddleRoomClient:
                 print(f"  Reusing project '{name}' ({p['id']})")
                 return p
         print(f"  Creating project '{name}'...")
-        resp, _ = self._post("/api/v1/projects", {"name": name, "description": "HuddleRoom protocol live integration tests"})
+        resp, _ = self._post("/api/v1/projects", {"name": name, "description": "HuddleRoom graph live integration tests"})
         return resp
 
     def create_agent(self, defn: dict) -> dict:
@@ -246,26 +246,26 @@ class HuddleRoomClient:
         resp, _ = self._post("/api/v1/events", body)
         return resp
 
-    def list_protocols(self, project_id: str) -> list[dict]:
-        resp = self._get(f"/api/v1/projects/{project_id}/protocols")
+    def list_graphs(self, project_id: str) -> list[dict]:
+        resp = self._get(f"/api/v1/projects/{project_id}/graphs")
         return resp if isinstance(resp, list) else resp.get("items", [])
 
-    def list_instances(self, project_id: str, status: str | None = None) -> list[dict]:
+    def list_runs(self, project_id: str, status: str | None = None) -> list[dict]:
         params = {}
         if status:
             params["status"] = status
-        return self._paged_get_items(f"/api/v1/projects/{project_id}/protocol-instances", **params)
+        return self._paged_get_items(f"/api/v1/projects/{project_id}/graph-runs", **params)
 
-    def get_instance(self, project_id: str, instance_id: str) -> dict:
-        return self._get(f"/api/v1/projects/{project_id}/protocol-instances/{instance_id}")
+    def get_run(self, project_id: str, run_id: str) -> dict:
+        return self._get(f"/api/v1/projects/{project_id}/graph-runs/{run_id}")
 
-    def list_transitions(self, project_id: str, instance_id: str) -> list[dict]:
-        resp = self._get(f"/api/v1/projects/{project_id}/protocol-instances/{instance_id}/transitions")
+    def list_steps(self, project_id: str, run_id: str) -> list[dict]:
+        resp = self._get(f"/api/v1/projects/{project_id}/graph-runs/{run_id}/steps")
         return resp if isinstance(resp, list) else resp.get("items", [])
 
-    def advance_instance(self, project_id: str, instance_id: str, to_state: str, reason: str) -> tuple[Any, int]:
-        body = {"to_state": to_state, "reason": reason}
-        return self._post(f"/api/v1/projects/{project_id}/protocol-instances/{instance_id}/advance", body)
+    def advance_run(self, project_id: str, run_id: str, to_node: str, reason: str) -> tuple[Any, int]:
+        body = {"to_node": to_node, "reason": reason}
+        return self._post(f"/api/v1/projects/{project_id}/graph-runs/{run_id}/advance", body)
 
     def list_channels(self, project_id: str) -> list[dict]:
         resp = self._get(f"/api/v1/projects/{project_id}/channels")
@@ -285,14 +285,14 @@ class HuddleRoomClient:
 
     def create_session(self, agent_id: str, project_id: str, task_id: str | None = None,
                        adapter_type_override: str | None = None,
-                       protocol_instance_id: str | None = None) -> dict:
+                       graph_run_id: str | None = None) -> dict:
         body: dict = {"agent_id": agent_id, "project_id": project_id}
         if task_id:
             body["task_id"] = task_id
         if adapter_type_override:
             body["adapter_type_override"] = adapter_type_override
-        if protocol_instance_id:
-            body["protocol_instance_id"] = protocol_instance_id
+        if graph_run_id:
+            body["graph_run_id"] = graph_run_id
         resp, _ = self._post("/api/v1/sessions", body)
         return resp
 
@@ -341,10 +341,10 @@ def setup_fixtures(
 
 # ── Helper functions ───────────────────────────────────────────────────────────
 
-def find_protocol_by_name(client: RallyClient, project_id: str, name: str) -> dict | None:
-    """Find a protocol by name from the workspace-loaded list."""
-    protocols = client.list_protocols(project_id)
-    return next((p for p in protocols if p.get("name") == name), None)
+def find_graph_by_name(client: RallyClient, project_id: str, name: str) -> dict | None:
+    """Find a graph by name from the workspace-loaded list."""
+    graphs = client.list_graphs(project_id)
+    return next((g for g in graphs if g.get("name") == name), None)
 
 
 def _wait_for_value(
@@ -399,8 +399,8 @@ def build_synthetic_pr_metadata(artifact_name: str) -> dict[str, Any]:
             f"Keep the live harness deterministic for PR #{pr_number}.",
         ],
         "test_plan": [
-            f"Run the reviewer protocol against the {scenario} scenario.",
-            "Confirm state transitions and emitted review events stay consistent.",
+            f"Run the reviewer graph against the {scenario} scenario.",
+            "Confirm node edges and emitted review events stay consistent.",
         ],
         "risk_notes": [
             f"{scenario.capitalize()} behavior may diverge between synthetic and live repository context.",
@@ -411,7 +411,7 @@ def build_synthetic_pr_metadata(artifact_name: str) -> dict[str, Any]:
 
 def setup_pr(client: RallyClient, project_id: str, artifact_name: str = "Test PR") -> tuple[dict, dict]:
     """Create a task and artifact for a code review test. Returns (task, artifact)."""
-    task = client.create_task(project_id, f"Implement: {artifact_name}", "Test task for protocol", {})
+    task = client.create_task(project_id, f"Implement: {artifact_name}", "Test task for graph", {})
     # Small delay to let async event-bus consumers finish any in-flight write
     # transactions from prior operations (SQLite serializes writers).
     time.sleep(0.5)
@@ -425,55 +425,55 @@ def setup_pr(client: RallyClient, project_id: str, artifact_name: str = "Test PR
     return task, artifact
 
 
-def wait_for_instance(
+def wait_for_run(
     client: RallyClient,
     project_id: str,
-    protocol_id: str,
+    graph_id: str,
     timeout: float = 15,
     artifact_id: str | None = None,
     interval: float = 1.0,
 ) -> dict:
-    """Poll for active instance of a given protocol, optionally matching artifact_id."""
+    """Poll for active run of a given graph, optionally matching artifact_id."""
 
-    def fetch_instance() -> dict | None:
-        instances = client.list_instances(project_id, status="active")
-        for inst in instances:
-            if inst.get("protocol_id") != protocol_id:
+    def fetch_run() -> dict | None:
+        runs = client.list_runs(project_id, status="active")
+        for run in runs:
+            if run.get("graph_id") != graph_id:
                 continue
-            if artifact_id and inst.get("artifact_id") != artifact_id:
+            if artifact_id and run.get("artifact_id") != artifact_id:
                 continue
-            return inst
+            return run
         return None
 
     return _wait_for_value(
-        f"protocol instance for protocol {protocol_id} artifact {artifact_id or '*'}",
-        fetch_instance,
-        lambda inst: inst is not None,
+        f"graph run for graph {graph_id} artifact {artifact_id or '*'}",
+        fetch_run,
+        lambda run: run is not None,
         timeout=timeout,
         interval=interval,
-        summarize=lambda inst: "no matching active instance" if inst is None else repr(inst),
+        summarize=lambda run: "no matching active run" if run is None else repr(run),
     )
 
 
-def wait_for_state(
+def wait_for_node(
     client: RallyClient,
     project_id: str,
-    instance_id: str,
-    expected_state: str,
+    run_id: str,
+    expected_node: str,
     timeout: float = 15,
     interval: float = 1.0,
 ) -> dict:
-    """Poll until instance reaches expected state."""
+    """Poll until run reaches expected node."""
     return _wait_for_value(
-        f"protocol instance {instance_id} to reach expected state '{expected_state}'",
-        lambda: client.get_instance(project_id, instance_id),
-        lambda inst: inst.get("current_state") == expected_state,
+        f"graph run {run_id} to reach expected node '{expected_node}'",
+        lambda: client.get_run(project_id, run_id),
+        lambda run: run.get("current_node") == expected_node,
         timeout=timeout,
         interval=interval,
-        summarize=lambda inst: (
-            f"state={inst.get('current_state')!r}, status={inst.get('status')!r}"
-            if isinstance(inst, dict)
-            else repr(inst)
+        summarize=lambda run: (
+            f"node={run.get('current_node')!r}, status={run.get('status')!r}"
+            if isinstance(run, dict)
+            else repr(run)
         ),
     )
 
@@ -481,17 +481,17 @@ def wait_for_state(
 def wait_for_session_complete(
     client: RallyClient,
     project_id: str,
-    protocol_instance_id: str,
+    graph_run_id: str,
     timeout: float = 90,
 ) -> dict:
-    """Poll until a session linked to this protocol instance reaches completed or failed.
+    """Poll until a session linked to this graph run reaches completed or failed.
 
     Returns the full session dict (including .output) or None on timeout.
     """
     def fetch_session() -> dict | None:
         sessions = client.list_sessions(project_id)
         for s in sessions:
-            if str(s.get("protocol_instance_id")) != protocol_instance_id:
+            if str(s.get("graph_run_id")) != graph_run_id:
                 continue
             status = s.get("status")
             if status in ("completed", "failed"):
@@ -500,7 +500,7 @@ def wait_for_session_complete(
         return None
 
     return _wait_for_value(
-        f"protocol session for instance {protocol_instance_id} to complete",
+        f"graph session for run {graph_run_id} to complete",
         fetch_session,
         lambda session: session is not None,
         timeout=timeout,
@@ -509,20 +509,20 @@ def wait_for_session_complete(
     )
 
 
-def wait_for_protocol_session(
+def wait_for_graph_run_session(
     client: RallyClient,
     project_id: str,
-    protocol_instance_id: str,
+    graph_run_id: str,
     *,
     timeout: float = 60,
     interval: float = 1.0,
     origin: str | None = None,
 ) -> dict:
-    """Poll until a session for the protocol instance exists."""
+    """Poll until a session for the graph run exists."""
 
     def fetch_session() -> dict | None:
         for session in client.list_sessions(project_id):
-            if str(session.get("protocol_instance_id")) != protocol_instance_id:
+            if str(session.get("graph_run_id")) != graph_run_id:
                 continue
             if origin and session.get("origin") != origin:
                 continue
@@ -530,7 +530,7 @@ def wait_for_protocol_session(
         return None
 
     return _wait_for_value(
-        f"protocol session for instance {protocol_instance_id}",
+        f"graph session for run {graph_run_id}",
         fetch_session,
         lambda session: session is not None,
         timeout=timeout,
@@ -647,14 +647,14 @@ def test_pc1_trigger_actor_resolution(client: RallyClient, project: dict, agents
         client.run_log = run_log
 
     try:
-        # Find code_review protocol
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        # Find code_review graph
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
-        protocol_id = protocol["id"]
-        print(f"    Found code_review protocol {protocol_id}")
+        graph_id = graph["id"]
+        print(f"    Found code_review graph {graph_id}")
 
         # Create task + artifact
         task, artifact = setup_pr(client, project["id"], f"PC1-TEST-{int(time.time())}")
@@ -669,22 +669,22 @@ def test_pc1_trigger_actor_resolution(client: RallyClient, project: dict, agents
         })
         print(f"    Emitted code.pr_opened with author_agent_id")
 
-        # Poll for instance
-        instance = wait_for_instance(client, project["id"], protocol_id, timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("No instance created within 15s")
+        # Poll for run
+        run = wait_for_run(client, project["id"], graph_id, timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("No run created within 15s")
         else:
-            instance_id = instance["id"]
-            print(f"    Instance {instance_id} created in state {instance.get('current_state')}")
+            run_id = run["id"]
+            print(f"    Run {run_id} created at node {run.get('current_node')}")
 
-            # Verify state and status
-            if instance.get("current_state") != "opened":
-                errors.append(f"Expected current_state='opened', got '{instance.get('current_state')}'")
-            if instance.get("status") != "active":
-                errors.append(f"Expected status='active', got '{instance.get('status')}'")
+            # Verify node and status
+            if run.get("current_node") != "opened":
+                errors.append(f"Expected current_node='opened', got '{run.get('current_node')}'")
+            if run.get("status") != "active":
+                errors.append(f"Expected status='active', got '{run.get('status')}'")
 
             # Verify actor assignments
-            actors = instance.get("actor_assignments") or {}
+            actors = run.get("actor_assignments") or {}
             if "author" not in actors:
                 errors.append("actor_assignments missing 'author'")
             elif actors["author"].get("id") != author_id:
@@ -740,12 +740,12 @@ def test_pc2_template_guard_resolution(client: RallyClient, project: dict, agent
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
-        protocol_id = protocol["id"]
+        graph_id = graph["id"]
 
         # Create two tasks + artifacts
         task_a, artifact_a = setup_pr(client, project["id"], f"PC2-TEST-A-{int(time.time())}")
@@ -768,27 +768,27 @@ def test_pc2_template_guard_resolution(client: RallyClient, project: dict, agent
             "author_agent_id": author_id,
         })
 
-        # Poll for both instances
+        # Poll for both runs
         deadline = time.time() + 15
-        instances_by_artifact = {}
-        while time.time() < deadline and len(instances_by_artifact) < 2:
-            instances = client.list_instances(project["id"], status="active")
-            for inst in instances:
-                if inst.get("protocol_id") == protocol_id:
+        runs_by_artifact = {}
+        while time.time() < deadline and len(runs_by_artifact) < 2:
+            runs = client.list_runs(project["id"], status="active")
+            for inst in runs:
+                if inst.get("graph_id") == graph_id:
                     aid = inst.get("artifact_id")
                     if aid == artifact_a["id"]:
-                        instances_by_artifact[artifact_a["id"]] = inst
+                        runs_by_artifact[artifact_a["id"]] = inst
                     elif aid == artifact_b["id"]:
-                        instances_by_artifact[artifact_b["id"]] = inst
-            if len(instances_by_artifact) < 2:
+                        runs_by_artifact[artifact_b["id"]] = inst
+            if len(runs_by_artifact) < 2:
                 time.sleep(1)
 
-        if len(instances_by_artifact) < 2:
-            errors.append(f"Only {len(instances_by_artifact)} instances created, expected 2")
+        if len(runs_by_artifact) < 2:
+            errors.append(f"Only {len(runs_by_artifact)} runs created, expected 2")
         else:
-            instance_a = instances_by_artifact[artifact_a["id"]]
-            instance_b = instances_by_artifact[artifact_b["id"]]
-            print(f"    Created 2 instances: A={instance_a['id']}, B={instance_b['id']}")
+            run_a = runs_by_artifact[artifact_a["id"]]
+            run_b = runs_by_artifact[artifact_b["id"]]
+            print(f"    Created 2 runs: A={run_a['id']}, B={run_b['id']}")
 
             # Emit test.passed for artifact_a ONLY
             client.emit_event(project["id"], "test.passed", {
@@ -796,19 +796,19 @@ def test_pc2_template_guard_resolution(client: RallyClient, project: dict, agent
             })
             print(f"    Emitted test.passed with artifact_a only")
 
-            # Check states: A should transition to ready_for_review, B should stay opened
-            inst_a = wait_for_state(client, project["id"], instance_a["id"], "ready_for_review", timeout=15)
-            inst_b = client.get_instance(project["id"], instance_b["id"])
+            # Check nodes: A should advance to ready_for_review, B should stay opened
+            inst_a = wait_for_node(client, project["id"], run_a["id"], "ready_for_review", timeout=15)
+            inst_b = client.get_run(project["id"], run_b["id"])
 
-            if inst_a.get("current_state") != "ready_for_review":
-                errors.append(f"Instance A should be ready_for_review, got {inst_a.get('current_state')}")
+            if inst_a.get("current_node") != "ready_for_review":
+                errors.append(f"Run A should be ready_for_review, got {inst_a.get('current_node')}")
             else:
-                print(f"    Instance A: ready_for_review ✓")
+                print(f"    Run A: ready_for_review ✓")
 
-            if inst_b.get("current_state") != "opened":
-                errors.append(f"Guard did not isolate: Instance B should stay opened, got {inst_b.get('current_state')}")
+            if inst_b.get("current_node") != "opened":
+                errors.append(f"Guard did not isolate: Run B should stay opened, got {inst_b.get('current_node')}")
             else:
-                print(f"    Instance B: opened ✓ (guard isolated correctly)")
+                print(f"    Run B: opened ✓ (guard isolated correctly)")
 
     except Exception as exc:
         errors.append(str(exc))
@@ -844,10 +844,10 @@ def test_pc3_post_message_content(client: RallyClient, project: dict, agents_by_
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         artifact_name = f"PC3-ARTIFACT-{uuid.uuid4().hex[:8]}"
         task, artifact = setup_pr(client, project["id"], artifact_name)
@@ -861,12 +861,12 @@ def test_pc3_post_message_content(client: RallyClient, project: dict, agents_by_
             "author_agent_id": author_id,
         })
 
-        # Wait for instance in opened state (filter by artifact_id to avoid stale instances)
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        # Wait for run in opened node (filter by artifact_id to avoid stale runs)
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            print(f"    Instance created in state {instance.get('current_state')}")
+            print(f"    Run created at node {run.get('current_node')}")
 
             # Find general channel
             channels = client.list_channels(project["id"])
@@ -880,11 +880,11 @@ def test_pc3_post_message_content(client: RallyClient, project: dict, agents_by_
                 msg = wait_for_message(
                     client,
                     channel_id,
-                    lambda message: message.get("metadata", {}).get("protocol_instance_id") == instance["id"],
+                    lambda message: message.get("metadata", {}).get("graph_run_id") == run["id"],
                     timeout=15,
                 )
                 content = msg.get("content", "")
-                print(f"    Found protocol message: {content[:60]}...")
+                print(f"    Found graph message: {content[:60]}...")
 
                 if artifact_name not in content:
                     errors.append(f"Artifact name '{artifact_name}' not found in message content")
@@ -930,10 +930,10 @@ def test_pc4_create_session_side_effect(client: RallyClient, project: dict, agen
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         task, artifact = setup_pr(client, project["id"], f"PC4-TEST-{int(time.time())}")
         author_id = agents_by_name["proto-author"]["id"]
@@ -944,25 +944,25 @@ def test_pc4_create_session_side_effect(client: RallyClient, project: dict, agen
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
-            print(f"    Instance in opened state")
+            run_id = run["id"]
+            print(f"    Run in opened node")
 
             # Transition to ready_for_review
             client.emit_event(project["id"], "test.passed", {
                 "artifact_id": artifact["id"],
             })
-            inst = wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+            inst = wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
             if not inst:
-                errors.append("Instance did not reach ready_for_review")
+                errors.append("Run did not reach ready_for_review")
             else:
-                print(f"    Instance in ready_for_review state")
+                print(f"    Run in ready_for_review node")
 
-                session = wait_for_protocol_session(
-                    client, project["id"], instance_id, timeout=30, origin="protocol"
+                session = wait_for_graph_run_session(
+                    client, project["id"], run_id, timeout=30, origin="graph"
                 )
                 session_agent_id = session.get("agent_id")
                 reviewer_id = agents_by_name["proto-reviewer"]["id"]
@@ -1006,10 +1006,10 @@ def test_pc5_notify_actor_content(client: RallyClient, project: dict, agents_by_
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         artifact_name = f"NOTIFY-TEST-{uuid.uuid4().hex[:8]}"
         task, artifact = setup_pr(client, project["id"], artifact_name)
@@ -1022,30 +1022,30 @@ def test_pc5_notify_actor_content(client: RallyClient, project: dict, agents_by_
             "author_agent_id": author_id,
         })
 
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
+            run_id = run["id"]
             # Capture author from actor_assignments
-            actors = instance.get("actor_assignments") or {}
+            actors = run.get("actor_assignments") or {}
             author_slot = actors.get("author")
             if not author_slot:
                 errors.append("author not in actor_assignments")
             else:
                 author_uuid = author_slot.get("id")
-                print(f"    Author in instance: {author_uuid}")
+                print(f"    Author in run: {author_uuid}")
 
-                # Drive to ci_failure state
+                # Drive to ci_failure node
                 client.emit_event(project["id"], "test.failed", {
                     "artifact_id": artifact["id"],
                 })
 
-                inst = wait_for_state(client, project["id"], instance_id, "ci_failure", timeout=15)
+                inst = wait_for_node(client, project["id"], run_id, "ci_failure", timeout=15)
                 if not inst:
-                    errors.append("Instance did not reach ci_failure")
+                    errors.append("Run did not reach ci_failure")
                 else:
-                    print(f"    Instance in ci_failure state, notify_actor should have fired")
+                    print(f"    Run in ci_failure node, notify_actor should have fired")
 
                     # Find DM channel
                     channels = client.list_channels(project["id"])
@@ -1058,7 +1058,7 @@ def test_pc5_notify_actor_content(client: RallyClient, project: dict, agents_by_
                         msg = wait_for_message(
                             client,
                             dm_channel["id"],
-                            lambda message: message.get("metadata", {}).get("protocol_instance_id") == instance_id,
+                            lambda message: message.get("metadata", {}).get("graph_run_id") == run_id,
                             timeout=15,
                         )
                         content = msg.get("content", "")
@@ -1108,10 +1108,10 @@ def test_pc6_ci_failure_loop(client: RallyClient, project: dict, agents_by_name:
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         task, artifact = setup_pr(client, project["id"], f"PC6-TEST-{int(time.time())}")
         author_id = agents_by_name["proto-author"]["id"]
@@ -1122,36 +1122,36 @@ def test_pc6_ci_failure_loop(client: RallyClient, project: dict, agents_by_name:
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
-            print(f"    Instance in opened state")
+            run_id = run["id"]
+            print(f"    Run in opened node")
 
             # ci_failure
             client.emit_event(project["id"], "test.failed", {
                 "artifact_id": artifact["id"],
             })
-            inst = wait_for_state(client, project["id"], instance_id, "ci_failure", timeout=15)
+            inst = wait_for_node(client, project["id"], run_id, "ci_failure", timeout=15)
             if not inst:
-                errors.append("Instance did not reach ci_failure")
+                errors.append("Run did not reach ci_failure")
             else:
-                print(f"    Instance in ci_failure state")
+                print(f"    Run in ci_failure node")
 
                 # Back to opened
                 client.emit_event(project["id"], "code.pr_updated", {
                     "artifact_id": artifact["id"],
                 })
-                inst = wait_for_state(client, project["id"], instance_id, "opened", timeout=15)
+                inst = wait_for_node(client, project["id"], run_id, "opened", timeout=15)
                 if not inst:
-                    errors.append("Instance did not return to opened")
+                    errors.append("Run did not return to opened")
                 else:
-                    print(f"    Instance back in opened state")
+                    print(f"    Run back in opened node")
 
                     # Verify transitions
-                    transitions = client.list_transitions(project["id"], instance_id)
-                    trans_pairs = [(t.get("from_state"), t.get("to_state")) for t in transitions]
+                    transitions = client.list_steps(project["id"], run_id)
+                    trans_pairs = [(t.get("from_node"), t.get("to_node")) for t in transitions]
 
                     if ("opened", "ci_failure") not in trans_pairs:
                         errors.append("Missing opened→ci_failure transition")
@@ -1195,10 +1195,10 @@ def test_pc7_complete_task(client: RallyClient, project: dict, agents_by_name: d
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         task, artifact = setup_pr(client, project["id"], f"PC7-TEST-{int(time.time())}")
         author_id = agents_by_name["proto-author"]["id"]
@@ -1209,18 +1209,18 @@ def test_pc7_complete_task(client: RallyClient, project: dict, agents_by_name: d
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
-            print(f"    Instance created")
+            run_id = run["id"]
+            print(f"    Run created")
 
             # ready_for_review
             client.emit_event(project["id"], "test.passed", {
                 "artifact_id": artifact["id"],
             })
-            inst = wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+            inst = wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
             if not inst:
                 errors.append("Did not reach ready_for_review")
             else:
@@ -1230,7 +1230,7 @@ def test_pc7_complete_task(client: RallyClient, project: dict, agents_by_name: d
                 client.emit_event(project["id"], "review.approved", {
                     "artifact_id": artifact["id"],
                 })
-                inst = wait_for_state(client, project["id"], instance_id, "approved", timeout=15)
+                inst = wait_for_node(client, project["id"], run_id, "approved", timeout=15)
                 if not inst:
                     errors.append("Did not reach approved")
                 else:
@@ -1240,26 +1240,26 @@ def test_pc7_complete_task(client: RallyClient, project: dict, agents_by_name: d
                     client.emit_event(project["id"], "code.pr_merged", {
                         "artifact_id": artifact["id"],
                     })
-                    inst = wait_for_state(client, project["id"], instance_id, "merged", timeout=15)
+                    inst = wait_for_node(client, project["id"], run_id, "merged", timeout=15)
                     if not inst:
                         errors.append("Did not reach merged")
                     else:
                         print(f"    merged")
 
                         final_inst = _wait_for_value(
-                            f"protocol instance {instance_id} completion",
-                            lambda: client.get_instance(project["id"], instance_id),
+                            f"graph run {run_id} completion",
+                            lambda: client.get_run(project["id"], run_id),
                             lambda current: current.get("status") == "completed",
                             timeout=20,
                             interval=1.0,
                             summarize=lambda current: (
-                                f"state={current.get('current_state')!r}, status={current.get('status')!r}"
+                                f"node={current.get('current_node')!r}, status={current.get('status')!r}"
                             ),
                         )
                         if final_inst.get("status") != "completed":
-                            errors.append(f"Instance status should be completed, got {final_inst.get('status')}")
+                            errors.append(f"Run status should be completed, got {final_inst.get('status')}")
                         else:
-                            print(f"    Instance status: completed")
+                            print(f"    Run status: completed")
 
                         task_after = wait_for_task_status(
                             client, project["id"], task["id"], "done", timeout=20
@@ -1303,10 +1303,10 @@ def test_pc8_record_decision(client: RallyClient, project: dict, agents_by_name:
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         artifact_name = f"PC8-DECISION-{uuid.uuid4().hex[:8]}"
         task, artifact = setup_pr(client, project["id"], artifact_name)
@@ -1318,39 +1318,39 @@ def test_pc8_record_decision(client: RallyClient, project: dict, agents_by_name:
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
+            run_id = run["id"]
 
             # ready_for_review
             client.emit_event(project["id"], "test.passed", {
                 "artifact_id": artifact["id"],
             })
-            wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+            wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
 
             # approved
             client.emit_event(project["id"], "review.approved", {
                 "artifact_id": artifact["id"],
             })
-            wait_for_state(client, project["id"], instance_id, "approved", timeout=15)
+            wait_for_node(client, project["id"], run_id, "approved", timeout=15)
 
             # merged
             client.emit_event(project["id"], "code.pr_merged", {
                 "artifact_id": artifact["id"],
             })
-            inst = wait_for_state(client, project["id"], instance_id, "merged", timeout=15)
+            inst = wait_for_node(client, project["id"], run_id, "merged", timeout=15)
             if not inst:
                 errors.append("Did not reach merged")
             else:
-                print(f"    Reached merged state")
+                print(f"    Reached merged node")
 
                 item = wait_for_knowledge_item(
                     client,
                     project["id"],
-                    lambda knowledge_item: knowledge_item.get("provenance_type") == "protocol"
-                    and knowledge_item.get("provenance_protocol_instance_id") == instance_id,
+                    lambda knowledge_item: knowledge_item.get("provenance_type") == "graph"
+                    and knowledge_item.get("provenance_graph_run_id") == run_id,
                     timeout=20,
                 )
                 content = item.get("content", "")
@@ -1400,22 +1400,22 @@ def test_pc9_timeout_escalation(client: RallyClient, project: dict, agents_by_na
         client.run_log = run_log
 
     try:
-        # Create a test-specific protocol with short timeout
+        # Create a test-specific graph with short timeout
         run_id = str(uuid.uuid4())
         proto_def = {
-            "name": f"protocol_timeout_test_{run_id[:8]}",
+            "name": f"graph_timeout_test_{run_id[:8]}",
             "version": "1.0",
             "description": "Test timeout escalation",
             "definition": {
-                "initial_state": "waiting",
-                "terminal_states": {},
-                "states": {
+                "start_node": "waiting",
+                "terminal_nodes": {},
+                "nodes": {
                     "waiting": {
                         "timeout": {
                             "duration": "1s",
                             "action": "escalate"
                         },
-                        "transitions": []
+                        "edges": []
                     }
                 }
             },
@@ -1429,29 +1429,29 @@ def test_pc9_timeout_escalation(client: RallyClient, project: dict, agents_by_na
             "loaded_from": None
         }
 
-        protocol = client._post(f"/api/v1/projects/{project['id']}/protocols", proto_def)[0]
-        protocol_id = protocol["id"]
-        print(f"    Created timeout test protocol {protocol_id}")
+        graph = client._post(f"/api/v1/projects/{project['id']}/graphs", proto_def)[0]
+        graph_id = graph["id"]
+        print(f"    Created timeout test graph {graph_id}")
 
         # Trigger it
         client.emit_event(project["id"], "timeout.test.triggered", {
             "run_id": run_id,
         })
 
-        # Wait for instance
-        instance = wait_for_instance(client, project["id"], protocol_id, timeout=15)
-        if not instance:
-            errors.append("Instance not created")
+        # Wait for run
+        run = wait_for_run(client, project["id"], graph_id, timeout=15)
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
-            print(f"    Instance created in state {instance.get('current_state')}")
+            run_id_val = run["id"]
+            print(f"    Run created in node {run.get('current_node')}")
             print(f"    (PC9 requires ~40s for background scheduler to fire escalation)")
 
             # Wait for escalation (scheduler runs every 30s, worst case ~70s total)
             deadline = time.time() + 80
             escalation_fired = False
             while time.time() < deadline:
-                inst = client.get_instance(project["id"], instance_id)
+                inst = client.get_run(project["id"], run_id_val)
                 if (inst.get("escalation_step") or 0) >= 1:
                     escalation_fired = True
                     print(f"    Escalation fired (escalation_step={inst.get('escalation_step')})")
@@ -1461,7 +1461,7 @@ def test_pc9_timeout_escalation(client: RallyClient, project: dict, agents_by_na
             if not escalation_fired:
                 errors.append("Escalation did not fire within 80s")
             else:
-                # Verify protocol.escalated event was emitted
+                # Verify graph.run_escalated event was emitted
                 print(f"    Timeout escalation test complete (40s elapsed)")
 
     except Exception as exc:
@@ -1498,10 +1498,10 @@ def test_pc10_awaiting_revision_loop(client: RallyClient, project: dict, agents_
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         task, artifact = setup_pr(client, project["id"], f"PC10-TEST-{int(time.time())}")
         author_id = agents_by_name["proto-author"]["id"]
@@ -1512,22 +1512,22 @@ def test_pc10_awaiting_revision_loop(client: RallyClient, project: dict, agents_
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        if not instance:
-            errors.append("Instance not created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        if not run:
+            errors.append("Run not created")
         else:
-            instance_id = instance["id"]
-            print(f"    Instance in opened state")
+            run_id = run["id"]
+            print(f"    Run in opened node")
 
             # ready_for_review
             client.emit_event(project["id"], "test.passed", {
                 "artifact_id": artifact["id"],
             })
-            inst = wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+            inst = wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
             if not inst:
                 errors.append("Did not reach ready_for_review")
             else:
-                print(f"    Instance in ready_for_review state")
+                print(f"    Run in ready_for_review node")
                 actors = inst.get("actor_assignments") or {}
                 author_uuid = actors.get("author", {}).get("id")
 
@@ -1535,25 +1535,25 @@ def test_pc10_awaiting_revision_loop(client: RallyClient, project: dict, agents_
                 client.emit_event(project["id"], "review.changes_requested", {
                     "artifact_id": artifact["id"],
                 })
-                inst = wait_for_state(client, project["id"], instance_id, "awaiting_revision", timeout=15)
+                inst = wait_for_node(client, project["id"], run_id, "awaiting_revision", timeout=15)
                 if not inst:
                     errors.append("Did not reach awaiting_revision")
                 else:
-                    print(f"    Instance in awaiting_revision state")
+                    print(f"    Run in awaiting_revision node")
 
                     # pr_updated -> ready_for_review
                     client.emit_event(project["id"], "code.pr_updated", {
                         "artifact_id": artifact["id"],
                     })
-                    inst = wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+                    inst = wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
                     if not inst:
                         errors.append("Did not return to ready_for_review")
                     else:
-                        print(f"    Instance back in ready_for_review state")
+                        print(f"    Run back in ready_for_review node")
 
                         # Verify transitions
-                        transitions = client.list_transitions(project["id"], instance_id)
-                        trans_pairs = [(t.get("from_state"), t.get("to_state")) for t in transitions]
+                        transitions = client.list_steps(project["id"], run_id)
+                        trans_pairs = [(t.get("from_node"), t.get("to_node")) for t in transitions]
 
                         if ("ready_for_review", "awaiting_revision") not in trans_pairs:
                             errors.append("Missing ready_for_review→awaiting_revision transition")
@@ -1570,7 +1570,7 @@ def test_pc10_awaiting_revision_loop(client: RallyClient, project: dict, agents_
                             dm_channel = next((c for c in channels if c.get("name") == dm_channel_name), None)
                             if dm_channel:
                                 messages = client.list_messages(dm_channel["id"], limit=50)
-                                proto_msgs = [m for m in messages if m.get("metadata", {}).get("protocol_instance_id") == instance_id]
+                                proto_msgs = [m for m in messages if m.get("metadata", {}).get("graph_run_id") == run_id]
                                 if proto_msgs:
                                     print(f"    DM notify_actor fired in awaiting_revision")
 
@@ -1603,7 +1603,7 @@ def test_pl1_live_reviewer_decision(
     log: logging.Logger | None = None,
     run_log: RunLog | None = None,
 ) -> TestResult:
-    """PL1: Live Reviewer Decision — real LLM reviews PR, output drives state machine.
+    """PL1: Live Reviewer Decision — real LLM reviews PR, output drives graph.
 
     Flow:
       code.pr_opened → [opened] → test.passed → [ready_for_review]
@@ -1621,10 +1621,10 @@ def test_pl1_live_reviewer_decision(
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         artifact_name = f"PL1-PR-{uuid.uuid4().hex[:8]}"
         try:
@@ -1641,18 +1641,18 @@ def test_pl1_live_reviewer_decision(
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(
-            client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"]
+        run = wait_for_run(
+            client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"]
         )
-        if not instance:
-            errors.append("Instance not created")
-            raise RuntimeError("no instance")
-        instance_id = instance["id"]
-        print(f"    Instance {instance_id[:8]} in opened state")
+        if not run:
+            errors.append("Run not created")
+            raise RuntimeError("no run")
+        run_id = run["id"]
+        print(f"    Run {run_id[:8]} in opened node")
 
-        # ready_for_review — create a live reviewer API session and use its output to drive the protocol
+        # ready_for_review — create a live reviewer API session and use its output to drive the graph
         client.emit_event(project["id"], "test.passed", {"artifact_id": artifact["id"]})
-        rfr = wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+        rfr = wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
         if not rfr:
             errors.append("Did not reach ready_for_review")
             raise RuntimeError("no ready_for_review")
@@ -1701,7 +1701,7 @@ def test_pl1_live_reviewer_decision(
         else:
             print(f"    LLM produced output ✓")
 
-        # Interpret output and drive protocol forward
+        # Interpret output and drive graph forward
         output_upper = session_output.upper()
         if "APPROVE" in output_upper:
             verdict = "approved"
@@ -1713,17 +1713,17 @@ def test_pl1_live_reviewer_decision(
             client.emit_event(project["id"], "review.changes_requested", {"artifact_id": artifact["id"]})
 
         if verdict == "approved":
-            approved_inst = wait_for_state(client, project["id"], instance_id, "approved", timeout=15)
+            approved_inst = wait_for_node(client, project["id"], run_id, "approved", timeout=15)
             if not approved_inst:
-                errors.append("Did not reach approved state")
+                errors.append("Did not reach approved node")
                 raise RuntimeError("no approved")
             print(f"    State: approved")
 
             # merge
             client.emit_event(project["id"], "code.pr_merged", {"artifact_id": artifact["id"]})
-            merged_inst = wait_for_state(client, project["id"], instance_id, "merged", timeout=15)
+            merged_inst = wait_for_node(client, project["id"], run_id, "merged", timeout=15)
             if not merged_inst:
-                errors.append("Did not reach merged state")
+                errors.append("Did not reach merged node")
             else:
                 print(f"    State: merged")
 
@@ -1737,8 +1737,8 @@ def test_pl1_live_reviewer_decision(
                 item = wait_for_knowledge_item(
                     client,
                     project["id"],
-                    lambda knowledge_item: knowledge_item.get("provenance_type") == "protocol"
-                    and str(knowledge_item.get("provenance_protocol_instance_id")) == instance_id,
+                    lambda knowledge_item: knowledge_item.get("provenance_type") == "graph"
+                    and str(knowledge_item.get("provenance_graph_run_id")) == run_id,
                     timeout=20,
                 )
                 if not item:
@@ -1746,17 +1746,17 @@ def test_pl1_live_reviewer_decision(
                 else:
                     print(f"    Knowledge item recorded ✓")
 
-                # verify instance completed
-                final = client.get_instance(project["id"], instance_id)
+                # verify run completed
+                final = client.get_run(project["id"], run_id)
                 if final.get("status") != "completed":
-                    errors.append(f"Instance status not completed (got {final.get('status')})")
+                    errors.append(f"Run status not completed (got {final.get('status')})")
                 else:
-                    print(f"    Protocol instance: completed ✓")
+                    print(f"    Graph run: completed ✓")
         else:
             # changes_requested path — verify awaiting_revision
-            ar_inst = wait_for_state(client, project["id"], instance_id, "awaiting_revision", timeout=15)
+            ar_inst = wait_for_node(client, project["id"], run_id, "awaiting_revision", timeout=15)
             if not ar_inst:
-                errors.append("Did not reach awaiting_revision state")
+                errors.append("Did not reach awaiting_revision node")
             else:
                 print(f"    State: awaiting_revision (LLM chose to request changes)")
                 print(f"    Note: revision loop not driven further in PL1")
@@ -1783,16 +1783,16 @@ def test_pl1_live_reviewer_decision(
     )
 
 
-def test_pl2_protocol_created_reviewer_session(
+def test_pl2_graph_created_reviewer_session(
     client: RallyClient,
     project: dict,
     agents_by_name: dict[str, dict],
     log: logging.Logger | None = None,
     run_log: RunLog | None = None,
 ) -> TestResult:
-    """PL2: Use the protocol-created reviewer session and validate its live output."""
+    """PL2: Use the graph-created reviewer session and validate its live output."""
     test_id = "PL2"
-    label = "Protocol-Created Reviewer Session (LLM)"
+    label = "Graph-Created Reviewer Session (LLM)"
     t_start = time.monotonic()
     errors: list[str] = []
 
@@ -1801,10 +1801,10 @@ def test_pl2_protocol_created_reviewer_session(
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         artifact_name = f"PL2-PR-{uuid.uuid4().hex[:8]}"
         task, artifact = setup_pr(client, project["id"], artifact_name)
@@ -1816,45 +1816,45 @@ def test_pl2_protocol_created_reviewer_session(
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        instance_id = instance["id"]
-        print(f"    Instance {instance_id[:8]} created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        run_id = run["id"]
+        print(f"    Run {run_id[:8]} created")
 
         client.emit_event(project["id"], "test.passed", {"artifact_id": artifact["id"]})
-        wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+        wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
         print("    State: ready_for_review")
 
-        protocol_session = wait_for_protocol_session(
-            client, project["id"], instance_id, timeout=30, origin="protocol"
+        graph_session = wait_for_graph_run_session(
+            client, project["id"], run_id, timeout=30, origin="graph"
         )
-        if protocol_session.get("agent_id") != reviewer_id:
+        if graph_session.get("agent_id") != reviewer_id:
             errors.append(
-                f"Protocol session agent mismatch: expected {reviewer_id}, got {protocol_session.get('agent_id')}"
+                f"Graph session agent mismatch: expected {reviewer_id}, got {graph_session.get('agent_id')}"
             )
             raise RuntimeError("wrong reviewer agent")
 
-        completed_session = wait_for_session_by_id(client, protocol_session["id"], timeout=300)
+        completed_session = wait_for_session_by_id(client, graph_session["id"], timeout=300)
         output = (completed_session.get("output") or "").strip()
         status = completed_session.get("status")
         print(f"    Session status: {status}")
 
         if status == "failed":
-            errors.append(f"Protocol-created reviewer session failed: {completed_session.get('error')}")
-            raise RuntimeError("protocol reviewer session failed")
+            errors.append(f"Graph-created reviewer session failed: {completed_session.get('error')}")
+            raise RuntimeError("graph reviewer session failed")
         if not output:
-            errors.append("Protocol-created reviewer session produced no output")
+            errors.append("Graph-created reviewer session produced no output")
             raise RuntimeError("empty reviewer output")
 
         output_upper = output.upper()
         if "APPROVE" in output_upper:
             print("    Verdict: APPROVE")
             client.emit_event(project["id"], "review.approved", {"artifact_id": artifact["id"]})
-            wait_for_state(client, project["id"], instance_id, "approved", timeout=15)
+            wait_for_node(client, project["id"], run_id, "approved", timeout=15)
             print("    State: approved")
         elif "CHANGES_REQUESTED" in output_upper or "CHANGES REQUESTED" in output_upper:
             print("    Verdict: CHANGES_REQUESTED")
             client.emit_event(project["id"], "review.changes_requested", {"artifact_id": artifact["id"]})
-            wait_for_state(client, project["id"], instance_id, "awaiting_revision", timeout=15)
+            wait_for_node(client, project["id"], run_id, "awaiting_revision", timeout=15)
             print("    State: awaiting_revision")
         else:
             errors.append("Reviewer output did not contain APPROVE or CHANGES_REQUESTED")
@@ -1899,10 +1899,10 @@ def test_pl3_live_reviewer_changes_requested(
         client.run_log = run_log
 
     try:
-        protocol = find_protocol_by_name(client, project["id"], "code_review")
-        if not protocol:
-            errors.append("code_review protocol not found")
-            raise RuntimeError("code_review protocol not found")
+        graph = find_graph_by_name(client, project["id"], "code_review")
+        if not graph:
+            errors.append("code_review graph not found")
+            raise RuntimeError("code_review graph not found")
 
         artifact_name = f"PL3-PR-{uuid.uuid4().hex[:8]}"
         task, artifact = setup_pr(client, project["id"], artifact_name)
@@ -1914,12 +1914,12 @@ def test_pl3_live_reviewer_changes_requested(
             "task_id": task["id"],
             "author_agent_id": author_id,
         })
-        instance = wait_for_instance(client, project["id"], protocol["id"], timeout=15, artifact_id=artifact["id"])
-        instance_id = instance["id"]
-        print(f"    Instance {instance_id[:8]} created")
+        run = wait_for_run(client, project["id"], graph["id"], timeout=15, artifact_id=artifact["id"])
+        run_id = run["id"]
+        print(f"    Run {run_id[:8]} created")
 
         client.emit_event(project["id"], "test.passed", {"artifact_id": artifact["id"]})
-        wait_for_state(client, project["id"], instance_id, "ready_for_review", timeout=15)
+        wait_for_node(client, project["id"], run_id, "ready_for_review", timeout=15)
         print("    State: ready_for_review")
 
         review_task = client.create_task(
@@ -1951,7 +1951,7 @@ def test_pl3_live_reviewer_changes_requested(
             raise RuntimeError("reviewer did not reject")
 
         client.emit_event(project["id"], "review.changes_requested", {"artifact_id": artifact["id"]})
-        wait_for_state(client, project["id"], instance_id, "awaiting_revision", timeout=15)
+        wait_for_node(client, project["id"], run_id, "awaiting_revision", timeout=15)
         print("    State: awaiting_revision")
 
     except RuntimeError:
@@ -1978,7 +1978,7 @@ def test_pl3_live_reviewer_changes_requested(
 
 # ── Test registry ──────────────────────────────────────────────────────────────
 
-PROTOCOL_TESTS = [
+GRAPH_TESTS = [
     ("PC1", test_pc1_trigger_actor_resolution),
     ("PC2", test_pc2_template_guard_resolution),
     ("PC3", test_pc3_post_message_content),
@@ -1990,7 +1990,7 @@ PROTOCOL_TESTS = [
     ("PC9", test_pc9_timeout_escalation),
     ("PC10", test_pc10_awaiting_revision_loop),
     ("PL1", test_pl1_live_reviewer_decision),
-    ("PL2", test_pl2_protocol_created_reviewer_session),
+    ("PL2", test_pl2_graph_created_reviewer_session),
     ("PL3", test_pl3_live_reviewer_changes_requested),
 ]
 
@@ -1998,7 +1998,7 @@ PROTOCOL_TESTS = [
 # ── Argument parsing ───────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="HuddleRoom protocol live integration tests")
+    p = argparse.ArgumentParser(description="HuddleRoom graph live integration tests")
     p.add_argument("--port", type=int, default=8001)
     p.add_argument("--no-start-server", action="store_true")
     p.add_argument("--keep-server", action="store_true")
@@ -2176,9 +2176,9 @@ def setup_logging() -> tuple[logging.Logger, str, Path]:
     logs_dir.mkdir(exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    log_path = logs_dir / f"run_protocols_{timestamp}.log"
+    log_path = logs_dir / f"run_graphs_{timestamp}.log"
 
-    logger = logging.getLogger("huddleroom_protocol_live_test")
+    logger = logging.getLogger("huddleroom_graph_live_test")
     logger.setLevel(logging.INFO)
 
     handler = logging.FileHandler(log_path)
@@ -2196,7 +2196,7 @@ def setup_logging() -> tuple[logging.Logger, str, Path]:
 
 def print_report(results: list[TestResult]) -> None:
     print(f"\n{'='*60}")
-    print("  HUDDLEROOM PROTOCOL LIVE TEST REPORT")
+    print("  HUDDLEROOM GRAPH LIVE TEST REPORT")
     print(f"{'='*60}")
     print(f"  {'ID':<6} {'Label':<35} {'Result':<8} {'Time':>7}")
     print(f"  {'-'*6} {'-'*35} {'-'*8} {'-'*7}")
@@ -2292,7 +2292,7 @@ def generate_html_report(run_log: RunLog, timestamp: str) -> str:
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>HuddleRoom Protocol Live Test Report</title>
+    <title>HuddleRoom Graph Live Test Report</title>
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -2417,7 +2417,7 @@ def generate_html_report(run_log: RunLog, timestamp: str) -> str:
 </head>
 <body>
     <div class="header">
-        <h1>HuddleRoom Protocol Live Test Report</h1>
+        <h1>HuddleRoom Graph Live Test Report</h1>
         <div class="meta">
             <div><strong>Run Time:</strong> {timestamp}</div>
             <div><strong>Tests:</strong> {total}</div>
@@ -2487,7 +2487,7 @@ def main() -> int:
         if check_server(base_url):
             print(f"Server already running at {base_url} — reusing.")
         else:
-            server_log_path = logs_dir / f"server_protocols_{timestamp}.log"
+            server_log_path = logs_dir / f"server_graphs_{timestamp}.log"
             try:
                 server_proc, server_log = start_server(base_url, args.port, PROJECT_ROOT, server_log_path)
             except Exception as exc:
@@ -2524,7 +2524,7 @@ def main() -> int:
     for test_id_upper in test_ids:
         # Find test function
         test_func = None
-        for tid, fn in PROTOCOL_TESTS:
+        for tid, fn in GRAPH_TESTS:
             if tid == test_id_upper:
                 test_func = fn
                 break
@@ -2570,7 +2570,7 @@ def main() -> int:
 
     # Generate HTML report
     html_content = generate_html_report(run_log, time.strftime("%Y-%m-%d %H:%M:%S"))
-    html_path = logs_dir / f"run_protocols_{timestamp}.html"
+    html_path = logs_dir / f"run_graphs_{timestamp}.html"
     html_path.write_text(html_content)
     print(f"HTML report: {html_path}")
 

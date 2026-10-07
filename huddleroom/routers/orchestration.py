@@ -39,7 +39,7 @@ async def orchestration_health(
     from huddleroom.workers.consumers.ws_hub import get_registry
 
     tasks = get_consumer_tasks()
-    all_names = ("ws_hub", "rule_engine", "protocol_engine", "meeting_engine", "optimizer")
+    all_names = ("ws_hub", "rule_engine", "graph_engine", "meeting_engine", "optimizer")
     consumers: dict[str, ConsumerStatus] = {}
     for name in all_names:
         task = tasks.get(name)

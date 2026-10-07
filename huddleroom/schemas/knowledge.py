@@ -28,7 +28,7 @@ class KnowledgeResponse(BaseModel):
     content_type: str
     tags: list[str] | None
     provenance_type: str
-    provenance_protocol_instance_id: UUID | None = None
+    provenance_graph_run_id: UUID | None = None
     is_superseded: bool
     version: int
     conflict_status: str

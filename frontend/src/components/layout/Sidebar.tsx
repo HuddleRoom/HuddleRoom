@@ -24,7 +24,7 @@ const NAV_OPERATE = [
   { to: '/orchestration', icon: Target, label: 'Orchestration' },
   { to: '/tasks', icon: CheckSquare, label: 'Tasks' },
   { to: '/agents', icon: Bot, label: 'Agents' },
-  { to: '/protocols', icon: GitBranch, label: 'Protocols' },
+  { to: '/graphs', icon: GitBranch, label: 'Graphs' },
   { to: '/meetings', icon: Users, label: 'Meetings' },
 ] as const
 

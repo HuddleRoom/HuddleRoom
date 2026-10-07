@@ -24,7 +24,7 @@ class KnowledgeItem(Base, TimestampMixin):
     provenance_type: Mapped[str] = mapped_column(String, nullable=False, default="human")
     provenance_session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True)
     provenance_meeting_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
-    provenance_protocol_instance_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    provenance_graph_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     created_by_agent: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
     created_by_user: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 

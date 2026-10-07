@@ -10,7 +10,7 @@ from fastapi import HTTPException
 
 from huddleroom.models.session import Session
 from huddleroom.models.agent import Agent
-from huddleroom.models.protocol import ProtocolInstance
+from huddleroom.models.graph import GraphRun
 from huddleroom.models.project import Project
 from huddleroom.models.task import Task
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
@@ -557,23 +557,23 @@ class SessionService:
             if task is None or task.project_id != data.project_id:
                 raise HTTPException(status_code=404, detail="Task not found")
 
-        protocol_instance = None
-        if data.protocol_instance_id:
+        graph_run = None
+        if data.graph_run_id:
             result3 = await db.execute(
-                select(ProtocolInstance).where(
-                    ProtocolInstance.id == data.protocol_instance_id,
-                    ProtocolInstance.project_id == data.project_id,
+                select(GraphRun).where(
+                    GraphRun.id == data.graph_run_id,
+                    GraphRun.project_id == data.project_id,
                 )
             )
-            protocol_instance = result3.scalar_one_or_none()
-            if protocol_instance is None:
-                raise HTTPException(status_code=404, detail="Protocol instance not found")
+            graph_run = result3.scalar_one_or_none()
+            if graph_run is None:
+                raise HTTPException(status_code=404, detail="Graph run not found")
             if (
                 data.task_id is not None
-                and protocol_instance.linked_task_id != data.task_id
-                and (task is None or task.protocol_instance_id != protocol_instance.id)
+                and graph_run.linked_task_id != data.task_id
+                and (task is None or task.graph_run_id != graph_run.id)
             ):
-                raise HTTPException(status_code=409, detail="Protocol instance is linked to a different task")
+                raise HTTPException(status_code=409, detail="Graph run is linked to a different task")
 
         adapter_type = self._resolve_adapter_type(agent, task, data.adapter_type_override)
         roadmap_context = await self._immutable_roadmap_context(db, task)
@@ -630,7 +630,7 @@ class SessionService:
             agent_id=data.agent_id,
             task_id=data.task_id,
             project_id=data.project_id,
-            protocol_instance_id=data.protocol_instance_id,
+            graph_run_id=data.graph_run_id,
             adapter_type=adapter_type,
             status="pending",
             input_context={
@@ -700,7 +700,7 @@ class SessionService:
         await emit_event(db, session.project_id, "session.created", {
             "session_id": str(session.id),
             "task_id": str(session.task_id) if session.task_id else None,
-            "protocol_instance_id": str(session.protocol_instance_id) if session.protocol_instance_id else None,
+            "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
             "agent_id": str(session.agent_id),
             "adapter_type": session.adapter_type,
             "origin": session.origin,

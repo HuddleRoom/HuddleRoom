@@ -1151,7 +1151,7 @@ export function TasksPage() {
         ]}
         alternatePaths={[
           'If the switcher is empty, confirm you are in the correct environment or ask an administrator to create a project.',
-          'If work has not been broken into tasks yet, start from Dashboard, Meetings, or Protocols to identify what should be queued.',
+          'If work has not been broken into tasks yet, start from Dashboard, Meetings, or Graphs to identify what should be queued.',
           'If you only need to inspect agent capacity first, open Agents before creating new work here.',
         ]}
       />
@@ -1257,11 +1257,11 @@ export function TasksPage() {
                   ? [
                       'Broaden the filter scope first if you are trying to understand overall workload.',
                       'Open Agents to confirm who is active before narrowing by assignee again.',
-                      'Use Dashboard to see whether meetings or protocols are producing new work that has not reached this board yet.',
+                      'Use Dashboard to see whether meetings or graphs are producing new work that has not reached this board yet.',
                     ]
                   : [
                       'Open Agents if you need to verify capacity before assigning the first task.',
-                      'Open Meetings or Protocols if the next task should be derived from active coordination instead of manual entry.',
+                      'Open Meetings or Graphs if the next task should be derived from active coordination instead of manual entry.',
                       'If tasks should already exist, confirm you selected the correct project in the top bar.',
                     ]
               }

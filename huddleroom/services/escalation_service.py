@@ -102,18 +102,18 @@ class EscalationChainService:
         self,
         db: AsyncSession,
         project_id: uuid.UUID,
-        protocol_instance_id: uuid.UUID,
-        protocol_name: str,
-        current_state: str,
+        graph_run_id: uuid.UUID,
+        graph_name: str,
+        current_node: str,
         message_template: str,
     ) -> None:
         """Replace template vars and emit system.escalation_alert event."""
         # Build the message string from template
         msg = (
             message_template
-            .replace("{{protocol_name}}", protocol_name)
-            .replace("{{current_state}}", current_state)
-            .replace("{{protocol_instance_id}}", str(protocol_instance_id))
+            .replace("{{graph_name}}", graph_name)
+            .replace("{{current_node}}", current_node)
+            .replace("{{graph_run_id}}", str(graph_run_id))
         )
 
         # Emit event
@@ -122,9 +122,9 @@ class EscalationChainService:
             project_id=project_id,
             event_type="system.escalation_alert",
             payload={
-                "protocol_instance_id": str(protocol_instance_id),
-                "protocol_name": protocol_name,
-                "current_state": current_state,
+                "graph_run_id": str(graph_run_id),
+                "graph_name": graph_name,
+                "current_node": current_node,
                 "message": msg,
             },
             source="escalation_service",

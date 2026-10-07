@@ -44,9 +44,9 @@ export function useWSQuerySync() {
     let invalidateEvents = false
     let invalidateSessionCount = false
     let invalidateAgents = false
-    let invalidateProtocols = false
-    let invalidateProtocolInstances = false
-    let invalidateProtocolInstanceCount = false
+    let invalidateGraphs = false
+    let invalidateGraphRuns = false
+    let invalidateGraphRunCount = false
     let invalidateMeetings = false
     let invalidateMeetingCount = false
     let invalidateKnowledge = false
@@ -83,10 +83,10 @@ export function useWSQuerySync() {
       } else if (type === 'agent.created') {
         invalidateAgents = true
         invalidateEvents = true
-      } else if (type.startsWith('protocol.')) {
-        invalidateProtocols = true
-        invalidateProtocolInstances = true
-        invalidateProtocolInstanceCount = true
+      } else if (type.startsWith('graph.')) {
+        invalidateGraphs = true
+        invalidateGraphRuns = true
+        invalidateGraphRunCount = true
         invalidateEvents = true
       } else if (type.startsWith('meeting.') && type !== 'meeting.turn_complete' && type !== 'meeting.human_turn') {
         invalidateMeetings = true
@@ -111,9 +111,9 @@ export function useWSQuerySync() {
     if (invalidateTaskCount) qc.invalidateQueries({ queryKey: ['tasks', 'count', projectId] })
     if (invalidateSessionCount) qc.invalidateQueries({ queryKey: ['sessions', 'count', projectId] })
     if (invalidateAgents) qc.invalidateQueries({ queryKey: ['agents'] })
-    if (invalidateProtocols) qc.invalidateQueries({ queryKey: ['protocols', projectId] })
-    if (invalidateProtocolInstances) qc.invalidateQueries({ queryKey: ['protocol-instances', projectId] })
-    if (invalidateProtocolInstanceCount) qc.invalidateQueries({ queryKey: ['protocol-instances', 'count', projectId] })
+    if (invalidateGraphs) qc.invalidateQueries({ queryKey: ['graphs', projectId] })
+    if (invalidateGraphRuns) qc.invalidateQueries({ queryKey: ['graph-runs', projectId] })
+    if (invalidateGraphRunCount) qc.invalidateQueries({ queryKey: ['graph-runs', 'count', projectId] })
     if (invalidateMeetings) qc.invalidateQueries({ queryKey: ['meetings', projectId] })
     if (invalidateMeetingCount) qc.invalidateQueries({ queryKey: ['meetings', 'count', projectId] })
     if (invalidateKnowledge) qc.invalidateQueries({ queryKey: ['knowledge', projectId] })

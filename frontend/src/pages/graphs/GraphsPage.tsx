@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 const Editor = React.lazy(() => import('@monaco-editor/react'))
-const ProtocolGraph = React.lazy(() => import('./ProtocolGraph').then((m) => ({ default: m.ProtocolGraph })))
+const GraphDiagram = React.lazy(() => import('./GraphDiagram').then((m) => ({ default: m.GraphDiagram })))
 import yaml from 'js-yaml'
 import { toast } from 'sonner'
 import { Plus, ChevronDown, ChevronRight, Play, Pause, RotateCcw, X, Zap } from 'lucide-react'
@@ -13,13 +13,13 @@ import { EmptyState } from '@/components/common/EmptyState'
 import { STATUS_COLORS } from '@/lib/statusColors'
 import { useUIStore } from '@/stores/ui'
 import {
-  useProtocols, useProtocol, useProtocolsAll,
-  useCreateProtocol, useUpdateProtocol, useDeactivateProtocol, useActivateProtocol,
-  useProtocolInstances, useProtocolInstancesAll,
-  useProtocolInstanceTransitions,
-  usePauseInstance, useResumeInstance, useAbandonInstance,
-} from '@/api/protocols'
-import type { Protocol, ProtocolInstance, ProtocolTransition } from '@/lib/types'
+  useGraphs, useGraph, useGraphsAll,
+  useCreateGraph, useUpdateGraph, useDeactivateGraph, useActivateGraph,
+  useGraphRuns, useGraphRunsAll,
+  useGraphRunSteps,
+  usePauseRun, useResumeRun, useAbandonRun,
+} from '@/api/graphs'
+import type { Graph, GraphRun, GraphRunStep } from '@/lib/types'
 import { useDocumentTitle } from '@/hooks/useDocumentTitle'
 import { absolute } from '@/lib/time'
 
@@ -31,21 +31,21 @@ function readableStatus(status: string): string {
   return status.replace(/_/g, ' ')
 }
 
-function instanceStatusAnnouncement(status: string): string {
+function runStatusAnnouncement(status: string): string {
   if (status === 'paused') {
-    return 'Protocol instance status paused. Live execution is stopped until an operator resumes it.'
+    return 'Graph run status paused. Live execution is stopped until an operator resumes it.'
   }
   if (status === 'active') {
-    return 'Protocol instance status active. Live execution is currently running.'
+    return 'Graph run status active. Live execution is currently running.'
   }
-  return `Protocol instance status ${readableStatus(status)}.`
+  return `Graph run status ${readableStatus(status)}.`
 }
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
-// ─── Protocol form state ──────────────────────────────────────────────────────
+// ─── Graph form state ──────────────────────────────────────────────────────
 
-interface ProtocolFormState {
+interface GraphFormState {
   name: string
   version: string
   description: string
@@ -53,12 +53,12 @@ interface ProtocolFormState {
   triggers: string
 }
 
-const BLANK_FORM: ProtocolFormState = {
+const BLANK_FORM: GraphFormState = {
   name: '',
   version: '1.0.0',
   description: '',
-  definition: `initial_state: pending
-states:
+  definition: `start_node: pending
+nodes:
   pending:
     type: initial
   active: {}
@@ -66,7 +66,7 @@ states:
     type: terminal
   failed:
     type: terminal
-transitions:
+edges:
   - from: pending
     to: active
     event: start
@@ -80,30 +80,30 @@ transitions:
   triggers: '',
 }
 
-function protocolToForm(protocol: Protocol): ProtocolFormState {
+function graphToForm(graph: Graph): GraphFormState {
   return {
-    name: protocol.name,
-    version: protocol.version,
-    description: protocol.description ?? '',
+    name: graph.name,
+    version: graph.version,
+    description: graph.description ?? '',
     definition: (() => {
       try {
-        return typeof protocol.definition === 'object' && protocol.definition !== null
-          ? yaml.dump(protocol.definition)
+        return typeof graph.definition === 'object' && graph.definition !== null
+          ? yaml.dump(graph.definition)
           : '';
       } catch {
-        toast.error('Protocol definition is invalid and cannot be displayed')
+        toast.error('Graph definition is invalid and cannot be displayed')
         return '';
       }
     })(),
-    triggers: (protocol.triggers ?? []).map((t) =>
+    triggers: (graph.triggers ?? []).map((t) =>
       typeof t === 'string' ? t : String((t as Record<string, unknown>).event_type ?? JSON.stringify(t))
     ).join(', '),
   }
 }
 
-// ─── ProtocolFormModal ────────────────────────────────────────────────────────
+// ─── GraphFormModal ────────────────────────────────────────────────────────
 
-function ProtocolFormModal({
+function GraphFormModal({
   open,
   onClose,
   initialData,
@@ -112,21 +112,21 @@ function ProtocolFormModal({
 }: {
   open: boolean
   onClose: () => void
-  initialData?: Protocol | null
+  initialData?: Graph | null
   mode: 'create' | 'edit'
   pid: string | null
 }) {
-  const [form, setForm] = useState<ProtocolFormState>(BLANK_FORM)
-  const createProtocol = useCreateProtocol(pid)
-  const updateProtocol = useUpdateProtocol(pid)
+  const [form, setForm] = useState<GraphFormState>(BLANK_FORM)
+  const createGraph = useCreateGraph(pid)
+  const updateGraph = useUpdateGraph(pid)
 
   useEffect(() => {
     if (open) {
-      setForm(initialData ? protocolToForm(initialData) : BLANK_FORM)
+      setForm(initialData ? graphToForm(initialData) : BLANK_FORM)
     }
   }, [open, initialData])
 
-  function set(patch: Partial<ProtocolFormState>) {
+  function set(patch: Partial<GraphFormState>) {
     setForm((p) => ({ ...p, ...patch }))
   }
 
@@ -147,25 +147,25 @@ function ProtocolFormModal({
       }
 
       if (mode === 'create') {
-        createProtocol.mutate({
+        createGraph.mutate({
           name: payload.name,
           version: payload.version,
           description: payload.description ?? undefined,
           definition: payload.definition,
           triggers: payload.triggers,
         }, {
-          onSuccess: () => { toast.success('Protocol created'); onClose() },
+          onSuccess: () => { toast.success('Graph created'); onClose() },
           onError: (e) => toast.error(e.message),
         })
       } else if (initialData) {
-        updateProtocol.mutate({ protocolId: initialData.id, data: {
+        updateGraph.mutate({ graphId: initialData.id, data: {
           name: payload.name,
           version: payload.version,
           description: payload.description ?? undefined,
           definition: payload.definition,
           triggers: payload.triggers,
         } }, {
-          onSuccess: () => { toast.success('Protocol updated'); onClose() },
+          onSuccess: () => { toast.success('Graph updated'); onClose() },
           onError: (e) => toast.error(e.message),
         })
       }
@@ -174,44 +174,44 @@ function ProtocolFormModal({
     }
   }
 
-  const isPending = createProtocol.isPending || updateProtocol.isPending
+  const isPending = createGraph.isPending || updateGraph.isPending
   const canSubmit = form.name.trim() && form.version.trim()
 
   return (
     <Dialog
       open={open}
       onOpenChange={(v) => { if (!v) onClose() }}
-      title={mode === 'create' ? 'New protocol' : 'Edit protocol'}
+      title={mode === 'create' ? 'New graph' : 'Edit graph'}
       description={
         mode === 'create'
-          ? 'Create a new protocol with name, version, YAML definition, and triggers.'
-          : `Edit the definition, version, and triggers for ${initialData?.name ?? 'this protocol'}.`
+          ? 'Create a new graph with name, version, YAML definition, and triggers.'
+          : `Edit the definition, version, and triggers for ${initialData?.name ?? 'this graph'}.`
       }
       size="md"
       footer={{
-        primaryLabel: isPending ? 'Saving...' : mode === 'create' ? 'Create protocol' : 'Save changes',
+        primaryLabel: isPending ? 'Saving...' : mode === 'create' ? 'Create graph' : 'Save changes',
         primaryType: 'submit',
-        formId: 'protocol-form',
+        formId: 'graph-form',
         isPending,
         primaryDisabled: !canSubmit,
       }}
     >
-      <form id="protocol-form" onSubmit={(e) => { e.preventDefault(); handleSubmit() }}>
+      <form id="graph-form" onSubmit={(e) => { e.preventDefault(); handleSubmit() }}>
             {/* Row: name + version */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 14 }}>
               <div>
-                <Input id="protocol-name" label="Name *" value={form.name} placeholder="protocol name"
+                <Input id="graph-name" label="Name *" value={form.name} placeholder="graph name"
                   onChange={(e) => set({ name: e.target.value })}
                 />
               </div>
               <div>
-                <Input id="protocol-version" label="Version *" value={form.version} placeholder="1.0.0"
+                <Input id="graph-version" label="Version *" value={form.version} placeholder="1.0.0"
                   onChange={(e) => set({ version: e.target.value })}
                 />
               </div>
             </div>
 
-            <Textarea id="protocol-description" label="Description" rows={3}
+            <Textarea id="graph-description" label="Description" rows={3}
               value={form.description} placeholder="optional description"
               onChange={(e) => set({ description: e.target.value })}
             />
@@ -240,7 +240,7 @@ function ProtocolFormModal({
               </div>
             </div>
 
-            <Input id="protocol-triggers" label="Triggers (comma-separated)" value={form.triggers} placeholder="start, stop"
+            <Input id="graph-triggers" label="Triggers (comma-separated)" value={form.triggers} placeholder="start, stop"
               onChange={(e) => set({ triggers: e.target.value })}
             />
       </form>
@@ -248,33 +248,33 @@ function ProtocolFormModal({
   )
 }
 
-// ─── Parse definition to get states and transitions ───────────────────────────
+// ─── Parse definition to get nodes and edges ───────────────────────────
 
-export interface ParsedStateInfo {
+export interface ParsedNodeInfo {
   id: string
   isInitial: boolean
   isTerminal: boolean
 }
 
 export interface ParsedFlow {
-  states: Map<string, ParsedStateInfo>
-  transitions: Array<{ from: string; to: string; event?: string }>
-  initialState?: string
+  nodes: Map<string, ParsedNodeInfo>
+  edges: Array<{ from: string; to: string; event?: string }>
+  startNode?: string
 }
 
-function parseProtocolDefinition(definition: Record<string, unknown>): ParsedFlow {
-  const states = new Map<string, ParsedStateInfo>()
-  const transitions: Array<{ from: string; to: string; event?: string }> = []
-  let initialState: string | undefined
+function parseGraphDefinition(definition: Record<string, unknown>): ParsedFlow {
+  const nodes = new Map<string, ParsedNodeInfo>()
+  const edges: Array<{ from: string; to: string; event?: string }> = []
+  let startNode: string | undefined
 
-  // Parse states
-  const statesObj = definition.states as Record<string, unknown> | undefined
-  if (statesObj && typeof statesObj === 'object') {
-    Object.entries(statesObj).forEach(([name, config]) => {
+  // Parse nodes
+  const nodesObj = definition.nodes as Record<string, unknown> | undefined
+  if (nodesObj && typeof nodesObj === 'object') {
+    Object.entries(nodesObj).forEach(([name, config]) => {
       const cfg = config as Record<string, unknown> | undefined
       const type = (cfg?.type as string | undefined) ?? ''
 
-      states.set(name, {
+      nodes.set(name, {
         id: name,
         isInitial: type === 'initial',
         isTerminal: type === 'terminal' || type === 'end' || (cfg?.is_terminal as boolean | undefined) === true,
@@ -282,23 +282,23 @@ function parseProtocolDefinition(definition: Record<string, unknown>): ParsedFlo
     })
   }
 
-  // Parse initial state
-  const initialStateVal = definition.initial_state as string | undefined
-  if (initialStateVal) {
-    initialState = initialStateVal
+  // Parse start node
+  const startNodeVal = definition.start_node as string | undefined
+  if (startNodeVal) {
+    startNode = startNodeVal
   } else {
-    // Look for initial state by type
-    states.forEach((info, name) => {
-      if (info.isInitial) initialState = name
+    // Look for start node by type
+    nodes.forEach((info, name) => {
+      if (info.isInitial) startNode = name
     })
   }
 
-  // Parse transitions
-  const transitionsArr = definition.transitions as Array<Record<string, unknown>> | undefined
-  if (Array.isArray(transitionsArr)) {
-    transitionsArr.forEach((t) => {
-      const from = (t.from as string | undefined) ?? (t.from_state as string | undefined)
-      const to = (t.to as string | undefined) ?? (t.to_state as string | undefined)
+  // Parse edges
+  const edgesArr = definition.edges as Array<Record<string, unknown>> | undefined
+  if (Array.isArray(edgesArr)) {
+    edgesArr.forEach((t) => {
+      const from = (t.from as string | undefined) ?? (t.from_node as string | undefined)
+      const to = (t.to as string | undefined) ?? (t.to_node as string | undefined)
       const eventRaw = t.event ?? t.event_type
       const event: string | undefined = typeof eventRaw === 'string'
         ? eventRaw
@@ -306,24 +306,24 @@ function parseProtocolDefinition(definition: Record<string, unknown>): ParsedFlo
           ? String((eventRaw as Record<string, unknown>).event_type ?? '')
           : undefined
       if (from && to) {
-        // Ensure states exist
-        if (!states.has(from)) {
-          states.set(from, { id: from, isInitial: false, isTerminal: false })
+        // Ensure nodes exist
+        if (!nodes.has(from)) {
+          nodes.set(from, { id: from, isInitial: false, isTerminal: false })
         }
-        if (!states.has(to)) {
-          states.set(to, { id: to, isInitial: false, isTerminal: false })
+        if (!nodes.has(to)) {
+          nodes.set(to, { id: to, isInitial: false, isTerminal: false })
         }
-        transitions.push({ from, to, event })
+        edges.push({ from, to, event })
       }
     })
   }
 
-  return { states, transitions, initialState }
+  return { nodes, edges, startNode }
 }
 
-// ─── ProtocolListView ─────────────────────────────────────────────────────────
+// ─── GraphListView ─────────────────────────────────────────────────────────
 
-function ProtocolListView() {
+function GraphListView() {
   const navigate = useNavigate()
   const pid = useUIStore((s) => s.activeProjectId)
   const [showCreate, setShowCreate] = useState(false)
@@ -331,30 +331,30 @@ function ProtocolListView() {
   const [search, setSearch] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
 
-  const { items: protocols, isLoading, isError: protocolsError, refetch: protocolsRefetch } = useProtocolsAll(pid, includeInactive)
-  const deactivateProtocol = useDeactivateProtocol(pid)
-  const activateProtocol = useActivateProtocol(pid)
-  const filteredProtocols = useMemo(() => {
+  const { items: graphs, isLoading, isError: graphsError, refetch: graphsRefetch } = useGraphsAll(pid, includeInactive)
+  const deactivateGraph = useDeactivateGraph(pid)
+  const activateGraph = useActivateGraph(pid)
+  const filteredGraphs = useMemo(() => {
     const query = search.trim().toLowerCase()
     if (!query) {
-      return protocols
+      return graphs
     }
-    return protocols.filter((protocol) => {
-      const haystack = `${protocol.name} ${protocol.version} ${protocol.description ?? ''}`.toLowerCase()
+    return graphs.filter((graph) => {
+      const haystack = `${graph.name} ${graph.version} ${graph.description ?? ''}`.toLowerCase()
       return haystack.includes(query)
     })
-  }, [protocols, search])
+  }, [graphs, search])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <PageHeader title="Protocols" />
+        <PageHeader title="Graphs" />
         <Button
           variant="primary"
           onClick={() => setShowCreate(true)}
         >
-          <Plus size={12} /> New protocol
+          <Plus size={12} /> New graph
         </Button>
       </div>
 
@@ -372,38 +372,38 @@ function ProtocolListView() {
         </label>
         <Input
           type="text"
-          aria-label="Search protocols"
-          placeholder="Search protocols"
+          aria-label="Search graphs"
+          placeholder="Search graphs"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           style={{ maxWidth: 240 }}
         />
       </div>
 
-      {/* Protocol list */}
+      {/* Graph list */}
       <QueryState
         query={{
           isLoading,
-          isError: protocolsError,
-          refetch: protocolsRefetch,
-          data: filteredProtocols,
+          isError: graphsError,
+          refetch: graphsRefetch,
+          data: filteredGraphs,
         }}
         skeleton="rows"
         skeletonCount={3}
-        errorLabel="Failed to load protocols"
-        emptyLabel={search.trim() ? 'No protocols match this search' : 'No protocols'}
-        emptyDetail={search.trim() ? undefined : 'Instances appear here when protocols are triggered.'}
+        errorLabel="Failed to load graphs"
+        emptyLabel={search.trim() ? 'No graphs match this search' : 'No graphs'}
+        emptyDetail={search.trim() ? undefined : 'Runs appear here when graphs are triggered.'}
       >
-        {(displayProtocols) => (
+        {(displayGraphs) => (
           <div className="border border-huddleroom-border rounded-md overflow-hidden bg-huddleroom-surface">
-            {displayProtocols.map((p, idx) => {
+            {displayGraphs.map((p, idx) => {
               const isGlobal = !p.project_id
               return (
                 <div key={p.id}
                   role="button"
                   tabIndex={0}
-                  data-testid={`protocol-card-${p.id}`}
-                  className={idx < displayProtocols.length - 1 ? 'border-b border-huddleroom-depth' : ''}
+                  data-testid={`graph-card-${p.id}`}
+                  className={idx < displayGraphs.length - 1 ? 'border-b border-huddleroom-depth' : ''}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 16, padding: '12px 16px', minHeight: 32,
                     transition: 'background 120ms',
@@ -411,8 +411,8 @@ function ProtocolListView() {
                   }}
                   onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = UI_COLORS.depth }}
                   onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = UI_COLORS.surface }}
-                  onClick={() => navigate(`/protocols/${p.id}`)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); navigate(`/protocols/${p.id}`) } }}
+                  onClick={() => navigate(`/graphs/${p.id}`)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); navigate(`/graphs/${p.id}`) } }}
                 >
                   <StatusBadge
                     status={p.is_active ? 'active' : 'disabled'}
@@ -436,7 +436,7 @@ function ProtocolListView() {
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => navigate(`/protocols/${p.id}`)}
+                      onClick={() => navigate(`/graphs/${p.id}`)}
                     >
                       Edit
                     </Button>
@@ -456,8 +456,8 @@ function ProtocolListView() {
                           variant="secondary"
                           size="sm"
                           onClick={() => {
-                            activateProtocol.mutate(p.id, {
-                              onSuccess: () => toast.success('Protocol reactivated'),
+                            activateGraph.mutate(p.id, {
+                              onSuccess: () => toast.success('Graph reactivated'),
                               onError: (e) => toast.error(e.message),
                             })
                           }}
@@ -477,7 +477,7 @@ function ProtocolListView() {
       </QueryState>
 
       {/* Create modal */}
-      <ProtocolFormModal
+      <GraphFormModal
         open={showCreate}
         onClose={() => setShowCreate(false)}
         mode="create"
@@ -488,14 +488,14 @@ function ProtocolListView() {
       <ConfirmDialog
         open={!!deleteConfirm}
         onOpenChange={(v) => { if (!v) setDeleteConfirm(null) }}
-        title="Deactivate this protocol?"
+        title="Deactivate this graph?"
         consequence="It will no longer be available to agents."
-        confirmLabel={deactivateProtocol.isPending ? 'Deactivating...' : 'Deactivate'}
-        isPending={deactivateProtocol.isPending}
+        confirmLabel={deactivateGraph.isPending ? 'Deactivating...' : 'Deactivate'}
+        isPending={deactivateGraph.isPending}
         onConfirm={() => {
           if (!deleteConfirm) return
-          deactivateProtocol.mutate(deleteConfirm, {
-            onSuccess: () => { toast.success('Protocol deactivated'); setDeleteConfirm(null) },
+          deactivateGraph.mutate(deleteConfirm, {
+            onSuccess: () => { toast.success('Graph deactivated'); setDeleteConfirm(null) },
             onError: (e) => toast.error(e.message),
           })
         }}
@@ -504,65 +504,65 @@ function ProtocolListView() {
   )
 }
 
-// ─── ProtocolDetailView ───────────────────────────────────────────────────────
+// ─── GraphDetailView ───────────────────────────────────────────────────────
 
-function ProtocolDetailView({ protocolId }: { protocolId: string }) {
+function GraphDetailView({ graphId }: { graphId: string }) {
   const pid = useUIStore((s) => s.activeProjectId)
   const [showEdit, setShowEdit] = useState(false)
   const [editDefinition, setEditDefinition] = useState('')
-  const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null)
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const [searchParams, setSearchParams] = useSearchParams()
-  const statusFilter = searchParams.get('instanceStatus') ?? 'all'
-  const [expandedInstance, setExpandedInstance] = useState<string | null>(null)
+  const statusFilter = searchParams.get('runStatus') ?? 'all'
+  const [expandedRun, setExpandedRun] = useState<string | null>(null)
   const [abandonConfirm, setAbandonConfirm] = useState<string | null>(null)
   const [deactivateConfirm, setDeactivateConfirm] = useState(false)
 
-  const { data: protocol, isLoading, isError: protocolError, refetch: protocolRefetch } = useProtocol(pid, protocolId)
-  const { items: instances, isLoading: instancesLoading } = useProtocolInstancesAll(pid, {
-    protocol_id: protocolId,
+  const { data: graph, isLoading, isError: graphError, refetch: graphRefetch } = useGraph(pid, graphId)
+  const { items: runs, isLoading: runsLoading } = useGraphRunsAll(pid, {
+    graph_id: graphId,
     status: statusFilter === 'all' ? undefined : statusFilter,
   })
 
-  const updateProtocol = useUpdateProtocol(pid)
-  const deactivateProtocol = useDeactivateProtocol(pid)
-  const activateProtocol = useActivateProtocol(pid)
-  const pauseInstance = usePauseInstance(pid)
-  const resumeInstance = useResumeInstance(pid)
-  const abandonInstance = useAbandonInstance(pid)
+  const updateGraph = useUpdateGraph(pid)
+  const deactivateGraph = useDeactivateGraph(pid)
+  const activateGraph = useActivateGraph(pid)
+  const pauseRun = usePauseRun(pid)
+  const resumeRun = useResumeRun(pid)
+  const abandonRun = useAbandonRun(pid)
 
   useEffect(() => {
-    if (protocol?.definition) {
+    if (graph?.definition) {
       try {
-        setEditDefinition(yaml.dump(protocol.definition))
+        setEditDefinition(yaml.dump(graph.definition))
       } catch {
-        toast.error('Protocol definition is invalid and cannot be displayed')
+        toast.error('Graph definition is invalid and cannot be displayed')
         setEditDefinition('')
       }
     }
-  }, [protocol])
+  }, [graph])
 
   const parsed = useMemo(
-    () => parseProtocolDefinition(protocol?.definition ?? {}),
-    [protocol?.definition]
+    () => parseGraphDefinition(graph?.definition ?? {}),
+    [graph?.definition]
   )
-  const currentInst = selectedInstanceId ? instances.find((i) => i.id === selectedInstanceId) : null
+  const currentRun = selectedRunId ? runs.find((i) => i.id === selectedRunId) : null
 
   return (
     <QueryState
-      query={{ isLoading, isError: protocolError, refetch: protocolRefetch, data: protocol }}
+      query={{ isLoading, isError: graphError, refetch: graphRefetch, data: graph }}
       skeleton="rows"
       skeletonCount={4}
-      errorLabel="Failed to load protocol"
-      emptyLabel="Protocol not found"
+      errorLabel="Failed to load graph"
+      emptyLabel="Graph not found"
     >
-      {(protocolData) => {
-        const isGlobal = !protocolData.project_id
+      {(graphData) => {
+        const isGlobal = !graphData.project_id
 
         function handleSaveDefinition() {
           try {
             const definition = yaml.load(editDefinition) as Record<string, unknown>
-            updateProtocol.mutate(
-              { protocolId, data: { definition } },
+            updateGraph.mutate(
+              { graphId, data: { definition } },
               {
                 onSuccess: () => { toast.success('Definition saved'); setShowEdit(false) },
                 onError: (e) => toast.error(e.message),
@@ -577,20 +577,20 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             {/* Header */}
             <DetailHeader
-              backTo="/protocols"
-              backLabel="Protocols"
-              title={protocolData.name}
+              backTo="/graphs"
+              backLabel="Graphs"
+              title={graphData.name}
               titleClassName="font-mono"
-              status={protocolData.is_active ? 'active' : 'disabled'}
-              statusLabel={protocolData.is_active ? 'Active' : 'Inactive'}
+              status={graphData.is_active ? 'active' : 'disabled'}
+              statusLabel={graphData.is_active ? 'Active' : 'Inactive'}
               actions={
                 <>
-                  <Tag mono>v{protocolData.version}</Tag>
+                  <Tag mono>v{graphData.version}</Tag>
                   <Button variant="ghost" onClick={() => setShowEdit(true)}>
                     Edit
                   </Button>
                   {!isGlobal && (
-                    protocolData.is_active ? (
+                    graphData.is_active ? (
                       <Button
                         variant="danger"
                         onClick={() => setDeactivateConfirm(true)}
@@ -600,8 +600,8 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                     ) : (
                       <Button
                         variant="secondary"
-                        onClick={() => activateProtocol.mutate(protocolData.id, {
-                          onSuccess: () => toast.success('Protocol reactivated'),
+                        onClick={() => activateGraph.mutate(graphData.id, {
+                          onSuccess: () => toast.success('Graph reactivated'),
                           onError: (e) => toast.error(e.message),
                         })}
                         className="text-huddleroom-status-green"
@@ -615,18 +615,18 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
             />
 
             {/* Description + triggers card */}
-            {(protocolData.description || protocolData.triggers.length > 0) && (
+            {(graphData.description || graphData.triggers.length > 0) && (
               <div className="bg-huddleroom-surface border border-huddleroom-border rounded-md" style={{ padding: 20 }}>
-                {protocolData.description && (
+                {graphData.description && (
                   <div>
                     <SectionLabel>Description</SectionLabel>
-                    <div className="text-[13px] text-huddleroom-text-muted" style={{ lineHeight: 1.5 }}>{protocolData.description}</div>
+                    <div className="text-[13px] text-huddleroom-text-muted" style={{ lineHeight: 1.5 }}>{graphData.description}</div>
                   </div>
                 )}
 
-                {protocolData.triggers.length > 0 && (
-                  <div style={{ marginTop: protocolData.description ? 12 : 0, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                    {protocolData.triggers.map((t, i) => {
+                {graphData.triggers.length > 0 && (
+                  <div style={{ marginTop: graphData.description ? 12 : 0, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {graphData.triggers.map((t, i) => {
                       const label = typeof t === 'string' ? t : String((t as Record<string, unknown>).event_type ?? JSON.stringify(t))
                       return (
                         <Tag key={i} mono>{label}</Tag>
@@ -638,10 +638,10 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
             )}
 
             {/* Definition editor + diagram (2-column split) */}
-            <div className="protocol-detail-grid">
+            <div className="graph-detail-grid">
               {/* Left: Editor */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <div data-testid="protocol-definition-editor" className="border border-huddleroom-border rounded-[3px] overflow-hidden">
+                <div data-testid="graph-definition-editor" className="border border-huddleroom-border rounded-[3px] overflow-hidden">
                   <React.Suspense fallback={<div className="bg-huddleroom-depth rounded-[3px]" style={{ height: '400px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><span className="text-huddleroom-text-muted text-[11px]">loading editor...</span></div>}>
                     <Editor
                       height="400px"
@@ -666,45 +666,45 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                   <Button
                     variant="primary"
                     onClick={handleSaveDefinition}
-                    disabled={updateProtocol.isPending}
+                    disabled={updateGraph.isPending}
                     className="self-start"
                   >
-                    {updateProtocol.isPending ? 'Saving...' : 'Save definition'}
+                    {updateGraph.isPending ? 'Saving...' : 'Save definition'}
                   </Button>
                 )}
               </div>
 
               {/* Right: Diagram */}
-              <div data-testid="protocol-graph" className="border border-huddleroom-border rounded-md bg-huddleroom-depth" style={{
+              <div data-testid="graph-diagram" className="border border-huddleroom-border rounded-md bg-huddleroom-depth" style={{
                 height: 440,
                 overflow: 'hidden', position: 'relative',
               }}>
-                {parsed.states.size === 0 ? (
+                {parsed.nodes.size === 0 ? (
                   <div className="text-huddleroom-text-muted text-xs" style={{
                     display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%',
                   }}>
-                    no state diagram available
+                    no graph diagram available
                   </div>
                 ) : (
                   <React.Suspense fallback={<div className="text-huddleroom-text-muted text-xs" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>Loading diagram…</div>}>
-                    <ProtocolGraph parsed={parsed} currentState={currentInst?.current_state} />
+                    <GraphDiagram parsed={parsed} currentNode={currentRun?.current_node} />
                   </React.Suspense>
                 )}
               </div>
             </div>
 
-            {/* Instance list */}
+            {/* Run list */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <StructuralLabel>Instances</StructuralLabel>
+                <StructuralLabel>Runs</StructuralLabel>
                 <Select
-                  aria-label="Filter protocol instances by status"
+                  aria-label="Filter graph runs by status"
                   value={statusFilter}
                   onChange={(e) => {
                     setSearchParams((prev) => {
                       const next = new URLSearchParams(prev)
-                      if (e.target.value && e.target.value !== 'all') next.set('instanceStatus', e.target.value)
-                      else next.delete('instanceStatus')
+                      if (e.target.value && e.target.value !== 'all') next.set('runStatus', e.target.value)
+                      else next.delete('runStatus')
                       return next
                     }, { replace: true })
                   }}
@@ -718,32 +718,32 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                 </Select>
               </div>
 
-              {instancesLoading ? (
+              {runsLoading ? (
                 <div className="text-huddleroom-text-muted text-xs bg-huddleroom-surface rounded-md border border-huddleroom-border" style={{ padding: 16 }}>
-                  loading instances...
+                  loading runs...
                 </div>
-              ) : instances.length === 0 ? (
+              ) : runs.length === 0 ? (
                 <div className="bg-huddleroom-surface rounded-md border border-huddleroom-border">
                   <EmptyState
-                    title="No instances yet"
-                    body="Runs of this protocol will appear here when it is triggered."
+                    title="No runs yet"
+                    body="Runs of this graph will appear here when it is triggered."
                     className="px-4"
                   />
                 </div>
               ) : (
                 <>
-                {instances.length > 50 && (
+                {runs.length > 50 && (
                   <div className="text-[11px] text-huddleroom-text-muted" style={{ marginBottom: 4 }}>
-                    showing 50 of {instances.length}
+                    showing 50 of {runs.length}
                   </div>
                 )}
-                <div data-testid="protocol-instance-list" className="border border-huddleroom-border rounded-md overflow-hidden bg-huddleroom-surface">
-                  {instances.slice(0, 50).map((inst, idx) => (
-                    <div key={inst.id}>
+                <div data-testid="graph-run-list" className="border border-huddleroom-border rounded-md overflow-hidden bg-huddleroom-surface">
+                  {runs.slice(0, 50).map((run, idx) => (
+                    <div key={run.id}>
                       <div
                         role="button"
                         tabIndex={0}
-                        className={idx < Math.min(instances.length, 50) - 1 ? 'border-b border-huddleroom-depth' : ''}
+                        className={idx < Math.min(runs.length, 50) - 1 ? 'border-b border-huddleroom-depth' : ''}
                         style={{
                           display: 'grid', gridTemplateColumns: 'auto 1fr auto auto auto 72px', gap: 12, padding: '12px 16px', minHeight: 32,
                           alignItems: 'center',
@@ -753,44 +753,44 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                         onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = UI_COLORS.depth }}
                         onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = UI_COLORS.surface }}
                         onClick={() => {
-                          setSelectedInstanceId(inst.id === selectedInstanceId ? null : inst.id)
-                          setExpandedInstance(inst.id === expandedInstance ? null : inst.id)
+                          setSelectedRunId(run.id === selectedRunId ? null : run.id)
+                          setExpandedRun(run.id === expandedRun ? null : run.id)
                         }}
-                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedInstanceId(inst.id === selectedInstanceId ? null : inst.id); setExpandedInstance(inst.id === expandedInstance ? null : inst.id) } }}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedRunId(run.id === selectedRunId ? null : run.id); setExpandedRun(run.id === expandedRun ? null : run.id) } }}
                       >
                         <ChevronRight size={12} className="text-huddleroom-text-muted" style={{
-                          transform: expandedInstance === inst.id ? 'rotate(90deg)' : 'rotate(0deg)',
+                          transform: expandedRun === run.id ? 'rotate(90deg)' : 'rotate(0deg)',
                           transition: 'transform 120ms',
                         }} />
-                        <div className="text-[11px] text-huddleroom-text-muted font-mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }} title={inst.id}>
-                          {inst.id.slice(0, 12)}…
+                        <div className="text-[11px] text-huddleroom-text-muted font-mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }} title={run.id}>
+                          {run.id.slice(0, 12)}…
                         </div>
                         <span className="text-[11px] font-semibold rounded-[2px] text-huddleroom-text-muted font-mono" style={{
                           padding: '2px 6px', background: UI_COLORS.border,
                         }}>
-                          {inst.current_state}
+                          {run.current_node}
                         </span>
                         <span
-                          className={`status-${inst.status} text-[11px] font-mono`}
+                          className={`status-${run.status} text-[11px] font-mono`}
                           style={{ minWidth: 60 }}
-                          aria-label={instanceStatusAnnouncement(inst.status)}
+                          aria-label={runStatusAnnouncement(run.status)}
                         >
-                          {inst.status}
+                          {run.status}
                         </span>
                         <span className="text-[11px] text-huddleroom-text-muted font-mono">
-                          {absolute(inst.started_at)}
+                          {absolute(run.started_at)}
                         </span>
-                        {(inst.status === 'active' || inst.status === 'paused') && (
+                        {(run.status === 'active' || run.status === 'paused') && (
                           <div style={{ display: 'flex', gap: 4 }} onClick={(e) => e.stopPropagation()}>
-                            {inst.status === 'active' ? (
+                            {run.status === 'active' ? (
                               <Button
                                 variant="secondary"
                                 size="sm"
-                                aria-label={`Pause protocol instance ${inst.id.slice(0, 12)}`}
-                                title="Pause instance"
+                                aria-label={`Pause graph run ${run.id.slice(0, 12)}`}
+                                title="Pause run"
                                 onClick={() => {
-                                  pauseInstance.mutate(inst.id, {
-                                    onSuccess: () => toast.success('Instance paused'),
+                                  pauseRun.mutate(run.id, {
+                                    onSuccess: () => toast.success('Run paused'),
                                     onError: (e) => toast.error(e.message),
                                   })
                                 }}
@@ -803,11 +803,11 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                               <Button
                                 variant="secondary"
                                 size="sm"
-                                aria-label={`Resume protocol instance ${inst.id.slice(0, 12)}`}
-                                title="Resume instance"
+                                aria-label={`Resume graph run ${run.id.slice(0, 12)}`}
+                                title="Resume run"
                                 onClick={() => {
-                                  resumeInstance.mutate(inst.id, {
-                                    onSuccess: () => toast.success('Instance resumed'),
+                                  resumeRun.mutate(run.id, {
+                                    onSuccess: () => toast.success('Run resumed'),
                                     onError: (e) => toast.error(e.message),
                                   })
                                 }}
@@ -820,9 +820,9 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                             <Button
                               variant="danger"
                               size="sm"
-                              aria-label={`Abandon protocol instance ${inst.id.slice(0, 12)}`}
-                              title="Abandon instance"
-                              onClick={() => setAbandonConfirm(inst.id)}
+                              aria-label={`Abandon graph run ${run.id.slice(0, 12)}`}
+                              title="Abandon run"
+                              onClick={() => setAbandonConfirm(run.id)}
                               className="text-[10px]"
                               style={{ minHeight: 32, padding: '4px 10px', display: 'flex', alignItems: 'center', gap: 2 }}
                             >
@@ -832,9 +832,9 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
                         )}
                       </div>
 
-                      {/* Expanded transition history */}
-                      {expandedInstance === inst.id && (
-                        <InstanceTransitionHistory projectId={pid} instanceId={inst.id} />
+                      {/* Expanded step history */}
+                      {expandedRun === run.id && (
+                        <RunStepHistory projectId={pid} runId={run.id} />
                       )}
                     </div>
                   ))}
@@ -844,46 +844,46 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
             </div>
 
             {/* Edit modal */}
-            <ProtocolFormModal
+            <GraphFormModal
               open={showEdit}
               onClose={() => setShowEdit(false)}
-              initialData={protocolData}
+              initialData={graphData}
               mode="edit"
               pid={pid}
             />
 
-            {/* Deactivate protocol confirm dialog */}
+            {/* Deactivate graph confirm dialog */}
             <ConfirmDialog
               open={deactivateConfirm}
               onOpenChange={setDeactivateConfirm}
-              title="Deactivate this protocol?"
+              title="Deactivate this graph?"
               consequence="It will no longer be available to agents."
               confirmLabel="Deactivate"
               onConfirm={() => {
-                deactivateProtocol.mutate(protocolData.id, {
-                  onSuccess: () => { toast.success('Protocol deactivated'); setDeactivateConfirm(false) },
+                deactivateGraph.mutate(graphData.id, {
+                  onSuccess: () => { toast.success('Graph deactivated'); setDeactivateConfirm(false) },
                   onError: (e) => toast.error(e.message),
                 })
               }}
-              isPending={deactivateProtocol.isPending}
+              isPending={deactivateGraph.isPending}
             />
 
-            {/* Abandon instance confirm dialog */}
+            {/* Abandon run confirm dialog */}
             <ConfirmDialog
               open={abandonConfirm !== null}
               onOpenChange={(open) => { if (!open) setAbandonConfirm(null) }}
-              title="Abandon this instance?"
-              consequence="This terminates the running protocol instance. Progress will be lost."
+              title="Abandon this run?"
+              consequence="This terminates the running graph run. Progress will be lost."
               confirmLabel="Abandon"
               onConfirm={() => {
                 if (abandonConfirm) {
-                  abandonInstance.mutate(abandonConfirm, {
-                    onSuccess: () => { toast.success('Instance abandoned'); setAbandonConfirm(null) },
+                  abandonRun.mutate(abandonConfirm, {
+                    onSuccess: () => { toast.success('Run abandoned'); setAbandonConfirm(null) },
                     onError: (e) => toast.error(e.message),
                   })
                 }
               }}
-              isPending={abandonInstance.isPending}
+              isPending={abandonRun.isPending}
             />
           </div>
         )
@@ -892,24 +892,23 @@ function ProtocolDetailView({ protocolId }: { protocolId: string }) {
   )
 }
 
-// ─── InstanceTransitionHistory ───────────────────────────────────────────────
+// ─── RunStepHistory ───────────────────────────────────────────────
 
-function InstanceTransitionHistory({ projectId, instanceId }: { projectId: string | null; instanceId: string }) {
-  const { data: transitions } = useProtocolInstanceTransitions(projectId, instanceId)
+function RunStepHistory({ projectId, runId }: { projectId: string | null; runId: string }) {
+  const { data: steps } = useGraphRunSteps(projectId, runId)
 
   return (
     <div className="bg-huddleroom-depth border-t border-huddleroom-border" style={{ padding: '8px 16px' }}>
-      {!transitions || transitions.length === 0 ? (
-        <div className="text-[11px] text-huddleroom-text-muted font-mono">no transitions</div>
+      {!steps || steps.length === 0 ? (
+        <div className="text-[11px] text-huddleroom-text-muted font-mono">no steps</div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {transitions.map((t) => {
-            const label = t.transition_name ?? t.event_type
-            const timestamp = t.transitioned_at ?? t.created_at
-            // fallback to deprecated fields during deprecation window — see schemas/protocol.py
+          {steps.map((t) => {
+            const label = t.edge_name
+            const timestamp = t.stepped_at
             return (
               <div key={t.id} className="text-[11px] text-huddleroom-text-muted font-mono">
-                {t.from_state} → {t.to_state} {label ? `(${label})` : ''} | {absolute(timestamp)}
+                {t.from_node} → {t.to_node} {label ? `(${label})` : ''} | {absolute(timestamp)}
               </div>
             )
           })}
@@ -919,11 +918,11 @@ function InstanceTransitionHistory({ projectId, instanceId }: { projectId: strin
   )
 }
 
-// ─── ProtocolsPage ───────────────────────────────────────────────────────────
+// ─── GraphsPage ───────────────────────────────────────────────────────────
 
-export function ProtocolsPage() {
-  useDocumentTitle('Protocols')
-  const { protocolId } = useParams<{ protocolId?: string }>()
-  if (protocolId) return <ProtocolDetailView protocolId={protocolId} />
-  return <ProtocolListView />
+export function GraphsPage() {
+  useDocumentTitle('Graphs')
+  const { graphId } = useParams<{ graphId?: string }>()
+  if (graphId) return <GraphDetailView graphId={graphId} />
+  return <GraphListView />
 }

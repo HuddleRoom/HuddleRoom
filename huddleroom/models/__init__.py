@@ -9,7 +9,7 @@ from huddleroom.models.knowledge_item import KnowledgeItem  # noqa: F401
 from huddleroom.models.channel import Channel  # noqa: F401
 from huddleroom.models.message import Message  # noqa: F401
 from huddleroom.models.event_log import EventLog  # noqa: F401
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTransition, ProtocolTimeout  # noqa: F401
+from huddleroom.models.graph import Graph, GraphRun, GraphRunStep, GraphRunTimeout  # noqa: F401
 from huddleroom.models.artifact import Artifact, ArtifactWatcher  # noqa: F401
 from huddleroom.models.escalation import EscalationChain  # noqa: F401
 from huddleroom.models.meeting import Meeting, MeetingAgendaItem, MeetingTurn, MeetingDecision, MeetingActionItem, MeetingEvent, MeetingParticipantSignal, MeetingRequest  # noqa: F401

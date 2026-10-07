@@ -20,7 +20,7 @@ export const CONTROL_MAP: RouteControlMap[] = [
       // design spec Section C) — name is "{label} {count}", so match by prefix.
       { kind: 'role', role: 'link', name: /^Sessions/ },
       { kind: 'role', role: 'link', name: /^Meetings/ },
-      { kind: 'role', role: 'link', name: /^Protocols/ },
+      { kind: 'role', role: 'link', name: /^Graphs/ },
       { kind: 'role', role: 'link', name: /^Ready tasks/ },
       { kind: 'role', role: 'button', name: 'Collapse sidebar' },
       { kind: 'role', role: 'button', name: 'Log out' },
@@ -65,13 +65,13 @@ export const CONTROL_MAP: RouteControlMap[] = [
     ],
   },
   {
-    path: '/dashboard/protocols',
-    label: 'Protocols',
+    path: '/dashboard/graphs',
+    label: 'Graphs',
     controls: [
-      { kind: 'role', role: 'button', name: /new protocol/i },
-      { kind: 'role', role: 'textbox', name: 'Search protocols' },
+      { kind: 'role', role: 'button', name: /new graph/i },
+      { kind: 'role', role: 'textbox', name: 'Search graphs' },
       { kind: 'role', role: 'checkbox', name: /include inactive/i },
-      { kind: 'text', text: 'ui_seed_protocol' },
+      { kind: 'text', text: 'ui_seed_graph' },
     ],
   },
   {

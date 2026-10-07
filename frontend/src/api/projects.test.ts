@@ -49,7 +49,7 @@ describe('removeProjectQueries', () => {
     queryClient.setQueryData(['tasks', 'project-1'], [])
     queryClient.setQueryData(['tasks', 'count', 'project-1', 'ready'], { count: 1 })
     queryClient.setQueryData(['task', 'subtasks', 'project-1', 'task-1'], [])
-    queryClient.setQueryData(['protocol-instance', 'transitions', 'project-1', 'instance-1'], [])
+    queryClient.setQueryData(['graph-run', 'steps', 'project-1', 'instance-1'], [])
     queryClient.getQueryCache().build(queryClient, {
       queryKey: ['meeting', 'turns', 'project-1', 'meeting-1'],
       queryFn: async () => undefined,
@@ -74,7 +74,7 @@ describe('removeProjectQueries', () => {
     expect(queryClient.getQueryState(['tasks', 'project-1'])).toBeUndefined()
     expect(queryClient.getQueryState(['tasks', 'count', 'project-1', 'ready'])).toBeUndefined()
     expect(queryClient.getQueryState(['task', 'subtasks', 'project-1', 'task-1'])).toBeUndefined()
-    expect(queryClient.getQueryState(['protocol-instance', 'transitions', 'project-1', 'instance-1'])).toBeUndefined()
+    expect(queryClient.getQueryState(['graph-run', 'steps', 'project-1', 'instance-1'])).toBeUndefined()
     expect(queryClient.getQueryState(['meeting', 'turns', 'project-1', 'meeting-1'])).toBeUndefined()
     expect(queryClient.getQueryState(['knowledge-item', 'project-1', 'knowledge-1'])).toBeUndefined()
     expect(queryClient.getQueryState(['tasks', 'project-2'])).toBeDefined()

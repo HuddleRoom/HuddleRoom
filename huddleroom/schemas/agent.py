@@ -69,4 +69,4 @@ class AgentContextResponse(BaseModel):
     current_tasks: list[AgentTaskSummary] = []
     pending_meetings: list[dict] = []
     recent_knowledge: list[AgentKnowledgeSummary] = []
-    active_protocol_instances: list[dict] = []
+    active_graph_runs: list[dict] = []

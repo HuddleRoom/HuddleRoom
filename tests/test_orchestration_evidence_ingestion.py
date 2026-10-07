@@ -10,7 +10,7 @@ from huddleroom.models.agent import Agent
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.meeting import Meeting, MeetingAgendaItem, MeetingDecision
 from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
@@ -53,7 +53,7 @@ async def _make_gate(db_session, run_id, gate_type: str = "work_completed") -> O
         success_criterion_key="plan_item:implement-api",
         gate_type=gate_type,
         required_evidence={
-            "required_source_types": ["task", "session", "review", "protocol_instance", "meeting_decision"],
+            "required_source_types": ["task", "session", "review", "graph_run", "meeting_decision"],
             "min_count": 1,
             "plan_item_id": "implement-api",
         },
@@ -246,7 +246,7 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
         input_context={},
         output="APPROVED",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
@@ -278,7 +278,7 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "violation_type",
-    ["missing_session", "mismatched_session_task", "mismatched_protocol_instance"],
+    ["missing_session", "mismatched_session_task", "mismatched_graph_run"],
 )
 async def test_tick_ignores_review_with_violated_link(db_session, test_project, violation_type):
     service, _goal, run = await _make_run(db_session, test_project.id)
@@ -315,7 +315,7 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
             input_context={},
             output="APPROVED",
             metadata_={},
-            origin="protocol",
+            origin="graph",
         )
         db_session.add(session)
         await db_session.flush()
@@ -331,47 +331,47 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
             },
             dedup_key=f"phase13-review-mismatched-task:{session.id}",
         )
-    else:  # mismatched_protocol_instance
+    else:  # mismatched_graph_run
         gate = await _make_gate(db_session, run.id, gate_type="review_accepted")
         task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, reviewer.id, "review")
-        protocol = Protocol(
+        graph = Graph(
             project_id=test_project.id,
-            name=f"evidence-review-protocol-{uuid.uuid4()}",
+            name=f"evidence-review-graph-{uuid.uuid4()}",
             version="1.0",
             definition={},
             triggers=[],
         )
-        db_session.add(protocol)
+        db_session.add(graph)
         await db_session.flush()
-        instance_a = ProtocolInstance(
-            protocol_id=protocol.id,
+        run_a = GraphRun(
+            graph_id=graph.id,
             project_id=test_project.id,
             linked_task_id=task.id,
-            current_state="reviewed",
+            current_node="reviewed",
             status="completed",
             context={},
         )
-        instance_b = ProtocolInstance(
-            protocol_id=protocol.id,
+        run_b = GraphRun(
+            graph_id=graph.id,
             project_id=test_project.id,
             linked_task_id=task.id,
-            current_state="other",
+            current_node="other",
             status="completed",
             context={},
         )
-        db_session.add_all([instance_a, instance_b])
+        db_session.add_all([run_a, run_b])
         await db_session.flush()
         session = Session(
             project_id=test_project.id,
             task_id=task.id,
             agent_id=reviewer.id,
-            protocol_instance_id=instance_a.id,
+            graph_run_id=run_a.id,
             adapter_type="api",
             status="completed",
             input_context={},
             output="APPROVED",
             metadata_={},
-            origin="protocol",
+            origin="graph",
         )
         db_session.add(session)
         await db_session.flush()
@@ -382,11 +382,11 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
             {
                 "session_id": str(session.id),
                 "task_id": str(task.id),
-                "protocol_instance_id": str(instance_b.id),
+                "graph_run_id": str(run_b.id),
                 "review_outcome": {"verdict": "approved"},
                 "project_id": str(test_project.id),
             },
-            dedup_key=f"phase13-review-mismatched-protocol:{session.id}",
+            dedup_key=f"phase13-review-mismatched-graph:{session.id}",
         )
 
     result = await service.tick(db_session, run.id)
@@ -396,53 +396,53 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
 
 
 @pytest.mark.asyncio
-async def test_tick_ingests_protocol_completed_evidence(db_session, test_project):
+async def test_tick_ingests_graph_completed_evidence(db_session, test_project):
     service, _goal, run = await _make_run(db_session, test_project.id)
     gate = await _make_gate(db_session, run.id, gate_type="validation_passed")
     validator = _agent("validator", "validator", ["validation"])
     db_session.add(validator)
     await db_session.flush()
     task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, validator.id, "validation")
-    protocol = Protocol(
+    graph = Graph(
         project_id=test_project.id,
         name=f"evidence-validation-{uuid.uuid4()}",
         version="1.0",
         definition={},
         triggers=[],
     )
-    db_session.add(protocol)
+    db_session.add(graph)
     await db_session.flush()
-    instance = ProtocolInstance(
-        protocol_id=protocol.id,
+    graph_run = GraphRun(
+        graph_id=graph.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="passed",
+        current_node="passed",
         status="completed",
         context={},
     )
-    db_session.add(instance)
+    db_session.add(graph_run)
     await db_session.flush()
     event, _ = await emit_event_once(
         db_session,
         test_project.id,
-        "protocol.completed",
+        "graph.run_completed",
         {
-            "protocol_instance_id": str(instance.id),
-            "protocol_name": protocol.name,
+            "graph_run_id": str(graph_run.id),
+            "graph_name": graph.name,
             "project_id": str(test_project.id),
         },
-        dedup_key=f"phase13-protocol-completed:{instance.id}",
+        dedup_key=f"phase13-graph-completed:{graph_run.id}",
     )
 
     await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
     assert len(rows) == 1
-    assert rows[0].source_type == "protocol_instance"
-    assert rows[0].source_id == instance.id
+    assert rows[0].source_type == "graph_run"
+    assert rows[0].source_id == graph_run.id
     assert rows[0].observed_event_id == event.id
     assert rows[0].verdict == "candidate"
-    assert rows[0].evidence_metadata["protocol_instance_id"] == str(instance.id)
+    assert rows[0].evidence_metadata["graph_run_id"] == str(graph_run.id)
     assert rows[0].evidence_metadata["source_status"] == "completed"
 
 

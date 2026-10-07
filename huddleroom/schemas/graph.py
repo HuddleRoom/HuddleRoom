@@ -1,10 +1,10 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict
 
 
-class ProtocolCreate(BaseModel):
+class GraphCreate(BaseModel):
     name: str
     version: str = "1.0"
     description: str | None = None
@@ -14,7 +14,7 @@ class ProtocolCreate(BaseModel):
     loaded_from: str | None = None
 
 
-class ProtocolUpdate(BaseModel):
+class GraphUpdate(BaseModel):
     name: str | None = None
     definition: dict | None = None
     description: str | None = None
@@ -23,7 +23,7 @@ class ProtocolUpdate(BaseModel):
     escalation_chain: str | None = None
 
 
-class ProtocolResponse(BaseModel):
+class GraphResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -40,51 +40,39 @@ class ProtocolResponse(BaseModel):
     updated_at: datetime
 
 
-class ProtocolInstanceResponse(BaseModel):
+class GraphRunResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    protocol_id: uuid.UUID
+    graph_id: uuid.UUID
     project_id: uuid.UUID
     linked_task_id: uuid.UUID | None
     artifact_id: uuid.UUID | None
-    current_state: str
+    current_node: str
     status: str
     actor_assignments: dict
     context: dict
     escalation_step: int | None
     started_at: datetime
-    last_transitioned_at: datetime | None
+    last_stepped_at: datetime | None
     completed_at: datetime | None
 
 
-class ProtocolTransitionResponse(BaseModel):
+class GraphRunStepResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    protocol_instance_id: uuid.UUID
-    from_state: str
-    to_state: str
-    transition_name: str | None
+    graph_run_id: uuid.UUID
+    from_node: str
+    to_node: str
+    edge_name: str | None
     trigger_event_id: uuid.UUID | None
     trigger_reason: str | None
     actions_executed: list
-    transitioned_at: datetime
-
-    # TODO: deprecate — remove once frontend no longer reads event_type on transitions (tracked in ISSUES.md)
-    @computed_field
-    @property
-    def event_type(self) -> str | None:
-        return self.transition_name
-
-    # TODO: deprecate — remove once frontend no longer reads created_at on transitions (tracked in ISSUES.md)
-    @computed_field
-    @property
-    def created_at(self) -> datetime:
-        return self.transitioned_at
+    stepped_at: datetime
 
 
-class ProtocolSummaryResponse(BaseModel):
+class GraphSummaryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -92,7 +80,7 @@ class ProtocolSummaryResponse(BaseModel):
     version: str
 
 
-class ProtocolInstanceSessionResponse(BaseModel):
+class GraphRunSessionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -100,7 +88,7 @@ class ProtocolInstanceSessionResponse(BaseModel):
     agent_id: uuid.UUID
     status: str
     origin: str
-    protocol_instance_id: uuid.UUID | None
+    graph_run_id: uuid.UUID | None
     output: str | None
     error: str | None
     started_at: datetime | None
@@ -108,12 +96,12 @@ class ProtocolInstanceSessionResponse(BaseModel):
     created_at: datetime
 
 
-class ProtocolTimeoutResponse(BaseModel):
+class GraphRunTimeoutResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    protocol_instance_id: uuid.UUID
-    state_name: str
+    graph_run_id: uuid.UUID
+    node_name: str
     timeout_action: str
     expires_at: datetime
     resolved: bool
@@ -122,23 +110,23 @@ class ProtocolTimeoutResponse(BaseModel):
     created_at: datetime
 
 
-class ProtocolInstanceTaskSummaryResponse(BaseModel):
+class GraphRunTaskSummaryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     title: str
     status: str
     parent_id: uuid.UUID | None
-    protocol_instance_id: uuid.UUID | None
+    graph_run_id: uuid.UUID | None
 
 
-class ProtocolInstanceDetailResponse(BaseModel):
-    instance: ProtocolInstanceResponse
-    protocol: ProtocolSummaryResponse
-    transitions: list[ProtocolTransitionResponse]
-    sessions: list[ProtocolInstanceSessionResponse]
-    timeouts: list[ProtocolTimeoutResponse]
-    tasks: list[ProtocolInstanceTaskSummaryResponse]
+class GraphRunDetailResponse(BaseModel):
+    run: GraphRunResponse
+    graph: GraphSummaryResponse
+    steps: list[GraphRunStepResponse]
+    sessions: list[GraphRunSessionResponse]
+    timeouts: list[GraphRunTimeoutResponse]
+    tasks: list[GraphRunTaskSummaryResponse]
 
 
 class ActorAssignRequest(BaseModel):
@@ -147,5 +135,5 @@ class ActorAssignRequest(BaseModel):
 
 
 class AdvanceRequest(BaseModel):
-    to_state: str
+    to_node: str
     reason: str | None = None

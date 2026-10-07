@@ -203,35 +203,6 @@ export interface AgendaItem {
   resolution_kind?: string | null
 }
 
-export interface Protocol {
-  id: string
-  project_id?: string
-  name: string
-  version: string
-  description?: string
-  definition: Record<string, unknown>
-  triggers: string[]
-  is_active: boolean
-  created_at: string
-  updated_at: string
-}
-
-export interface ProtocolInstance {
-  id: string
-  protocol_id: string
-  project_id: string
-  linked_task_id?: string | null
-  artifact_id?: string | null
-  current_state: string
-  status: string
-  actor_assignments?: Record<string, unknown>
-  context?: Record<string, unknown>
-  escalation_step?: number | null
-  started_at: string
-  last_transitioned_at?: string | null
-  completed_at?: string | null
-}
-
 export interface KnowledgeItem {
   id: string
   project_id: string
@@ -350,30 +321,57 @@ export interface MeetingSignal {
   created_at: string
 }
 
-export interface ProtocolTransition {
+export interface Graph {
   id: string
-  protocol_instance_id: string
-  from_state: string
-  to_state: string
-  transition_name?: string | null
+  project_id?: string
+  name: string
+  version: string
+  description?: string
+  definition: Record<string, unknown>
+  triggers: string[]
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface GraphRun {
+  id: string
+  graph_id: string
+  project_id: string
+  linked_task_id?: string | null
+  artifact_id?: string | null
+  current_node: string
+  status: string
+  actor_assignments?: Record<string, unknown>
+  context?: Record<string, unknown>
+  escalation_step?: number | null
+  started_at: string
+  last_stepped_at?: string | null
+  completed_at?: string | null
+}
+
+export interface GraphRunStep {
+  id: string
+  graph_run_id: string
+  from_node: string
+  to_node: string
+  edge_name?: string | null
   trigger_event_id?: string | null
   trigger_reason?: string | null
   actions_executed: unknown[]
-  transitioned_at: string
-  event_type?: string | null
-  created_at?: string
+  stepped_at: string
 }
 
-export interface ProtocolSummary {
+export interface GraphSummary {
   id: string
   name: string
   version: string
 }
 
-export interface ProtocolTimeout {
+export interface GraphRunTimeout {
   id: string
-  protocol_instance_id: string
-  state_name: string
+  graph_run_id: string
+  node_name: string
   timeout_action: string
   expires_at: string
   resolved: boolean
@@ -382,13 +380,13 @@ export interface ProtocolTimeout {
   created_at: string
 }
 
-export interface ProtocolInstanceSession {
+export interface GraphRunSession {
   id: string
   task_id?: string | null
   agent_id?: string | null
   status: string
   origin: string
-  protocol_instance_id?: string | null
+  graph_run_id?: string | null
   output?: string | null
   error?: string | null
   started_at?: string | null
@@ -396,21 +394,21 @@ export interface ProtocolInstanceSession {
   created_at: string
 }
 
-export interface ProtocolInstanceTaskSummary {
+export interface GraphRunTaskSummary {
   id: string
   title: string
   status: string
   parent_id?: string | null
-  protocol_instance_id?: string | null
+  graph_run_id?: string | null
 }
 
-export interface ProtocolInstanceDetail {
-  instance: ProtocolInstance
-  protocol: ProtocolSummary
-  transitions: ProtocolTransition[]
-  sessions: ProtocolInstanceSession[]
-  timeouts: ProtocolTimeout[]
-  tasks: ProtocolInstanceTaskSummary[]
+export interface GraphRunDetail {
+  run: GraphRun
+  graph: GraphSummary
+  steps: GraphRunStep[]
+  sessions: GraphRunSession[]
+  timeouts: GraphRunTimeout[]
+  tasks: GraphRunTaskSummary[]
 }
 
 export interface HuddleRoomEvent {

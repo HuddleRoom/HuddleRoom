@@ -12,7 +12,7 @@ steps:
       - role: architect
       - role: pm
     message_template: >
-      ADR protocol for {{task.title}} is stuck in state {{current_state}}.
+      ADR graph run for {{task.title}} is stuck in node {{current_node}}.
       Architect and PM have been scheduled for a pair session to resolve.
     on_timeout: next_step
 
@@ -25,7 +25,7 @@ steps:
     message_template: >
       Architecture decision {{task.title}} requires human judgment.
       Automated escalation has not resolved the blockage.
-      Please review at: {{dashboard_url}}/protocol-instances/{{protocol_instance.id}}
+      Please review at: {{dashboard_url}}/graph-runs/{{graph_run.id}}
       Agents have been paused pending your input.
     on_timeout: fail
 

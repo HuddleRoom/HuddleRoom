@@ -21,7 +21,7 @@ from huddleroom.models.meeting import (
 from huddleroom.models.memory_item import MemoryItem
 from huddleroom.models.optimization import CostMetric, Optimization, Pattern
 from huddleroom.models.project import Project
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTimeout, ProtocolTransition
+from huddleroom.models.graph import Graph, GraphRun, GraphRunTimeout, GraphRunStep
 from huddleroom.models.routing_rule import RoutingRule
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -44,10 +44,10 @@ SEEDED_COUNTS = {
     MeetingActionItem: 1,
     MeetingEvent: 3,
     MeetingParticipantSignal: 2,
-    Protocol: 2,
-    ProtocolInstance: 2,
-    ProtocolTransition: 2,
-    ProtocolTimeout: 1,
+    Graph: 2,
+    GraphRun: 2,
+    GraphRunStep: 2,
+    GraphRunTimeout: 1,
     KnowledgeItem: 2,
     MemoryItem: 2,
     RoutingRule: 2,

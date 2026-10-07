@@ -18,7 +18,7 @@ ALLOWED_ACTION_SCHEMAS: dict[str, frozenset[str]] = {
     "reassign_task": frozenset({"agent_id", "task_id"}),
     "request_split": frozenset({"reason", "task_id"}),
     "schedule_meeting": frozenset({"participant_agent_ids", "topic"}),
-    "start_protocol": frozenset({"protocol_id", "subject_id", "subject_type"}),
+    "start_graph": frozenset({"graph_id", "subject_id", "subject_type"}),
     "ask_human": frozenset({"question"}),
     "pause_run": frozenset({"reason"}),
     "complete_run": frozenset({"reason"}),

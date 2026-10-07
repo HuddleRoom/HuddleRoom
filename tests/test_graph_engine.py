@@ -14,15 +14,15 @@ from huddleroom.models.channel import Channel
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.knowledge_item import KnowledgeItem
 from huddleroom.models.message import Message
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTimeout, ProtocolTransition
+from huddleroom.models.graph import Graph, GraphRun, GraphRunTimeout, GraphRunStep
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
-from huddleroom.services.protocol_service import ProtocolService
+from huddleroom.services.graph_service import GraphService
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _runnable_protocol_project(db_session, test_project, tmp_path: Path):
-    workspace = tmp_path / "protocol-workspace"
+async def _runnable_graph_project(db_session, test_project, tmp_path: Path):
+    workspace = tmp_path / "graph-workspace"
     workspace.mkdir()
     test_project.workspace_path = str(workspace.resolve())
     await db_session.flush()
@@ -160,7 +160,7 @@ async def test_resolve_actor_no_match(db_session):
 async def test_template_resolver_basic(db_session, test_project):
     from huddleroom.services.template_resolver import TemplateResolver
 
-    proto = Protocol(project_id=None, name="test_proto", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="test_proto", version="1.0", definition={}, triggers=[], is_active=True)
     db_session.add(proto)
     await db_session.flush()
 
@@ -174,25 +174,25 @@ async def test_template_resolver_basic(db_session, test_project):
     db_session.add(artifact)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="opened",
+        current_node="opened",
         status="active",
         artifact_id=artifact.id,
         actor_assignments={},
         context={"pr_title": "My PR"},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     resolver = TemplateResolver()
     assert await resolver.resolve(
         db_session,
         "PR opened: {{artifact.name}}. Branch: {{artifact.metadata.branch}}",
-        instance,
+        run,
     ) == "PR opened: my-pr. Branch: feature/x"
-    assert await resolver.resolve(db_session, "{{protocol_instance.artifact_id}}", instance) == str(artifact.id)
+    assert await resolver.resolve(db_session, "{{graph_run.artifact_id}}", run) == str(artifact.id)
 
 
 def test_guard_evaluator_simple_match():
@@ -244,39 +244,39 @@ def test_guard_evaluator_empty_guard_always_passes():
 async def test_action_emit_event(db_session, test_project):
     from huddleroom.services.action_executor import ActionExecutor
 
-    proto = Protocol(project_id=None, name="t1", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="t1", version="1.0", definition={}, triggers=[], is_active=True)
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="s1",
+        current_node="s1",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     await ActionExecutor().execute(
         db_session,
         {"action_type": "emit_event", "event_type": "task.created", "payload_overrides": {"note": "test"}},
-        instance,
+        run,
     )
     await db_session.flush()
 
     result = await db_session.execute(select(EventLog).where(EventLog.event_type == "task.created"))
     event = result.scalar_one()
     assert event.payload["note"] == "test"
-    assert event.payload["protocol_instance_id"] == str(instance.id)
+    assert event.payload["graph_run_id"] == str(run.id)
 
 
 @pytest.mark.asyncio
 async def test_action_emit_event_includes_linked_task_and_artifact_correlation(db_session, test_project):
     from huddleroom.services.action_executor import ActionExecutor
 
-    proto = Protocol(project_id=None, name="t-emit-correlated", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="t-emit-correlated", version="1.0", definition={}, triggers=[], is_active=True)
     task = Task(project_id=test_project.id, title="Parent feature", status="in_progress")
     artifact = Artifact(
         project_id=test_project.id,
@@ -288,23 +288,23 @@ async def test_action_emit_event_includes_linked_task_and_artifact_correlation(d
     db_session.add_all([proto, task, artifact])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="in_review",
+        current_node="in_review",
         status="active",
         linked_task_id=task.id,
         artifact_id=artifact.id,
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     await ActionExecutor().execute(
         db_session,
         {"action_type": "emit_event", "event_type": "code.pr_opened"},
-        instance,
+        run,
     )
     await db_session.flush()
 
@@ -312,11 +312,11 @@ async def test_action_emit_event_includes_linked_task_and_artifact_correlation(d
         await db_session.execute(
             select(EventLog).where(
                 EventLog.event_type == "code.pr_opened",
-                EventLog.source == "protocol",
+                EventLog.source == "graph",
             )
         )
     ).scalar_one()
-    assert event.payload["protocol_instance_id"] == str(instance.id)
+    assert event.payload["graph_run_id"] == str(run.id)
     assert event.payload["task_id"] == str(task.id)
     assert event.payload["artifact_id"] == str(artifact.id)
 
@@ -329,32 +329,32 @@ async def test_action_post_message(db_session, test_project, test_user):
     db_session.add(channel)
     await db_session.flush()
 
-    proto = Protocol(project_id=None, name="t2", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="t2", version="1.0", definition={}, triggers=[], is_active=True)
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="s1",
+        current_node="s1",
         status="active",
         actor_assignments={},
         context={"system_user_id": str(test_user.id)},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     await ActionExecutor().execute(
         db_session,
-        {"action_type": "post_message", "channel": "general", "template": "Hello from protocol"},
-        instance,
+        {"action_type": "post_message", "channel": "general", "template": "Hello from graph"},
+        run,
     )
     await db_session.flush()
 
     result = await db_session.execute(select(Message).where(Message.channel_id == channel.id))
     messages = list(result.scalars().all())
     assert len(messages) == 1
-    assert "Hello from protocol" in messages[0].content
+    assert "Hello from graph" in messages[0].content
     assert messages[0].sender_user_id == test_user.id
 
 
@@ -362,30 +362,30 @@ async def test_action_post_message(db_session, test_project, test_user):
 async def test_action_create_session_without_resolved_actor_creates_no_task_or_session(db_session, test_project):
     from huddleroom.services.action_executor import ActionExecutor
 
-    proto = Protocol(project_id=None, name="t-create-session", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="t-create-session", version="1.0", definition={}, triggers=[], is_active=True)
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     result = await ActionExecutor().execute(
         db_session,
         {"action_type": "create_session", "actor": "reviewer", "task_title": "Review PR"},
-        instance,
+        run,
     )
     await db_session.flush()
 
-    tasks = list((await db_session.execute(select(Task).where(Task.protocol_instance_id == instance.id))).scalars().all())
-    sessions = list((await db_session.execute(select(Session).where(Session.protocol_instance_id == instance.id))).scalars().all())
+    tasks = list((await db_session.execute(select(Task).where(Task.graph_run_id == run.id))).scalars().all())
+    sessions = list((await db_session.execute(select(Session).where(Session.graph_run_id == run.id))).scalars().all())
     assert result == {"action_type": "create_session", "status": "actor_not_found"}
     assert tasks == []
     assert sessions == []
@@ -414,29 +414,29 @@ async def test_action_create_session_with_resolved_actor_creates_task_and_sessio
         capabilities=["code_review"],
         config={},
     )
-    proto = Protocol(project_id=None, name="t-create-session-ok", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="t-create-session-ok", version="1.0", definition={}, triggers=[], is_active=True)
     db_session.add_all([reviewer, proto])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     result = await ActionExecutor().execute(
         db_session,
         {"action_type": "create_session", "actor": "reviewer", "task_title": "Review PR"},
-        instance,
+        run,
     )
     await db_session.flush()
 
-    tasks = list((await db_session.execute(select(Task).where(Task.protocol_instance_id == instance.id))).scalars().all())
+    tasks = list((await db_session.execute(select(Task).where(Task.graph_run_id == run.id))).scalars().all())
     sessions = list((await db_session.execute(select(Session).where(Session.task_id == tasks[0].id))).scalars().all())
     assert result["action_type"] == "create_session"
     assert "session_id" in result
@@ -444,34 +444,34 @@ async def test_action_create_session_with_resolved_actor_creates_task_and_sessio
     assert len(sessions) == 1
     assert sessions[0].agent_id == reviewer.id
     assert sessions[0].runner_task_id is not None
-    assert sessions[0].protocol_instance_id == instance.id
+    assert sessions[0].graph_run_id == run.id
 
 
 @pytest.mark.asyncio
 async def test_action_complete_task_does_not_bypass_invalid_transition(db_session, test_project):
     from huddleroom.services.action_executor import ActionExecutor
 
-    proto = Protocol(project_id=None, name="t-complete", version="1.0", definition={}, triggers=[], is_active=True)
+    proto = Graph(project_id=None, name="t-complete", version="1.0", definition={}, triggers=[], is_active=True)
     task = Task(project_id=test_project.id, title="Blocked completion", status="archived")
     db_session.add_all([proto, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="merged",
+        current_node="merged",
         status="completed",
         linked_task_id=task.id,
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     result = await ActionExecutor().execute(
         db_session,
         {"action_type": "complete_task", "task_id": str(task.id)},
-        instance,
+        run,
     )
     await db_session.refresh(task)
 
@@ -482,10 +482,10 @@ async def test_action_complete_task_does_not_bypass_invalid_transition(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_engine_creates_instance_on_trigger(db_session, test_project, test_user):
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+async def test_engine_creates_run_on_trigger(db_session, test_project, test_user):
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-{uuid.uuid4()}",
         role="reviewer",
@@ -513,7 +513,7 @@ async def test_engine_creates_instance_on_trigger(db_session, test_project, test
     )
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     from huddleroom.services.event_bus import BusEvent
 
     event = BusEvent(
@@ -527,22 +527,22 @@ async def test_engine_creates_instance_on_trigger(db_session, test_project, test
     await db_session.flush()
 
     result = await db_session.execute(
-        select(ProtocolInstance).where(
-            ProtocolInstance.protocol_id == proto.id,
-            ProtocolInstance.project_id == test_project.id,
+        select(GraphRun).where(
+            GraphRun.graph_id == proto.id,
+            GraphRun.project_id == test_project.id,
         )
     )
-    instances = list(result.scalars().all())
-    assert len(instances) == 1
-    assert instances[0].current_state == "opened"
-    assert instances[0].status == "active"
+    runs = list(result.scalars().all())
+    assert len(runs) == 1
+    assert runs[0].current_node == "opened"
+    assert runs[0].status == "active"
 
 
 @pytest.mark.asyncio
-async def test_engine_starts_feature_protocol_from_task_service_created_event_metadata(db_session, test_project, monkeypatch):
+async def test_engine_starts_feature_graph_from_task_service_created_event_metadata(db_session, test_project, monkeypatch):
     from huddleroom.schemas.task import TaskCreate
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
     from huddleroom.services.task_service import TaskService
 
     async def fake_dispatch_session(_session_id: str, _adapter_type: str, _project_id: uuid.UUID) -> str:
@@ -550,7 +550,7 @@ async def test_engine_starts_feature_protocol_from_task_service_created_event_me
 
     monkeypatch.setattr("huddleroom.workers.task_runner.dispatch_session", fake_dispatch_session)
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/feature_development.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/feature_development.yaml"))
     pm = Agent(
         name=f"pm-{uuid.uuid4()}",
         role="pm",
@@ -584,7 +584,7 @@ async def test_engine_starts_feature_protocol_from_task_service_created_event_me
     task = await TaskService().create(
         db_session,
         test_project.id,
-        TaskCreate(title="Build metadata-triggered feature", metadata={"protocol": "feature_development"}),
+        TaskCreate(title="Build metadata-triggered feature", metadata={"graph": "feature_development"}),
     )
     task_event = (
         await db_session.execute(
@@ -595,7 +595,7 @@ async def test_engine_starts_feature_protocol_from_task_service_created_event_me
         )
     ).scalar_one()
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=task_event.id,
@@ -608,44 +608,44 @@ async def test_engine_starts_feature_protocol_from_task_service_created_event_me
     )
     await db_session.flush()
 
-    instances = list(
+    runs = list(
         (
             await db_session.execute(
-                select(ProtocolInstance).where(
-                    ProtocolInstance.protocol_id == proto.id,
-                    ProtocolInstance.project_id == test_project.id,
-                    ProtocolInstance.linked_task_id == task.id,
+                select(GraphRun).where(
+                    GraphRun.graph_id == proto.id,
+                    GraphRun.project_id == test_project.id,
+                    GraphRun.linked_task_id == task.id,
                 )
             )
         )
         .scalars()
         .all()
     )
-    assert len(instances) == 1
-    assert instances[0].current_state == "spec_required"
+    assert len(runs) == 1
+    assert runs[0].current_node == "spec_required"
 
 
 @pytest.mark.asyncio
 async def test_feature_development_completes_from_real_task_done_status_changed_payload(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
     from huddleroom.services.task_service import TaskService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/feature_development.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/feature_development.yaml"))
     task = Task(project_id=test_project.id, title="Deploy merged feature", status="in_progress")
     db_session.add(task)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="deployment_ready",
+        current_node="deployment_ready",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     await TaskService().transition_status(db_session, test_project.id, task.id, "done")
@@ -662,7 +662,7 @@ async def test_feature_development_completes_from_real_task_done_status_changed_
     assert status_changed.payload["status"] == "done"
     assert "new_status" not in status_changed.payload
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=status_changed.id,
@@ -674,29 +674,29 @@ async def test_feature_development_completes_from_real_task_done_status_changed_
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
 
-    transition = (
+    step = (
         await db_session.execute(
-            select(ProtocolTransition).where(
-                ProtocolTransition.protocol_instance_id == instance.id,
-                ProtocolTransition.transition_name == "deployed",
+            select(GraphRunStep).where(
+                GraphRunStep.graph_run_id == run.id,
+                GraphRunStep.edge_name == "deployed",
             )
         )
     ).scalar_one()
-    assert instance.current_state == "complete"
-    assert instance.status == "completed"
-    assert instance.completed_at is not None
-    assert transition.from_state == "deployment_ready"
-    assert transition.to_state == "complete"
+    assert run.current_node == "complete"
+    assert run.status == "completed"
+    assert run.completed_at is not None
+    assert step.from_node == "deployment_ready"
+    assert step.to_node == "complete"
 
 
 @pytest.mark.asyncio
 async def test_engine_deduplicates_same_trigger_for_same_artifact(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-{uuid.uuid4()}",
         role="reviewer",
@@ -727,7 +727,7 @@ async def test_engine_deduplicates_same_trigger_for_same_artifact(db_session, te
     )
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     first_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,
@@ -747,28 +747,28 @@ async def test_engine_deduplicates_same_trigger_for_same_artifact(db_session, te
     await engine.process_event(db_session, second_event)
     await db_session.flush()
 
-    instances = list(
+    runs = list(
         (
             await db_session.execute(
-                select(ProtocolInstance).where(
-                    ProtocolInstance.protocol_id == proto.id,
-                    ProtocolInstance.project_id == test_project.id,
-                    ProtocolInstance.artifact_id == artifact.id,
+                select(GraphRun).where(
+                    GraphRun.graph_id == proto.id,
+                    GraphRun.project_id == test_project.id,
+                    GraphRun.artifact_id == artifact.id,
                 )
             )
         )
         .scalars()
         .all()
     )
-    assert len(instances) == 1
+    assert len(runs) == 1
 
 
 @pytest.mark.asyncio
-async def test_engine_transitions_state_on_event(db_session, test_project, test_user):
+async def test_engine_advances_node_on_event(db_session, test_project, test_user):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-{uuid.uuid4()}",
         role="reviewer",
@@ -804,7 +804,7 @@ async def test_engine_transitions_state_on_event(db_session, test_project, test_
     )
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     await engine.process_event(
         db_session,
         BusEvent(
@@ -830,18 +830,18 @@ async def test_engine_transitions_state_on_event(db_session, test_project, test_
     await db_session.flush()
 
     result = await db_session.execute(
-        select(ProtocolInstance).where(
-            ProtocolInstance.protocol_id == proto.id,
-            ProtocolInstance.project_id == test_project.id,
+        select(GraphRun).where(
+            GraphRun.graph_id == proto.id,
+            GraphRun.project_id == test_project.id,
         )
     )
-    instance = result.scalar_one()
-    assert instance.current_state == "ready_for_review"
+    run = result.scalar_one()
+    assert run.current_node == "ready_for_review"
 
     timeouts = list(
         (
             await db_session.execute(
-                select(ProtocolTimeout).where(ProtocolTimeout.protocol_instance_id == instance.id)
+                select(GraphRunTimeout).where(GraphRunTimeout.graph_run_id == run.id)
             )
         )
         .scalars()
@@ -850,22 +850,22 @@ async def test_engine_transitions_state_on_event(db_session, test_project, test_
     resolved = [timeout for timeout in timeouts if timeout.resolved]
     unresolved = [timeout for timeout in timeouts if not timeout.resolved]
     assert len(resolved) == 1
-    assert resolved[0].state_name == "opened"
+    assert resolved[0].node_name == "opened"
     assert len(unresolved) == 1
-    assert unresolved[0].state_name == "ready_for_review"
+    assert unresolved[0].node_name == "ready_for_review"
 
 
 @pytest.mark.asyncio
-async def test_engine_completes_protocol_on_merge(db_session, test_project, monkeypatch):
+async def test_engine_completes_graph_on_merge(db_session, test_project, monkeypatch):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
     async def fake_dispatch_session(_session_id: str, _adapter_type: str, _project_id: uuid.UUID) -> str:
         return "runner-456"
 
     monkeypatch.setattr("huddleroom.workers.task_runner.dispatch_session", fake_dispatch_session)
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-{uuid.uuid4()}",
         role="reviewer",
@@ -897,7 +897,7 @@ async def test_engine_completes_protocol_on_merge(db_session, test_project, monk
     )
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     artifact_id = str(artifact.id)
     for event_type in ("code.pr_opened", "test.passed", "review.approved", "code.pr_merged"):
         await engine.process_event(
@@ -912,11 +912,11 @@ async def test_engine_completes_protocol_on_merge(db_session, test_project, monk
         )
     await db_session.flush()
 
-    instance = (
+    run = (
         await db_session.execute(
-            select(ProtocolInstance).where(
-                ProtocolInstance.protocol_id == proto.id,
-                ProtocolInstance.project_id == test_project.id,
+            select(GraphRun).where(
+                GraphRun.graph_id == proto.id,
+                GraphRun.project_id == test_project.id,
             )
         )
     ).scalar_one()
@@ -926,24 +926,24 @@ async def test_engine_completes_protocol_on_merge(db_session, test_project, monk
         await db_session.execute(
             select(EventLog).where(
                 EventLog.project_id == test_project.id,
-                EventLog.event_type == "protocol.completed",
+                EventLog.event_type == "graph.run_completed",
             )
         )
     ).scalar_one()
     decisions = list(
         (
             await db_session.execute(
-                select(KnowledgeItem).where(KnowledgeItem.provenance_protocol_instance_id == instance.id)
+                select(KnowledgeItem).where(KnowledgeItem.provenance_graph_run_id == run.id)
             )
         )
         .scalars()
         .all()
     )
 
-    assert instance.current_state == "merged"
-    assert instance.status == "completed"
-    assert instance.completed_at is not None
-    assert completed_event.payload["to_state"] == "merged"
+    assert run.current_node == "merged"
+    assert run.status == "completed"
+    assert run.completed_at is not None
+    assert completed_event.payload["to_node"] == "merged"
     assert linked_task.status == "done"
     assert linked_task.completed_at is not None
     assert len(decisions) == 1
@@ -953,9 +953,9 @@ async def test_engine_completes_protocol_on_merge(db_session, test_project, monk
 @pytest.mark.asyncio
 async def test_engine_session_completed_guard_uses_session_metadata_when_payload_only_ids(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/architecture_decision.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/architecture_decision.yaml"))
     architect = Agent(
         name=f"architect-{uuid.uuid4()}",
         role="architect",
@@ -969,32 +969,32 @@ async def test_engine_session_completed_guard_uses_session_metadata_when_payload
     db_session.add_all([architect, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="proposal_submitted",
+        current_node="proposal_submitted",
         status="active",
         actor_assignments={"architect": {"kind": "agent", "id": str(architect.id), "name": architect.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=architect.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         metadata_={"recommendation": "recommend_meeting"},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=uuid.uuid4(),
@@ -1005,27 +1005,27 @@ async def test_engine_session_completed_guard_uses_session_metadata_when_payload
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
 
-    transition = (
+    step = (
         await db_session.execute(
-            select(ProtocolTransition).where(
-                ProtocolTransition.protocol_instance_id == instance.id,
-                ProtocolTransition.transition_name == "recommend_meeting",
+            select(GraphRunStep).where(
+                GraphRunStep.graph_run_id == run.id,
+                GraphRunStep.edge_name == "recommend_meeting",
             )
         )
     ).scalar_one()
-    assert instance.current_state == "meeting_scheduled"
-    assert transition.from_state == "proposal_submitted"
-    assert transition.to_state == "meeting_scheduled"
+    assert run.current_node == "meeting_scheduled"
+    assert step.from_node == "proposal_submitted"
+    assert step.to_node == "meeting_scheduled"
 
 
 @pytest.mark.asyncio
 async def test_engine_session_metadata_takes_precedence_over_linked_task_metadata(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/architecture_decision.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/architecture_decision.yaml"))
     architect = Agent(
         name=f"architect-conflict-{uuid.uuid4()}",
         role="architect",
@@ -1044,32 +1044,32 @@ async def test_engine_session_metadata_takes_precedence_over_linked_task_metadat
     db_session.add_all([architect, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="proposal_submitted",
+        current_node="proposal_submitted",
         status="active",
         actor_assignments={"architect": {"kind": "agent", "id": str(architect.id), "name": architect.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=architect.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         metadata_={"recommendation": "recommend_meeting"},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=uuid.uuid4(),
@@ -1080,9 +1080,9 @@ async def test_engine_session_metadata_takes_precedence_over_linked_task_metadat
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
 
-    assert instance.current_state == "meeting_scheduled"
+    assert run.current_node == "meeting_scheduled"
 
 
 @pytest.mark.asyncio
@@ -1095,11 +1095,11 @@ async def test_engine_session_metadata_takes_precedence_over_linked_task_metadat
         ("DO NOT APPROVE", "commented"),
     ],
 )
-async def test_engine_enriches_protocol_review_session_completed(db_session, test_project, output, expected_verdict):
+async def test_engine_enriches_graph_review_session_completed(db_session, test_project, output, expected_verdict):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-{uuid.uuid4()}",
         role="reviewer",
@@ -1113,43 +1113,43 @@ async def test_engine_enriches_protocol_review_session_completed(db_session, tes
     db_session.add_all([reviewer, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output=output,
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     captured: dict[str, dict] = {}
 
     async def fake_check_triggers(_db, event):
         captured["payload"] = event.payload
 
-    async def fake_evaluate_instances(_db, _event):
+    async def fake_evaluate_runs(_db, _event):
         return None
 
     engine._check_triggers = fake_check_triggers
-    engine._evaluate_active_instances = fake_evaluate_instances
+    engine._evaluate_active_runs = fake_evaluate_runs
 
     await engine.process_event(
         db_session,
@@ -1178,9 +1178,9 @@ async def test_engine_enriches_protocol_review_session_completed(db_session, tes
     ],
 )
 def test_engine_review_outcome_parser_recognizes_conservative_variants(raw_output, expected_verdict):
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    assert ProtocolEngineService()._parse_review_outcome(raw_output) == {
+    assert GraphEngineService()._parse_review_outcome(raw_output) == {
         "verdict": expected_verdict,
         "raw_output": raw_output,
     }
@@ -1189,13 +1189,13 @@ def test_engine_review_outcome_parser_recognizes_conservative_variants(raw_outpu
 @pytest.mark.asyncio
 async def test_engine_does_not_enrich_non_code_review_session_completed_with_review_fields(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = Protocol(
+    proto = Graph(
         project_id=None,
         name=f"general_review_{uuid.uuid4()}",
         version="1.0",
-        definition={"states": {"ready_for_review": {"transitions": []}}},
+        definition={"nodes": {"ready_for_review": {"edges": []}}},
         triggers=[],
         is_active=True,
     )
@@ -1212,43 +1212,43 @@ async def test_engine_does_not_enrich_non_code_review_session_completed_with_rev
     db_session.add_all([proto, reviewer, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="APPROVE",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     captured: dict[str, dict] = {}
 
     async def fake_check_triggers(_db, event):
         captured["payload"] = event.payload
 
-    async def fake_evaluate_instances(_db, _event):
+    async def fake_evaluate_runs(_db, _event):
         return None
 
     engine._check_triggers = fake_check_triggers
-    engine._evaluate_active_instances = fake_evaluate_instances
+    engine._evaluate_active_runs = fake_evaluate_runs
 
     await engine.process_event(
         db_session,
@@ -1266,11 +1266,11 @@ async def test_engine_does_not_enrich_non_code_review_session_completed_with_rev
 
 
 @pytest.mark.asyncio
-async def test_engine_does_not_enrich_non_protocol_origin_code_review_session_completed(db_session, test_project):
+async def test_engine_does_not_enrich_non_graph_origin_code_review_session_completed(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-manual-origin-{uuid.uuid4()}",
         role="reviewer",
@@ -1284,23 +1284,23 @@ async def test_engine_does_not_enrich_non_protocol_origin_code_review_session_co
     db_session.add_all([reviewer, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="APPROVE",
@@ -1310,17 +1310,17 @@ async def test_engine_does_not_enrich_non_protocol_origin_code_review_session_co
     db_session.add(session)
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     captured: dict[str, dict] = {}
 
     async def fake_check_triggers(_db, event):
         captured["payload"] = event.payload
 
-    async def fake_evaluate_instances(_db, _event):
+    async def fake_evaluate_runs(_db, _event):
         return None
 
     engine._check_triggers = fake_check_triggers
-    engine._evaluate_active_instances = fake_evaluate_instances
+    engine._evaluate_active_runs = fake_evaluate_runs
 
     await engine.process_event(
         db_session,
@@ -1340,9 +1340,9 @@ async def test_engine_does_not_enrich_non_protocol_origin_code_review_session_co
 @pytest.mark.asyncio
 async def test_engine_does_not_enrich_or_auto_emit_review_for_wrong_assigned_actor(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     assigned_reviewer = Agent(
         name=f"reviewer-assigned-{uuid.uuid4()}",
         role="reviewer",
@@ -1372,45 +1372,45 @@ async def test_engine_does_not_enrich_or_auto_emit_review_for_wrong_assigned_act
     db_session.add_all([assigned_reviewer, wrong_reviewer, artifact, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
         artifact_id=artifact.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(assigned_reviewer.id), "name": assigned_reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=wrong_reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="APPROVED",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
     captured: dict[str, dict] = {}
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     original_check_triggers = engine._check_triggers
 
     async def fake_check_triggers(_db, event):
         captured["payload"] = event.payload
 
-    async def fake_evaluate_instances(_db, _event):
+    async def fake_evaluate_runs(_db, _event):
         return None
 
     engine._check_triggers = fake_check_triggers
-    engine._evaluate_active_instances = fake_evaluate_instances
+    engine._evaluate_active_runs = fake_evaluate_runs
 
     await engine.process_event(
         db_session,
@@ -1423,14 +1423,14 @@ async def test_engine_does_not_enrich_or_auto_emit_review_for_wrong_assigned_act
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
     await db_session.refresh(session)
 
     assert captured["payload"]["session"]["id"] == str(session.id)
     assert "output" not in captured["payload"]["session"]
     assert "review_outcome" not in captured["payload"]
-    assert instance.current_state == "ready_for_review"
-    assert "auto_review_protocol_event" not in session.metadata_
+    assert run.current_node == "ready_for_review"
+    assert "auto_review_graph_event" not in session.metadata_
 
     engine._check_triggers = original_check_triggers
     result = await db_session.execute(
@@ -1443,11 +1443,11 @@ async def test_engine_does_not_enrich_or_auto_emit_review_for_wrong_assigned_act
 
 
 @pytest.mark.asyncio
-async def test_engine_auto_emits_review_approved_and_advances_code_review_instance(db_session, test_project):
+async def test_engine_auto_emits_review_approved_and_advances_code_review_run(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-auto-approved-{uuid.uuid4()}",
         role="reviewer",
@@ -1468,34 +1468,34 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_instan
     db_session.add_all([reviewer, artifact, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
         artifact_id=artifact.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="APPROVE",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     completion_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,
@@ -1507,11 +1507,11 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_instan
     await engine.process_event(db_session, completion_event)
     await engine.process_event(db_session, completion_event)
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
     await db_session.refresh(session)
 
-    assert instance.current_state == "approved"
-    assert session.metadata_["auto_review_protocol_event"]["event_type"] == "review.approved"
+    assert run.current_node == "approved"
+    assert session.metadata_["auto_review_graph_event"]["event_type"] == "review.approved"
     result = await db_session.execute(
         select(EventLog).where(
             EventLog.project_id == test_project.id,
@@ -1521,17 +1521,17 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_instan
     events = result.scalars().all()
     assert len(events) == 1
     assert events[0].payload["artifact_id"] == str(artifact.id)
-    assert events[0].payload["protocol_instance_id"] == str(instance.id)
+    assert events[0].payload["graph_run_id"] == str(run.id)
 
 
 @pytest.mark.asyncio
-async def test_engine_auto_emits_review_changes_requested_and_advances_code_review_instance(
+async def test_engine_auto_emits_review_changes_requested_and_advances_code_review_run(
     db_session, test_project
 ):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-auto-changes-{uuid.uuid4()}",
         role="reviewer",
@@ -1552,34 +1552,34 @@ async def test_engine_auto_emits_review_changes_requested_and_advances_code_revi
     db_session.add_all([reviewer, artifact, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
         artifact_id=artifact.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="CHANGES_REQUESTED",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=uuid.uuid4(),
@@ -1590,9 +1590,9 @@ async def test_engine_auto_emits_review_changes_requested_and_advances_code_revi
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
 
-    assert instance.current_state == "awaiting_revision"
+    assert run.current_node == "awaiting_revision"
     result = await db_session.execute(
         select(EventLog).where(
             EventLog.project_id == test_project.id,
@@ -1601,7 +1601,7 @@ async def test_engine_auto_emits_review_changes_requested_and_advances_code_revi
     )
     event = result.scalar_one()
     assert event.payload["artifact_id"] == str(artifact.id)
-    assert event.payload["protocol_instance_id"] == str(instance.id)
+    assert event.payload["graph_run_id"] == str(run.id)
 
 
 @pytest.mark.asyncio
@@ -1609,9 +1609,9 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
     db_session, test_project
 ):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-auto-dedup-{uuid.uuid4()}",
         role="reviewer",
@@ -1632,34 +1632,34 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
     db_session.add_all([reviewer, artifact, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
         artifact_id=artifact.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="APPROVE",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     completion_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,
@@ -1674,10 +1674,10 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
 
     await engine.process_event(db_session, completion_event)
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
     await db_session.refresh(session)
 
-    assert instance.current_state == "approved"
+    assert run.current_node == "approved"
 
     result = await db_session.execute(
         select(EventLog).where(
@@ -1694,9 +1694,9 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
 @pytest.mark.asyncio
 async def test_engine_does_not_auto_emit_review_event_for_commented_output(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-auto-comment-{uuid.uuid4()}",
         role="reviewer",
@@ -1717,34 +1717,34 @@ async def test_engine_does_not_auto_emit_review_event_for_commented_output(db_se
     db_session.add_all([reviewer, artifact, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
         artifact_id=artifact.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="I left comments, but no approval yet.",
         metadata_={},
-        origin="protocol",
+        origin="graph",
     )
     db_session.add(session)
     await db_session.flush()
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=uuid.uuid4(),
@@ -1755,11 +1755,11 @@ async def test_engine_does_not_auto_emit_review_event_for_commented_output(db_se
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
     await db_session.refresh(session)
 
-    assert instance.current_state == "ready_for_review"
-    assert "auto_review_protocol_event" not in session.metadata_
+    assert run.current_node == "ready_for_review"
+    assert "auto_review_graph_event" not in session.metadata_
     result = await db_session.execute(
         select(EventLog).where(
             EventLog.project_id == test_project.id,
@@ -1770,21 +1770,21 @@ async def test_engine_does_not_auto_emit_review_event_for_commented_output(db_se
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("origin, protocol_name", [("api", "code_review"), ("protocol", None)])
+@pytest.mark.parametrize("origin, graph_name", [("api", "code_review"), ("graph", None)])
 async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessions(
-    db_session, test_project, origin, protocol_name
+    db_session, test_project, origin, graph_name
 ):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    if protocol_name == "code_review":
-        proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    if graph_name == "code_review":
+        proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     else:
-        proto = Protocol(
+        proto = Graph(
             project_id=None,
             name=f"generic_review_{uuid.uuid4()}",
             version="1.0",
-            definition={"states": {"ready_for_review": {"transitions": []}}},
+            definition={"nodes": {"ready_for_review": {"edges": []}}},
             triggers=[],
             is_active=True,
         )
@@ -1811,24 +1811,24 @@ async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessio
     db_session.add_all([reviewer, artifact, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
         linked_task_id=task.id,
         artifact_id=artifact.id,
-        current_state="ready_for_review",
+        current_node="ready_for_review",
         status="active",
         actor_assignments={"reviewer": {"kind": "agent", "id": str(reviewer.id), "name": reviewer.name}},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     session = Session(
         agent_id=reviewer.id,
         task_id=task.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="completed",
         output="APPROVE",
@@ -1838,7 +1838,7 @@ async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessio
     db_session.add(session)
     await db_session.flush()
 
-    await ProtocolEngineService().process_event(
+    await GraphEngineService().process_event(
         db_session,
         BusEvent(
             id=uuid.uuid4(),
@@ -1849,11 +1849,11 @@ async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessio
         ),
     )
     await db_session.flush()
-    await db_session.refresh(instance)
+    await db_session.refresh(run)
     await db_session.refresh(session)
 
-    assert instance.current_state == "ready_for_review"
-    assert "auto_review_protocol_event" not in session.metadata_
+    assert run.current_node == "ready_for_review"
+    assert "auto_review_graph_event" not in session.metadata_
     result = await db_session.execute(
         select(EventLog).where(
             EventLog.project_id == test_project.id,
@@ -1864,11 +1864,11 @@ async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessio
 
 
 @pytest.mark.asyncio
-async def test_engine_guard_mismatch_does_not_transition(db_session, test_project):
+async def test_engine_guard_mismatch_does_not_step(db_session, test_project):
     from huddleroom.services.event_bus import BusEvent
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = await ProtocolService().load_from_yaml(db_session, Path("workspace/protocols/code_review.yaml"))
+    proto = await GraphService().load_from_yaml(db_session, Path("workspace/graphs/code_review.yaml"))
     reviewer = Agent(
         name=f"reviewer-{uuid.uuid4()}",
         role="reviewer",
@@ -1899,7 +1899,7 @@ async def test_engine_guard_mismatch_does_not_transition(db_session, test_projec
     )
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     await engine.process_event(
         db_session,
         BusEvent(
@@ -1922,36 +1922,36 @@ async def test_engine_guard_mismatch_does_not_transition(db_session, test_projec
     )
     await db_session.flush()
 
-    instance = (
+    run = (
         await db_session.execute(
-            select(ProtocolInstance).where(
-                ProtocolInstance.protocol_id == proto.id,
-                ProtocolInstance.project_id == test_project.id,
+            select(GraphRun).where(
+                GraphRun.graph_id == proto.id,
+                GraphRun.project_id == test_project.id,
             )
         )
     ).scalar_one()
-    transitions = list(
+    steps = list(
         (
             await db_session.execute(
-                select(ProtocolTransition).where(ProtocolTransition.protocol_instance_id == instance.id)
+                select(GraphRunStep).where(GraphRunStep.graph_run_id == run.id)
             )
         )
         .scalars()
         .all()
     )
-    assert instance.current_state == "opened"
-    assert len(transitions) == 1
+    assert run.current_node == "opened"
+    assert len(steps) == 1
 
 
 @pytest.mark.asyncio
 async def test_engine_processes_expired_timeouts_once(db_session, test_project):
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = Protocol(
+    proto = Graph(
         project_id=None,
         name="timeout-regression",
         version="1.0",
-        definition={"states": {"waiting": {}}, "initial_state": "waiting"},
+        definition={"nodes": {"waiting": {}}, "start_node": "waiting"},
         triggers=[],
         escalation_chain="standard_dev_escalation",
         is_active=True,
@@ -1959,27 +1959,27 @@ async def test_engine_processes_expired_timeouts_once(db_session, test_project):
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="waiting",
+        current_node="waiting",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
-    timeout = ProtocolTimeout(
-        protocol_instance_id=instance.id,
-        state_name="waiting",
+    timeout = GraphRunTimeout(
+        graph_run_id=run.id,
+        node_name="waiting",
         timeout_action="escalate",
         expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
     )
     db_session.add(timeout)
     await db_session.flush()
 
-    engine = ProtocolEngineService()
+    engine = GraphEngineService()
     await engine.process_timeouts(db_session)
     await db_session.flush()
     await db_session.refresh(timeout)
@@ -1989,7 +1989,7 @@ async def test_engine_processes_expired_timeouts_once(db_session, test_project):
             await db_session.execute(
                 select(EventLog).where(
                     EventLog.project_id == test_project.id,
-                    EventLog.event_type.in_(["protocol.escalated", "system.escalation_alert"]),
+                    EventLog.event_type.in_(["graph.run_escalated", "system.escalation_alert"]),
                 )
             )
         )
@@ -1999,7 +1999,7 @@ async def test_engine_processes_expired_timeouts_once(db_session, test_project):
     assert timeout.resolved is True
     assert timeout.resolved_at is not None
     assert len(first_events) == 1
-    assert first_events[0].payload["protocol_instance_id"] == str(instance.id)
+    assert first_events[0].payload["graph_run_id"] == str(run.id)
 
     await engine.process_timeouts(db_session)
     await db_session.flush()
@@ -2009,7 +2009,7 @@ async def test_engine_processes_expired_timeouts_once(db_session, test_project):
             await db_session.execute(
                 select(EventLog).where(
                     EventLog.project_id == test_project.id,
-                    EventLog.event_type.in_(["protocol.escalated", "system.escalation_alert"]),
+                    EventLog.event_type.in_(["graph.run_escalated", "system.escalation_alert"]),
                 )
             )
         )
@@ -2020,112 +2020,112 @@ async def test_engine_processes_expired_timeouts_once(db_session, test_project):
 
 
 @pytest.mark.asyncio
-async def test_advance_manually_records_transition(db_session, test_project):
+async def test_advance_manually_records_step(db_session, test_project):
     from fastapi import HTTPException
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    engine = ProtocolEngineService()
-    with pytest.raises(HTTPException, match="Protocol instance not found"):
+    engine = GraphEngineService()
+    with pytest.raises(HTTPException, match="Graph run not found"):
         await engine.advance_manually(db_session, uuid.uuid4(), "merged")
 
-    proto = Protocol(
+    proto = Graph(
         project_id=None,
         name="manual",
         version="1.0",
-        definition={"states": {"opened": {}, "merged": {}}, "terminal_states": {"success": ["merged"]}},
+        definition={"nodes": {"opened": {}, "merged": {}}, "terminal_nodes": {"success": ["merged"]}},
         triggers=[],
         is_active=True,
     )
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="opened",
+        current_node="opened",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
-    updated = await engine.advance_manually(db_session, instance.id, "merged", reason="manual override")
+    updated = await engine.advance_manually(db_session, run.id, "merged", reason="manual override")
     await db_session.flush()
 
-    transitions = list(
+    steps = list(
         (
             await db_session.execute(
-                select(ProtocolTransition).where(ProtocolTransition.protocol_instance_id == instance.id)
+                select(GraphRunStep).where(GraphRunStep.graph_run_id == run.id)
             )
         )
         .scalars()
         .all()
     )
-    assert updated.current_state == "merged"
+    assert updated.current_node == "merged"
     assert updated.status == "completed"
-    assert transitions[-1].transition_name == "manual_advance"
-    assert transitions[-1].trigger_reason == "manual override"
+    assert steps[-1].edge_name == "manual_advance"
+    assert steps[-1].trigger_reason == "manual override"
 
 
 @pytest.mark.asyncio
-async def test_advance_manually_rejects_invalid_target_state(db_session, test_project):
+async def test_advance_manually_rejects_invalid_target_node(db_session, test_project):
     from fastapi import HTTPException
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = Protocol(
+    proto = Graph(
         project_id=None,
         name="manual-invalid-target",
         version="1.0",
-        definition={"states": {"opened": {}, "merged": {}}, "terminal_states": {"success": ["merged"]}},
+        definition={"nodes": {"opened": {}, "merged": {}}, "terminal_nodes": {"success": ["merged"]}},
         triggers=[],
         is_active=True,
     )
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="opened",
+        current_node="opened",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     with pytest.raises(HTTPException):
-        await ProtocolEngineService().advance_manually(db_session, instance.id, "not_a_state")
+        await GraphEngineService().advance_manually(db_session, run.id, "not_a_node")
 
 
 @pytest.mark.asyncio
-async def test_advance_manually_rejects_inactive_instances(db_session, test_project):
+async def test_advance_manually_rejects_inactive_runs(db_session, test_project):
     from fastapi import HTTPException
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
-    proto = Protocol(
+    proto = Graph(
         project_id=None,
         name="manual-inactive",
         version="1.0",
-        definition={"states": {"opened": {}, "merged": {}}, "terminal_states": {"success": ["merged"]}},
+        definition={"nodes": {"opened": {}, "merged": {}}, "terminal_nodes": {"success": ["merged"]}},
         triggers=[],
         is_active=True,
     )
     db_session.add(proto)
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=proto.id,
         project_id=test_project.id,
-        current_state="merged",
+        current_node="merged",
         status="completed",
         actor_assignments={},
         context={},
         completed_at=datetime.now(timezone.utc),
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     with pytest.raises(HTTPException):
-        await ProtocolEngineService().advance_manually(db_session, instance.id, "opened")
+        await GraphEngineService().advance_manually(db_session, run.id, "opened")

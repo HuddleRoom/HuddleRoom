@@ -47,7 +47,7 @@ from huddleroom.models.orchestration_process import (
     OrchestrationWarning,
 )
 from huddleroom.models.project import Project
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTimeout, ProtocolTransition
+from huddleroom.models.graph import Graph, GraphRun, GraphRunTimeout, GraphRunStep
 from huddleroom.models.routing_rule import RoutingRule
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -1132,7 +1132,7 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
         execution_count=3,
         error_count=2,
     )
-    protocol = Protocol(project_id=test_project.id, name="retained-protocol", definition={})
+    graph = Graph(project_id=test_project.id, name="retained-graph", definition={})
     api_key = ApiKey(
         project_id=test_project.id,
         user_id=test_user.id,
@@ -1153,15 +1153,15 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
         definition={"level": 1},
         steps=[{"action": "notify"}],
     )
-    db_session.add_all([hook, protocol, api_key, routing_rule, escalation_chain])
+    db_session.add_all([hook, graph, api_key, routing_rule, escalation_chain])
     await db_session.flush()
 
     task = Task(project_id=test_project.id, title="task")
     meeting = Meeting(project_id=test_project.id, title="meeting", meeting_type="decision")
-    protocol_instance = ProtocolInstance(
+    graph_run = GraphRun(
         project_id=test_project.id,
-        protocol_id=protocol.id,
-        current_state="start",
+        graph_id=graph.id,
+        current_node="start",
     )
     channel = Channel(project_id=test_project.id, name="channel", channel_type="task")
     goal = OrchestrationGoal(project_id=test_project.id, objective="goal")
@@ -1173,7 +1173,7 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
         confidence=1.0,
         sample_size=1,
     )
-    db_session.add_all([task, meeting, protocol_instance, channel, goal, artifact, pattern])
+    db_session.add_all([task, meeting, graph_run, channel, goal, artifact, pattern])
     await db_session.flush()
 
     agenda_item = MeetingAgendaItem(meeting_id=meeting.id, order=1, title="agenda")
@@ -1215,8 +1215,8 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
             title="request",
             reason="reason",
         ),
-        ProtocolTransition(protocol_instance_id=protocol_instance.id, to_state="next"),
-        ProtocolTimeout(protocol_instance_id=protocol_instance.id, state_name="next", timeout_action="stop", expires_at=task.created_at),
+        GraphRunStep(graph_run_id=graph_run.id, to_node="next"),
+        GraphRunTimeout(graph_run_id=graph_run.id, node_name="next", timeout_action="stop", expires_at=task.created_at),
         Message(channel_id=channel.id, sender_agent_id=test_agent.id, content="message"),
         OrchestrationDecision(run_id=run.id, decision_type="test"),
         OrchestrationAction(run_id=run.id, idempotency_key="action", action_type="test"),
@@ -1260,10 +1260,10 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
     await db_session.flush()
     retained_task = Task(project_id=retained_project.id, title="retained")
     retained_meeting = Meeting(project_id=retained_project.id, title="retained", meeting_type="decision")
-    retained_protocol_instance = ProtocolInstance(
+    retained_graph_run = GraphRun(
         project_id=retained_project.id,
-        protocol_id=protocol.id,
-        current_state="start",
+        graph_id=graph.id,
+        current_node="start",
     )
     retained_channel = Channel(project_id=retained_project.id, name="retained", channel_type="task")
     retained_goal = OrchestrationGoal(project_id=retained_project.id, objective="retained")
@@ -1278,7 +1278,7 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
     db_session.add_all([
         retained_task,
         retained_meeting,
-        retained_protocol_instance,
+        retained_graph_run,
         retained_channel,
         retained_goal,
         retained_artifact,
@@ -1343,10 +1343,10 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
             title="retained",
             reason="reason",
         ),
-        ProtocolTransition(protocol_instance_id=retained_protocol_instance.id, to_state="next"),
-        ProtocolTimeout(
-            protocol_instance_id=retained_protocol_instance.id,
-            state_name="next",
+        GraphRunStep(graph_run_id=retained_graph_run.id, to_node="next"),
+        GraphRunTimeout(
+            graph_run_id=retained_graph_run.id,
+            node_name="next",
             timeout_action="stop",
             expires_at=task.created_at,
         ),
@@ -1421,7 +1421,7 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
     target_rows = [
         task,
         meeting,
-        protocol_instance,
+        graph_run,
         channel,
         goal,
         artifact,
@@ -1436,7 +1436,7 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
     retained_rows = [
         retained_task,
         retained_meeting,
-        retained_protocol_instance,
+        retained_graph_run,
         retained_channel,
         retained_goal,
         retained_artifact,
@@ -1450,7 +1450,7 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
     ]
     preserved_rows = [
         (test_project, ("name", "description", "workspace_path", "config", "status")),
-        (protocol, ("name", "description", "definition", "triggers", "escalation_chain", "is_active")),
+        (graph, ("name", "description", "definition", "triggers", "escalation_chain", "is_active")),
         (hook, ("name", "description", "code", "status", "trigger_event")),
         (api_key, ("project_id", "user_id", "key_prefix", "hashed_key", "label")),
         (test_user, ("email", "display_name", "role", "is_active")),
@@ -1485,9 +1485,9 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
         "meeting_participant_signals": 1,
         "meeting_requests": 1,
         "meetings": 1,
-        "protocol_transitions": 1,
-        "protocol_timeouts": 1,
-        "protocol_instances": 1,
+        "graph_run_steps": 1,
+        "graph_run_timeouts": 1,
+        "graph_runs": 1,
         "messages": 1,
         "channels": 1,
         "orchestration_decisions": 1,

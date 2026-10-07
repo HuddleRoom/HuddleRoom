@@ -83,7 +83,7 @@ export function buildActiveDelegations(
   tasksById: Map<string, Task>,
 ): ActiveDelegation[] {
   // Only task targets have a resolvable live status (via useAllTasks), so only
-  // tasks can be proven active. Session/meeting/protocol targets have no live
+  // tasks can be proven active. Session/meeting/graph targets have no live
   // sub-status in this read model — the delegating action status only proves the
   // delegation was created, not that the downstream work is still running — so
   // asserting them "active" here would be unreliable. Non-task coordination is
@@ -1333,7 +1333,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                   <SkeletonRow />
                 </div>
               ) : activeDelegations.length === 0 ? (
-                <p className="text-xs text-huddleroom-text-muted">No active delegations — session, meeting, and protocol targets only appear in the timeline.</p>
+                <p className="text-xs text-huddleroom-text-muted">No active delegations — session, meeting, and graph targets only appear in the timeline.</p>
               ) : (
                 <div className="divide-y divide-huddleroom-border">
                   {activeDelegations.map((delegation) => (
@@ -1497,7 +1497,7 @@ export function OrchestrationPage() {
         ]}
         alternatePaths={[
           'If the switcher is empty, confirm you are in the correct environment or ask an administrator to create a project.',
-          'If no goals exist yet, start one from Meetings or Protocols before returning here.',
+          'If no goals exist yet, start one from Meetings or Graphs before returning here.',
         ]}
       />
     )

@@ -4,21 +4,21 @@ from sqlalchemy import select, text
 
 
 @pytest.mark.asyncio
-async def test_protocol_insert_defaults(db_session):
-    from huddleroom.models.protocol import Protocol
-    proto = Protocol(
-        name="test_proto",
-        definition={"states": {}},
+async def test_graph_insert_defaults(db_session):
+    from huddleroom.models.graph import Graph
+    graph = Graph(
+        name="test_graph",
+        definition={"nodes": {}},
         triggers=[],
     )
-    db_session.add(proto)
+    db_session.add(graph)
     await db_session.flush()
 
-    assert proto.id is not None
-    assert proto.is_active is True or proto.is_active == 1  # SQLite may return int
-    assert proto.version == "1.0"
-    assert proto.created_at is not None
-    assert proto.updated_at is not None
+    assert graph.id is not None
+    assert graph.is_active is True or graph.is_active == 1  # SQLite may return int
+    assert graph.version == "1.0"
+    assert graph.created_at is not None
+    assert graph.updated_at is not None
 
 
 @pytest.mark.asyncio

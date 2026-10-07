@@ -11,7 +11,7 @@ from huddleroom.models.meeting import Meeting, MeetingDecision
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationEvidence, OrchestrationGate, OrchestrationRoadmapItem, OrchestrationRoadmapVersion, OrchestrationRun, OrchestrationWait
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_steering import OrchestrationSteeringService
@@ -50,15 +50,15 @@ class OrchestrationSupervisionContextBuilder:
         ).order_by(Meeting.created_at, Meeting.id))).all())
         meeting_ids = [row.id for row in meetings]
         meeting_decisions = list((await db.scalars(select(MeetingDecision).where(MeetingDecision.meeting_id.in_(meeting_ids) if meeting_ids else False).order_by(MeetingDecision.created_at, MeetingDecision.id))).all())
-        instances = list((await db.scalars(select(ProtocolInstance).where(
-            ProtocolInstance.linked_task_id.in_(task_ids) if task_ids else False,
-            ProtocolInstance.project_id == goal.project_id,
-        ).order_by(ProtocolInstance.created_at, ProtocolInstance.id))).all())
-        protocol_ids = [row.protocol_id for row in instances]
-        protocols = list((await db.scalars(select(Protocol).where(
-            Protocol.id.in_(protocol_ids) if protocol_ids else False,
-            or_(Protocol.project_id == goal.project_id, Protocol.project_id.is_(None)),
-        ).order_by(Protocol.created_at, Protocol.id))).all())
+        graph_runs = list((await db.scalars(select(GraphRun).where(
+            GraphRun.linked_task_id.in_(task_ids) if task_ids else False,
+            GraphRun.project_id == goal.project_id,
+        ).order_by(GraphRun.created_at, GraphRun.id))).all())
+        graph_ids = [row.graph_id for row in graph_runs]
+        graphs = list((await db.scalars(select(Graph).where(
+            Graph.id.in_(graph_ids) if graph_ids else False,
+            or_(Graph.project_id == goal.project_id, Graph.project_id.is_(None)),
+        ).order_by(Graph.created_at, Graph.id))).all())
         gates = list((await db.scalars(select(OrchestrationGate).where(OrchestrationGate.run_id == run.id).order_by(OrchestrationGate.created_at, OrchestrationGate.id))).all())
         evidence = list((await db.scalars(select(OrchestrationEvidence).where(OrchestrationEvidence.run_id == run.id).order_by(OrchestrationEvidence.created_at, OrchestrationEvidence.id))).all())
         decisions = list((await db.scalars(select(OrchestrationAuthorityDecision).where(OrchestrationAuthorityDecision.goal_id == goal.id).order_by(OrchestrationAuthorityDecision.created_at, OrchestrationAuthorityDecision.id))).all())
@@ -83,8 +83,8 @@ class OrchestrationSupervisionContextBuilder:
             "sessions": [_row(row, "id", "task_id", "agent_id", "status", "error", "origin") for row in sessions],
             "meetings": [_row(row, "id", "source_task_id", "title", "status", "meeting_type") for row in meetings],
             "meeting_decisions": [_row(row, "id", "meeting_id", "chosen_option", "is_vetoed", "is_partial") for row in meeting_decisions],
-            "protocols": [_row(row, "id", "name", "version", "is_active", "definition") for row in protocols],
-            "protocol_instances": [_row(row, "id", "protocol_id", "linked_task_id", "status", "current_state") for row in instances],
+            "graphs": [_row(row, "id", "name", "version", "is_active", "definition") for row in graphs],
+            "graph_runs": [_row(row, "id", "graph_id", "linked_task_id", "status", "current_node") for row in graph_runs],
             "gates": [_row(row, "id", "gate_type", "success_criterion_key", "status", "required_evidence", "failure_reason") for row in gates],
             "evidence": [_row(row, "id", "gate_id", "source_type", "source_id", "producer_agent_id", "verdict", "evidence_metadata") for row in evidence],
             "authority_decisions": [_row(row, "id", "decision_key", "status", "authority", "question", "context", "options", "recommendation", "selected_option", "reason", "consequences", "runtime_identity", "contract_version", "continuation", "related_gate_id") for row in decisions],

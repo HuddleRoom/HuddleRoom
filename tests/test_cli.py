@@ -602,7 +602,7 @@ def test_run_migrations_upgrades_an_old_database_without_losing_sentinel(tmp_pat
 
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve me",)
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("047",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("048",)
 
 
 def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
@@ -627,7 +627,7 @@ def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
 
     assert 0 in results
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("047",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("048",)
         assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve me",)
     for returncode, output in zip(results, outcomes):
         if returncode:

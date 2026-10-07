@@ -11,7 +11,7 @@ class Task(Base, TimestampMixin):
         Index("idx_tasks_project_status", "project_id", "status"),
         Index("idx_tasks_assigned_to", "assigned_to"),
         Index("idx_tasks_parent_id", "parent_id"),
-        Index("idx_tasks_protocol_instance", "protocol_instance_id"),
+        Index("idx_tasks_graph_run", "graph_run_id"),
     )
 
     # State machine transitions
@@ -28,7 +28,7 @@ class Task(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     parent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
-    protocol_instance_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)  # No database foreign key.
+    graph_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)  # No database foreign key.
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="backlog")

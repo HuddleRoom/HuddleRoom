@@ -16,7 +16,7 @@ const NewMeetingPage = React.lazy(() => import('@/pages/meetings/NewMeetingPage'
 const MemoryPage = React.lazy(() => import('@/pages/memory/MemoryPage').then(m => ({ default: m.MemoryPage })))
 const OptimizationsPage = React.lazy(() => import('@/pages/optimizations/OptimizationsPage').then(m => ({ default: m.OptimizationsPage })))
 const OrchestrationPage = React.lazy(() => import('@/pages/orchestration/OrchestrationPage').then(m => ({ default: m.OrchestrationPage })))
-const ProtocolsPage = React.lazy(() => import('@/pages/protocols/ProtocolsPage').then(m => ({ default: m.ProtocolsPage })))
+const GraphsPage = React.lazy(() => import('@/pages/graphs/GraphsPage').then(m => ({ default: m.GraphsPage })))
 const RulesPage = React.lazy(() => import('@/pages/rules/RulesPage').then(m => ({ default: m.RulesPage })))
 const SettingsPage = React.lazy(() => import('@/pages/settings/SettingsPage').then(m => ({ default: m.SettingsPage })))
 const TasksPage = React.lazy(() => import('@/pages/tasks/TasksPage').then(m => ({ default: m.TasksPage })))
@@ -68,8 +68,8 @@ export function App() {
             <Route path="meetings" element={<MeetingsPage />} />
             <Route path="meetings/new" element={<NewMeetingPage />} />
             <Route path="meetings/:meetingId" element={<MeetingsPage />} />
-            <Route path="protocols" element={<ProtocolsPage />} />
-            <Route path="protocols/:protocolId" element={<ProtocolsPage />} />
+            <Route path="graphs" element={<GraphsPage />} />
+            <Route path="graphs/:graphId" element={<GraphsPage />} />
             <Route path="knowledge" element={<KnowledgePage />} />
             <Route path="memory" element={<MemoryPage />} />
             <Route path="rules" element={<RulesPage />} />

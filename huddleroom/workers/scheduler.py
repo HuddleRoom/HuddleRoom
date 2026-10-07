@@ -44,16 +44,16 @@ async def archive_old_events_job() -> None:
         logger.error("Event log archival failed: %s", e)
 
 
-async def process_protocol_timeouts_job() -> None:
+async def process_graph_timeouts_job() -> None:
     from huddleroom.database import AsyncSessionLocal
-    from huddleroom.services.protocol_engine import ProtocolEngineService
+    from huddleroom.services.graph_engine import GraphEngineService
 
     try:
         async with AsyncSessionLocal() as db:
             async with db.begin():
-                await ProtocolEngineService().process_timeouts(db)
+                await GraphEngineService().process_timeouts(db)
     except Exception as e:
-        logger.error("Protocol timeout processing failed: %s", e)
+        logger.error("Graph timeout processing failed: %s", e)
 
 
 async def check_due_meetings_job() -> None:
@@ -281,10 +281,10 @@ def create_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
     scheduler.add_job(
-        process_protocol_timeouts_job,
+        process_graph_timeouts_job,
         trigger="interval",
         seconds=30,
-        id="process_protocol_timeouts",
+        id="process_graph_timeouts",
         replace_existing=True,
     )
     scheduler.add_job(

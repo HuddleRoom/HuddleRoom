@@ -190,7 +190,7 @@ export function LoginPage() {
         <div style={brandBlockStyle}>
           <h1 style={headingStyle}>Sign in to HuddleRoom</h1>
           <p style={bodyStyle}>
-            Authenticate to monitor sessions, review protocols, and steer work in this environment.
+            Authenticate to monitor sessions, review graphs, and steer work in this environment.
           </p>
         </div>
 

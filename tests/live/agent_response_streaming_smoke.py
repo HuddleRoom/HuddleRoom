@@ -40,7 +40,7 @@ from live_test import (  # noqa: E402  pylint: disable=wrong-import-position
     start_server,
     stop_server,
 )
-from live_test_protocols import check_provider_ready  # noqa: E402  pylint: disable=wrong-import-position
+from live_test_graphs import check_provider_ready  # noqa: E402  pylint: disable=wrong-import-position
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from huddleroom.services.secret_redaction import redact_secrets  # noqa: E402  pylint: disable=wrong-import-position

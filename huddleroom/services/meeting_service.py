@@ -70,7 +70,7 @@ class MeetingService:
         created_by_trigger: bool = False,
         trigger_reason: str | None = None,
         source_task_id: uuid.UUID | None = None,
-        source_protocol_instance_id: uuid.UUID | None = None,
+        source_graph_run_id: uuid.UUID | None = None,
         organizer_agent_id: uuid.UUID | None = None,
         organizer_user_id: uuid.UUID | None = None,
         planner_agent_id: uuid.UUID | None = None,
@@ -98,7 +98,7 @@ class MeetingService:
             created_by_trigger=created_by_trigger,
             trigger_reason=trigger_reason,
             source_task_id=source_task_id,
-            source_protocol_instance_id=source_protocol_instance_id,
+            source_graph_run_id=source_graph_run_id,
             organizer_agent_id=organizer_agent_id,
             organizer_user_id=organizer_user_id,
             planner_agent_id=planner_agent_id,
@@ -119,7 +119,7 @@ class MeetingService:
                 turn_order=item_data.get("turn_order"),
                 max_rounds=item_data.get("max_rounds", 3),
                 requires_approval=item_data.get("requires_approval", False),
-                creates_protocol=item_data.get("creates_protocol", False),
+                creates_graph=item_data.get("creates_graph", False),
             )
             db.add(item)
 
@@ -153,7 +153,7 @@ class MeetingService:
                 "turn_order": item.turn_order,
                 "max_rounds": item.max_rounds,
                 "requires_approval": item.requires_approval,
-                "creates_protocol": item.creates_protocol,
+                "creates_graph": item.creates_graph,
             }
             for item in result.scalars().all()
         ]

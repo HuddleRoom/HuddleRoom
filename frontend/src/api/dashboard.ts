@@ -1,18 +1,18 @@
 import { useTaskCount } from './tasks'
-import { useProtocolInstanceCount } from './protocols'
+import { useGraphRunCount } from './graphs'
 import { useSessionCount } from './sessions'
 import { useOrchestrationGoals } from '@/api/orchestration'
 
 export function useDashboardTriage(projectId: string | null) {
   const blockedTasksQuery = useTaskCount(projectId, 'blocked')
   const failedTasksQuery = useTaskCount(projectId, 'failed')
-  const failedProtocolsQuery = useProtocolInstanceCount(projectId, 'failed')
+  const failedGraphRunsQuery = useGraphRunCount(projectId, 'failed')
   const failedSessionsQuery = useSessionCount(projectId, 'failed')
   const goalsQuery = useOrchestrationGoals(projectId)
 
   const blockedTasksCount = blockedTasksQuery.data?.count
   const failedTasksCount = failedTasksQuery.data?.count
-  const failedProtocolsCount = failedProtocolsQuery.data?.count
+  const failedGraphRunsCount = failedGraphRunsQuery.data?.count
   const failedSessionsCount = failedSessionsQuery.data?.count
 
   // LM retries and unacknowledged warnings are already folded into needs_you_count by the backend — do not add separate fetches.
@@ -24,7 +24,7 @@ export function useDashboardTriage(projectId: string | null) {
   const hasAttention =
     (blockedTasksCount ?? 0) > 0 ||
     (failedTasksCount ?? 0) > 0 ||
-    (failedProtocolsCount ?? 0) > 0 ||
+    (failedGraphRunsCount ?? 0) > 0 ||
     (failedSessionsCount ?? 0) > 0 ||
     needsYouGoalsList.length > 0 ||
     blockedGoalsList.length > 0
@@ -32,14 +32,14 @@ export function useDashboardTriage(projectId: string | null) {
   const isLoading =
     blockedTasksQuery.isLoading ||
     failedTasksQuery.isLoading ||
-    failedProtocolsQuery.isLoading ||
+    failedGraphRunsQuery.isLoading ||
     failedSessionsQuery.isLoading ||
     goalsQuery.isLoading
 
   const isError =
     blockedTasksQuery.isError ||
     failedTasksQuery.isError ||
-    failedProtocolsQuery.isError ||
+    failedGraphRunsQuery.isError ||
     failedSessionsQuery.isError ||
     goalsQuery.isError
 
@@ -54,10 +54,10 @@ export function useDashboardTriage(projectId: string | null) {
       isLoading: failedTasksQuery.isLoading,
       isError: failedTasksQuery.isError,
     },
-    failedProtocols: {
-      count: failedProtocolsCount,
-      isLoading: failedProtocolsQuery.isLoading,
-      isError: failedProtocolsQuery.isError,
+    failedGraphRuns: {
+      count: failedGraphRunsCount,
+      isLoading: failedGraphRunsQuery.isLoading,
+      isError: failedGraphRunsQuery.isError,
     },
     failedSessions: {
       count: failedSessionsCount,

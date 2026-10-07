@@ -22,7 +22,7 @@ from huddleroom.models.meeting import (
     MeetingRequest,
     MeetingTurn,
 )
-from huddleroom.models.protocol import ProtocolInstance, ProtocolTimeout, ProtocolTransition
+from huddleroom.models.graph import GraphRun, GraphRunStep, GraphRunTimeout
 from huddleroom.models.channel import Channel
 from huddleroom.models.message import Message
 from huddleroom.models.orchestration import (
@@ -231,8 +231,8 @@ class ProjectService:
                 exists(select(Meeting.id).where(
                     Meeting.project_id == project.id, Meeting.status.in_(("preparing", "active", "concluding")),
                 )),
-                exists(select(ProtocolInstance.id).where(
-                    ProtocolInstance.project_id == project.id, ProtocolInstance.status.in_(("active", "paused")),
+                exists(select(GraphRun.id).where(
+                    GraphRun.project_id == project.id, GraphRun.status.in_(("active", "paused")),
                 )),
                 exists(select(OrchestrationRun.id).join(OrchestrationGoal).where(
                     OrchestrationGoal.project_id == project.id,
@@ -267,7 +267,7 @@ class ProjectService:
             counts[name] = result.rowcount or 0
 
         meeting_ids = select(Meeting.id).where(Meeting.project_id == project_id)
-        protocol_instance_ids = select(ProtocolInstance.id).where(ProtocolInstance.project_id == project_id)
+        graph_run_ids = select(GraphRun.id).where(GraphRun.project_id == project_id)
         channel_ids = select(Channel.id).where(Channel.project_id == project_id)
         goal_ids = select(OrchestrationGoal.id).where(OrchestrationGoal.project_id == project_id)
         run_ids = select(OrchestrationRun.id).where(OrchestrationRun.goal_id.in_(goal_ids))
@@ -289,16 +289,16 @@ class ProjectService:
         await purge("meetings", Meeting, Meeting.project_id == project_id)
 
         await purge(
-            "protocol_transitions",
-            ProtocolTransition,
-            ProtocolTransition.protocol_instance_id.in_(protocol_instance_ids),
+            "graph_run_steps",
+            GraphRunStep,
+            GraphRunStep.graph_run_id.in_(graph_run_ids),
         )
         await purge(
-            "protocol_timeouts",
-            ProtocolTimeout,
-            ProtocolTimeout.protocol_instance_id.in_(protocol_instance_ids),
+            "graph_run_timeouts",
+            GraphRunTimeout,
+            GraphRunTimeout.graph_run_id.in_(graph_run_ids),
         )
-        await purge("protocol_instances", ProtocolInstance, ProtocolInstance.project_id == project_id)
+        await purge("graph_runs", GraphRun, GraphRun.project_id == project_id)
 
         await purge("messages", Message, Message.channel_id.in_(channel_ids))
         await purge("channels", Channel, Channel.project_id == project_id)

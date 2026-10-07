@@ -13,11 +13,11 @@ from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGa
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
 from huddleroom.models.meeting import Meeting
-from huddleroom.models.protocol import ProtocolInstance
+from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
 
 
-DISPOSITIONS = frozenset({"continue", "pause", "follow_up", "verify", "reassign", "meeting", "protocol", "replan", "attention"})
+DISPOSITIONS = frozenset({"continue", "pause", "follow_up", "verify", "reassign", "meeting", "graph", "replan", "attention"})
 
 
 @dataclass(frozen=True)
@@ -169,16 +169,16 @@ class OrchestrationSupervisionService:
             Meeting.source_task_id.in_(task_ids) if task_ids else False,
             Meeting.status.in_(("scheduled", "preparing", "active", "concluding")),
         ).order_by(Meeting.created_at, Meeting.id))).all())
-        active_protocols = list((await db.scalars(select(ProtocolInstance).where(
-            ProtocolInstance.linked_task_id.in_(task_ids) if task_ids else False,
-            ProtocolInstance.status == "active",
-        ).order_by(ProtocolInstance.created_at, ProtocolInstance.id))).all())
+        active_graph_runs = list((await db.scalars(select(GraphRun).where(
+            GraphRun.linked_task_id.in_(task_ids) if task_ids else False,
+            GraphRun.status == "active",
+        ).order_by(GraphRun.created_at, GraphRun.id))).all())
         active_meeting = active_meetings[0] if active_meetings else None
-        active_protocol = active_protocols[0] if active_protocols else None
+        active_graph_run = active_graph_runs[0] if active_graph_runs else None
         provider_task_ids = {
             task_id for task_id in (
                 *(meeting.source_task_id for meeting in active_meetings),
-                *(protocol.linked_task_id for protocol in active_protocols),
+                *(graph_run.linked_task_id for graph_run in active_graph_runs),
             ) if task_id is not None
         }
 
@@ -349,8 +349,8 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "needs_attention"}
             run.supervision_state = state
             return {"outcome": "needs_attention", "action_id": str(action.id)}
-        if active_meeting is not None or active_protocol is not None:
-            source_type, source_id = ("meeting", active_meeting.id) if active_meeting is not None else ("protocol", active_protocol.id)
+        if active_meeting is not None or active_graph_run is not None:
+            source_type, source_id = ("meeting", active_meeting.id) if active_meeting is not None else ("graph", active_graph_run.id)
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "durable_source_active", "source_type": source_type, "source_id": str(source_id)}
             run.supervision_state = state
             return {"outcome": "durable_source_active", "source_type": source_type, "source_id": str(source_id)}
@@ -462,7 +462,7 @@ class OrchestrationSupervisionService:
             "verify": ("execute_request_verification_action", "request_verification", {"action_type": "request_verification", **request}),
             "reassign": ("execute_reassign_task_action", "reassign_task", {"action_type": "reassign_task", **request}),
             "meeting": ("execute_schedule_meeting_action", "schedule_meeting", {"action_type": "schedule_meeting", **request}),
-            "protocol": ("execute_start_protocol_action", "start_protocol", {"action_type": "start_protocol", **request}),
+            "graph": ("execute_start_graph_action", "start_graph", {"action_type": "start_graph", **request}),
             "replan": ("execute_request_roadmap_replan_action", "request_roadmap_replan", {"action_type": "request_roadmap_replan", **request, "reason": reason}),
             "attention": ("execute_record_warning_action", "record_warning", {"action_type": "record_warning", "warning_type": "supervision_attention", "severity": "warning", "message": reason}),
         }

@@ -40,7 +40,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRoadmapVersion,
     OrchestrationRun,
 )
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTransition
+from huddleroom.models.graph import Graph, GraphRun, GraphRunStep
 from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -77,7 +77,7 @@ from huddleroom.services.orchestration_process_service import OrchestrationProce
 from huddleroom.services.orchestration_llm_decision_adapter import LLMDecisionAdapter, OrchestrationDecisionAdapter
 from huddleroom.services.orchestration_memory_preface import OrchestrationMemoryPrefaceBuilder
 from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
-from huddleroom.services.protocol_engine import ProtocolEngineService
+from huddleroom.services.graph_engine import GraphEngineService
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
@@ -107,13 +107,13 @@ TICK_EVENT_BATCH_LIMIT = 500
 TASK_EVIDENCE_EVENT_TYPES = frozenset({"task.status_changed"})
 SESSION_EVIDENCE_EVENT_TYPES = frozenset({"session.completed", "session.failed"})
 REVIEW_EVIDENCE_EVENT_TYPES = frozenset({"review.approved", "review.changes_requested"})
-PROTOCOL_EVIDENCE_EVENT_TYPES = frozenset({"protocol.completed", "protocol.failed", "protocol.state_transitioned"})
+GRAPH_EVIDENCE_EVENT_TYPES = frozenset({"graph.run_completed", "graph.run_failed", "graph.run_advanced"})
 MEETING_EVIDENCE_EVENT_TYPES = frozenset({"meeting.concluded", "meeting.decision_recorded"})
 EVIDENCE_EVENT_TYPES = (
     TASK_EVIDENCE_EVENT_TYPES
     | SESSION_EVIDENCE_EVENT_TYPES
     | REVIEW_EVIDENCE_EVENT_TYPES
-    | PROTOCOL_EVIDENCE_EVENT_TYPES
+    | GRAPH_EVIDENCE_EVENT_TYPES
     | MEETING_EVIDENCE_EVENT_TYPES
 )
 RECOVERY_RETRY_FAILED_SESSION_LIMIT = 1
@@ -125,7 +125,7 @@ RECOVERY_VERIFICATION_REQUESTED_EVENT_TYPE = "orchestration.verification_request
 GATE_REPAIRED_EVENT_TYPE = "orchestration.gate_repaired"
 RECOVERY_RUN_PAUSED_EVENT_TYPE = "orchestration.run_paused"
 MEETING_SCHEDULED_EVENT_TYPE = "orchestration.meeting_scheduled"
-PROTOCOL_STARTED_EVENT_TYPE = "orchestration.protocol_started"
+GRAPH_STARTED_EVENT_TYPE = "orchestration.graph_started"
 
 class _ReentrantAsyncioLock:
     """Reentrant wrapper around asyncio.Lock for SQLite baseline-transition serialization.
@@ -3304,7 +3304,7 @@ class OrchestrationService:
             target_id=meeting.id,
         )
 
-    async def execute_start_protocol_action(
+    async def execute_start_graph_action(
         self,
         db: AsyncSession,
         run_id: uuid.UUID,
@@ -3314,7 +3314,7 @@ class OrchestrationService:
     ) -> OrchestrationAction:
         existing = await self._existing_action_for_key(db, run_id, idempotency_key)
         request_to_store = (
-            existing.request if existing is not None else self._canonical_start_protocol_request(request)
+            existing.request if existing is not None else self._canonical_start_graph_request(request)
         )
         project_id = await self._project_id_for_run(db, run_id)
         await ProjectService().lock_workspace_boundary(db, project_id)
@@ -3324,7 +3324,7 @@ class OrchestrationService:
             db,
             run_id=run_id,
             idempotency_key=idempotency_key,
-            action_type="start_protocol",
+            action_type="start_graph",
             request=request_to_store,
             decision_id=decision_id,
         )
@@ -3334,31 +3334,31 @@ class OrchestrationService:
         try:
             await self._require_unmetered_control_provider_budget(db, run_id)
             stored_request = self._json_object_or_empty(action.request)
-            protocol_id = self._required_uuid(stored_request.get("protocol_id"), "protocol_id")
+            graph_id = self._required_uuid(stored_request.get("graph_id"), "graph_id")
             subject_type = self._required_string(stored_request.get("subject_type"), "subject_type")
             subject_id = self._required_uuid(stored_request.get("subject_id"), "subject_id")
-            project_id, task, gate, artifact_id = await self._protocol_subject(
+            project_id, task, gate, artifact_id = await self._graph_subject(
                 db,
                 run_id,
                 subject_type,
                 subject_id,
             )
-            protocol = (
+            graph = (
                 await db.execute(
-                    select(Protocol).where(
-                        Protocol.id == protocol_id,
-                        Protocol.is_active.is_(True),
-                        or_(Protocol.project_id == project_id, Protocol.project_id.is_(None)),
+                    select(Graph).where(
+                        Graph.id == graph_id,
+                        Graph.is_active.is_(True),
+                        or_(Graph.project_id == project_id, Graph.project_id.is_(None)),
                     )
                 )
             ).scalar_one_or_none()
-            if protocol is None:
-                raise HTTPException(status_code=404, detail="Active protocol not found")
+            if graph is None:
+                raise HTTPException(status_code=404, detail="Active graph not found")
 
             event = BusEvent(
                 id=action.id,
                 project_id=project_id,
-                event_type="orchestration.protocol_start_requested",
+                event_type="orchestration.graph_start_requested",
                 payload={
                     "run_id": str(run_id),
                     "action_id": str(action.id),
@@ -3368,21 +3368,21 @@ class OrchestrationService:
                 },
                 source="orchestrator",
             )
-            instance = await ProtocolEngineService().start_protocol(db, protocol, event)
+            graph_run = await GraphEngineService().start_run(db, graph, event)
             await emit_event_once(
                 db,
                 project_id,
-                PROTOCOL_STARTED_EVENT_TYPE,
+                GRAPH_STARTED_EVENT_TYPE,
                 {
                     "run_id": str(run_id),
                     "action_id": str(action.id),
-                    "protocol_id": str(protocol.id),
-                    "protocol_instance_id": str(instance.id),
+                    "graph_id": str(graph.id),
+                    "graph_run_id": str(graph_run.id),
                     "task_id": str(task.id),
                     "gate_id": str(gate.id),
                 },
                 source="orchestrator",
-                dedup_key=f"{PROTOCOL_STARTED_EVENT_TYPE}:action:{action.id}",
+                dedup_key=f"{GRAPH_STARTED_EVENT_TYPE}:action:{action.id}",
             )
         except Exception as exc:
             error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
@@ -3391,8 +3391,8 @@ class OrchestrationService:
         return await self._mark_action_completed(
             db,
             action,
-            target_type="protocol_instance",
-            target_id=instance.id,
+            target_type="graph_run",
+            target_id=graph_run.id,
         )
 
     async def execute_retry_task_action(
@@ -3740,7 +3740,7 @@ class OrchestrationService:
         }
 
     async def _require_unmetered_control_provider_budget(self, db: AsyncSession, run_id: uuid.UUID) -> None:
-        """Meeting/protocol providers cannot report the durable measurements a cap requires."""
+        """Meeting/graph providers cannot report the durable measurements a cap requires."""
         from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
 
         run = await db.get(OrchestrationRun, run_id)
@@ -4098,7 +4098,7 @@ class OrchestrationService:
             "retry_task": self._canonical_retry_task_request,
             "reassign_task": self._canonical_reassign_task_request,
             "schedule_meeting": self._canonical_schedule_meeting_request,
-            "start_protocol": self._canonical_start_protocol_request,
+            "start_graph": self._canonical_start_graph_request,
             "ask_human": self._canonical_ask_human_request,
             "pause_run": self._canonical_pause_run_request,
             "suggest_agent": self._canonical_suggest_agent_request,
@@ -5183,7 +5183,7 @@ class OrchestrationService:
             forbidden_work=[
                 "Do not implement the plan.",
                 "Do not edit project artifacts.",
-                "Do not create tasks, meetings, protocols, rules, hooks, or automations.",
+                "Do not create tasks, meetings, graphs, rules, hooks, or automations.",
             ],
             success_evidence=[
                 "A plan artifact linked to this planning task.",
@@ -5916,14 +5916,14 @@ class OrchestrationService:
             dedup_key=f"{DELEGATION_TASK_CREATED_EVENT_TYPE}:action:{action.id}",
         )
 
-    def _canonical_start_protocol_request(self, request: Any) -> dict[str, Any]:
+    def _canonical_start_graph_request(self, request: Any) -> dict[str, Any]:
         request_obj = self._json_object_or_empty(request)
         subject_type = self._required_string(request_obj.get("subject_type"), "subject_type")
         if subject_type not in {"task", "artifact"}:
             raise HTTPException(status_code=400, detail="subject_type must be 'task' or 'artifact'")
         return {
-            "action_type": "start_protocol",
-            "protocol_id": str(self._required_uuid(request_obj.get("protocol_id"), "protocol_id")),
+            "action_type": "start_graph",
+            "graph_id": str(self._required_uuid(request_obj.get("graph_id"), "graph_id")),
             "subject_type": subject_type,
             "subject_id": str(self._required_uuid(request_obj.get("subject_id"), "subject_id")),
         }
@@ -5978,7 +5978,7 @@ class OrchestrationService:
             raise HTTPException(status_code=409, detail="Task is not linked to the requested gate")
         return project_id, task, gate
 
-    async def _protocol_subject(
+    async def _graph_subject(
         self,
         db: AsyncSession,
         run_id: uuid.UUID,
@@ -5997,11 +5997,11 @@ class OrchestrationService:
         project_id = await self._project_id_for_run(db, run_id)
         artifact = await db.get(Artifact, subject_id)
         if artifact is None or artifact.project_id != project_id:
-            raise HTTPException(status_code=404, detail="Protocol subject artifact not found")
+            raise HTTPException(status_code=404, detail="Graph subject artifact not found")
         if artifact.linked_task_id is None:
             raise HTTPException(
                 status_code=409,
-                detail="Protocol subject artifact must link to an orchestration task",
+                detail="Graph subject artifact must link to an orchestration task",
             )
         project_id, task, gate = await self._coordination_task_and_gate(
             db,
@@ -7150,8 +7150,8 @@ class OrchestrationService:
             return await self._ingest_session_evidence(db, run, event)
         if event.event_type in REVIEW_EVIDENCE_EVENT_TYPES:
             return await self._ingest_review_evidence(db, run, event)
-        if event.event_type in PROTOCOL_EVIDENCE_EVENT_TYPES:
-            return await self._ingest_protocol_evidence(db, run, event)
+        if event.event_type in GRAPH_EVIDENCE_EVENT_TYPES:
+            return await self._ingest_graph_evidence(db, run, event)
         if event.event_type in MEETING_EVIDENCE_EVENT_TYPES:
             return await self._ingest_meeting_evidence(db, run, event)
         return 0
@@ -7232,7 +7232,7 @@ class OrchestrationService:
             **self._base_evidence_metadata(event, gate, orchestration, status),
             "task_id": str(task.id),
             "session_id": str(session.id),
-            "protocol_instance_id": str(session.protocol_instance_id) if session.protocol_instance_id else None,
+            "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
             "origin": session.origin,
             "adapter_type": session.adapter_type,
             "error": session.error,
@@ -7396,11 +7396,11 @@ class OrchestrationService:
             )
             if latest != session.id:
                 return None
-            if task.protocol_instance_id is not None or session.protocol_instance_id is not None:
-                if task.protocol_instance_id != session.protocol_instance_id:
+            if task.graph_run_id is not None or session.graph_run_id is not None:
+                if task.graph_run_id != session.graph_run_id:
                     return None
-                instance = await db.get(ProtocolInstance, session.protocol_instance_id)
-                if instance is None or instance.linked_task_id != task.id:
+                graph_run = await db.get(GraphRun, session.graph_run_id)
+                if graph_run is None or graph_run.linked_task_id != task.id:
                     return None
             return action, task
         if (
@@ -7424,11 +7424,11 @@ class OrchestrationService:
         )
         if latest != session.id:
             return None
-        if task.protocol_instance_id is not None or session.protocol_instance_id is not None:
-            if task.protocol_instance_id != session.protocol_instance_id:
+        if task.graph_run_id is not None or session.graph_run_id is not None:
+            if task.graph_run_id != session.graph_run_id:
                 return None
-            instance = await db.get(ProtocolInstance, session.protocol_instance_id)
-            if instance is None or instance.linked_task_id != task.id:
+            graph_run = await db.get(GraphRun, session.graph_run_id)
+            if graph_run is None or graph_run.linked_task_id != task.id:
                 return None
         return action, source_task
 
@@ -7464,7 +7464,7 @@ class OrchestrationService:
                 "session_id": str(session.id),
                 "verification_action_id": str(action.id),
                 "source_task_id": str(source_task.id),
-                "protocol_instance_id": str(session.protocol_instance_id) if session.protocol_instance_id else None,
+                "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
             },
         )
 
@@ -7520,8 +7520,8 @@ class OrchestrationService:
             return 0
         if task_id is not None and task_id != session.task_id:
             return 0
-        protocol_instance_id = self._event_uuid(event.payload.get("protocol_instance_id"))
-        if protocol_instance_id is not None and protocol_instance_id != session.protocol_instance_id:
+        graph_run_id = self._event_uuid(event.payload.get("graph_run_id"))
+        if graph_run_id is not None and graph_run_id != session.graph_run_id:
             return 0
         task_id = session.task_id
         task = await db.get(Task, task_id)
@@ -7540,7 +7540,7 @@ class OrchestrationService:
             **self._base_evidence_metadata(event, gate, orchestration, review_verdict),
             "task_id": str(task.id),
             "session_id": str(session.id),
-            "protocol_instance_id": str(session.protocol_instance_id) if session.protocol_instance_id else None,
+            "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
             "artifact_id": self._optional_string(event.payload.get("artifact_id")),
             "review_verdict": review_verdict,
             "review_outcome": review_outcome,
@@ -7557,19 +7557,19 @@ class OrchestrationService:
             evidence_metadata=metadata,
         )
 
-    async def _ingest_protocol_evidence(
+    async def _ingest_graph_evidence(
         self,
         db: AsyncSession,
         run: OrchestrationRun,
         event: EventLog,
     ) -> int:
-        protocol_instance_id = self._event_uuid(event.payload.get("protocol_instance_id"))
-        if protocol_instance_id is None:
+        graph_run_id = self._event_uuid(event.payload.get("graph_run_id"))
+        if graph_run_id is None:
             return 0
-        instance = await db.get(ProtocolInstance, protocol_instance_id)
-        if instance is None or instance.linked_task_id is None:
+        graph_run = await db.get(GraphRun, graph_run_id)
+        if graph_run is None or graph_run.linked_task_id is None:
             return 0
-        task = await db.get(Task, instance.linked_task_id)
+        task = await db.get(Task, graph_run.linked_task_id)
         if task is None:
             return 0
         gate_ref = await self._task_gate_for_run(db, run.id, task)
@@ -7577,34 +7577,34 @@ class OrchestrationService:
             return 0
 
         gate, orchestration = gate_ref
-        status = self._optional_string(instance.status)
-        is_transition_event = event.event_type == "protocol.state_transitioned"
-        has_transition_id = "protocol_transition_id" in event.payload
-        transition_id = self._event_uuid(event.payload.get("protocol_transition_id"))
+        status = self._optional_string(graph_run.status)
+        is_step_event = event.event_type == "graph.run_advanced"
+        has_transition_id = "graph_run_step_id" in event.payload
+        transition_id = self._event_uuid(event.payload.get("graph_run_step_id"))
         transition = None
-        if is_transition_event or has_transition_id:
+        if is_step_event or has_transition_id:
             if transition_id is None:
                 return 0
-            transition = await db.get(ProtocolTransition, transition_id)
-            if transition is None or transition.protocol_instance_id != instance.id:
+            transition = await db.get(GraphRunStep, transition_id)
+            if transition is None or transition.graph_run_id != graph_run.id:
                 return 0
 
         source_type = (
-            "protocol_transition"
-            if is_transition_event
-            else "protocol_instance"
+            "graph_run_step"
+            if is_step_event
+            else "graph_run"
         )
-        source_id = transition.id if is_transition_event else instance.id
+        source_id = transition.id if is_step_event else graph_run.id
         metadata = {
             **self._base_evidence_metadata(event, gate, orchestration, status),
             "task_id": str(task.id),
-            "protocol_instance_id": str(instance.id),
-            "protocol_transition_id": str(transition_id) if transition_id is not None else None,
-            "protocol_name": self._optional_string(event.payload.get("protocol_name")),
-            "current_state": instance.current_state,
-            "transition_name": self._optional_string(event.payload.get("transition_name")),
-            "from_state": self._optional_string(event.payload.get("from_state")),
-            "to_state": self._optional_string(event.payload.get("to_state")),
+            "graph_run_id": str(graph_run.id),
+            "graph_run_step_id": str(transition_id) if transition_id is not None else None,
+            "graph_name": self._optional_string(event.payload.get("graph_name")),
+            "current_node": graph_run.current_node,
+            "edge_name": self._optional_string(event.payload.get("edge_name")),
+            "from_node": self._optional_string(event.payload.get("from_node")),
+            "to_node": self._optional_string(event.payload.get("to_node")),
         }
         return await self._record_evidence_once(
             db,
@@ -7614,7 +7614,7 @@ class OrchestrationService:
             source_id=source_id,
             observed_event=event,
             producer_agent_id=None,
-            verdict="rejected" if event.event_type == "protocol.failed" else "candidate",
+            verdict="rejected" if event.event_type == "graph.run_failed" else "candidate",
             evidence_metadata=metadata,
         )
 

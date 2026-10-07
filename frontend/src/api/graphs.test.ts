@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useProtocolInstanceCount } from './protocols'
+import { useGraphRunCount } from './graphs'
 import { useWSStore } from '@/stores/ws'
 
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
@@ -18,9 +18,9 @@ afterEach(() => {
   vi.mocked(useQuery).mockClear()
 })
 
-describe('protocols API', () => {
-  it('protocol instance count polling respects WS connection state', () => {
-    const query = useProtocolInstanceCount('project-1') as unknown as {
+describe('graphs API', () => {
+  it('graph run count polling respects WS connection state', () => {
+    const query = useGraphRunCount('project-1') as unknown as {
       refetchInterval: () => number | false
       staleTime: number
     }

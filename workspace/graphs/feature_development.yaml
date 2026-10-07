@@ -6,7 +6,7 @@ description: >
 triggers:
   - event_type: task.created
     conditions:
-      metadata.protocol: feature_development
+      metadata.graph: feature_development
 
 actors:
   pm:
@@ -25,7 +25,7 @@ actors:
     assignment: role
     role_value: reviewer
 
-states:
+nodes:
   spec_required:
     description: Feature task created. PM must write the spec artifact.
     actor: pm
@@ -37,13 +37,13 @@ states:
         actor: pm
         task_title: "Write spec for: {{task.title}}"
         task_description: "Write a feature spec artifact for task {{task.id}}. Include acceptance criteria, data model changes, and API changes. Post as artifact type: feature_spec."
-    transitions:
+    edges:
       - name: spec_written
         to: development
         trigger_event: artifact.created
         guard:
           metadata.type: feature_spec
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
 
   development:
     description: Spec available. Developer implements.
@@ -59,15 +59,15 @@ states:
       - action_type: post_message
         channel: general
         template: "Development started on: {{task.title}}"
-    transitions:
+    edges:
       - name: pr_opened
         to: in_review
         trigger_event: code.pr_opened
         guard:
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
 
   in_review:
-    description: PR opened. code_review sub-protocol handles review.
+    description: PR opened. code_review sub-graph handles review.
     actor: reviewer
     timeout:
       duration: 8h
@@ -75,12 +75,12 @@ states:
     on_enter:
       - action_type: emit_event
         event_type: code.pr_opened
-    transitions:
+    edges:
       - name: pr_merged
         to: deployment_ready
         trigger_event: code.pr_merged
         guard:
-          metadata.task_id: "{{protocol_instance.linked_task_id}}"
+          metadata.task_id: "{{graph_run.linked_task_id}}"
 
   deployment_ready:
     description: Code merged. Deployment trigger or manual deploy needed.
@@ -95,12 +95,12 @@ states:
       - action_type: notify_actor
         actor: pm
         message: "Feature ready for deployment sign-off: {{task.title}}"
-    transitions:
+    edges:
       - name: deployed
         to: complete
         trigger_event: task.status_changed
         guard:
-          task_id: "{{protocol_instance.linked_task_id}}"
+          task_id: "{{graph_run.linked_task_id}}"
           new_status: done
 
   complete:
@@ -110,16 +110,16 @@ states:
       - action_type: record_decision
         summary: "Feature {{task.title}} shipped"
         rationale: "Spec written, implemented, reviewed, and deployed."
-    transitions: []
+    edges: []
 
   failed:
     description: Feature development stalled and escalation exhausted.
     actor: null
-    transitions: []
+    edges: []
 
-initial_state: spec_required
+start_node: spec_required
 
-terminal_states:
+terminal_nodes:
   success: [complete]
   failure: [failed]
 

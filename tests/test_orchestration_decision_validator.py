@@ -63,9 +63,9 @@ ALLOWED_DECISIONS = {
         "topic": "Resolve contradictory validation outputs.",
         "participant_agent_ids": [_id(), _id()],
     },
-    "start_protocol": {
-        "action_type": "start_protocol",
-        "protocol_id": _id(),
+    "start_graph": {
+        "action_type": "start_graph",
+        "graph_id": _id(),
         "subject_type": "task",
         "subject_id": _id(),
     },

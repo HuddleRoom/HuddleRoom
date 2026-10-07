@@ -1,6 +1,6 @@
 name: standard_dev_escalation
 description: >
-  Standard escalation chain for development protocols (code_review, feature_development, bug_fix).
+  Standard escalation chain for development graphs (code_review, feature_development, bug_fix).
   Three steps: peer review, pair session with senior agent, human notification.
 
 steps:
@@ -12,8 +12,8 @@ steps:
       - role: reviewer
       - role: developer
     message_template: >
-      Protocol {{protocol_instance.id}} ({{protocol_name}}) is stuck in state
-      {{current_state}}. A pair session has been scheduled. Please join to
+      Graph run {{graph_run.id}} ({{graph_name}}) is stuck in node
+      {{current_node}}. A pair session has been scheduled. Please join to
       unblock: {{pair_session_link}}.
     on_timeout: next_step
 
@@ -26,7 +26,7 @@ steps:
       - role: developer
       - role: reviewer
     message_template: >
-      Protocol {{protocol_name}} on {{task.title}} has been stuck for over 2h.
+      Graph run {{graph_name}} on {{task.title}} has been stuck for over 2h.
       A meeting has been called with PM to resolve the blockage.
     on_timeout: next_step
 
@@ -37,12 +37,12 @@ steps:
     participants:
       - kind: human
     message_template: >
-      ATTENTION REQUIRED: Protocol {{protocol_name}} on {{task.title}} has failed
-      to self-resolve through automated escalation. Current state: {{current_state}}.
+      ATTENTION REQUIRED: Graph run {{graph_name}} on {{task.title}} has failed
+      to self-resolve through automated escalation. Current node: {{current_node}}.
       Reason: {{timeout_reason}}. Please review and intervene at:
-      {{dashboard_url}}/protocol-instances/{{protocol_instance.id}}
+      {{dashboard_url}}/graph-runs/{{graph_run.id}}
     on_timeout: fail
 
 terminal_action_on_fail: >
-  Protocol instance marked FAILED. Task {{task.id}} transitioned to blocked
+  Graph run marked FAILED. Task {{task.id}} transitioned to blocked
   with reason: escalation_exhausted. Human must manually resolve.

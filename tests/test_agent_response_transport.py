@@ -219,7 +219,7 @@ def _stub_sqlite_lifespan_runtime(monkeypatch):
     monkeypatch.setattr("huddleroom.workers.scheduler.stop_scheduler", lambda: None)
     monkeypatch.setattr("huddleroom.workers.consumers.get_consumer_tasks", lambda: consumer_tasks)
     monkeypatch.setattr("huddleroom.workers.orchestration_tasks.run_orchestration_event_supervisor", idle)
-    for module in ("ws_hub", "rule_engine", "protocol_engine", "meeting_engine", "optimizer"):
+    for module in ("ws_hub", "rule_engine", "graph_engine", "meeting_engine", "optimizer"):
         monkeypatch.setattr(f"huddleroom.workers.consumers.{module}.run_{module}", idle)
     return consumer_tasks
 

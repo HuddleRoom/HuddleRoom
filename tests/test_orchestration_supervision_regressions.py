@@ -16,7 +16,7 @@ from huddleroom.models.meeting import Meeting
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun, OrchestrationSchedulerState
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationWait
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_supervision_context import OrchestrationSupervisionContextBuilder
@@ -89,14 +89,14 @@ async def test_real_supervision_events_resolve_their_durable_owner_to_the_run(db
     task = await _task_for_run(db_session, test_project, run)
     artifact = Artifact(project_id=test_project.id, name="Result", artifact_type="report", linked_task_id=task.id)
     meeting = Meeting(project_id=test_project.id, title="Decision", meeting_type="decision", source_task_id=task.id)
-    protocol = Protocol(project_id=test_project.id, name="Review", version="1", definition={}, triggers=[])
-    db_session.add_all([artifact, meeting, protocol])
+    graph = Graph(project_id=test_project.id, name="Review", version="1", definition={}, triggers=[])
+    db_session.add_all([artifact, meeting, graph])
     await db_session.flush()
-    instance = ProtocolInstance(
-        protocol_id=protocol.id,
+    instance = GraphRun(
+        graph_id=graph.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="done",
+        current_node="done",
     )
     db_session.add(instance)
     await db_session.flush()
@@ -105,8 +105,8 @@ async def test_real_supervision_events_resolve_their_durable_owner_to_the_run(db
     cases = (
         ("artifact.breaking_change", {"artifact_id": str(artifact.id)}),
         ("meeting.concluded", {"meeting_id": str(meeting.id)}),
-        ("protocol.failed", {"protocol_instance_id": str(instance.id)}),
-        ("protocol.state_transitioned", {"protocol_instance_id": str(instance.id)}),
+        ("graph.run_failed", {"graph_run_id": str(instance.id)}),
+        ("graph.run_advanced", {"graph_run_id": str(instance.id)}),
         ("orchestration.run_completed", {"run_id": str(run.id)}),
     )
     for event_type, payload in cases:

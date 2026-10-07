@@ -26,7 +26,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
 )
 from huddleroom.models.orchestration_process import OrchestrationWarning
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -497,7 +497,7 @@ async def _tasks_for_run(db_session, run_id):
 
 async def _complete_task_session(
     db_session, project_id, task, agent_id, output, *, emit_task_event=True, event_type="session.completed",
-    protocol_instance_id=None,
+    graph_run_id=None,
 ):
     """Complete an owned task through the same durable event boundary tick reads."""
     task.status = "done"
@@ -508,7 +508,7 @@ async def _complete_task_session(
         adapter_type="api",
         status="completed",
         output=output,
-        protocol_instance_id=protocol_instance_id,
+        graph_run_id=graph_run_id,
         metadata_={"orchestration": dict(((task.metadata_ or {}).get("orchestration") or {}))},
         origin="auto",
     )
@@ -1707,9 +1707,9 @@ async def test_accepted_snapshot_ignores_later_artifact_plan_mutation(
     assert item["scope"] == "Frozen scope"
 
 
-@pytest.mark.parametrize("protocol_bound", [False, True])
+@pytest.mark.parametrize("graph_bound", [False, True])
 async def test_outcome_plan_item_gate_requires_authoritative_producer_and_independent_verification(
-    db_session, test_project, stub_decision, safe_effectiveness_review_continue, protocol_bound
+    db_session, test_project, stub_decision, safe_effectiveness_review_continue, graph_bound
 ):
     """Planner metadata cannot weaken Outcome work's producer/reviewer split."""
     producer = _agent("defaulted-producer", ["implementation"])
@@ -1764,30 +1764,30 @@ async def test_outcome_plan_item_gate_requires_authoritative_producer_and_indepe
     assert binding["source_task_id"] == str(work_task.id)
     assert binding["producer_agent_id"] == str(producer.id)
     assert binding["verifier_agent_id"] == str(verifier.id)
-    if protocol_bound:
-        protocol = Protocol(
+    if graph_bound:
+        graph = Graph(
             project_id=test_project.id,
             name=f"verification-{uuid.uuid4()}",
-            description="Bound verification test protocol.",
+            description="Bound verification test graph.",
             definition={},
             triggers=[],
         )
-        db_session.add(protocol)
+        db_session.add(graph)
         await db_session.flush()
-        instance = ProtocolInstance(
-            protocol_id=protocol.id,
+        instance = GraphRun(
+            graph_id=graph.id,
             project_id=test_project.id,
             linked_task_id=verification_task.id,
-            current_state="done",
+            current_node="done",
             status="completed",
         )
         db_session.add(instance)
         await db_session.flush()
-        verification_task.protocol_instance_id = instance.id
+        verification_task.graph_run_id = instance.id
     await _complete_task_session(
         db_session, test_project.id, verification_task, verifier.id,
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["Reviewed the delivered work."]}),
-        protocol_instance_id=verification_task.protocol_instance_id,
+        graph_run_id=verification_task.graph_run_id,
     )
     await service.tick(db_session, run.id)
     await db_session.refresh(gate)
@@ -1998,7 +1998,7 @@ async def test_outcome_sessionless_producer_and_verifier_accept_gate(
     assert gate.status == "accepted"
 
 
-@pytest.mark.parametrize("failure", ["wrong_action", "wrong_gate", "wrong_source", "wrong_agent", "protocol", "stale", "malformed"])
+@pytest.mark.parametrize("failure", ["wrong_action", "wrong_gate", "wrong_source", "wrong_agent", "graph", "stale", "malformed"])
 async def test_outcome_verification_rejects_unbound_or_invalid_sessions(
     db_session, test_project, stub_decision, safe_effectiveness_review_continue, failure
 ):
@@ -2031,22 +2031,22 @@ async def test_outcome_verification_rejects_unbound_or_invalid_sessions(
         action.request = {**action.request, "gate_id": str(uuid.uuid4())}
     elif failure == "wrong_source":
         action.request = {**action.request, "source_task_id": str(uuid.uuid4())}
-    elif failure == "protocol":
-        protocol = Protocol(project_id=test_project.id, name=f"bad-{uuid.uuid4()}", description="", definition={}, triggers=[])
-        db_session.add(protocol)
+    elif failure == "graph":
+        graph = Graph(project_id=test_project.id, name=f"bad-{uuid.uuid4()}", description="", definition={}, triggers=[])
+        db_session.add(graph)
         await db_session.flush()
-        instance = ProtocolInstance(protocol_id=protocol.id, project_id=test_project.id,
-                                    linked_task_id=verification_task.id, current_state="done", status="completed")
+        instance = GraphRun(graph_id=graph.id, project_id=test_project.id,
+                                    linked_task_id=verification_task.id, current_node="done", status="completed")
         db_session.add(instance)
         await db_session.flush()
-        verification_task.protocol_instance_id = instance.id
+        verification_task.graph_run_id = instance.id
     agent_id = producer.id if failure == "wrong_agent" else verifier.id
     output = "not-json" if failure == "malformed" else json.dumps({
         "status": "done", "verdict": "accepted", "evidence": ["Independent evidence."],
     })
     session = await _complete_task_session(
         db_session, test_project.id, verification_task, agent_id, output,
-        protocol_instance_id=None,
+        graph_run_id=None,
     )
     if failure == "stale":
         db_session.add(Session(task_id=verification_task.id, agent_id=verifier.id, project_id=test_project.id,

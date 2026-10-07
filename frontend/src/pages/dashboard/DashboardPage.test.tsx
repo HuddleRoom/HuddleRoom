@@ -40,8 +40,8 @@ vi.mock('@/api/meetings', () => ({
   useMeetingCount: () => ({ data: undefined, isLoading: false, isError: false }),
 }))
 
-vi.mock('@/api/protocols', () => ({
-  useProtocolInstanceCount: () => ({ data: undefined, isLoading: false, isError: false }),
+vi.mock('@/api/graphs', () => ({
+  useGraphRunCount: () => ({ data: undefined, isLoading: false, isError: false }),
 }))
 
 vi.mock('@/api/events', () => ({

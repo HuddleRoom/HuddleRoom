@@ -33,15 +33,15 @@ function isProjectQuery(query: Query, projectId: string) {
   }
   if (prefix === 'knowledge-item') return second === projectId
   if (prefix === 'memory') return second === 'project' && third === projectId
-  if (prefix === 'tasks' || prefix === 'meetings' || prefix === 'protocol-instances' || prefix === 'sessions') {
+  if (prefix === 'tasks' || prefix === 'meetings' || prefix === 'graph-runs' || prefix === 'sessions') {
     return (second === 'count' ? third : second) === projectId
   }
-  if (prefix === 'task' || prefix === 'protocol-instance') {
-    return (second === 'subtasks' || second === 'sessions' || second === 'transitions' ? third : second) === projectId
+  if (prefix === 'task' || prefix === 'graph-run') {
+    return (second === 'subtasks' || second === 'sessions' || second === 'steps' ? third : second) === projectId
   }
   return [
     'project', 'events', 'hooks', 'knowledge', 'optimizations', 'patterns', 'pattern',
-    'orchestration-goals', 'orchestration-goal', 'protocols', 'protocol', 'rules',
+    'orchestration-goals', 'orchestration-goal', 'graphs', 'graph', 'rules',
   ].includes(String(prefix)) && second === projectId
 }
 

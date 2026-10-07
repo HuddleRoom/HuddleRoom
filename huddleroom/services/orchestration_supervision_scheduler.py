@@ -22,7 +22,7 @@ from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.meeting import Meeting
-from huddleroom.models.protocol import ProtocolInstance
+from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
 
 
@@ -31,8 +31,8 @@ SUPPORTED_EVENTS = frozenset({
     "session.completed", "session.failed", "session.cancelled", "session.resumed",
     "authority.decision_resolved", "artifact.created", "artifact.content_changed",
     "artifact.breaking_change", "meeting.scheduled",
-    "meeting.concluded", "protocol.completed", "protocol.failed",
-    "protocol.state_transitioned", "orchestration.run_completed",
+    "meeting.concluded", "graph.run_completed", "graph.run_failed",
+    "graph.run_advanced", "orchestration.run_completed",
     "orchestration.steering_changed",
 })
 
@@ -286,7 +286,7 @@ class OrchestrationSupervisionScheduler:
         for key, model, task_attr in (
             ("artifact_id", Artifact, "linked_task_id"),
             ("meeting_id", Meeting, "source_task_id"),
-            ("protocol_instance_id", ProtocolInstance, "linked_task_id"),
+            ("graph_run_id", GraphRun, "linked_task_id"),
         ):
             try:
                 value = payload.get(key)

@@ -15,7 +15,7 @@ from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.models.user import User
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.schemas.agent import AgentCreate, AgentUpdate
 from huddleroom.schemas.channel import ChannelCreate
 from huddleroom.schemas.knowledge import KnowledgeCreate
@@ -771,15 +771,15 @@ async def test_session_create_unknown_agent(db_session: AsyncSession, runnable_p
 
 
 @pytest.mark.asyncio
-async def test_session_create_rejects_unknown_protocol_instance(
+async def test_session_create_rejects_unknown_graph_run(
     db_session: AsyncSession, runnable_project, test_agent
 ):
-    """protocol_instance_id must reference an existing instance in the same project."""
+    """graph_run_id must reference an existing run in the same project."""
     svc = SessionService()
     data = SessionCreate(
         agent_id=test_agent.id,
         project_id=runnable_project.id,
-        protocol_instance_id=uuid.uuid4(),
+        graph_run_id=uuid.uuid4(),
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -789,33 +789,33 @@ async def test_session_create_rejects_unknown_protocol_instance(
 
 
 @pytest.mark.asyncio
-async def test_session_create_rejects_mismatched_protocol_task(
+async def test_session_create_rejects_mismatched_graph_task(
     db_session: AsyncSession, runnable_project, test_agent
 ):
-    """protocol_instance_id must match the requested task when both are supplied."""
-    proto = Protocol(project_id=None, name="session-validation", version="1.0", definition={}, triggers=[])
+    """graph_run_id must match the requested task when both are supplied."""
+    graph = Graph(project_id=None, name="session-validation", version="1.0", definition={}, triggers=[])
     linked_task = Task(project_id=runnable_project.id, title="Linked task")
     other_task = Task(project_id=runnable_project.id, title="Other task")
-    db_session.add_all([proto, linked_task, other_task])
+    db_session.add_all([graph, linked_task, other_task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=graph.id,
         project_id=runnable_project.id,
         linked_task_id=linked_task.id,
-        current_state="waiting",
+        current_node="waiting",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     data = SessionCreate(
         agent_id=test_agent.id,
         task_id=other_task.id,
         project_id=runnable_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -825,37 +825,37 @@ async def test_session_create_rejects_mismatched_protocol_task(
 
 
 @pytest.mark.asyncio
-async def test_session_create_rejects_task_from_different_protocol_instance(
+async def test_session_create_rejects_task_from_different_graph_run(
     db_session: AsyncSession, runnable_project, test_agent
 ):
-    """an unlinked protocol instance can only create sessions for its own child tasks."""
-    proto = Protocol(project_id=None, name="session-validation-child", version="1.0", definition={}, triggers=[])
-    db_session.add(proto)
+    """an unlinked graph run can only create sessions for its own child tasks."""
+    graph = Graph(project_id=None, name="session-validation-child", version="1.0", definition={}, triggers=[])
+    db_session.add(graph)
     await db_session.flush()
 
-    target_instance = ProtocolInstance(
-        protocol_id=proto.id,
+    target_run = GraphRun(
+        graph_id=graph.id,
         project_id=runnable_project.id,
-        current_state="waiting",
+        current_node="waiting",
         status="active",
         actor_assignments={},
         context={},
     )
-    other_instance = ProtocolInstance(
-        protocol_id=proto.id,
+    other_run = GraphRun(
+        graph_id=graph.id,
         project_id=runnable_project.id,
-        current_state="waiting",
+        current_node="waiting",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add_all([target_instance, other_instance])
+    db_session.add_all([target_run, other_run])
     await db_session.flush()
 
     other_task = Task(
         project_id=runnable_project.id,
-        title="Other protocol child task",
-        protocol_instance_id=other_instance.id,
+        title="Other graph child task",
+        graph_run_id=other_run.id,
     )
     db_session.add(other_task)
     await db_session.flush()
@@ -864,7 +864,7 @@ async def test_session_create_rejects_task_from_different_protocol_instance(
         agent_id=test_agent.id,
         task_id=other_task.id,
         project_id=runnable_project.id,
-        protocol_instance_id=target_instance.id,
+        graph_run_id=target_run.id,
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -874,59 +874,59 @@ async def test_session_create_rejects_task_from_different_protocol_instance(
 
 
 @pytest.mark.asyncio
-async def test_session_create_accepts_matching_protocol_task(
+async def test_session_create_accepts_matching_graph_task(
     db_session: AsyncSession, runnable_project, test_agent
 ):
-    """valid protocol_instance_id/task_id pairs are persisted on the session."""
-    proto = Protocol(project_id=None, name="session-validation-ok", version="1.0", definition={}, triggers=[])
+    """valid graph_run_id/task_id pairs are persisted on the session."""
+    graph = Graph(project_id=None, name="session-validation-ok", version="1.0", definition={}, triggers=[])
     task = Task(project_id=runnable_project.id, title="Linked task")
-    db_session.add_all([proto, task])
+    db_session.add_all([graph, task])
     await db_session.flush()
 
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=graph.id,
         project_id=runnable_project.id,
         linked_task_id=task.id,
-        current_state="waiting",
+        current_node="waiting",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
 
     data = SessionCreate(
         agent_id=test_agent.id,
         task_id=task.id,
         project_id=runnable_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
     )
     with patch("huddleroom.workers.task_runner.dispatch_session", new=AsyncMock(return_value="fake-task-id")):
         session = await SessionService().create(db_session, data)
 
-    assert session.protocol_instance_id == instance.id
+    assert session.graph_run_id == run.id
 
 
 @pytest.mark.asyncio
-async def test_session_response_includes_protocol_instance_id(db_session: AsyncSession, test_project, test_agent):
-    """SessionResponse exposes protocol linkage to API callers."""
-    proto = Protocol(project_id=None, name="session-response", version="1.0", definition={}, triggers=[])
-    db_session.add(proto)
+async def test_session_response_includes_graph_run_id(db_session: AsyncSession, test_project, test_agent):
+    """SessionResponse exposes graph run linkage to API callers."""
+    graph = Graph(project_id=None, name="session-response", version="1.0", definition={}, triggers=[])
+    db_session.add(graph)
     await db_session.flush()
-    instance = ProtocolInstance(
-        protocol_id=proto.id,
+    run = GraphRun(
+        graph_id=graph.id,
         project_id=test_project.id,
-        current_state="waiting",
+        current_node="waiting",
         status="active",
         actor_assignments={},
         context={},
     )
-    db_session.add(instance)
+    db_session.add(run)
     await db_session.flush()
     raw_session = Session(
         agent_id=test_agent.id,
         project_id=test_project.id,
-        protocol_instance_id=instance.id,
+        graph_run_id=run.id,
         adapter_type="api",
         status="pending",
         input_context={},
@@ -937,7 +937,7 @@ async def test_session_response_includes_protocol_instance_id(db_session: AsyncS
 
     response = SessionResponse.model_validate(raw_session)
 
-    assert response.protocol_instance_id == instance.id
+    assert response.graph_run_id == run.id
 
 
 @pytest.mark.asyncio

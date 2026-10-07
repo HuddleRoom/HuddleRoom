@@ -29,6 +29,6 @@ The suite runs in the supported local, unauthenticated mode. The seed helper cre
 
 ## Coverage Model
 
-Workflow specs cover navigation, dashboard quick actions, tasks, agents, meetings, protocols, knowledge, memory, rules, hooks, optimizations, and settings.
+Workflow specs cover navigation, dashboard quick actions, tasks, agents, meetings, graphs, knowledge, memory, rules, hooks, optimizations, and settings.
 
 `support/control-map.ts` is the explicit inventory of visible, meaningful controls per primary route. Update it in the same change that adds, removes, or renames user-facing controls.

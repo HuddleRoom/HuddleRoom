@@ -118,7 +118,7 @@ async def create_meeting(
         scheduled_at=body.scheduled_at,
         created_by_user_id=current_user.id,
         source_task_id=body.source_task_id,
-        source_protocol_instance_id=body.source_protocol_instance_id,
+        source_graph_run_id=body.source_graph_run_id,
         organizer_agent_id=body.organizer_agent_id,
         organizer_user_id=body.organizer_user_id,
         planner_agent_id=body.planner_agent_id,
@@ -591,7 +591,7 @@ async def add_agenda_item(
         turn_order=[str(t) for t in body.turn_order] if body.turn_order else None,
         max_rounds=body.max_rounds,
         requires_approval=body.requires_approval,
-        creates_protocol=body.creates_protocol,
+        creates_graph=body.creates_graph,
     )
     db.add(item)
     await db.flush()

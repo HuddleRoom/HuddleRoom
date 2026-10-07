@@ -18,8 +18,8 @@ class _StubBus:
 
 
 @pytest.mark.asyncio
-async def test_run_protocol_engine_processes_events(monkeypatch, test_project):
-    from huddleroom.workers.consumers import protocol_engine as consumer
+async def test_run_graph_engine_processes_events(monkeypatch, test_project):
+    from huddleroom.workers.consumers import graph_engine as consumer
 
     event = BusEvent(
         id=uuid.uuid4(),
@@ -38,17 +38,17 @@ async def test_run_protocol_engine_processes_events(monkeypatch, test_project):
             processed.append((db, bus_event))
 
     monkeypatch.setattr(consumer, "get_event_bus", lambda: _StubBus([event]))
-    monkeypatch.setattr(consumer, "ProtocolEngineService", StubEngine)
+    monkeypatch.setattr(consumer, "GraphEngineService", StubEngine)
 
-    await consumer.run_protocol_engine()
+    await consumer.run_graph_engine()
 
     assert len(processed) == 1
     assert processed[0][1] == event
 
 
 @pytest.mark.asyncio
-async def test_run_protocol_engine_reraises_cancelled_error(monkeypatch, test_project):
-    from huddleroom.workers.consumers import protocol_engine as consumer
+async def test_run_graph_engine_reraises_cancelled_error(monkeypatch, test_project):
+    from huddleroom.workers.consumers import graph_engine as consumer
 
     event = BusEvent(
         id=uuid.uuid4(),
@@ -66,15 +66,15 @@ async def test_run_protocol_engine_reraises_cancelled_error(monkeypatch, test_pr
             raise asyncio.CancelledError()
 
     monkeypatch.setattr(consumer, "get_event_bus", lambda: _StubBus([event]))
-    monkeypatch.setattr(consumer, "ProtocolEngineService", StubEngine)
+    monkeypatch.setattr(consumer, "GraphEngineService", StubEngine)
 
     with pytest.raises(asyncio.CancelledError):
-        await consumer.run_protocol_engine()
+        await consumer.run_graph_engine()
 
 
 @pytest.mark.asyncio
-async def test_run_protocol_engine_logs_and_continues_after_error(monkeypatch, caplog, test_project):
-    from huddleroom.workers.consumers import protocol_engine as consumer
+async def test_run_graph_engine_logs_and_continues_after_error(monkeypatch, caplog, test_project):
+    from huddleroom.workers.consumers import graph_engine as consumer
 
     events = [
         BusEvent(
@@ -104,9 +104,9 @@ async def test_run_protocol_engine_logs_and_continues_after_error(monkeypatch, c
                 raise RuntimeError("boom")
 
     monkeypatch.setattr(consumer, "get_event_bus", lambda: _StubBus(events))
-    monkeypatch.setattr(consumer, "ProtocolEngineService", StubEngine)
+    monkeypatch.setattr(consumer, "GraphEngineService", StubEngine)
 
-    await consumer.run_protocol_engine()
+    await consumer.run_graph_engine()
 
     assert processed == ["code.pr_opened", "test.passed"]
-    assert "protocol_engine error processing code.pr_opened" in caplog.text
+    assert "graph_engine error processing code.pr_opened" in caplog.text

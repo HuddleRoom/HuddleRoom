@@ -33,12 +33,12 @@
         .task-card { background: #16213e; border: 1px solid #0f3460; border-radius: 3px; padding: 8px; margin: 4px 0; cursor: pointer; }
         .task-card:hover { border-color: #a8dadc; }
 
-        /* Protocols / artifacts */
+        /* Graphs / artifacts */
         .panel-empty { color: #666; font-size: 12px; padding: 8px 0; }
         .panel-error { color: #ef5350; font-size: 12px; padding: 8px 0; }
-        .protocol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
-        .protocol-card { background: #16213e; border: 1px solid #0f3460; border-radius: 4px; padding: 10px; }
-        .protocol-card .meta { color: #666; font-size: 11px; margin-top: 4px; }
+        .graph-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+        .graph-card { background: #16213e; border: 1px solid #0f3460; border-radius: 4px; padding: 10px; }
+        .graph-card .meta { color: #666; font-size: 11px; margin-top: 4px; }
         .artifact-inventory td { vertical-align: top; }
         .artifact-muted { color: #666; font-size: 11px; }
 
@@ -143,8 +143,8 @@
     </section>
 
     <section>
-        <h2>Protocols</h2>
-        <div class="protocol-grid" id="protocols-panel">Loading...</div>
+        <h2>Graphs</h2>
+        <div class="graph-grid" id="graphs-panel">Loading...</div>
     </section>
 
     <section>
@@ -582,7 +582,7 @@ async function createAgent() {
 }
 
 async function refreshAll() {
-    await Promise.all([loadAgents(), loadTasks(), loadProtocolInstances(), loadArtifacts(), loadSessions(), loadMeetings()]);
+    await Promise.all([loadAgents(), loadTasks(), loadGraphRuns(), loadArtifacts(), loadSessions(), loadMeetings()]);
 }
 
 async function loadAgents() {
@@ -650,35 +650,35 @@ async function loadTasks() {
     } catch (e) { console.error('Tasks load failed:', e); }
 }
 
-async function loadProtocolInstances() {
-    const panel = document.getElementById('protocols-panel');
+async function loadGraphRuns() {
+    const panel = document.getElementById('graphs-panel');
     if (!currentProjectId) {
         panel.innerHTML = '<div class="panel-empty">Select a project</div>';
         return;
     }
     try {
-        const data = await apiFetch(`/api/v1/projects/${currentProjectId}/protocol-instances`);
+        const data = await apiFetch(`/api/v1/projects/${currentProjectId}/graph-runs`);
         panel.innerHTML = '';
         if (!data || data.length === 0) {
-            panel.innerHTML = '<div class="panel-empty">No protocol instances</div>';
+            panel.innerHTML = '<div class="panel-empty">No graph runs</div>';
             return;
         }
-        data.forEach(instance => {
+        data.forEach(run => {
             const card = document.createElement('div');
-            card.className = 'protocol-card';
-            const linked = instance.linked_task_id ? `Task ${esc(instance.linked_task_id.slice(0, 8))}` : 'No task';
-            const artifact = instance.artifact_id ? `Artifact ${esc(instance.artifact_id.slice(0, 8))}` : 'No artifact';
+            card.className = 'graph-card';
+            const linked = run.linked_task_id ? `Task ${esc(run.linked_task_id.slice(0, 8))}` : 'No task';
+            const artifact = run.artifact_id ? `Artifact ${esc(run.artifact_id.slice(0, 8))}` : 'No artifact';
             card.innerHTML = `
-                <strong>${esc(instance.current_state)}</strong>
-                <div><span style="color:#666">Status:</span> ${esc(instance.status)}</div>
+                <strong>${esc(run.current_node)}</strong>
+                <div><span style="color:#666">Status:</span> ${esc(run.status)}</div>
                 <div class="meta">${linked} · ${artifact}</div>
-                <div class="meta">Protocol ${esc(instance.protocol_id.slice(0, 8))}</div>
+                <div class="meta">Graph ${esc(run.graph_id.slice(0, 8))}</div>
             `;
             panel.appendChild(card);
         });
     } catch (e) {
-        console.error('Protocol instances load failed:', e);
-        panel.innerHTML = '<div class="panel-error">Failed to load protocol instances</div>';
+        console.error('Graph runs load failed:', e);
+        panel.innerHTML = '<div class="panel-error">Failed to load graph runs</div>';
     }
 }
 
@@ -1026,8 +1026,8 @@ function connectEventStream(projectId) {
     if (eventTypeName === 'task.status_changed' || eventTypeName === 'task.created' || eventTypeName === 'task.assigned') {
       loadTasks();
     }
-    if (eventTypeName === 'task.status_changed' || eventTypeName.startsWith('protocol.')) {
-      loadProtocolInstances();
+    if (eventTypeName === 'task.status_changed' || eventTypeName.startsWith('graph.')) {
+      loadGraphRuns();
     }
     if (eventTypeName.startsWith('artifact.')) {
       loadArtifacts();

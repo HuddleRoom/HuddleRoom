@@ -12,18 +12,18 @@ from huddleroom.models.agent import Agent
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.meeting import Meeting, MeetingAgendaItem, MeetingDecision
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationEvidence, OrchestrationGate
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTimeout, ProtocolTransition
+from huddleroom.models.graph import Graph, GraphRun, GraphRunTimeout, GraphRunStep
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_service import OrchestrationService
-from huddleroom.services.protocol_engine import ProtocolEngineService
+from huddleroom.services.graph_engine import GraphEngineService
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _runnable_protocol_project(db_session, test_project, tmp_path):
-    workspace = tmp_path / "protocol-workspace"
+async def _runnable_graph_project(db_session, test_project, tmp_path):
+    workspace = tmp_path / "graph-workspace"
     workspace.mkdir()
     test_project.workspace_path = str(workspace.resolve())
     await db_session.flush()
@@ -95,13 +95,13 @@ async def _make_orchestrated_task(
     task = Task(
         project_id=project_id,
         title="Resolve coordination blocker",
-        description="Work linked to a meeting protocol gate.",
+        description="Work linked to a meeting graph gate.",
         status=status,
         assigned_to=agent_id,
         started_at=datetime.now(timezone.utc),
         metadata_={
             "orchestration": {
-                "goal_id": "meeting-protocol-goal",
+                "goal_id": "meeting-graph-goal",
                 "run_id": str(run_id),
                 "action_id": str(uuid.uuid4()),
                 "work_function": "validation",
@@ -335,37 +335,37 @@ async def test_schedule_meeting_action_respects_paused_run(db_session, test_proj
     ) == 0
 
 
-async def _protocol(db_session, project_id) -> Protocol:
-    protocol = Protocol(
+async def _graph(db_session, project_id) -> Graph:
+    graph = Graph(
         project_id=project_id,
-        name=f"meeting-protocol-review-{uuid.uuid4()}",
+        name=f"meeting-graph-review-{uuid.uuid4()}",
         version="1.0",
         definition={
-            "initial_state": "pending",
-            "states": {
+            "start_node": "pending",
+            "nodes": {
                 "pending": {
                     "timeout": {"duration": "1h", "action": "escalate"},
-                    "transitions": [],
+                    "edges": [],
                 },
-                "reviewed": {"transitions": []},
+                "reviewed": {"edges": []},
             },
-            "terminal_states": {"success": [], "failure": []},
+            "terminal_nodes": {"success": [], "failure": []},
         },
         triggers=[],
         is_active=True,
     )
-    db_session.add(protocol)
+    db_session.add(graph)
     await db_session.flush()
-    return protocol
+    return graph
 
 
 @pytest.mark.asyncio
-async def test_start_protocol_action_uses_engine_and_replays_once(db_session, test_project):
+async def test_start_graph_action_uses_engine_and_replays_once(db_session, test_project):
     validator = _agent("validator", "validator", ["validation"])
     db_session.add(validator)
     await db_session.flush()
     service, _goal, run = await _make_run(db_session, test_project.id)
-    gate = await _make_gate(db_session, run.id, "protocol_transition")
+    gate = await _make_gate(db_session, run.id, "graph_run_step")
     task = await _make_orchestrated_task(
         db_session,
         test_project.id,
@@ -374,22 +374,22 @@ async def test_start_protocol_action_uses_engine_and_replays_once(db_session, te
         validator.id,
         status="in_progress",
     )
-    protocol = await _protocol(db_session, test_project.id)
+    graph = await _graph(db_session, test_project.id)
     request = {
-        "action_type": "start_protocol",
-        "protocol_id": str(protocol.id),
+        "action_type": "start_graph",
+        "graph_id": str(graph.id),
         "subject_type": "task",
         "subject_id": str(task.id),
     }
-    key = f"run:{run.id}:kind:start_protocol:protocol:{protocol.id}:task:{task.id}"
+    key = f"run:{run.id}:kind:start_graph:graph:{graph.id}:task:{task.id}"
 
-    first = await service.execute_start_protocol_action(
+    first = await service.execute_start_graph_action(
         db_session,
         run_id=run.id,
         request=request,
         idempotency_key=key,
     )
-    second = await service.execute_start_protocol_action(
+    second = await service.execute_start_graph_action(
         db_session,
         run_id=run.id,
         request=request,
@@ -398,32 +398,32 @@ async def test_start_protocol_action_uses_engine_and_replays_once(db_session, te
 
     assert first.id == second.id
     assert first.status == "completed"
-    assert first.target_type == "protocol_instance"
-    instance = await db_session.get(ProtocolInstance, first.target_id)
-    assert instance is not None
-    assert instance.protocol_id == protocol.id
-    assert instance.linked_task_id == task.id
-    assert instance.current_state == "pending"
-    assert instance.triggering_event_id == first.id
-    transitions = list(
+    assert first.target_type == "graph_run"
+    run_instance = await db_session.get(GraphRun, first.target_id)
+    assert run_instance is not None
+    assert run_instance.graph_id == graph.id
+    assert run_instance.linked_task_id == task.id
+    assert run_instance.current_node == "pending"
+    assert run_instance.triggering_event_id == first.id
+    steps = list(
         (
             await db_session.execute(
-                select(ProtocolTransition).where(ProtocolTransition.protocol_instance_id == instance.id)
+                select(GraphRunStep).where(GraphRunStep.graph_run_id == run_instance.id)
             )
         ).scalars().all()
     )
-    assert len(transitions) == 1
-    assert transitions[0].from_state == ""
-    assert transitions[0].to_state == "pending"
+    assert len(steps) == 1
+    assert steps[0].from_node == ""
+    assert steps[0].to_node == "pending"
     assert await db_session.scalar(
-        select(func.count(ProtocolTimeout.id)).where(ProtocolTimeout.protocol_instance_id == instance.id)
+        select(func.count(GraphRunTimeout.id)).where(GraphRunTimeout.graph_run_id == run_instance.id)
     ) == 1
-    assert await db_session.scalar(select(func.count(ProtocolInstance.id))) == 1
-    assert len(await _events(db_session, test_project.id, "protocol.instance_started")) == 1
+    assert await db_session.scalar(select(func.count(GraphRun.id))) == 1
+    assert len(await _events(db_session, test_project.id, "graph.run_started")) == 1
     orchestration_events = await _events(
         db_session,
         test_project.id,
-        "orchestration.protocol_started",
+        "orchestration.graph_started",
     )
     assert len(orchestration_events) == 1
     assert orchestration_events[0].payload["gate_id"] == str(gate.id)
@@ -433,7 +433,7 @@ async def test_start_protocol_action_uses_engine_and_replays_once(db_session, te
 
 
 @pytest.mark.asyncio
-async def test_start_protocol_action_rejects_unrunnable_project_before_reservation(db_session, test_project):
+async def test_start_graph_action_rejects_unrunnable_project_before_reservation(db_session, test_project):
     """Moving the guard after reservation would persist a failed action for a rejected execution."""
     validator = _agent("validator", "validator", ["validation"])
     db_session.add(validator)
@@ -441,7 +441,7 @@ async def test_start_protocol_action_rejects_unrunnable_project_before_reservati
     service, _goal, run = await _make_run(db_session, test_project.id)
     test_project.workspace_path = None
     await db_session.flush()
-    gate = await _make_gate(db_session, run.id, "protocol_transition")
+    gate = await _make_gate(db_session, run.id, "graph_run_step")
     task = await _make_orchestrated_task(
         db_session,
         test_project.id,
@@ -450,23 +450,23 @@ async def test_start_protocol_action_rejects_unrunnable_project_before_reservati
         validator.id,
         status="in_progress",
     )
-    protocol = await _protocol(db_session, test_project.id)
+    graph = await _graph(db_session, test_project.id)
     counts_before = {
         model: await db_session.scalar(select(func.count(model.id)))
-        for model in (OrchestrationAction, ProtocolInstance, Session, Task, EventLog)
+        for model in (OrchestrationAction, GraphRun, Session, Task, EventLog)
     }
 
     with pytest.raises(HTTPException) as exc:
-        await service.execute_start_protocol_action(
+        await service.execute_start_graph_action(
             db_session,
             run_id=run.id,
             request={
-                "action_type": "start_protocol",
-                "protocol_id": str(protocol.id),
+                "action_type": "start_graph",
+                "graph_id": str(graph.id),
                 "subject_type": "task",
                 "subject_id": str(task.id),
             },
-            idempotency_key=f"run:{run.id}:kind:start_protocol:unrunnable:{task.id}",
+            idempotency_key=f"run:{run.id}:kind:start_graph:unrunnable:{task.id}",
         )
 
     assert exc.value.status_code == 409
@@ -484,7 +484,7 @@ async def test_start_protocol_action_rejects_unrunnable_project_before_reservati
 
 
 @pytest.mark.asyncio
-async def test_start_protocol_action_rejects_subject_outside_run(db_session, test_project):
+async def test_start_graph_action_rejects_subject_outside_run(db_session, test_project):
     validator = _agent("validator", "validator", ["validation"])
     db_session.add(validator)
     await db_session.flush()
@@ -498,25 +498,25 @@ async def test_start_protocol_action_rejects_subject_outside_run(db_session, tes
         metadata_={},
     )
     db_session.add(unrelated)
-    protocol = await _protocol(db_session, test_project.id)
+    graph = await _graph(db_session, test_project.id)
     await db_session.flush()
 
     with pytest.raises(HTTPException) as exc:
-        await service.execute_start_protocol_action(
+        await service.execute_start_graph_action(
             db_session,
             run_id=run.id,
             request={
-                "action_type": "start_protocol",
-                "protocol_id": str(protocol.id),
+                "action_type": "start_graph",
+                "graph_id": str(graph.id),
                 "subject_type": "task",
                 "subject_id": str(unrelated.id),
             },
-            idempotency_key=f"run:{run.id}:kind:start_protocol:unrelated:{unrelated.id}",
+            idempotency_key=f"run:{run.id}:kind:start_graph:unrelated:{unrelated.id}",
         )
 
     assert exc.value.status_code == 409
-    assert await db_session.scalar(select(func.count(ProtocolInstance.id))) == 0
-    actions = await _actions(db_session, run.id, "start_protocol")
+    assert await db_session.scalar(select(func.count(GraphRun.id))) == 0
+    actions = await _actions(db_session, run.id, "start_graph")
     assert len(actions) == 1
     assert actions[0].status == "failed"
 
@@ -595,12 +595,12 @@ async def test_concluded_meeting_decision_satisfies_configured_gate(db_session, 
 
 
 @pytest.mark.asyncio
-async def test_protocol_transition_records_exact_transition_evidence(db_session, test_project):
+async def test_graph_run_step_records_exact_edge_evidence(db_session, test_project):
     validator = _agent("validator", "validator", ["validation"])
     db_session.add(validator)
     await db_session.flush()
     service, _goal, run = await _make_run(db_session, test_project.id)
-    gate = await _make_gate(db_session, run.id, "protocol_transition")
+    gate = await _make_gate(db_session, run.id, "graph_run_step")
     task = await _make_orchestrated_task(
         db_session,
         test_project.id,
@@ -609,36 +609,36 @@ async def test_protocol_transition_records_exact_transition_evidence(db_session,
         validator.id,
         status="in_progress",
     )
-    protocol = await _protocol(db_session, test_project.id)
-    action = await service.execute_start_protocol_action(
+    graph = await _graph(db_session, test_project.id)
+    action = await service.execute_start_graph_action(
         db_session,
         run_id=run.id,
         request={
-            "action_type": "start_protocol",
-            "protocol_id": str(protocol.id),
+            "action_type": "start_graph",
+            "graph_id": str(graph.id),
             "subject_type": "task",
             "subject_id": str(task.id),
         },
-        idempotency_key=f"run:{run.id}:kind:start_protocol:protocol:{protocol.id}:task:{task.id}",
+        idempotency_key=f"run:{run.id}:kind:start_graph:graph:{graph.id}:task:{task.id}",
     )
-    instance = await db_session.get(ProtocolInstance, action.target_id)
+    run_instance = await db_session.get(GraphRun, action.target_id)
 
     before = await service.tick(db_session, run.id)
     assert before["evidence_created"] == 0
-    await ProtocolEngineService().advance_manually(
+    await GraphEngineService().advance_manually(
         db_session,
-        instance,
-        "reviewed",
+        run_instance,
+        to_node="reviewed",
         reason="Validation completed",
     )
-    transition = (
+    step = (
         await db_session.execute(
-            select(ProtocolTransition)
+            select(GraphRunStep)
             .where(
-                ProtocolTransition.protocol_instance_id == instance.id,
-                ProtocolTransition.to_state == "reviewed",
+                GraphRunStep.graph_run_id == run_instance.id,
+                GraphRunStep.to_node == "reviewed",
             )
-            .order_by(ProtocolTransition.transitioned_at.desc())
+            .order_by(GraphRunStep.stepped_at.desc())
         )
     ).scalar_one()
 
@@ -655,14 +655,14 @@ async def test_protocol_transition_records_exact_transition_evidence(db_session,
     assert result["evidence_created"] == 1
     assert gate.status == "accepted"
     assert len(evidence) == 1
-    assert evidence[0].source_type == "protocol_transition"
-    assert evidence[0].source_id == transition.id
-    assert evidence[0].evidence_metadata["protocol_transition_id"] == str(transition.id)
-    assert evidence[0].evidence_metadata["from_state"] == "pending"
-    assert evidence[0].evidence_metadata["to_state"] == "reviewed"
+    assert evidence[0].source_type == "graph_run_step"
+    assert evidence[0].source_id == step.id
+    assert evidence[0].evidence_metadata["graph_run_step_id"] == str(step.id)
+    assert evidence[0].evidence_metadata["from_node"] == "pending"
+    assert evidence[0].evidence_metadata["to_node"] == "reviewed"
 
 
-async def _start_protocol_for_evidence(db_session, project_id, required_source_type):
+async def _start_graph_for_evidence(db_session, project_id, required_source_type):
     validator = _agent("validator", "validator", ["validation"])
     db_session.add(validator)
     await db_session.flush()
@@ -676,49 +676,49 @@ async def _start_protocol_for_evidence(db_session, project_id, required_source_t
         validator.id,
         status="in_progress",
     )
-    protocol = await _protocol(db_session, project_id)
-    action = await service.execute_start_protocol_action(
+    graph = await _graph(db_session, project_id)
+    action = await service.execute_start_graph_action(
         db_session,
         run_id=run.id,
         request={
-            "action_type": "start_protocol",
-            "protocol_id": str(protocol.id),
+            "action_type": "start_graph",
+            "graph_id": str(graph.id),
             "subject_type": "task",
             "subject_id": str(task.id),
         },
-        idempotency_key=f"run:{run.id}:kind:start_protocol:protocol:{protocol.id}:task:{task.id}",
+        idempotency_key=f"run:{run.id}:kind:start_graph:graph:{graph.id}:task:{task.id}",
     )
-    instance = await db_session.get(ProtocolInstance, action.target_id)
+    run_instance = await db_session.get(GraphRun, action.target_id)
     await service.tick(db_session, run.id)
-    return service, run, gate, task, protocol, instance
+    return service, run, gate, task, graph, run_instance
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transition_id", [None, "not-a-uuid"], ids=["missing", "malformed"])
-async def test_protocol_state_transition_rejects_missing_or_malformed_transition_id(
+@pytest.mark.parametrize("step_id", [None, "not-a-uuid"], ids=["missing", "malformed"])
+async def test_graph_run_step_rejects_missing_or_malformed_step_id(
     db_session,
     test_project,
-    transition_id,
+    step_id,
 ):
-    service, run, gate, _task, protocol, instance = await _start_protocol_for_evidence(
+    service, run, gate, _task, graph, run_instance = await _start_graph_for_evidence(
         db_session,
         test_project.id,
-        "protocol_transition",
+        "graph_run_step",
     )
     payload = {
-        "protocol_instance_id": str(instance.id),
-        "protocol_name": protocol.name,
-        "from_state": "pending",
-        "to_state": "reviewed",
+        "graph_run_id": str(run_instance.id),
+        "graph_name": graph.name,
+        "from_node": "pending",
+        "to_node": "reviewed",
     }
-    if transition_id is not None:
-        payload["protocol_transition_id"] = transition_id
+    if step_id is not None:
+        payload["graph_run_step_id"] = step_id
     await emit_event_once(
         db_session,
         test_project.id,
-        "protocol.state_transitioned",
+        "graph.run_advanced",
         payload,
-        dedup_key=f"phase16-invalid-transition:{instance.id}:{transition_id}",
+        dedup_key=f"phase16-invalid-step:{run_instance.id}:{step_id}",
     )
 
     result = await service.tick(db_session, run.id)
@@ -730,40 +730,40 @@ async def test_protocol_state_transition_rejects_missing_or_malformed_transition
 
 
 @pytest.mark.asyncio
-async def test_protocol_state_transition_rejects_transition_owned_by_another_instance(db_session, test_project):
-    service, run, gate, task, protocol, instance = await _start_protocol_for_evidence(
+async def test_graph_run_step_rejects_step_owned_by_another_run(db_session, test_project):
+    service, run, gate, task, graph, run_instance = await _start_graph_for_evidence(
         db_session,
         test_project.id,
-        "protocol_transition",
+        "graph_run_step",
     )
-    foreign_instance = ProtocolInstance(
-        protocol_id=protocol.id,
+    foreign_run = GraphRun(
+        graph_id=graph.id,
         project_id=test_project.id,
         linked_task_id=task.id,
-        current_state="reviewed",
+        current_node="reviewed",
         context={},
     )
-    db_session.add(foreign_instance)
+    db_session.add(foreign_run)
     await db_session.flush()
-    foreign_transition = ProtocolTransition(
-        protocol_instance_id=foreign_instance.id,
-        from_state="pending",
-        to_state="reviewed",
+    foreign_step = GraphRunStep(
+        graph_run_id=foreign_run.id,
+        from_node="pending",
+        to_node="reviewed",
     )
-    db_session.add(foreign_transition)
+    db_session.add(foreign_step)
     await db_session.flush()
     await emit_event_once(
         db_session,
         test_project.id,
-        "protocol.state_transitioned",
+        "graph.run_advanced",
         {
-            "protocol_instance_id": str(instance.id),
-            "protocol_transition_id": str(foreign_transition.id),
-            "protocol_name": protocol.name,
-            "from_state": "pending",
-            "to_state": "reviewed",
+            "graph_run_id": str(run_instance.id),
+            "graph_run_step_id": str(foreign_step.id),
+            "graph_name": graph.name,
+            "from_node": "pending",
+            "to_node": "reviewed",
         },
-        dedup_key=f"phase16-foreign-transition:{instance.id}:{foreign_transition.id}",
+        dedup_key=f"phase16-foreign-step:{run_instance.id}:{foreign_step.id}",
     )
 
     result = await service.tick(db_session, run.id)
@@ -775,35 +775,35 @@ async def test_protocol_state_transition_rejects_transition_owned_by_another_ins
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("include_transition_id", [False, True], ids=["legacy-omitted", "owned"])
-async def test_terminal_protocol_evidence_keeps_instance_source(
+@pytest.mark.parametrize("include_step_id", [False, True], ids=["legacy-omitted", "owned"])
+async def test_terminal_graph_evidence_keeps_run_source(
     db_session,
     test_project,
-    include_transition_id,
+    include_step_id,
 ):
-    service, run, gate, _task, protocol, instance = await _start_protocol_for_evidence(
+    service, run, gate, _task, graph, run_instance = await _start_graph_for_evidence(
         db_session,
         test_project.id,
-        "protocol_instance",
+        "graph_run",
     )
-    transition = (
+    step = (
         await db_session.execute(
-            select(ProtocolTransition).where(ProtocolTransition.protocol_instance_id == instance.id)
+            select(GraphRunStep).where(GraphRunStep.graph_run_id == run_instance.id)
         )
     ).scalar_one()
-    instance.status = "completed"
+    run_instance.status = "completed"
     payload = {
-        "protocol_instance_id": str(instance.id),
-        "protocol_name": protocol.name,
+        "graph_run_id": str(run_instance.id),
+        "graph_name": graph.name,
     }
-    if include_transition_id:
-        payload["protocol_transition_id"] = str(transition.id)
+    if include_step_id:
+        payload["graph_run_step_id"] = str(step.id)
     await emit_event_once(
         db_session,
         test_project.id,
-        "protocol.completed",
+        "graph.run_completed",
         payload,
-        dedup_key=f"phase16-terminal-source:{instance.id}:{include_transition_id}",
+        dedup_key=f"phase16-terminal-source:{run_instance.id}:{include_step_id}",
     )
 
     result = await service.tick(db_session, run.id)
@@ -817,63 +817,63 @@ async def test_terminal_protocol_evidence_keeps_instance_source(
     )
     assert result["evidence_created"] == 1
     assert len(evidence) == 1
-    assert evidence[0].source_type == "protocol_instance"
-    assert evidence[0].source_id == instance.id
-    assert evidence[0].evidence_metadata["protocol_transition_id"] == (
-        str(transition.id) if include_transition_id else None
+    assert evidence[0].source_type == "graph_run"
+    assert evidence[0].source_id == run_instance.id
+    assert evidence[0].evidence_metadata["graph_run_step_id"] == (
+        str(step.id) if include_step_id else None
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("event_type", "transition_identity"),
+    ("event_type", "step_identity"),
     [
-        ("protocol.completed", "foreign"),
-        ("protocol.failed", "foreign"),
-        ("protocol.completed", "malformed"),
+        ("graph.run_completed", "foreign"),
+        ("graph.run_failed", "foreign"),
+        ("graph.run_completed", "malformed"),
     ],
 )
-async def test_terminal_protocol_evidence_rejects_invalid_transition_identity(
+async def test_terminal_graph_evidence_rejects_invalid_step_identity(
     db_session,
     test_project,
     event_type,
-    transition_identity,
+    step_identity,
 ):
-    service, run, gate, task, protocol, instance = await _start_protocol_for_evidence(
+    service, run, gate, task, graph, run_instance = await _start_graph_for_evidence(
         db_session,
         test_project.id,
-        "protocol_instance",
+        "graph_run",
     )
-    if transition_identity == "foreign":
-        foreign_instance = ProtocolInstance(
-            protocol_id=protocol.id,
+    if step_identity == "foreign":
+        foreign_run = GraphRun(
+            graph_id=graph.id,
             project_id=test_project.id,
             linked_task_id=task.id,
-            current_state="reviewed",
+            current_node="reviewed",
             context={},
         )
-        db_session.add(foreign_instance)
+        db_session.add(foreign_run)
         await db_session.flush()
-        foreign_transition = ProtocolTransition(
-            protocol_instance_id=foreign_instance.id,
-            from_state="pending",
-            to_state="reviewed",
+        foreign_step = GraphRunStep(
+            graph_run_id=foreign_run.id,
+            from_node="pending",
+            to_node="reviewed",
         )
-        db_session.add(foreign_transition)
+        db_session.add(foreign_step)
         await db_session.flush()
-        transition_id = str(foreign_transition.id)
+        step_id = str(foreign_step.id)
     else:
-        transition_id = "not-a-uuid"
+        step_id = "not-a-uuid"
     await emit_event_once(
         db_session,
         test_project.id,
         event_type,
         {
-            "protocol_instance_id": str(instance.id),
-            "protocol_transition_id": transition_id,
-            "protocol_name": protocol.name,
+            "graph_run_id": str(run_instance.id),
+            "graph_run_step_id": step_id,
+            "graph_name": graph.name,
         },
-        dedup_key=f"phase16-invalid-terminal-transition:{instance.id}:{event_type}:{transition_identity}",
+        dedup_key=f"phase16-invalid-terminal-step:{run_instance.id}:{event_type}:{step_identity}",
     )
 
     result = await service.tick(db_session, run.id)

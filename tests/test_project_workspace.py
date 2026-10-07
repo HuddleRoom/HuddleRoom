@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
-from huddleroom.models.protocol import Protocol, ProtocolInstance
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.schemas.project import ProjectCreate, ProjectUpdate
@@ -46,8 +46,8 @@ def test_workspace_paths_must_be_usable_directories(workspace_path: str):
         ("meeting", "preparing"),
         ("meeting", "active"),
         ("meeting", "concluding"),
-        ("protocol", "active"),
-        ("protocol", "paused"),
+        ("graph", "active"),
+        ("graph", "paused"),
         ("run", "running"),
         ("run", "blocked"),
         ("run", "paused"),
@@ -65,12 +65,12 @@ async def test_workspace_change_is_rejected_while_project_work_is_active(
         db_session.add(Meeting(
             project_id=legacy_project.id, title="Active work", meeting_type="decision", status=status,
         ))
-    elif work_type == "protocol":
-        protocol = Protocol(project_id=legacy_project.id, name="Protocol", definition={}, triggers=[])
-        db_session.add(protocol)
+    elif work_type == "graph":
+        graph = Graph(project_id=legacy_project.id, name="Graph", definition={}, triggers=[])
+        db_session.add(graph)
         await db_session.flush()
-        db_session.add(ProtocolInstance(
-            protocol_id=protocol.id, project_id=legacy_project.id, current_state="start", status=status,
+        db_session.add(GraphRun(
+            graph_id=graph.id, project_id=legacy_project.id, current_node="start", status=status,
         ))
     else:
         goal = OrchestrationGoal(project_id=legacy_project.id, objective="Finish safely")

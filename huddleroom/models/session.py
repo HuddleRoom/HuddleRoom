@@ -27,7 +27,7 @@ class Session(Base):
     task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
     agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id", ondelete="RESTRICT"), nullable=False)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    protocol_instance_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)  # No database foreign key.
+    graph_run_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)  # No database foreign key.
     meeting_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)  # No database foreign key.
     adapter_type: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="pending")

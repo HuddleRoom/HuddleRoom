@@ -24,7 +24,7 @@ from huddleroom.models.meeting import (
 from huddleroom.models.memory_item import MemoryItem
 from huddleroom.models.optimization import CostMetric, Optimization, Pattern
 from huddleroom.models.project import Project
-from huddleroom.models.protocol import Protocol, ProtocolInstance, ProtocolTimeout, ProtocolTransition
+from huddleroom.models.graph import Graph, GraphRun, GraphRunTimeout, GraphRunStep
 from huddleroom.models.routing_rule import RoutingRule
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -45,8 +45,8 @@ SEED_NAMES = {
     "disposable_task": "UI disposable task",
     "active_meeting": "UI seed active meeting",
     "concluded_meeting": "UI seed concluded meeting",
-    "active_protocol": "ui_seed_protocol",
-    "inactive_protocol": "ui_inactive_protocol",
+    "active_graph": "ui_seed_graph",
+    "inactive_graph": "ui_inactive_graph",
     "knowledge": "UI seed rollout policy",
     "disposable_knowledge": "UI disposable knowledge",
     "rule": "UI seed routing rule",
@@ -79,10 +79,10 @@ SEEDED_MODELS = (
     MeetingActionItem,
     MeetingEvent,
     MeetingParticipantSignal,
-    Protocol,
-    ProtocolInstance,
-    ProtocolTransition,
-    ProtocolTimeout,
+    Graph,
+    GraphRun,
+    GraphRunStep,
+    GraphRunTimeout,
     KnowledgeItem,
     MemoryItem,
     RoutingRule,
@@ -178,19 +178,19 @@ async def _delete_existing_seed_records(session) -> None:
         meeting_ids = (
             await session.execute(select(Meeting.id).where(Meeting.project_id.in_(project_ids)))
         ).scalars().all()
-        protocol_instance_ids = (
+        graph_run_ids = (
             await session.execute(
-                select(ProtocolInstance.id).where(ProtocolInstance.project_id.in_(project_ids))
+                select(GraphRun.id).where(GraphRun.project_id.in_(project_ids))
             )
         ).scalars().all()
 
-        if protocol_instance_ids:
+        if graph_run_ids:
             await session.execute(
-                delete(ProtocolTimeout).where(ProtocolTimeout.protocol_instance_id.in_(protocol_instance_ids))
+                delete(GraphRunTimeout).where(GraphRunTimeout.graph_run_id.in_(graph_run_ids))
             )
             await session.execute(
-                delete(ProtocolTransition).where(
-                    ProtocolTransition.protocol_instance_id.in_(protocol_instance_ids)
+                delete(GraphRunStep).where(
+                    GraphRunStep.graph_run_id.in_(graph_run_ids)
                 )
             )
 
@@ -220,8 +220,8 @@ async def _delete_existing_seed_records(session) -> None:
             RoutingRule,
             MemoryItem,
             KnowledgeItem,
-            ProtocolInstance,
-            Protocol,
+            GraphRun,
+            Graph,
             Meeting,
             Session,
             Task,
@@ -393,47 +393,47 @@ async def seed_database(database_url: str, workspace_dir: Path | None) -> dict:
                 ]
             )
 
-            protocol_definition = {
-                "initial_state": "draft",
-                "states": {
-                    "draft": {"transitions": [{"name": "submit", "to": "review"}]},
-                    "review": {"transitions": [{"name": "approve", "to": "done"}]},
+            graph_definition = {
+                "start_node": "draft",
+                "nodes": {
+                    "draft": {"edges": [{"name": "submit", "to": "review"}]},
+                    "review": {"edges": [{"name": "approve", "to": "done"}]},
                     "done": {"terminal": True},
                 },
             }
-            active_protocol = Protocol(
+            active_graph = Graph(
                 project_id=project.id,
-                name=SEED_NAMES["active_protocol"],
+                name=SEED_NAMES["active_graph"],
                 version="1.0.0",
-                description="Active seed protocol",
-                definition=protocol_definition,
+                description="Active seed graph",
+                definition=graph_definition,
                 triggers=[{"event_type": "task.created"}],
                 is_active=True,
             )
-            inactive_protocol = Protocol(
+            inactive_graph = Graph(
                 project_id=project.id,
-                name=SEED_NAMES["inactive_protocol"],
+                name=SEED_NAMES["inactive_graph"],
                 version="1.0.0",
-                description="Inactive seed protocol",
-                definition=protocol_definition,
+                description="Inactive seed graph",
+                definition=graph_definition,
                 triggers=[{"event_type": "manual"}],
                 is_active=False,
             )
-            session.add_all([active_protocol, inactive_protocol])
+            session.add_all([active_graph, inactive_graph])
             await session.flush()
 
-            protocol_instances = [
-                ProtocolInstance(project_id=project.id, protocol_id=active_protocol.id, linked_task_id=tasks[0].id, current_state="review", status="active", actor_assignments={"reviewer": str(reviewer.id)}, context={"seed": True}, started_at=now - timedelta(minutes=15), last_transitioned_at=now - timedelta(minutes=10)),
-                ProtocolInstance(project_id=project.id, protocol_id=active_protocol.id, linked_task_id=tasks[1].id, current_state="draft", status="paused", actor_assignments={"architect": str(architect.id)}, context={"seed": True}, started_at=now - timedelta(minutes=30), last_transitioned_at=now - timedelta(minutes=20)),
+            graph_runs = [
+                GraphRun(project_id=project.id, graph_id=active_graph.id, linked_task_id=tasks[0].id, current_node="review", status="active", actor_assignments={"reviewer": str(reviewer.id)}, context={"seed": True}, started_at=now - timedelta(minutes=15), last_stepped_at=now - timedelta(minutes=10)),
+                GraphRun(project_id=project.id, graph_id=active_graph.id, linked_task_id=tasks[1].id, current_node="draft", status="paused", actor_assignments={"architect": str(architect.id)}, context={"seed": True}, started_at=now - timedelta(minutes=30), last_stepped_at=now - timedelta(minutes=20)),
             ]
-            session.add_all(protocol_instances)
+            session.add_all(graph_runs)
             await session.flush()
 
             session.add_all(
                 [
-                    ProtocolTransition(protocol_instance_id=protocol_instances[0].id, from_state="draft", to_state="review", transition_name="submit", trigger_reason="Seed transition", actor_id=architect.id, actions_executed=["notify"], guard_context={"ok": True}),
-                    ProtocolTransition(protocol_instance_id=protocol_instances[1].id, from_state="draft", to_state="draft", transition_name="pause", trigger_reason="Seed pause", actor_id=reviewer.id, actions_executed=["pause"], guard_context={"ok": True}),
-                    ProtocolTimeout(protocol_instance_id=protocol_instances[0].id, state_name="review", timeout_action="remind", expires_at=now + timedelta(hours=1), resolved=False),
+                    GraphRunStep(graph_run_id=graph_runs[0].id, from_node="draft", to_node="review", edge_name="submit", trigger_reason="Seed step", actor_id=architect.id, actions_executed=["notify"], guard_context={"ok": True}),
+                    GraphRunStep(graph_run_id=graph_runs[1].id, from_node="draft", to_node="draft", edge_name="pause", trigger_reason="Seed pause", actor_id=reviewer.id, actions_executed=["pause"], guard_context={"ok": True}),
+                    GraphRunTimeout(graph_run_id=graph_runs[0].id, node_name="review", timeout_action="remind", expires_at=now + timedelta(hours=1), resolved=False),
                 ]
             )
 
@@ -472,7 +472,7 @@ async def seed_database(database_url: str, workspace_dir: Path | None) -> dict:
                     CostMetric(project_id=project.id, optimization_id=None, date=date.today() - timedelta(days=2), llm_calls_saved=5, estimated_cost_saved_usd=0.55),
                     EventLog(project_id=project.id, event_type="task.created", dedup_key="ui-seed-task-created", payload={"task": SEED_NAMES["ready_task"]}, source="seed", emitted_at=now - timedelta(minutes=30)),
                     EventLog(project_id=project.id, event_type="meeting.started", dedup_key="ui-seed-meeting-started", payload={"meeting": SEED_NAMES["active_meeting"]}, source="seed", emitted_at=now - timedelta(minutes=20)),
-                    EventLog(project_id=project.id, event_type="protocol.transitioned", dedup_key="ui-seed-protocol-transitioned", payload={"protocol": SEED_NAMES["active_protocol"]}, source="seed", emitted_at=now - timedelta(minutes=10)),
+                    EventLog(project_id=project.id, event_type="graph.run_advanced", dedup_key="ui-seed-graph-run-advanced", payload={"graph": SEED_NAMES["active_graph"]}, source="seed", emitted_at=now - timedelta(minutes=10)),
                 ]
             )
 

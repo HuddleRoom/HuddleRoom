@@ -5,11 +5,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 from huddleroom.models.base import Base, TimestampMixin, _utcnow_naive
 
 
-class Protocol(Base, TimestampMixin):
-    __tablename__ = "protocols"
+class Graph(Base, TimestampMixin):
+    __tablename__ = "graphs"
     __table_args__ = (
-        Index("idx_protocols_active", "project_id", "is_active"),
-        UniqueConstraint("project_id", "name", "version", name="uq_protocols_project_name_version"),
+        Index("idx_graphs_active", "project_id", "is_active"),
+        UniqueConstraint("project_id", "name", "version", name="uq_graphs_project_name_version"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -24,65 +24,65 @@ class Protocol(Base, TimestampMixin):
     loaded_from: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
-class ProtocolInstance(Base, TimestampMixin):
-    __tablename__ = "protocol_instances"
+class GraphRun(Base, TimestampMixin):
+    __tablename__ = "graph_runs"
     __table_args__ = (
-        Index("idx_pi_project_status", "project_id", "status"),
-        Index("idx_pi_protocol", "protocol_id"),
+        Index("idx_gr_project_status", "project_id", "status"),
+        Index("idx_gr_graph", "graph_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    protocol_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("protocols.id"), nullable=False)
+    graph_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("graphs.id"), nullable=False)
     project_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     linked_task_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     artifact_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
-    current_state: Mapped[str] = mapped_column(String, nullable=False)
+    current_node: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="active")
     actor_assignments: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     context: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     escalation_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
     triggering_event_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     started_at: Mapped[datetime] = mapped_column(nullable=False, default=_utcnow_naive)
-    last_transitioned_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_stepped_at: Mapped[datetime | None] = mapped_column(nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
-class ProtocolTransition(Base):
-    __tablename__ = "protocol_transitions"
+class GraphRunStep(Base):
+    __tablename__ = "graph_run_steps"
     __table_args__ = (
-        Index("idx_pt_instance", "protocol_instance_id"),
-        Index("idx_pt_instance_ts", "protocol_instance_id", "transitioned_at"),
+        Index("idx_grs_run", "graph_run_id"),
+        Index("idx_grs_run_ts", "graph_run_id", "stepped_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    protocol_instance_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("protocol_instances.id", ondelete="CASCADE"), nullable=False
+    graph_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("graph_runs.id", ondelete="CASCADE"), nullable=False
     )
-    from_state: Mapped[str] = mapped_column(String, nullable=False, server_default="")
-    to_state: Mapped[str] = mapped_column(String, nullable=False)
-    transition_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    from_node: Mapped[str] = mapped_column(String, nullable=False, server_default="")
+    to_node: Mapped[str] = mapped_column(String, nullable=False)
+    edge_name: Mapped[str | None] = mapped_column(String, nullable=True)
     trigger_event_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     trigger_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     actions_executed: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     guard_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    transitioned_at: Mapped[datetime] = mapped_column(
+    stepped_at: Mapped[datetime] = mapped_column(
         nullable=False, default=_utcnow_naive
     )
 
 
-class ProtocolTimeout(Base):
-    __tablename__ = "protocol_timeouts"
+class GraphRunTimeout(Base):
+    __tablename__ = "graph_run_timeouts"
     __table_args__ = (
-        Index("idx_pto_expires", "expires_at"),
-        Index("idx_pto_instance", "protocol_instance_id"),
+        Index("idx_grt_expires", "expires_at"),
+        Index("idx_grt_run", "graph_run_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    protocol_instance_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("protocol_instances.id", ondelete="CASCADE"), nullable=False
+    graph_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("graph_runs.id", ondelete="CASCADE"), nullable=False
     )
-    state_name: Mapped[str] = mapped_column(String, nullable=False)
+    node_name: Mapped[str] = mapped_column(String, nullable=False)
     timeout_action: Mapped[str] = mapped_column(String, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(nullable=False)
     resolved: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))

@@ -9,10 +9,10 @@ class SessionCreate(BaseModel):
     agent_id: UUID
     task_id: UUID | None = None
     project_id: UUID
-    protocol_instance_id: UUID | None = None
+    graph_run_id: UUID | None = None
     adapter_type_override: str | None = None
     context_override: dict = {}
-    origin: Literal["manual", "auto", "trigger", "meeting", "protocol"] = "manual"
+    origin: Literal["manual", "auto", "trigger", "meeting", "graph"] = "manual"
     model_override: str | None = None
     timeout: int | None = None
     max_tokens: int | None = None
@@ -24,7 +24,7 @@ class SessionResponse(BaseModel):
     task_id: UUID | None
     agent_id: UUID
     project_id: UUID
-    protocol_instance_id: UUID | None
+    graph_run_id: UUID | None
     adapter_type: str
     status: str
     input_context: dict

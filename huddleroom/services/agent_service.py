@@ -163,5 +163,5 @@ class AgentService:
             current_tasks=task_summaries,
             pending_meetings=[],   # Not included in the agent context yet.
             recent_knowledge=[],   # Not included in the agent context yet.
-            active_protocol_instances=[],  # Not included in the agent context yet.
+            active_graph_runs=[],  # Not included in the agent context yet.
         )

@@ -4,7 +4,7 @@ import 'reactflow/dist/style.css'
 import dagre from 'dagre'
 import { UI_COLORS } from '@/components/common/uiPrimitives'
 import { STATUS_COLORS } from '@/lib/statusColors'
-import type { ParsedFlow } from './ProtocolsPage'
+import type { ParsedFlow } from './GraphsPage'
 
 const MONO = 'var(--huddleroom-font-mono)'
 const SANS = 'var(--huddleroom-font-sans)'
@@ -13,12 +13,12 @@ const SANS = 'var(--huddleroom-font-sans)'
 
 function buildFlowDiagram(
   parsed: ParsedFlow,
-  currentState?: string
+  currentNode?: string
 ): { nodes: Node[]; edges: Edge[] } {
-  const states = Array.from(parsed.states.keys())
-  const transitions = parsed.transitions
+  const nodeIds = Array.from(parsed.nodes.keys())
+  const parsedEdges = parsed.edges
 
-  if (states.length === 0) {
+  if (nodeIds.length === 0) {
     return { nodes: [], edges: [] }
   }
 
@@ -27,23 +27,23 @@ function buildFlowDiagram(
   g.setGraph({ rankdir: 'LR', ranksep: 60, nodesep: 40 })
   g.setDefaultEdgeLabel(() => ({}))
 
-  states.forEach((s) => {
+  nodeIds.forEach((s) => {
     g.setNode(s, { width: 120, height: 40 })
   })
 
-  transitions.forEach((t) => {
+  parsedEdges.forEach((t) => {
     g.setEdge(t.from, t.to)
   })
 
   dagre.layout(g)
 
   // Build react-flow nodes
-  const nodes: Node[] = states.map((s) => {
+  const nodes: Node[] = nodeIds.map((s) => {
     const pos = g.node(s) ?? { x: 80, y: 80 }
-    const stateInfo = parsed.states.get(s)!
-    const isCurrent = s === currentState
-    const isInitial = stateInfo.isInitial
-    const isTerminal = stateInfo.isTerminal
+    const nodeInfo = parsed.nodes.get(s)!
+    const isCurrent = s === currentNode
+    const isInitial = nodeInfo.isInitial
+    const isTerminal = nodeInfo.isTerminal
 
     let bgColor: string = UI_COLORS.surface
     let borderColor: string = UI_COLORS.border
@@ -87,7 +87,7 @@ function buildFlowDiagram(
   // Build react-flow edges
   // Pre-build running index map to handle multiple edges between same nodes
   const edgeRunningIndex = new Map<string, number>()
-  const edges: Edge[] = transitions.map((t) => {
+  const edges: Edge[] = parsedEdges.map((t) => {
     const key = JSON.stringify([t.from, t.to])
     const edgeIndex = edgeRunningIndex.get(key) ?? 0
     edgeRunningIndex.set(key, edgeIndex + 1)
@@ -107,12 +107,12 @@ function buildFlowDiagram(
   return { nodes, edges }
 }
 
-// ─── ProtocolGraph ────────────────────────────────────────────────────────────
+// ─── GraphDiagram ────────────────────────────────────────────────────────────
 
-export function ProtocolGraph({ parsed, currentState }: { parsed: ParsedFlow; currentState?: string }) {
+export function GraphDiagram({ parsed, currentNode }: { parsed: ParsedFlow; currentNode?: string }) {
   const { nodes, edges } = useMemo(
-    () => buildFlowDiagram(parsed, currentState),
-    [parsed, currentState]
+    () => buildFlowDiagram(parsed, currentNode),
+    [parsed, currentNode]
   )
 
   if (nodes.length === 0) {
@@ -121,7 +121,7 @@ export function ProtocolGraph({ parsed, currentState }: { parsed: ParsedFlow; cu
         display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%',
         color: UI_COLORS.textMuted, fontSize: 12, fontFamily: SANS,
       }}>
-        no state diagram available
+        no graph diagram available
       </div>
     )
   }

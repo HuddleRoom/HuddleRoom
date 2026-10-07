@@ -145,7 +145,7 @@ async def test_orchestration_health_endpoint(client, auth_headers):
     assert "event_bus_mode" in data
     assert "event_log_total" in data
     assert data["event_bus_mode"] in ("in_process", "redis_streams")
-    for name in ("ws_hub", "rule_engine", "protocol_engine", "meeting_engine", "optimizer"):
+    for name in ("ws_hub", "rule_engine", "graph_engine", "meeting_engine", "optimizer"):
         assert name in data["consumers"]
 
 

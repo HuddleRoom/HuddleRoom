@@ -4,7 +4,7 @@ import { useUIStore } from '@/stores/ui'
 import { useTaskCount } from '@/api/tasks'
 import { useSessionCount } from '@/api/sessions'
 import { useMeetingCount } from '@/api/meetings'
-import { useProtocolInstanceCount } from '@/api/protocols'
+import { useGraphRunCount } from '@/api/graphs'
 import { useRecentEvents } from '@/api/events'
 import { useDashboardTriage } from '@/api/dashboard'
 import { Button, PageHeader, QueryState, UI_COLORS, NoProjectSelected } from '@/components/common/uiPrimitives'
@@ -17,20 +17,20 @@ import type { HuddleRoomEvent } from '@/lib/types'
 import { useDocumentTitle } from '@/hooks/useDocumentTitle'
 
 // `hasAttention` mirrors the Needs-attention panel above (blocked/failed
-// tasks, failed protocols/sessions, goals needing you, blocked goals). When
+// tasks, failed graph runs/sessions, goals needing you, blocked goals). When
 // true, this must never say "System steady" — that would contradict the
 // panel — even if there's no active/ready work to summarize.
 export function buildAttentionSummary({
   sessions,
   meetings,
-  protocols,
+  graphRuns,
   tasks,
   hasAnyError = false,
   hasAttention = false,
 }: {
   sessions?: number
   meetings?: number
-  protocols?: number
+  graphRuns?: number
   tasks?: number
   hasAnyError?: boolean
   hasAttention?: boolean
@@ -41,7 +41,7 @@ export function buildAttentionSummary({
 
   const segments = [
     meetings ? `${meetings} active meeting${meetings === 1 ? '' : 's'}` : null,
-    protocols ? `${protocols} protocol instance${protocols === 1 ? '' : 's'}` : null,
+    graphRuns ? `${graphRuns} graph run${graphRuns === 1 ? '' : 's'}` : null,
     tasks ? `${tasks} ready task${tasks === 1 ? '' : 's'}` : null,
     sessions ? `${sessions} running session${sessions === 1 ? '' : 's'}` : null,
   ].filter(Boolean) as string[]
@@ -76,7 +76,7 @@ function getEventNavRoute(source: string): string | null {
   if (!source) return null
   const s = source.toLowerCase()
   if (s.includes('agent') || s.includes('session')) return '/agents'
-  if (s.includes('protocol')) return '/protocols'
+  if (s.startsWith('graph.')) return '/graphs'
   if (s.includes('meeting')) return '/meetings'
   if (s.includes('task')) return '/tasks'
   return null
@@ -98,7 +98,7 @@ function getEventDotColor(source: string, eventType?: string): string {
   if (!source) return UI_COLORS.sidebarGroupLabel
   const s = source.toLowerCase()
   if (s.includes('agent') || s.includes('session')) return UI_COLORS.textMuted
-  if (s.includes('protocol') || s.includes('meeting')) return UI_COLORS.primary
+  if (s.startsWith('graph.') || s.includes('meeting')) return UI_COLORS.primary
   return UI_COLORS.sidebarGroupLabel
 }
 
@@ -164,7 +164,7 @@ export function DashboardPage() {
 
   const sessionCountQuery = useSessionCount(activeProjectId, 'running')
   const meetingCountQuery = useMeetingCount(activeProjectId, 'active')
-  const protocolCountQuery = useProtocolInstanceCount(activeProjectId, 'active')
+  const graphRunCountQuery = useGraphRunCount(activeProjectId, 'active')
   const taskCountQuery = useTaskCount(activeProjectId, 'ready')
   const eventsQuery = useRecentEvents(activeProjectId)
   const triage = useDashboardTriage(activeProjectId)
@@ -172,9 +172,9 @@ export function DashboardPage() {
   const summary = buildAttentionSummary({
     sessions: sessionCountQuery.data?.count,
     meetings: meetingCountQuery.data?.count,
-    protocols: protocolCountQuery.data?.count,
+    graphRuns: graphRunCountQuery.data?.count,
     tasks: taskCountQuery.data?.count,
-    hasAnyError: sessionCountQuery.isError || meetingCountQuery.isError || protocolCountQuery.isError || taskCountQuery.isError || triage.isError,
+    hasAnyError: sessionCountQuery.isError || meetingCountQuery.isError || graphRunCountQuery.isError || taskCountQuery.isError || triage.isError,
     hasAttention: triage.hasAttention,
   })
   const primaryAction = buildPrimaryAction({
@@ -188,7 +188,7 @@ export function DashboardPage() {
       <NoProjectSelected
         pageTitle="Dashboard"
         title="Select a project to see what needs attention"
-        detail="The dashboard shows running session counts, active meetings, protocol instances, ready tasks, and a live event feed for one project at a time. Choose a workspace in the top-bar switcher to connect it."
+        detail="The dashboard shows running session counts, active meetings, graph runs, ready tasks, and a live event feed for one project at a time. Choose a workspace in the top-bar switcher to connect it."
         primaryAction={{ label: 'New project', onClick: () => setCreateProjectOpen(true) }}
         prerequisites={[
           'Your account can list at least one HuddleRoom project.',
@@ -233,13 +233,13 @@ export function DashboardPage() {
                   onClick={() => navigate('/tasks?status=failed')}
                 />
               )}
-              {(triage.failedProtocols?.count ?? 0) > 0 && (
+              {(triage.failedGraphRuns?.count ?? 0) > 0 && (
                 <StatTile
                   layout="chip"
-                  label="failed protocols"
-                  value={triage.failedProtocols.count!}
+                  label="failed graph runs"
+                  value={triage.failedGraphRuns.count!}
                   color={STATUS_COLORS.red}
-                  onClick={() => navigate('/protocols?status=failed')}
+                  onClick={() => navigate('/graphs?status=failed')}
                 />
               )}
               {(triage.failedSessions?.count ?? 0) > 0 && (
@@ -304,7 +304,7 @@ export function DashboardPage() {
       >
         <div className="flex items-center gap-3 flex-wrap px-4 py-3" style={{ borderBottom: `1px solid ${UI_COLORS.border}` }}>
           <div className="flex-1 min-w-0">
-            {sessionCountQuery.isLoading || meetingCountQuery.isLoading || protocolCountQuery.isLoading || taskCountQuery.isLoading || triage.isLoading ? (
+            {sessionCountQuery.isLoading || meetingCountQuery.isLoading || graphRunCountQuery.isLoading || taskCountQuery.isLoading || triage.isLoading ? (
               <div className="skeleton" style={{ width: '60%', height: 16, borderRadius: 4 }} />
             ) : (
               <>
@@ -320,7 +320,7 @@ export function DashboardPage() {
         <div className="flex flex-wrap gap-2 px-4 py-3">
           <StatTile label="Sessions" value={sessionCountQuery.data?.count} color={STATUS_COLORS.amber} to="/agents" />
           <StatTile label="Meetings" value={meetingCountQuery.data?.count} to="/meetings" />
-          <StatTile label="Protocols" value={protocolCountQuery.data?.count} to="/protocols" />
+          <StatTile label="Graphs" value={graphRunCountQuery.data?.count} to="/graphs" />
           <StatTile label="Ready tasks" value={taskCountQuery.data?.count} color={STATUS_COLORS.blue} to="/tasks" />
         </div>
       </div>
@@ -346,7 +346,7 @@ export function DashboardPage() {
             skeletonCount={6}
             errorLabel="Failed to load recent events"
             emptyLabel="No recent activity"
-            emptyDetail="Once agents, meetings, or protocols emit events, they will appear here with newest updates first."
+            emptyDetail="Once agents, meetings, or graphs emit events, they will appear here with newest updates first."
           >
             {(events) => {
               const collapsed = collapseRuns(events.map((e) => ({ ...e, type: e.event_type })))
