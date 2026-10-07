@@ -1,3 +1,4 @@
+import configparser
 import importlib
 import os
 import pathlib
@@ -280,6 +281,26 @@ def test_run_migrations_creates_schema_and_is_idempotent(tmp_path, monkeypatch):
     assert (tmp_path / "workspace").is_dir()
 
 
+def test_run_migrations_does_not_emit_noisy_alembic_logs(tmp_path, monkeypatch, capfd):
+    import huddleroom.cli as cli
+    import huddleroom.config as config
+
+    database = tmp_path / "state" / "huddleroom.db"
+    configured = config.Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{database}",
+        workspace_dir=str(tmp_path / "workspace"),
+    )
+    monkeypatch.setattr(config, "settings", configured)
+    monkeypatch.chdir(tmp_path)
+
+    cli._run_migrations(configured)
+
+    captured = capfd.readouterr()
+    assert "Running upgrade" not in captured.err
+    assert "Context impl" not in captured.err
+
+
 def test_run_migrations_keeps_existing_llm_logger_enabled(tmp_path, monkeypatch):
     import logging
     import huddleroom.cli as cli
@@ -475,3 +496,16 @@ def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
             assert "huddleroom setup" in message
             assert "~/.huddleroom/config.toml" in message
             assert "HUDDLEROOM_" in message
+
+
+def test_alembic_ini_has_warn_log_level():
+    repo_root = pathlib.Path(__file__).parents[1]
+    files = [
+        repo_root / "alembic.ini",
+        repo_root / "huddleroom" / "migrations" / "alembic.ini",
+    ]
+
+    for alembic_file in files:
+        config = configparser.ConfigParser()
+        config.read(alembic_file)
+        assert config.get("logger_alembic", "level") == "WARN", f"{alembic_file} [logger_alembic] level should be WARN"
