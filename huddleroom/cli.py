@@ -257,6 +257,7 @@ def _resolve_orchestration_effort(
 @click.option("--orchestration-backend", type=click.Choice(["api", "claude", "codex"], case_sensitive=False))
 @click.option("--orchestration-effort")
 @click.option("--orchestration-model")
+@click.option("--orchestration-cli-model", help="Model for the claude/codex CLI backend ('default' removes it).")
 @click.option("--database-path")
 @click.option("--workspace-dir")
 def setup(
@@ -268,12 +269,13 @@ def setup(
     orchestration_backend: str | None = None,
     orchestration_effort: str | None = None,
     orchestration_model: str | None = None,
+    orchestration_cli_model: str | None = None,
     database_path: str | None = None,
     workspace_dir: str | None = None,
 ):
     """Save local direct or OneCLI gateway settings without exposing secrets."""
     try:
-        from huddleroom.config import DEFAULT_CONFIG_FILE, settings
+        from huddleroom.config import DEFAULT_CONFIG_FILE, settings, validate_cli_model
     except Exception:
         config_file = pathlib.Path.home() / ".huddleroom" / "config.toml"
         raise click.ClickException(
@@ -294,6 +296,10 @@ def setup(
         else:
             orchestration_backend = "api"
     orchestration_backend = orchestration_backend.lower()
+    if orchestration_backend == "api" and orchestration_cli_model is not None:
+        raise click.ClickException(
+            "--orchestration-cli-model only applies to claude/codex. No changes were written."
+        )
     if orchestration_backend != "api" and any(
         value is not None
         for value in (provider, credential_mode, onecli_agent, onecli_management_url, onecli_gateway_url, orchestration_model)
@@ -308,9 +314,26 @@ def setup(
             f"The {orchestration_backend} CLI is not installed. Install it, then rerun setup. No changes were written."
         )
     if orchestration_backend != "api":
+        # A saved model belongs to the backend it was saved for; switching backends drops it.
+        switched = orchestration_backend != settings.orchestration_backend
+        saved_model = None if switched else settings.orchestration_cli_model
+        cli_model, update_cli_model = saved_model, switched
+        if orchestration_cli_model is None and backend_was_prompted:
+            orchestration_cli_model = click.prompt(
+                f"Orchestration CLI model (Enter keeps {saved_model}, type default to use the CLI default)"
+                if saved_model else "Orchestration CLI model (blank = CLI default)",
+                default=saved_model or "",
+                show_default=False,
+            )
+        if orchestration_cli_model is not None:
+            try:
+                cli_model = None if orchestration_cli_model.strip().lower() == "default" else validate_cli_model(orchestration_cli_model)
+            except ValueError as error:
+                raise click.ClickException(f"Invalid orchestration CLI model: {error}. No changes were written.") from None
+            update_cli_model = True
         orchestration_effort, remove_effort = _resolve_orchestration_effort(
             orchestration_backend,
-            None,
+            cli_model,
             orchestration_effort,
             settings.orchestration_effort,
             interactive=backend_was_prompted,
@@ -324,8 +347,11 @@ def setup(
         }
         if orchestration_effort is not None or remove_effort:
             updates["orchestration_effort"] = orchestration_effort
+        if update_cli_model:
+            updates["orchestration_cli_model"] = cli_model
         _update_config(updates)
         click.echo(f"Saved setup values to {DEFAULT_CONFIG_FILE}.")
+        click.echo(f"Orchestration CLI model: {cli_model or 'CLI default'}.")
         click.echo(f"{orchestration_backend.title()} was found on PATH; authentication is not verified.")
         click.echo("Embeddings and API agents may still need separately configured provider credentials.")
         return

@@ -577,3 +577,53 @@ def test_onecli_native_auth_runtimes_rejects_multiple_unknown():
 
     with pytest.raises(ValidationError, match="onecli_native_auth_runtimes"):
         Settings(_env_file=None, onecli_native_auth_runtimes=["claude", "aider"])
+
+
+def test_orchestration_cli_model_default_and_env(monkeypatch):
+    from huddleroom.config import Settings
+
+    assert Settings(_env_file=None).orchestration_cli_model is None
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_CLI_MODEL", "opus[1m]")
+    assert Settings(_env_file=None).orchestration_cli_model == "opus[1m]"
+
+
+@pytest.mark.parametrize("value", ["claude-opus-4-1", "opus[1m]", "gpt-5-codex", "openai/o3"])
+def test_orchestration_cli_model_accepts(value):
+    from huddleroom.config import Settings
+
+    assert Settings(_env_file=None, orchestration_cli_model=value).orchestration_cli_model == value
+
+
+@pytest.mark.parametrize("value", ["-x", "--model", "a b", "a;b", "a" * 129])
+def test_orchestration_cli_model_rejects(value):
+    from huddleroom.config import Settings
+
+    with pytest.raises(ValueError, match="orchestration_cli_model"):
+        Settings(_env_file=None, orchestration_cli_model=value)
+
+
+@pytest.mark.parametrize("value", ["", "  "])
+def test_orchestration_cli_model_blank_is_none(value):
+    from huddleroom.config import Settings
+
+    assert Settings(_env_file=None, orchestration_cli_model=value).orchestration_cli_model is None
+
+
+@pytest.mark.parametrize("value", [True, 5])
+def test_orchestration_cli_model_rejects_non_string_values(value):
+    from huddleroom.config import Settings
+
+    with pytest.raises(ValueError, match="orchestration_cli_model"):
+        Settings(_env_file=None, orchestration_cli_model=value)
+
+
+def test_orchestration_cli_model_toml_int_fails(tmp_path):
+    home = tmp_path / "home"
+    config_dir = home / ".huddleroom"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text("orchestration_cli_model = 5\n", encoding="utf-8")
+
+    result = _import_config(tmp_path, home)
+
+    assert result.returncode != 0
+    assert "orchestration_cli_model" in result.stderr

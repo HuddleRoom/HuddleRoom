@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import re
 import tomllib
 import warnings
 from typing import Any, Literal
@@ -58,6 +59,23 @@ def validate_onecli_origin(value: str) -> str:
     ):
         raise ValueError("must be an HTTP(S) origin without credentials, path, query, or fragment")
     return value.rstrip("/")
+
+
+_CLI_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}$")
+
+
+def validate_cli_model(value: str | None) -> str | None:
+    """Return a safe CLI model name (blank -> None) or reject it."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("must be a string")
+    value = value.strip()
+    if not value:
+        return None
+    if not _CLI_MODEL_RE.fullmatch(value):
+        raise ValueError("must be 1-128 chars of letters, digits and . _ : / @ [ ] -, not starting with '-'")
+    return value
 
 
 def _toml_values(config_file: Path) -> dict[str, Any]:
@@ -148,6 +166,7 @@ class Settings(BaseSettings):
     workspace_dir: str = Field(default_factory=_default_workspace_dir)
     orchestration_model: str = "openai/gpt-6.1-sol"
     orchestration_backend: Literal["api", "claude", "codex"] = "api"
+    orchestration_cli_model: str | None = None  # --model/-m for the claude/codex CLI; orchestration_model is API-only
     orchestration_effort: OrchestrationEffort | None = None
     orchestration_conversation_allowance_tokens: int = Field(default=50000, ge=0)
     # -1 = unlimited (default), 0 = disabled, >0 = lifetime token cap
@@ -175,6 +194,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_onecli_url(cls, value: str) -> str:
         return validate_onecli_origin(value)
+
+    @field_validator("orchestration_cli_model", mode="before")
+    @classmethod
+    def validate_orchestration_cli_model(cls, value):
+        return validate_cli_model(value)
 
     @field_validator("onecli_native_auth_runtimes")
     @classmethod

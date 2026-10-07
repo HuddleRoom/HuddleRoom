@@ -115,6 +115,7 @@ same process environment, `.env`, TOML precedence.
 | `HUDDLEROOM_EMBEDDING_MODEL` | `text-embedding-3-small` | litellm embedding model for knowledge search |
 | `HUDDLEROOM_ORCHESTRATION_MODEL` | `openai/gpt-6.1-sol` | Model for orchestration decisions and meeting control |
 | `HUDDLEROOM_MEETING_CONTROL_MODEL` | `HUDDLEROOM_ORCHESTRATION_MODEL` | Optional meeting-control override |
+| `HUDDLEROOM_ORCHESTRATION_CLI_MODEL` | unset | Model passed to the Claude/Codex CLI (`--model` / `-m`) when the orchestration backend is `claude` or `codex`; unset uses the CLI's native default. |
 | `HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES` | `["claude_code", "codex"]` | JSON list of CLI runtimes that bypass OneCLI gateway when in onecli mode |
 
 ### Orchestration backend
@@ -122,8 +123,9 @@ same process environment, `.env`, TOML precedence.
 `huddleroom setup` selects **API via LiteLLM**, or an installed **Claude** or
 **Codex** CLI. Authenticate the selected CLI first with `claude auth login` or
 `codex login`; setup only checks `PATH` and makes neither an authentication nor
-a model request. CLI orchestration uses the CLI's native default model, so it
-preserves API provider credentials and `orchestration_model` for later API use.
+a model request. CLI orchestration uses `orchestration_cli_model` when it is set,
+and otherwise the CLI's native default. `orchestration_model` stays the LiteLLM
+API model, so switching back to API keeps it.
 Each completion uses a fresh noninteractive CLI process with structured output;
 HuddleRoom does not resume sessions or execute returned tool calls. The CLI's
 own practical restrictions apply, but they do not guarantee that every tool or
@@ -133,12 +135,16 @@ This backend setting affects orchestration decisions, analysis, conversation,
 and the project advisor. It does not change worker agents, embeddings, meeting
 intelligence/outcomes, or OneCLI.
 
-`orchestration_effort` is optional. Leave it unset, or pass
-`--orchestration-effort default`, to preserve the backend default. An explicit
-API effort needs exact LiteLLM metadata; an explicit CLI effort needs the
-selected CLI's native metadata for its default model. Unknown metadata fails
-safely and does not silently translate or downgrade. Categorical effort is
-separate from provider numeric thinking budgets.
+`orchestration_effort` is optional. Unset, or `--orchestration-effort default`,
+keeps the backend default. API effort needs exact LiteLLM metadata. Codex with
+its default model is checked against its native metadata. Claude, or any CLI with
+an explicit `orchestration_cli_model`, passes the effort to the CLI. An unsupported
+model or effort is rejected by the CLI and reported as an error, with no fallback.
+Categorical effort is separate from provider numeric thinking budgets.
+
+`huddleroom setup` prompts for the model and effort of the chosen backend;
+non-interactive flags are `--orchestration-model` (API), `--orchestration-cli-model`
+(claude/codex, `default` clears it) and `--orchestration-effort`.
 
 For API adapter agents to call LLMs, add provider credentials to either configuration file:
 

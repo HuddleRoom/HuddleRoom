@@ -18,8 +18,24 @@ from sqlalchemy.ext.asyncio import (
 # Keep collection independent of a developer's ~/.huddleroom/config.toml.
 os.environ["HOME"] = tempfile.mkdtemp(prefix="huddleroom-test-home-")
 
-from huddleroom.config import settings
+
+def _strip_config_env(environ=os.environ):
+    for key in [k for k in environ if k.startswith(("HUDDLEROOM_", "RALLY_"))]:
+        del environ[key]
+
+
+_strip_config_env()
+
+from huddleroom.config import Settings, settings
 from huddleroom.database import get_db
+
+# The singleton was built from the developer's cwd .env; rebuild it from clean defaults.
+for _name, _value in Settings(_env_file=None).model_dump().items():
+    setattr(settings, _name, _value)
+settings._setting_names = {}  # dict[str, str]; nothing was "supplied" by a developer source
+# ponytail: sqlite-only pin; the postgres branch below is unreachable until the SPR #118 opt-in.
+settings.database_url = f"sqlite+aiosqlite:///{tempfile.mkdtemp(prefix='huddleroom-test-db-')}/huddleroom.db"
+settings.workspace_dir = tempfile.mkdtemp(prefix="huddleroom-test-workspace-")
 
 # Prevent pytest from writing to the production log file.
 # Set log_file to a per-pid temp path before any code path calls
@@ -43,6 +59,19 @@ if _db_url.startswith("sqlite"):
 else:
     base_url, _ = _db_url.rsplit("/", 1)
     TEST_DATABASE_URL = f"{base_url}/rally_test"
+
+@pytest.fixture(autouse=True)
+def _hermetic_config_env():
+    # litellm calls load_dotenv() on import, copying the developer's .env into
+    # os.environ; strip it so Settings(_env_file=None) tests are hermetic.
+    # (No monkeypatch here: requesting it early would delay its undo past other
+    # fixtures' teardown and break tests that guard builtins.__import__.)
+    saved = dict(os.environ)
+    _strip_config_env()
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
 
 @pytest.fixture(scope="session")
 def event_loop():

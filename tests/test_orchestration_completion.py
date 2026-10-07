@@ -313,7 +313,7 @@ async def test_cli_gateway_redacts_native_failure_stderr(monkeypatch, tmp_path):
 
     assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.EXIT
     assert "super-secret" not in str(error.value)
-    assert "native failure" not in str(error.value)
+    assert "native failure" in str(error.value)
     assert "23" in str(error.value)
 
 
@@ -696,27 +696,153 @@ async def test_codex_artifact_growth_stops_the_process_before_the_request_timeou
     assert terminated == [12345]
 
 
+_CLAUDE_OK = (
+    b'{"structured_output":{"content":"ok","tool_calls":[]},'
+    b'"usage":{"input_tokens":1,"output_tokens":1}}'
+)
+
+
+def _claude_argv_fake(monkeypatch, tmp_path, completion_module):
+    return _install_fake_cli(
+        monkeypatch, completion_module, "claude", tmp_path / "claude",
+        lambda argv: b'{"loggedIn":true}' if argv[-2:] == ("auth", "status") else _CLAUDE_OK,
+    )
+
+
+def _codex_argv_fake(monkeypatch, tmp_path, completion_module):
+    def respond(argv):
+        if argv[-2:] == ("login", "status"):
+            return {"stderr": b"Logged in with ChatGPT", "returncode": 0}
+        Path(argv[argv.index("--output-last-message") + 1]).write_text('{"content":"ok","tool_calls":[]}')
+        return b'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n'
+
+    return _install_fake_cli(monkeypatch, completion_module, "codex", tmp_path / "codex", respond)
+
+
 @pytest.mark.asyncio
-async def test_claude_explicit_effort_requires_exact_native_model_capability(monkeypatch, tmp_path):
-    """Claude's generic effort flag is insufficient proof for an explicit configured effort."""
+@pytest.mark.parametrize("model", [None, "claude-opus-4-1"])
+async def test_claude_argv_model_and_effort_without_capability_metadata(monkeypatch, tmp_path, model):
+    """Claude accepts an enum effort without a model; --model is passed only when configured."""
     from huddleroom.config import settings
     from huddleroom.services import orchestration_completion
 
     monkeypatch.setattr(settings, "orchestration_backend", "claude")
     monkeypatch.setattr(settings, "orchestration_effort", "high")
-    calls = _install_fake_cli(
-        monkeypatch,
-        orchestration_completion,
-        "claude",
-        tmp_path / "claude",
-        lambda _argv: b'{"loggedIn":true}',
-    )
+    monkeypatch.setattr(settings, "orchestration_cli_model", model)
+    calls = _claude_argv_fake(monkeypatch, tmp_path, orchestration_completion)
 
-    with pytest.raises(orchestration_completion.OrchestrationBackendError, match="default") as error:
+    await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    argv = next(argv for argv, _stdin in calls if "--print" in argv)
+    assert argv[argv.index("--effort") + 1] == "high"
+    if model:
+        assert argv[argv.index("--model") + 1] == model
+    else:
+        assert "--model" not in argv
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "gpt-5-codex"])
+async def test_codex_argv_model(monkeypatch, tmp_path, model):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    monkeypatch.setattr(settings, "orchestration_cli_model", model)
+    calls = _codex_argv_fake(monkeypatch, tmp_path, orchestration_completion)
+
+    await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    argv = next(argv for argv, _stdin in calls if "exec" in argv)
+    if model:
+        assert argv[argv.index("-m") + 1] == model
+        assert argv[-1] == "-"
+    else:
+        assert "-m" not in argv
+
+
+@pytest.mark.asyncio
+async def test_codex_model_with_xhigh_needs_no_catalog(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    empty_home = tmp_path / "empty-codex-home"
+    empty_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(empty_home))
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", "xhigh")
+    monkeypatch.setattr(settings, "orchestration_cli_model", "gpt-5-codex")
+    calls = _codex_argv_fake(monkeypatch, tmp_path, orchestration_completion)
+
+    await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    argv = next(argv for argv, _stdin in calls if "exec" in argv)
+    assert "model_reasoning_effort=xhigh" in argv
+
+
+@pytest.mark.asyncio
+async def test_codex_effort_without_model_and_empty_metadata_is_unsupported(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    empty_home = tmp_path / "empty-codex-home"
+    empty_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(empty_home))
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", "high")
+    monkeypatch.setattr(settings, "orchestration_cli_model", None)
+    _codex_argv_fake(monkeypatch, tmp_path, orchestration_completion)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
         await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
 
     assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
-    assert all("--print" not in argv for argv, _stdin in calls)
+
+
+@pytest.mark.asyncio
+async def test_cli_exit_error_includes_redacted_stderr_tail(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    _install_fake_cli(
+        monkeypatch, orchestration_completion, "claude", tmp_path / "claude",
+        lambda argv: (
+            b'{"loggedIn":true}' if argv[-2:] == ("auth", "status")
+            else {"stderr": b"error:\n  model not found\n key sk-abcdefghijklmnop1234567890", "returncode": 1}
+        ),
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.EXIT
+    assert "error: model not found" in str(error.value)
+    assert "abcdefghijklmnop1234567890" not in str(error.value)
+
+
+@pytest.mark.parametrize("backend, model, label", [
+    ("claude", "opus[1m]", "claude CLI (opus[1m])"),
+    ("codex", None, "codex CLI (configured CLI default)"),
+])
+def test_runtime_metadata_label_uses_cli_model(backend, model, label):
+    from huddleroom.services import orchestration_completion
+
+    config = SimpleNamespace(orchestration_backend=backend, orchestration_cli_model=model)
+    assert orchestration_completion.orchestration_runtime_metadata(
+        orchestration_completion.orchestration_completion, "api/model", config
+    ) == ("cli_main", label)
+
+
+def test_api_runtime_metadata_ignores_cli_model():
+    from huddleroom.services import orchestration_completion
+
+    config = SimpleNamespace(orchestration_backend="api", orchestration_cli_model="opus")
+    assert orchestration_completion.orchestration_runtime_metadata(
+        orchestration_completion.orchestration_completion, "api/model", config
+    ) == ("api", "api/model")
 
 
 @pytest.mark.asyncio
@@ -823,16 +949,22 @@ def test_cli_effort_catalog_requires_native_model_capability(monkeypatch, tmp_pa
     }))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    assert orchestration_completion.supported_orchestration_efforts("claude") == frozenset()
+    assert orchestration_completion.supported_orchestration_efforts("claude") == orchestration_completion.CLI_EFFORTS
     assert orchestration_completion.supported_orchestration_efforts("codex") == frozenset({"high"})
+    assert orchestration_completion.supported_orchestration_efforts("codex", "gpt-5-codex") == (
+        orchestration_completion.CLI_EFFORTS - {"max"}
+    )
 
 
-def test_cli_validation_rejects_explicit_effort_before_authentication(monkeypatch):
+def test_cli_validation_rejects_explicit_effort_before_authentication(monkeypatch, tmp_path):
     """An unsupported saved CLI effort fails at startup before it can authenticate or open state."""
     from huddleroom.services import orchestration_completion
 
-    config = SimpleNamespace(orchestration_backend="claude", orchestration_effort="high", orchestration_model="ignored")
-    monkeypatch.setattr(orchestration_completion.shutil, "which", lambda _name: "/fake/claude")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    config = SimpleNamespace(
+        orchestration_backend="codex", orchestration_effort="high", orchestration_model="ignored", orchestration_cli_model=None
+    )
+    monkeypatch.setattr(orchestration_completion.shutil, "which", lambda _name: "/fake/codex")
 
     async def authenticate(*_args):
         pytest.fail("explicit effort must be validated before auth")
@@ -1117,3 +1249,79 @@ class _BlockingCliStdin(_RecordingCliStdin):
 
     async def drain(self):
         await self._released.wait()
+
+
+@pytest.mark.asyncio
+async def test_cli_exit_error_redacts_secret_straddling_the_300_char_cut(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    secret = "sk-" + "Zq9" * 12
+    stderr = ("head " + secret + " " + "tail " * 54).encode()  # cut lands inside the secret
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    _install_fake_cli(
+        monkeypatch, orchestration_completion, "claude", tmp_path / "claude",
+        lambda argv: (
+            b'{"loggedIn":true}' if argv[-2:] == ("auth", "status")
+            else {"stderr": stderr, "returncode": 1}
+        ),
+    )
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert "Zq9" not in str(error.value)
+    assert "tail" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_codex_argv_puts_model_and_effort_before_the_stdin_dash(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", "high")
+    monkeypatch.setattr(settings, "orchestration_cli_model", "gpt-5-codex")
+    calls = _codex_argv_fake(monkeypatch, tmp_path, orchestration_completion)
+
+    await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    argv = next(argv for argv, _stdin in calls if "exec" in argv)
+    assert argv[-1] == "-"
+    assert argv.index("-m") < len(argv) - 1 and argv.index("-c") < len(argv) - 1
+
+
+@pytest.mark.asyncio
+async def test_codex_model_with_max_effort_is_unsupported(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "codex")
+    monkeypatch.setattr(settings, "orchestration_effort", "max")
+    monkeypatch.setattr(settings, "orchestration_cli_model", "gpt-5-codex")
+    _codex_argv_fake(monkeypatch, tmp_path, orchestration_completion)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+async def test_invalid_cli_model_is_unsupported_at_argv_build(monkeypatch, tmp_path, backend):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", backend)
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    monkeypatch.setattr(settings, "orchestration_cli_model", "-x")
+    fake = _claude_argv_fake if backend == "claude" else _codex_argv_fake
+    calls = fake(monkeypatch, tmp_path, orchestration_completion)
+
+    with pytest.raises(orchestration_completion.OrchestrationBackendError) as error:
+        await orchestration_completion.orchestration_completion(messages=[{"role": "user", "content": "hello"}])
+
+    assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
+    assert all("-x" not in argv for argv, _stdin in calls)

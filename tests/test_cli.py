@@ -648,3 +648,156 @@ def test_alembic_ini_has_warn_log_level():
         config = configparser.ConfigParser()
         config.read(alembic_file)
         assert config.get("logger_alembic", "level") == "WARN", f"{alembic_file} [logger_alembic] level should be WARN"
+
+
+def _only_cli(monkeypatch, name):
+    cli = importlib.import_module("huddleroom.cli")
+    monkeypatch.setattr(cli.shutil, "which", lambda n: f"/bin/{n}" if n == name else None)
+
+
+@pytest.mark.parametrize(
+    ("backend", "efforts"),
+    [("claude", "low, medium, high, xhigh, max"), ("codex", "low, medium, high, xhigh")],
+)
+def test_setup_interactive_cli_prompts_model_and_offers_model_efforts(setup_home, monkeypatch, backend, efforts):
+    _only_cli(monkeypatch, backend)
+
+    result = _invoke([], f"{backend}\nmy-model\nxhigh\nstate.db\nwork\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Orchestration CLI model (blank = CLI default)" in result.output
+    offered = result.output.split("backend default) (")[1].split(")")[0].split(", ")
+    assert sorted(offered) == sorted(["default", *efforts.split(", ")])
+    saved = setup_home.read_text()
+    assert 'orchestration_cli_model = "my-model"' in saved
+    assert 'orchestration_effort = "xhigh"' in saved
+    assert "Orchestration CLI model: my-model." in result.output
+
+
+def test_setup_interactive_blank_cli_model_means_cli_default(setup_home, monkeypatch):
+    _only_cli(monkeypatch, "claude")
+
+    result = _invoke([], "claude\n\ndefault\nstate.db\nwork\n")
+
+    assert result.exit_code == 0, result.output
+    assert "orchestration_cli_model" not in setup_home.read_text()
+    assert "Orchestration CLI model: CLI default." in result.output
+
+
+def test_setup_noninteractive_cli_model_flag(setup_home, monkeypatch):
+    _only_cli(monkeypatch, "codex")
+
+    result = _invoke(
+        ["--orchestration-backend", "codex", "--orchestration-cli-model", "gpt-5-codex",
+         "--orchestration-effort", "xhigh", "--database-path", "state.db", "--workspace-dir", "work"]
+    )
+
+    assert result.exit_code == 0, result.output
+    saved = setup_home.read_text()
+    assert 'orchestration_cli_model = "gpt-5-codex"' in saved
+    assert 'orchestration_effort = "xhigh"' in saved
+
+
+@pytest.mark.parametrize("flag_args", [["--orchestration-cli-model", "a;b"], ["--orchestration-cli-model=-x"]])
+def test_setup_rejects_invalid_cli_model_without_writing(setup_home, monkeypatch, flag_args):
+    setup_home.parent.mkdir()
+    original = 'custom = "keep"\n'
+    setup_home.write_text(original)
+    _only_cli(monkeypatch, "claude")
+
+    result = _invoke(
+        ["--orchestration-backend", "claude", *flag_args, "--database-path", "state.db", "--workspace-dir", "work"]
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid orchestration CLI model" in result.output
+    assert setup_home.read_text() == original
+
+
+def test_setup_cli_model_with_api_backend_is_an_error(setup_home):
+    result = _invoke(["--provider", "skip", "--orchestration-cli-model", "opus"])
+
+    assert result.exit_code != 0
+    assert "only applies to claude/codex" in result.output
+    assert not setup_home.exists()
+
+
+def test_setup_cli_model_default_removes_saved_value(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    setup_home.write_text('orchestration_cli_model = "opus"\n')
+    _only_cli(monkeypatch, "claude")
+
+    result = _invoke(
+        ["--orchestration-backend", "claude", "--orchestration-cli-model", "default",
+         "--database-path", "state.db", "--workspace-dir", "work"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "orchestration_cli_model" not in setup_home.read_text()
+
+
+def test_setup_leaves_saved_cli_model_untouched_without_flag(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    setup_home.write_text('orchestration_backend = "claude"\norchestration_cli_model = "opus"\n')
+    _only_cli(monkeypatch, "claude")
+
+    result = _invoke(
+        ["--orchestration-backend", "claude", "--database-path", "state.db", "--workspace-dir", "work"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert 'orchestration_cli_model = "opus"' in setup_home.read_text()
+
+
+def test_setup_backend_switch_clears_saved_cli_model_noninteractively(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    setup_home.write_text('orchestration_backend = "claude"\norchestration_cli_model = "opus"\n')
+    _only_cli(monkeypatch, "codex")
+
+    result = _invoke(["--orchestration-backend", "codex", "--database-path", "state.db", "--workspace-dir", "work"])
+
+    assert result.exit_code == 0, result.output
+    assert "orchestration_cli_model" not in setup_home.read_text()
+
+
+def test_setup_interactive_backend_switch_does_not_offer_saved_cli_model(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    setup_home.write_text('orchestration_backend = "claude"\norchestration_cli_model = "opus"\n')
+    cli = importlib.import_module("huddleroom.cli")
+    monkeypatch.setattr(cli.shutil, "which", lambda n: f"/bin/{n}")
+
+    result = _invoke([], "codex\n\ndefault\nstate.db\nwork\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Orchestration CLI model (blank = CLI default)" in result.output
+    assert "opus" not in result.output
+    assert "orchestration_cli_model" not in setup_home.read_text()
+
+
+def test_setup_interactive_same_backend_enter_keeps_and_default_clears_cli_model(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    original = 'orchestration_backend = "claude"\norchestration_cli_model = "opus"\n'
+    setup_home.write_text(original)
+    _only_cli(monkeypatch, "claude")
+
+    kept = _invoke([], "claude\n\ndefault\nstate.db\nwork\n")
+    assert kept.exit_code == 0, kept.output
+    assert "Enter keeps opus" in kept.output
+    assert 'orchestration_cli_model = "opus"' in setup_home.read_text()
+
+    cleared = _invoke([], "claude\ndefault\ndefault\nstate.db\nwork\n")
+    assert cleared.exit_code == 0, cleared.output
+    assert "orchestration_cli_model" not in setup_home.read_text()
+
+
+def test_setup_interactive_invalid_cli_model_writes_nothing(setup_home, monkeypatch):
+    setup_home.parent.mkdir()
+    original = 'custom = "keep"\n'
+    setup_home.write_text(original)
+    _only_cli(monkeypatch, "claude")
+
+    result = _invoke([], "claude\na;b\n")
+
+    assert result.exit_code != 0
+    assert "Invalid orchestration CLI model" in result.output
+    assert setup_home.read_text() == original

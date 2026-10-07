@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable
 
 import litellm
 
-from huddleroom.config import Settings, settings
+from huddleroom.config import Settings, settings, validate_cli_model
 from huddleroom.services.cli_streaming import terminate_process_group
 from huddleroom.services.secret_redaction import redact_secrets
 
@@ -44,9 +44,9 @@ def supported_orchestration_efforts(backend: str, model: str | None = None) -> f
     if backend == "api":
         return _api_supported_efforts(model or settings.orchestration_model)
     if backend == "claude":
-        return frozenset()
+        return CLI_EFFORTS
     if backend == "codex":
-        return _codex_efforts()
+        return CLI_EFFORTS - {"max"} if model else _codex_efforts()
     raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, f"Unknown orchestration backend: {backend}")
 
 
@@ -61,7 +61,7 @@ def validate_orchestration_backend(config: Settings = settings) -> None:
     if config.orchestration_backend not in {"claude", "codex"}:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, "Unknown orchestration backend.")
     executable = _executable(config.orchestration_backend)
-    _validate_native_effort(config.orchestration_backend, config.orchestration_effort)
+    _validate_native_effort(config.orchestration_backend, config.orchestration_effort, config.orchestration_cli_model)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -75,7 +75,7 @@ def get_orchestration_completion(completion_fn: CompletionFn | None = None) -> C
 def orchestration_runtime_metadata(completion_fn: CompletionFn, api_model: str, config: Settings = settings) -> tuple[str, str]:
     if completion_fn is not orchestration_completion or config.orchestration_backend == "api":
         return "api", api_model
-    return "cli_main", f"{config.orchestration_backend} CLI (configured CLI default)"
+    return "cli_main", f"{config.orchestration_backend} CLI ({config.orchestration_cli_model or 'configured CLI default'})"
 
 
 async def orchestration_completion(**request: Any) -> Any:
@@ -90,7 +90,7 @@ async def orchestration_completion(**request: Any) -> Any:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, "Unknown orchestration backend.")
     executable = _executable(backend)
     await _authenticate(executable, backend)
-    _validate_native_effort(backend, settings.orchestration_effort)
+    _validate_native_effort(backend, settings.orchestration_effort, settings.orchestration_cli_model)
     return await _complete_cli(executable, backend, request)
 
 
@@ -123,6 +123,8 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
     with tempfile.TemporaryDirectory(prefix="huddleroom-orchestration-") as directory:
         if backend == "claude":
             command = [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema), "--no-session-persistence", "--safe-mode", "--permission-prompts", "none", "--tools", ""]
+            if model := _cli_model():
+                command.extend(("--model", model))
             if settings.orchestration_effort is not None:
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("--effort", settings.orchestration_effort))
@@ -132,10 +134,13 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
             result_path = Path(directory) / "result.json"
             schema_path = Path(directory) / "schema.json"
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
-            command = [executable, "exec", "--ephemeral", "--json", "--skip-git-repo-check", "-s", "read-only", "--output-schema", str(schema_path), "--output-last-message", str(result_path), "-"]
+            command = [executable, "exec", "--ephemeral", "--json", "--skip-git-repo-check", "-s", "read-only", "--output-schema", str(schema_path), "--output-last-message", str(result_path)]
+            if model := _cli_model():
+                command.extend(("-m", model))
             if settings.orchestration_effort is not None:
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("-c", f"model_reasoning_effort={settings.orchestration_effort}"))
+            command.append("-")
             stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), artifact_path=result_path, backend=backend)
             try:
                 if result_path.stat().st_size > _MAX_OUTPUT:
@@ -228,7 +233,8 @@ async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None =
         await terminate_process_group(proc)
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.MALFORMED_OUTPUT, "CLI output exceeded the allowed size.")
     if proc.returncode:
-        raise OrchestrationBackendError(OrchestrationBackendErrorKind.EXIT, f"CLI exited unsuccessfully (code {proc.returncode}).")
+        detail = " ".join(redact_secrets(stderr.decode(errors="replace")).split())[-300:]
+        raise OrchestrationBackendError(OrchestrationBackendErrorKind.EXIT, f"CLI exited unsuccessfully (code {proc.returncode})." + (f" {detail}" if detail else ""))
     return stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
@@ -297,16 +303,26 @@ def _envelope(envelope: Any, tools: Any) -> tuple[str, list[dict[str, Any]]]:
     return envelope["content"], calls
 
 
+def _cli_model() -> str | None:
+    try:
+        return validate_cli_model(settings.orchestration_cli_model)
+    except ValueError as error:
+        raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, f"Invalid orchestration CLI model: {error}.") from None
+
+
 def _validate_cli_effort(effort: str) -> None:
     if effort not in CLI_EFFORTS:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, f"Unsupported CLI orchestration effort {effort!r}; select default.")
 
 
-def _validate_native_effort(backend: str, effort: str | None) -> None:
+def _validate_native_effort(backend: str, effort: str | None, model: str | None = None) -> None:
     if effort is None:
         return
-    if backend == "claude":
-        raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, "Claude model capability is unknown; select default.")
+    if model or backend == "claude":
+        _validate_cli_effort(effort)  # the CLI itself accepts or rejects it for the model
+        if backend == "codex" and effort == "max":
+            raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, "Codex does not support effort 'max'; select another effort.")
+        return
     if effort not in _codex_efforts():
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, "Codex configured model does not advertise this effort; select default.")
 
