@@ -113,8 +113,9 @@ same process environment, `.env`, TOML precedence.
 | `HUDDLEROOM_DATABASE_URL` | `sqlite+aiosqlite:///$HOME/.huddleroom/huddleroom.db` | Local SQLite database file; an existing CWD database wins when no value is supplied |
 | `HUDDLEROOM_DEBUG` | `false` | Enable SQLAlchemy query logging and full redacted LLM completion exchanges. Debug logs may contain sensitive prompt/response data; use only in trusted environments. |
 | `HUDDLEROOM_EMBEDDING_MODEL` | `text-embedding-3-small` | litellm embedding model for knowledge search |
-| `HUDDLEROOM_ORCHESTRATION_MODEL` | `openai/gpt-4o-mini` | Model for orchestration decisions and meeting control |
+| `HUDDLEROOM_ORCHESTRATION_MODEL` | `openai/gpt-6.1-sol` | Model for orchestration decisions and meeting control |
 | `HUDDLEROOM_MEETING_CONTROL_MODEL` | `HUDDLEROOM_ORCHESTRATION_MODEL` | Optional meeting-control override |
+| `HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES` | `["claude_code", "codex"]` | JSON list of CLI runtimes that bypass OneCLI gateway when in onecli mode |
 
 ### Orchestration backend
 
@@ -286,7 +287,7 @@ Calls an LLM via litellm. Assembles context from task, knowledge base, and chann
    "name": "reviewer",
    "role": "reviewer",
    "provider": "openai",
-   "model": "gpt-4o-mini",
+   "model": "gpt-6.1-sol",
    "adapter_type": "api",
    "system_prompt": "You are a code reviewer.",
    "config": {
@@ -308,7 +309,7 @@ Spawns a subprocess in the project's workspace. It writes `task.md` and
    "name": "developer",
    "role": "developer",
    "provider": "anthropic",
-   "model": "claude-opus-4-6",
+   "model": "claude-opus-5-5",
    "adapter_type": "cli",
    "cli_runtime": "claude_code",
    "config": {
@@ -319,6 +320,25 @@ Spawns a subprocess in the project's workspace. It writes `task.md` and
 
 Supported `cli_runtime` values: `claude_code`, `codex`, `aider`, `copilot`,
 `opencode`, `pi`, and `custom`.
+
+#### Claude Code, Codex, aider, and custom
+
+| Runtime | Required local setup | Invocation, permissions and workspace |
+| --- | --- | --- |
+| `claude_code` | `claude` installed and logged in as the server's user | Runs in the project workspace as `claude --dangerously-skip-permissions --print --verbose [--model M] [--effort E] <task> --output-format stream-json`. A returned session ID is passed to `--resume` on a retry. |
+| `codex` | `codex` installed and logged in as the server's user | `codex exec --sandbox workspace-write --cd <workspace> --skip-git-repo-check -c sandbox_workspace_write.network_access=true [--model M] [-c model_reasoning_effort=E] <task>`. Runs with workspace-write sandbox and network access enabled. No resume: a retry restarts from the persisted task context. |
+| `aider` | `aider` installed with its model API key set | `aider --yes --no-pretty [--model M] --message <task>`. Not sandboxed; no resume. |
+| `custom` | An executable set as `config.script_path` | Invoked as `[script_path, <path to task.md>]`. The model is not forwarded. Without `script_path` the session fails with `custom_runtime_missing_script_path`. |
+
+- **Native auth runtimes** are controlled by `onecli_native_auth_runtimes` in `~/.huddleroom/config.toml` (env: `HUDDLEROOM_ONECLI_NATIVE_AUTH_RUNTIMES` as JSON list, e.g. `'["codex"]'`). Default `["claude_code", "codex"]`: they use the user's local subscription logins (~/.claude / keychain, ~/.codex) instead of per-call API billing. Set `[]` to route through the OneCLI gateway. Unknown names fail at startup. Applies to agent tasks, meeting turns, and orchestrator CLI calls.
+- For bypassed runtimes in onecli mode, gateway proxy/CA variables, placeholder API keys, and any `*_BASE_URL` (including from `cli_env_extras`) are removed from the child environment.
+- Effort: set the **Effort** field in the agent form (stored as
+  `config.reasoning_effort`: `low`, `medium`, `high`, `xhigh`, `max`; `codex`
+  does not accept `max`). Only `claude_code` and `codex` use it.
+- **Provider** is not set for CLI agents: the agent form hides it and stores the runtime name (for example `claude_code`).
+- `custom` scripts receive `HUDDLEROOM_*` and `RALLY_*` environment variables
+  (`SESSION_ID`, `TASK_ID`, `AGENT_ID`, `PROJECT_ID`, `API_BASE`) and find
+  `huddleroom_context.json` in the workspace's `.huddleroom/` directory.
 
 #### GitHub Copilot CLI, OpenCode, and pi
 
