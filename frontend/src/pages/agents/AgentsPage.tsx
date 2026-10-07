@@ -58,6 +58,7 @@ interface AgentFormState {
   description: string
   capabilities: string
   memory_enabled: boolean
+  effort: string
 }
 
 const BLANK_FORM: AgentFormState = {
@@ -71,6 +72,7 @@ const BLANK_FORM: AgentFormState = {
   description: '',
   capabilities: '',
   memory_enabled: false,
+  effort: '',
 }
 
 const API_ADAPTER_WARNING_ID = 'agent-api-adapter-warning'
@@ -86,6 +88,9 @@ const CLI_RUNTIMES = [
   { value: 'custom', label: 'Custom script' },
 ] as const
 
+const EFFORT_RUNTIMES = ['claude_code', 'codex']
+const effortLevels = (runtime: string) => (runtime === 'codex' ? ['low', 'medium', 'high', 'xhigh'] : ['low', 'medium', 'high', 'xhigh', 'max'])
+
 function agentToForm(agent: Agent): AgentFormState {
   return {
     name:           agent.name,
@@ -98,6 +103,7 @@ function agentToForm(agent: Agent): AgentFormState {
     description:    agent.description ?? '',
     capabilities:   agent.capabilities.join(', '),
     memory_enabled: (agent.config?.memory_enabled as boolean | undefined) ?? false,
+    effort:         (agent.config?.reasoning_effort as string | undefined) ?? '',
   }
 }
 
@@ -147,6 +153,8 @@ function AgentFormModal({
     setForm((p) => ({ ...p, ...patch }))
   }
 
+  const showEffort = form.adapter_type === 'cli' && EFFORT_RUNTIMES.includes(form.cli_runtime)
+
   function handleSubmit() {
     if (form.adapter_type === 'cli' && !form.cli_runtime.trim()) return
 
@@ -155,17 +163,21 @@ function AgentFormModal({
       .map((s) => s.trim())
       .filter(Boolean)
 
+    const config: Record<string, unknown> = { ...(initialData?.config ?? {}), memory_enabled: form.memory_enabled }
+    if (showEffort && effortLevels(form.cli_runtime).includes(form.effort)) config.reasoning_effort = form.effort
+    else delete config.reasoning_effort
+
     const payload = {
       name:          form.name.trim(),
       role:          form.role.trim(),
-      provider:      form.provider.trim(),
+      provider:      form.adapter_type === 'cli' ? form.cli_runtime.trim() : form.provider.trim(),
       model:         form.model.trim(),
       adapter_type:  form.adapter_type,
       cli_runtime:   form.adapter_type === 'cli' ? form.cli_runtime.trim() : null,
       system_prompt: form.system_prompt,
       description:   form.description.trim() || null,
       capabilities,
-      config:        { ...(initialData?.config ?? {}), memory_enabled: form.memory_enabled },
+      config,
       is_active:     initialData?.is_active ?? true,
     }
 
@@ -184,7 +196,7 @@ function AgentFormModal({
 
   const isPending = createAgent.isPending || updateAgent.isPending
   const canSubmit = Boolean(
-    form.name.trim() && form.role.trim() && form.provider.trim() && form.model.trim()
+    form.name.trim() && form.role.trim() && (form.adapter_type === 'cli' || form.provider.trim()) && form.model.trim()
     && (form.adapter_type !== 'cli' || form.cli_runtime.trim()),
   )
   const runtimeGuidanceNotice = runtimeGuidance(form.cli_runtime)
@@ -230,24 +242,6 @@ function AgentFormModal({
               />
             </div>
 
-            {/* Row: provider + model */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 14 }}>
-              <Input
-                label="Provider *"
-                id="agent-provider"
-                value={form.provider}
-                placeholder="anthropic"
-                onChange={(e) => set({ provider: e.target.value })}
-              />
-              <Input
-                label="Model *"
-                id="agent-model"
-                value={form.model}
-                placeholder="claude-sonnet-4-6"
-                onChange={(e) => set({ model: e.target.value })}
-              />
-            </div>
-
             <Select
               id="agent-adapter-type"
               label="Adapter type"
@@ -274,7 +268,11 @@ function AgentFormModal({
                   value={form.cli_runtime}
                   required
                   aria-describedby="agent-cli-runtime-guidance"
-                  onChange={(e) => set({ cli_runtime: e.target.value })}
+                  onChange={(e) => {
+                    const newRuntime = e.target.value
+                    const shouldResetEffort = form.effort && !effortLevels(newRuntime).includes(form.effort)
+                    set({ cli_runtime: newRuntime, ...(shouldResetEffort ? { effort: '' } : {}) })
+                  }}
                 >
                   <option value="" disabled>Select a runtime</option>
                   {unknownRuntime && <option value={form.cli_runtime}>Unknown runtime: {form.cli_runtime}</option>}
@@ -284,6 +282,49 @@ function AgentFormModal({
                   <Banner variant={runtimeGuidanceNotice.tone} title={runtimeGuidanceNotice.title} message={runtimeGuidanceNotice.body} />
                 </div>
               </>
+            )}
+
+            {/* Row: provider + model */}
+            {form.adapter_type !== 'cli' && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 14 }}>
+                <Input
+                  label="Provider *"
+                  id="agent-provider"
+                  value={form.provider}
+                  placeholder="anthropic"
+                  onChange={(e) => set({ provider: e.target.value })}
+                />
+                <Input
+                  label="Model *"
+                  id="agent-model"
+                  value={form.model}
+                  placeholder="claude-sonnet-5-5"
+                  onChange={(e) => set({ model: e.target.value })}
+                />
+              </div>
+            )}
+            {form.adapter_type === 'cli' && (
+              <div style={{ marginBottom: 14 }}>
+                <Input
+                  label="Model *"
+                  id="agent-model"
+                  value={form.model}
+                  placeholder="claude-sonnet-5-5"
+                  onChange={(e) => set({ model: e.target.value })}
+                />
+              </div>
+            )}
+
+            {showEffort && (
+              <Select
+                label="Effort"
+                id="agent-effort"
+                value={form.effort}
+                onChange={(e) => set({ effort: e.target.value })}
+              >
+                <option value="">Default</option>
+                {effortLevels(form.cli_runtime).map((l) => <option key={l} value={l}>{l}</option>)}
+              </Select>
             )}
 
             <label className="inline-flex items-center gap-2 py-2.5 cursor-pointer" style={{ minHeight: 44 }}>
