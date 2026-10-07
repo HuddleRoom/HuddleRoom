@@ -91,8 +91,8 @@ AGENTS = [
     {
         "name": "live-architect",
         "role": "architect",
-        "provider": "openi",
-        "model": "openai/gpt-5-nano",
+        "provider": "openai",
+        "model": "openai/gpt-6-luna",
         "system_prompt": (
             "You are a software architect. You champion clean abstractions, scalability, "
             "and maintainability. You push back firmly on shortcuts and over-simple solutions. "
@@ -103,8 +103,8 @@ AGENTS = [
     {
         "name": "live-pragmatist",
         "role": "engineer",
-        "provider": "openi",
-        "model": "openai/gpt-5-nano",
+        "provider": "openai",
+        "model": "openai/gpt-6-luna",
         "system_prompt": (
             "You are a pragmatic engineer. You value working code and fast delivery over "
             "elegant design. You push back on over-engineering. In meetings, disagree with "
@@ -115,8 +115,8 @@ AGENTS = [
     {
         "name": "live-security",
         "role": "security",
-        "provider": "openi",
-        "model": "openai/gpt-5-nano",
+        "provider": "openai",
+        "model": "openai/gpt-6-luna",
         "system_prompt": (
             "You are a security engineer. You identify vulnerabilities, auth gaps, and data risks. "
             "You object assertively to any decision that introduces security risk. "
@@ -127,8 +127,8 @@ AGENTS = [
     {
         "name": "live-pm",
         "role": "pm",
-        "provider": "openi",
-        "model": "openai/gpt-5-nano",
+        "provider": "openai",
+        "model": "openai/gpt-6-luna",
         "system_prompt": (
             "You are a product manager. You focus on user impact and delivery timelines. "
             "You mediate between technical views and push discussions toward concrete decisions. "

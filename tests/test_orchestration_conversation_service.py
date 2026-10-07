@@ -221,7 +221,7 @@ async def test_submit_commits_before_provider_and_settles_trustworthy_usage(
     ("model", "steering", "completion_ceiling"),
     (
         ("openrouter/minimax/minimax-m3", True, 1_600),
-        ("openai/gpt-4o-mini", True, 800),
+        ("openai/gpt-6.1-sol", True, 800),
         ("openrouter/minimax/minimax-m3", False, 800),
     ),
 )

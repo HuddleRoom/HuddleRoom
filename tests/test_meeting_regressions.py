@@ -1466,7 +1466,7 @@ async def test_final_review_reviewer_precedence_and_invocation(
             name=f"cli-reviewer-{uuid.uuid4()}",
             role="reviewer",
             provider="anthropic",
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-5-5",
             adapter_type="cli",
             cli_runtime="claude_code",
             capabilities=[],

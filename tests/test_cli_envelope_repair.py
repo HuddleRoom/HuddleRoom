@@ -189,7 +189,7 @@ async def test_cli_adapter_resume_raw_basic():
             agent_config={},
             workspace=None,
             task_path=None,
-            model="claude-3-5-sonnet-20241022",
+            model="claude-sonnet-5-5",
             cwd=".",
             env={},
             timeout=30,

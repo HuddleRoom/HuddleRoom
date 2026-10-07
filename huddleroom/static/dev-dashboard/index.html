@@ -231,7 +231,7 @@
         <label>Name</label><input type="text" id="agent-name" />
         <label>Role</label><input type="text" id="agent-role" value="developer" />
         <label>Provider</label><input type="text" id="agent-provider" value="openai" />
-        <label>Model</label><input type="text" id="agent-model" value="gpt-4o-mini" />
+        <label>Model</label><input type="text" id="agent-model" value="gpt-6.1-sol" />
         <label>Adapter Type</label>
         <select id="agent-adapter-type">
             <option value="api">api</option>
@@ -524,7 +524,7 @@ function openNewAgentModal() {
     document.getElementById('agent-name').value = '';
     document.getElementById('agent-role').value = 'developer';
     document.getElementById('agent-provider').value = 'openai';
-    document.getElementById('agent-model').value = 'gpt-4o-mini';
+    document.getElementById('agent-model').value = 'gpt-6.1-sol';
     document.getElementById('agent-adapter-type').value = 'api';
     document.getElementById('agent-description').value = '';
     document.getElementById('new-agent-modal').classList.add('open');
@@ -570,7 +570,7 @@ async function createAgent() {
                 role: document.getElementById('agent-role').value.trim() || 'developer',
                 description: document.getElementById('agent-description').value.trim() || null,
                 provider: document.getElementById('agent-provider').value.trim() || 'openai',
-                model: document.getElementById('agent-model').value.trim() || 'gpt-4o-mini',
+                model: document.getElementById('agent-model').value.trim() || 'gpt-6.1-sol',
                 adapter_type: document.getElementById('agent-adapter-type').value || 'api',
             }),
         });

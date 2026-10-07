@@ -15,7 +15,7 @@ async def _make_agent(db_session, *, name, role, capabilities=None, is_active=Tr
         name=name,
         role=role,
         provider="anthropic",
-        model="claude-sonnet-5",
+        model="claude-sonnet-5-5",
         adapter_type="api",
         capabilities=capabilities or [],
         is_active=is_active,

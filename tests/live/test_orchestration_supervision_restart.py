@@ -478,7 +478,7 @@ async def _seed(workspace: Path, provider_url: str) -> dict[str, str]:
     async with AsyncSessionLocal() as db, db.begin():
         project = Project(name=f"live-restart-{uuid.uuid4()}", workspace_path=str(workspace))
         agent = Agent(
-            name=f"live-restart-agent-{uuid.uuid4()}", role="worker", provider="openai", model="gpt-4o-mini",
+            name=f"live-restart-agent-{uuid.uuid4()}", role="worker", provider="openai", model="gpt-6-luna",
             adapter_type="api", capabilities=["planning", "implementation"],
             config={"provider_extras": {"api_base": provider_url}},
         )
@@ -1035,8 +1035,8 @@ def _diagnostic_snapshot() -> dict[str, Any]:
 def _configure_local_control_plane(env: dict[str, str], provider_url: str) -> None:
     """Keep durable orchestration decisions inside the local fake provider."""
     env.update({
-        "RALLY_ORCHESTRATION_MODEL": "openai/gpt-4o-mini",
-        "RALLY_MEETING_CONTROL_MODEL": "openai/gpt-4o-mini",
+        "RALLY_ORCHESTRATION_MODEL": "openai/gpt-6-luna",
+        "RALLY_MEETING_CONTROL_MODEL": "openai/gpt-6-luna",
         "OPENAI_API_KEY": "live-harness-key",
         "OPENAI_API_BASE": provider_url,
     })

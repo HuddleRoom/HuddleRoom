@@ -134,7 +134,7 @@ const baseEvent = (
   payload: {
     request_display: { kind: 'prompt', content: 'test', truncated: false },
     actor_label: 'Test Agent',
-    model_or_runtime: 'claude-3',
+    model_or_runtime: 'claude-sonnet-5-5',
   },
   ...overrides,
 })
@@ -537,7 +537,7 @@ describe('AgentActivityPanel - event store and socket', () => {
         payload: {
           request_display: { kind: 'prompt', content: 'test prompt', truncated: false },
           actor_label: 'Custom Label',
-          model_or_runtime: 'claude-3',
+          model_or_runtime: 'claude-sonnet-5-5',
         },
       })
 
@@ -555,7 +555,7 @@ describe('AgentActivityPanel - event store and socket', () => {
         payload: {
           request_display: { kind: 'continuation', content: null, truncated: false },
           actor_label: null,
-          model_or_runtime: 'claude-3',
+          model_or_runtime: 'claude-sonnet-5-5',
         },
       })
 
@@ -757,7 +757,7 @@ describe('AgentActivityPanel - event store and socket', () => {
         payload: {
           request_display: { kind: 'prompt', content: null, truncated: false },
           actor_label: 'Custom Agent Name',
-          model_or_runtime: 'claude-3',
+          model_or_runtime: 'claude-sonnet-5-5',
         },
       })
       useAgentResponseStore.getState().ingest(evt)
@@ -772,7 +772,7 @@ describe('AgentActivityPanel - event store and socket', () => {
         payload: {
           request_display: { kind: 'prompt', content: null, truncated: false },
           actor_label: null,
-          model_or_runtime: 'claude-3',
+          model_or_runtime: 'claude-sonnet-5-5',
         },
       })
       useAgentResponseStore.getState().ingest(evt)
@@ -787,7 +787,7 @@ describe('AgentActivityPanel - event store and socket', () => {
         payload: {
           request_display: { kind: 'prompt', content: null, truncated: false },
           actor_label: '',
-          model_or_runtime: 'claude-3',
+          model_or_runtime: 'claude-sonnet-5-5',
         },
       })
       useAgentResponseStore.getState().ingest(evt)
@@ -909,7 +909,7 @@ describe('AgentActivityPanel - event store and socket', () => {
           payload: {
             request_display: { kind: 'prompt', content: 'better late than never', truncated: false },
             actor_label: 'Agent X',
-            model_or_runtime: 'claude-3',
+            model_or_runtime: 'claude-sonnet-5-5',
           },
         })
       )

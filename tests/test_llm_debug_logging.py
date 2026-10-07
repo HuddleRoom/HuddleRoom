@@ -30,7 +30,7 @@ async def test_completion_callback_logs_allowlisted_redacted_request_and_respons
     }
     messages = [{"role": "user", "content": "token=private-value"}]
 
-    callback.log_pre_api_call("openai/gpt-4o-mini", messages, kwargs)
+    callback.log_pre_api_call("openai/gpt-6.1-sol", messages, kwargs)
     await callback.async_log_success_event(
         kwargs,
         SimpleNamespace(model_dump=lambda mode="json": {"choices": [{"message": {"content": "done"}}]}),
@@ -40,7 +40,7 @@ async def test_completion_callback_logs_allowlisted_redacted_request_and_respons
 
     request = payload_for(caplog, "llm.api.request")
     response = payload_for(caplog, "llm.api.response")
-    assert request["model"] == "openai/gpt-4o-mini"
+    assert request["model"] == "openai/gpt-6.1-sol"
     assert request["messages"][0]["content"] == "token=[REDACTED]"
     assert request["tools"] == kwargs["tools"]
     assert request["temperature"] == 0.2
@@ -114,7 +114,7 @@ async def test_litellm_acompletion_logs_request(monkeypatch, caplog):
     debug_logging.register_litellm_debug_logger()
 
     await debug_logging.litellm.acompletion(
-        model="openai/gpt-4o-mini",
+        model="openai/gpt-6.1-sol",
         messages=[{"role": "user", "content": "hello"}],
         mock_response="pong",
     )
@@ -146,7 +146,7 @@ def test_debug_events_are_written_to_configured_file_only_when_enabled(monkeypat
         monkeypatch.setattr(debug_logging.settings, "debug", True)
         debug_logging.configure_debug_file_logging()
         debug_logging.LlmDebugLogger().log_pre_api_call(
-            "openai/gpt-4o-mini",
+            "openai/gpt-6.1-sol",
             [{"role": "user", "content": "api_key=private-value"}],
             {"call_type": "acompletion"},
         )

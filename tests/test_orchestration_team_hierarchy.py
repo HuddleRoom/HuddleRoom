@@ -302,7 +302,7 @@ def test_hierarchy_request_prompt_allows_defaults_and_constrains_reporting_lines
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model,uses_json_mode", [
     ("openrouter/minimax/minimax-m3", False),
-    ("openai/gpt-4o-mini", True),
+    ("openai/gpt-6.1-sol", True),
 ])
 async def test_hierarchy_request_keeps_checkpoint_but_adapts_minimax_call(model, uses_json_mode):
     request = TeamHierarchyAnalyzer.build_request({

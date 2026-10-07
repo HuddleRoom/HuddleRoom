@@ -40,7 +40,7 @@ import litellm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PROJECT_NAME = "huddleroom-protocol-live-test"
 DEFAULT_PAGE_LIMIT = 500
-OPENAI_READINESS_MODEL = "openai/gpt-4.1-nano"
+OPENAI_READINESS_MODEL = "openai/gpt-6-luna"
 DEFAULT_PR_REPOSITORY = "acme/huddleroom-live-harness"
 DEFAULT_PR_BASE_BRANCH = "main"
 
@@ -49,7 +49,7 @@ PROTO_AGENTS = [
         "name": "proto-author",
         "role": "engineer",
         "provider": "openai",
-        "model": "gpt-4.1-nano",
+        "model": "gpt-6-luna",
         "system_prompt": "Protocol test author agent.",
         "capabilities": [],
     },
@@ -57,7 +57,7 @@ PROTO_AGENTS = [
         "name": "proto-reviewer",
         "role": "reviewer",
         "provider": "openai",
-        "model": "gpt-4.1-nano",
+        "model": "gpt-6-luna",
         "adapter_type": "api",
         "system_prompt": (
             "You are a code reviewer in an automated test pipeline. "
@@ -69,7 +69,7 @@ PROTO_AGENTS = [
         "name": "proto-merger",
         "role": "pm",
         "provider": "openai",
-        "model": "gpt-4.1-nano",
+        "model": "gpt-6-luna",
         "system_prompt": "Protocol test merger agent.",
         "capabilities": [],
     },

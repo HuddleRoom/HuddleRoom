@@ -477,7 +477,7 @@ class MeetingOutcomeService:
             return None
 
         provider = getattr(planner, "provider", None) or "openai"
-        model = getattr(planner, "model", None) or "gpt-4o-mini"
+        model = getattr(planner, "model", None) or "gpt-6.1-sol"
         litellm_model = build_litellm_model_name(provider, model)
 
         decisions_text = ""
@@ -996,7 +996,7 @@ class MeetingOutcomeService:
                     actor_label=agent.name,
                     invocation_kind="api",
                     operation="meeting_final_review",
-                    model_or_runtime=getattr(agent, "model", "gpt-4o-mini"),
+                    model_or_runtime=getattr(agent, "model", "gpt-6.1-sol"),
                     request_prompt=agent_review_request_prompt,
                 )
                 agent_review_invocation = AgentResponseInvocation(agent_review_invocation_ctx)

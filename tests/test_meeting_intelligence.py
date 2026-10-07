@@ -19,7 +19,7 @@ def test_orchestration_model_defaults_and_cheap_model_is_removed(monkeypatch):
     monkeypatch.delenv("HUDDLEROOM_ORCHESTRATION_MODEL", raising=False)
     monkeypatch.delenv("RALLY_ORCHESTRATION_MODEL", raising=False)
     configured = Settings(_env_file=None)
-    assert configured.orchestration_model == "openai/gpt-4o-mini"
+    assert configured.orchestration_model == "openai/gpt-6.1-sol"
     assert not hasattr(configured, "cheap_model")
 
 
@@ -509,7 +509,7 @@ async def test_select_next_speaker_uses_orchestration_model_when_meeting_control
 
     svc = MeetingIntelligenceService()
     with patch("huddleroom.services.meeting_intelligence.settings.meeting_control_model", None):
-        with patch("huddleroom.services.meeting_intelligence.settings.orchestration_model", "openai/gpt-4o-mini"):
+        with patch("huddleroom.services.meeting_intelligence.settings.orchestration_model", "openai/gpt-6.1-sol"):
             with patch("huddleroom.services.meeting_intelligence.litellm.acompletion", side_effect=fake_acompletion):
                 result = await svc.select_next_speaker(
                     participant_ids=[pid1],
@@ -519,7 +519,7 @@ async def test_select_next_speaker_uses_orchestration_model_when_meeting_control
                 )
 
     assert result["next_speaker_id"] == pid1
-    assert captured_models == ["openai/gpt-4o-mini"]
+    assert captured_models == ["openai/gpt-6.1-sol"]
     assert result["selected_by"] == "orchestration_model"
 
 
@@ -568,10 +568,10 @@ async def test_select_next_speaker_falls_back_to_default_openai_model_after_empt
 
     assert result["next_speaker_id"] == pid2
     assert result["reason"] == "Bob has not spoken yet."
-    assert result["model_used"] == "openai/gpt-4o-mini"
+    assert result["model_used"] == "openai/gpt-6.1-sol"
     # complete_with_repair retries up to max_attempts per model, then falls back to next candidate
     # First N calls should be to ollama (all failing with empty responses)
     # Last call should be to openai (succeeding)
-    assert captured_models[-1] == "openai/gpt-4o-mini"  # Final successful call
+    assert captured_models[-1] == "openai/gpt-6.1-sol"  # Final successful call
     assert all(m == "ollama/gemma4:26b" for m in captured_models[:-1])  # All prior calls to ollama
     assert len(captured_models) >= 4  # At least 3 retries for ollama + 1 for openai

@@ -407,7 +407,7 @@ async def test_list_reviews_filters_by_agent(db_session, orch_goal, test_agent):
         name=f"other-agent-{uuid.uuid4()}",
         role="reviewer",
         provider="anthropic",
-        model="claude-sonnet-5",
+        model="claude-sonnet-5-5",
         adapter_type="api",
         capabilities=[],
         config={},

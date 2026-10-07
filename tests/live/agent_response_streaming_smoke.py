@@ -48,7 +48,7 @@ from huddleroom.services.secret_redaction import redact_secrets  # noqa: E402  p
 PROJECT_NAME = "huddleroom-agent-response-streaming-smoke"
 AGENT_NAME = "streaming-smoke-agent"
 AGENT_PROVIDER = "openai"
-AGENT_MODEL = "openai/gpt-4.1-nano"
+AGENT_MODEL = "openai/gpt-6-luna"
 WORKSPACE_DIR = Path(__file__).resolve().parent / "logs" / "streaming-smoke-workspace"
 ORCHESTRATOR_ACTOR = ("system", "orchestrator")
 RECV_TIMEOUT_SECONDS = 240

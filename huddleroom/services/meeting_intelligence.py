@@ -13,7 +13,7 @@ from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_llm_decision_adapter import orchestrator_preamble
 
 logger = logging.getLogger(__name__)
-_DEFAULT_OPENAI_CONTROL_MODEL = "openai/gpt-4o-mini"
+_DEFAULT_OPENAI_CONTROL_MODEL = "openai/gpt-6.1-sol"
 
 
 class MeetingIntelligenceService:
