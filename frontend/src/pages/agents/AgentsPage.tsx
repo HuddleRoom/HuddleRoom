@@ -230,14 +230,12 @@ function AgentFormModal({
                 label="Name *"
                 id="agent-name"
                 value={form.name}
-                placeholder="agent name"
                 onChange={(e) => set({ name: e.target.value })}
               />
               <Input
                 label="Role *"
                 id="agent-role"
                 value={form.role}
-                placeholder="developer"
                 onChange={(e) => set({ role: e.target.value })}
               />
             </div>
@@ -291,14 +289,12 @@ function AgentFormModal({
                   label="Provider *"
                   id="agent-provider"
                   value={form.provider}
-                  placeholder="anthropic"
                   onChange={(e) => set({ provider: e.target.value })}
                 />
                 <Input
                   label="Model *"
                   id="agent-model"
                   value={form.model}
-                  placeholder="claude-sonnet-5-5"
                   onChange={(e) => set({ model: e.target.value })}
                 />
               </div>
@@ -309,7 +305,6 @@ function AgentFormModal({
                   label="Model *"
                   id="agent-model"
                   value={form.model}
-                  placeholder="claude-sonnet-5-5"
                   onChange={(e) => set({ model: e.target.value })}
                 />
               </div>
