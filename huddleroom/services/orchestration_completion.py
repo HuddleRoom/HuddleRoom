@@ -10,11 +10,13 @@ import tomllib
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 import litellm
 
 from huddleroom.config import Settings, settings, validate_cli_model
-from huddleroom.services.cli_streaming import terminate_process_group
+from huddleroom.services.cli_streaming import _json_session_id, _jsonl_records, terminate_process_group
+from huddleroom.services.llm_debug_logging import log_orchestration_exchange
 from huddleroom.services.secret_redaction import redact_secrets
 
 CompletionFn = Callable[..., Awaitable[Any]]
@@ -91,7 +93,15 @@ async def orchestration_completion(**request: Any) -> Any:
     executable = _executable(backend)
     await _authenticate(executable, backend)
     _validate_native_effort(backend, settings.orchestration_effort, settings.orchestration_cli_model)
-    return await _complete_cli(executable, backend, request)
+    meta = {"exchange_id": uuid4().hex, "backend": backend, "model": settings.orchestration_cli_model, "effort": settings.orchestration_effort, "session_id": None}
+    log_orchestration_exchange("request", request=request, **meta)
+    try:
+        result = await _complete_cli(executable, backend, request, meta)
+    except BaseException as error:
+        log_orchestration_exchange("failure", error=error, **meta)
+        raise
+    log_orchestration_exchange("response", response=result, **meta)
+    return result
 
 
 def _executable(backend: str) -> str:
@@ -115,7 +125,7 @@ async def _authenticate(executable: str, backend: str) -> None:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNAUTHENTICATED, f"The {backend} CLI is not signed in. Sign in, rerun setup, or select API via LiteLLM.")
 
 
-async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) -> dict[str, Any]:
+async def _complete_cli(executable: str, backend: str, request: dict[str, Any], meta: dict[str, Any] | None = None) -> dict[str, Any]:
     schema = _schema(request.get("tools"))
     prompt = "Return only the required JSON envelope for this request:\n" + json.dumps({key: request[key] for key in ("messages", "tools", "tool_choice", "response_format") if key in request}, default=str)
     if len(prompt.encode()) + len(json.dumps(schema).encode()) > _MAX_OUTPUT:
@@ -129,6 +139,8 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("--effort", settings.orchestration_effort))
             stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), backend=backend)
+            if meta is not None:
+                meta["session_id"] = _cli_session_id(backend, stdout)
             envelope, usage = _claude_result(stdout)
         else:
             result_path = Path(directory) / "result.json"
@@ -142,6 +154,8 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any]) 
                 command.extend(("-c", f"model_reasoning_effort={settings.orchestration_effort}"))
             command.append("-")
             stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), artifact_path=result_path, backend=backend)
+            if meta is not None:
+                meta["session_id"] = _cli_session_id(backend, stdout)
             try:
                 if result_path.stat().st_size > _MAX_OUTPUT:
                     raise ValueError("oversized result")
@@ -265,6 +279,16 @@ def _claude_result(raw: str) -> tuple[Any, dict[str, int] | None]:
     prompt = usage["input_tokens"] + usage["cache_read_input_tokens"] + usage["cache_creation_input_tokens"]
     completion = usage["output_tokens"]
     return envelope, {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+
+
+def _cli_session_id(backend: str, stdout: str) -> str | None:
+    try:
+        if backend == "claude":
+            session_id = json.loads(stdout).get("session_id")
+            return session_id if isinstance(session_id, str) else None
+        return next((session_id for record in _jsonl_records(stdout) if (session_id := _json_session_id(record, "codex"))), None)
+    except Exception:
+        return None
 
 
 def _codex_usage(raw: str) -> dict[str, int] | None:

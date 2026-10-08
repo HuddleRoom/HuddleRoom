@@ -182,3 +182,244 @@ def test_serve_configures_single_rally_logger(monkeypatch, debug, expected_level
         "level": expected_level,
         "propagate": False,
     }
+
+
+# --- orchestration CLI exchange logging ---
+import asyncio
+
+from huddleroom.services import orchestration_completion as oc
+
+_REAL_AUTH = oc._authenticate
+_REQ = {
+    "messages": [{"role": "user", "content": "hello there"}],
+    "tools": [{"type": "function", "function": {"name": "lookup"}}],
+}
+
+
+def _setup_cli(monkeypatch, caplog, stub, debug=True):
+    monkeypatch.setattr(debug_logging.settings, "debug", debug)
+    monkeypatch.setattr(oc.settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(oc.settings, "orchestration_cli_model", "sonnet")
+    monkeypatch.setattr(oc.settings, "orchestration_effort", None)
+    monkeypatch.setattr(oc, "_executable", lambda b: "/bin/claude")
+
+    async def no_auth(*_a):
+        return None
+
+    monkeypatch.setattr(oc, "_authenticate", no_auth)
+    monkeypatch.setattr(oc, "_complete_cli", stub)
+    caplog.set_level(logging.DEBUG, logger="huddleroom.llm")
+
+
+def _orch_records(caplog):
+    return [r for r in caplog.records if r.name == "huddleroom.llm" and r.message.startswith("llm.orchestration.")]
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_success_logs_request_and_response(monkeypatch, caplog):
+    result = {"choices": [{"message": {"content": "ok"}}]}
+
+    async def stub(*_a):
+        return result
+
+    _setup_cli(monkeypatch, caplog, stub)
+    assert await oc.orchestration_completion(**_REQ) is result
+    req = payload_for(caplog, "llm.orchestration.request")
+    resp = payload_for(caplog, "llm.orchestration.response")
+    assert req["exchange_id"] == resp["exchange_id"]
+    assert req["backend"] == "claude" and req["model"] == "sonnet"
+    assert req["messages"] == _REQ["messages"] and req["tools"] == _REQ["tools"]
+    assert resp["response"] == result
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_failure_logged_and_same_error_reraised(monkeypatch, caplog):
+    error = oc.OrchestrationBackendError(oc.OrchestrationBackendErrorKind.TIMEOUT, "slow")
+
+    async def stub(*_a):
+        raise error
+
+    _setup_cli(monkeypatch, caplog, stub)
+    with pytest.raises(oc.OrchestrationBackendError) as info:
+        await oc.orchestration_completion(**_REQ)
+    assert info.value is error
+    failure = payload_for(caplog, "llm.orchestration.failure")
+    assert failure["error_type"] == "OrchestrationBackendError"
+    assert "timeout" in str(failure["kind"]).lower()
+    assert payload_for(caplog, "llm.orchestration.request")["exchange_id"] == failure["exchange_id"]
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_cancellation_propagates_and_is_logged(monkeypatch, caplog):
+    async def stub(*_a):
+        raise asyncio.CancelledError()
+
+    _setup_cli(monkeypatch, caplog, stub)
+    with pytest.raises(asyncio.CancelledError):
+        await oc.orchestration_completion(**_REQ)
+    assert payload_for(caplog, "llm.orchestration.failure")["error_type"] == "CancelledError"
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_debug_disabled_logs_nothing(monkeypatch, caplog):
+    result = {"ok": 1}
+
+    async def stub(*_a):
+        return result
+
+    _setup_cli(monkeypatch, caplog, stub, debug=False)
+    assert await oc.orchestration_completion(**_REQ) is result
+    assert not [r for r in caplog.records if r.name == "huddleroom.llm"]
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_redacts_request_and_response(monkeypatch, caplog):
+    async def stub(*_a):
+        return {"content": "leak api_key=sk-response-secret-1234567890"}
+
+    _setup_cli(monkeypatch, caplog, stub)
+    await oc.orchestration_completion(messages=[{"role": "user", "content": "api_key=sk-request-secret-1234567890"}])
+    assert "sk-request-secret" not in caplog.text and "sk-response-secret" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_logging_failures_never_break_call(monkeypatch, caplog):
+    result = {"ok": 1}
+    error = oc.OrchestrationBackendError(oc.OrchestrationBackendErrorKind.TIMEOUT, "slow")
+
+    async def ok(*_a):
+        return result
+
+    async def bad(*_a):
+        raise error
+
+    _setup_cli(monkeypatch, caplog, ok)
+
+    def boom(_v):
+        raise RuntimeError("redaction broke")
+
+    monkeypatch.setattr(debug_logging, "redact_secrets", boom)
+    assert await oc.orchestration_completion(**_REQ) is result
+    monkeypatch.setattr(oc, "_complete_cli", bad)
+    with pytest.raises(oc.OrchestrationBackendError) as info:
+        await oc.orchestration_completion(**_REQ)
+    assert info.value is error
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_unprintable_error_reraises_original(monkeypatch, caplog):
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no str")
+
+    error = Unprintable()
+
+    async def stub(*_a):
+        raise error
+
+    _setup_cli(monkeypatch, caplog, stub)
+    with pytest.raises(Unprintable) as info:
+        await oc.orchestration_completion(**_REQ)
+    assert info.value is error
+
+
+@pytest.mark.asyncio
+async def test_orchestration_cli_request_metadata_is_logged(monkeypatch, caplog):
+    async def stub(*_a):
+        return {}
+
+    _setup_cli(monkeypatch, caplog, stub)
+    await oc.orchestration_completion(**_REQ, metadata={"goal_id": "g-1"})
+    assert payload_for(caplog, "llm.orchestration.request")["metadata"] == {"goal_id": "g-1"}
+
+
+@pytest.mark.asyncio
+async def test_orchestration_auth_check_is_not_logged(monkeypatch, caplog):
+    async def stub(*_a):
+        raise AssertionError("must not run")
+
+    _setup_cli(monkeypatch, caplog, stub)
+    monkeypatch.setattr(oc, "_authenticate", _REAL_AUTH)
+
+    async def fake_run(*_a, **_k):
+        return '{"loggedIn": false}', ""
+
+    monkeypatch.setattr(oc, "_run", fake_run)
+    with pytest.raises(oc.OrchestrationBackendError) as info:
+        await oc.orchestration_completion(**_REQ)
+    assert info.value.kind == oc.OrchestrationBackendErrorKind.UNAUTHENTICATED
+    assert not _orch_records(caplog)
+
+
+@pytest.mark.asyncio
+async def test_orchestration_api_backend_not_logged_by_cli_hook(monkeypatch, caplog):
+    monkeypatch.setattr(debug_logging.settings, "debug", True)
+    monkeypatch.setattr(oc.settings, "orchestration_backend", "api")
+    monkeypatch.setattr(oc.settings, "orchestration_effort", None)
+    caplog.set_level(logging.DEBUG, logger="huddleroom.llm")
+    sentinel = object()
+
+    async def fake(**_k):
+        return sentinel
+
+    monkeypatch.setattr(oc.litellm, "acompletion", fake)
+    assert await oc.orchestration_completion(model="m", messages=[]) is sentinel
+    assert not _orch_records(caplog)
+
+
+_REAL_COMPLETE_CLI = oc._complete_cli
+_OK_ENVELOPE = {"content": "ok", "tool_calls": []}
+
+
+def _setup_real_cli(monkeypatch, caplog, backend, run):
+    _setup_cli(monkeypatch, caplog, None)
+    monkeypatch.setattr(oc, "_complete_cli", _REAL_COMPLETE_CLI)
+    monkeypatch.setattr(oc.settings, "orchestration_backend", backend)
+    monkeypatch.setattr(oc.settings, "orchestration_cli_model", None)
+    monkeypatch.setattr(oc, "_run", run)
+
+
+@pytest.mark.asyncio
+async def test_orchestration_claude_session_id_logged_on_response(monkeypatch, caplog):
+    async def run(*_a, **_k):
+        return json.dumps({"session_id": "sess-123", "structured_output": _OK_ENVELOPE}), ""
+
+    _setup_real_cli(monkeypatch, caplog, "claude", run)
+    result = await oc.orchestration_completion(**_REQ)
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert payload_for(caplog, "llm.orchestration.request")["session_id"] is None
+    assert payload_for(caplog, "llm.orchestration.response")["session_id"] == "sess-123"
+
+
+@pytest.mark.asyncio
+async def test_orchestration_claude_malformed_failure_carries_session_id(monkeypatch, caplog):
+    async def run(*_a, **_k):
+        return json.dumps({"session_id": "sess-456"}), ""
+
+    _setup_real_cli(monkeypatch, caplog, "claude", run)
+    with pytest.raises(oc.OrchestrationBackendError) as info:
+        await oc.orchestration_completion(**_REQ)
+    assert info.value.kind == oc.OrchestrationBackendErrorKind.MALFORMED_OUTPUT
+    failure = payload_for(caplog, "llm.orchestration.failure")
+    assert failure["session_id"] == "sess-456"
+    assert payload_for(caplog, "llm.orchestration.request")["session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_orchestration_codex_thread_id_logged_as_session_id(monkeypatch, caplog):
+    async def run(*_a, artifact_path=None, **_k):
+        artifact_path.write_text(json.dumps(_OK_ENVELOPE), encoding="utf-8")
+        return '{"type":"thread.started","thread_id":"th-1"}\n{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}', ""
+
+    _setup_real_cli(monkeypatch, caplog, "codex", run)
+    result = await oc.orchestration_completion(**_REQ)
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert payload_for(caplog, "llm.orchestration.request")["session_id"] is None
+    assert payload_for(caplog, "llm.orchestration.response")["session_id"] == "th-1"
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+@pytest.mark.parametrize("stdout", ["not json at all", "", "[1, 2]", "{broken\n{also broken"])
+def test_cli_session_id_garbage_is_none(backend, stdout):
+    assert oc._cli_session_id(backend, stdout) is None

@@ -129,3 +129,39 @@ def log_cli_exchange(
     }
     payload["error" if error is not None else "response"] = error if error is not None else response
     _emit("llm.cli.failure" if error is not None else "llm.cli.exchange", payload)
+
+
+def log_orchestration_exchange(
+    event: str,
+    *,
+    exchange_id: str,
+    backend: str,
+    model: str | None,
+    effort: str | None,
+    session_id: str | None = None,
+    request: dict[str, Any] | None = None,
+    response: Any = None,
+    error: BaseException | None = None,
+) -> None:
+    if not settings.debug:
+        return
+    try:
+        payload: dict[str, Any] = {"exchange_id": exchange_id, "backend": backend, "model": model, "effort": effort, "session_id": session_id}
+        if event == "request":
+            payload["messages"] = request.get("messages")
+            payload.update({key: request[key] for key in _REQUEST_FIELDS if key in request})
+            if "metadata" in request:
+                payload["metadata"] = request["metadata"]
+        elif event == "response":
+            payload["response"] = response
+        elif event == "failure":
+            payload["error_type"] = type(error).__name__
+            try:
+                payload["error"] = str(error)
+            except Exception:
+                payload["error"] = "<unprintable error>"
+            payload["kind"] = getattr(error, "kind", None)
+    except Exception:
+        logger.warning("LLM debug logging failed for llm.orchestration.%s", event)
+        return
+    _emit(f"llm.orchestration.{event}", payload)
