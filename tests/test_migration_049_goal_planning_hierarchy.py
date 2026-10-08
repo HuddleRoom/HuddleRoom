@@ -205,7 +205,19 @@ def _recursive_child(conn):
     )
 
 
-@pytest.mark.parametrize("seed", [_successor_lineage, _recursive_child])
+def _terminal_reason_only(conn):
+    _run(conn, _goal(conn), "cancelled", terminal_reason="reclassified")
+
+
+def _continuous_child(conn):
+    parent = _goal(conn, "continuous", planning_mode="continuous_policy")
+    _goal(
+        conn, "continuous", planning_mode="continuous_policy", parent_goal_id=parent,
+        roadmap_version_id=uuid.uuid4().hex, roadmap_item_key="a", parent_contract_snapshot="{}", goal_delta="{}",
+    )
+
+
+@pytest.mark.parametrize("seed", [_successor_lineage, _recursive_child, _terminal_reason_only, _continuous_child])
 def test_downgrade_refuses_when_new_lineage_exists(tmp_path, seed):
     db_path, env = _env(tmp_path)
     _alembic(env, "upgrade", "049")
@@ -216,6 +228,18 @@ def test_downgrade_refuses_when_new_lineage_exists(tmp_path, seed):
     assert result.returncode != 0 and "049 downgrade refused" in result.stderr
     assert set(GOAL_COLUMNS) <= _columns(db_path, "orchestration_goals")
     assert set(RUN_COLUMNS) <= _columns(db_path, "orchestration_runs")
+
+
+def test_downgrade_allows_legacy_outcome_child_of_roadmap(tmp_path):
+    db_path, env = _env(tmp_path)
+    _alembic(env, "upgrade", "049")
+    with sqlite3.connect(db_path) as conn:
+        parent = _goal(conn, "roadmap", planning_mode="roadmap")
+        _goal(conn, "outcome", planning_mode="implementation", parent_goal_id=parent, roadmap_version_id=uuid.uuid4().hex,
+              roadmap_item_key="a", parent_contract_snapshot="{}", goal_delta="{}")
+        conn.commit()
+    _alembic(env, "downgrade", "048")
+    assert not set(GOAL_COLUMNS) & _columns(db_path, "orchestration_goals")
 
 
 def test_models_match_migration(migrated, tmp_path):
