@@ -390,3 +390,48 @@ async def test_reset_preserves_expansion_policy(client, test_project):
     resp = await client.post(f"{url}/{goal_id}/reset")
     assert resp.status_code == 200, resp.text
     assert resp.json()["goal"]["orchestrator_context"] == {"expansion_policy": {**_DEFAULT_POLICY, "max_concurrent_tasks": 4}}
+
+
+# --- Task 4 tester additions ---
+
+@real_shape
+def test_conftest_stub_skipped_for_real_goal_shape_marker():
+    assert OrchestrationGoalShapeService._classify.__module__ == "huddleroom.services.orchestration_goal_shape"
+
+
+def test_conftest_stub_active_for_unmarked_tests():
+    assert OrchestrationGoalShapeService._classify.__module__ != "huddleroom.services.orchestration_goal_shape"
+
+
+@pytest.mark.parametrize("reason", ["provider_error", "invalid_response"])
+async def test_api_unresolved_shape_reports_reason_and_creates_nothing(client, db_session, test_project, reason):
+    async def fail(self, project_id, data):
+        raise GoalShapeResolutionError(reason, "bad")
+
+    with patch.object(OrchestrationGoalShapeService, "_classify", fail):
+        resp = await client.post(f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload())
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["reason"] == reason
+    assert (await db_session.execute(select(OrchestrationGoal))).all() == []
+    assert (await db_session.execute(select(OrchestrationRun))).all() == []
+
+
+async def test_api_weight_is_independent_of_resolved_shape(client, test_project):
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    payload = _api_payload(budget={"caps": {"max_hours": 200}}, success_criteria=[
+        {"key": f"c{i}", "description": f"criterion {i}"} for i in range(8)])
+    weights = {
+        gt: (await client.post(url, json={**payload, "goal_type": gt})).json()["goal"]["weight"]
+        for gt in ("auto", "outcome", "roadmap", "continuous")
+    }
+    assert len(set(weights.values())) == 1, weights
+
+
+@pytest.mark.parametrize("goal_type", ["outcome", "roadmap", "continuous"])
+async def test_api_explicit_create_persists_rationales_and_policy(client, test_project, goal_type):
+    resp = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload(goal_type=goal_type))
+    goal = resp.json()["goal"]
+    assert goal["goal_type_rationale"] == "Selected by user at goal creation."
+    assert goal["planning_rationale"] == f"Default planning mode for an explicitly selected {goal_type} goal."
+    assert goal["orchestrator_context"]["expansion_policy"] == _DEFAULT_POLICY
