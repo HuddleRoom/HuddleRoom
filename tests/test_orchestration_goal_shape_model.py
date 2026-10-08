@@ -138,3 +138,16 @@ async def test_goal_contract_fingerprint_tracks_contract_not_status_or_context(d
     assert with_mode not in (base, changed)
     goal.goal_type, goal.planning_mode = "continuous", "continuous_policy"
     assert compute_goal_contract_fingerprint(goal) not in (base, changed, with_mode)
+
+
+@pytest.mark.asyncio
+async def test_frozen_snapshot_validator_does_not_lazy_load_expired_instance(db_session, test_project):
+    goal = _goal(test_project)
+    run = OrchestrationRun(goal_id=goal.id, budget_state={})
+    await _persist(db_session, goal)
+    run.goal_id = goal.id
+    await _persist(db_session, run)
+    db_session.expire(run)
+
+    # A lazy load here would raise MissingGreenlet; an unloaded value is treated as unknown.
+    run.goal_type_snapshot = "outcome"

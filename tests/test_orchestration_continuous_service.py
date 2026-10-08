@@ -14,7 +14,7 @@ from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationBudgetReservation, OrchestrationContinuousCandidate,
-    OrchestrationGoal, OrchestrationRun,
+    OrchestrationGoal, OrchestrationRun, compute_goal_contract_fingerprint,
 )
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.project import Project
@@ -1433,6 +1433,16 @@ async def started_continuous(db_session, test_project, *, enabled=True):
     )
     await OrchestrationService().start_run(db_session, test_project.id, goal.id, actor="human:test")
     return goal, run
+
+
+async def test_start_freezes_goal_contract_fingerprint(db_session, test_project):
+    goal, run = await continuous_ready(db_session, test_project)
+    assert run.goal_contract_fingerprint is None
+    await OrchestrationService().start_run(db_session, test_project.id, goal.id, actor="human:test")
+    frozen = run.goal_contract_fingerprint
+    assert frozen == compute_goal_contract_fingerprint(goal)
+    await OrchestrationService().start_run(db_session, test_project.id, goal.id, actor="human:test")
+    assert run.goal_contract_fingerprint == frozen
 
 
 async def test_claim_is_atomic_and_coalesces_missed_slots(db_session, test_project):

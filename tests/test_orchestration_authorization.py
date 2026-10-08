@@ -121,7 +121,7 @@ async def test_baseline_ready_stops_at_phase_ready_without_completing(db_session
     await db_session.refresh(goal)
     assert run.phase == "ready"
     assert run.status == "running"                     # not completed
-    assert run.goal_contract_fingerprint == compute_goal_contract_fingerprint(goal)
+    assert run.goal_contract_fingerprint is None       # frozen at Start, not when baseline settles
     assert goal.status in {"active", "blocked"}         # not completed
     actions = (await db_session.scalars(
         select(OrchestrationAction).where(OrchestrationAction.run_id == run.id)
@@ -142,12 +142,16 @@ async def test_start_transitions_ready_to_authorized_idempotently(db_session, cl
     )
     assert r1.status_code == 200, r1.text
     assert r1.json()["run"]["phase"] == "authorized"
+    await db_session.refresh(goal)
+    frozen = compute_goal_contract_fingerprint(goal)
+    assert r1.json()["run"]["goal_contract_fingerprint"] == frozen
 
     r2 = await client.post(
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/start",
         headers=auth_headers,
     )
     assert r2.status_code == 200                      # idempotent, not 409
+    assert r2.json()["run"]["goal_contract_fingerprint"] == frozen
     detail = (await client.get(
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}",
         headers=auth_headers,

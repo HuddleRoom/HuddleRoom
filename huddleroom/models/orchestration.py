@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, false, inspect, text, true
 from sqlalchemy.orm import Mapped, mapped_column, validates
+from sqlalchemy.orm.base import NO_VALUE
 
 from huddleroom.models.base import Base, _utcnow
 
@@ -314,9 +315,12 @@ class OrchestrationRun(Base):
     # allowed once so legacy runs can be frozen later.
     @validates("supersedes_run_id", "goal_type_snapshot", "planning_mode_snapshot", "goal_contract_fingerprint")
     def preserve_frozen_snapshot(self, key: str, value):
-        current = getattr(self, key)
-        if inspect(self).persistent and current is not None and value != current:
-            raise ValueError(f"{key} is immutable")
+        state = inspect(self)
+        if state.persistent:
+            # loaded_value avoids a lazy load on an expired instance; unloaded counts as unknown (NULL).
+            current = state.attrs[key].loaded_value
+            if current is not NO_VALUE and current is not None and value != current:
+                raise ValueError(f"{key} is immutable")
         return value
 
 

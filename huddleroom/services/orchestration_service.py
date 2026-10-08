@@ -6582,6 +6582,9 @@ class OrchestrationService:
 
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
+            # Baseline processes may still rewrite contract fields while ready; Start freezes them.
+            if run.goal_contract_fingerprint is None:
+                run.goal_contract_fingerprint = compute_goal_contract_fingerprint(goal)
             action = await self.reserve_action(
                 db,
                 run_id=run.id,
@@ -10060,8 +10063,6 @@ class OrchestrationService:
             # phase == "authorized".
             if baseline_ready and run.phase == "baseline":
                 run.phase = "ready"
-                if run.goal_contract_fingerprint is None:
-                    run.goal_contract_fingerprint = compute_goal_contract_fingerprint(goal)
                 await db.flush()
 
             new_events = await self._new_events(db, project_id, run.event_cursor)

@@ -1,9 +1,11 @@
 """Migration 049 (goal-shape provenance + successor-run lineage). Raw SQL seeds; no ORM writes."""
+import importlib.util
 import os
 import sqlite3
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -265,3 +267,31 @@ def test_models_match_migration(migrated, tmp_path):
     assert models.PLANNING_MODE_FITS_TYPE_CHECK.replace("'", "").replace(" ", "") in migration_sql.replace(
         "'", ""
     ).replace(" ", "")
+
+
+def test_migration_literals_match_model_constants():
+    """The migration hardcodes its literals; any drift from the model constants must fail here."""
+    path = Path(__file__).resolve().parent.parent / "alembic" / "versions" / "049_goal_planning_hierarchy.py"
+    spec = importlib.util.spec_from_file_location("migration_049", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    assert migration.GOAL_TYPE_RATIONALE == models.LEGACY_GOAL_TYPE_RATIONALE
+    assert migration.PLANNING_RATIONALE == models.LEGACY_PLANNING_RATIONALE
+    assert models.OrchestrationGoal.__table__.c.goal_type_source.server_default.arg == "legacy"
+    assert models.OrchestrationGoal.__table__.c.planning_mode.server_default.arg == "implementation"
+
+    def normalized(sql):
+        return " ".join(str(sql).split())
+
+    for table, checks in (
+        (models.OrchestrationGoal.__table__, migration.GOAL_CHECKS),
+        (models.OrchestrationRun.__table__, migration.RUN_CHECKS),
+    ):
+        model_checks = {
+            constraint.name: normalized(constraint.sqltext)
+            for constraint in table.constraints
+            if isinstance(constraint, sa.CheckConstraint)
+        }
+        for name, sql in checks.items():
+            assert model_checks[name] == normalized(sql), name
