@@ -4,6 +4,17 @@
  */
 
 /**
+ * Parse a backend timestamp. Backend emits naive ISO strings (no zone) that
+ * are UTC; `new Date` would read those as local time, so append "Z".
+ */
+export function parseUtc(iso: string | number): Date {
+  if (typeof iso === 'string' && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(iso) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(iso)) {
+    return new Date(iso.replace(' ', 'T') + 'Z')
+  }
+  return new Date(iso)
+}
+
+/**
  * Relative time format: "3h ago", "just now", etc.
  * Falls back to absolute format for timestamps ≥24h old.
  * Gracefully handles invalid/empty input.
@@ -13,7 +24,7 @@ export function relative(iso: string): string {
 
   let date: Date
   try {
-    date = new Date(iso)
+    date = parseUtc(iso)
     if (isNaN(date.getTime())) return iso
   } catch {
     return iso
@@ -41,7 +52,7 @@ export function absolute(iso: string | number | null | undefined): string {
 
   let date: Date
   try {
-    date = new Date(iso)
+    date = parseUtc(iso)
     if (isNaN(date.getTime())) return String(iso)
   } catch {
     return String(iso)
@@ -70,7 +81,7 @@ export function timeOfDay(iso: string): string {
 
   let date: Date
   try {
-    date = new Date(iso)
+    date = parseUtc(iso)
     if (isNaN(date.getTime())) return iso
   } catch {
     return iso
@@ -90,7 +101,7 @@ export function dateHeading(iso: string): string {
 
   let date: Date
   try {
-    date = new Date(iso)
+    date = parseUtc(iso)
     if (isNaN(date.getTime())) return iso
   } catch {
     return iso

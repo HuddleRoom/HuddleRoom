@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { parseUtc } from '@/lib/time'
 import {
   AgentResponseEvent,
   AgentCallRecord,
@@ -271,7 +272,7 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
 
         for (const callId of callIds) {
           const c = callsToUpdate[callId]
-          const startTime = new Date(c.callStartedAt).getTime()
+          const startTime = parseUtc(c.callStartedAt).getTime()
 
           if (c.terminal) {
             if (startTime < oldestTerminalStartTime) {

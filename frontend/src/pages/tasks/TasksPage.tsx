@@ -25,7 +25,7 @@ import { useDocumentTitle } from '@/hooks/useDocumentTitle'
 import { TASK_COLUMN_COLOR, STATUS_COLORS } from '@/lib/statusColors'
 import { Button, Input, Textarea, PageHeader, Select, SectionLabel, UI_COLORS, SkeletonTable, NoProjectSelected } from '@/components/common/uiPrimitives'
 import { StatTile } from '@/components/common/StatTile'
-import { absolute } from '@/lib/time'
+import { absolute, parseUtc } from '@/lib/time'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ type BoardCursor = {
 }
 
 function fmtDate(dateStr: string): string {
-  const d = new Date(dateStr)
+  const d = parseUtc(dateStr)
   const now = new Date()
   const month = d.getMonth() + 1
   const day = d.getDate()

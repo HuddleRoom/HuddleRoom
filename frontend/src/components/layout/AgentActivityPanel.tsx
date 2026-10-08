@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { parseUtc } from '@/lib/time'
 import { useAgentResponseStore } from '@/stores/agent-response'
 import { useWSStore } from '@/stores/ws'
 import { orderedCalls, reconcileAgentTabs, AgentCallRecord, AgentCallItem, JsonValue } from '@/lib/agentResponse'
@@ -61,8 +62,8 @@ function ReadableValue({ value }: { value: unknown }) {
 
 // Format duration in ms to readable string; freeze at terminal time
 function formatDuration(startedAt: string, terminatedAt?: string): string {
-  const start = new Date(startedAt).getTime()
-  const end = terminatedAt ? new Date(terminatedAt).getTime() : Date.now()
+  const start = parseUtc(startedAt).getTime()
+  const end = terminatedAt ? parseUtc(terminatedAt).getTime() : Date.now()
   const ms = end - start
   if (ms < 1000) return `${ms}ms`
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
