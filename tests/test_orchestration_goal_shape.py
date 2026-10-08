@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from huddleroom.config import settings
 from huddleroom.models.orchestration import (
     EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE,
     GOAL_TYPE_SOURCE_VALUES,
@@ -360,3 +361,32 @@ async def test_api_unresolved_shape_is_503_and_creates_nothing(client, db_sessio
     goals = (await db_session.execute(select(OrchestrationGoal).where(OrchestrationGoal.project_id == test_project.id))).all()
     runs = (await db_session.execute(select(OrchestrationRun))).all()
     assert goals == [] and runs == []
+
+
+# --- expansion policy freeze ---
+
+_DEFAULT_POLICY = {"max_concurrent_tasks": 2, "max_goal_depth": 3, "max_descendant_goals": 50, "depth": 0}
+
+
+async def test_api_create_freezes_expansion_policy(client, test_project):
+    resp = await client.post(f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload())
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["goal"]["orchestrator_context"] == {"expansion_policy": _DEFAULT_POLICY}
+
+
+async def test_settings_override_applies_only_to_new_goals(client, test_project):
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    first = await client.post(url, json=_api_payload())
+    with patch.object(settings, "orchestration_max_concurrent_tasks", 4):
+        second = await client.post(url, json=_api_payload())
+    assert first.json()["goal"]["orchestrator_context"]["expansion_policy"]["max_concurrent_tasks"] == 2
+    assert second.json()["goal"]["orchestrator_context"]["expansion_policy"]["max_concurrent_tasks"] == 4
+
+
+async def test_reset_preserves_expansion_policy(client, test_project):
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    with patch.object(settings, "orchestration_max_concurrent_tasks", 4):
+        goal_id = (await client.post(url, json=_api_payload())).json()["goal"]["id"]
+    resp = await client.post(f"{url}/{goal_id}/reset")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["goal"]["orchestrator_context"] == {"expansion_policy": {**_DEFAULT_POLICY, "max_concurrent_tasks": 4}}

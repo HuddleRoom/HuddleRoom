@@ -637,6 +637,9 @@ def test_proactive_orchestrator_setting_defaults_and_env_override(monkeypatch):
     settings = Settings(_env_file=None)
     assert settings.orchestration_wake_max_seconds == 3600
     assert settings.orchestration_max_actions_per_tick == 3
+    assert settings.orchestration_max_concurrent_tasks == 2
+    assert settings.orchestration_max_goal_depth == 3
+    assert settings.orchestration_max_descendant_goals == 50
 
     monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_WAKE_MAX_SECONDS", "120")
     monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_MAX_ACTIONS_PER_TICK", "1")

@@ -328,6 +328,14 @@ class OrchestrationService:
             ),
             explicit_multi_work_function=data.explicit_multi_work_function,
             created_by_user_id=created_by_user_id,
+            orchestrator_context={
+                "expansion_policy": {
+                    "max_concurrent_tasks": settings.orchestration_max_concurrent_tasks,
+                    "max_goal_depth": settings.orchestration_max_goal_depth,
+                    "max_descendant_goals": settings.orchestration_max_descendant_goals,
+                    "depth": 0,
+                }
+            },
             **decision.model_dump(),
         )
         db.add(goal)
@@ -4294,7 +4302,7 @@ class OrchestrationService:
         operational = {
             key: value
             for key, value in context.items()
-            if key not in {"assumptions", "merged_decision_keys"}
+            if key not in {"assumptions", "merged_decision_keys", "expansion_policy"}
         }
         return any(value not in (None, "", [], {}) for value in operational.values())
 
@@ -6871,7 +6879,8 @@ class OrchestrationService:
             db.add(run)
 
             # Reset goal columns to fresh state
-            goal.orchestrator_context = {}
+            policy = (goal.orchestrator_context or {}).get("expansion_policy")
+            goal.orchestrator_context = {"expansion_policy": policy} if policy else {}
             goal.manager_agent_id = None
             goal.manager_user_id = None
             goal.authority_model = None

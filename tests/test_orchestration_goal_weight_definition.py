@@ -686,7 +686,7 @@ async def _goal_and_run(db_session, test_project, *, objective, criteria=None, c
 
 
 @pytest.mark.asyncio
-async def test_goal_creation_initializes_empty_orchestrator_context(
+async def test_goal_creation_initializes_orchestrator_context_with_expansion_policy(
     db_session, test_project, test_user
 ):
     from huddleroom.schemas.orchestration import OrchestrationGoalCreate
@@ -702,7 +702,11 @@ async def test_goal_creation_initializes_empty_orchestrator_context(
         created_by_user_id=test_user.id,
     )
 
-    assert goal.orchestrator_context == {}
+    assert goal.orchestrator_context == {
+        "expansion_policy": {
+            "max_concurrent_tasks": 2, "max_goal_depth": 3, "max_descendant_goals": 50, "depth": 0,
+        }
+    }
 
 
 def _gd_decisions(decisions):
