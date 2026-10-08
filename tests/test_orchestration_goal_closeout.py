@@ -1014,10 +1014,10 @@ async def test_cancel_waits_for_tick_goal_lock_and_cancels_pending_decision(
     lock_goal = service._lock_goal_for_baseline_transition
 
     @asynccontextmanager
-    async def observe_lock(db, goal_id):
+    async def observe_lock(db, goal_id, *, tick_owns_transaction=False):
         if db is cancel_db:
             cancel_attempted_lock.set()
-        async with lock_goal(db, goal_id):
+        async with lock_goal(db, goal_id, tick_owns_transaction=tick_owns_transaction):
             yield
 
     async def pause_sync(*args, **kwargs):

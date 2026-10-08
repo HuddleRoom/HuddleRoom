@@ -403,12 +403,12 @@ async def test_concurrent_goal_item_release_cannot_overallocate(
     real_lock = OrchestrationService._lock_goal_for_baseline_transition
 
     @asynccontextmanager
-    async def observed_lock(service, db, goal_id):
+    async def observed_lock(service, db, goal_id, *, tick_owns_transaction=False):
         assert goal_id == parent_id
         attempts.append(db)
         if len(attempts) == 2:
             both_attempting.set()
-        async with real_lock(service, db, goal_id):
+        async with real_lock(service, db, goal_id, tick_owns_transaction=tick_owns_transaction):
             assert not holders, "Both ticks entered the parent critical section"
             holders.add(db)
             lock_events.append(("enter", db))

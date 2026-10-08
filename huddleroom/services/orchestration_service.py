@@ -714,6 +714,20 @@ class OrchestrationService:
         project_ctx = None
         goal_ctx = None
         context = None
+        # A tick-owned SQLite write transaction must release the sole writer
+        # before isolated sessions read decision context and write the result.
+        if (
+            db.info.get("orchestration_tick_owns_transaction")
+            and db.bind is not None
+            and db.bind.dialect.name == "sqlite"
+        ):
+            transaction = db.sync_session.get_transaction()
+            if (
+                transaction is not None
+                and transaction.origin == SessionTransactionOrigin.AUTOBEGIN
+                and not db.in_nested_transaction()
+            ):
+                await db.commit()
         async with AsyncSessionLocal() as read_db:
             caller_bind = db.get_bind()
             factory_bind = read_db.get_bind()
@@ -830,7 +844,13 @@ class OrchestrationService:
         return run
 
     @asynccontextmanager
-    async def _lock_goal_for_baseline_transition(self, db: AsyncSession, goal_id: uuid.UUID):
+    async def _lock_goal_for_baseline_transition(
+        self,
+        db: AsyncSession,
+        goal_id: uuid.UUID,
+        *,
+        tick_owns_transaction: bool = False,
+    ):
         """Serialize baseline process advancement/completion for one goal.
 
         Must run on the SAME session that performs the critical section's
@@ -868,7 +888,20 @@ class OrchestrationService:
             async with _SQLITE_GOAL_LOCKS_GUARD:
                 lock = _SQLITE_GOAL_LOCKS.setdefault(goal_id, _ReentrantAsyncioLock())
             async with lock.acquire_if_needed():
-                yield
+                if not tick_owns_transaction:
+                    yield
+                    return
+                marker = "orchestration_tick_owns_transaction"
+                missing = object()
+                previous = db.info.get(marker, missing)
+                db.info[marker] = True
+                try:
+                    yield
+                finally:
+                    if previous is missing:
+                        db.info.pop(marker, None)
+                    else:
+                        db.info[marker] = previous
             return
         await db.execute(
             select(OrchestrationGoal).where(OrchestrationGoal.id == goal_id).with_for_update()
@@ -9320,7 +9353,11 @@ class OrchestrationService:
 
         # Lock goal-level to serialize concurrent ticks and force-starts on the same goal.
         # This prevents: (a) baseline_ready stale-gate race; (b) concurrent completion race.
-        async with self._lock_goal_for_baseline_transition(db, goal_id):
+        async with self._lock_goal_for_baseline_transition(
+            db,
+            goal_id,
+            tick_owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(),
+        ):
             # Reload run and goal inside lock with populate_existing=True (fix #5).
             run = await db.execute(
                 select(OrchestrationRun)
