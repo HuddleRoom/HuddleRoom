@@ -8579,6 +8579,27 @@ class OrchestrationService:
         )
         return list(result.scalars().all())
 
+    async def _start_released_tasks(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
+        """Start never-started backlog tasks the orchestrator delegated (nothing else runs them)."""
+        if goal.status != "active" or run.status != "running" or run.phase not in {"baseline", "authorized"}:
+            return 0
+        started = 0
+        for task in await self._orchestrated_tasks_for_run(db, run.id, statuses=["backlog"]):
+            if task.assigned_to is None:
+                continue
+            # ponytail: only never-started tasks; recovery/retry/reassign own tasks that already had a session.
+            if await db.scalar(select(Session.id).where(Session.task_id == task.id).limit(1)) is not None:
+                continue
+            if await self._blocked_task_awaiting(db, task) is not None:  # open dependency / meeting / graph run
+                continue
+            await TaskService().auto_start(db, task)
+            if task.status == "in_progress":
+                started += 1
+            else:  # refused start rolled back a savepoint, which expires run/goal; reload for tick's later reads
+                await db.refresh(run)
+                await db.refresh(goal)
+        return started
+
     async def _failed_session_count(self, db: AsyncSession, task: Task) -> int:
         return await db.scalar(
             select(func.count(Session.id)).where(  # pylint: disable=not-callable
@@ -10145,6 +10166,8 @@ class OrchestrationService:
                 and run.status == "completed"
                 and goal.status == "completed"
             )
+
+            await self._start_released_tasks(db, goal, run)
 
             # Move emit_event_once and run.event_cursor inside lock (fix #9).
             _, created = await emit_event_once(

@@ -44,6 +44,15 @@ from huddleroom.services.orchestration_work_report import parse_work_report
 from tests.conftest import complete_baseline_processes, heal_baseline_drift_for_test
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 
+
+@pytest.fixture(autouse=True)
+def _manual_task_start(monkeypatch):
+    # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
+    async def _noop(self, db, goal, run):
+        return 0
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
+
+
 pytestmark = pytest.mark.asyncio
 
 

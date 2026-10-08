@@ -125,7 +125,8 @@ async def post_agent_report(
                 assigned_to=st.assigned_to,
                 parent_id=parent_task_id,
             )
-            await task_service.create(db, project_id, t_data)
+            task = await task_service.create(db, project_id, t_data)
+            await task_service.auto_start(db, task)
             subtasks_created += 1
 
     task_status_updated = False

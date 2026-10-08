@@ -129,6 +129,9 @@ class ActionExecutor:
             },
             _bus=self._bus,
         )
+        from huddleroom.services.task_service import TaskService
+
+        await TaskService().auto_start(db, task)
         return {"action_type": "assign_task", "task_id": str(task.id)}
 
     async def _create_session(self, db: AsyncSession, action: dict, run: GraphRun) -> dict:

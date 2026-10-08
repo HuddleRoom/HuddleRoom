@@ -314,6 +314,11 @@ class MeetingOutcomeService:
             item.task_id = created[i].id
 
         await db.flush()
+
+        from huddleroom.services.task_service import TaskService
+
+        for task in created:
+            await TaskService().auto_start(db, task)
         return created
 
     async def write_knowledge_items(

@@ -30,6 +30,14 @@ from tests.conftest import heal_baseline_drift_for_test
 
 
 @pytest.fixture(autouse=True)
+def _manual_task_start(monkeypatch):
+    # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
+    async def _noop(self, db, goal, run):
+        return 0
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
+
+
+@pytest.fixture(autouse=True)
 def no_live_decisions(stub_decision):
     stub_decision(lambda _context: {"action_type": "noop"})
 

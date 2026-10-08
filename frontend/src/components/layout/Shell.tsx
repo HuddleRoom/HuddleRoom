@@ -138,6 +138,7 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
     .join(' ')
 
   return (
+    <>
     <div
       className="huddleroom-shell"
       style={{
@@ -214,6 +215,7 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
           </div>
         )}
       </div>
+    </div>
       <Toaster
         theme="light"
         toastOptions={{
@@ -226,6 +228,6 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
           },
         }}
       />
-    </div>
+    </>
   )
 }

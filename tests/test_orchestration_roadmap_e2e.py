@@ -41,6 +41,14 @@ from tests.test_orchestration_roadmap_task_items import roadmap_task
 from tests.test_orchestration_runtime_e2e import _agent, _run_actions, _seed_accepted_plan, _tasks_for_run
 
 
+@pytest.fixture(autouse=True)
+def _manual_task_start(monkeypatch):
+    # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
+    async def _noop(self, db, goal, run):
+        return 0
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
+
+
 pytestmark = pytest.mark.asyncio
 
 

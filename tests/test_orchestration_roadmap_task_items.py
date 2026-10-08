@@ -38,6 +38,15 @@ from huddleroom.schemas.session import SessionCreate
 from huddleroom.workers.session_tasks import _require_runnable_session
 
 from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _complete_task_session
+from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest.fixture(autouse=True)
+def _manual_task_start(monkeypatch):
+    # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
+    async def _noop(self, db, goal, run):
+        return 0
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
 
 
 pytestmark = pytest.mark.asyncio

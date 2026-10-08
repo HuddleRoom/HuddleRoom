@@ -67,6 +67,15 @@ from tests.test_orchestration_runtime_e2e import (
     _tasks_for_run,
 )
 
+
+@pytest.fixture(autouse=True)
+def _manual_task_start(monkeypatch):
+    # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
+    async def _noop(self, db, goal, run):
+        return 0
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
+
+
 pytestmark = pytest.mark.asyncio
 
 PLAN_WAKE = {"recheck_after_seconds": 600, "expected_result": "Plan task finishes"}

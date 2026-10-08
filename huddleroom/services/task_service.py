@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import select
@@ -10,6 +11,8 @@ from huddleroom.models.task import Task
 from huddleroom.models.agent import Agent
 from huddleroom.schemas.task import TaskCreate, TaskUpdate
 from huddleroom.services.event_bus import emit_event
+
+logger = logging.getLogger(__name__)
 
 
 class TaskService:
@@ -238,6 +241,27 @@ class TaskService:
         )
         session = await SessionService().create(db, session_data)
         return task, session.id
+
+    async def auto_start(self, db: AsyncSession, task: Task) -> None:
+        """Best-effort start of a system/agent-created task; failures leave it unstarted."""
+        if task.assigned_to is None:
+            return
+        agent = await db.get(Agent, task.assigned_to)
+        if agent is None or not agent.is_active:
+            return
+        from huddleroom.services.session_service import SessionClaimAttention, SessionService
+        try:
+            async with db.begin_nested():
+                if task.status == "backlog":
+                    await self.transition_status(db, task.project_id, task.id, "ready")
+                else:
+                    await self._maybe_auto_session(db, task)
+        except HTTPException as exc:
+            if isinstance(exc, SessionClaimAttention):
+                await SessionService.persist_claim_attention(db, exc)
+            # Savepoint rollback expires `task`; reload it so callers can read it without lazy IO.
+            await db.refresh(task)
+            logger.warning("Auto-start of task %s failed: %s", task.id, exc.detail)
 
     async def _maybe_auto_session(self, db: AsyncSession, task: Task) -> None:
         """Auto-create a session if task is ready and assigned.

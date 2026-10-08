@@ -8,6 +8,15 @@ from huddleroom.models.orchestration import OrchestrationAction
 from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
 from tests.test_orchestration_roadmap_task_items import accepted_roadmap as accepted_roadmap_fixture
 from tests.test_orchestration_roadmap_task_items import roadmap_task
+from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest.fixture(autouse=True)
+def _manual_task_start(monkeypatch):
+    # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
+    async def _noop(self, db, goal, run):
+        return 0
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
 
 
 @pytest.mark.asyncio
