@@ -179,6 +179,8 @@ class Settings(BaseSettings):
     orchestration_semantic_progress_seconds: int = Field(default=120, ge=1)
     orchestration_sweep_goal_limit: int = Field(default=100, ge=1)
     orchestration_sweep_seconds_limit: int = Field(default=5, ge=1)
+    orchestration_wake_max_seconds: int = Field(default=3600, ge=1)
+    orchestration_max_actions_per_tick: int = Field(default=3, ge=1)
     effectiveness_recovery_threshold: int = Field(default=2, ge=1)
     effectiveness_failed_session_threshold: int = Field(default=3, ge=1)
     effectiveness_inactivity_hours: int = Field(default=24, ge=1)

@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from huddleroom.services.orchestration_wake_when import normalize_wake_when
+
 
 ALLOWED_ACTION_SCHEMAS: dict[str, frozenset[str]] = {
-    "noop": frozenset(),
+    "noop": frozenset({"wake_when"}),
     "request_plan": frozenset({"agent_id", "scope", "work_function"}),
     "request_roadmap_replan": frozenset({"agent_id", "scope", "reason"}),
     "request_plan_revision": frozenset({"plan_task_id", "revision_request"}),
@@ -139,6 +141,12 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
             False,
             f"Decision '{action_type}' missing required fields: {', '.join(missing_fields)}",
         )
+
+    if action_type == "noop":
+        try:
+            normalize_wake_when(decision["wake_when"])
+        except ValueError as exc:
+            return DecisionValidationResult(False, f"Decision 'noop' wake_when invalid: {exc}")
 
     if action_type == "request_plan" and str(decision.get("work_function")).strip() != PLAN_WORK_FUNCTION:
         return DecisionValidationResult(

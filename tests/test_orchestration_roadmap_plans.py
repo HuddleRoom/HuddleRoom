@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.orchestration import (
@@ -668,9 +669,10 @@ async def test_no_manager_advance_ingests_independent_verification_and_accepts_o
 
 
 async def test_tick_reconciles_terminal_roadmap_task_by_dispatching_one_verifier(
-    db_session, test_project, test_user, stub_decision,
+    db_session, test_project, test_user, stub_decision, monkeypatch,
 ):
     """A terminal item reaches independent verification only through tick."""
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     verifier = _agent("terminal-roadmap-verifier", ["validation"])
     db_session.add(verifier)
     await db_session.flush()
@@ -722,8 +724,10 @@ async def test_tick_releases_only_the_first_ready_roadmap_item(db_session, test_
 
 
 async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_ticks(
-    db_session, test_project, test_user, stub_decision,
+    db_session, test_project, test_user, stub_decision, monkeypatch,
 ):
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
+
     async def cardinalities():
         return (
             await db_session.scalar(select(func.count()).select_from(Task).where(

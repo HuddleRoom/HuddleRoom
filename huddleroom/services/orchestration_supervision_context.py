@@ -14,6 +14,7 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
 from huddleroom.services.orchestration_steering import OrchestrationSteeringService
 
 
@@ -97,6 +98,9 @@ class OrchestrationSupervisionContextBuilder:
                 "items": [_row(row, "id", "first_version_id", "item_key", "unit_type", "task_id", "child_goal_id", "gate_id", "completed_at") for row in items],
             },
         }
+        # ponytail: ~9 extra reads per local tick per running goal; cache per run if it ever shows up in profiles.
+        situation = await OrchestrationProgressView().build_safe(db, goal, run)
+        snapshot.update(situation.as_context())
         steering = await OrchestrationSteeringService().context_snapshot(db, goal, run)
         if steering:
             snapshot["steering"] = steering

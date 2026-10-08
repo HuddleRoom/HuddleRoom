@@ -14,6 +14,12 @@ import type { Project } from '@/lib/types'
 
 const apiFetchMock = vi.hoisted(() => vi.fn())
 const toastSuccess = vi.hoisted(() => vi.fn())
+const toastError = vi.hoisted(() => vi.fn())
+const routeState = vi.hoisted(() => ({ hash: '', activeProjectId: 'project-1' as string | null }))
+
+vi.mock('react-router-dom', () => ({
+  useLocation: () => ({ pathname: '/settings', search: '', hash: routeState.hash }),
+}))
 
 vi.mock('@/api/auth', () => ({
   useApiKeys: () => ({ data: [], isLoading: false, isError: false, refetch: vi.fn() }),
@@ -28,7 +34,7 @@ vi.mock('@/api/auth', () => ({
 }))
 
 vi.mock('@/stores/ui', () => ({
-  useUIStore: () => ({ activeProjectId: 'project-1' }),
+  useUIStore: () => ({ activeProjectId: routeState.activeProjectId }),
 }))
 
 vi.mock('@/stores/ws', () => ({
@@ -40,7 +46,7 @@ vi.mock('@monaco-editor/react', () => ({
 }))
 
 vi.mock('sonner', () => ({
-  toast: { error: vi.fn(), success: toastSuccess },
+  toast: { error: toastError, success: toastSuccess },
 }))
 
 vi.mock('@/lib/api-client', () => {
@@ -145,9 +151,8 @@ describe('ProjectConfigSection', () => {
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ['project', 'project-1'] })
       expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ['projects'] })
       expect(workspace.value).toBe('/srv/canonical')
-      const status = descendants(view.container).find((node) => node.getAttribute('role') === 'status')
+      const status = descendants(view.container).find((node) => node.getAttribute('role') === 'status' && textOf(node) === 'Server directory saved')
       expect(status?.getAttribute('aria-live')).toBe('polite')
-      expect(status && textOf(status)).toBe('Server directory saved')
       expect(toastSuccess).toHaveBeenCalledWith('Server directory saved')
     } finally {
       view.cleanup()
@@ -355,5 +360,180 @@ describe('reset danger zone', () => {
       view.cleanup()
       client.clear()
     }
+  })
+})
+
+describe('ProjectDetailsSection', () => {
+  const withDescription = { ...project, description: 'Build the thing.' }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    routeState.hash = ''
+    routeState.activeProjectId = 'project-1'
+    apiFetchMock.mockImplementation(() => Promise.resolve(withDescription))
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 0
+    })
+  })
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  async function setup(data: Record<string, unknown> = withDescription) {
+    const client = createClient()
+    client.setQueryData(['project', project.id], data)
+    const view = await mountSettings(client)
+    return {
+      client,
+      view,
+      name: getByLabel(view.container, 'Project name', 'input'),
+      description: getByLabel(view.container, 'Description', 'textarea'),
+      save: getButton(view.container, 'Save'),
+      discard: getButton(view.container, 'Discard changes'),
+      done() { view.cleanup(); client.clear() },
+    }
+  }
+
+  const putCalls = () => apiFetchMock.mock.calls.filter(([, o]) => o?.method === 'PUT')
+
+  it('shows project name and description', async () => {
+    const t = await setup()
+    try {
+      expect(t.name.value).toBe('Project One')
+      expect(t.description.value).toBe('Build the thing.')
+    } finally { t.done() }
+  })
+
+  it('null description renders empty textarea', async () => {
+    const t = await setup({ ...project, description: null })
+    try {
+      expect(t.description.value).toBe('')
+      expect(t.save.getAttribute('disabled')).not.toBeNull()
+    } finally { t.done() }
+  })
+
+  it('save disabled until dirty and discard resets', async () => {
+    const t = await setup()
+    try {
+      expect(t.save.getAttribute('disabled')).not.toBeNull()
+      expect(t.discard.getAttribute('disabled')).not.toBeNull()
+      await React.act(async () => changeControl(t.description, 'Changed'))
+      expect(t.save.getAttribute('disabled')).toBeNull()
+      expect(t.discard.getAttribute('disabled')).toBeNull()
+      await React.act(async () => t.discard.click())
+      expect(t.description.value).toBe('Build the thing.')
+      expect(t.save.getAttribute('disabled')).not.toBeNull()
+    } finally { t.done() }
+  })
+
+  it('save sends PUT with changed fields only', async () => {
+    const t = await setup()
+    try {
+      await React.act(async () => changeControl(t.description, '  New text  '))
+      await React.act(async () => { submit(t.save); await new Promise((r) => setTimeout(r, 0)) })
+      expect(putCalls()).toEqual([[
+        '/api/v1/projects/project-1',
+        { method: 'PUT', body: JSON.stringify({ description: 'New text' }) },
+      ]])
+    } finally { t.done() }
+  })
+
+  it('success shows toast/status and invalidates projects', async () => {
+    const t = await setup()
+    const invalidate = vi.spyOn(t.client, 'invalidateQueries')
+    apiFetchMock.mockImplementation(() => Promise.resolve({ ...withDescription, name: 'Renamed' }))
+    try {
+      await React.act(async () => changeControl(t.name, 'Renamed'))
+      await React.act(async () => { submit(t.save); await new Promise((r) => setTimeout(r, 0)) })
+      // react-query delivers the setQueryData notification on its own timer tick
+      await React.act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+      expect(toastSuccess).toHaveBeenCalledWith('Project saved')
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['projects'] })
+      const status = descendants(t.view.container).find((n) => n.getAttribute('role') === 'status' && textOf(n) === 'Project saved')
+      expect(status?.getAttribute('aria-live')).toBe('polite')
+      expect(t.save.getAttribute('disabled')).not.toBeNull()
+    } finally { t.done() }
+  })
+
+  it('422 on description shows inline error and focuses field', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    apiFetchMock.mockRejectedValue(new ApiError(422, 'HTTP 422', [{ loc: ['body', 'description'], msg: 'Description too long' }]))
+    const t = await setup()
+    try {
+      await React.act(async () => changeControl(t.description, 'x'))
+      await React.act(async () => { submit(t.save); await new Promise((r) => setTimeout(r, 0)) })
+      expect(t.view.activeElement).toBe(t.description)
+      expect(textOf(t.view.container)).toContain('Description too long')
+      expect(t.description.value).toBe('x')
+    } finally { t.done() }
+  })
+
+  it('other errors toast', async () => {
+    apiFetchMock.mockRejectedValue(new Error('boom'))
+    const t = await setup()
+    try {
+      await React.act(async () => changeControl(t.description, 'x'))
+      await React.act(async () => { submit(t.save); await new Promise((r) => setTimeout(r, 0)) })
+      expect(toastError).toHaveBeenCalledWith('Could not save the project. Try again.')
+    } finally { t.done() }
+  })
+
+  it('empty name blocks save', async () => {
+    const t = await setup()
+    try {
+      await React.act(async () => changeControl(t.name, '   '))
+      await React.act(async () => { submit(t.save); await new Promise((r) => setTimeout(r, 0)) })
+      expect(putCalls()).toHaveLength(0)
+      expect(textOf(t.view.container)).toContain('Enter a project name.')
+      expect(t.view.activeElement).toBe(t.name)
+    } finally { t.done() }
+  })
+
+  it('no project selected shows muted message', async () => {
+    routeState.activeProjectId = null
+    const client = createClient()
+    const view = await mountSettings(client)
+    try {
+      expect(textOf(view.container)).toContain('Select a project to edit its name and description.')
+    } finally { view.cleanup(); client.clear() }
+  })
+
+  it('#project-details hash scrolls and focuses description', async () => {
+    routeState.hash = '#project-details'
+    const scrollIntoView = vi.fn()
+    const getElementById = vi.fn(() => ({ scrollIntoView }))
+    const client = createClient()
+    client.setQueryData(['project', project.id], withDescription)
+    const { SettingsPage } = await import('./SettingsPage')
+    const view = await mountWithTestDom(
+      () => (
+        <QueryClientProvider client={client}>
+          <SettingsPage />
+        </QueryClientProvider>
+      ),
+      async (cb) => {
+        ;(globalThis.document as unknown as { getElementById: unknown }).getElementById = getElementById
+        return React.act(cb)
+      },
+    )
+    try {
+      expect(getElementById).toHaveBeenCalledWith('project-details')
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'start' })
+      expect(view.activeElement).toBe(getByLabel(view.container, 'Description', 'textarea'))
+    } finally { view.cleanup(); client.clear() }
+  })
+
+  it('helper text mentions the orchestrator', async () => {
+    const t = await setup()
+    try {
+      expect(textOf(t.view.container)).toContain('The orchestrator reads this description in every decision it makes.')
+    } finally { t.done() }
+  })
+
+  it('project config section no longer shows a duplicate name field', async () => {
+    const t = await setup()
+    try {
+      expect(descendants(t.view.container).some((n) => textOf(n) === 'Project Name')).toBe(false)
+    } finally { t.done() }
   })
 })

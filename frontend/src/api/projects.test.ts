@@ -9,6 +9,7 @@ import {
   resetProjectDataBoundary,
   type ProjectResetResponse,
   useResetProject,
+  useUpdateProject,
 } from './projects'
 
 const { resetReplayCursor } = vi.hoisted(() => ({
@@ -182,5 +183,31 @@ describe('useResetProject', () => {
 
     await expect(mutation.mutateAsync({ confirm_name: 'Alpha' })).rejects.toBe(resetError)
     expect(resetReplayCursor).not.toHaveBeenCalled()
+  })
+})
+
+describe('useUpdateProject', () => {
+  beforeEach(() => apiFetchMock.mockReset())
+
+  it('PUTs the body, seeds the project cache and invalidates the list', async () => {
+    const updated = { id: 'project-1', name: 'New' }
+    apiFetchMock.mockResolvedValue(updated)
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    let mutation: ReturnType<typeof useUpdateProject> | undefined
+    function Harness() {
+      mutation = useUpdateProject('project-1')
+      return null
+    }
+    renderToString(createElement(QueryClientProvider, { client: queryClient }, createElement(Harness)))
+
+    await mutation!.mutateAsync({ name: 'New', description: '' })
+
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/v1/projects/project-1', {
+      method: 'PUT',
+      body: JSON.stringify({ name: 'New', description: '' }),
+    })
+    expect(queryClient.getQueryData(['project', 'project-1'])).toEqual(updated)
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['projects'] })
   })
 })

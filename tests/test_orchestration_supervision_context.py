@@ -11,7 +11,9 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
+from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
 from huddleroom.services.orchestration_service import OrchestrationService
+from huddleroom.services.orchestration_supervision_context import OrchestrationSupervisionContextBuilder
 
 
 pytestmark = pytest.mark.asyncio
@@ -192,3 +194,66 @@ async def test_context_build_is_stable_with_open_gates(db_session, test_project)
 
     service = OrchestrationService()
     assert await service._decision_context(db_session, goal, run) == await service._decision_context(db_session, goal, run)
+
+
+async def test_context_includes_progress_view_for_declared_criteria(db_session, test_project):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    goal.success_criteria = [{"key": "alpha", "description": "Alpha works"}]
+    db_session.add(OrchestrationGate(run_id=run.id, success_criterion_key="alpha", gate_type="evidence"))
+    await db_session.flush()
+
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    assert [(row["criterion_key"], row["description"], row["state"]) for row in context["progress_view"]] == [
+        ("alpha", "Alpha works", "evidence_pending"),
+    ]
+    assert "progress_view_error" not in context
+
+
+async def test_context_includes_untracked_follow_ups_and_total(db_session, test_project):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    db_session.add_all([
+        OrchestrationGate(run_id=run.id, success_criterion_key="a", gate_type="evidence"),
+        OrchestrationGate(run_id=run.id, success_criterion_key="b", gate_type="evidence"),
+    ])
+    await db_session.flush()
+
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    assert context["untracked_follow_ups_total"] == 2
+    assert [row["kind"] for row in context["untracked_follow_ups"]] == ["unverified_gate", "unverified_gate"]
+
+
+async def test_context_marks_progress_view_error_with_empty_lists(db_session, test_project, monkeypatch):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    db_session.add(OrchestrationGate(run_id=run.id, success_criterion_key="a", gate_type="evidence"))
+    await db_session.flush()
+
+    async def boom(self, db, goal, run):
+        raise RuntimeError("progress read failed")
+
+    monkeypatch.setattr(OrchestrationProgressView, "build", boom)
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    assert context["progress_view_error"] is True
+    assert context["progress_view"] == []
+    assert context["untracked_follow_ups"] == []
+    assert context["untracked_follow_ups_total"] == 0
+
+
+async def test_context_progress_view_is_stable_across_two_builds(db_session, test_project):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    goal.success_criteria = [{"key": "a", "description": "A"}, {"key": "b", "description": "B"}]
+    db_session.add_all([
+        OrchestrationGate(run_id=run.id, success_criterion_key="a", gate_type="evidence"),
+        OrchestrationGate(run_id=run.id, success_criterion_key="b", gate_type="evidence"),
+    ])
+    await db_session.flush()
+
+    builder = OrchestrationSupervisionContextBuilder()
+    first = await builder.build(db_session, goal, run)
+    second = await builder.build(db_session, goal, run)
+
+    assert first["progress_view"] == second["progress_view"]
+    assert first["untracked_follow_ups"] == second["untracked_follow_ups"]
+    assert first["untracked_follow_ups_total"] == second["untracked_follow_ups_total"]

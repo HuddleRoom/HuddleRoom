@@ -181,3 +181,135 @@ async def test_goal_detail_exposes_goal_type_and_phase(client, auth_headers, tes
     assert body["run"]["condition"] in {
         "working", "waiting_authority", "waiting_work", "needs_attention",
     }
+
+
+async def _start_ready_goal(
+    db_session, client, auth_headers, test_project, *, description=None, objective=None, constraints=None,
+    goal_type=None,
+):
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    if constraints is not None:
+        goal.constraints = constraints
+    if goal_type is not None:
+        goal.goal_type = goal_type
+        goal.continuous_policy = {
+            "version": 1,
+            "activation": {"cron": "*/5 * * * *", "timezone": "UTC", "missed_slots": "coalesce"},
+            "adapter_filter": {"adapter_type": "schedule", "enabled": True},
+            "cycle_mode": "direct",
+            "child_template": {
+                "objective": "Process the scheduled case",
+                "success_criteria": [{"key": "processed", "description": "Case is independently verified"}],
+                "constraints": {"external_impact": False},
+            },
+            "per_case_budget": {"max_tokens": "100", "max_turns": "2", "max_hours": "0.5"},
+            "response_target_seconds": 900,
+            "max_active_cases": 2,
+            "max_backlog": 3,
+            "rolling_budget": {
+                "window_seconds": 3600,
+                "limits": {"max_tokens": "500", "max_turns": "10", "max_hours": "2"},
+            },
+            "stop_condition": {"mode": "manual"},
+        }
+    if description is not None:
+        test_project.description = description
+    if objective is not None:
+        goal.objective = objective
+    await OrchestrationService().tick(db_session, run.id)
+    await db_session.flush()
+    resp = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/start",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    if goal_type is None:
+        assert resp.json()["run"]["phase"] == "authorized"
+    return goal
+
+
+async def _conflict_warnings(db_session, goal):
+    warnings = await OrchestrationWarningService().list_warnings(db_session, goal.id, active_only=True)
+    return [w for w in warnings if w.warning_type == "start_text_conflict"]
+
+
+@pytest.mark.asyncio
+async def test_start_with_do_not_start_text_creates_recommendation_warning(
+    db_session, client, auth_headers, test_project
+):
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project,
+        description="Mimlo site. Prepare only; do not start the goal.",
+    )
+    found = await _conflict_warnings(db_session, goal)
+    assert len(found) == 1
+    assert found[0].severity == "recommendation"
+    assert "project description" in found[0].message
+    assert "Prepare only" in found[0].message
+
+
+@pytest.mark.asyncio
+async def test_start_with_goal_objective_conflict_names_goal_objective(
+    db_session, client, auth_headers, test_project
+):
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project, objective="Draft plan, hold off on building",
+    )
+    found = await _conflict_warnings(db_session, goal)
+    assert len(found) == 1
+    assert "goal objective" in found[0].message
+
+
+@pytest.mark.asyncio
+async def test_start_without_conflicting_text_creates_no_warning(
+    db_session, client, auth_headers, test_project
+):
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project, description="A normal project.",
+    )
+    assert await _conflict_warnings(db_session, goal) == []
+
+
+@pytest.mark.asyncio
+async def test_start_replay_does_not_duplicate_warning(db_session, client, auth_headers, test_project):
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project, description="Prepare only.",
+    )
+    resp = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/start",
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert len(await _conflict_warnings(db_session, goal)) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_succeeds_when_warning_helper_raises(
+    db_session, client, auth_headers, test_project, monkeypatch
+):
+    def boom(_sources):
+        raise RuntimeError("checker down")
+
+    monkeypatch.setattr("huddleroom.services.orchestration_service.find_start_contradictions", boom)
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project, description="Prepare only.",
+    )
+    assert await _conflict_warnings(db_session, goal) == []
+
+
+@pytest.mark.asyncio
+async def test_start_continuous_goal_with_conflicting_text_warns(db_session, client, auth_headers, test_project):
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project, description="Prepare only.", goal_type="continuous",
+    )
+    assert len(await _conflict_warnings(db_session, goal)) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_conflict_phrase_only_in_constraint_key_does_not_warn(
+    db_session, client, auth_headers, test_project
+):
+    goal = await _start_ready_goal(
+        db_session, client, auth_headers, test_project, constraints={"prepare only": True},
+    )
+    assert await _conflict_warnings(db_session, goal) == []

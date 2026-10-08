@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import React, { act, useState, type ComponentProps } from 'react'
+import { MemoryRouter } from 'react-router-dom'
 import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
 import type {
@@ -210,7 +211,7 @@ function QueueHarness(props: Partial<NeedsYouQueueProps> & { onSelectProcess?: (
 }
 
 async function mountQueue(props: Partial<ComponentProps<typeof QueueHarness>> = {}) {
-  const render = (nextProps: Partial<ComponentProps<typeof QueueHarness>> = props) => <GoalAnnouncerProvider><QueueHarness {...nextProps} /></GoalAnnouncerProvider>
+  const render = (nextProps: Partial<ComponentProps<typeof QueueHarness>> = props) => <MemoryRouter><GoalAnnouncerProvider><QueueHarness {...nextProps} /></GoalAnnouncerProvider></MemoryRouter>
   const view = await mountWithTestDom(() => render(), act)
   return { ...view, rerender: (nextProps: Partial<ComponentProps<typeof QueueHarness>> = props) => view.rerender(() => render(nextProps)) }
 }
@@ -449,6 +450,28 @@ describe('NeedsYouQueue', () => {
       await act(async () => getButton(view.container, 'Resolve').click())
       await act(async () => getButton(view.container, 'Submit resolve').click())
       expect(textOf(view.container)).not.toContain('Already acknowledged.')
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('start_text_conflict warning links to project settings', async () => {
+    const warn = warning({ id: 'warn-start', warning_type: 'start_text_conflict', severity: 'recommendation', message: 'Description says prepare only.' })
+    const view = await mountQueue({ warnings: [warn] })
+    try {
+      const link = descendants(view.container).find((node) => node.tagName === 'A')
+      expect(link?.getAttribute('href')?.endsWith('/settings#project-details')).toBe(true)
+      expect(() => getButton(view.container, 'Acknowledge')).not.toThrow()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('other warning types render no settings link', async () => {
+    const warn = warning({ id: 'warn-other', warning_type: 'coverage_gap' })
+    const view = await mountQueue({ warnings: [warn] })
+    try {
+      expect(descendants(view.container).some((node) => node.tagName === 'A')).toBe(false)
     } finally {
       view.cleanup()
     }

@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useApiKeys, useCreateApiKey, useRevokeApiKey, useCurrentUser } from '@/api/auth'
-import { useResetProject } from '@/api/projects'
+import { useLocation } from 'react-router-dom'
+import { useResetProject, useUpdateProject } from '@/api/projects'
 import { ApiError, apiFetch } from '@/lib/api-client'
 import { useUIStore } from '@/stores/ui'
 import { toast } from 'sonner'
 import { Plus, Trash2, Save } from 'lucide-react'
 import { LazyMonacoEditor as Editor } from '@/lib/lazyMonaco'
-import { Button, Field, Section, Input, SectionLabel, PageHeader, QueryState, ConfirmDialog } from '@/components/common/uiPrimitives'
+import { Button, Field, Section, Input, Textarea, SectionLabel, PageHeader, QueryState, ConfirmDialog } from '@/components/common/uiPrimitives'
 import { Dialog } from '@/components/common/Dialog'
 import type { ApiKey, User, Project } from '@/lib/types'
 import { useDocumentTitle } from '@/hooks/useDocumentTitle'
@@ -258,6 +259,158 @@ function ApiKeysSection() {
   )
 }
 
+function fieldErrorFrom(error: unknown, field: string): string | undefined {
+  const detail = error instanceof ApiError ? error.detail : undefined
+  if (!Array.isArray(detail)) return undefined
+  const item = detail.find((entry) =>
+    typeof entry === 'object' && entry !== null && Array.isArray((entry as { loc?: unknown }).loc)
+      && (entry as { loc: unknown[] }).loc.includes(field)) as { msg?: unknown } | undefined
+  return typeof item?.msg === 'string' ? item.msg : undefined
+}
+
+function ProjectDetailsForm({ project }: { project: Project }) {
+  const updateMutation = useUpdateProject(project.id)
+  const { hash } = useLocation()
+  const [name, setName] = useState(project.name)
+  const [description, setDescription] = useState(project.description ?? '')
+  const [nameError, setNameError] = useState<string | null>(null)
+  const [descriptionError, setDescriptionError] = useState<string | null>(null)
+  const [status, setStatus] = useState('')
+  const nameInput = useRef<HTMLInputElement>(null)
+  const descriptionInput = useRef<HTMLTextAreaElement>(null)
+
+  const savedDescription = (project.description ?? '').trim()
+  const nameChanged = name.trim() !== project.name.trim()
+  const descriptionChanged = description.trim() !== savedDescription
+  const dirty = nameChanged || descriptionChanged
+
+  useEffect(() => {
+    if (hash !== '#project-details') return
+    document.getElementById('project-details')?.scrollIntoView({ block: 'start' })
+    descriptionInput.current?.focus()
+  }, [hash])
+
+  const handleDiscard = () => {
+    setName(project.name)
+    setDescription(project.description ?? '')
+    setNameError(null)
+    setDescriptionError(null)
+    setStatus('')
+  }
+
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault()
+    setStatus('')
+    if (!name.trim()) {
+      setNameError('Enter a project name.')
+      nameInput.current?.focus()
+      return
+    }
+    const body: { name?: string; description?: string } = {}
+    if (nameChanged) body.name = name.trim()
+    if (descriptionChanged) body.description = description.trim()
+    updateMutation.mutate(body, {
+      onSuccess: (updated) => {
+        const saved = updated as Project
+        setName(saved.name)
+        setDescription(saved.description ?? '')
+        setNameError(null)
+        setDescriptionError(null)
+        setStatus('Project saved')
+        toast.success('Project saved')
+      },
+      onError: (error) => {
+        const nameMsg = fieldErrorFrom(error, 'name')
+          ?? (error instanceof ApiError && error.status === 409 ? error.message : undefined)
+        const descriptionMsg = fieldErrorFrom(error, 'description')
+        setNameError(nameMsg ?? null)
+        setDescriptionError(descriptionMsg ?? null)
+        if (nameMsg) requestAnimationFrame(() => nameInput.current?.focus())
+        else if (descriptionMsg) requestAnimationFrame(() => descriptionInput.current?.focus())
+        else toast.error('Could not save the project. Try again.')
+      },
+    })
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <Input
+        ref={nameInput}
+        label="Project name"
+        value={name}
+        required
+        onChange={(event) => { setName(event.target.value); setNameError(null); setStatus('') }}
+        error={nameError ?? undefined}
+        aria-invalid={!!nameError}
+      />
+      <Textarea
+        ref={descriptionInput}
+        label="Description"
+        rows={5}
+        value={description}
+        placeholder="Describe what this project is for."
+        onChange={(event) => { setDescription(event.target.value); setDescriptionError(null); setStatus('') }}
+        error={descriptionError ?? undefined}
+        aria-invalid={!!descriptionError}
+        aria-describedby="project-description-help"
+      />
+      <p id="project-description-help" className="text-huddleroom-text-muted text-xs" style={{ margin: '-8px 0 10px' }}>
+        The orchestrator reads this description in every decision it makes. Don't put instructions about starting or pausing goals here, such as "prepare only" or "do not start".
+      </p>
+      <div style={{ display: 'flex', gap: 12 }}>
+        <Button variant="primary" type="submit" className="min-h-11" disabled={!dirty || updateMutation.isPending}>
+          <Save size={14} />
+          {updateMutation.isPending ? 'Saving…' : 'Save'}
+        </Button>
+        <Button variant="secondary" type="button" className="min-h-11" disabled={!dirty || updateMutation.isPending} onClick={handleDiscard}>
+          Discard changes
+        </Button>
+      </div>
+      <p className="sr-only" role="status" aria-live="polite">{status}</p>
+    </form>
+  )
+}
+
+function ProjectDetailsSection() {
+  const { activeProjectId } = useUIStore()
+  const projectQuery = useQuery({
+    queryKey: ['project', activeProjectId],
+    queryFn: () => apiFetch<Project>(`/api/v1/projects/${activeProjectId}`),
+    enabled: !!activeProjectId,
+  })
+
+  if (!activeProjectId) {
+    return (
+      <Section title="Project">
+        <div className="text-huddleroom-text-muted text-[13px]" style={{ padding: 16 }}>
+          Select a project to edit its name and description.
+        </div>
+      </Section>
+    )
+  }
+
+  return (
+    <Section id="project-details" title="Project" subtitle="Name and description for this project." tabIndex={-1} className="scroll-mt-4">
+      <div style={{ padding: '16px' }}>
+        <QueryState
+          query={{
+            isLoading: projectQuery.isLoading,
+            isError: projectQuery.isError,
+            data: projectQuery.data,
+            refetch: projectQuery.refetch,
+          }}
+          skeleton="list"
+          skeletonCount={2}
+          errorLabel="Failed to load project"
+          emptyLabel="Project not found"
+        >
+          {(data) => <ProjectDetailsForm project={data} />}
+        </QueryState>
+      </div>
+    </Section>
+  )
+}
+
 function ProjectConfigSection() {
   const { activeProjectId } = useUIStore()
   const qc = useQueryClient()
@@ -438,12 +591,6 @@ function ProjectConfigSection() {
         >
           {(data) => (
             <>
-              <Field label="Project Name">
-                <div className="text-huddleroom-text-primary" style={{ padding: '6px 8px' }}>
-                  {data.name}
-                </div>
-              </Field>
-
               <form onSubmit={handleSaveWorkspace} style={{ marginBottom: 14 }}>
                 <Input
                   ref={workspaceInput}
@@ -671,6 +818,7 @@ export function SettingsPage() {
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <ApiKeysSection />
+          <ProjectDetailsSection key={`details-${activeProjectId ?? 'none'}`} />
           <ProjectConfigSection key={activeProjectId ?? 'none'} />
           <UserProfileSection />
         </div>

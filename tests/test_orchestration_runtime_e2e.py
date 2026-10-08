@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from fastapi import HTTPException
 
+from huddleroom.config import settings
 from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.base import _utcnow
@@ -41,6 +42,7 @@ from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_work_report import parse_work_report
 
 from tests.conftest import complete_baseline_processes, heal_baseline_drift_for_test
+from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 
 pytestmark = pytest.mark.asyncio
 
@@ -357,8 +359,10 @@ async def test_plan_validation_handles_deep_acyclic_dag():
 
 
 async def test_runtime_commits_malformed_plan_failure_then_accepts_revision(
-    db_session, concurrent_sessions, test_project, stub_decision
+    db_session, concurrent_sessions, test_project, stub_decision, monkeypatch
 ):
+    # Step-by-step plan failure/revision contract; pin single-action ticks.
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     planner = _agent("runtime-malformed-plan", ["planning"])
     db_session.add(planner)
     await db_session.flush()
@@ -691,8 +695,11 @@ async def test_follow_up_rejects_wrong_agent_and_parent_run(db_session, test_pro
 
 
 async def test_tick_replay_deduplicates_regenerated_follow_up_decisions(
-    db_session, test_project, stub_decision
+    db_session, test_project, stub_decision, monkeypatch
 ):
+    # Cross-tick replay of one decision per tick; pin single-action ticks so the
+    # in-tick loop does not add a second decision per tick.
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     service, run, parent, agent, report_session = await _completed_parent_task(db_session, test_project)
     await _seed_accepted_plan(
         db_session,
@@ -846,7 +853,10 @@ async def test_runtime_non_dispatchable_decision_persists_one_replayable_wait(
     ))).all())
 
     assert first["authorized_execution"]["action_id"] is not None
-    assert second["authorized_execution"]["action_id"] == first["authorized_execution"]["action_id"]
+    # The fallback noop now creates an orchestrator backstop wait, so the next tick waits.
+    assert second["authorized_execution"]["step"] == "local_liveness"
+    assert second["authorized_execution"]["outcome"] == "waiting"
+    assert "action_id" not in second["authorized_execution"]
     assert len(first_actions) == actions_before + 1
     assert len(second_actions) == len(first_actions)
     assert len(waits) == len(wait_events) == 1
@@ -901,7 +911,7 @@ async def test_committed_regenerated_decisions_replay_once_across_fresh_services
         "reason": "First wording.",
     }
     ask = {"action_type": "ask_human", "question": "Choose the delivery scope.", "reason": "First wording."}
-    noop = {"action_type": "noop", "reason": "Waiting for the next event."}
+    noop = {"action_type": "noop", "reason": "Waiting for the next event.", "wake_when": NOOP_WAKE_WHEN}
     for parsed in (delegation, meeting, ask, noop):
         await dispatch(db_session, parsed)
     await db_session.commit()
@@ -1194,13 +1204,15 @@ async def test_cancel_only_stops_owned_runner_sessions(db_session, test_project,
 
 
 async def test_outcome_goal_golden_path_reaches_completed_phase(
-    db_session, test_project, stub_decision, safe_effectiveness_review_continue
+    db_session, test_project, stub_decision, safe_effectiveness_review_continue, monkeypatch
 ):
     """A real Outcome run only completes after independent evidence and closeout.
 
     Removing Start, accepting the producer session, or forgetting the terminal
     phase transition each makes this contract fail.
     """
+    # Step-by-step golden path; pin single-action ticks so each tick asserts one step.
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     planner = _agent("golden-planner", ["planning"])
     producer = _agent("golden-producer", ["implementation"])
     verifier = _agent("golden-verifier", ["validation"])
@@ -1364,8 +1376,12 @@ async def test_outcome_two_criterion_plan_requires_criterion_scoped_verification
     safe_agent_definition_review,
     safe_effectiveness_review_continue,
     reuse_first_criterion_evidence,
+    monkeypatch,
 ):
     """Real two-criterion Outcome work reaches completion only with linked verifier proof."""
+    # Pin single-action ticks: with the loop, the accept tick also releases work, and the
+    # following tick would fall through to a stub that still returns accept_plan (409).
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     planner = _agent("two-criterion-planner", ["planning"])
     producer_a = _agent("two-criterion-producer-a", ["implementation"])
     producer_b = _agent("two-criterion-producer-b", ["implementation"])

@@ -627,3 +627,28 @@ def test_orchestration_cli_model_toml_int_fails(tmp_path):
 
     assert result.returncode != 0
     assert "orchestration_cli_model" in result.stderr
+
+
+def test_proactive_orchestrator_setting_defaults_and_env_override(monkeypatch):
+    from pydantic import ValidationError
+
+    from huddleroom.config import Settings
+
+    settings = Settings(_env_file=None)
+    assert settings.orchestration_wake_max_seconds == 3600
+    assert settings.orchestration_max_actions_per_tick == 3
+
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_WAKE_MAX_SECONDS", "120")
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_MAX_ACTIONS_PER_TICK", "1")
+    settings = Settings(_env_file=None)
+    assert settings.orchestration_wake_max_seconds == 120
+    assert settings.orchestration_max_actions_per_tick == 1
+
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_WAKE_MAX_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_WAKE_MAX_SECONDS", "3600")
+
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_MAX_ACTIONS_PER_TICK", "0")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

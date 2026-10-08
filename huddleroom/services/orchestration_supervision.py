@@ -15,6 +15,14 @@ from huddleroom.models.session import Session
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
+from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE as _ORCH_OWNER
+
+from huddleroom.services.orchestration_decision_validator import FINAL_SUMMARY_WORK_FUNCTION, PLAN_WORK_FUNCTION
+
+SYSTEM_WAIT_OWNER_TYPES = frozenset({"session", "task", "authority_decision", "child_run"})
+
+def _same_owner(a, b) -> bool:
+    return all((a or {}).get(k) == (b or {}).get(k) for k in ("type", "id"))
 
 
 DISPOSITIONS = frozenset({"continue", "pause", "follow_up", "verify", "reassign", "meeting", "graph", "replan", "attention"})
@@ -90,15 +98,35 @@ class OrchestrationSupervisionService:
             current_run = await db.get(OrchestrationRun, run.id, populate_existing=True)
             if current_goal is None or current_run is None or current_goal.status != "active" or current_run.status != "running" or current_run.phase != "authorized":
                 raise HTTPException(status_code=409, detail="wait is not authorized")
-            existing = (await db.scalars(select(OrchestrationWait).where(
-                OrchestrationWait.run_id == current_run.id, OrchestrationWait.wait_key == key
-            ).order_by(OrchestrationWait.created_at.desc()))).first()
+            matches = (contract["owner"], contract["awaited_event"], stored_fallback)
+            orchestrator_owned = contract["owner"]["type"] == _ORCH_OWNER
+
+            async def lookup():
+                """Return (existing open/system row or None, wait_key for a new row)."""
+                if not orchestrator_owned:
+                    row = (await db.scalars(select(OrchestrationWait).where(
+                        OrchestrationWait.run_id == current_run.id, OrchestrationWait.wait_key == key
+                    ).order_by(OrchestrationWait.created_at.desc()))).first()
+                    return row, key
+                rows = list((await db.scalars(select(OrchestrationWait).where(
+                    OrchestrationWait.run_id == current_run.id,
+                    (OrchestrationWait.wait_key == key) | OrchestrationWait.wait_key.like(f"{key}:g%"),
+                ))).all())
+                if not rows:
+                    return None, key
+                latest = max(rows, key=lambda r: (r.created_at, r.wait_key))
+                if latest.status == "open":
+                    return latest, key
+                # ponytail: a consumed wait is history; a repeat of the same origin is a new generation
+                return None, f"{key}:g{len(rows)}"
+
+            existing, new_key = await lookup()
             if existing is not None:
-                if (existing.owner, existing.awaited_event, existing.fallback) != (contract["owner"], contract["awaited_event"], stored_fallback):
+                if (existing.owner, existing.awaited_event, existing.fallback) != matches:
                     raise HTTPException(status_code=409, detail="wait replay conflicts with existing contract")
                 return existing
             wait = OrchestrationWait(
-                run_id=current_run.id, wait_key=key, owner=contract["owner"], awaited_event=contract["awaited_event"],
+                run_id=current_run.id, wait_key=new_key, owner=contract["owner"], awaited_event=contract["awaited_event"],
                 due_recheck_at=_utcnow() + timedelta(seconds=contract["recheck_seconds"]), fallback=stored_fallback,
             )
             try:
@@ -106,13 +134,67 @@ class OrchestrationSupervisionService:
                     db.add(wait)
                     await db.flush()
             except IntegrityError:
-                existing = (await db.scalars(select(OrchestrationWait).where(
-                    OrchestrationWait.run_id == current_run.id, OrchestrationWait.wait_key == key
-                ).order_by(OrchestrationWait.created_at.desc()))).first()
-                if existing is not None and (existing.owner, existing.awaited_event, existing.fallback) == (contract["owner"], contract["awaited_event"], stored_fallback):
+                existing, _ = await lookup()
+                if existing is not None and (existing.owner, existing.awaited_event, existing.fallback) == matches:
                     return existing
                 raise HTTPException(status_code=409, detail="wait replay conflicts with existing contract")
             return wait
+
+    async def create_orchestrator_waits(self, db, run, *, owner_id, wake_when) -> list[OrchestrationWait]:
+        """Turn a decision's wake_when into grouped waits; a missing or invalid spec gets a backstop."""
+        from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+        from huddleroom.services.orchestration_steering import OrchestrationSteeringService
+        from huddleroom.services.orchestration_wake_when import (
+            BACKSTOP_RECHECK_SECONDS, ORCHESTRATOR_WAIT_OWNER_TYPE, WAKE_RECHECK_EVENT_TYPE,
+            clamp_recheck_seconds, normalize_wake_when,
+        )
+        spec = None
+        if wake_when is not None:
+            try:
+                spec = normalize_wake_when(wake_when)
+            except ValueError:
+                spec = None
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        if goal is None:
+            return []
+        # Mirrors reconcile_local: an accepted roadmap plan never waits.
+        if goal.goal_type == "roadmap" and self.orchestration._json_object_or_empty(run.plan_state).get("status") == "accepted":
+            return []
+        situation = await OrchestrationProgressView().build_safe(db, goal, run)
+        follow_up_ids = sorted(item["id"] for item in situation.untracked_follow_ups)
+        steering = OrchestrationSteeringService(self.orchestration)
+        digest = steering.version_digest(await steering.current_versions(db, goal, run))
+        owner = {"type": ORCHESTRATOR_WAIT_OWNER_TYPE, "id": str(owner_id)}
+        fallback = {
+            "action_type": "continue",
+            "reason": spec["expected_result"] if spec else "Orchestrator backstop recheck",
+            "steering_digest": digest,
+        }
+        if not situation.error:  # an unknown follow-up set must not look like "none"; the safety net skips a missing key
+            fallback["follow_up_ids"] = follow_up_ids
+            fallback["no_work_ids"] = sorted(c["criterion_key"] for c in situation.progress_view if c["state"] == "no_work")
+        time_only = {"event_type": WAKE_RECHECK_EVENT_TYPE, "matcher": {}}
+        if spec is None:
+            plans = [(f"decision:{owner_id}:recheck", time_only, clamp_recheck_seconds(BACKSTOP_RECHECK_SECONDS),
+                      "Backstop recheck after a wait without a valid wake_when")]
+        else:
+            default_seconds = clamp_recheck_seconds(settings.orchestration_wake_max_seconds)
+            event_seconds = spec["recheck_after_seconds"] or default_seconds
+            plans = [(f"decision:{owner_id}:event:{n}", event, event_seconds, spec["expected_result"])
+                     for n, event in enumerate(spec["events"])]
+            if spec["recheck_after_seconds"]:
+                plans.append((f"decision:{owner_id}:recheck", time_only, spec["recheck_after_seconds"], spec["expected_result"]))
+        waits = []
+        for origin, awaited_event, recheck_seconds, expected_result in plans:
+            try:
+                waits.append(await self.create_wait(
+                    db, run, origin=origin, owner=owner, awaited_event=awaited_event, recheck_seconds=recheck_seconds,
+                    fallback=fallback, expected_result=expected_result,
+                ))
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+        return waits
 
     async def clear_matching_waits(self, db, run, *, event_type, subject_id=None, event_id=None, matcher=None):
         """Clear only waits whose event type and complete matcher match exactly."""
@@ -133,19 +215,90 @@ class OrchestrationSupervisionService:
                 continue
             wait.status, wait.cleared_by_event_id, wait.cleared_at = "cleared", event_id, _utcnow()
             cleared += 1
+        # An orchestrator decision's waits are one group: any event releases the whole group.
+        for done in [w for w in waits if w.status == "cleared" and (w.owner or {}).get("type") == _ORCH_OWNER]:
+            for wait in waits:
+                if wait.status == "open" and _same_owner(wait.owner, done.owner):
+                    wait.status, wait.cleared_by_event_id, wait.cleared_at = "cleared", done.cleared_by_event_id, done.cleared_at
+                    cleared += 1
         if cleared:
             await db.flush()
         return cleared
 
+    async def _clear_stale_orchestrator_waits(self, db, goal, run, waits, now, situation_getter) -> None:
+        """Safety net: clear every orchestrator wait if steering changed or a new follow-up appeared."""
+        from huddleroom.services.orchestration_steering import OrchestrationSteeringService
+        mine = [w for w in waits if w.status == "open" and (w.owner or {}).get("type") == _ORCH_OWNER]
+        if not mine:
+            return
+        steering = OrchestrationSteeringService(self.orchestration)
+        digest = steering.version_digest(await steering.current_versions(db, goal, run))
+        situation = await situation_getter()
+        current_ids = set() if situation.error else {item["id"] for item in situation.untracked_follow_ups}
+        for wait in mine:
+            fallback = dict(wait.fallback or {})
+            if ("steering_digest" in fallback and fallback["steering_digest"] != digest) or (
+                "follow_up_ids" in fallback and current_ids - set(fallback["follow_up_ids"])
+            ):
+                for other in mine:
+                    other.status, other.cleared_at = "cleared", now
+                return
+
+    async def _nothing_new_since_last_wait(self, db, run, situation) -> bool:
+        """True when the latest orchestrator wait (any status) already knew every current follow-up and no_work item."""
+        # ponytail: compares against only the latest wait; per-item tracking if that proves too coarse
+        rows = list((await db.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id))).all())
+        mine = [w for w in rows if (w.owner or {}).get("type") == _ORCH_OWNER]
+        if situation.error or not mine:
+            return False
+        fallback = dict(max(mine, key=lambda w: (w.created_at, w.wait_key)).fallback or {})
+        if "follow_up_ids" not in fallback or "no_work_ids" not in fallback:
+            return False
+        return (
+            {item["id"] for item in situation.untracked_follow_ups} <= set(fallback["follow_up_ids"])
+            and {c["criterion_key"] for c in situation.progress_view if c["state"] == "no_work"} <= set(fallback["no_work_ids"])
+        )
+
+    async def _has_proactive_work(self, active_tasks, situation_getter) -> bool:
+        """True when the orchestrator can usefully decide while system work is still running."""
+        situation = await situation_getter()
+        if situation.error:
+            return False
+        if situation.untracked_follow_ups:
+            return True
+        work_in_flight = [
+            t for t in active_tasks
+            if self.orchestration._task_work_function(t) not in (PLAN_WORK_FUNCTION, FINAL_SUMMARY_WORK_FUNCTION)
+        ]
+        return (
+            any(c["state"] == "no_work" for c in situation.progress_view)
+            and len(work_in_flight) < self.orchestration.RELEASE_TWO_TASK_CAP
+        )
+
     async def reconcile_local(self, db, goal, run, now=None, events=(), *, allow_release=True):
         """Deterministic local liveness pass; it never asks a provider or dispatches recovery."""
         now = now or _utcnow()
+        _situation: dict = {}
+
+        async def situation_getter():
+            if "value" not in _situation:
+                from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+                _situation["value"] = await OrchestrationProgressView().build_safe(db, goal, run)
+            return _situation["value"]
+
         state = dict(run.supervision_state or {})
         if goal.status != "active" or run.status != "running" or run.phase != "authorized":
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "controlled"}
             run.supervision_state = state
             return {"outcome": "controlled"}
         if goal.goal_type == "roadmap" and self.orchestration._json_object_or_empty(run.plan_state).get("status") == "accepted":
+            # A lingering orchestrator wait on an accepted roadmap would never be consumed; drop it.
+            for wait in await db.scalars(select(OrchestrationWait).where(
+                OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"
+            )):
+                if (wait.owner or {}).get("type") == _ORCH_OWNER:
+                    wait.status, wait.cleared_at = "cleared", now
+            await db.flush()
             return {"outcome": "continue"}
         # Any subsequent liveness pass supersedes the prior idle snapshot; a
         # fresh idle state below recreates the same fingerprinted blocker.
@@ -271,6 +424,7 @@ class OrchestrationSupervisionService:
             )
             if stale:
                 wait.status, wait.cleared_at = "cleared", now
+        await self._clear_stale_orchestrator_waits(db, goal, run, waits, now, situation_getter)
         waits = [wait for wait in waits if wait.status == "open"]
         def is_due(wait):
             reference = now.replace(tzinfo=None) if wait.due_recheck_at.tzinfo is None else now
@@ -358,6 +512,10 @@ class OrchestrationSupervisionService:
         if due:
             wait = due[0]
             wait.status, wait.cleared_at = "cleared", now
+            if (wait.owner or {}).get("type") == _ORCH_OWNER:
+                for sibling in waits:
+                    if sibling.status == "open" and (sibling.owner or {}).get("type") == _ORCH_OWNER and _same_owner(sibling.owner, wait.owner):
+                        sibling.status, sibling.cleared_at = "cleared", now
             fallback = dict(wait.fallback or {})
             action = await (
                 self.orchestration.execute_noop_action(
@@ -378,6 +536,15 @@ class OrchestrationSupervisionService:
             return {"outcome": "due_fallback", "fallback": fallback, "action_id": str(action.id)}
         future = [wait for wait in waits if not is_due(wait)]
         if future:
+            if (
+                all((w.owner or {}).get("type") in SYSTEM_WAIT_OWNER_TYPES for w in future)
+                and plan_accepted
+                and await self._has_proactive_work(active_tasks, situation_getter)
+                and not await self._nothing_new_since_last_wait(db, run, await situation_getter())
+            ):
+                state["last_assessment"] = {"at": now.isoformat(), "outcome": "continue"}
+                run.supervision_state = state
+                return {"outcome": "continue"}
             wait = future[0]
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "waiting", "wait_id": str(wait.id)}
             run.supervision_state = state
@@ -451,6 +618,9 @@ class OrchestrationSupervisionService:
         result = await getattr(self.orchestration, executor)(db, run.id, canonical, key)
         self._set_contract(result, goal, run, origin, key, disposition, reason)
         await db.flush()
+        if kind == "continue":
+            # ponytail: waits are created inline; a replay reuses the action id, so origin dedup keeps them single.
+            await self.create_orchestrator_waits(db, run, owner_id=result.id, wake_when=request.get("wake_when"))
         return result
 
     @staticmethod

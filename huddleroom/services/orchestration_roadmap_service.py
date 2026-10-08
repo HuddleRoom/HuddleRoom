@@ -986,6 +986,12 @@ class OrchestrationRoadmapService:
         return {"step": "release_item", "item_key": item.item_key, "unit_type": "goal"}
 
     async def advance(self, db, goal, run) -> dict:
+        return await self.orchestration._act_until_wait(
+            db, goal, run, self._advance_once,
+            loop_steps=frozenset({"replan_decision", "terminal_item_decision", "integration_decision"}),
+        )
+
+    async def _advance_once(self, db, goal, run) -> dict:
         version = await self.current_version(db, goal.id)
         if version is None:
             return await self.orchestration._advance_authorized_execution(db, goal, run)

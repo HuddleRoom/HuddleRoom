@@ -10,6 +10,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
 )
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 
 # SQLAlchemy's dynamic function namespace is not statically callable to pylint.
 # pylint: disable=not-callable
@@ -202,8 +203,8 @@ async def test_goal_detail_returns_complete_audit_ledgers(client, db_session, te
             db_session,
             run_id,
             input_snapshot={"index": index},
-            llm_output={"action_type": "noop", "reason": f"Reason {index}"},
-            parsed_decision={"action_type": "noop", "reason": f"Reason {index}"},
+            llm_output={"action_type": "noop", "reason": f"Reason {index}", "wake_when": NOOP_WAKE_WHEN},
+            parsed_decision={"action_type": "noop", "reason": f"Reason {index}", "wake_when": NOOP_WAKE_WHEN},
         )
         decisions.append(decision)
         actions.append(

@@ -8,6 +8,7 @@ from graphlib import CycleError, TopologicalSorter
 import hashlib
 import hmac
 import json
+import logging
 from textwrap import shorten
 import uuid
 from datetime import datetime, timezone
@@ -61,6 +62,7 @@ from huddleroom.models.orchestration_process import (
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.services.orchestration_authority_interview import build_checkpoint, sync_deferred_questions_memory
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService, runtime_decision_identity
+from huddleroom.services.orchestration_start_text_check import find_start_contradictions
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 from huddleroom.services.orchestration_goal_definition import (
     GOAL_WEIGHT_ORDER,
@@ -84,6 +86,8 @@ from huddleroom.services.task_service import TaskService
 
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
+# Actions that hand off to a human or pause: `_act_until_wait` must not keep acting after them.
+_LOOP_STOP_ACTIONS = frozenset({"ask_human", "pause_run", "request_human_decision", "request_manager_decision"})
 ASK_HUMAN_EVENT_TYPE = "orchestration.human_input_required"
 NOOP_WAIT_EVENT_TYPE = "orchestration.waiting"
 AGENT_SUGGESTED_EVENT_TYPE = "orchestration.agent_suggested"
@@ -921,6 +925,27 @@ class OrchestrationService:
         )
         return result.scalar_one_or_none()
 
+    _VOLATILE_SUPERVISION_KEYS = frozenset({
+        "at", "judgment_in_flight", "judgment_dirty", "judgment_failures",
+        "last_event_id", "context_fingerprint", "last_pass",
+    })
+
+    @staticmethod
+    def _stable_supervision_state(state: Any) -> Any:
+        # ponytail: strips timestamps and bookkeeping counters so two idle ticks produce the same decision context.
+        # The scheduler fingerprint is a separate hash and is untouched by this.
+        if isinstance(state, dict):
+            return {
+                key: OrchestrationService._stable_supervision_state(value)
+                for key, value in state.items()
+                if not (isinstance(key, str) and (
+                    key.endswith("_at") or key in OrchestrationService._VOLATILE_SUPERVISION_KEYS
+                ))
+            }
+        if isinstance(state, list):
+            return [OrchestrationService._stable_supervision_state(item) for item in state]
+        return deepcopy(state)
+
     async def _decision_context(
         self,
         db: AsyncSession,
@@ -957,7 +982,7 @@ class OrchestrationService:
                 "active_blockers": deepcopy(run.active_blockers),
                 "budget_state": deepcopy(run.budget_state),
                 "retry_state": deepcopy(run.retry_state),
-                "supervision_state": deepcopy(run.supervision_state),
+                "supervision_state": self._stable_supervision_state(run.supervision_state),
             },
             "open_gates": [
                 {
@@ -4140,7 +4165,7 @@ class OrchestrationService:
 
     def _canonical_noop_request(self, request: Any) -> dict[str, Any]:
         return {
-            "action_type": "noop",
+            "action_type": "noop",  # action request, not an LLM decision: wake_when lives on the decision, not here
             "reason": self._optional_string(self._json_object_or_empty(request).get("reason")),
         }
 
@@ -6536,10 +6561,54 @@ class OrchestrationService:
                 await OrchestrationContinuousService(self).initialize_after_start(db, goal, run, _utcnow())
             else:
                 run.phase = "authorized"
+            await self._warn_start_text_conflicts(db, goal, run)
             await db.flush()
             if not caller_owns_transaction:
                 await db.commit()
         return goal, run
+
+    @classmethod
+    def _constraint_strings(cls, value) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+        return [s for item in items for s in cls._constraint_strings(item)]
+
+    async def _warn_start_text_conflicts(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
+    ) -> None:
+        """Tell the owner when project/goal text says "don't start" but they pressed Start.
+        Never blocks Start. run.phase is the source of truth; no flag is written to constraints."""
+        # ponytail: phrase list is a fixed regex in orchestration_start_text_check; add phrases as they show up.
+        try:
+            project = await db.get(Project, goal.project_id)
+            hits = find_start_contradictions({
+                "project description": project.description if project else None,
+                "goal objective": goal.objective,
+                "goal constraints": " ".join(self._constraint_strings(goal.constraints)) or None,
+            })
+            if not hits:
+                return
+            by_source: dict[str, list[str]] = {}
+            for source, phrase in hits:
+                by_source.setdefault(source, []).append(f'"{phrase}"')
+            parts = [
+                f"the {source}{' (Settings → Project)' if source == 'project description' else ''} says "
+                + ", ".join(phrases)
+                for source, phrases in by_source.items()
+            ]
+            message = (
+                f"You started this goal, but {'; and '.join(parts)}. "
+                "The orchestrator reads this text in every decision; edit it so it matches."
+            )
+            # create_warning dedupes active rows per (goal, type, run), so repeats don't pile up.
+            async with db.begin_nested():
+                await OrchestrationWarningService().create_warning(
+                    db, goal.id, warning_type="start_text_conflict", severity="recommendation",
+                    run_id=run.id, message=message,
+                )
+        except Exception:  # noqa: BLE001 - advisory only
+            logging.getLogger(__name__).warning("start text conflict check failed", exc_info=True)
 
     def _start_conflict(self, conflict: str, message: str) -> HTTPException:
         return HTTPException(status_code=409, detail={"conflict": conflict, "message": message})
@@ -9109,6 +9178,8 @@ class OrchestrationService:
                 db, run, refreshed, stale_retry=True,
             )
         if action is not None:
+            if action.action_type == "noop":
+                await self._create_noop_waits(db, run, decision)
             return action
 
         parsed = self._json_object_or_empty(decision.parsed_decision)
@@ -9121,15 +9192,133 @@ class OrchestrationService:
             "validator_status": decision.validator_status,
             **{key: value for key, value in parsed.items() if key != "reason"},
         }
-        return await self.execute_noop_action(
+        action = await self.execute_noop_action(
             db,
             run_id=run.id,
             request={"action_type": "noop", "reason": reason},
             idempotency_key=dispatcher.action_key(run.id, "noop", wait_identity),
             decision_id=decision.id,
         )
+        await self._create_noop_waits(db, run, decision)
+        return action
+
+    async def _create_noop_waits(self, db, run, decision) -> None:
+        """A noop waits on its wake_when; any other or unusable outcome gets the backstop wait."""
+        parsed = self._json_object_or_empty(decision.parsed_decision)
+        wake_when = (
+            parsed.get("wake_when")
+            if decision.validator_status == "accepted" and parsed.get("action_type") == "noop"
+            else None
+        )
+        await self.supervision.create_orchestrator_waits(db, run, owner_id=decision.id, wake_when=wake_when)
 
     async def _advance_authorized_execution(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
+    ) -> dict:
+        return await self._act_until_wait(
+            db, goal, run, self._advance_authorized_execution_once,
+            loop_steps=frozenset({"plan_decision", "next_action"}),
+        )
+
+    async def _act_until_wait(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, step_once, *, loop_steps) -> dict:
+        """Repeat step_once while each step dispatched a real, completed, non-noop
+        action and the run is still runnable, up to orchestration_max_actions_per_tick.
+        Each iteration re-reads context via request_llm_decision. The returned `step`
+        and extra keys come from the last iteration; `action_id` is the first
+        dispatched id and `action_ids` the full list.
+        # ponytail: on non-SQLite the isolated context read can't see the uncommitted
+        # action, so iteration 2 reuses the decision -> same action id -> loop stops
+        # (one action per tick). Upgrade path: commit before each re-decision."""
+        import logging
+
+        cap = max(1, settings.orchestration_max_actions_per_tick)
+        action_ids: list[str] = []
+        iterations = 0
+        result: dict = {}
+        hit_cap = False
+        while iterations < cap:
+            iterations += 1
+            try:
+                step_result = await step_once(db, goal, run)
+            except HTTPException:
+                # ponytail: later-iteration failures are swallowed to keep already-dispatched
+                # actions; they are not retried until the next tick.
+                if iterations == 1:
+                    raise
+                logging.getLogger(__name__).warning("act_until_wait: iteration %s failed", iterations, exc_info=True)
+                break
+            result = step_result
+            aid = result.get("action_id")
+            if aid in action_ids:
+                break
+            if aid:
+                action_ids.append(aid)
+            if result.get("step") not in loop_steps or not aid:
+                break
+            action = await db.get(OrchestrationAction, uuid.UUID(str(aid)))
+            if action is None or action.action_type == "noop" or action.status != "completed":
+                break
+            if action.action_type in _LOOP_STOP_ACTIONS:
+                break
+            if action.action_type == "accept_plan" and goal.goal_type == "roadmap":
+                # roadmap accept writes no snapshot; the roadmap stepper takes over next tick
+                break
+            await db.refresh(run)
+            await db.refresh(goal)
+            if (
+                run.status not in LLM_DECISION_RUN_STATUSES
+                or run.phase != "authorized"
+                or goal.status not in {"active", "blocked"}
+            ):
+                break
+        else:
+            # ponytail: loop was still productive; parking a wait would stall it
+            hit_cap = True
+        if action_ids:
+            if not hit_cap:
+                await self._post_action_wait(db, goal, run, action_ids, result, loop_steps)
+        if iterations == 1 or not action_ids:
+            return result
+        return {**result, "action_id": action_ids[0], "action_ids": action_ids}
+
+    async def _post_action_wait(self, db, goal, run, action_ids, result, loop_steps) -> None:
+        """After a real action ended the loop, park a short orchestrator wait so an action that
+        did not remove its trigger cannot re-call the LLM on every reconcile tick."""
+        from huddleroom.models.orchestration import OrchestrationWait
+        from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
+
+        if result.get("step") not in loop_steps:
+            return
+        action = await db.get(OrchestrationAction, uuid.UUID(str(action_ids[-1])))
+        if (
+            action is None
+            or action.status != "completed"
+            or action.action_type == "noop"
+            or action.action_type in _LOOP_STOP_ACTIONS
+            or (action.action_type == "accept_plan" and goal.goal_type == "roadmap")
+            or self._json_object_or_empty(run.plan_state).get("status") != "accepted"
+        ):
+            return
+        waits = (await db.scalars(select(OrchestrationWait).where(
+            OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"
+        ))).all()
+        from huddleroom.services.orchestration_supervision import SYSTEM_WAIT_OWNER_TYPES
+
+        owner_types = {(w.owner or {}).get("type") for w in waits}
+        if ORCHESTRATOR_WAIT_OWNER_TYPE in owner_types or not owner_types & SYSTEM_WAIT_OWNER_TYPES:
+            return
+        # ponytail: only on the decide-while-work path (open system waits); a task created this tick has no
+        # system wait yet, so one extra LLM call can occur. One post-action wait per tick, fixed recheck =
+        # reconcile interval; per-item tracking if needed
+        await self.supervision.create_orchestrator_waits(
+            db, run, owner_id=action.id,
+            wake_when={
+                "recheck_after_seconds": settings.orchestration_reconcile_interval_seconds,
+                "expected_result": "Post-action recheck",
+            },
+        )
+
+    async def _advance_authorized_execution_once(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
     ) -> dict:
         """One forward step of the authorized Outcome runner. Exactly one action

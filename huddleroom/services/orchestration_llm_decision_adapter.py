@@ -12,13 +12,36 @@ from huddleroom.services.orchestration_completion import (
     get_orchestration_completion,
     orchestration_runtime_metadata,
 )
-from huddleroom.services.orchestration_decision_validator import ALLOWED_ACTION_SCHEMAS, OPTIONAL_ACTION_FIELDS
+from huddleroom.services.orchestration_decision_validator import (
+    ALLOWED_ACTION_SCHEMAS,
+    OPTIONAL_ACTION_FIELDS,
+    validate_orchestration_decision,
+)
+from huddleroom.services.orchestration_wake_when import normalize_wake_when, wake_when_prompt_table
 from huddleroom.services.secret_redaction import redact_secrets
 
 
 CompletionFn = Callable[..., Awaitable[Any]]
 INVALID_LLM_OUTPUT_ACTION_TYPE = "invalid_llm_output"
 _MAX_ERROR_MESSAGE_LEN = 120
+PROGRESS_CONTRACT = (
+    "Progress duty: move the goal to completion. Every decision must advance or unblock a success criterion. "
+    "Wait only when every useful action is blocked on a named event or time.\n"
+    "Fresh run (no accepted plan and no orchestrated work): normally request_plan to the best planning agent in the roster. "
+    "Use request_human_decision only when a missing owner decision truly blocks starting. "
+    "If a plan task is already in flight, wait for it.\n"
+    "Run with history: review progress_view and untracked_follow_ups. Handle the first untracked follow-up. "
+    "Otherwise start work on a no_work criterion. Otherwise verify an evidence_pending criterion. "
+    "Never create a second task for something that already has one. "
+    "When you create a task for a criterion or a meeting action item, add criterion:<key> or meeting_action_item:<id> "
+    "to its inputs.\n"
+    'Authority: run.phase == "authorized" means the owner explicitly started the goal. Earlier "prepare only" or '
+    '"do not start" wording is satisfied by that start. Specific restrictions still bind: live sends or messages, '
+    "spending, purchases, account changes, publishing, and destructive operations. "
+    "Route those actions to request_human_decision.\n"
+    "Waiting: a wait (noop on the decision path, continue on the supervision path) must carry wake_when.\n"
+    "Reason: the reason states how the action advances the goal."
+)
 # ponytail: backward compatibility alias for code that may import _redact_secrets directly
 _redact_secrets = redact_secrets
 
@@ -93,17 +116,37 @@ def build_orchestration_decision_messages(context: Mapping[str, Any], *, project
         }
         for action_type, required_fields in ALLOWED_ACTION_SCHEMAS.items()
     }
-    system_text = (
+    restrictions = (
         "You are the orchestrator's control-plane decision assistant. "
         "You choose coordination actions only. Agents produce all work artifacts and HuddleRoom code executes side effects "
         "after validation. You must not write plans, must not write code, must not write tests, must not write reviews, "
         "must not write validation reports, must not write meeting decisions, must not write project artifacts, "
-        "must not write file content, must not write diffs or patches, and must not write final summaries. "
+        "must not write file content, must not write diffs or patches, and must not write final summaries."
+    )
+    shape = (
         "Return exactly one JSON object with this shape: "
-        '{"decision":{"action_type":"noop","reason":"short coordination reason"}}. '
+        '{"decision":{"action_type":"<allowed type>", ...required fields, "reason":"how this advances the goal"}}. '
         "The decision object must use one allowed action schema. "
-        "Top-level reason is optional for every action. "
-        f"Allowed action schemas: {json.dumps(allowed_actions, sort_keys=True)}"
+        "Top-level reason is optional for every action."
+    )
+    wake_when = (
+        'A wait requires wake_when. noop is a wait and must carry wake_when shaped {"events":[{"event_type":"<event>",'
+        '"matcher":{"<key>":"<uuid>"}}],"recheck_after_seconds":<int>,"expected_result":"<what you expect on wake>"}. '
+        "Give events and/or recheck_after_seconds. At most 5 events. Each matcher must be non-empty, use only the listed "
+        "keys, and use UUID values from the context. Use recheck_after_seconds to wait on child goals or steering, "
+        "which emit no event. "
+        f"Allowed wake events and matcher keys: {wake_when_prompt_table()}"
+    )
+    system_text = (
+        restrictions
+        + "\n\n"
+        + PROGRESS_CONTRACT
+        + "\n\n"
+        + shape
+        + "\n\n"
+        + wake_when
+        + "\n\n"
+        + f"Allowed action schemas: {json.dumps(allowed_actions, sort_keys=True)}"
     )
     preamble = orchestrator_preamble(project, goal=goal)
     system_text = preamble + "\n\n" + system_text
@@ -165,6 +208,12 @@ class OrchestrationDecisionAdapter:
             decision = parse_decision_content(raw)
             if decision.get("action_type") == INVALID_LLM_OUTPUT_ACTION_TYPE:
                 raise ValueError(decision.get("reason") or "invalid decision output")
+            # Context-free structural validation; the rejection reason is fed back to the model on repair.
+            verdict = validate_orchestration_decision(decision)
+            if not verdict.accepted:
+                raise ValueError(verdict.rejection_reason)
+            if decision.get("action_type") == "noop":
+                return {**decision, "wake_when": normalize_wake_when(decision["wake_when"])}
             return decision
 
         try:

@@ -83,6 +83,21 @@ export function useCreateProject() {
   })
 }
 
+export function useUpdateProject(projectId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: { name?: string; description?: string }) =>
+      apiFetch<Project>(`/api/v1/projects/${projectId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    onSuccess: (updated) => {
+      qc.setQueryData(['project', projectId], updated)
+      qc.invalidateQueries({ queryKey: ['projects'] })
+    },
+  })
+}
+
 export function useResetProject(projectId: string) {
   const queryClient = useQueryClient()
   return useMutation({

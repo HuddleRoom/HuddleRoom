@@ -22,7 +22,9 @@ from huddleroom.services.orchestration_llm_decision_adapter import (
     parse_decision_content,
 )
 from huddleroom.services.orchestration_service import OrchestrationService
+from huddleroom.services.orchestration_wake_when import clamp_recheck_seconds
 from huddleroom.services.project_service import ProjectService
+from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -111,6 +113,7 @@ async def test_adapter_decide_calls_litellm_boundary_with_json_response_format()
                                 "decision": {
                                     "action_type": "noop",
                                     "reason": "Waiting for new evidence.",
+                                    "wake_when": {"recheck_after_seconds": 300, "expected_result": "New evidence."},
                                 }
                             }
                         )
@@ -124,9 +127,19 @@ async def test_adapter_decide_calls_litellm_boundary_with_json_response_format()
 
     assert result.input_snapshot["goal"]["objective"] == "Wait"
     assert result.llm_output["raw_content"] == json.dumps(
-        {"decision": {"action_type": "noop", "reason": "Waiting for new evidence."}}
+        {
+            "decision": {
+                "action_type": "noop",
+                "reason": "Waiting for new evidence.",
+                "wake_when": {"recheck_after_seconds": 300, "expected_result": "New evidence."},
+            }
+        }
     )
-    assert result.parsed_decision == {"action_type": "noop", "reason": "Waiting for new evidence."}
+    assert result.parsed_decision == {
+        "action_type": "noop",
+        "reason": "Waiting for new evidence.",
+        "wake_when": {"events": [], "recheck_after_seconds": clamp_recheck_seconds(300), "expected_result": "New evidence."},
+    }
     assert calls[0]["model"] == "openai/test-model"
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert calls[0]["temperature"] == 0
@@ -135,7 +148,10 @@ async def test_adapter_decide_calls_litellm_boundary_with_json_response_format()
 
 @pytest.mark.asyncio
 async def test_adapter_decide_accepts_fenced_json_but_retains_raw_diagnostics():
-    raw_content = ' \n```json\n{"decision":{"action_type":"noop","reason":"Wait."}}\n```\n '
+    raw_content = (
+        ' \n```json\n{"decision":{"action_type":"noop","reason":"Wait.",'
+        '"wake_when":{"recheck_after_seconds":300,"expected_result":"test wait"}}}\n```\n '
+    )
 
     async def fake_completion(**_kwargs):
         return {"choices": [{"message": {"content": raw_content}}]}
@@ -143,7 +159,11 @@ async def test_adapter_decide_accepts_fenced_json_but_retains_raw_diagnostics():
     result = await OrchestrationDecisionAdapter(completion_fn=fake_completion).decide({"run": {"status": "running"}})
 
     assert result.llm_output["raw_content"] == raw_content
-    assert result.parsed_decision == {"action_type": "noop", "reason": "Wait."}
+    assert result.parsed_decision == {
+        "action_type": "noop",
+        "reason": "Wait.",
+        "wake_when": {"events": [], "recheck_after_seconds": clamp_recheck_seconds(300), "expected_result": "test wait"},
+    }
 
 
 @pytest.mark.asyncio
@@ -158,6 +178,7 @@ async def test_adapter_decide_accepts_mapping_response_shape():
                                 "decision": {
                                     "action_type": "noop",
                                     "reason": "Mapping responses should work too.",
+                                    "wake_when": NOOP_WAKE_WHEN,
                                 }
                             }
                         )
@@ -169,7 +190,11 @@ async def test_adapter_decide_accepts_mapping_response_shape():
     adapter = OrchestrationDecisionAdapter(completion_fn=fake_completion)
     result = await adapter.decide({"goal": {"objective": "Wait"}, "run": {"status": "running"}})
 
-    assert result.parsed_decision == {"action_type": "noop", "reason": "Mapping responses should work too."}
+    assert result.parsed_decision == {
+        "action_type": "noop",
+        "reason": "Mapping responses should work too.",
+        "wake_when": {"events": [], "recheck_after_seconds": clamp_recheck_seconds(300), "expected_result": "test wait"},
+    }
 
 
 @pytest.mark.parametrize(
@@ -453,7 +478,7 @@ async def test_decision_context_excludes_orchestration_events_to_keep_cache_stab
         {"title": "Existing work"},
         dedup_key=f"phase7-task-{uuid.uuid4()}",
     )
-    adapter = RecordingAdapter({"action_type": "noop", "reason": "Only inspecting context."})
+    adapter = RecordingAdapter({"action_type": "noop", "reason": "Only inspecting context.", "wake_when": NOOP_WAKE_WHEN})
 
     await service.request_llm_decision(db_session, run.id, adapter=adapter)
 
@@ -465,7 +490,7 @@ async def test_request_llm_decision_allows_blocked_run(db_session, test_project)
     service, run = await _make_run(db_session, test_project)
     run.status = "blocked"
     await db_session.flush()
-    adapter = RecordingAdapter({"action_type": "noop", "reason": "Blocked runs can still coordinate recovery."})
+    adapter = RecordingAdapter({"action_type": "noop", "reason": "Blocked runs can still coordinate recovery.", "wake_when": NOOP_WAKE_WHEN})
 
     decision = await service.request_llm_decision(db_session, run.id, adapter=adapter)
 
@@ -483,7 +508,7 @@ async def test_request_llm_decision_rejects_inactive_run(db_session, test_projec
         await service.request_llm_decision(
             db_session,
             run.id,
-            adapter=RecordingAdapter({"action_type": "noop", "reason": "Paused."}),
+            adapter=RecordingAdapter({"action_type": "noop", "reason": "Paused.", "wake_when": NOOP_WAKE_WHEN}),
         )
 
     assert exc.value.status_code == 409
@@ -493,7 +518,7 @@ async def test_request_llm_decision_rejects_inactive_run(db_session, test_projec
 @pytest.mark.asyncio
 async def test_request_llm_decision_fallback_404s_when_goal_missing(db_session, test_project, monkeypatch):
     service, run = await _make_run(db_session, test_project)
-    adapter = RecordingAdapter({"action_type": "noop", "reason": "Should not reach adapter."})
+    adapter = RecordingAdapter({"action_type": "noop", "reason": "Should not reach adapter.", "wake_when": NOOP_WAKE_WHEN})
 
     original_get = db_session.get
 
@@ -523,7 +548,7 @@ async def test_request_llm_decision_uses_committed_sessions_for_committed_run(co
         run = await caller_db.get(orchestration_service_module.OrchestrationRun, run_id)
         goal = await caller_db.get(orchestration_service_module.OrchestrationGoal, run.goal_id)
         goal.objective = "Caller-only objective"
-        adapter = RecordingAdapter({"action_type": "noop", "reason": "Committed context should win."})
+        adapter = RecordingAdapter({"action_type": "noop", "reason": "Committed context should win.", "wake_when": NOOP_WAKE_WHEN})
 
         decision = await service.request_llm_decision(caller_db, run_id, adapter=adapter)
         assert caller_db.is_modified(goal)
@@ -557,7 +582,7 @@ async def test_request_llm_decision_uses_caller_when_factory_has_another_engine(
 
     monkeypatch.setattr(orchestration_service_module, "AsyncSessionLocal", ForeignSession)
     decision = await service.request_llm_decision(
-        db_session, run.id, adapter=RecordingAdapter({"action_type": "noop", "reason": "Caller owns run."}),
+        db_session, run.id, adapter=RecordingAdapter({"action_type": "noop", "reason": "Caller owns run.", "wake_when": NOOP_WAKE_WHEN}),
     )
 
     assert decision.run_id == run.id
@@ -581,8 +606,8 @@ async def test_request_llm_decision_committed_path_returns_cached_accepted_decis
             self.calls += 1
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
-                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Cached"}})},
-                parsed_decision={"action_type": "noop", "reason": "Cached"},
+                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Cached", "wake_when": NOOP_WAKE_WHEN}})},
+                parsed_decision={"action_type": "noop", "reason": "Cached", "wake_when": NOOP_WAKE_WHEN},
             )
 
     adapter = CountingAdapter()
@@ -623,8 +648,8 @@ async def test_request_llm_decision_committed_path_does_not_block_pause_midfligh
             await release.wait()
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
-                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Late"}})},
-                parsed_decision={"action_type": "noop", "reason": "Late"},
+                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Late", "wake_when": NOOP_WAKE_WHEN}})},
+                parsed_decision={"action_type": "noop", "reason": "Late", "wake_when": NOOP_WAKE_WHEN},
             )
 
     async def pause_run():
@@ -684,8 +709,8 @@ async def test_request_llm_decision_releases_sqlite_autobegin_workspace_lock_bef
                 raise writer_error
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
-                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Done"}})},
-                parsed_decision={"action_type": "noop", "reason": "Done"},
+                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Done", "wake_when": NOOP_WAKE_WHEN}})},
+                parsed_decision={"action_type": "noop", "reason": "Done", "wake_when": NOOP_WAKE_WHEN},
             )
 
     async def commit_other_writer():
@@ -741,7 +766,7 @@ async def test_request_llm_decision_preserves_explicit_nested_caller_transaction
 
     service, session_factory, _project_id, _goal_id, run_id = committed_run_details
     monkeypatch.setattr(orchestration_service_module, "AsyncSessionLocal", session_factory)
-    adapter = RecordingAdapter({"action_type": "noop", "reason": "Caller owns this transaction."})
+    adapter = RecordingAdapter({"action_type": "noop", "reason": "Caller owns this transaction.", "wake_when": NOOP_WAKE_WHEN})
 
     async with session_factory() as caller_db:
         async with caller_db.begin():
@@ -792,8 +817,8 @@ async def test_request_llm_decision_committed_path_rejects_terminal_run_before_w
             await release.wait()
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
-                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Late"}})},
-                parsed_decision={"action_type": "noop", "reason": "Late"},
+                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Late", "wake_when": NOOP_WAKE_WHEN}})},
+                parsed_decision={"action_type": "noop", "reason": "Late", "wake_when": NOOP_WAKE_WHEN},
             )
 
     async def complete_run():
@@ -867,9 +892,9 @@ async def test_request_llm_decision_committed_path_retries_after_rejected_duplic
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
                 llm_output={
-                    "raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Recovered"}})
+                    "raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Recovered", "wake_when": NOOP_WAKE_WHEN}})
                 },
-                parsed_decision={"action_type": "noop", "reason": "Recovered"},
+                parsed_decision={"action_type": "noop", "reason": "Recovered", "wake_when": NOOP_WAKE_WHEN},
             )
 
     adapter = FailThenSucceedAdapter()
@@ -906,8 +931,8 @@ async def test_request_llm_decision_committed_path_deduplicates_concurrent_reque
             await release.wait()
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
-                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Once"}})},
-                parsed_decision={"action_type": "noop", "reason": "Once"},
+                llm_output={"raw_content": json.dumps({"decision": {"action_type": "noop", "reason": "Once", "wake_when": NOOP_WAKE_WHEN}})},
+                parsed_decision={"action_type": "noop", "reason": "Once", "wake_when": NOOP_WAKE_WHEN},
             )
 
     adapter = BlockingAdapter()
@@ -935,3 +960,184 @@ async def test_request_llm_decision_committed_path_deduplicates_concurrent_reque
         )
         decisions = result.scalars().all()
         assert len(decisions) == 1
+
+
+def _system_text(**kwargs) -> str:
+    return build_orchestration_decision_messages({"run": {"phase": "authorized"}}, **kwargs)[0]["content"]
+
+
+def test_prompt_includes_progress_contract_sections():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    assert PROGRESS_CONTRACT in _system_text()
+    for section in ("Progress duty", "Fresh run", "Run with history", "Authority", "Waiting", "Reason"):
+        assert section in PROGRESS_CONTRACT
+    assert "request_plan" in PROGRESS_CONTRACT
+    assert "request_human_decision" in PROGRESS_CONTRACT
+    assert "progress_view" in PROGRESS_CONTRACT
+    assert "untracked_follow_ups" in PROGRESS_CONTRACT
+
+
+def test_prompt_states_authority_rule_and_keeps_specific_restrictions():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    system_text = _system_text()
+    assert 'run.phase == "authorized"' in system_text
+    assert "prepare only" in system_text
+    for restriction in ("live sends", "spending", "purchases", "account changes", "publishing", "destructive"):
+        assert restriction in PROGRESS_CONTRACT
+
+
+def test_prompt_has_neutral_example_not_noop_only():
+    system_text = _system_text()
+    assert '{"decision":{"action_type":"noop","reason":"short coordination reason"}}' not in system_text
+    assert '"action_type":"<allowed type>"' in system_text
+    assert '"reason":"how this advances the goal"' in system_text
+
+
+def test_prompt_documents_wake_when_and_event_matcher_table():
+    system_text = _system_text()
+    assert "wake_when" in system_text
+    assert "recheck_after_seconds" in system_text
+    assert "task.status_changed" in system_text
+    assert "orchestration.steering_changed" not in system_text
+
+
+def test_prompt_starts_with_preamble():
+    from huddleroom.services.orchestration_llm_decision_adapter import orchestrator_preamble
+
+    assert _system_text().startswith(orchestrator_preamble())
+
+
+def test_progress_contract_is_importable_constant():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    assert isinstance(PROGRESS_CONTRACT, str)
+    assert PROGRESS_CONTRACT.strip()
+
+
+def test_prompt_tells_model_to_tag_inputs():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    system_text = _system_text()
+    assert PROGRESS_CONTRACT in system_text
+    assert "criterion:<key>" in PROGRESS_CONTRACT
+    assert "meeting_action_item:<id>" in PROGRESS_CONTRACT
+
+
+def test_prompt_section_order_restriction_contract_shape_wake_schemas():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    system_text = _system_text()
+    first_line = PROGRESS_CONTRACT.splitlines()[0]
+    assert (
+        system_text.index("You must not write plans")
+        < system_text.index(first_line)
+        < system_text.index("Return exactly one JSON object")
+        < system_text.index("A wait requires wake_when")
+        < system_text.index("Allowed action schemas:")
+    )
+
+
+def _completion_returning(*decisions):
+    calls = []
+    queue = list(decisions)
+
+    async def fake_completion(**kwargs):
+        calls.append(kwargs)
+        content = queue.pop(0) if len(queue) > 1 else queue[0]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    return fake_completion, calls
+
+
+@pytest.mark.asyncio
+async def test_adapter_noop_without_wake_when_is_repaired():
+    fake_completion, calls = _completion_returning(
+        json.dumps({"decision": {"action_type": "noop", "reason": "Waiting."}}),
+        json.dumps({"decision": {"action_type": "noop", "reason": "Waiting.", "wake_when": NOOP_WAKE_WHEN}}),
+    )
+    adapter = OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion)
+
+    result = await adapter.decide({"goal": {"objective": "Wait"}})
+
+    assert len(calls) == 2
+    assert result.parsed_decision["action_type"] == "noop"
+    assert result.parsed_decision["wake_when"]["expected_result"] == "test wait"
+
+
+@pytest.mark.asyncio
+async def test_adapter_noop_exhausts_repairs_to_invalid_llm_output():
+    fake_completion, calls = _completion_returning(
+        json.dumps({"decision": {"action_type": "noop", "reason": "Waiting."}}),
+    )
+    adapter = OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion)
+
+    result = await adapter.decide({"goal": {"objective": "Wait"}})
+
+    assert len(calls) == 3
+    assert result.parsed_decision["action_type"] == "invalid_llm_output"
+    assert "wake_when" in result.parsed_decision["reason"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_repairs_unknown_top_level_key_with_validator_message():
+    good = {"action_type": "ask_human", "question": "Choose scope.", "reason": "Need input."}
+    fake_completion, calls = _completion_returning(
+        json.dumps({"decision": {**good, "bogus_key": 1}}),
+        json.dumps({"decision": good}),
+    )
+    adapter = OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion)
+
+    result = await adapter.decide({"goal": {"objective": "Wait"}})
+
+    assert len(calls) == 2
+    assert "includes unknown top-level key: bogus_key" in json.dumps(calls[1]["messages"])
+    assert result.parsed_decision == good
+
+
+@pytest.mark.asyncio
+async def test_adapter_repairs_wake_when_on_non_noop_with_validator_message():
+    good = {"action_type": "ask_human", "question": "Choose scope.", "reason": "Need input."}
+    fake_completion, calls = _completion_returning(
+        json.dumps({"decision": {**good, "wake_when": NOOP_WAKE_WHEN}}),
+        json.dumps({"decision": good}),
+    )
+    adapter = OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion)
+
+    result = await adapter.decide({"goal": {"objective": "Wait"}})
+
+    assert len(calls) == 2
+    assert "includes unknown top-level key: wake_when" in json.dumps(calls[1]["messages"])
+    assert result.parsed_decision == good
+
+
+@pytest.mark.asyncio
+async def test_adapter_clamps_wake_when_recheck():
+    fake_completion, _calls = _completion_returning(
+        json.dumps({"decision": {"action_type": "noop", "reason": "Waiting.", "wake_when": {
+            "recheck_after_seconds": 10 ** 9, "expected_result": "Later."}}}),
+    )
+    adapter = OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion)
+
+    result = await adapter.decide({"goal": {"objective": "Wait"}})
+
+    assert result.parsed_decision["wake_when"]["recheck_after_seconds"] == clamp_recheck_seconds(10 ** 9)
+
+
+@pytest.mark.asyncio
+async def test_adapter_leaves_non_noop_decisions_untouched():
+    decision = {"action_type": "ask_human", "question": "Choose scope.", "reason": "Need input."}
+    fake_completion, _calls = _completion_returning(json.dumps({"decision": decision}))
+    adapter = OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion)
+
+    result = await adapter.decide({"goal": {"objective": "Wait"}})
+
+    assert result.parsed_decision == decision
+
+
+def test_prompt_schema_lists_wake_when_as_noop_required():
+    system_text = _system_text()
+    schemas = json.loads(system_text.split("Allowed action schemas: ", 1)[1])
+
+    assert schemas["noop"]["required"] == ["wake_when"]

@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from huddleroom.config import settings
 from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationBudgetReservation, OrchestrationEvidence, OrchestrationGate,
     OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRoadmapVersion, OrchestrationRun,
@@ -18,6 +19,7 @@ from huddleroom.models.task import Task
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.session_sync import sync_task_from_session
+from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 from tests.test_orchestration_roadmap_children import goal_item
 from tests.test_orchestration_roadmap_task_items import roadmap_task
 from tests.test_orchestration_runtime_e2e import (
@@ -1031,6 +1033,7 @@ async def test_roadmap_cannot_close_without_accepted_integration_gate(db_session
 async def test_accepted_integration_reuses_existing_summary_and_closeout(
     db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
 ):
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     builder = _agent("integration-golden-builder", ["implementation"])
     verifier = _agent("integration-golden-verifier", ["validation"])
     summarizer = _agent("integration-golden-summarizer", ["summarization"])
@@ -1041,7 +1044,7 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
     ])
     parent.weight = "trivial"
     service = roadmap.orchestration
-    decision = {"action_type": "noop", "reason": "Awaiting integration verification."}
+    decision = {"action_type": "noop", "reason": "Awaiting integration verification.", "wake_when": NOOP_WAKE_WHEN}
     _local_decisions(monkeypatch, service, lambda _ctx: decision)
     await service.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
@@ -1068,7 +1071,7 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
     action, verifier_task = await _finish_integration_verification(
         db_session, test_project.id, service, run, gate, verifier.id,
     )
-    decision = {"action_type": "noop", "reason": "Integration report consumed."}
+    decision = {"action_type": "noop", "reason": "Integration report consumed.", "wake_when": NOOP_WAKE_WHEN}
     await service.tick(db_session, run.id)
     evidence = await db_session.scalar(select(OrchestrationEvidence).where(
         OrchestrationEvidence.gate_id == gate.id,

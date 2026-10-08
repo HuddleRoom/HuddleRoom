@@ -373,6 +373,42 @@ def test_meeting_runner_has_repair() -> None:
     )
 
 
+# --- Supervision analyzer ---
+
+def test_supervision_analyzer_has_preamble() -> None:
+    """Assert supervision analyzer imports and uses orchestrator_preamble."""
+    root = _repo_root()
+    path = root / "huddleroom/services/orchestration_supervision_analyzer.py"
+
+    imports = _imports(path)
+    refs = _module_refs(path)
+
+    assert "orchestrator_preamble" in imports, (
+        f"{path}: must import orchestrator_preamble from "
+        "huddleroom.services.orchestration_llm_decision_adapter"
+    )
+    assert "orchestrator_preamble" in refs, (
+        f"{path}: must reference orchestrator_preamble in code"
+    )
+
+
+def test_supervision_analyzer_has_repair() -> None:
+    """Assert supervision analyzer imports and uses complete_with_repair."""
+    root = _repo_root()
+    path = root / "huddleroom/services/orchestration_supervision_analyzer.py"
+
+    imports = _imports(path)
+    refs = _module_refs(path)
+
+    assert "complete_with_repair" in imports, (
+        f"{path}: must import complete_with_repair from "
+        "huddleroom.services.llm_structured_repair"
+    )
+    assert "complete_with_repair" in refs, (
+        f"{path}: must reference complete_with_repair in code"
+    )
+
+
 # --- CLI adapter ---
 
 def test_cli_adapter_has_cli_repair() -> None:

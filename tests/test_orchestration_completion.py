@@ -6,6 +6,8 @@ from uuid import uuid4
 
 import pytest
 
+from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
+
 
 def _default_completion_services(completion_fn=None):
     from huddleroom.services.orchestration_agent_definition_analyzer import AgentDefinitionSemanticAnalyzer
@@ -1041,12 +1043,10 @@ async def test_default_cli_route_emits_valid_cli_main_event_metadata(monkeypatch
     async def never_reset(_project_id):
         await asyncio.Event().wait()
 
+    decision = {"action_type": "noop", "reason": "wait", "wake_when": NOOP_WAKE_WHEN}
+
     async def fake_completion(**_request):
-        return {
-            "choices": [
-                {"message": {"content": json.dumps({"decision": {"action_type": "noop", "reason": "wait"}})}}
-            ]
-        }
+        return {"choices": [{"message": {"content": json.dumps({"decision": decision})}}]}
 
     async def publish(event):
         events.append(event)
@@ -1073,7 +1073,8 @@ async def test_default_cli_route_emits_valid_cli_main_event_metadata(monkeypatch
         {"run": {"status": "running"}}, project={"id": str(uuid4())}
     )
 
-    assert result.parsed_decision == {"action_type": "noop", "reason": "wait"}
+    # ponytail: adapter normalizes wake_when (adds events=[]); compare against that shape.
+    assert result.parsed_decision == {**decision, "wake_when": {**NOOP_WAKE_WHEN, "events": []}}
     started = next(event for event in events if event.event_type == "agent_response.started")
     assert (started.invocation_kind, started.payload["model_or_runtime"]) == (
         "cli_main", "codex CLI (configured CLI default)"
@@ -1081,7 +1082,7 @@ async def test_default_cli_route_emits_valid_cli_main_event_metadata(monkeypatch
     assert [event.payload for event in events if event.event_type == "agent_response.output"] == [
         {
             "stream": "output",
-            "text": json.dumps({"decision": {"action_type": "noop", "reason": "wait"}}),
+            "text": json.dumps({"decision": decision}),
         }
     ]
 

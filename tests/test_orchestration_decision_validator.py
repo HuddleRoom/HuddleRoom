@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.orchestration_decision_validator import validate_orchestration_decision
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 
 
 def _id() -> str:
@@ -15,7 +16,11 @@ def _id() -> str:
 
 
 ALLOWED_DECISIONS = {
-    "noop": {"action_type": "noop", "reason": "Nothing can advance yet."},
+    "noop": {
+        "action_type": "noop",
+        "reason": "Nothing can advance yet.",
+        "wake_when": {"recheck_after_seconds": 300, "expected_result": "Dependency moved on."},
+    },
     "request_plan": {
         "action_type": "request_plan",
         "work_function": "planning",
@@ -199,11 +204,42 @@ def test_create_delegation_task_allows_contract_context_fields():
     assert result.rejection_reason is None
 
 
-def test_noop_accepts_missing_reason():
-    result = validate_orchestration_decision({"action_type": "noop"})
+def test_noop_accepts_missing_reason_when_wake_when_present():
+    result = validate_orchestration_decision(
+        {"action_type": "noop", "wake_when": {"recheck_after_seconds": 300, "expected_result": "Wait over."}}
+    )
 
     assert result.accepted is True
     assert result.rejection_reason is None
+
+
+def test_noop_without_wake_when_is_rejected():
+    result = validate_orchestration_decision({"action_type": "noop", "reason": "Waiting."})
+
+    assert result.accepted is False
+    assert result.rejection_reason == "Decision 'noop' missing required fields: wake_when"
+
+
+def test_noop_with_invalid_wake_when_is_rejected():
+    result = validate_orchestration_decision(
+        {"action_type": "noop", "wake_when": {"events": "not-a-list", "expected_result": "x"}}
+    )
+
+    assert result.accepted is False
+    assert result.rejection_reason == "Decision 'noop' wake_when invalid: events must be a list"
+
+
+def test_wake_when_is_rejected_on_other_actions():
+    result = validate_orchestration_decision(
+        {
+            "action_type": "ask_human",
+            "question": "Choose scope.",
+            "wake_when": {"recheck_after_seconds": 300, "expected_result": "x"},
+        }
+    )
+
+    assert result.accepted is False
+    assert result.rejection_reason == "Decision 'ask_human' includes unknown top-level key: wake_when"
 
 
 @pytest.mark.parametrize("key", ["timeout", "max_tokens"])
@@ -593,8 +629,8 @@ async def test_record_validated_decision_rejects_missing_run(db_session):
             db_session,
             run_id=uuid.uuid4(),
             input_snapshot={},
-            llm_output={"action_type": "noop"},
-            parsed_decision={"action_type": "noop"},
+            llm_output={"action_type": "noop", "wake_when": NOOP_WAKE_WHEN},
+            parsed_decision={"action_type": "noop", "wake_when": NOOP_WAKE_WHEN},
         )
 
     assert exc_info.value.status_code == 404
@@ -639,8 +675,8 @@ async def test_record_validated_decision_preserves_404_when_run_disappears_befor
             ForeignKeyFailureOnFlushSession(db_session, run.id),
             run_id=run.id,
             input_snapshot={},
-            llm_output={"action_type": "noop"},
-            parsed_decision={"action_type": "noop"},
+            llm_output={"action_type": "noop", "wake_when": NOOP_WAKE_WHEN},
+            parsed_decision={"action_type": "noop", "wake_when": NOOP_WAKE_WHEN},
         )
 
     assert exc_info.value.status_code == 404

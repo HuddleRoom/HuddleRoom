@@ -29,6 +29,7 @@ export type MemoryScope = 'project' | 'global'
 export interface Project {
   id: string
   name: string
+  description?: string | null
   workspace_path?: string | null
   config: Record<string, unknown>
   created_at: string

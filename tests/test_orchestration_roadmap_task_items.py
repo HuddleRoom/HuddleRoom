@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from huddleroom.adapters.cli_adapter import CliAdapter
+from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import (
@@ -403,6 +404,7 @@ def _local_decisions(monkeypatch, service, decision_fn):
 async def test_roadmap_task_successor_waits_for_accepted_predecessor_gate(
     db_session, test_project, accepted_roadmap, monkeypatch,
 ):
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     service, goal, run, verifier = await accepted_roadmap([
         roadmap_task("build"), roadmap_task("verify", depends_on=["build"]),
     ])

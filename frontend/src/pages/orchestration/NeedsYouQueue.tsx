@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { AlertTriangle, Ban, CheckCircle2, HelpCircle, RotateCcw, ShieldAlert } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { Button, Textarea } from '@/components/common/uiPrimitives'
 import { ErrorRecord } from '@/components/common/ErrorRecord'
@@ -586,7 +587,9 @@ export function NeedsYouQueue({
             <span className="mr-1.5 text-xs text-huddleroom-text-muted">{warningTypeLabel(row.warning.warning_type)} · {warningSeverityLabel(row.warning.severity)}</span>
             {warningMessage(row.warning.message)}
           </>
-          tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
+          tag = row.warning.warning_type === 'start_text_conflict'
+            ? <Link to={{ pathname: '/settings', hash: '#project-details' }} className="inline-flex min-h-11 items-center text-xs font-medium text-huddleroom-primary underline-offset-2 hover:underline">Edit project description</Link>
+            : <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
           action = <Button ref={(element) => registerRow(focusAction, row.key, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy} onClick={() => onOpenAction(focusAction)}>{label}</Button>
           if (openAction?.kind === focusAction.kind && openAction.id === row.warning.id) {
             below = <div className="mt-1">{renderActionForm(focusAction, row.warning, successFocus)}</div>
