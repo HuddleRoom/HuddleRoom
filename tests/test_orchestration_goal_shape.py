@@ -146,3 +146,32 @@ def test_preview_result_rejects():
 def test_supersede_request_unchanged():
     assert OrchestrationSupersedeRequest().goal_type == "outcome"
     assert set(OrchestrationSupersedeRequest.model_fields) == {"goal_type"}
+
+
+def test_preview_result_rejects_more_malformed_nested_items():
+    base = preview_result()
+    blocker = base["blockers"][0]
+    retained = base["retained_evidence_manifest"][0]
+    no_artifact = {k: v for k, v in retained.items() if k != "artifact_id"}
+    cases = [
+        dict(retained_evidence_manifest=[no_artifact]),
+        dict(retained_evidence_manifest=[{**retained, "source_contract_fingerprint": "A" * 64}]),
+        dict(retained_evidence_manifest=[{**retained, "reason": ""}]),
+        dict(retained_evidence_manifest=[{**retained, "source_run_id": "not-a-uuid"}]),
+        dict(blockers=[{**blocker, "code": ""}]),
+        dict(blockers=[{**blocker, "resolution": ""}]),
+        dict(current_goal_type="auto"),
+        dict(proposed_goal_type="bogus"),
+        dict(source="manual"),
+        dict(preview_fingerprint="short"),
+        dict(extra="x"),
+    ]
+    for kw in cases:
+        with pytest.raises(ValidationError):
+            GoalTypeCorrectionPreviewResult(**{**base, **kw})
+
+
+def test_no_response_or_decision_model_accepts_auto_goal_type():
+    for model in (GoalShapeDecision, GoalTypeCorrectionPreviewRequest):
+        field = "goal_type" if model is GoalShapeDecision else "requested_goal_type"
+        assert "auto" not in get_args(model.model_fields[field].annotation)
