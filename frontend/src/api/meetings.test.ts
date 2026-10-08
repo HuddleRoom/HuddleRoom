@@ -12,14 +12,21 @@ import {
   useMeetingFinalReview,
   useMeetingSignals,
   useMeetingTurns,
+  useResumeMeeting,
 } from './meetings'
-import type { MeetingFinalReviewSubmit } from '@/lib/types'
+import type { Meeting, MeetingFinalReviewSubmit } from '@/lib/types'
 
-const { useQueryMock } = vi.hoisted(() => ({ useQueryMock: vi.fn((options) => options) }))
+const { useQueryMock, useMutationMock, useQueryClientMock } = vi.hoisted(() => ({
+  useQueryMock: vi.fn((options) => options),
+  useMutationMock: vi.fn((options) => options),
+  useQueryClientMock: vi.fn(),
+}))
 
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
   useQuery: useQueryMock,
+  useMutation: useMutationMock,
+  useQueryClient: useQueryClientMock,
 }))
 
 vi.mock('@/lib/api-client', () => ({ apiFetch: vi.fn() }))
@@ -30,6 +37,8 @@ describe('meeting final review API', () => {
   beforeEach(() => {
     apiFetchMock.mockReset()
     useQueryMock.mockClear()
+    useMutationMock.mockClear()
+    useQueryClientMock.mockReset()
   })
 
   it.each<[string, MeetingFinalReviewSubmit]>([
@@ -100,5 +109,26 @@ describe('meeting final review API', () => {
       expect(queryClient.getQueryData(options.queryKey)).toBeUndefined()
     }
     expect(apiFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('marks the cached failed turn as resuming after the resume request is accepted', () => {
+    const setQueryData = vi.fn()
+    const invalidateQueries = vi.fn()
+    useQueryClientMock.mockReturnValue({ setQueryData, invalidateQueries })
+    const meeting = {
+      id: 'meeting-1', project_id: 'project-1', title: 'Retry', meeting_type: 'decision', status: 'active',
+      participant_agent_ids: [], agenda_items: [], created_at: '', updated_at: '',
+      resume_state: { failed: true, error: 'timed out', speaker_agent_id: 'agent-1' },
+    } as Meeting
+    const mutation = useResumeMeeting() as unknown as { onSuccess: (meeting: Meeting) => void }
+
+    mutation.onSuccess(meeting)
+
+    expect(setQueryData).toHaveBeenCalledWith(
+      meetingKeys.detail('project-1', 'meeting-1'),
+      expect.objectContaining({
+        resume_state: { failed: true, error: 'timed out', speaker_agent_id: 'agent-1', resuming: true },
+      }),
+    )
   })
 })

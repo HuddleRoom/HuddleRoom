@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     emitted_at: string
   }>,
   invalidateQueries: vi.fn(),
+  getQueryData: vi.fn(),
   projectId: 'project-1' as string | null,
 }))
 
@@ -29,7 +30,10 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@tanstack/react-query')>()
   return {
     ...actual,
-    useQueryClient: () => ({ invalidateQueries: mocks.invalidateQueries }),
+    useQueryClient: () => ({
+      invalidateQueries: mocks.invalidateQueries,
+      getQueryData: mocks.getQueryData,
+    }),
   }
 })
 
@@ -49,6 +53,7 @@ beforeEach(() => {
   mocks.effects = []
   mocks.events = []
   mocks.invalidateQueries.mockReset()
+  mocks.getQueryData.mockReset()
   mocks.projectId = 'project-1'
 })
 
@@ -126,5 +131,35 @@ describe('isOrchestrationEvent', () => {
 
     expect(qc.getQueryState(processesKey)?.isInvalidated).toBe(true)
     expect(qc.getQueryState(checkpointKey)?.isInvalidated).toBe(true)
+  })
+
+  it('invalidates a cached resuming meeting on turn completion without changing ordinary meetings', () => {
+    const qc = new QueryClient()
+    mocks.invalidateQueries.mockImplementation((options) => qc.invalidateQueries(options))
+    mocks.getQueryData.mockImplementation((queryKey) => qc.getQueryData(queryKey))
+    const resumingKey = ['meeting', 'project-1', 'meeting-resuming']
+    const ordinaryKey = ['meeting', 'project-1', 'meeting-ordinary']
+    const resumingMeeting = { id: 'meeting-resuming', resume_state: { failed: true, resuming: true } }
+    const ordinaryMeeting = { id: 'meeting-ordinary', resume_state: { failed: true } }
+    qc.setQueryData(resumingKey, resumingMeeting)
+    qc.setQueryData(ordinaryKey, ordinaryMeeting)
+    mocks.events = [
+      {
+        id: 'event-ordinary', event_type: 'meeting.turn_complete',
+        payload: { meeting_id: 'meeting-ordinary' }, emitted_at: '2026-07-15T10:00:01Z',
+      },
+      {
+        id: 'event-resuming', event_type: 'meeting.turn_complete',
+        payload: { meeting_id: 'meeting-resuming' }, emitted_at: '2026-07-15T10:00:00Z',
+      },
+    ]
+
+    useWSQuerySync()
+    mocks.effects[0]()
+
+    expect(qc.getQueryState(resumingKey)?.isInvalidated).toBe(true)
+    expect(qc.getQueryData(resumingKey)).toEqual(resumingMeeting)
+    expect(qc.getQueryState(ordinaryKey)?.isInvalidated).toBe(false)
+    expect(qc.getQueryData(ordinaryKey)).toEqual(ordinaryMeeting)
   })
 })

@@ -103,7 +103,7 @@ export interface Meeting {
   deadlock_strategy?: string
   organizer_user_id?: string
   organizer_agent_id?: string
-  resume_state?: { failed?: boolean; error?: string; speaker_agent_id?: string; agenda_item_id?: string; adapter?: string }
+  resume_state?: { failed?: boolean; error?: string; speaker_agent_id?: string; agenda_item_id?: string; adapter?: string; resuming?: boolean }
   created_at: string
   updated_at: string
 }

@@ -281,6 +281,23 @@ describe('MeetingsPage', () => {
     expect((markup.match(/Resume/g) ?? []).length).toBe(1)
   })
 
+  it('shows a fresh model failure but replaces a claimed failure with a neutral resuming state', async () => {
+    const { MeetingsPage } = await import('./MeetingsPage')
+    meetingMock.resume_state = { failed: true, error: 'The model timed out.' }
+    const failedMarkup = renderToStaticMarkup(<MeetingsPage />)
+
+    meetingMock.resume_state = {
+      failed: true, error: 'The model timed out.', resuming: true,
+    } as NonNullable<Meeting['resume_state']> & { resuming: true }
+    const resumingMarkup = renderToStaticMarkup(<MeetingsPage />)
+
+    expect(failedMarkup).toContain('The model timed out.')
+    expect((failedMarkup.match(/Resume/g) ?? []).length).toBe(1)
+    expect(resumingMarkup).toContain('Resuming')
+    expect(resumingMarkup).not.toContain('The model timed out.')
+    expect((resumingMarkup.match(/Resume/g) ?? []).length).toBe(0)
+  })
+
   it('renders ErrorRecord with a back-to-meetings action when the meeting fails to load', async () => {
     meetingQueryErrorMock = new ApiError(404, 'not found')
     const { MeetingsPage } = await import('./MeetingsPage')

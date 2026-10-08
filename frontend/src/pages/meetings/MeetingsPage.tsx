@@ -554,6 +554,7 @@ function MeetingLiveView({ meetingId }: { meetingId: string }) {
   const isActive = meetingData.status === 'active' || meetingData.status === 'scheduled' || meetingData.status === 'preparing'
   const canEndMeeting = meetingData.status === 'active' || meetingData.status === 'concluding'
   const canCancelMeeting = meetingData.status !== 'concluded' && meetingData.status !== 'cancelled'
+  const isResuming = meetingData.resume_state?.resuming
 
   return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%' }}>
@@ -566,7 +567,9 @@ function MeetingLiveView({ meetingId }: { meetingId: string }) {
                 status={meetingData.status}
                 actions={
                   <>
-                    {meetingData.resume_state?.failed && (
+                    {isResuming ? (
+                      <StatusBadge status="pending" label="Resuming…" />
+                    ) : meetingData.resume_state?.failed && (
                       <>
                         <StatusBadge status="failed" label="Model error" />
                         <Button
@@ -638,7 +641,7 @@ function MeetingLiveView({ meetingId }: { meetingId: string }) {
             </div>
 
             {/* Model error message */}
-            {meetingData.resume_state?.failed && (
+            {meetingData.resume_state?.failed && !isResuming && (
               <div className="border-b border-huddleroom-border" style={{ paddingBottom: 12 }}>
                 <ErrorRecord
                   error={meetingData.resume_state.error ?? 'The last turn failed to generate.'}

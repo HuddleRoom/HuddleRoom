@@ -234,7 +234,11 @@ export function useResumeMeeting() {
         body: JSON.stringify({}),
       }),
     onSuccess: (meeting) => {
-      qc.setQueryData(meetingKeys.detail(meeting.project_id, meeting.id), meeting)
+      // ponytail: cache-only marker resets on reload; persist it if retries need cross-client visibility.
+      qc.setQueryData(meetingKeys.detail(meeting.project_id, meeting.id), {
+        ...meeting,
+        resume_state: { ...meeting.resume_state, resuming: true },
+      })
       qc.invalidateQueries({ queryKey: ['meetings'] })
       qc.invalidateQueries({ queryKey: ['meetings', 'count'] })
     },

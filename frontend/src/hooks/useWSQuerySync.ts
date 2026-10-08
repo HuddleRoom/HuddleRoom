@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useWSStore } from '@/stores/ws'
 import { useUIStore } from '@/stores/ui'
+import type { Meeting } from '@/lib/types'
 
 export function isOrchestrationEvent(eventType: string) {
   return eventType.startsWith('orchestration.')
@@ -88,6 +89,8 @@ export function useWSQuerySync() {
         invalidateGraphRuns = true
         invalidateGraphRunCount = true
         invalidateEvents = true
+      } else if (type === 'meeting.turn_complete' && meetingId && qc.getQueryData<Meeting>(['meeting', projectId, meetingId])?.resume_state?.resuming) {
+        meetingIds.add(meetingId)
       } else if (type.startsWith('meeting.') && type !== 'meeting.turn_complete' && type !== 'meeting.human_turn') {
         invalidateMeetings = true
         invalidateMeetingCount = true
