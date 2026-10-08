@@ -761,7 +761,8 @@ async def test_discovery_failed_source_retries_once_with_original_limits(
     task.status = "failed"
     session.status = "failed"
     session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
-                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0}
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
+                         "attempt": {"effect_state": "started"}}
 
     result = await continuous.advance(db_session, goal, run)
 
@@ -806,7 +807,8 @@ async def test_discovery_second_execution_failure_needs_attention(db_session, te
     )
     task.status = session.status = "failed"
     session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
-                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0}
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
+                         "attempt": {"effect_state": "started"}}
     assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_retry"
     task.status = "failed"
 

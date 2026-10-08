@@ -2517,7 +2517,7 @@ async def test_runtime_recovery_retries_reassigns_then_escalates_needs_attention
             adapter_type="api",
             status="failed",
             error="transient failure",
-            metadata_={},
+            metadata_={"attempt": {"effect_state": "started"}},
             origin="auto",
         ))
         await db_session.flush()
@@ -2529,6 +2529,7 @@ async def test_runtime_recovery_retries_reassigns_then_escalates_needs_attention
     assert retry.status == "completed" and task.status == "in_progress"
 
     retried_session = await db_session.get(Session, retry.target_id)
+    retried_session.metadata_ = {"attempt": {"effect_state": "started"}}
     task.status = retried_session.status = "failed"
     await db_session.flush()
     await service.tick(db_session, run.id)
@@ -2537,6 +2538,7 @@ async def test_runtime_recovery_retries_reassigns_then_escalates_needs_attention
     assert reassign.status == "completed" and task.assigned_to == alternate.id, reassign.error
 
     reassigned_session = await db_session.get(Session, reassign.target_id)
+    reassigned_session.metadata_ = {"attempt": {"effect_state": "started"}}
     task.status = reassigned_session.status = "failed"
     await db_session.flush()
     await service.tick(db_session, run.id)

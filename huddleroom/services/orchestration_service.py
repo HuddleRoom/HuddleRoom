@@ -3466,6 +3466,11 @@ class OrchestrationService:
         if await self._task_has_active_session(db, task.id):
             await self._fail_reserved_action_for_current_flow(db, action, "Task already has an active session")
             raise HTTPException(status_code=409, detail="Task already has an active session")
+        if exact_source_session_id is None and recovery_disposition is None:
+            reason = await self._non_agent_failure_reason(db, task.id)
+            if reason:
+                await self._fail_reserved_action_for_current_flow(db, action, reason)
+                raise HTTPException(status_code=409, detail=reason)
         if exact_source_session_id is not None:
             proof_error = await self._exact_resume_proof(db, run_id, task.id, exact_source_session_id)
             if proof_error:
@@ -3785,6 +3790,22 @@ class OrchestrationService:
             select(Session.id).where(Session.task_id == task_id, Session.status.in_(["pending", "running"])).limit(1)
         )
         return result.first() is not None
+
+    async def _non_agent_failure_reason(self, db: AsyncSession, task_id: uuid.UUID) -> str | None:
+        """Reason the latest failed session never launched the agent (so a retry is pointless), else None."""
+        result = await db.execute(
+            select(Session).where(Session.task_id == task_id).order_by(Session.created_at.desc()).limit(1)
+        )
+        session = result.scalar_one_or_none()
+        if session is None or session.status != "failed":
+            return None
+        metadata = session.metadata_ if isinstance(session.metadata_, dict) else {}
+        attempt = metadata.get("attempt") if isinstance(metadata.get("attempt"), dict) else {}
+        # effect_state is only written for orchestrated sessions; manual sessions carry no attempt record.
+        never_ran = attempt.get("effect_state") != "started" if attempt else session.started_at is None
+        if never_ran or (session.error or "").startswith("command_not_found"):
+            return f"Not retryable: agent never ran ({session.error or 'unknown error'}); fix the cause before retrying"
+        return None
 
     async def _task_recovery_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, task_id: uuid.UUID) -> str:
         """Key suffix for the next retry/reassign attempt of a task: one per prior

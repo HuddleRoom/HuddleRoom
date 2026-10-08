@@ -134,7 +134,7 @@ async def _add_failed_session(db_session, task: Task, agent_id) -> Session:
         input_context={},
         output=None,
         error="model_error",
-        metadata_={},
+        metadata_={"attempt": {"effect_state": "started"}},
         origin="auto",
         started_at=datetime.now(timezone.utc),
         ended_at=datetime.now(timezone.utc),
@@ -1027,6 +1027,144 @@ async def test_execute_retry_blocked_task_succeeds(db_session, test_project, mon
     assert calls == [task.id]
     assert task.assigned_to == agent.id
     assert task.status == "in_progress"
+
+
+async def _add_latest_failed_session(
+    db_session, task: Task, agent_id, *, error: str, metadata: dict, started_at=None,
+) -> Session:
+    session = Session(
+        agent_id=agent_id,
+        task_id=task.id,
+        project_id=task.project_id,
+        adapter_type="cli",
+        status="failed",
+        input_context={},
+        error=error,
+        metadata_=metadata,
+        origin="auto",
+        started_at=started_at,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_execute_retry_refuses_when_agent_never_launched(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+
+    agent = _agent("developer", "developer", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id, status="failed")
+    await _add_latest_failed_session(
+        db_session, task, agent.id,
+        error="orchestration_lineage_invalid",
+        metadata={"attempt": {"effect_state": "not_started"}},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await service.execute_retry_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "retry_task", "task_id": str(task.id)},
+            idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+        )
+    assert exc.value.status_code == 409
+    assert "Not retryable" in exc.value.detail
+    assert calls == []
+    assert [a.status for a in await _actions(db_session, run.id, "retry_task")] == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_execute_retry_proceeds_after_agent_ran_and_failed(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_service.TaskService.run",
+        _fake_task_run(calls, mark_in_progress=True),
+    )
+
+    agent = _agent("developer", "developer", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id, status="failed")
+    await _add_latest_failed_session(
+        db_session, task, agent.id,
+        error="exit 1",
+        metadata={"attempt": {"effect_state": "started"}},
+    )
+
+    action = await service.execute_retry_task_action(
+        db_session,
+        run_id=run.id,
+        request={"action_type": "retry_task", "task_id": str(task.id)},
+        idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+    )
+
+    assert action.status == "completed"
+    assert calls == [task.id]
+
+
+@pytest.mark.asyncio
+async def test_execute_retry_proceeds_after_manual_session_ran_and_failed(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_service.TaskService.run",
+        _fake_task_run(calls, mark_in_progress=True),
+    )
+
+    agent = _agent("developer", "developer", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id, status="failed")
+    await _add_latest_failed_session(
+        db_session, task, agent.id,
+        error="exit 1", metadata={}, started_at=datetime.now(timezone.utc),
+    )
+
+    action = await service.execute_retry_task_action(
+        db_session,
+        run_id=run.id,
+        request={"action_type": "retry_task", "task_id": str(task.id)},
+        idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+    )
+
+    assert action.status == "completed"
+    assert calls == [task.id]
+
+
+@pytest.mark.asyncio
+async def test_execute_retry_refuses_stale_pending_session_without_attempt_metadata(
+    db_session, test_project, monkeypatch,
+):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+
+    agent = _agent("developer", "developer", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id, status="failed")
+    await _add_latest_failed_session(db_session, task, agent.id, error="stale_pending_session", metadata={})
+
+    with pytest.raises(HTTPException) as exc:
+        await service.execute_retry_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "retry_task", "task_id": str(task.id)},
+            idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+        )
+    assert exc.value.status_code == 409
+    assert calls == []
+    assert [a.status for a in await _actions(db_session, run.id, "retry_task")] == ["failed"]
 
 
 @pytest.mark.asyncio

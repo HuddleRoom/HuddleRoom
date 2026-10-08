@@ -341,7 +341,7 @@ async def test_diagnose_4xx_discards_executor_work_but_keeps_failed_row(db_sessi
     service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="stuck")
     db_session.add(Session(
         agent_id=agent.id, task_id=task.id, project_id=task.project_id, adapter_type="api",
-        status="failed", input_context={}, metadata_={}, origin="auto",
+        status="failed", input_context={}, metadata_={"attempt": {"effect_state": "started"}}, origin="auto",
     ))
     await db_session.flush()
     await _patch_run_4xx(monkeypatch, service, "x")
