@@ -57,10 +57,13 @@ async def orchestration_lineage_state(db, session: SessionModel) -> bool | None:
             and contract.get("owner") == "orchestration_recovery"
             and action.target_type == "session" and action.target_id == session.id
         )
+    # Plain delegations carry bookkeeping keys (steering_versions, applies_decision_id) and
+    # supervision-owned follow-ups carry an orchestrator owner; only recovery-owned contracts
+    # are routed through the recovery branch, so only they are rejected here.
     return bool(
         action.action_type in _TASK_DISPATCH_ACTIONS
         and action.target_type == "task" and action.target_id == task.id
-        and not contract
+        and contract.get("owner") != "orchestration_recovery"
     )
 
 
@@ -117,8 +120,10 @@ async def _require_runnable_session_once(db, session_id: uuid.UUID, runner_task_
 
     lineage = await orchestration_lineage_state(db, session)
     if lineage is False:
+        logger.warning("Rejecting session %s: invalid orchestration lineage", session.id)
         return False
     if lineage is True and not runner_task_id:
+        logger.warning("Rejecting orchestration session %s: no runner_task_id claim", session.id)
         return False
 
     try:

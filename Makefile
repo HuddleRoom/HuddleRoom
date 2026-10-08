@@ -3,7 +3,7 @@
 # ── Local Development ────────────────────────────────────────────────────────
 
 serve:
-	.venv/bin/huddleroom serve --reload
+	.venv/bin/huddleroom serve
 
 migrate-local:
 	alembic upgrade head

@@ -124,6 +124,23 @@ async def test_current_verified_retry_ignores_older_unlinked_failure(db_session,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("contract, expected", [
+    ({"steering_versions": {"t1": 2}, "applies_decision_id": "x"}, True),
+    ({"owner": {"type": "orchestrator", "goal_id": "g1", "run_id": "r1"}}, True),
+    ({"owner": "orchestration_recovery"}, False),
+])
+async def test_delegation_lineage_contract_keys(db_session, test_project, test_agent, contract, expected):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, _, action, task, session = await _owned(db_session, test_project, test_agent)
+    action.action_type = "create_delegation_task"
+    action.request = {}
+    action.target_type, action.target_id = "task", task.id
+    action.dispatch_contract = contract
+
+    assert await orchestration_lineage_state(db_session, session) is expected
+
+
+@pytest.mark.asyncio
 async def test_direct_retry_target_is_not_verified_ownership(db_session, test_project, test_agent):
     goal, run, recovery_action, task, older = await _owned(
         db_session, test_project, test_agent, session_status="failed", task_status="failed",
