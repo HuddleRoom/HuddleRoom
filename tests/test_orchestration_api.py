@@ -130,7 +130,7 @@ async def test_create_and_detail_responses_keep_existing_fields_and_outcome_type
         assert GOAL_RESPONSE_KEYS <= set(body["goal"])
         assert RUN_RESPONSE_KEYS <= set(body["run"])
         assert body["goal"]["goal_type"] == "outcome"
-        assert body["goal"]["goal_type_source"] == "legacy"
+        assert body["goal"]["goal_type_source"] == "auto"
         assert body["goal"]["planning_mode"] == "implementation"
         assert body["goal"]["goal_type_rationale"].strip() and body["goal"]["planning_rationale"].strip()
         assert body["run"]["goal_type_snapshot"] == "outcome"

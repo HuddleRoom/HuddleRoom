@@ -74,6 +74,31 @@ def _hermetic_config_env():
     os.environ.update(saved)
 
 
+@pytest.fixture(autouse=True)
+def _stub_goal_shape_classifier(request):
+    # Auto goal creation would call the orchestrator model; stub it to the legacy
+    # runtime shape. patch.object (not monkeypatch) for the teardown-order reason above.
+    if any(request.node.get_closest_marker(m) for m in ("real_goal_shape", "live", "integration")):
+        yield
+        return
+    from unittest.mock import patch
+
+    from huddleroom.schemas.orchestration import GoalShapeDecision
+    from huddleroom.services.orchestration_goal_shape import OrchestrationGoalShapeService
+
+    async def classify(self, project_id, data):
+        return GoalShapeDecision(
+            goal_type="outcome",
+            goal_type_source="auto",
+            goal_type_rationale="Test stub: one bounded result.",
+            planning_mode="implementation",
+            planning_rationale="Test stub: leaf implementation plan.",
+        )
+
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        yield
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create a session-scoped event loop."""

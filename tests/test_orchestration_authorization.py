@@ -321,3 +321,18 @@ async def test_start_conflict_phrase_only_in_constraint_key_does_not_warn(
         db_session, client, auth_headers, test_project, constraints={"prepare only": True},
     )
     assert await _conflict_warnings(db_session, goal) == []
+
+
+@pytest.mark.asyncio
+async def test_start_continuous_goal_without_policy_conflicts(client, auth_headers, test_project):
+    base = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    created = await client.post(base, headers=auth_headers, json={
+        "objective": "Triage issues", "success_criteria": [], "constraints": {}, "budget": {},
+        "goal_type": "continuous",
+    })
+    assert created.status_code == 201, created.text
+    goal = created.json()["goal"]
+    assert goal["continuous_policy"] is None
+    resp = await client.post(f"{base}/{goal['id']}/start", headers=auth_headers)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == {"conflict": "goal_not_runnable", "message": "Continuous policy is required"}

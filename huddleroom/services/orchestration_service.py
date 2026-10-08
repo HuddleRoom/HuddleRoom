@@ -67,6 +67,7 @@ from huddleroom.services.orchestration_authority_interview import build_checkpoi
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService, runtime_decision_identity
 from huddleroom.services.orchestration_start_text_check import find_start_contradictions
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+from huddleroom.services.orchestration_goal_shape import OrchestrationGoalShapeService
 from huddleroom.services.orchestration_goal_definition import (
     GOAL_WEIGHT_ORDER,
     GoalDefinitionProcess,
@@ -304,6 +305,8 @@ class OrchestrationService:
         data: OrchestrationGoalCreate,
         created_by_user_id: uuid.UUID | None,
     ) -> tuple[OrchestrationGoal, OrchestrationRun]:
+        # ponytail: shape before lock; non-runnable project costs one call
+        decision = await OrchestrationGoalShapeService().resolve_creation_shape(project_id, data)
         await ProjectService().lock_workspace_boundary(db, project_id)
         await ProjectService().require_runnable_project(db, project_id)
         success_criteria = deepcopy(data.success_criteria)
@@ -325,6 +328,7 @@ class OrchestrationService:
             ),
             explicit_multi_work_function=data.explicit_multi_work_function,
             created_by_user_id=created_by_user_id,
+            **decision.model_dump(),
         )
         db.add(goal)
         await db.flush()

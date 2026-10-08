@@ -68,6 +68,7 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
 from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService
+from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_supersession import OrchestrationSupersessionService
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
@@ -602,7 +603,18 @@ async def create_goal(
     db: AsyncSession = Depends(get_db),
 ):
     await ensure_project_exists(db, project_id)
-    goal, run = await service.create_goal(db, project_id, data, created_by_user_id=user.id)
+    try:
+        goal, run = await service.create_goal(db, project_id, data, created_by_user_id=user.id)
+    except GoalShapeResolutionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "goal_shape_unresolved",
+                "reason": exc.reason,
+                "message": "Could not determine the goal type automatically. "
+                "Retry, or choose Outcome, Roadmap, or Continuous explicitly.",
+            },
+        )
     return await _detail(db, goal, run)
 
 

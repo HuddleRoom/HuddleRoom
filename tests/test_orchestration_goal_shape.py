@@ -3,8 +3,11 @@ import uuid
 from decimal import Decimal
 from typing import get_args
 
+from unittest.mock import patch
+
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from huddleroom.models.orchestration import (
     EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE,
@@ -12,6 +15,8 @@ from huddleroom.models.orchestration import (
     GOAL_TYPE_VALUES,
     LEGACY_PLANNING_MODE_BY_GOAL_TYPE,
     PLANNING_MODE_VALUES,
+    OrchestrationGoal,
+    OrchestrationRun,
 )
 from huddleroom.schemas import orchestration as s
 from huddleroom.schemas.orchestration import (
@@ -293,3 +298,65 @@ async def test_provider_error_is_not_retried():
         await OrchestrationGoalShapeService(fake).resolve_creation_shape(PROJECT_ID, create("x"))
     assert exc.value.reason == "provider_error"
     assert len(fake.calls) == 1
+
+
+# --- API wiring (autouse stub replaces _classify unless a test patches it) ---
+
+def _api_payload(**extra):
+    return {
+        "objective": "Ship it",
+        "success_criteria": [{"key": "done", "description": "Done"}],
+        "constraints": {},
+        "budget": {"caps": {"max_tokens": 1000}},
+        **extra,
+    }
+
+
+async def test_api_default_create_resolves_auto(client, test_project):
+    resp = await client.post(f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload())
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["goal"]["goal_type"] in GOAL_TYPE_VALUES
+    assert (body["goal"]["goal_type"], body["goal"]["goal_type_source"], body["goal"]["planning_mode"]) == (
+        "outcome", "auto", "implementation",
+    )
+    assert (body["run"]["goal_type_snapshot"], body["run"]["planning_mode_snapshot"]) == ("outcome", "implementation")
+    assert body["goal"]["weight"] == classify_goal_weight(
+        [{"key": "done", "description": "Done"}], {}, {"caps": {"max_tokens": 1000}}, "Ship it",
+    )
+
+
+@pytest.mark.parametrize("goal_type", ["outcome", "roadmap", "continuous"])
+async def test_api_explicit_create_bypasses_classifier(client, test_project, goal_type):
+    async def boom(self, project_id, data):
+        raise AssertionError("classifier must not run for explicit goal types")
+
+    with patch.object(OrchestrationGoalShapeService, "_classify", boom):
+        resp = await client.post(
+            f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload(goal_type=goal_type),
+        )
+    assert resp.status_code == 201, resp.text
+    goal = resp.json()["goal"]
+    assert (goal["goal_type"], goal["goal_type_source"]) == (goal_type, "user")
+    assert goal["planning_mode"] == EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[goal_type]
+
+
+async def test_api_unknown_goal_type_is_422(client, test_project):
+    resp = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload(goal_type="epic"),
+    )
+    assert resp.status_code == 422
+
+
+async def test_api_unresolved_shape_is_503_and_creates_nothing(client, db_session, test_project):
+    async def fail(self, project_id, data):
+        raise GoalShapeResolutionError("provider_error", "down")
+
+    with patch.object(OrchestrationGoalShapeService, "_classify", fail):
+        resp = await client.post(f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload())
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "goal_shape_unresolved"
+    assert resp.json()["detail"]["reason"] == "provider_error"
+    goals = (await db_session.execute(select(OrchestrationGoal).where(OrchestrationGoal.project_id == test_project.id))).all()
+    runs = (await db_session.execute(select(OrchestrationRun))).all()
+    assert goals == [] and runs == []
