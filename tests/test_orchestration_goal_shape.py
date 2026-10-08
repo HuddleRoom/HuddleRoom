@@ -1,3 +1,4 @@
+import json
 import uuid
 from decimal import Decimal
 from typing import get_args
@@ -18,8 +19,11 @@ from huddleroom.schemas.orchestration import (
     GoalTypeCorrectionApplyRequest,
     GoalTypeCorrectionPreviewRequest,
     GoalTypeCorrectionPreviewResult,
+    OrchestrationGoalCreate,
     OrchestrationSupersedeRequest,
 )
+from huddleroom.services.orchestration_goal_definition import classify_goal_weight
+from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 
 FP = "a" * 64
 
@@ -175,3 +179,117 @@ def test_no_response_or_decision_model_accepts_auto_goal_type():
     for model in (GoalShapeDecision, GoalTypeCorrectionPreviewRequest):
         field = "goal_type" if model is GoalShapeDecision else "requested_goal_type"
         assert "auto" not in get_args(model.model_fields[field].annotation)
+
+
+# --- Task 4a: shape resolution service (unit, injected completion_fn) ---
+
+real_shape = pytest.mark.real_goal_shape
+PROJECT_ID = uuid.uuid4()
+
+
+def shape_reply(goal_type, planning_mode, **extra):
+    payload = {
+        "goal_type": goal_type, "goal_type_rationale": "Because structure.",
+        "planning_mode": planning_mode, "planning_rationale": "Because mode.", **extra,
+    }
+    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+
+
+def scripted(*replies):
+    calls = []
+
+    async def fake(**request):
+        calls.append(request)
+        reply = replies[min(len(calls), len(replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    fake.calls = calls
+    return fake
+
+
+def create(objective, **kw):
+    return OrchestrationGoalCreate(objective=objective, **kw)
+
+
+def test_create_schema_goal_type_defaults_to_auto():
+    assert create("x").goal_type == "auto"
+    with pytest.raises(ValidationError):
+        create("x", goal_type="epic")
+
+
+@real_shape
+@pytest.mark.parametrize("data,reply,expected", [
+    (create("Add CSV export to the reports page"), ("outcome", "delivery"), ("outcome", "delivery")),
+    (create("Fix off-by-one in pagination helper"), ("outcome", "implementation"), ("outcome", "implementation")),
+    (create("Launch v2: auth migration, then billing, then mobile app"), ("roadmap", "roadmap"), ("roadmap", "roadmap")),
+    (create("Every morning triage new GitHub issues and label them"),
+     ("continuous", "continuous_policy"), ("continuous", "continuous_policy")),
+    (create("Rewrite payments service", success_criteria=[{"key": f"c{i}", "text": f"criterion {i}"} for i in range(8)],
+            budget={"caps": {"max_hours": 200}}), ("outcome", "delivery"), ("outcome", "delivery")),
+])
+async def test_auto_golden(data, reply, expected):
+    fake = scripted(shape_reply(*reply))
+    result = await OrchestrationGoalShapeService(fake).resolve_creation_shape(PROJECT_ID, data)
+    assert (result.goal_type, result.planning_mode) == expected
+    assert result.goal_type_source == "auto"
+    assert len(fake.calls) == 1
+    system = fake.calls[0]["messages"][0]["content"]
+    assert data.objective in system and "structure only" in system
+
+
+@real_shape
+async def test_large_bounded_result_weight_is_independent_of_shape():
+    data = create(
+        "Rewrite payments service", success_criteria=[{"key": f"c{i}", "text": f"criterion {i}"} for i in range(8)],
+        budget={"caps": {"max_hours": 200}},
+    )
+    await OrchestrationGoalShapeService(scripted(shape_reply("outcome", "delivery"))).resolve_creation_shape(PROJECT_ID, data)
+    assert classify_goal_weight(data.success_criteria, data.constraints, data.budget, data.objective) == "substantial"
+
+
+@real_shape
+@pytest.mark.parametrize("goal_type", ["outcome", "roadmap", "continuous"])
+async def test_explicit_bypasses_model(goal_type):
+    async def forbidden(**request):
+        raise AssertionError("model must not be called for explicit goal_type")
+
+    result = await OrchestrationGoalShapeService(forbidden).resolve_creation_shape(
+        PROJECT_ID, create("anything", goal_type=goal_type))
+    assert result.goal_type == goal_type
+    assert result.goal_type_source == "user"
+    assert result.planning_mode == EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[goal_type]
+    assert result.goal_type_rationale == "Selected by user at goal creation."
+    assert result.planning_rationale == f"Default planning mode for an explicitly selected {goal_type} goal."
+
+
+@real_shape
+async def test_misfit_mode_is_repaired():
+    fake = scripted(shape_reply("roadmap", "delivery"), shape_reply("roadmap", "roadmap"))
+    result = await OrchestrationGoalShapeService(fake).resolve_creation_shape(PROJECT_ID, create("Launch v2"))
+    assert (result.goal_type, result.planning_mode) == ("roadmap", "roadmap")
+    assert len(fake.calls) == 2
+    assert "rejected" in fake.calls[1]["messages"][-1]["content"]
+
+
+@real_shape
+@pytest.mark.parametrize("bad", [
+    shape_reply("outcome", "delivery", extra="nope"),
+    shape_reply("auto", "delivery"),
+])
+async def test_invalid_response_after_three_attempts(bad):
+    fake = scripted(bad)
+    with pytest.raises(GoalShapeResolutionError) as exc:
+        await OrchestrationGoalShapeService(fake).resolve_creation_shape(PROJECT_ID, create("x"))
+    assert exc.value.reason == "invalid_response"
+    assert len(fake.calls) == 3
+
+
+@real_shape
+async def test_provider_error_is_not_retried():
+    fake = scripted(RuntimeError("provider down"))
+    with pytest.raises(GoalShapeResolutionError) as exc:
+        await OrchestrationGoalShapeService(fake).resolve_creation_shape(PROJECT_ID, create("x"))
+    assert exc.value.reason == "provider_error"
+    assert len(fake.calls) == 1

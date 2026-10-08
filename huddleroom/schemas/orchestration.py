@@ -354,6 +354,7 @@ def valid_lm_retry_checkpoint(checkpoint: Any, process_type: str | None = None) 
 
 
 class OrchestrationGoalCreate(BaseModel):
+    goal_type: GoalTypeSelection = "auto"
     objective: str = Field(min_length=1)
     original_request: str | None = Field(default=None, min_length=1)
     success_criteria: list[dict] = Field(default_factory=list)
