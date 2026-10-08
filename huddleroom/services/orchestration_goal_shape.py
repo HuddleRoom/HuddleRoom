@@ -4,8 +4,9 @@ from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 from huddleroom.config import settings
-from huddleroom.models.orchestration import EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE
+from huddleroom.models.orchestration import EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE, explicit_planning_rationale
 from huddleroom.schemas.orchestration import GoalShapeDecision, OrchestrationGoalCreate
+from huddleroom.services.orchestration_goal_definition import _redacted_json
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_completion import (
     get_orchestration_completion,
@@ -60,7 +61,7 @@ class OrchestrationGoalShapeService:
                 goal_type_source="user",
                 goal_type_rationale="Selected by user at goal creation.",
                 planning_mode=EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[data.goal_type],
-                planning_rationale=f"Default planning mode for an explicitly selected {data.goal_type} goal.",
+                planning_rationale=explicit_planning_rationale(data.goal_type),
             )
         return await self._classify(project_id, data)
 
@@ -76,13 +77,13 @@ class OrchestrationGoalShapeService:
                 },
                 {
                     "role": "user",
-                    "content": json.dumps({
+                    "content": json.dumps(_redacted_json({
                         "objective": data.objective,
                         "original_request": data.original_request,
                         "success_criteria": data.success_criteria,
                         "constraints": data.constraints,
                         "budget": data.budget,
-                    }, sort_keys=True, default=str),
+                    }), sort_keys=True, default=str),
                 },
             ],
             "response_format": {"type": "json_object"},

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.config import settings
-from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun, delegable_context
 from huddleroom.models.project import Project
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_goal_analyzer import GoalClarificationAnalyzer
@@ -318,7 +318,7 @@ class GoalDefinitionProcess:
             "success_criteria": working_goal.success_criteria,
             "constraints": goal.constraints,
             "budget": goal.budget,
-            "orchestrator_context": context,
+            "orchestrator_context": delegable_context(context),
             "clarification_round": round_number,
         }
         request = _redacted_json(self.analyzer.build_request(snapshot, project={"name": project.name, "description": project.description} if project else None))

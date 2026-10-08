@@ -43,6 +43,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRoadmapVersion,
     OrchestrationRun,
     compute_goal_contract_fingerprint,
+    delegable_context,
 )
 from huddleroom.models.graph import Graph, GraphRun, GraphRunStep
 from huddleroom.models.project import Project
@@ -1935,7 +1936,7 @@ class OrchestrationService:
             inherited_goal = await db.get(OrchestrationGoal, gate_run.goal_id)
             inherited_context = self._json_object_or_empty(inherited_goal.orchestrator_context)
             if self._has_delegable_orchestrator_context(inherited_context):
-                request = {**request, "orchestrator_context": deepcopy(inherited_context)}
+                request = {**request, "orchestrator_context": delegable_context(inherited_context)}
         request_to_store = existing.request if existing is not None else self._canonical_plan_request(request)
         agent = None
         run = None
@@ -2098,7 +2099,7 @@ class OrchestrationService:
             if authority.get("status") == "rejected":
                 raise HTTPException(status_code=409, detail="needs_attention")
             if authority:
-                context = self._json_object_or_empty((inherited_goal.orchestrator_context or {}) if inherited_goal else {})
+                context = delegable_context(self._json_object_or_empty(inherited_goal.orchestrator_context if inherited_goal else {}))
                 roadmap = self._json_object_or_empty(context.get("roadmap"))
                 request_to_store = {
                     **request_to_store,
@@ -3889,7 +3890,7 @@ class OrchestrationService:
             self._json_object_or_empty(source_task.metadata_ if source_task else {}).get("orchestration_contract")
         )
         source_context = self._json_object_or_empty(source_contract.get("orchestrator_context"))
-        verification_context = source_context or (deepcopy(goal.orchestrator_context or {}) if goal else {})
+        verification_context = source_context or (delegable_context(goal.orchestrator_context) if goal else {})
         allowed_agent_ids = self._roadmap_team_agent_ids(
             verification_context.get("team")
         )
@@ -4826,7 +4827,7 @@ class OrchestrationService:
                     "notes": "str",
                 },
                 "parent_task_id": None,
-                "orchestrator_context": deepcopy(orchestrator_context) if orchestrator_context is not None else (deepcopy(goal.orchestrator_context or {}) if goal else {}),
+                "orchestrator_context": delegable_context(orchestrator_context if orchestrator_context is not None else (goal.orchestrator_context if goal else None)),
             }
         )
         await self._validate_delegation_targets(db, run_id, request)
@@ -5298,7 +5299,7 @@ class OrchestrationService:
                 }
             ),
             parent_task_id=None,
-            orchestrator_context=deepcopy(goal.orchestrator_context or {}),
+            orchestrator_context=delegable_context(goal.orchestrator_context),
         )
 
     def _final_summary_delegation_request(

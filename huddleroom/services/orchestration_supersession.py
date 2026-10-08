@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import (
     EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE, OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGoal,
-    OrchestrationRun,
+    OrchestrationRun, explicit_planning_rationale,
 )
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -95,7 +95,7 @@ class OrchestrationSupersessionService:
                     goal_type_source="user",
                     goal_type_rationale=f"Selected by user when superseding goal {original_goal_id}.",
                     planning_mode=EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[new_goal_type],
-                    planning_rationale=f"Default planning mode for an explicitly selected {new_goal_type} goal.",
+                    planning_rationale=explicit_planning_rationale(new_goal_type),
                     supersedes_goal_id=original_goal_id,
                     created_by_user_id=goal.created_by_user_id,
                 )

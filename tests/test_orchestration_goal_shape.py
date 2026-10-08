@@ -19,6 +19,7 @@ from huddleroom.models.orchestration import (
     OrchestrationGoal,
     OrchestrationRun,
 )
+from huddleroom.models.orchestration import delegable_context
 from huddleroom.schemas import orchestration as s
 from huddleroom.schemas.orchestration import (
     GoalShapeDecision,
@@ -29,6 +30,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationSupersedeRequest,
 )
 from huddleroom.services.orchestration_goal_definition import classify_goal_weight
+from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 
 FP = "a" * 64
@@ -189,6 +191,7 @@ def test_no_response_or_decision_model_accepts_auto_goal_type():
 
 # --- Task 4a: shape resolution service (unit, injected completion_fn) ---
 
+# Unit tests of _classify/resolve_creation_shape must carry real_shape, or the autouse conftest stub replaces _classify.
 real_shape = pytest.mark.real_goal_shape
 PROJECT_ID = uuid.uuid4()
 
@@ -351,13 +354,14 @@ async def test_api_unknown_goal_type_is_422(client, test_project):
 
 async def test_api_unresolved_shape_is_503_and_creates_nothing(client, db_session, test_project):
     async def fail(self, project_id, data):
-        raise GoalShapeResolutionError("provider_error", "down")
+        raise GoalShapeResolutionError("provider_error", "upstream-secret-text")
 
     with patch.object(OrchestrationGoalShapeService, "_classify", fail):
         resp = await client.post(f"/api/v1/projects/{test_project.id}/orchestration/goals", json=_api_payload())
     assert resp.status_code == 503
     assert resp.json()["detail"]["code"] == "goal_shape_unresolved"
     assert resp.json()["detail"]["reason"] == "provider_error"
+    assert "upstream-secret-text" not in resp.text
     goals = (await db_session.execute(select(OrchestrationGoal).where(OrchestrationGoal.project_id == test_project.id))).all()
     runs = (await db_session.execute(select(OrchestrationRun))).all()
     assert goals == [] and runs == []
@@ -435,3 +439,32 @@ async def test_api_explicit_create_persists_rationales_and_policy(client, test_p
     assert goal["goal_type_rationale"] == "Selected by user at goal creation."
     assert goal["planning_rationale"] == f"Default planning mode for an explicitly selected {goal_type} goal."
     assert goal["orchestrator_context"]["expansion_policy"] == _DEFAULT_POLICY
+
+
+@real_shape
+async def test_classifier_request_redacts_secrets():
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+    fake = scripted(shape_reply("outcome", "delivery"))
+    data = create("Ship it", constraints={"note": f"use key {secret}"})
+    await OrchestrationGoalShapeService(fake).resolve_creation_shape(PROJECT_ID, data)
+    assert secret not in json.dumps(fake.calls[0]["messages"])
+
+
+def test_delegable_context_drops_only_expansion_policy():
+    ctx = {"expansion_policy": {"depth": 0}, "team": {"a": 1}}
+    assert delegable_context(ctx) == {"team": {"a": 1}}
+    assert "expansion_policy" in ctx and delegable_context(None) == {}
+
+
+def test_planning_contract_excludes_expansion_policy():
+    from types import SimpleNamespace
+
+    goal = SimpleNamespace(
+        id=uuid.uuid4(), objective="Ship", success_criteria=[], constraints={}, budget={}, goal_type="outcome",
+        orchestrator_context={"expansion_policy": {"depth": 0}, "team": {"agent_ids": ["x"]}},
+    )
+    request = {"agent_id": str(uuid.uuid4()), "scope": "plan it"}
+    contract = OrchestrationService()._planning_contract(
+        goal, SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4()), request,
+    )
+    assert contract.orchestrator_context == {"team": {"agent_ids": ["x"]}}

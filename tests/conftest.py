@@ -77,7 +77,8 @@ def _hermetic_config_env():
 @pytest.fixture(autouse=True)
 def _stub_goal_shape_classifier(request):
     # Auto goal creation would call the orchestrator model; stub it to the legacy
-    # runtime shape. patch.object (not monkeypatch) for the teardown-order reason above.
+    # runtime shape; unit tests of _classify must carry @pytest.mark.real_goal_shape or they test this stub.
+    # patch.object (not monkeypatch) for the teardown-order reason above.
     if any(request.node.get_closest_marker(m) for m in ("real_goal_shape", "live", "integration")):
         yield
         return

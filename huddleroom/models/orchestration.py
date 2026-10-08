@@ -1,6 +1,7 @@
 import hashlib
 import json
 import uuid
+from copy import deepcopy
 from datetime import datetime
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, false, inspect, text, true
@@ -69,6 +70,17 @@ LEGACY_PLANNING_MODE_BY_GOAL_TYPE = {
 EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE = {
     "outcome": "delivery", "roadmap": "roadmap", "continuous": "continuous_policy",
 }
+
+
+def explicit_planning_rationale(goal_type: str) -> str:
+    return f"Default planning mode for an explicitly selected {goal_type} goal."
+
+
+def delegable_context(context: dict | None) -> dict:
+    """Goal orchestrator_context minus expansion_policy, which only goal rows carry."""
+    return {key: deepcopy(value) for key, value in (context or {}).items() if key != "expansion_policy"}
+
+
 LEGACY_GOAL_TYPE_RATIONALE = "Existing goal type preserved by the planning-hierarchy migration."
 LEGACY_PLANNING_RATIONALE = "Planning mode mapped from the existing goal type by the planning-hierarchy migration."
 GOAL_TYPE_SOURCE_CHECK = _column_check("goal_type_source", GOAL_TYPE_SOURCE_VALUES)
