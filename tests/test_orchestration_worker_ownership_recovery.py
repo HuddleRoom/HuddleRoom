@@ -141,6 +141,24 @@ async def test_delegation_lineage_contract_keys(db_session, test_project, test_a
 
 
 @pytest.mark.asyncio
+async def test_pending_session_with_invalid_lineage_fails_immediately(db_session, test_project, test_agent, monkeypatch):
+    _, _, action, task, session = await _owned(
+        db_session, test_project, test_agent, session_status="pending", task_status="in_progress",
+    )
+    action.action_type = "create_delegation_task"
+    action.request = {}
+    action.target_type, action.target_id = "task", task.id
+    action.dispatch_contract = {"owner": "orchestration_recovery"}
+    async def no_commit(): return None
+    monkeypatch.setattr(db_session, "commit", no_commit)
+
+    assert await _require_runnable_session(db_session, session.id, session.runner_task_id) is False
+
+    assert session.status == "failed" and session.error == "orchestration_lineage_invalid"
+    assert session.ended_at is not None and task.status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_direct_retry_target_is_not_verified_ownership(db_session, test_project, test_agent):
     goal, run, recovery_action, task, older = await _owned(
         db_session, test_project, test_agent, session_status="failed", task_status="failed",
