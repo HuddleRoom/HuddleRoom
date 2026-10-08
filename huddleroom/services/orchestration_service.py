@@ -5940,7 +5940,22 @@ class OrchestrationService:
             f"Deliverable: {contract.deliverable}",
         ]
         if contract.inputs:
-            sections.append("Inputs:\n" + "\n".join(f"- {item}" for item in contract.inputs))
+            criterion_descriptions: dict[str, str] = {}
+            criteria = getattr(goal, "success_criteria", None)
+            for criterion in criteria if isinstance(criteria, list) else []:
+                if isinstance(criterion, dict) and isinstance(criterion.get("key"), str):
+                    description = criterion.get("description")
+                    if isinstance(description, str) and description.strip():
+                        criterion_descriptions.setdefault(criterion["key"], description.strip())
+
+            def _render_input(item: str) -> str:
+                if item.startswith("criterion:"):
+                    description = criterion_descriptions.get(item[len("criterion:"):])
+                    if description:
+                        return f"{item} — {description}"
+                return item
+
+            sections.append("Inputs:\n" + "\n".join(f"- {_render_input(item)}" for item in contract.inputs))
         if contract.forbidden_work:
             sections.append("Forbidden work:\n" + "\n".join(f"- {item}" for item in contract.forbidden_work))
         if contract.success_evidence:
