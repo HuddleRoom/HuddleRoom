@@ -676,6 +676,11 @@ class OrchestrationRunResponse(BaseModel):
     phase: str
     baseline_authorized: bool = True
     cycle_key: str | None = None
+    supersedes_run_id: uuid.UUID | None = None
+    terminal_reason: str | None = None
+    goal_type_snapshot: str | None = None
+    planning_mode_snapshot: str | None = None
+    goal_contract_fingerprint: str | None = None
     # ponytail: default lets the response validate before `condition` (a
     # derived, non-column value) is injected by the router; always
     # overwritten before reaching a client.
@@ -791,6 +796,10 @@ class OrchestrationGoalResponse(BaseModel):
     manager_user_id: uuid.UUID | None = None
     authority_model: str | None = None
     goal_type: str
+    goal_type_source: str
+    goal_type_rationale: str
+    planning_mode: str
+    planning_rationale: str
     supersedes_goal_id: uuid.UUID | None = None
     parent_goal_id: uuid.UUID | None = None
     roadmap_version_id: uuid.UUID | None = None

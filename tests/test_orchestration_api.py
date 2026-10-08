@@ -101,10 +101,13 @@ GOAL_RESPONSE_KEYS = {
     "status", "goal_type", "weight", "supersedes_goal_id", "parent_goal_id", "roadmap_item_key",
     "roadmap_version_id", "continuous_policy", "continuous_state", "continuous_origin_key",
     "orchestrator_context", "needs_you_count", "created_at", "updated_at",
+    "goal_type_source", "goal_type_rationale", "planning_mode", "planning_rationale",
 }
 RUN_RESPONSE_KEYS = {
     "id", "goal_id", "status", "phase", "condition", "baseline_authorized", "budget_state",
     "plan_state", "retry_state", "active_blockers", "cycle_key", "started_at", "completed_at",
+    "supersedes_run_id", "terminal_reason", "goal_type_snapshot", "planning_mode_snapshot",
+    "goal_contract_fingerprint",
 }
 DETAIL_RESPONSE_KEYS = {
     "goal", "run", "decisions", "actions", "gates", "evidence", "agent_suggestions", "timeline",
@@ -127,6 +130,15 @@ async def test_create_and_detail_responses_keep_existing_fields_and_outcome_type
         assert GOAL_RESPONSE_KEYS <= set(body["goal"])
         assert RUN_RESPONSE_KEYS <= set(body["run"])
         assert body["goal"]["goal_type"] == "outcome"
+        assert body["goal"]["goal_type_source"] == "legacy"
+        assert body["goal"]["planning_mode"] == "implementation"
+        assert body["goal"]["goal_type_rationale"].strip() and body["goal"]["planning_rationale"].strip()
+        assert body["run"]["goal_type_snapshot"] == "outcome"
+        assert body["run"]["planning_mode_snapshot"] == "implementation"
+        # Still in baseline: not yet frozen, no successor lineage.
+        assert body["run"]["supersedes_run_id"] is None
+        assert body["run"]["terminal_reason"] is None
+        assert body["run"]["goal_contract_fingerprint"] is None
         assert body["goal"]["parent_goal_id"] is None
         assert body["goal"]["supersedes_goal_id"] is None
         assert body["run"]["phase"] == "baseline"
