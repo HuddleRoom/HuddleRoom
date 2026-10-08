@@ -1081,3 +1081,64 @@ async def test_cancel_closeout_failure_leaves_goal_and_run_nonterminal(
 
     assert goal.status == "active"
     assert run.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_closeout_blocks_on_unresolved_meeting_commitment(db_session, test_project, completion_ready_goal):
+    from huddleroom.models.meeting import Meeting, MeetingActionItem
+    from huddleroom.models.task import Task
+
+    service, goal, run = completion_ready_goal
+    source = Task(
+        project_id=test_project.id, title="Source", status="done",
+        metadata_={"orchestration": {"run_id": str(run.id)}},
+    )
+    failed = Task(
+        project_id=test_project.id, title="Failed follow-up", status="failed",
+        metadata_={"orchestration": {"run_id": str(run.id)}},
+    )
+    db_session.add_all([source, failed])
+    await db_session.flush()
+    meeting = Meeting(project_id=test_project.id, title="Sync", meeting_type="standup", source_task_id=source.id)
+    db_session.add(meeting)
+    await db_session.flush()
+    item = MeetingActionItem(meeting_id=meeting.id, description="Do it", task_id=failed.id, status="task_created")
+    db_session.add(item)
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc:
+        await service._closeout_preconditions_manifest(db_session, goal, run)
+    assert exc.value.status_code == 409
+    assert "Unresolved meeting commitments" in exc.value.detail and str(item.id) in exc.value.detail
+
+    item.status = "waived"
+    await db_session.flush()
+    manifest = await service._closeout_preconditions_manifest(db_session, goal, run)
+    assert manifest["unresolved_meeting_commitments"] == []
+
+
+@pytest.mark.asyncio
+async def test_tick_swallows_commitment_409_and_progress_view_lists_it(db_session, test_project, completion_ready_goal):
+    from huddleroom.models.meeting import Meeting, MeetingActionItem
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+
+    service, goal, run = completion_ready_goal
+    source = Task(
+        project_id=test_project.id, title="Source", status="done",
+        metadata_={"orchestration": {"run_id": str(run.id)}},
+    )
+    db_session.add(source)
+    await db_session.flush()
+    meeting = Meeting(project_id=test_project.id, title="Sync", meeting_type="standup", source_task_id=source.id)
+    db_session.add(meeting)
+    await db_session.flush()
+    item = MeetingActionItem(meeting_id=meeting.id, description="Unhandled commitment")
+    db_session.add(item)
+    await db_session.flush()
+
+    await service.tick(db_session, run.id)
+
+    assert run.status != "completed"
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert str(item.id) in {f["id"] for f in situation.untracked_follow_ups}

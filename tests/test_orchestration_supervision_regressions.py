@@ -674,3 +674,347 @@ async def test_fair_sweep_uses_a_fresh_session_per_goal_after_an_error(  # pylin
     async with sessions() as observer:
         state = await observer.get(OrchestrationSchedulerState, "supervision")
         assert state.cursor_goal_id == max(first_goal.id, second_goal.id)
+
+
+# --- judgment claim lease, timeout, escalation ---------------------------
+
+_NOW = datetime(2026, 9, 10, 16, 0, tzinfo=timezone.utc)
+
+
+def _live_claim_state(token="tok", expires=None):
+    return {
+        "needs_judgment": True, "judgment_due_at": _NOW.isoformat(), "judgment_in_flight": True,
+        "judgment_claim_token": token,
+        "judgment_lease_expires_at": (expires or _NOW + timedelta(seconds=60)).isoformat(),
+    }
+
+
+async def _persisted_state(sessions, run_id):
+    async with sessions() as observer:
+        return dict((await observer.get(OrchestrationRun, run_id)).supervision_state)
+
+
+async def test_expired_lease_is_reclaimed_and_judge_runs(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = _live_claim_state(expires=_NOW - timedelta(seconds=1))
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    calls = []
+
+    async def judge(_payload):
+        calls.append(1)
+        return _provider_assessment()
+
+    async with sessions() as worker:
+        assert await OrchestrationSupervisionScheduler(judge=judge).evaluate_run(worker, run.id, now=_NOW) == 1
+    state = await _persisted_state(sessions, run.id)
+    assert calls == [1]
+    assert state["judgment_in_flight"] is False and "judgment_claim_token" not in state
+
+
+async def test_legacy_flag_without_token_is_reclaimable(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {
+        "needs_judgment": True, "judgment_due_at": _NOW.isoformat(), "judgment_in_flight": True,
+    }
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    claim = await OrchestrationSupervisionScheduler()._claim_judgment(run.id, _NOW)  # pylint: disable=protected-access
+    assert claim is not None and claim["token"]
+    state = await _persisted_state(sessions, run.id)
+    assert state["judgment_claim_token"] == claim["token"]
+    assert state["judgment_lease_expires_at"] > state["judgment_claimed_at"]
+
+
+async def test_live_claim_is_not_stolen(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = _live_claim_state()
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    scheduler = OrchestrationSupervisionScheduler()
+    assert await scheduler._claim_judgment(run.id, _NOW) is None  # pylint: disable=protected-access
+    assert (await _persisted_state(sessions, run.id))["judgment_claim_token"] == "tok"
+
+
+async def test_racing_evaluators_on_expired_claim_judge_once(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = _live_claim_state(expires=_NOW - timedelta(seconds=1))
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    calls = []
+
+    async def judge(_payload):
+        calls.append(1)
+        await asyncio.sleep(0.05)
+        return _provider_assessment()
+
+    scheduler = OrchestrationSupervisionScheduler(judge=judge)
+
+    async def evaluate():
+        async with sessions() as worker:
+            return await scheduler.evaluate_run(worker, run.id, now=_NOW)
+
+    await asyncio.gather(evaluate(), evaluate())
+    assert len(calls) == 1
+
+
+async def test_late_result_from_old_token_is_discarded(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat()}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    scheduler = OrchestrationSupervisionScheduler()
+    old = await scheduler._claim_judgment(run.id, _NOW)  # pylint: disable=protected-access
+    async with sessions() as db:  # lease expires; a second worker reclaims
+        row = await db.get(OrchestrationRun, run.id)
+        row.supervision_state = {
+            **row.supervision_state, "judgment_lease_expires_at": (_NOW - timedelta(seconds=1)).isoformat(),
+        }
+        await db.commit()
+    new = await scheduler._claim_judgment(run.id, _NOW)  # pylint: disable=protected-access
+    before = await _persisted_state(sessions, run.id)
+    assert new["token"] != old["token"]
+    assert await scheduler._finish_judgment(old, _provider_assessment()) is False  # pylint: disable=protected-access
+    assert await _persisted_state(sessions, run.id) == before
+
+
+async def test_old_worker_failure_cleanup_keeps_newer_claim(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = _live_claim_state(token="new")
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    before = await _persisted_state(sessions, run.id)
+    await OrchestrationSupervisionScheduler()._update_judgment_failure(  # pylint: disable=protected-access
+        run.id, failure=True, token="old",
+    )
+    assert await _persisted_state(sessions, run.id) == before
+
+
+async def test_hanging_judge_times_out_and_counts_failure(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat()}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    monkeypatch.setattr(settings, "orchestration_judgment_timeout_seconds", 0.05)
+
+    async def hang(_payload):
+        await asyncio.sleep(30)
+
+    async with sessions() as worker:
+        assert await OrchestrationSupervisionScheduler(judge=hang).evaluate_run(worker, run.id, now=_NOW) == 0
+    state = await _persisted_state(sessions, run.id)
+    assert state["judgment_failures"] == 2 and state["judgment_in_flight"] is False
+    assert "judgment_claim_token" not in state
+
+
+def _fake_clock(monkeypatch, start=_NOW):
+    import huddleroom.services.orchestration_supervision_scheduler as scheduler_module
+
+    clock = {"t": start}
+    monkeypatch.setattr(scheduler_module, "_utcnow", lambda: clock["t"])
+    return clock
+
+
+async def test_three_failures_escalate_once_and_success_recovers(db_session, test_project, monkeypatch):
+    from sqlalchemy import select
+    from huddleroom.models.orchestration_process import OrchestrationWarning
+
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat(), "judgment_failures": 1}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+
+    async def fail(_payload):
+        raise RuntimeError("down")
+
+    async def ok(_payload):
+        return _provider_assessment()
+
+    async def evaluate(judge):
+        async with sessions() as worker:
+            await OrchestrationSupervisionScheduler(judge=judge).evaluate_run(worker, run.id, now=clock["t"])
+
+    async def snapshot():
+        async with sessions() as observer:
+            current = await observer.get(OrchestrationRun, run.id)
+            warnings = (await observer.scalars(select(OrchestrationWarning).where(
+                OrchestrationWarning.goal_id == run.goal_id,
+                OrchestrationWarning.warning_type == "supervision_judgment_failures",
+            ))).all()
+            blockers = [b for b in current.active_blockers if b.get("kind") == "supervision_judgment_failures"]
+            return dict(current.supervision_state), warnings, blockers
+
+    await evaluate(fail)  # failures 1 -> 3 (two attempts)
+    state, warnings, blockers = await snapshot()
+    assert state["judgment_failures"] == 3 and len(warnings) == 1 and len(blockers) == 1
+    assert blockers[0]["failure_count"] == 3
+    backoff = clock["t"] + timedelta(seconds=settings.orchestration_semantic_progress_seconds)
+    assert state["judgment_due_at"] == backoff.isoformat()
+    assert blockers[0]["next_retry_at"] == backoff.isoformat() and backoff > clock["t"]
+    assert not any(ch.isdigit() for ch in warnings[0].message.split("retrying at")[0])
+
+    clock["t"] += timedelta(hours=1)
+    await evaluate(fail)  # 4th failure; backoff due blocks the in-pass retry
+    _state, warnings, blockers = await snapshot()
+    assert len(warnings) == 1 and len(blockers) == 1 and blockers[0]["failure_count"] == 4
+
+    clock["t"] += timedelta(hours=1)
+    await evaluate(ok)
+    state, warnings, blockers = await snapshot()
+    assert state["judgment_failures"] == 0 and blockers == []
+    assert [w.active for w in warnings] == [False]
+
+
+async def test_second_attempt_gets_a_full_lease_after_a_slow_first(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat()}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    leases = []
+
+    async def judge(_payload):
+        state = await _persisted_state(sessions, run.id)
+        leases.append(
+            datetime.fromisoformat(state["judgment_lease_expires_at"]) - clock["t"]
+        )
+        clock["t"] += timedelta(seconds=360)
+        raise RuntimeError("slow failure")
+
+    async with sessions() as worker:
+        await OrchestrationSupervisionScheduler(judge=judge).evaluate_run(worker, run.id, now=_NOW)
+    full = timedelta(seconds=settings.orchestration_judgment_lease_seconds)
+    assert leases == [full, full]
+
+
+async def test_finish_after_lease_expiry_is_discarded(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat()}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    applied = []
+
+    async def apply(*_args, **_kwargs):
+        applied.append(1)
+
+    monkeypatch.setattr(OrchestrationService().supervision.__class__, "apply_disposition", apply)
+    scheduler = OrchestrationSupervisionScheduler()
+    claim = await scheduler._claim_judgment(run.id, _NOW)  # pylint: disable=protected-access
+    clock["t"] += timedelta(seconds=settings.orchestration_judgment_lease_seconds + 1)
+    assert await scheduler._finish_judgment(claim, _provider_assessment()) is False  # pylint: disable=protected-access
+    assert applied == []
+    state = await _persisted_state(sessions, run.id)
+    assert state["judgment_in_flight"] is False and "judgment_claim_token" not in state
+
+
+async def test_cleanup_failure_is_contained_and_lease_bounds_the_stuck_claim(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat()}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    scheduler = OrchestrationSupervisionScheduler()
+    real_cleanup = scheduler._update_judgment_failure  # pylint: disable=protected-access
+    cleanups = []
+
+    async def flaky_cleanup(*args, **kwargs):
+        cleanups.append(1)
+        if len(cleanups) == 1:
+            raise RuntimeError("db hiccup")
+        return await real_cleanup(*args, **kwargs)
+
+    calls = []
+
+    async def fail(_payload):
+        calls.append(1)
+        raise RuntimeError("down")
+
+    scheduler._update_judgment_failure = flaky_cleanup  # pylint: disable=protected-access
+    scheduler._judge_impl = fail  # pylint: disable=protected-access
+    # A failed cleanup must not escape; the still-live claim blocks attempt 2 until its lease expires.
+    await scheduler._evaluate_claimed(run.id, _NOW)  # pylint: disable=protected-access
+    assert cleanups == [1] and calls == [1]
+    async with sessions() as db:
+        state = (await db.get(OrchestrationRun, run.id)).supervision_state
+    assert state["judgment_in_flight"] and state["judgment_claim_token"] and state["judgment_lease_expires_at"]
+
+
+async def test_cancellation_during_judge_runs_cleanup_and_propagates(db_session, test_project, monkeypatch):
+    _goal, run = await _run(db_session, test_project)
+    run.supervision_state = {"needs_judgment": True, "judgment_due_at": _NOW.isoformat()}
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    started = asyncio.Event()
+
+    async def hang(_payload):
+        started.set()
+        await asyncio.sleep(30)
+
+    task = asyncio.ensure_future(
+        OrchestrationSupervisionScheduler(judge=hang)._evaluate_claimed(run.id, _NOW)  # pylint: disable=protected-access
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    state = await _persisted_state(sessions, run.id)
+    assert state["judgment_in_flight"] is False and state["judgment_failures"] == 1
+    assert "judgment_claim_token" not in state
+
+
+@pytest.mark.parametrize(
+    ("kind", "finish_expected"),
+    [("supervision_judgment_failures", True), ("everyone_idle", True), ("some_real_blocker", False)],
+)
+async def test_escalation_blocker_does_not_block_goal_completion(
+    db_session, test_project, monkeypatch, kind, finish_expected
+):
+    """Behavioral: tick reaches the finish path with only the escalation blocker; a real blocker still gates it."""
+    from huddleroom.services import orchestration_service
+    from huddleroom.services.orchestration_llm_decision_adapter import (
+        OrchestrationDecisionAdapter,
+        OrchestrationDecisionAdapterResult,
+    )
+    from tests.test_orchestration_debug import _seed_terminal
+    from tests.test_orchestration_effectiveness_review import _goal_run, _stub_tick_baseline
+
+    goal, run = await _goal_run(db_session, test_project)
+    run.phase = "authorized"
+    run.active_blockers = [{"kind": kind, "reason": "x"}]
+    await db_session.flush()
+    await _seed_terminal(db_session, goal.id, "goal_definition", run.id)
+    await _seed_terminal(db_session, goal.id, "manager_selection", run.id)
+    await _seed_terminal(db_session, goal.id, "agent_definition_review", run.id, terminal="skipped")
+    await _seed_terminal(db_session, goal.id, "team_hierarchy", run.id, terminal="skipped")
+
+    async def fake_decide(self, context, *, project=None, goal=None):  # pylint: disable=unused-argument
+        return OrchestrationDecisionAdapterResult(
+            input_snapshot=dict(context),
+            llm_output={"raw_content": None},
+            parsed_decision={"action_type": "noop", "reason": "test stub"},
+        )
+
+    monkeypatch.setattr(OrchestrationDecisionAdapter, "decide", fake_decide)
+    await _stub_tick_baseline(monkeypatch)
+    service = OrchestrationService()
+    calls = []
+
+    async def zero(*_a, **_k):
+        return 0
+
+    async def not_ready(*_a, **_k):
+        calls.append("final_summary")
+        return False
+
+    async def preconditions(*_a, **_k):
+        calls.append("closeout_preconditions")
+        return {}
+
+    async def closeout(*_a, **_k):
+        calls.append("closeout")
+        return {"status": "completed", "completion_authorized": True}
+
+    async def completion_not_ready(*_a, **_k):
+        calls.append("completion")
+        return False
+
+    monkeypatch.setattr(service, "validate_open_gates", zero)
+    monkeypatch.setattr(service, "recover_run", zero)
+    monkeypatch.setattr(service, "_run_ready_for_final_summary_request", not_ready)
+    monkeypatch.setattr(service, "_closeout_preconditions_manifest", preconditions)
+    monkeypatch.setattr(orchestration_service.GoalCloseoutProcess, "advance", closeout)
+    monkeypatch.setattr(service, "_run_ready_for_completion", completion_not_ready)
+
+    await service.tick(db_session, run.id)
+
+    finish_calls = ["final_summary", "closeout_preconditions", "closeout", "completion"]
+    assert [c for c in calls if c in finish_calls] == (finish_calls if finish_expected else [])

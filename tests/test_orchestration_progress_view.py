@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.meeting import Meeting, MeetingActionItem
 from huddleroom.models.orchestration import (
     OrchestrationAction,
@@ -12,7 +13,8 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
     OrchestrationWait,
 )
-from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
+from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_progress_view import (
     ACTIVE_TASK_STATUSES,
@@ -200,7 +202,141 @@ async def test_blocked_task_is_in_flight_and_stalled(db_session, test_project):
     task = await _task(db_session, test_project, run, status="blocked", criterion_keys=["done"])
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     assert _entry(situation, "done")["state"] == "in_flight"
-    assert [f["id"] for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"] == [str(task.id)]
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert [f["id"] for f in stalled] == [str(task.id)]
+    assert stalled[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+
+
+async def test_blocked_task_without_session_or_dependency_suggests_reassign_or_ask_human(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled == [{
+        "kind": "stalled_task",
+        "id": str(task.id),
+        "summary": f"{task.title} is blocked",
+        "suggested_actions": ["reassign_task", "ask_human"],
+    }]
+
+
+async def test_blocked_summary_includes_stored_block_reason(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    task.metadata_ = {**task.metadata_, "blocked": {"reason": "API key expired", "at": "2026-01-01T00:00:00+00:00"}}
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["summary"] == f"{task.title} is blocked: API key expired"
+    assert stalled[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+
+
+async def test_blocked_task_waiting_on_unmet_dependency_has_no_actions(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    dependency = await _task(db_session, test_project, run, status="in_progress")
+    task = await _task(db_session, test_project, run, status="blocked")
+    task.depends_on = [str(dependency.id)]
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == []
+    assert stalled[0]["summary"] == f"{task.title} is blocked (waiting on task {dependency.title} (in_progress))"
+
+
+async def test_blocked_task_with_done_dependency_is_not_waiting(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    dependency = await _task(db_session, test_project, run, status="done")
+    task = await _task(db_session, test_project, run, status="blocked")
+    task.depends_on = [str(dependency.id)]
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+    assert stalled[0]["summary"] == f"{task.title} is blocked"
+
+
+async def test_blocked_task_with_failed_dependency_is_not_waiting(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    dependency = await _task(db_session, test_project, run, status="failed")
+    task = await _task(db_session, test_project, run, status="blocked")
+    task.depends_on = [str(dependency.id)]
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    blocked = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task" and f["id"] == str(task.id)]
+    assert blocked[0]["summary"] == f"{task.title} is blocked"
+    assert blocked[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+
+
+async def test_blocked_task_with_live_session_waits_on_it(db_session, test_project, test_agent):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    db_session.add(Session(
+        agent_id=test_agent.id, task_id=task.id, project_id=test_project.id, adapter_type="api",
+        status="running", input_context={}, metadata_={}, origin="auto",
+    ))
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == []
+    assert stalled[0]["summary"] == f"{task.title} is blocked (session running)"
+
+
+async def test_blocked_task_with_ended_session_is_not_waiting(db_session, test_project, test_agent):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    db_session.add(Session(
+        agent_id=test_agent.id, task_id=task.id, project_id=test_project.id, adapter_type="api",
+        status="failed", input_context={}, metadata_={}, origin="auto",
+    ))
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+
+
+async def test_blocked_task_with_active_meeting_waits_on_it(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    await _meeting(db_session, test_project, task, title="Design review")
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == []
+    assert stalled[0]["summary"] == f"{task.title} is blocked (waiting on meeting Design review)"
+
+
+async def test_blocked_task_linked_to_active_graph_run_waits_on_it(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    graph = Graph(project_id=test_project.id, name="Review", version="1", definition={}, triggers=[])
+    db_session.add(graph)
+    await db_session.flush()
+    graph_run = GraphRun(
+        graph_id=graph.id, project_id=test_project.id, linked_task_id=task.id, current_node="review", status="active",
+    )
+    db_session.add(graph_run)
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == []
+    assert stalled[0]["summary"] == f"{task.title} is blocked (waiting on graph run {graph_run.id})"
+
+
+async def test_blocked_task_with_concluded_meeting_or_completed_graph_run_is_not_waiting(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run, status="blocked")
+    meeting = await _meeting(db_session, test_project, task)
+    meeting.status = "concluded"
+    graph = Graph(project_id=test_project.id, name="Review", version="1", definition={}, triggers=[])
+    db_session.add(graph)
+    await db_session.flush()
+    db_session.add(GraphRun(
+        graph_id=graph.id, project_id=test_project.id, linked_task_id=task.id, current_node="done", status="completed",
+    ))
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
+    assert stalled[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+    assert stalled[0]["summary"] == f"{task.title} is blocked"
 
 
 async def test_malformed_criteria_are_skipped(db_session, test_project):
@@ -273,7 +409,7 @@ async def test_meeting_action_item_included_when_open_untasked_from_run_meeting(
         "kind": "meeting_action_item",
         "id": str(item.id),
         "summary": "Write the report",
-        "suggested_actions": ["create_delegation_task"],
+        "suggested_actions": ["create_delegation_task", "ask_human"],
     }]
     assert all("created_at" not in follow_up for follow_up in situation.untracked_follow_ups)
 
@@ -378,11 +514,34 @@ async def test_answered_decision_excluded_without_related_action(db_session, tes
     assert situation.untracked_follow_ups == []
 
 
-async def test_answered_decision_excluded_after_a_later_orchestration_decision(db_session, test_project):
+async def test_process_owned_answered_decision_is_not_a_follow_up(db_session, test_project):
     goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
     task = await _task(db_session, test_project, run)
     action = await _delegation(db_session, run, task, [])
-    await _authority_decision(
+    decided = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    process_run = OrchestrationProcessRun(
+        goal_id=goal.id, run_id=run.id, process_type="goal_definition", trigger_reason="test",
+    )
+    db_session.add(process_run)
+    await db_session.flush()
+    owned = await _authority_decision(db_session, goal, run, action, decided_at=decided, title="Owned")
+    owned.source_process_run_id = process_run.id
+    free = await _authority_decision(db_session, goal, run, action, decided_at=decided, title="Free")
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.untracked_follow_ups == [{
+        "kind": "answered_decision",
+        "id": str(free.id),
+        "summary": "Free: approve",
+        "suggested_actions": [],
+    }]
+
+
+async def test_answered_decision_not_hidden_by_unrelated_newer_orchestration_decision(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    action = await _delegation(db_session, run, task, [])
+    decision = await _authority_decision(
         db_session, goal, run, action, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
     )
     db_session.add(OrchestrationDecision(
@@ -390,16 +549,70 @@ async def test_answered_decision_excluded_after_a_later_orchestration_decision(d
     ))
     await db_session.flush()
     situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [(f["kind"], f["id"]) for f in situation.untracked_follow_ups] == [("answered_decision", str(decision.id))]
+
+
+async def test_answered_decision_included_with_zero_prior_decisions(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    action = await _delegation(db_session, run, task, [])
+    decision = await _authority_decision(
+        db_session, goal, run, action, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [(f["kind"], f["id"]) for f in situation.untracked_follow_ups] == [("answered_decision", str(decision.id))]
+
+
+async def test_answered_decision_cleared_by_completed_action_applying_it(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    action = await _delegation(db_session, run, task, [])
+    decision = await _authority_decision(
+        db_session, goal, run, action, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    await _action(
+        db_session, run, "execute_decision", {}, status="completed",
+        dispatch_contract={"applies_decision_id": str(decision.id)},
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
     assert situation.untracked_follow_ups == []
 
 
-async def _action(db, run, action_type, request, created_at=None, status="completed"):
+async def test_decision_continuation_action_does_not_clear_answered_decision(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    action = await _delegation(db_session, run, task, [])
+    decision = await _authority_decision(
+        db_session, goal, run, action, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    await _action(
+        db_session, run, "decision_continuation", {}, status="completed",
+        dispatch_contract={"applies_decision_id": str(decision.id)},
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [(f["kind"], f["id"]) for f in situation.untracked_follow_ups] == [("answered_decision", str(decision.id))]
+
+
+async def test_answered_decision_without_selected_option_has_no_colon_suffix(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    action = await _delegation(db_session, run, task, [])
+    await _authority_decision(
+        db_session, goal, run, action, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc), selected_option=None,
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [f["summary"] for f in situation.untracked_follow_ups] == ["Approve plan"]
+
+
+async def _action(db, run, action_type, request, created_at=None, status="completed", error=None, dispatch_contract=None):
     action = OrchestrationAction(
         run_id=run.id,
         idempotency_key=f"{action_type}:{uuid.uuid4()}",
         action_type=action_type,
         request=request,
         status=status,
+        error=error,
+        dispatch_contract=dispatch_contract or {},
         created_at=created_at or datetime.now(timezone.utc),
     )
     db.add(action)
@@ -425,10 +638,10 @@ async def test_stalled_task_suggested_actions_depend_on_status(db_session, test_
     await _task(db_session, test_project, run, status="blocked")
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     actions = {f["summary"].rsplit(" is ", 1)[1]: f["suggested_actions"] for f in situation.untracked_follow_ups}
-    assert actions == {"failed": ["retry_task", "reassign_task"], "blocked": []}
+    assert actions == {"failed": ["retry_task", "reassign_task"], "blocked": ["reassign_task", "ask_human"]}
 
 
-@pytest.mark.parametrize("action_type", ["retry_task", "reassign_task", "request_split"])
+@pytest.mark.parametrize("action_type", ["retry_task", "reassign_task"])
 async def test_stalled_task_tracked_by_later_retry_or_reassign_or_split_action(db_session, test_project, action_type):
     goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
     task = await _task(db_session, test_project, run, status="failed")
@@ -644,3 +857,100 @@ async def test_two_builds_without_changes_are_equal(db_session, test_project):
     await _gate(db_session, run, "done", status="open")
     view = OrchestrationProgressView()
     assert await view.build(db_session, goal, run) == await view.build(db_session, goal, run)
+
+
+async def test_failed_then_successful_verification_clears_gate(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    gate = await _gate(db_session, run, "done", status="open")
+    await _action(
+        db_session, run, "request_verification", {"gate_id": str(gate.id)},
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), status="failed", error="boom",
+    )
+    await _action(
+        db_session, run, "request_verification", {"gate_id": str(gate.id)},
+        created_at=datetime(2026, 1, 2, tzinfo=timezone.utc), status="reserved",
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [f for f in situation.untracked_follow_ups if f["kind"] == "unverified_gate"] == []
+
+
+async def test_failed_verification_then_accepted_gate_clears_failure(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    gate = await _gate(db_session, run, "done", status="accepted")
+    await _action(
+        db_session, run, "request_verification", {"gate_id": str(gate.id)},
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), status="failed", error="boom",
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.untracked_follow_ups == []
+
+
+async def test_latest_failed_verification_keeps_gate_actionable_with_error(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    gate = await _gate(db_session, run, "done", status="open")
+    await _action(
+        db_session, run, "request_verification", {"gate_id": str(gate.id)},
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), status="completed",
+    )
+    await _action(
+        db_session, run, "request_verification", {"gate_id": str(gate.id)},
+        created_at=datetime(2026, 1, 2, tzinfo=timezone.utc), status="failed", error="validator timeout",
+    )
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    unverified = [f for f in situation.untracked_follow_ups if f["kind"] == "unverified_gate"]
+    assert [f["id"] for f in unverified] == [str(gate.id)]
+    assert "validator timeout" in unverified[0]["summary"]
+    assert unverified[0]["suggested_actions"] == ["request_verification"]
+
+
+async def test_plan_item_gate_summary_names_its_task(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    gate = await _gate(db_session, run, "done", status="open")
+    db_session.add(Task(
+        project_id=test_project.id,
+        title="Write the spec",
+        status="done",
+        metadata_={"orchestration": {"run_id": str(run.id), "plan_item_gate_id": str(gate.id)}},
+    ))
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [f["summary"] for f in situation.untracked_follow_ups] == [
+        "Write the spec (work_completed gate) awaiting verification",
+    ]
+
+
+async def test_each_kind_represented_when_meeting_items_exceed_cap(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    meeting = await _meeting(db_session, test_project, task)
+    for i in range(12):
+        await _action_item(db_session, meeting, description=f"Item {i}", created_at=datetime(2026, 1, 1 + i, tzinfo=timezone.utc))
+    action = await _delegation(db_session, run, task, [])
+    await _authority_decision(db_session, goal, run, action, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    await _task(db_session, test_project, run, status="failed")
+    await _gate(db_session, run, "done", status="open")
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.untracked_follow_ups_total == 15
+    assert [f["kind"] for f in situation.untracked_follow_ups] == (
+        ["meeting_action_item"] * 7 + ["answered_decision", "stalled_task", "unverified_gate"]
+    )
+    assert [f["summary"] for f in situation.untracked_follow_ups if f["kind"] == "meeting_action_item"] == [
+        f"Item {i}" for i in range(7)
+    ]
+
+
+async def test_stalled_representative_prefers_item_with_suggested_actions(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    task = await _task(db_session, test_project, run)
+    meeting = await _meeting(db_session, test_project, task)
+    for i in range(12):
+        await _action_item(db_session, meeting, description=f"Item {i}", created_at=datetime(2026, 1, 1 + i, tzinfo=timezone.utc))
+    dependency = await _task(db_session, test_project, run, status="in_progress")
+    blocked = await _task(db_session, test_project, run, status="blocked")
+    blocked.depends_on = [str(dependency.id)]
+    blocked.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    failed = await _task(db_session, test_project, run, status="failed")
+    failed.created_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [f["id"] for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"] == [str(failed.id)]

@@ -125,7 +125,7 @@ class TaskService:
         return task
 
     async def transition_status(
-        self, db: AsyncSession, project_id: uuid.UUID, task_id: uuid.UUID, new_status: str, _reason: str | None = None
+        self, db: AsyncSession, project_id: uuid.UUID, task_id: uuid.UUID, new_status: str, reason: str | None = None
     ) -> Task:
         task = await self.get_or_404(db, project_id, task_id)
         current = task.status
@@ -141,6 +141,11 @@ class TaskService:
             task.started_at = now
         if new_status == "done":
             task.completed_at = now
+        if new_status == "blocked":
+            # Copy + reassign so SQLAlchemy detects the JSON change.
+            metadata = dict(task.metadata_ or {})
+            metadata["blocked"] = {"reason": reason or None, "at": now.isoformat()}
+            task.metadata_ = metadata
         await db.flush()
         await emit_event(db, project_id, "task.status_changed", {
             "task_id": str(task.id),

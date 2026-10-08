@@ -2776,3 +2776,52 @@ async def test_incomplete_or_claim_only_report_is_consumed_once_without_curation
     assert len(markers) == 1
     assert not [section for section in sections if section.section_key == f"report_{session.id}"]
     assert gate.status == "open"
+
+
+async def test_tick_with_accept_plan_decision_for_already_accepted_plan_waits_without_error(
+    db_session, test_project, stub_decision
+):
+    from huddleroom.models.orchestration import OrchestrationWait
+    from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE, WAKE_RECHECK_EVENT_TYPE
+
+    planner = _agent("accepted-replay", ["planning"])
+    db_session.add(planner)
+    await db_session.flush()
+    service, _, run = await _authorized_run(db_session, test_project)
+    await _seed_accepted_plan(db_session, test_project, service, run, planner)
+    await service.tick(db_session, run.id)  # release the sole deterministic item
+    await db_session.refresh(run)
+    state_before = dict(run.plan_state)
+    accept_id = state_before["accept_action_id"]
+    calls = {"n": 0}
+
+    def scripted(_ctx):
+        calls["n"] += 1
+        return {
+            "action_type": "accept_plan", "plan_artifact_id": state_before["accepted_artifact_id"],
+            "reason": "Re-accept",
+        }
+
+    open_wait_ids = set((await db_session.scalars(select(OrchestrationWait.id).where(
+        OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"
+    ))).all())
+    stub_decision(scripted)
+
+    result = await service.tick(db_session, run.id)
+
+    await db_session.refresh(run)
+    accepts = [a for a in await _run_actions(db_session, run.id) if a.action_type == "accept_plan"]
+    waits = (await db_session.scalars(select(OrchestrationWait).where(
+        OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"
+    ))).all()
+    assert result["authorized_execution"]["step"] == "next_action"
+    assert result["authorized_execution"]["action_id"] == accept_id
+    assert [str(a.id) for a in accepts] == [accept_id]
+    assert run.plan_state == state_before
+    new_waits = [
+        w for w in waits
+        if w.id not in open_wait_ids and (w.owner or {}).get("type") == ORCHESTRATOR_WAIT_OWNER_TYPE
+    ]
+    assert calls["n"] == 1
+    assert new_waits and new_waits[0].fallback["reason"] == "Replayed accept_plan recheck"
+    assert new_waits[0].awaited_event["event_type"] == WAKE_RECHECK_EVENT_TYPE

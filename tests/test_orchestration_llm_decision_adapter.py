@@ -58,7 +58,7 @@ def test_prompt_states_hard_boundary_and_allowed_schema():
     assert "parent_task_id" in system_text
     assert "source_session_id" in system_text
     assert "Return exactly one JSON object" in system_text
-    assert "Top-level reason is optional for every action." in system_text
+    assert REASON_RULE in system_text
     assert messages[1]["role"] == "user"
     assert '"objective": "Ship a feature"' in messages[1]["content"]
 
@@ -962,6 +962,27 @@ async def test_request_llm_decision_committed_path_deduplicates_concurrent_reque
         assert len(decisions) == 1
 
 
+REASON_RULE = (
+    "Top-level reason is required where the action schema lists it; otherwise it is optional but recommended. "
+    "When present it states how the action advances or unblocks the goal."
+)
+
+# Action names that the dispatcher no longer executes (validator rejects them). None may appear in the prompt.
+NON_DISPATCHABLE_ACTION_NAMES = (
+    "request_human_decision",
+    "request_manager_decision",
+    "request_split",
+    "complete_run",
+    "request_final_summary",
+    "expand_plan_item",
+    "open_gate",
+    "record_authority_decision",
+    "cancel_pending_decision",
+    "acknowledge_warning",
+    "resolve_warning",
+)
+
+
 def _system_text(**kwargs) -> str:
     return build_orchestration_decision_messages({"run": {"phase": "authorized"}}, **kwargs)[0]["content"]
 
@@ -973,9 +994,39 @@ def test_prompt_includes_progress_contract_sections():
     for section in ("Progress duty", "Fresh run", "Run with history", "Authority", "Waiting", "Reason"):
         assert section in PROGRESS_CONTRACT
     assert "request_plan" in PROGRESS_CONTRACT
-    assert "request_human_decision" in PROGRESS_CONTRACT
+    assert "ask_human" in PROGRESS_CONTRACT
+    assert "request_human_decision" not in PROGRESS_CONTRACT
     assert "progress_view" in PROGRESS_CONTRACT
     assert "untracked_follow_ups" in PROGRESS_CONTRACT
+
+
+def test_progress_contract_routes_owner_decisions_to_ask_human():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    assert "Use ask_human only when a missing owner decision truly blocks starting" in PROGRESS_CONTRACT
+    assert "Route those actions to ask_human" in PROGRESS_CONTRACT
+
+
+def test_progress_contract_follow_up_wording_is_ranked_and_non_repeating():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    assert "Handle the highest-impact actionable follow-up; the list is already ranked." in PROGRESS_CONTRACT
+    assert "A blocked item names its dependency" in PROGRESS_CONTRACT
+    assert "defer it and continue independent work" in PROGRESS_CONTRACT
+    assert "After an unsuccessful wake, your diagnosis or action must differ from last time." in PROGRESS_CONTRACT
+    assert "Handle the first untracked follow-up" not in PROGRESS_CONTRACT
+    assert "progress_view" in PROGRESS_CONTRACT
+    assert "untracked_follow_ups" in PROGRESS_CONTRACT
+
+
+def test_prompt_reason_rule_is_single_and_agrees_in_contract_and_shape():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    system_text = _system_text()
+    assert REASON_RULE in PROGRESS_CONTRACT
+    assert REASON_RULE in system_text
+    assert "Top-level reason is optional for every action" not in system_text
+    assert "the reason states how the action advances the goal" not in system_text
 
 
 def test_prompt_states_authority_rule_and_keeps_specific_restrictions():
@@ -1016,6 +1067,23 @@ def test_progress_contract_is_importable_constant():
     assert PROGRESS_CONTRACT.strip()
 
 
+def test_decision_prompt_instructs_applies_decision_id_for_follow_ups():
+    from huddleroom.services.orchestration_llm_decision_adapter import (
+        DECISION_FOLLOW_UP_CONTRACT,
+        PROGRESS_CONTRACT,
+    )
+
+    system_text = _system_text()
+    assert DECISION_FOLLOW_UP_CONTRACT in system_text
+    assert "set top-level applies_decision_id" in system_text
+    assert "applies_decision_id" not in PROGRESS_CONTRACT
+    assert (
+        system_text.index(PROGRESS_CONTRACT)
+        < system_text.index(DECISION_FOLLOW_UP_CONTRACT)
+        < system_text.index("Return exactly one JSON object")
+    )
+
+
 def test_prompt_tells_model_to_tag_inputs():
     from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
 
@@ -1037,6 +1105,30 @@ def test_prompt_section_order_restriction_contract_shape_wake_schemas():
         < system_text.index("A wait requires wake_when")
         < system_text.index("Allowed action schemas:")
     )
+
+
+def test_prompt_mentions_no_non_dispatchable_action_names():
+    from huddleroom.services.orchestration_decision_validator import ALLOWED_ACTION_SCHEMAS
+
+    system_text = _system_text()
+    for name in NON_DISPATCHABLE_ACTION_NAMES:
+        assert name not in ALLOWED_ACTION_SCHEMAS
+        assert name not in system_text, f"prompt advertises non-dispatchable action {name}"
+
+
+def test_prompt_action_name_mentions_are_all_dispatchable():
+    import re
+
+    from huddleroom.services.orchestration_decision_validator import ALLOWED_ACTION_SCHEMAS
+
+    system_text = _system_text()
+    verb_prefixed = re.compile(
+        r"\b(?:request|complete|open|expand|record|cancel|acknowledge|resolve|ask|start|pause|suggest|"
+        r"create|retry|reassign|schedule|accept|noop)_[a-z_]+\b"
+    )
+    mentioned = set(verb_prefixed.findall(system_text))
+    unknown = mentioned - set(ALLOWED_ACTION_SCHEMAS) - {"noop"}
+    assert not unknown, f"prompt names actions outside ALLOWED_ACTION_SCHEMAS: {sorted(unknown)}"
 
 
 def _completion_returning(*decisions):

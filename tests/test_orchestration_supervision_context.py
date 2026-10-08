@@ -55,6 +55,7 @@ async def test_context_uses_durable_rows_not_recent_events(db_session, test_proj
         "id": str(action.id), "action_type": "create_delegation_task", "status": "failed",
         "request": {"scope": "implementation"}, "dispatch_contract": {"deliverable": "a durable result"},
         "budget_ledger": {}, "error": "runner unavailable",
+        "created_at": action.created_at.isoformat(), "updated_at": action.updated_at.isoformat(),
     }]
 
 
@@ -257,3 +258,120 @@ async def test_context_progress_view_is_stable_across_two_builds(db_session, tes
     assert first["progress_view"] == second["progress_view"]
     assert first["untracked_follow_ups"] == second["untracked_follow_ups"]
     assert first["untracked_follow_ups_total"] == second["untracked_follow_ups_total"]
+
+
+async def test_context_exposes_meeting_commitments(db_session, test_project):
+    from huddleroom.models.meeting import Meeting, MeetingActionItem
+
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    source = Task(
+        project_id=test_project.id, title="Source", status="done",
+        metadata_={"orchestration": {"run_id": str(run.id)}},
+    )
+    db_session.add(source)
+    await db_session.flush()
+    meeting = Meeting(project_id=test_project.id, title="Sync", meeting_type="standup", source_task_id=source.id)
+    db_session.add(meeting)
+    await db_session.flush()
+    item = MeetingActionItem(meeting_id=meeting.id, description="Follow up")
+    db_session.add(item)
+    await db_session.flush()
+
+    context = await OrchestrationService()._decision_context(db_session, goal, run)
+
+    assert context["meeting_commitments"] == [{
+        "id": str(item.id), "description": "Follow up", "state": "open",
+        "task_id": None, "reason": "no task or resolution", "fulfilled": False,
+        "suggested_actions": ["create_delegation_task", "ask_human"],
+    }]
+
+
+async def test_context_includes_roster_snapshot(db_session, test_project):
+    from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
+
+    goal, run = await _goal_and_run(db_session, test_project.id)
+
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    assert context["roster"] == await OrchestrationRosterMapper().context_snapshot(db_session, test_project.id)
+    assert set(context["roster"]) == {"active_agent_count", "work_functions"}
+
+
+async def test_context_rows_carry_stable_timestamps(db_session, test_project, test_agent):
+    from huddleroom.models.graph import Graph, GraphRun
+    from huddleroom.models.meeting import Meeting
+    from huddleroom.models.session import Session
+
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    task = Task(project_id=test_project.id, title="Timed", status="ready")
+    db_session.add(task)
+    await db_session.flush()
+    action = OrchestrationAction(
+        run_id=run.id, idempotency_key="timed-action", action_type="create_delegation_task",
+        request={}, budget_ledger={}, target_type="task", target_id=task.id,
+    )
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="timed", gate_type="evidence")
+    session = Session(project_id=test_project.id, task_id=task.id, agent_id=test_agent.id, adapter_type="test")
+    meeting = Meeting(project_id=test_project.id, title="Timed sync", meeting_type="standup", source_task_id=task.id)
+    graph = Graph(name="timed-graph", definition={})
+    db_session.add_all([action, gate, session, meeting, graph])
+    await db_session.flush()
+    graph_run = GraphRun(graph_id=graph.id, project_id=test_project.id, linked_task_id=task.id, current_node="start")
+    db_session.add(graph_run)
+    await db_session.flush()
+
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    expected = {
+        "tasks": (task, ["created_at", "updated_at", "started_at", "completed_at"]),
+        "sessions": (session, ["created_at", "started_at"]),
+        "meetings": (meeting, ["created_at", "updated_at"]),
+        "graph_runs": (graph_run, ["created_at", "updated_at", "started_at", "completed_at"]),
+        "gates": (gate, ["created_at", "updated_at"]),
+        "actions": (action, ["created_at", "updated_at"]),
+    }
+    for kind, (model, fields) in expected.items():
+        [row] = context[kind]
+        assert row["id"] == str(model.id)
+        for field in fields:
+            assert field in row, (kind, field)
+        assert row["created_at"] == model.created_at.isoformat(), kind
+        assert row["created_at"] is not None, kind
+
+
+async def test_judgment_fingerprint_is_identical_across_builds_without_data_change(db_session, test_project, test_agent):
+    from types import SimpleNamespace
+
+    from huddleroom.models.session import Session
+    from huddleroom.services.orchestration_supervision_scheduler import OrchestrationSupervisionScheduler
+
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    task = Task(project_id=test_project.id, title="Fingerprint", status="ready")
+    db_session.add(task)
+    await db_session.flush()
+    db_session.add(Session(project_id=test_project.id, task_id=task.id, agent_id=test_agent.id, adapter_type="test"))
+    db_session.add(OrchestrationAction(
+        run_id=run.id, idempotency_key="fingerprint-action", action_type="create_delegation_task",
+        request={}, budget_ledger={}, target_type="task", target_id=task.id,
+    ))
+    await db_session.flush()
+
+    async def contract_version(db, goal, run):
+        return "v1"
+
+    service = SimpleNamespace(supervision=SimpleNamespace(_contract_version=contract_version))
+    builder = OrchestrationSupervisionContextBuilder()
+    first_payload, first = await OrchestrationSupervisionScheduler._judgment_payload(db_session, service, builder, goal, run)
+    second_payload, second = await OrchestrationSupervisionScheduler._judgment_payload(db_session, service, builder, goal, run)
+
+    assert first == second
+    assert first_payload == second_payload
+
+
+async def test_fingerprint_ignores_roster_load_only():
+    fp = OrchestrationSupervisionContextBuilder.fingerprint_snapshot
+    a = {"roster": [{"id": "x", "load": 1, "nested": {"load": 5}}], "state": "s"}
+    b = {"roster": [{"id": "x", "load": 9, "nested": {"load": 0}}], "state": "s"}
+    assert fp(a) == fp(b)
+    assert fp(a) != fp({**b, "state": "t"})
+    assert fp(a) != fp({"roster": [{"id": "y", "load": 1, "nested": {}}], "state": "s"})

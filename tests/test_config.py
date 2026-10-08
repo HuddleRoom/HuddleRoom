@@ -652,3 +652,42 @@ def test_proactive_orchestrator_setting_defaults_and_env_override(monkeypatch):
     monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_MAX_ACTIONS_PER_TICK", "0")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_judgment_timeout_and_lease_defaults_and_ordering():
+    from pydantic import ValidationError
+    from huddleroom.config import Settings
+
+    s = Settings(_env_file=None)
+    assert s.orchestration_judgment_timeout_seconds == 360
+    assert s.orchestration_judgment_lease_seconds == 420
+    for bad in (
+        {"orchestration_judgment_lease_seconds": 0},
+        {"orchestration_judgment_timeout_seconds": 0},
+        {"orchestration_judgment_lease_seconds": 390},  # == timeout + reconcile (360 + 30)
+    ):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, **bad)
+
+
+def test_unset_judgment_lease_derives_from_reconcile_interval():
+    from huddleroom.config import Settings
+
+    s = Settings(_env_file=None, orchestration_reconcile_interval_seconds=120)
+    assert s.orchestration_judgment_lease_seconds >= 360 + 120 + 30
+    assert s.orchestration_judgment_lease_seconds == 510
+
+    s = Settings(_env_file=None, orchestration_reconcile_interval_seconds=30)
+    assert s.orchestration_judgment_lease_seconds == 420
+
+
+def test_explicit_judgment_lease_is_still_validated_against_interval():
+    from pydantic import ValidationError
+    from huddleroom.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, orchestration_reconcile_interval_seconds=120,
+                 orchestration_judgment_lease_seconds=420)
+    s = Settings(_env_file=None, orchestration_reconcile_interval_seconds=120,
+                 orchestration_judgment_lease_seconds=600)
+    assert s.orchestration_judgment_lease_seconds == 600

@@ -77,5 +77,6 @@ asyncio_mode = "auto"
 markers = [
     "integration: real-LLM integration test, requires live API credentials, excluded from default run",
     "unsupported_mode: relies on authentication, PostgreSQL, Redis, or Celery and is excluded from the default run",
+    "live: bounded live-model orchestration evaluation, needs HUDDLEROOM_LIVE_EVAL=1 and a provider, excluded from the default run",
 ]
-addopts = "-m \"not integration and not unsupported_mode\""
+addopts = "-m \"not integration and not unsupported_mode and not live\""

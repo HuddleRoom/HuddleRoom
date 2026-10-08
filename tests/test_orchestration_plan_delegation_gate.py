@@ -2292,3 +2292,75 @@ def test_plan_delegation_validator_rejects_authored_plan_content():
 
     assert result.accepted is False
     assert result.rejection_reason == "Decision includes forbidden artifact content at 'plan_text'"
+
+
+async def _accepted_run(db_session, project_id):
+    planner = _agent("planner")
+    db_session.add(planner)
+    await db_session.flush()
+    service, _, run = await _make_run(db_session, project_id)
+    request_action = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id),
+        idempotency_key="run:replay:kind:request_plan",
+    )
+    artifact = Artifact(
+        project_id=project_id, name="delegation-plan", artifact_type="plan", status="draft",
+        linked_task_id=request_action.target_id, created_by_agent=planner.id,
+        metadata_=_accepted_plan_metadata(),
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    first = await service.execute_accept_plan_action(
+        db_session, run_id=run.id,
+        request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+        idempotency_key="run:replay:kind:accept_plan:a",
+    )
+    return service, run, artifact, first
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_same_artifact_different_key_reuses_accepted_action(db_session, test_project):
+    from huddleroom.services.orchestration_service import PLAN_ACCEPTED_EVENT_TYPE
+
+    service, run, artifact, first = await _accepted_run(db_session, test_project.id)
+    events_before = len(await _event_rows(db_session, test_project.id, PLAN_ACCEPTED_EVENT_TYPE))
+    state_before = dict(run.plan_state)
+
+    again = await service.execute_accept_plan_action(
+        db_session, run_id=run.id,
+        request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+        idempotency_key="run:replay:kind:accept_plan:b",
+    )
+
+    assert again.id == first.id
+    assert run.plan_state == state_before
+    assert await db_session.scalar(select(count(OrchestrationAction.id)).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "accept_plan",
+    )) == 1
+    assert len(await _event_rows(db_session, test_project.id, PLAN_ACCEPTED_EVENT_TYPE)) == events_before == 1
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_different_artifact_different_key_still_conflicts(db_session, test_project):
+    service, run, _artifact, _first = await _accepted_run(db_session, test_project.id)
+    with pytest.raises(HTTPException) as exc_info:
+        await service.execute_accept_plan_action(
+            db_session, run_id=run.id,
+            request={"action_type": "accept_plan", "plan_artifact_id": str(uuid.uuid4())},
+            idempotency_key="run:replay:kind:accept_plan:other",
+        )
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_same_artifact_without_completed_accept_action_still_conflicts(db_session, test_project):
+    service, run, artifact, first = await _accepted_run(db_session, test_project.id)
+    first.status = "failed"
+    await db_session.flush()
+    with pytest.raises(HTTPException) as exc_info:
+        await service.execute_accept_plan_action(
+            db_session, run_id=run.id,
+            request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+            idempotency_key="run:replay:kind:accept_plan:c",
+        )
+    assert exc_info.value.status_code == 409

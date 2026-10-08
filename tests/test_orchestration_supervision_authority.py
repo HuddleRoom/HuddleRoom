@@ -54,6 +54,11 @@ async def test_runtime_question_replays_pending_and_answered_identity(db_session
         options=[{"key": "approve"}],
     )
     assert answered_replay.id == first.id
+    assert await db_session.scalar(
+        select(func.count(OrchestrationAuthorityDecision.id)).where(
+            OrchestrationAuthorityDecision.goal_id == goal.id
+        )
+    ) == 1
 
 
 async def test_ask_human_action_creates_a_durable_runtime_decision(db_session, test_project):

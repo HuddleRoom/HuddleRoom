@@ -26,6 +26,7 @@ from huddleroom.database import AsyncSessionLocal
 from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.meeting import Meeting, MeetingDecision
+from huddleroom.services.orchestration_meeting_commitments import link_meeting_action_items, meeting_commitments
 from huddleroom.models.orchestration import (
     ACTIVE_RUN_STATUSES,
     GOAL_STATUSES,
@@ -927,7 +928,7 @@ class OrchestrationService:
 
     _VOLATILE_SUPERVISION_KEYS = frozenset({
         "at", "judgment_in_flight", "judgment_dirty", "judgment_failures",
-        "last_event_id", "context_fingerprint", "last_pass",
+        "last_event_id", "context_fingerprint", "last_pass", "judgment_claim_token",
     })
 
     @staticmethod
@@ -1546,6 +1547,7 @@ class OrchestrationService:
         existing_task = await self._find_task_for_action(db, project_id, action, run_id=run_id)
         if existing_task is not None:
             await self._emit_delegation_task_created(db, project_id, action, existing_task)
+            await link_meeting_action_items(db, run_id, action, existing_task)
             return await self._mark_action_completed(db, action, target_type="task", target_id=existing_task.id)
 
         stored_request = action.request or {}
@@ -1639,6 +1641,7 @@ class OrchestrationService:
             task_id=action.id,
         )
         await self._emit_delegation_task_created(db, project_id, action, task)
+        await link_meeting_action_items(db, run_id, action, task)
         return await self._mark_action_completed(db, action, target_type="task", target_id=task.id)
 
     async def execute_request_final_summary_action(
@@ -2179,6 +2182,24 @@ class OrchestrationService:
         artifact = None
         if existing is None:
             run = await self._run_for_plan_action(db, run_id)
+            accepted = self._json_object_or_empty(run.plan_state)
+            if accepted.get("status") == "accepted" and not accepted.get("pending_replan") and accepted.get(
+                "accepted_artifact_id"
+            ) == str(
+                self._required_uuid(request_to_store.get("plan_artifact_id"), "plan_artifact_id")
+            ):
+                try:
+                    prior_id = uuid.UUID(str(accepted.get("accept_action_id")))
+                except ValueError:
+                    prior_id = None
+                prior = await db.get(OrchestrationAction, prior_id) if prior_id else None
+                if (
+                    prior is not None
+                    and prior.run_id == run_id
+                    and prior.action_type == "accept_plan"
+                    and prior.status == "completed"
+                ):
+                    return prior  # same plan already accepted under another key
             await self._ensure_plan_acceptance_pending(db, run)
             artifact = await self._plan_artifact_for_run(
                 db,
@@ -3507,9 +3528,12 @@ class OrchestrationService:
         if task is None:
             await self._fail_reserved_action_for_current_flow(db, action, "Task not found")
             raise HTTPException(status_code=404, detail="Task not found")
-        if task.status != "failed":
+        if task.status not in {"failed", "blocked"}:
             await self._fail_reserved_action_for_current_flow(db, action, f"Task is {task.status}")
             raise HTTPException(status_code=409, detail=f"Task is {task.status}")
+        if await self._task_has_active_session(db, task.id):
+            await self._fail_reserved_action_for_current_flow(db, action, "Task already has an active session")
+            raise HTTPException(status_code=409, detail="Task already has an active session")
         if exact_source_session_id is not None:
             proof_error = await self._exact_resume_proof(db, run_id, task.id, exact_source_session_id)
             if proof_error:
@@ -3686,20 +3710,25 @@ class OrchestrationService:
         if agent is None or not agent.is_active:
             await self._fail_reserved_action_for_current_flow(db, action, "Agent not found")
             raise HTTPException(status_code=404, detail="Agent not found")
-        if task.status != "failed":
+        if task.status not in {"failed", "blocked"}:
             await self._fail_reserved_action_for_current_flow(db, action, f"Task is {task.status}")
             raise HTTPException(status_code=409, detail=f"Task is {task.status}")
+        if await self._task_has_active_session(db, task.id):
+            await self._fail_reserved_action_for_current_flow(db, action, "Task already has an active session")
+            raise HTTPException(status_code=409, detail="Task already has an active session")
 
         await self._reserve_recovery_task_budget(db, run_id, action, task)
         self._set_task_budget_action(task, action.id)
 
         previous_agent_id = task.assigned_to
+        previous_status = task.status
         task.assigned_to = agent.id
         await db.flush()
         try:
             _, session_id = await TaskService().run(db, project_id, task.id)
         except Exception as exc:
             task.assigned_to = previous_agent_id
+            task.status = previous_status
             await db.flush()
             error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
             from huddleroom.services.session_service import SessionClaimAttention, SessionService
@@ -3806,6 +3835,40 @@ class OrchestrationService:
         if goal is not None and run is not None and (await OrchestrationBudgetService().snapshot_for_run(db, goal, run))["caps"]:
             raise HTTPException(status_code=409, detail="Budgeted control provider requires measured session telemetry")
 
+    async def verification_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any) -> str:
+        """Key suffix that makes a verification retryable: one attempt per prior FAILED
+        request_verification for the gate. Attempt 0 has no suffix (legacy keys unchanged)."""
+        rows = (await db.execute(
+            select(OrchestrationAction.request).where(
+                OrchestrationAction.run_id == run_id,
+                OrchestrationAction.action_type == "request_verification",
+                OrchestrationAction.status == "failed",
+            )
+        )).scalars().all()
+        failed = sum(1 for req in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id))
+        return f":attempt:{failed}" if failed else ""
+
+    async def _task_has_active_session(self, db: AsyncSession, task_id: uuid.UUID) -> bool:
+        result = await db.execute(
+            select(Session.id).where(Session.task_id == task_id, Session.status.in_(["pending", "running"])).limit(1)
+        )
+        return result.first() is not None
+
+    async def _task_recovery_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, task_id: uuid.UUID) -> str:
+        """Key suffix for the next retry/reassign attempt of a task: one per prior
+        retry_task/reassign_task action that is not still reserved. Attempt 0 has no
+        suffix (legacy keys unchanged). Reserved rows are excluded so an in-flight
+        attempt replays onto its own key instead of minting a new one."""
+        rows = (await db.execute(
+            select(OrchestrationAction.request).where(
+                OrchestrationAction.run_id == run_id,
+                OrchestrationAction.action_type.in_(["retry_task", "reassign_task"]),
+                OrchestrationAction.status != "reserved",
+            )
+        )).scalars().all()
+        prior = sum(1 for req in rows if isinstance(req, dict) and str(req.get("task_id")) == str(task_id))
+        return f":a{prior}" if prior else ""
+
     async def execute_request_verification_action(
         self,
         db: AsyncSession,
@@ -3911,7 +3974,10 @@ class OrchestrationService:
                     "parent_task_id": str(source_task.id) if source_task is not None else None,
                     "orchestrator_context": verification_context,
                 },
-                idempotency_key=f"run:{run_id}:kind:create_delegation_task:verify_gate:{gate.id}",
+                idempotency_key=(
+                    f"run:{run_id}:kind:create_delegation_task:verify_gate:{gate.id}"
+                    + await self.verification_attempt_suffix(db, run_id, gate.id)
+                ),
                 decision_id=decision_id,
             )
         except Exception as exc:
@@ -5490,6 +5556,11 @@ class OrchestrationService:
         final_gates = [gate for gate in gates if gate.gate_type == FINAL_SUMMARY_GATE_TYPE]
         if len(final_gates) != 1 or any(gate.status != "accepted" for gate in gates):
             raise HTTPException(status_code=409, detail="All orchestration gates must be accepted")
+        unresolved_commitments = [c for c in await meeting_commitments(db, run) if not c["fulfilled"]]
+        if unresolved_commitments:
+            raise HTTPException(status_code=409, detail="Unresolved meeting commitments: " + ", ".join(
+                f"{c['id']} ({c['state']}: {c['reason']})" for c in unresolved_commitments
+            ))
         evidence = list(
             (
                 await db.execute(
@@ -5555,6 +5626,7 @@ class OrchestrationService:
             for gate in non_summary_gates
         ]
         return {
+            "unresolved_meeting_commitments": [],
             "declared_success_criteria": deepcopy(goal.success_criteria),
             "criterion_evidence": deepcopy(summary_payload["criteria"]),
             "accepted_non_summary_gates": accepted_non_summary,
@@ -7938,20 +8010,42 @@ class OrchestrationService:
         run: OrchestrationRun,
     ) -> int:
         created = 0
+        owner_only = []
         for task in await self._orchestrated_tasks_for_run(db, run.id, statuses=["blocked"]):
-            key = f"run:{run.id}:kind:ask_human:blocked_task:{task.id}"
+            blocked = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("blocked"))
+            episode_at = self._optional_string(blocked.get("at"))
+            key = f"run:{run.id}:kind:ask_human:blocked_task:{task.id}" + (f":{episode_at}" if episode_at else "")
             if await self._existing_action_for_key(db, run.id, key) is not None:
                 continue
+            handled = await self._diagnose_blocked_task(db, goal, run, task, episode_at)
+            if handled is not None:
+                created += handled
+            else:
+                owner_only.append((task, blocked, key))
+        # Owner-only input: the only branch that blocks the run, and only after all tasks are triaged.
+        for task, blocked, key in owner_only:
+            reason = self._optional_string(blocked.get("reason"))
+            if reason is not None:
+                reason = reason[:200]
+            if reason is None:
+                latest = await db.scalar(select(Session).where(
+                    Session.task_id == task.id, (Session.error.is_not(None)) | (Session.output.is_not(None)),
+                ).order_by(Session.created_at.desc(), Session.id.desc()).limit(1))
+                excerpt = str(latest.error or latest.output or "").strip()[:200] if latest is not None else ""
+                reason = excerpt or "no reason was recorded"
             gate_id = await self._gate_id_for_task(db, run.id, task)
             nested = await db.begin_nested()
             try:
-                self._mark_run_blocked(goal, run)
+                self._mark_run_blocked(goal, run)  # idempotent; inside the savepoint so a failed ask rolls it back
                 ask = await self.execute_ask_human_action(
                     db,
                     run_id=run.id,
                     request={
                         "action_type": "ask_human",
-                        "question": f"Task is blocked and needs clarification: {task.title}",
+                        "question": (
+                            f'Task "{task.title}" is blocked: {reason}. '
+                            "What input or decision do you need to supply to unblock it?"
+                        ),
                         "work_function": self._task_work_function(task),
                         "required_capabilities": [],
                         "candidate_agent_ids": [],
@@ -7972,6 +8066,132 @@ class OrchestrationService:
             await nested.commit()
             created += 1
         return created
+
+    async def _diagnose_blocked_task(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        task: Task,
+        episode_at: str | None,
+    ) -> int | None:
+        """Deterministic blocked-task triage: bounded wait, then retry/reassign.
+        Returns the number of things created, or None when only the owner can unblock."""
+        from huddleroom.models.orchestration import OrchestrationWait
+
+        since = None
+        if episode_at:
+            try:
+                since = datetime.fromisoformat(episode_at)
+            except ValueError:
+                since = None
+            if since is not None and since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+
+        def in_episode(row) -> bool:
+            if since is None:
+                return True
+            stamp = row.created_at if row.created_at.tzinfo else row.created_at.replace(tzinfo=timezone.utc)
+            return stamp >= since
+
+        # 1. Bounded wait on a dependency or live provider.
+        waits = list(await db.scalars(select(OrchestrationWait).where(
+            OrchestrationWait.run_id == run.id,
+            OrchestrationWait.wait_key.like(f"run:{run.id}:wait:task:{task.id}:blocked:%"),
+        )))
+        if any(wait.status == "open" for wait in waits):
+            return 0
+        awaiting = await self._blocked_task_awaiting(db, task)
+        # ponytail: waiting is bounded by elapsed time (24 wake windows since the episode's first wait), not wait count.
+        stamps = [w.created_at if w.created_at.tzinfo else w.created_at.replace(tzinfo=timezone.utc)
+                  for w in waits if in_episode(w)]
+        within_bound = not stamps or (
+            datetime.now(timezone.utc) - min(stamps)
+        ).total_seconds() < settings.orchestration_wake_max_seconds * 24
+        if awaiting and within_bound:
+            label, event_task_id = awaiting
+            try:
+                await self.supervision.create_wait(
+                    db, run, origin=f"task:{task.id}:blocked:{len(waits)}",
+                    owner={"type": "task", "id": str(task.id), "task_id": str(task.id)},
+                    awaited_event={"event_type": "task.status_changed", "matcher": {"task_id": str(event_task_id)}},
+                    recheck_seconds=settings.orchestration_wake_max_seconds,
+                    fallback={"action_type": "continue", "reason": f"Blocked task still waiting on {label}."},
+                    expected_result=f"The blocked task can proceed once {label} finishes.",
+                )
+                return 1
+            except HTTPException:
+                return 0  # rejected create_wait with a live dependency: retry next tick, do not ask
+
+        # 2. Recoverable ownership/agent failure: reassign or retry, once per blocked episode.
+        agent = await db.get(Agent, task.assigned_to) if task.assigned_to else None
+        agent_bad = agent is None or not agent.is_active
+        latest_status = await db.scalar(select(Session.status).where(Session.task_id == task.id).order_by(
+            Session.created_at.desc(), Session.id.desc()).limit(1))
+        if not (agent_bad or latest_status == "failed"):
+            return None
+        prior = (await db.execute(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+            OrchestrationAction.action_type.in_(["retry_task", "reassign_task"]),
+        ))).scalars().all()
+        if any(str((act.request or {}).get("task_id")) == str(task.id) and in_episode(act) for act in prior):
+            return None
+        attempt = await self._task_recovery_attempt_suffix(db, run.id, task.id)
+        if agent_bad:
+            work_function = self._task_work_function(task)
+            fit = await self._best_recovery_agent(
+                db, goal.project_id, work_function, required_capabilities=[work_function],
+                exclude_agent_ids={task.assigned_to} if task.assigned_to else set(),
+            )
+            if fit is None:
+                return None
+            action_type, extra = "reassign_task", {"agent_id": str(fit.agent_id)}
+            key = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{fit.agent_id}{attempt}"
+            execute = self.execute_reassign_task_action
+        else:
+            action_type, extra = "retry_task", {}
+            key = f"run:{run.id}:kind:retry_task:task:{task.id}{attempt}"
+            execute = self.execute_retry_task_action
+        try:
+            async with db.begin_nested():
+                await execute(
+                    db, run_id=run.id,
+                    request={"action_type": action_type, "task_id": str(task.id), **extra},
+                    idempotency_key=key,
+                )
+            return 1
+        except HTTPException:
+            return None
+
+    async def _blocked_task_awaiting(self, db: AsyncSession, task: Task) -> tuple[str, uuid.UUID] | None:
+        """(label, task id whose status event ends the wait) for what a blocked task awaits, or None."""
+        dep_ids = []
+        for raw in task.depends_on or []:
+            try:
+                dep_ids.append(uuid.UUID(str(raw)))
+            except ValueError:
+                continue
+        if dep_ids:
+            dep = await db.scalar(select(Task.id).where(
+                Task.id.in_(dep_ids), Task.status.in_(["backlog", "ready", "in_progress", "blocked"])).limit(1))
+            if dep is not None:
+                return f"dependency task {dep}", dep
+        session_id = await self._first_id(db, select(Session.id).where(
+            Session.task_id == task.id, Session.status.in_(["pending", "running"])))
+        if session_id is not None:
+            return f"live session {session_id}", task.id
+        meeting_id = await self._first_id(db, select(Meeting.id).where(
+            Meeting.source_task_id == task.id,
+            Meeting.status.in_(("scheduled", "preparing", "active", "concluding"))))
+        if meeting_id is not None:
+            return f"meeting {meeting_id}", task.id
+        run_id = await self._first_id(db, select(GraphRun.id).where(
+            GraphRun.linked_task_id == task.id, GraphRun.status == "active"))
+        return (f"graph run {run_id}", task.id) if run_id is not None else None
+
+    @staticmethod
+    async def _first_id(db: AsyncSession, stmt):
+        return await db.scalar(stmt.limit(1))
 
     async def _recover_failed_gates(
         self,
@@ -8077,7 +8297,8 @@ class OrchestrationService:
         task: Task,
     ) -> int:
         work_function = self._task_work_function(task)
-        key = f"run:{run.id}:kind:retry_task:task:{task.id}"
+        attempt = await self._task_recovery_attempt_suffix(db, run.id, task.id)
+        key = f"run:{run.id}:kind:retry_task:task:{task.id}{attempt}"
         if await self._existing_action_for_key(db, run.id, key) is not None:
             return 0
         try:
@@ -8140,7 +8361,8 @@ class OrchestrationService:
             exclude_agent_ids={task.assigned_to} if task.assigned_to else set(),
         )
         if fit is not None:
-            key = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{fit.agent_id}"
+            attempt = await self._task_recovery_attempt_suffix(db, run.id, task.id)
+            key = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{fit.agent_id}{attempt}"
             existing = await self._existing_action_for_key(db, run.id, key)
             if existing is None:
                 try:
@@ -9228,9 +9450,11 @@ class OrchestrationService:
         dispatched id and `action_ids` the full list.
         # ponytail: on non-SQLite the isolated context read can't see the uncommitted
         # action, so iteration 2 reuses the decision -> same action id -> loop stops
-        # (one action per tick). Upgrade path: commit before each re-decision."""
-        import logging
-
+        # (one action per tick). Upgrade path: commit before each re-decision.
+        Errors from any iteration propagate so the caller's transaction rolls back (no partial
+        writes of the failed iteration). On SQLite a tick-owned autobegin transaction is
+        pre-committed by request_llm_decision, so earlier iterations stay durable; executors are
+        idempotent by key, so a retry reuses their effects."""
         cap = max(1, settings.orchestration_max_actions_per_tick)
         action_ids: list[str] = []
         iterations = 0
@@ -9238,16 +9462,9 @@ class OrchestrationService:
         hit_cap = False
         while iterations < cap:
             iterations += 1
-            try:
-                step_result = await step_once(db, goal, run)
-            except HTTPException:
-                # ponytail: later-iteration failures are swallowed to keep already-dispatched
-                # actions; they are not retried until the next tick.
-                if iterations == 1:
-                    raise
-                logging.getLogger(__name__).warning("act_until_wait: iteration %s failed", iterations, exc_info=True)
-                break
-            result = step_result
+            result = await step_once(db, goal, run)
+            if result.get("reused"):
+                break  # already-accepted plan re-dispatched: not progress
             aid = result.get("action_id")
             if aid in action_ids:
                 break
@@ -9277,6 +9494,7 @@ class OrchestrationService:
         if action_ids:
             if not hit_cap:
                 await self._post_action_wait(db, goal, run, action_ids, result, loop_steps)
+        result = {k: v for k, v in result.items() if k != "reused"}
         if iterations == 1 or not action_ids:
             return result
         return {**result, "action_id": action_ids[0], "action_ids": action_ids}
@@ -9317,6 +9535,17 @@ class OrchestrationService:
                 "expected_result": "Post-action recheck",
             },
         )
+
+    @staticmethod
+    def _waiting_step_for_http_error(exc: HTTPException) -> dict | None:
+        """Map a recoverable dispatch/decision HTTP error to an explicit wait step."""
+        from huddleroom.services.orchestration_roadmap_service import RoadmapReplanMeasurementAttention
+
+        if isinstance(exc, RoadmapReplanMeasurementAttention):
+            return {"step": "waiting", "reason": "needs_attention"}
+        if exc.status_code == 409 and exc.detail in {"budget_wait", "needs_attention"}:
+            return {"step": "waiting", "reason": exc.detail}
+        return None
 
     async def _advance_authorized_execution_once(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
@@ -9390,11 +9619,8 @@ class OrchestrationService:
             try:
                 action = await self._dispatch_execution_decision(db, run, decision)
             except HTTPException as exc:
-                from huddleroom.services.orchestration_roadmap_service import RoadmapReplanMeasurementAttention
-                if isinstance(exc, RoadmapReplanMeasurementAttention):
-                    return {"step": "waiting", "reason": "needs_attention"}
-                if exc.status_code == 409 and exc.detail in {"budget_wait", "needs_attention"}:
-                    return {"step": "waiting", "reason": exc.detail}
+                if (waiting := self._waiting_step_for_http_error(exc)) is not None:
+                    return waiting
                 if (
                     decision_action_type != "accept_plan"
                     or plan_status not in {"requested", "revision_requested"}
@@ -9448,10 +9674,31 @@ class OrchestrationService:
 
         # (4) nothing deterministic -> one LLM next-action (verification / follow-up /
         # meeting / wait). noop/ask_human/pause_run IS the explicit wait/escalation.
-        decision = await self.request_llm_decision(db, run.id)
-        action = await self._dispatch_execution_decision(db, run, decision)
+        try:
+            decision = await self.request_llm_decision(db, run.id)
+            action = await self._dispatch_execution_decision(db, run, decision)
+        except HTTPException as exc:
+            if (waiting := self._waiting_step_for_http_error(exc)) is not None:
+                return waiting
+            if exc.status_code == 409 and exc.detail == "Orchestration run is paused":
+                return {"step": "waiting", "reason": "paused"}  # concurrent pause during the LLM call
+            raise
         if action is None:
             return {"step": "waiting", "reason": "stale_steering_versions"}
+        if (
+            action.action_type == "accept_plan"
+            and action.status == "completed"
+            and plan_state.get("accept_action_id") == str(action.id)
+        ):
+            # Plan was already accepted before this dispatch: replayed accept, not progress.
+            await self.supervision.create_orchestrator_waits(
+                db, run, owner_id=decision.id,
+                wake_when={
+                    "recheck_after_seconds": settings.orchestration_reconcile_interval_seconds,
+                    "expected_result": "Replayed accept_plan recheck",
+                },
+            )
+            return {"step": "next_action", "action_id": str(action.id), "reused": True}
         return {"step": "next_action", "action_id": str(action.id)}
 
     RELEASE_TWO_TASK_CAP = 2
@@ -9883,7 +10130,8 @@ class OrchestrationService:
                 and run.phase == "authorized"          # NEW: no completion before Start
                 and baseline_ready
                 and not any(
-                    isinstance(blocker, Mapping) and blocker.get("kind") != "everyone_idle"
+                    isinstance(blocker, Mapping)
+                    and blocker.get("kind") not in {"everyone_idle", "supervision_judgment_failures"}
                     for blocker in run.active_blockers
                 )
                 and (

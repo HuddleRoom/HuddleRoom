@@ -2,7 +2,15 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import ANY, AsyncMock
+from huddleroom.models.orchestration import OrchestrationGate
+from huddleroom.models.task import Task
+from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+from tests.test_orchestration_progress_view import _authority_decision
+from tests.test_orchestration_runtime_e2e import (
+    _agent, _authorized_run, _run_actions, _seed_accepted_plan, _tasks_for_run,
+)
 from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 from huddleroom.services.orchestration_service import OrchestrationService
 
@@ -319,3 +327,238 @@ def test_canonical_meeting_preserves_participant_order_as_semantic():
     assert OrchestrationDecisionDispatcher.action_key(run_id, "schedule_meeting", first) != (
         OrchestrationDecisionDispatcher.action_key(run_id, "schedule_meeting", second)
     )
+
+
+def _plan_decision(applies_decision_id=None):
+    parsed = {"action_type": "request_plan", "agent_id": str(uuid.uuid4()),
+              "scope": "plan it", "work_function": "planning"}
+    if applies_decision_id is not None:
+        parsed["applies_decision_id"] = str(applies_decision_id)
+    return SimpleNamespace(id=uuid.uuid4(), validator_status="accepted", parsed_decision=parsed,
+                           input_snapshot={}, rejection_reason=None)
+
+
+def _authority_db(decision_row):
+    return SimpleNamespace(get=AsyncMock(return_value=decision_row))
+
+
+def _answered(run_id, status="answered"):
+    return SimpleNamespace(id=uuid.uuid4(), run_id=run_id, status=status)
+
+
+def _service_returning(action_type, status, dispatch_contract=None):
+    service = OrchestrationService()
+    service._steering_action_fence = AsyncMock()
+    action = SimpleNamespace(id=uuid.uuid4(), action_type=action_type, status=status,
+                             dispatch_contract=dispatch_contract)
+    service.execute_request_plan_action = AsyncMock(return_value=action)
+    service.execute_noop_action = AsyncMock(return_value=action)
+    return service, action
+
+
+@pytest.mark.asyncio
+async def test_completed_action_is_linked_to_applied_decision():
+    run = SimpleNamespace(id=uuid.uuid4())
+    answered = _answered(run.id)
+    service, action = _service_returning("request_plan", "completed", {"owner": "planner"})
+    decision = _plan_decision(answered.id)
+
+    await OrchestrationDecisionDispatcher(service).dispatch(_authority_db(answered), run, decision)
+
+    assert action.dispatch_contract == {"owner": "planner", "applies_decision_id": str(answered.id)}
+    assert decision.validator_status == "accepted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_type", "status"),
+    [("noop", "completed"), ("record_warning", "completed"), ("pause_run", "completed"),
+     ("ask_human", "completed"), ("suggest_agent", "completed"), ("request_plan", "failed")],
+)
+async def test_noop_warning_and_failed_actions_are_not_linked(action_type, status):
+    run = SimpleNamespace(id=uuid.uuid4())
+    answered = _answered(run.id)
+    service, action = _service_returning(action_type, status, {"owner": "x"})
+
+    await OrchestrationDecisionDispatcher(service).dispatch(
+        _authority_db(answered), run, _plan_decision(answered.id),
+    )
+
+    assert action.dispatch_contract == {"owner": "x"}
+
+
+@pytest.mark.asyncio
+async def test_decision_from_other_run_is_rejected_before_executor():
+    run = SimpleNamespace(id=uuid.uuid4())
+    other = _answered(uuid.uuid4())
+    service, _ = _service_returning("request_plan", "completed")
+    decision = _plan_decision(other.id)
+
+    result = await OrchestrationDecisionDispatcher(service).dispatch(_authority_db(other), run, decision)
+
+    assert result is None
+    assert decision.validator_status == "rejected"
+    assert decision.rejection_reason
+    service.execute_request_plan_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "cancelled", "expired"])
+async def test_non_answered_decision_is_rejected_before_executor(status):
+    run = SimpleNamespace(id=uuid.uuid4())
+    pending = _answered(run.id, status=status)
+    service, _ = _service_returning("request_plan", "completed")
+    decision = _plan_decision(pending.id)
+
+    result = await OrchestrationDecisionDispatcher(service).dispatch(_authority_db(pending), run, decision)
+
+    assert result is None
+    assert decision.validator_status == "rejected"
+    assert decision.rejection_reason
+    service.execute_request_plan_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_decision_row_is_rejected_before_executor():
+    run = SimpleNamespace(id=uuid.uuid4())
+    service, _ = _service_returning("request_plan", "completed")
+    decision = _plan_decision(uuid.uuid4())
+
+    assert await OrchestrationDecisionDispatcher(service).dispatch(_authority_db(None), run, decision) is None
+    assert decision.validator_status == "rejected"
+    service.execute_request_plan_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_replayed_completed_action_is_still_linked():
+    run = SimpleNamespace(id=uuid.uuid4())
+    answered = _answered(run.id)
+    service, action = _service_returning("request_plan", "completed", {"owner": "planner"})
+    dispatcher = OrchestrationDecisionDispatcher(service)
+
+    await dispatcher.dispatch(_authority_db(answered), run, _plan_decision(answered.id))
+    action.dispatch_contract = {"owner": "planner"}  # executor overwrote it on replay
+    await dispatcher.dispatch(_authority_db(answered), run, _plan_decision(answered.id))
+
+    assert action.dispatch_contract["applies_decision_id"] == str(answered.id)
+
+
+@pytest.mark.asyncio
+async def test_replayed_action_keeps_original_applies_decision_id():
+    run = SimpleNamespace(id=uuid.uuid4())
+    first, second = _answered(run.id), _answered(run.id)
+    service, action = _service_returning("request_plan", "completed", {"applies_decision_id": str(first.id)})
+
+    await OrchestrationDecisionDispatcher(service).dispatch(
+        _authority_db(second), run, _plan_decision(second.id),
+    )
+
+    assert action.dispatch_contract == {"applies_decision_id": str(first.id)}
+
+
+@pytest.mark.asyncio
+async def test_applies_decision_id_does_not_change_action_key():
+    run = SimpleNamespace(id=uuid.uuid4())
+    answered = _answered(run.id)
+    service, _ = _service_returning("request_plan", "completed")
+    dispatcher = OrchestrationDecisionDispatcher(service)
+    plain = _plan_decision()
+    linked = _plan_decision(answered.id)
+    linked.parsed_decision = {**plain.parsed_decision, "applies_decision_id": str(answered.id)}
+
+    await dispatcher.dispatch(None, run, plain)
+    await dispatcher.dispatch(_authority_db(answered), run, linked)
+
+    plain_key = service.execute_request_plan_action.call_args_list[0].kwargs["idempotency_key"]
+    linked_key = service.execute_request_plan_action.call_args_list[1].kwargs["idempotency_key"]
+    assert plain_key == linked_key
+
+
+async def _verifiable_gate(db_session, test_project):
+    producer, verifier = _agent("disp-producer", ["implementation"]), _agent("disp-verifier", ["validation"])
+    producer.role, verifier.role = "developer", "validator"
+    db_session.add_all([producer, verifier])
+    await db_session.flush()
+    service, goal, run = await _authorized_run(db_session, test_project)
+    await _seed_accepted_plan(db_session, test_project, service, run, producer, plan_items=[{
+        "id": "disp-item", "work_function": "implementation", "scope": "Deliver.",
+        "deliverable": "Delivered.", "agent_id": str(producer.id),
+    }])
+    await service.tick(db_session, run.id)
+    work_task = next(t for t in await _tasks_for_run(db_session, run.id)
+                     if service._task_work_function(t) == "implementation")
+    work_task.status = "done"
+    gate = await db_session.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
+    return service, goal, run, gate
+
+
+def _verify_decision(gate, **extra):
+    return SimpleNamespace(
+        id=None, validator_status="accepted", input_snapshot={}, rejection_reason=None,
+        parsed_decision={"action_type": "request_verification", "gate_id": str(gate.id),
+                         "work_function": "validation", **extra},
+    )
+
+
+async def test_failed_verification_is_retryable_and_replays_are_idempotent(
+    db_session, test_project, safe_effectiveness_review_continue,
+):
+    service, _goal, run, gate = await _verifiable_gate(db_session, test_project)
+    dispatcher = OrchestrationDecisionDispatcher(service)
+
+    first = await dispatcher.dispatch(db_session, run, _verify_decision(gate))
+    assert first.status == "completed"
+    assert ":attempt:" not in first.idempotency_key  # attempt 0 keeps the legacy key
+    assert (await dispatcher.dispatch(db_session, run, _verify_decision(gate))).id == first.id
+
+    first.status = "failed"
+    await db_session.flush()
+    second = await dispatcher.dispatch(db_session, run, _verify_decision(gate))
+    assert second.id != first.id
+    assert second.idempotency_key.endswith(":attempt:1")
+    assert second.status == "completed"
+    assert second.target_id != first.target_id
+    assert await db_session.get(Task, second.target_id) is not None
+    # replay of the successful retry: same action, no third verifier task
+    assert (await dispatcher.dispatch(db_session, run, _verify_decision(gate))).id == second.id
+    verifiers = [a for a in await _run_actions(db_session, run.id)
+                 if a.action_type == "create_delegation_task" and ":verify_gate:" in a.idempotency_key]
+    assert sorted(a.idempotency_key.rsplit(str(gate.id), 1)[1] for a in verifiers) == ["", ":attempt:1"]
+
+
+async def test_progress_view_follow_up_cleared_only_by_substantive_continuation(
+    db_session, test_project, safe_effectiveness_review_continue,
+):
+    service, goal, run, gate = await _verifiable_gate(db_session, test_project)
+    related = (await _run_actions(db_session, run.id))[0]
+    answered = await _authority_decision(
+        db_session, goal, run, related, decided_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    async def follow_ups():
+        view = await OrchestrationProgressView().build(db_session, goal, run)
+        return [f["id"] for f in view.untracked_follow_ups if f["kind"] == "answered_decision"]
+
+    assert await follow_ups() == [str(answered.id)]
+    dispatcher = OrchestrationDecisionDispatcher(service)
+    noop = SimpleNamespace(id=None, validator_status="accepted", input_snapshot={}, rejection_reason=None,
+                           parsed_decision={"action_type": "noop", "applies_decision_id": str(answered.id)})
+    await dispatcher.dispatch(db_session, run, noop)
+    assert await follow_ups() == [str(answered.id)]
+
+    action = await dispatcher.dispatch(
+        db_session, run, _verify_decision(gate, applies_decision_id=str(answered.id)),
+    )
+    assert action.status == "completed"
+    assert await follow_ups() == []
+
+
+def test_advertised_action_schemas_match_dispatchable_executors():
+    from huddleroom.services.orchestration_decision_validator import ALLOWED_ACTION_SCHEMAS
+
+    assert set(ALLOWED_ACTION_SCHEMAS) == set(OrchestrationDecisionDispatcher._EXECUTORS)
+
+
+def test_every_dispatcher_executor_method_exists_on_orchestration_service():
+    for action_type, method_name in OrchestrationDecisionDispatcher._EXECUTORS.items():
+        assert callable(getattr(OrchestrationService, method_name, None)), (action_type, method_name)

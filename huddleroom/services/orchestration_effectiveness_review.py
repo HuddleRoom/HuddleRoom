@@ -7,12 +7,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.config import settings
 from huddleroom.models.agent import Agent
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import (
+    OrchestrationAction,
+    OrchestrationEvidence,
+    OrchestrationGate,
+    OrchestrationGoal,
+    OrchestrationRun,
+)
 from huddleroom.models.orchestration_process import (
     OrchestrationAuthorityDecision,
     OrchestrationProcessRun,
@@ -37,6 +43,17 @@ PROCESS_TYPE = "effectiveness_review"
 LIVE_TASK_STATUSES = ("backlog", "ready", "in_progress", "blocked")
 MEMORY_SECTION_KEY = "effectiveness_review"
 MEMORY_TOC_ORDER = 50
+# Actions that do not count as substantive progress for the inactivity trigger.
+NON_PROGRESS_ACTION_TYPES = (
+    "noop",
+    "record_warning",
+    "acknowledge_warning",
+    "resolve_warning",
+    "pause_run",
+    "ask_human",
+    "suggest_agent",
+    "decision_continuation",
+)
 
 
 @dataclass(frozen=True)
@@ -399,7 +416,6 @@ async def detect_triggers(
     goal: OrchestrationGoal,
     run: OrchestrationRun,
 ) -> list[TriggerReason]:
-    del goal
     actions = (
         await db.execute(
             select(OrchestrationAction).where(
@@ -455,30 +471,64 @@ async def detect_triggers(
         if failed_sessions >= settings.effectiveness_failed_session_threshold
         else None
     )
-    latest_action = (
+    # Substantive progress only: noops/warnings/etc. must not reset inactivity.
+    latest_progress_action = (
         await db.execute(
             select(OrchestrationAction.created_at)
-            .where(OrchestrationAction.run_id == run.id)
+            .where(
+                OrchestrationAction.run_id == run.id,
+                OrchestrationAction.status == "completed",
+                ~OrchestrationAction.action_type.in_(NON_PROGRESS_ACTION_TYPES),
+            )
             .order_by(OrchestrationAction.created_at.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
-    latest_gate = (
-        await db.execute(
-            select(OrchestrationGate.updated_at)
-            .where(OrchestrationGate.run_id == run.id)
-            .order_by(OrchestrationGate.updated_at.desc())
-            .limit(1)
+    gates = (
+        await db.execute(select(OrchestrationGate).where(OrchestrationGate.run_id == run.id))
+    ).scalars().all()
+    gate_decisions = [value for gate in gates for value in (gate.accepted_at, gate.failed_at)]
+    # ponytail: scan bounded to the run lifetime (SQL started/completed >= run.started_at), run metadata matched in Python; add a JSON index if this gets hot.
+    task_conditions = [Task.project_id == goal.project_id]
+    if task_ids:
+        task_conditions.append(Task.id.in_(task_ids))
+    task_where = [or_(*task_conditions), or_(Task.started_at.is_not(None), Task.completed_at.is_not(None))]
+    if run.started_at is not None:
+        # Task columns are naive UTC on sqlite; values before run start can never raise last_progress (run.started_at is in the max).
+        run_start = _utc(run.started_at).replace(tzinfo=None)
+        task_where.append(or_(Task.started_at >= run_start, Task.completed_at >= run_start))
+    task_rows = (
+        await db.execute(select(Task.id, Task.started_at, Task.completed_at, Task.metadata_).where(*task_where))
+    ).all()
+    task_progress = [
+        value
+        for task_id, started_at, completed_at, metadata in task_rows
+        if str(task_id) in task_to_gate
+        or (
+            isinstance(metadata, dict)
+            and isinstance(metadata.get("orchestration"), dict)
+            and metadata["orchestration"].get("run_id") == str(run.id)
         )
-    ).scalar_one_or_none()
-    task_updates = (
-        (await db.execute(select(Task.updated_at).where(Task.id.in_(task_ids)))).scalars().all()
-        if task_ids
-        else []
-    )
+        for value in (started_at, completed_at)
+    ]
+    # ponytail: Evidence.updated_at bumps on any edit, so non-progress edits count as progress (accepted noise).
+    evidence_max_created, evidence_max_updated = (
+        await db.execute(
+            select(func.max(OrchestrationEvidence.created_at), func.max(OrchestrationEvidence.updated_at)).where(
+                OrchestrationEvidence.run_id == run.id
+            )
+        )
+    ).one()
     last_progress = max(
         _utc(value)
-        for value in (run.started_at, latest_action, latest_gate, *task_updates)
+        for value in (
+            run.started_at,
+            latest_progress_action,
+            *gate_decisions,
+            *task_progress,
+            evidence_max_created,
+            evidence_max_updated,
+        )
         if value is not None
     )
     idle_hours = (_utc(datetime.now(timezone.utc)) - last_progress).total_seconds() / 3600
@@ -492,9 +542,6 @@ async def detect_triggers(
         if inactivity_bucket >= 1
         else None
     )
-    gates = (
-        await db.execute(select(OrchestrationGate).where(OrchestrationGate.run_id == run.id))
-    ).scalars().all()
     non_summary_gates = [gate for gate in gates if gate.gate_type != "final_summary_accepted"]
     pre_completion = (
         TriggerReason(

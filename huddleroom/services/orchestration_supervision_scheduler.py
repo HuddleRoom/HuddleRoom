@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -25,6 +26,7 @@ from huddleroom.models.meeting import Meeting
 from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
 
+logger = logging.getLogger(__name__)
 
 SUPPORTED_EVENTS = frozenset({
     "task.status_changed", "task.assigned", "session.created", "session.started",
@@ -54,6 +56,20 @@ class OrchestrationSupervisionScheduler:
             return await self._tick_impl(db, run_id, local_only=local_only)
         from huddleroom.services.orchestration_service import OrchestrationService
         return await OrchestrationService().tick(db, run_id, local_only=local_only)
+
+    @staticmethod
+    def _claim_live(state, now) -> bool:
+        """A flight bit only counts with a token and an unexpired lease (legacy flags are reclaimable)."""
+        expires = state.get("judgment_lease_expires_at")
+        return bool(
+            state.get("judgment_in_flight") and state.get("judgment_claim_token") and expires
+            and OrchestrationSupervisionScheduler._parse_time(expires) > now
+        )
+
+    @staticmethod
+    def _clear_claim(state) -> None:
+        for key in ("judgment_claim_token", "judgment_claimed_at", "judgment_lease_expires_at"):
+            state.pop(key, None)
 
     async def _judge(self, payload):
         if self._judge_impl is not None:
@@ -87,6 +103,8 @@ class OrchestrationSupervisionScheduler:
             if run is None:
                 await db.rollback()
                 return None
+            # ponytail: claim exclusivity on SQLite is the in-process per-goal asyncio lock (single
+            # process only); Postgres uses FOR UPDATE. Multi-process SQLite would need a CAS on the token.
             # pylint: disable=protected-access
             async with service._lock_goal_for_baseline_transition(db, run.goal_id):
                 goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True)
@@ -97,7 +115,7 @@ class OrchestrationSupervisionScheduler:
                     or goal.status not in {"active", "blocked"}
                     or run.status not in {"running", "blocked"}
                     or run.phase != "authorized"
-                    or state.get("judgment_in_flight")
+                    or self._claim_live(state, now)
                     or not state.get("needs_judgment")
                     or not state.get("judgment_due_at")
                     or self._parse_time(state["judgment_due_at"]) > now
@@ -107,10 +125,17 @@ class OrchestrationSupervisionScheduler:
                 canonical_payload, fingerprint = await self._judgment_payload(
                     db, service, context, goal, run,
                 )
+                token = uuid4().hex
+                claimed = _utcnow()  # injected `now` is only for due/liveness comparison
                 state.update({
                     "judgment_in_flight": True,
                     "judgment_dirty": False,
                     "context_fingerprint": fingerprint,
+                    "judgment_claim_token": token,
+                    "judgment_claimed_at": claimed.isoformat(),
+                    "judgment_lease_expires_at": (
+                        claimed + timedelta(seconds=settings.orchestration_judgment_lease_seconds)
+                    ).isoformat(),
                 })
                 run.supervision_state = state
                 payload = context.provider_snapshot(canonical_payload)
@@ -119,7 +144,8 @@ class OrchestrationSupervisionScheduler:
                     "goal_id": goal.id,
                     "run_id": run.id,
                     "fingerprint": fingerprint,
-                        "payload": payload,
+                    "token": token,
+                    "payload": payload,
                 }
 
     # pylint: disable=too-many-locals,too-many-branches
@@ -144,6 +170,8 @@ class OrchestrationSupervisionScheduler:
                         goal is not None and run is not None and goal.status in {"active", "blocked"}
                         and run.status in {"running", "blocked"} and run.phase == "authorized"
                         and state.get("judgment_in_flight") and current == claim["fingerprint"]
+                        and state.get("judgment_claim_token") == claim["token"]
+                        and self._claim_live(state, _utcnow())
                         and not state.get("judgment_dirty")
                         and not service._budget_is_exhausted(run)  # pylint: disable=protected-access
                     )
@@ -151,25 +179,70 @@ class OrchestrationSupervisionScheduler:
                         # apply_disposition rechecks current control and contract
                         # while this reentrant goal lock is held.
                         await service.supervision.apply_disposition(db, goal, run, assessment)
-                    if run is not None:
+                    # A stale token's late result must not touch a newer claim's state.
+                    if run is not None and state.get("judgment_claim_token") == claim["token"]:
                         state = dict(run.supervision_state or {})
                         state["judgment_in_flight"] = False
+                        self._clear_claim(state)
                         if allowed:
                             state["judgment_dirty"] = False
                             state["judgment_failures"] = 0
                             state["judgment_due_at"] = (
                                 _utcnow() + timedelta(seconds=settings.orchestration_semantic_progress_seconds)
                             ).isoformat()
+                            await self._recover_judgment_escalation(db, run)
                         run.supervision_state = state
                 await db.commit()
                 return allowed
             except Exception:
                 await db.rollback()
                 # A failed provider disposition must never strand the flight bit.
-                await self._update_judgment_failure(claim["run_id"], _utcnow(), failure=False)
+                try:
+                    await self._update_judgment_failure(claim["run_id"], failure=False, token=claim["token"])
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.exception("Supervision judgment cleanup failed for run %s", claim["run_id"])
                 raise
 
-    async def _update_judgment_failure(self, run_id, now, *, failure: bool) -> None:
+    @staticmethod
+    async def _recover_judgment_escalation(db, run) -> None:
+        """Drop the escalation blocker and resolve its warning once judgment succeeds."""
+        from huddleroom.models.orchestration_process import OrchestrationWarning
+        from huddleroom.services.orchestration_service import OrchestrationService
+        from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+        for item in list(run.active_blockers or []):
+            if isinstance(item, dict) and item.get("kind") == "supervision_judgment_failures":
+                warning = None
+                if item.get("warning_id"):
+                    warning = await db.get(OrchestrationWarning, UUID(str(item["warning_id"])))
+                if warning is not None and warning.active:
+                    await OrchestrationWarningService().resolve_warning(
+                        db, warning, resolved_by="system", reason="Supervision judgment recovered",
+                    )
+        OrchestrationService._remove_active_blocker_by_kind(  # pylint: disable=protected-access
+            run, "supervision_judgment_failures",
+        )
+
+    @staticmethod
+    async def _escalate_judgment_failures(db, goal, run, count, retry_at) -> None:
+        from huddleroom.services.orchestration_service import OrchestrationService
+        from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+        reason = f"Supervision judgment is failing repeatedly; retrying at {retry_at.isoformat()}"
+        warning = await OrchestrationWarningService().create_warning(
+            db, goal.id, warning_type="supervision_judgment_failures", severity="warning",
+            message=reason, run_id=run.id,
+        )
+        OrchestrationService._upsert_active_blocker(run, {  # pylint: disable=protected-access
+            "kind": "supervision_judgment_failures",
+            "scope": "liveness",
+            "warning_id": str(warning.id),
+            "failure_count": count,
+            "next_retry_at": retry_at.isoformat(),
+            "reason": reason,
+        })
+
+    async def _update_judgment_failure(self, run_id, *, failure: bool, token: str | None = None) -> None:
         """Release a failed claim without overwriting a concurrent event's deadline."""
         from huddleroom.database import AsyncSessionLocal
         from huddleroom.services.orchestration_service import OrchestrationService
@@ -190,28 +263,51 @@ class OrchestrationSupervisionScheduler:
                     await db.commit()
                     return
                 state = dict(run.supervision_state or {})
+                if state.get("judgment_claim_token") != token:
+                    # A newer claim owns the run; this worker's cleanup is stale.
+                    await db.commit()
+                    return
                 state["judgment_in_flight"] = False
                 if failure:
+                    self._clear_claim(state)
                     state["judgment_dirty"] = True
-                    state["judgment_failures"] = int(state.get("judgment_failures", 0)) + 1
-                    retry_due = now + timedelta(seconds=settings.orchestration_reconcile_interval_seconds)
+                    count = state["judgment_failures"] = int(state.get("judgment_failures", 0)) + 1
+                    escalated = count >= 3
+                    delay = (
+                        settings.orchestration_semantic_progress_seconds if escalated
+                        else settings.orchestration_reconcile_interval_seconds
+                    )
+                    retry_due = _utcnow() + timedelta(seconds=delay)
                     due = state.get("judgment_due_at")
-                    if not due or self._parse_time(due) > retry_due:
+                    # Escalated backoff is bounded but must always push the retry out.
+                    if escalated or not due or self._parse_time(due) > retry_due:
                         state["judgment_due_at"] = retry_due.isoformat()
+                    if escalated:
+                        await self._escalate_judgment_failures(db, goal, run, count, retry_due)
+                # failure=False (finish-path cleanup) keeps the token so the caller's
+                # failure=True accounting still matches this claim.
                 run.supervision_state = state
                 await db.commit()
 
     async def _evaluate_claimed(self, run_id, now) -> int:
         for attempt in range(2):
-            claim = await self._claim_judgment(run_id, now)
+            claim = await self._claim_judgment(run_id, _utcnow() if attempt else now)
             if claim is None:
                 return 0
             try:
-                assessment = await self._judge(claim["payload"])
+                assessment = await asyncio.wait_for(
+                    self._judge(claim["payload"]),
+                    timeout=settings.orchestration_judgment_timeout_seconds,
+                )
                 return int(await self._finish_judgment(claim, assessment))
-            except Exception:
+            except (Exception, asyncio.CancelledError) as exc:  # pylint: disable=broad-exception-caught
                 # Each retry obtains a new local snapshot in a new transaction.
-                await self._update_judgment_failure(run_id, now, failure=True)
+                try:
+                    await asyncio.shield(self._update_judgment_failure(run_id, failure=True, token=claim["token"]))
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.exception("Supervision judgment failure cleanup failed for run %s", run_id)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
         return 0
 
     async def record_event(
@@ -362,7 +458,7 @@ class OrchestrationSupervisionScheduler:
             return 0
         state = dict(run.supervision_state or {})
         due = state.get("judgment_due_at")
-        if state.get("judgment_in_flight") or not due or self._parse_time(due) > now:
+        if self._claim_live(state, now) or not due or self._parse_time(due) > now:
             return 0
         if self._tick_impl is not None:
             state["judgment_dirty"], state["judgment_in_flight"] = False, True
@@ -454,7 +550,7 @@ class OrchestrationSupervisionScheduler:
                 due = state.get("judgment_due_at")
                 if (
                     state.get("needs_judgment")
-                    and not state.get("judgment_in_flight")
+                    and not self._claim_live(state, now)
                     and due
                     and self._parse_time(due) <= now
                 ):

@@ -1,11 +1,12 @@
 """Execute current, authorized supervision dispositions through the action ledger."""
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from huddleroom.models.base import _utcnow
@@ -17,15 +18,51 @@ from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE as _ORCH_OWNER
 
-from huddleroom.services.orchestration_decision_validator import FINAL_SUMMARY_WORK_FUNCTION, PLAN_WORK_FUNCTION
+from huddleroom.services.orchestration_decision_validator import (
+    ALLOWED_ACTION_SCHEMAS,
+    FINAL_SUMMARY_WORK_FUNCTION,
+    OPTIONAL_ACTION_FIELDS,
+    PLAN_WORK_FUNCTION,
+)
 
+UNCHANGED_WAKE_LIMIT = 3
+VERIFICATION_ATTEMPT_LIMIT = 3
 SYSTEM_WAIT_OWNER_TYPES = frozenset({"session", "task", "authority_decision", "child_run"})
 
 def _same_owner(a, b) -> bool:
     return all((a or {}).get(k) == (b or {}).get(k) for k in ("type", "id"))
 
 
-DISPOSITIONS = frozenset({"continue", "pause", "follow_up", "verify", "reassign", "meeting", "graph", "replan", "attention"})
+def _disposition_table(request, reason):
+    return {
+        "continue": ("execute_noop_action", "noop", {"action_type": "noop", "reason": reason}),
+        "pause": ("execute_pause_run_action", "pause_run", {"action_type": "pause_run", "reason": reason}),
+        "follow_up": ("execute_create_delegation_task_action", "create_delegation_task", {"action_type": "create_delegation_task", **request, "work_function": "follow_up"}),
+        "verify": ("execute_request_verification_action", "request_verification", {"action_type": "request_verification", **request, "work_function": "validation"}),
+        "reassign": ("execute_reassign_task_action", "reassign_task", {"action_type": "reassign_task", **request}),
+        "meeting": ("execute_schedule_meeting_action", "schedule_meeting", {"action_type": "schedule_meeting", **request}),
+        "graph": ("execute_start_graph_action", "start_graph", {"action_type": "start_graph", **request}),
+        "replan": ("execute_request_roadmap_replan_action", "request_roadmap_replan", {"action_type": "request_roadmap_replan", **request, "reason": reason}),
+        "ask_human": ("execute_ask_human_action", "ask_human", {"action_type": "ask_human", **request, "reason": reason}),
+        "attention": ("execute_record_warning_action", "record_warning", {"action_type": "record_warning", "warning_type": "supervision_attention", "severity": "warning", "message": reason}),
+    }
+
+
+DISPOSITIONS = frozenset(_disposition_table({}, ""))
+_PROBE_FIELD = "__probe__"
+_EXTRA_REQUIRED = {"follow_up": frozenset({"parent_task_id"})}  # optional on the action, mandatory for _apply_current
+
+
+def disposition_request_fields(kind: str) -> tuple[frozenset[str], frozenset[str]]:
+    """(required, optional) request fields a disposition accepts, from its mapped action schema."""
+    _, action_type, empty = _disposition_table({}, "")[kind]
+    _, _, probed = _disposition_table({_PROBE_FIELD: True}, "")[kind]
+    injected = frozenset(empty) - {"action_type"}  # fields the mapper supplies itself
+    forwarded = _PROBE_FIELD in probed  # mapper passes caller request through
+    required = ALLOWED_ACTION_SCHEMAS[action_type] - injected
+    optional = (OPTIONAL_ACTION_FIELDS.get(action_type, frozenset()) - injected) if forwarded else frozenset()
+    extra = _EXTRA_REQUIRED.get(kind, frozenset())
+    return required | extra, optional - extra
 
 
 @dataclass(frozen=True)
@@ -244,27 +281,66 @@ class OrchestrationSupervisionService:
                     other.status, other.cleared_at = "cleared", now
                 return
 
-    async def _nothing_new_since_last_wait(self, db, run, situation) -> bool:
-        """True when the latest orchestrator wait (any status) already knew every current follow-up and no_work item."""
-        # ponytail: compares against only the latest wait; per-item tracking if that proves too coarse
-        rows = list((await db.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id))).all())
-        mine = [w for w in rows if (w.owner or {}).get("type") == _ORCH_OWNER]
-        if situation.error or not mine:
-            return False
-        fallback = dict(max(mine, key=lambda w: (w.created_at, w.wait_key)).fallback or {})
-        if "follow_up_ids" not in fallback or "no_work_ids" not in fallback:
-            return False
-        return (
-            {item["id"] for item in situation.untracked_follow_ups} <= set(fallback["follow_up_ids"])
-            and {c["criterion_key"] for c in situation.progress_view if c["state"] == "no_work"} <= set(fallback["no_work_ids"])
-        )
+    @staticmethod
+    def _actionable(situation, held) -> tuple[list[dict], list[str]]:
+        """Follow-ups and no_work criterion keys the orchestrator could act on now; a stalled task held by a provider/dependency, or a gate awaiting an owner answer, is not."""
+        follow_ups = [i for i in situation.untracked_follow_ups if not (i.get("kind") in ("stalled_task", "unverified_gate") and i["id"] in held)]
+        return follow_ups, sorted(c["criterion_key"] for c in situation.progress_view if c["state"] == "no_work")
 
-    async def _has_proactive_work(self, active_tasks, situation_getter) -> bool:
+    async def _proactive_outcome(self, db, run, situation, held, state, now, commitments=()):
+        """Proactive work exists: reconsider it; once the same work survived UNCHANGED_WAKE_LIMIT ticks, ask the owner once.
+
+        # ponytail: time-gated counter (wake_max_seconds * 2**asks between increments), not per-wake tracking.
+        """
+        follow_ups, no_work = self._actionable(situation, held)
+        digest = self.orchestration._stable_hash({
+            "follow_up_ids": sorted(i["id"] for i in follow_ups), "no_work_ids": no_work,
+            **({"commitment_ids": sorted(c["id"] for c in commitments)} if commitments else {}),
+        })
+        unchanged = dict(state.get("unchanged") or {})
+        # Any open owner question means the run is waiting on a human: neither count nor ask again.
+        if await db.scalar(select(OrchestrationAuthorityDecision.id).where(
+            OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending").limit(1)) is not None:
+            if unchanged:
+                state["unchanged"] = {}  # counting restarts after the answer
+                run.supervision_state = state
+            return None
+        prev = int(unchanged.get("n") or 0) if unchanged.get("digest") == digest else 0
+        if prev < UNCHANGED_WAKE_LIMIT:
+            if unchanged.get("digest") == digest:
+                def _utc(value):
+                    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+                try:
+                    elapsed = _utc(now) - _utc(datetime.fromisoformat(str(unchanged.get("at"))))
+                except ValueError:
+                    elapsed = None  # missing/invalid timestamp counts as elapsed
+                interval = timedelta(seconds=settings.orchestration_wake_max_seconds * 2 ** min(int(state.get("no_progress_asks") or 0), 4))
+                if elapsed is not None and elapsed < interval:
+                    return {"outcome": "continue"}
+            state["unchanged"] = {"digest": digest, "n": prev + 1, "at": now.isoformat()}
+            state["last_assessment"] = {"at": now.isoformat(), "outcome": "continue"}
+            run.supervision_state = state
+            return {"outcome": "continue"}
+        generation = int(state.get("no_progress_asks") or 0)
+        items = [i["summary"] for i in follow_ups] + [f"criterion {k} has no work in flight" for k in no_work] + [
+            f"meeting commitment {c['id']} ({c['description']}) unresolved: {c['reason']}" for c in commitments]
+        action = await self.orchestration.execute_ask_human_action(db, run.id, {
+            "action_type": "ask_human",
+            "question": f"Orchestration made no progress after {UNCHANGED_WAKE_LIMIT} wakes. Still stuck: " + "; ".join(items) + ". How should it proceed?",
+            "reason": "Unchanged follow-ups across repeated wakes.",
+        }, f"run:{run.id}:ask_human:no_progress:{generation}")
+        state["no_progress_asks"] = generation + 1
+        state["unchanged"] = {"digest": digest, "n": 0, "at": now.isoformat(), "ask_decision_id": str(action.target_id)}
+        state["last_assessment"] = {"at": now.isoformat(), "outcome": "needs_attention"}
+        run.supervision_state = state
+        return {"outcome": "needs_attention", "action_id": str(action.id)}
+
+    async def _has_proactive_work(self, active_tasks, situation_getter, held=frozenset()) -> bool:
         """True when the orchestrator can usefully decide while system work is still running."""
         situation = await situation_getter()
         if situation.error:
             return False
-        if situation.untracked_follow_ups:
+        if self._actionable(situation, held)[0]:
             return True
         work_in_flight = [
             t for t in active_tasks
@@ -486,28 +562,40 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "released", "count": released}
             run.supervision_state = state
             return {"outcome": "released", "count": released}
-        # A gate by itself is not an attempted verification.  Let the executor
-        # choose/dispatch one; only a failed concrete verifier is attention.
-        verification_actions = list((await db.scalars(select(OrchestrationAction).where(
-            OrchestrationAction.run_id == run.id,
-            OrchestrationAction.action_type == "request_verification",
-        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all())
-        failed_verification = next((action for action in verification_actions if action.status == "failed"), None)
-        if failed_verification is not None:
-            action = await self.orchestration.execute_record_warning_action(
-                db, run.id,
-                {"action_type": "record_warning", "warning_type": "supervision_attention", "severity": "warning",
-                 "message": str(failed_verification.error or "Verification action failed.")},
-                f"run:{run.id}:supervision:verification:{failed_verification.id}:failed",
-            )
+        # Exhaustion: 3 consecutive failed request_verification attempts for an open gate is a precise owner question.
+        # A failed request_verification only comes from the executor's own deterministic failures (no provider call;
+        # a verifier rejection is not recorded as a failed request_verification), so 3 in a row is legitimate.
+        # Fewer failures stay an actionable follow-up in the progress view.
+        attempts_by_gate: dict[str, list] = {}
+        for attempt in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_verification",
+        ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id.desc()))).all():
+            attempts_by_gate.setdefault(str((attempt.request or {}).get("gate_id")), []).append(attempt)
+        for gate in (await db.scalars(select(OrchestrationGate).where(
+            OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open"
+        ).order_by(OrchestrationGate.created_at, OrchestrationGate.id))).all():
+            trailing = []
+            for attempt in attempts_by_gate.get(str(gate.id), []):
+                if attempt.status != "failed":
+                    break
+                trailing.append(attempt)
+            n = len(trailing)
+            if n < VERIFICATION_ATTEMPT_LIMIT or n % VERIFICATION_ATTEMPT_LIMIT:
+                continue
+            key = f"run:{run.id}:ask_human:verification_exhausted:{gate.id}:{n // VERIFICATION_ATTEMPT_LIMIT}"
+            if await self.orchestration._existing_action_for_key(db, run.id, key) is not None:
+                continue
+            action = await self.orchestration.execute_ask_human_action(db, run.id, {
+                "action_type": "ask_human",
+                "question": (
+                    f"Verification of {gate.gate_type} gate {gate.id} (criterion {gate.success_criterion_key}) failed "
+                    f"{n} times; last error: {trailing[0].error or 'unknown'}. How should it proceed?"
+                ),
+                "gate_id": str(gate.id), "reason": "Verification attempts exhausted.",
+            }, key)
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "needs_attention"}
             run.supervision_state = state
             return {"outcome": "needs_attention", "action_id": str(action.id)}
-        if active_meeting is not None or active_graph_run is not None:
-            source_type, source_id = ("meeting", active_meeting.id) if active_meeting is not None else ("graph", active_graph_run.id)
-            state["last_assessment"] = {"at": now.isoformat(), "outcome": "durable_source_active", "source_type": source_type, "source_id": str(source_id)}
-            run.supervision_state = state
-            return {"outcome": "durable_source_active", "source_type": source_type, "source_id": str(source_id)}
         due = [wait for wait in waits if is_due(wait)]
         if due:
             wait = due[0]
@@ -534,17 +622,36 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "due_fallback", "wait_id": str(wait.id)}
             run.supervision_state = state
             return {"outcome": "due_fallback", "fallback": fallback, "action_id": str(action.id)}
+        task_by_id = {str(t.id): t for t in active_tasks}
+        held = (
+            {str(i) for i in provider_task_ids} | {str(i) for i in sessions_by_task}
+            | {tid for tid, t in task_by_id.items() if any(str(d) in task_by_id for d in (t.depends_on or []))}
+        )
+        # A gate whose owner question is pending is not actionable (ask_human links decision -> gate via the action).
+        pending = (await db.execute(select(OrchestrationAuthorityDecision.id, OrchestrationAuthorityDecision.related_gate_id).where(
+            OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending"))).all()
+        held |= {str(g) for _, g in pending if g is not None}
+        if pending:
+            held |= {str((a.request or {}).get("gate_id")) for a in (await db.scalars(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human",
+                OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()} - {"None", ""}
         future = [wait for wait in waits if not is_due(wait)]
+        proactive = (
+            plan_accepted
+            and (future or active_meeting is not None or active_graph_run is not None)
+            and all((w.owner or {}).get("type") in SYSTEM_WAIT_OWNER_TYPES for w in future)
+            and await self._has_proactive_work(active_tasks, situation_getter, held)
+        )
+        if proactive:
+            result = await self._proactive_outcome(db, run, await situation_getter(), held, state, now)
+            if result is not None:
+                return result
+        if active_meeting is not None or active_graph_run is not None:
+            source_type, source_id = ("meeting", active_meeting.id) if active_meeting is not None else ("graph", active_graph_run.id)
+            state["last_assessment"] = {"at": now.isoformat(), "outcome": "durable_source_active", "source_type": source_type, "source_id": str(source_id)}
+            run.supervision_state = state
+            return {"outcome": "durable_source_active", "source_type": source_type, "source_id": str(source_id)}
         if future:
-            if (
-                all((w.owner or {}).get("type") in SYSTEM_WAIT_OWNER_TYPES for w in future)
-                and plan_accepted
-                and await self._has_proactive_work(active_tasks, situation_getter)
-                and not await self._nothing_new_since_last_wait(db, run, await situation_getter())
-            ):
-                state["last_assessment"] = {"at": now.isoformat(), "outcome": "continue"}
-                run.supervision_state = state
-                return {"outcome": "continue"}
             wait = future[0]
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "waiting", "wait_id": str(wait.id)}
             run.supervision_state = state
@@ -556,7 +663,12 @@ class OrchestrationSupervisionService:
         has_open_gate = await db.scalar(select(OrchestrationGate.id).where(
             OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open"
         ).limit(1)) is not None
-        if allow_release and not active_tasks and plan_accepted and not has_open_gate:
+        from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
+        # Closeout rejects unfulfilled meeting commitments; let the orchestrator see them instead of idling.
+        open_commitments = [c for c in await meeting_commitments(db, run) if not c["fulfilled"]]
+        commitments_open = bool(open_commitments)
+        idle_commitments = open_commitments if not active_tasks else []  # in-flight work already drives the run
+        if allow_release and not active_tasks and plan_accepted and not has_open_gate and not commitments_open:
             fingerprint = self.orchestration._stable_hash({"plan": run.plan_state, "run_id": str(run.id)})
             run.active_blockers = [blocker for blocker in run.active_blockers if not (
                 isinstance(blocker, Mapping) and blocker.get("kind") == "everyone_idle"
@@ -568,6 +680,10 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "closeout_ready", "fingerprint": fingerprint}
             run.supervision_state = state
             return {"outcome": "closeout_ready", "action_id": str(action.id), "fingerprint": fingerprint}
+        if plan_accepted and (idle_commitments or await self._has_proactive_work(active_tasks, situation_getter, held)):
+            result = await self._proactive_outcome(db, run, await situation_getter(), held, state, now, idle_commitments)
+            if result is not None:
+                return result
         state["last_assessment"] = {"at": now.isoformat(), "outcome": "continue"}
         run.supervision_state = state
         return {"outcome": "continue"}
@@ -610,8 +726,23 @@ class OrchestrationSupervisionService:
             canonical["source_session_id"] = str(source) if source else None
             key = self.orchestration._follow_up_delegation_key(run.id, canonical)
         else:
-            digest = self.orchestration._stable_hash({"origin": origin, "request": canonical, "contract": disposition["contract_version"]})
+            if kind == "ask_human":  # same question replays regardless of origin
+                question = " ".join(str(canonical.get("question") or "").split()).lower()
+                basis = {"question": question, "gate_id": request.get("gate_id")}
+                # An identical question after the previous one was answered is a new ask.
+                answered = await db.scalar(select(func.count()).select_from(OrchestrationAction).join(
+                    OrchestrationAuthorityDecision, OrchestrationAuthorityDecision.id == OrchestrationAction.target_id).where(
+                    OrchestrationAction.run_id == run.id, OrchestrationAuthorityDecision.status != "pending",
+                    OrchestrationAction.idempotency_key.like(
+                        f"run:{run.id}:kind:supervision:ask_human:origin:{self.orchestration._stable_hash(basis)}%"))) or 0
+            else:
+                basis = {"origin": origin, "request": canonical, "contract": disposition["contract_version"]}
+            digest = self.orchestration._stable_hash(basis)
             key = f"run:{run.id}:kind:supervision:{kind}:origin:{digest}"
+            if kind == "ask_human" and answered:
+                key += f":{answered}"
+            if kind == "verify":
+                key += await self.orchestration.verification_attempt_suffix(db, run.id, canonical.get("gate_id"))
         action = await self.orchestration.reserve_action(db, run_id=run.id, idempotency_key=key, action_type=action_type, request=canonical)
         self._set_contract(action, goal, run, origin, key, disposition, reason)
         await db.flush()
@@ -625,18 +756,7 @@ class OrchestrationSupervisionService:
 
     @staticmethod
     def _mapping(kind, request, reason):
-        mapping = {
-            "continue": ("execute_noop_action", "noop", {"action_type": "noop", "reason": reason}),
-            "pause": ("execute_pause_run_action", "pause_run", {"action_type": "pause_run", "reason": reason}),
-            "follow_up": ("execute_create_delegation_task_action", "create_delegation_task", {"action_type": "create_delegation_task", **request, "work_function": "follow_up"}),
-            "verify": ("execute_request_verification_action", "request_verification", {"action_type": "request_verification", **request}),
-            "reassign": ("execute_reassign_task_action", "reassign_task", {"action_type": "reassign_task", **request}),
-            "meeting": ("execute_schedule_meeting_action", "schedule_meeting", {"action_type": "schedule_meeting", **request}),
-            "graph": ("execute_start_graph_action", "start_graph", {"action_type": "start_graph", **request}),
-            "replan": ("execute_request_roadmap_replan_action", "request_roadmap_replan", {"action_type": "request_roadmap_replan", **request, "reason": reason}),
-            "attention": ("execute_record_warning_action", "record_warning", {"action_type": "record_warning", "warning_type": "supervision_attention", "severity": "warning", "message": reason}),
-        }
-        return mapping[kind]
+        return _disposition_table(request, reason)[kind]
 
     @staticmethod
     def _set_contract(action, goal, run, origin, key, disposition, _reason):

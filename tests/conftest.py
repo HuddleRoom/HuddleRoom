@@ -20,7 +20,8 @@ os.environ["HOME"] = tempfile.mkdtemp(prefix="huddleroom-test-home-")
 
 
 def _strip_config_env(environ=os.environ):
-    for key in [k for k in environ if k.startswith(("HUDDLEROOM_", "RALLY_"))]:
+    # HUDDLEROOM_LIVE_EVAL is the explicit opt-in for tests/live/ and is not a Settings field.
+    for key in [k for k in environ if k.startswith(("HUDDLEROOM_", "RALLY_")) and k != "HUDDLEROOM_LIVE_EVAL"]:
         del environ[key]
 
 

@@ -338,34 +338,256 @@ async def test_recover_run_stops_creating_work_after_repeated_failure_escalation
     assert await db_session.scalar(select(count(Session.id)).where(Session.task_id == sibling_failed_task.id)) == 1
 
 
-@pytest.mark.asyncio
-async def test_recover_run_marks_blocked_task_and_asks_human_once(db_session, test_project):
-    developer = _agent("developer", "developer", ["implementation"])
-    db_session.add(developer)
-    await db_session.flush()
-    service, goal, run = await _make_run(db_session, test_project.id)
+async def _blocked_setup(db_session, project, *, agent=None, reason=None, authorize=True):
+    if agent is None:
+        agent = _agent("developer", "developer", ["implementation"])
+        db_session.add(agent)
+        await db_session.flush()
+    service, goal, run = await _make_run(db_session, project.id)
+    if authorize:
+        run.phase = "authorized"
     gate = await _make_gate(db_session, run.id)
     task = await _make_orchestrated_task(
-        db_session,
-        test_project.id,
-        run.id,
-        gate.id,
-        developer.id,
-        status="blocked",
+        db_session, project.id, run.id, gate.id, agent.id, status="blocked",
     )
+    if reason:
+        task.metadata_ = {**task.metadata_, "blocked": {"reason": reason, "at": datetime.now(timezone.utc).isoformat()}}
+        await db_session.flush()
+    return service, goal, run, task, agent
+
+
+async def _task_waits(db_session, run_id):
+    from huddleroom.models.orchestration import OrchestrationWait
+
+    return list((await db_session.scalars(
+        select(OrchestrationWait).where(OrchestrationWait.run_id == run_id).order_by(OrchestrationWait.created_at)
+    )).all())
+
+
+async def _assert_waiting(db_session, service, goal, run):
+    created = await service.recover_run(db_session, run.id, baseline_ready=True)
+    replay = await service.recover_run(db_session, run.id, baseline_ready=True)
+    waits = await _task_waits(db_session, run.id)
+    assert (created, replay) == (1, 0)
+    assert len(waits) == 1 and waits[0].awaited_event["event_type"] == "task.status_changed"
+    assert await _actions(db_session, run.id, "ask_human") == []
+    assert goal.status == "active" and run.status == "running"
+    return waits[0]
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_owner_only_asks_human_with_stored_reason_once(db_session, test_project):
+    service, goal, run, task, _ = await _blocked_setup(db_session, test_project, reason="Need the prod API key")
 
     created = await service.recover_run(db_session, run.id, baseline_ready=True)
     replay_created = await service.recover_run(db_session, run.id, baseline_ready=True)
     ask_actions = await _actions(db_session, run.id, "ask_human")
 
-    assert created == 1
-    assert replay_created == 0
-    assert goal.status == "blocked"
-    assert run.status == "blocked"
+    assert (created, replay_created) == (1, 0)
+    assert goal.status == "blocked" and run.status == "blocked"
     assert run.active_blockers[0]["kind"] == "task_blocked"
     assert run.active_blockers[0]["task_id"] == str(task.id)
     assert len(ask_actions) == 1
-    assert ask_actions[0].request["question"].startswith("Task is blocked")
+    assert ask_actions[0].request["question"] == (
+        'Task "Implementation work" is blocked: Need the prod API key. '
+        "What input or decision do you need to supply to unblock it?"
+    )
+    assert await _task_waits(db_session, run.id) == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_without_reason_says_so(db_session, test_project):
+    service, _goal, run, _task, _ = await _blocked_setup(db_session, test_project)
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    question = (await _actions(db_session, run.id, "ask_human"))[0].request["question"]
+    assert "is blocked: no reason was recorded." in question
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_unfinished_dependency_waits(db_session, test_project):
+    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="needs upstream")
+    dep = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, (await _make_gate(db_session, run.id)).id, agent.id, status="in_progress",
+    )
+    task.depends_on = [str(dep.id)]
+    await db_session.flush()
+
+    wait = await _assert_waiting(db_session, service, goal, run)
+
+    assert str(dep.id) in wait.fallback["expected_result"]
+    assert wait.owner["task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_done_dependency_is_not_a_wait(db_session, test_project):
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="why")
+    dep = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, (await _make_gate(db_session, run.id)).id, agent.id, status="done",
+    )
+    task.depends_on = [str(dep.id)]
+    await db_session.flush()
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert await _task_waits(db_session, run.id) == []
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_live_session_waits(db_session, test_project):
+    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="provider busy")
+    db_session.add(Session(
+        agent_id=agent.id, task_id=task.id, project_id=task.project_id, adapter_type="api",
+        status="running", input_context={}, metadata_={}, origin="auto",
+    ))
+    await db_session.flush()
+
+    await _assert_waiting(db_session, service, goal, run)
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_active_meeting_source_waits(db_session, test_project):
+    from huddleroom.models.meeting import Meeting
+
+    service, goal, run, task, _ = await _blocked_setup(db_session, test_project, reason="discussing")
+    db_session.add(Meeting(
+        project_id=test_project.id, title="Unblock", meeting_type="decision", status="active", source_task_id=task.id,
+    ))
+    await db_session.flush()
+
+    await _assert_waiting(db_session, service, goal, run)
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_missing_agent_reassigns(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+    original = _agent("original", "developer", ["implementation"], is_active=False)
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, _goal, run, task, _ = await _blocked_setup(db_session, test_project, agent=original, reason="no owner")
+
+    created = await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    await db_session.refresh(task)
+    assert created == 1
+    assert task.assigned_to == alternate.id
+    assert len(await _actions(db_session, run.id, "reassign_task")) == 1
+    assert await _actions(db_session, run.id, "ask_human") == []
+    assert run.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_no_alternate_agent_asks_human(db_session, test_project):
+    original = _agent("original", "developer", ["implementation"], is_active=False)
+    db_session.add(original)
+    await db_session.flush()
+    service, _goal, run, _task, _ = await _blocked_setup(db_session, test_project, agent=original, reason="no owner")
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+    assert await _actions(db_session, run.id, "reassign_task") == []
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_failed_latest_session_retries_once(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="crashed")
+    await _add_failed_session(db_session, task, agent.id)
+
+    created = await service.recover_run(db_session, run.id, baseline_ready=True)
+    # Re-block within the same episode: retry is spent, so the owner is asked.
+    task.status = "blocked"
+    for session in await db_session.scalars(select(Session).where(Session.task_id == task.id)):
+        session.status = "failed"
+    await db_session.flush()
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert created == 1
+    assert len(await _actions(db_session, run.id, "retry_task")) == 1
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+async def _with_dependency(db_session, project, run, task, agent, *, status="in_progress"):
+    dep = await _make_orchestrated_task(
+        db_session, project.id, run.id, (await _make_gate(db_session, run.id)).id, agent.id, status=status,
+    )
+    task.depends_on = [str(dep.id)]
+    await db_session.flush()
+    return dep
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_live_dependency_rewaits_after_each_expiry_and_never_asks(db_session, test_project):
+    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="stuck dependency")
+    dep = await _with_dependency(db_session, test_project, run, task, agent)
+
+    for expected_waits in (1, 2, 3):
+        await service.recover_run(db_session, run.id, baseline_ready=True)
+        waits = await _task_waits(db_session, run.id)
+        assert len(waits) == expected_waits and goal.status == "active"
+        assert waits[-1].awaited_event["matcher"] == {"task_id": str(dep.id)}
+        waits[-1].status = "cleared"
+        await db_session.flush()
+
+    assert await _actions(db_session, run.id, "ask_human") == []
+    assert run.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_asks_owner_once_wait_bound_is_exceeded(db_session, test_project):
+    from datetime import timedelta
+    from huddleroom.config import settings
+
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project)
+    await _with_dependency(db_session, test_project, run, task, agent)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    wait = (await _task_waits(db_session, run.id))[0]
+    wait.status = "cleared"
+    wait.created_at = datetime.now(timezone.utc) - timedelta(seconds=settings.orchestration_wake_max_seconds * 24 + 60)
+    await db_session.flush()
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert len(await _task_waits(db_session, run.id)) == 1
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+    assert run.status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_cancelled_dependency_is_not_awaiting(db_session, test_project):
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="dep failed")
+    await _with_dependency(db_session, test_project, run, task, agent, status="cancelled")
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert await _task_waits(db_session, run.id) == []
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_only_and_dependency_blocked_tasks_yield_one_ask_and_one_wait(db_session, test_project):
+    service, _goal, run, owner_task, agent = await _blocked_setup(db_session, test_project, reason="need a decision")
+    waiting_task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, (await _make_gate(db_session, run.id)).id, agent.id, status="blocked",
+    )
+    waiting_task.metadata_ = {**waiting_task.metadata_, "blocked": {"reason": "upstream", "at": datetime.now(timezone.utc).isoformat()}}
+    dep = await _with_dependency(db_session, test_project, run, waiting_task, agent)
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    waits = await _task_waits(db_session, run.id)
+    asks = await _actions(db_session, run.id, "ask_human")
+    assert len(asks) == 1 and "need a decision" in asks[0].request["question"]
+    assert len(waits) == 1 and waits[0].owner["task_id"] == str(waiting_task.id)
+    assert waits[0].awaited_event["matcher"] == {"task_id": str(dep.id)}
+    assert run.status == "blocked"
 
 
 @pytest.mark.asyncio
@@ -684,6 +906,319 @@ async def test_execute_reassign_task_action_restores_assignee_when_run_raises(
     assert task.assigned_to == original.id
     assert task.status == "failed"
     assert await db_session.scalar(select(count(Session.id)).where(Session.task_id == task.id)) == 0
+
+
+def _fake_task_run(calls=None, *, fail_with=None, mark_in_progress=False):
+    """Stand-in for TaskService.run: optionally flips status like the real run, then fails or creates a pending session."""
+
+    async def _run(self, db, project_id, task_id, **kwargs):
+        if calls is not None:
+            calls.append(task_id)
+        task = await db.get(Task, task_id)
+        if mark_in_progress:
+            task.status = "in_progress"
+            await db.flush()
+        if fail_with is not None:
+            raise fail_with
+        session = Session(
+            agent_id=task.assigned_to,
+            task_id=task.id,
+            project_id=project_id,
+            adapter_type="api",
+            status="pending",
+            input_context={},
+            metadata_={},
+            origin="manual",
+        )
+        db.add(session)
+        await db.flush()
+        return task, session.id
+
+    return _run
+
+
+async def _add_session_with_status(db_session, task: Task, agent_id, status: str) -> Session:
+    session = Session(
+        agent_id=agent_id,
+        task_id=task.id,
+        project_id=task.project_id,
+        adapter_type="api",
+        status=status,
+        input_context={},
+        metadata_={},
+        origin="manual",
+    )
+    db_session.add(session)
+    await db_session.flush()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_execute_reassign_blocked_task_preserves_description_metadata_and_sessions(
+    db_session,
+    test_project,
+    monkeypatch,
+):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+
+    original = _agent("developer", "developer", ["implementation"])
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, gate.id, original.id, status="blocked",
+    )
+    task.metadata_ = {**task.metadata_, "orchestration_contract": {"owner": "test"}}
+    await db_session.flush()
+    prior = await _add_failed_session(db_session, task, original.id)
+    description_before = task.description
+    plan_item_before = task.metadata_["orchestration_plan_item"]
+
+    action = await service.execute_reassign_task_action(
+        db_session,
+        run_id=run.id,
+        request={"action_type": "reassign_task", "task_id": str(task.id), "agent_id": str(alternate.id)},
+        idempotency_key=f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{alternate.id}",
+    )
+
+    await db_session.refresh(task)
+    await db_session.refresh(prior)
+    assert action.status == "completed"
+    assert calls == [task.id]
+    assert task.assigned_to == alternate.id
+    assert task.description == description_before
+    assert task.metadata_["orchestration_plan_item"] == plan_item_before
+    assert task.metadata_["orchestration_contract"] == {"owner": "test"}
+    assert task.metadata_["orchestration"]["plan_item_gate_id"] == str(gate.id)
+    assert prior.status == "failed"
+    assert prior.task_id == task.id
+    assert await db_session.scalar(select(count(Session.id)).where(Session.task_id == task.id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_retry_blocked_task_succeeds(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_service.TaskService.run",
+        _fake_task_run(calls, mark_in_progress=True),
+    )
+
+    agent = _agent("developer", "developer", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, gate.id, agent.id, status="blocked",
+    )
+
+    action = await service.execute_retry_task_action(
+        db_session,
+        run_id=run.id,
+        request={"action_type": "retry_task", "task_id": str(task.id)},
+        idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+    )
+
+    await db_session.refresh(task)
+    assert action.status == "completed"
+    assert calls == [task.id]
+    assert task.assigned_to == agent.id
+    assert task.status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_execute_retry_and_reassign_refuse_task_with_active_session(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+
+    original = _agent("developer", "developer", ["implementation"])
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, gate.id, original.id, status="blocked",
+    )
+    await _add_session_with_status(db_session, task, original.id, "running")
+
+    with pytest.raises(HTTPException) as retry_exc:
+        await service.execute_retry_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "retry_task", "task_id": str(task.id)},
+            idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+        )
+    assert retry_exc.value.status_code == 409
+
+    with pytest.raises(HTTPException) as reassign_exc:
+        await service.execute_reassign_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "reassign_task", "task_id": str(task.id), "agent_id": str(alternate.id)},
+            idempotency_key=f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{alternate.id}",
+        )
+    assert reassign_exc.value.status_code == 409
+
+    await db_session.refresh(task)
+    assert calls == []
+    assert task.status == "blocked"
+    assert task.assigned_to == original.id
+    assert [a.status for a in await _actions(db_session, run.id, "retry_task")] == ["failed"]
+    assert [a.status for a in await _actions(db_session, run.id, "reassign_task")] == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_execute_reassign_run_failure_restores_blocked_status_and_agent(
+    db_session,
+    test_project,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_service.TaskService.run",
+        _fake_task_run(fail_with=HTTPException(status_code=409, detail="reassign boom"), mark_in_progress=True),
+    )
+
+    original = _agent("developer", "developer", ["implementation"])
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, gate.id, original.id, status="blocked",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await service.execute_reassign_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "reassign_task", "task_id": str(task.id), "agent_id": str(alternate.id)},
+            idempotency_key=f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{alternate.id}",
+        )
+    assert exc.value.status_code == 409
+
+    await db_session.refresh(task)
+    reassign_actions = await _actions(db_session, run.id, "reassign_task")
+    assert [a.status for a in reassign_actions] == ["failed"]
+    assert task.status == "blocked"
+    assert task.assigned_to == original.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["in_progress", "ready", "done"])
+async def test_execute_retry_and_reassign_still_refuse_other_statuses(db_session, test_project, monkeypatch, status):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+
+    original = _agent("developer", "developer", ["implementation"])
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, gate.id, original.id, status=status,
+    )
+
+    with pytest.raises(HTTPException) as retry_exc:
+        await service.execute_retry_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "retry_task", "task_id": str(task.id)},
+            idempotency_key=f"run:{run.id}:kind:retry_task:task:{task.id}",
+        )
+    assert retry_exc.value.status_code == 409
+
+    with pytest.raises(HTTPException) as reassign_exc:
+        await service.execute_reassign_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "reassign_task", "task_id": str(task.id), "agent_id": str(alternate.id)},
+            idempotency_key=f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{alternate.id}",
+        )
+    assert reassign_exc.value.status_code == 409
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_retry_key_is_attempt_aware_and_same_attempt_replay_is_idempotent(
+    db_session,
+    test_project,
+    monkeypatch,
+):
+    calls: list = []
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_service.TaskService.run",
+        _fake_task_run(calls, fail_with=HTTPException(status_code=409, detail="retry boom")),
+    )
+
+    agent = _agent("developer", "developer", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id, status="failed")
+    first_key = f"run:{run.id}:kind:retry_task:task:{task.id}"
+
+    with pytest.raises(HTTPException):
+        await service.execute_retry_task_action(
+            db_session,
+            run_id=run.id,
+            request={"action_type": "retry_task", "task_id": str(task.id)},
+            idempotency_key=first_key,
+        )
+
+    # Second recovery after the failed first attempt: new key, new action.
+    await service._retry_failed_task_once(db_session, goal, run, task)
+    actions = await _actions(db_session, run.id, "retry_task")
+    assert len(actions) == 2
+    assert {a.idempotency_key for a in actions} == {first_key, f"{first_key}:a1"}
+    second = next(a for a in actions if a.idempotency_key == f"{first_key}:a1")
+    assert second.status == "failed"
+
+    # Replaying the same attempt returns the same action without creating another.
+    replay = await service.execute_retry_task_action(
+        db_session,
+        run_id=run.id,
+        request=second.request,
+        idempotency_key=second.idempotency_key,
+    )
+    assert replay.id == second.id
+    assert len(await _actions(db_session, run.id, "retry_task")) == 2
+
+
+@pytest.mark.asyncio
+async def test_reassign_key_is_attempt_aware_after_failed_first_attempt(
+    db_session,
+    test_project,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_service.TaskService.run",
+        _fake_task_run(fail_with=HTTPException(status_code=409, detail="reassign boom")),
+    )
+
+    original = _agent("developer", "developer", ["implementation"])
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(
+        db_session, test_project.id, run.id, gate.id, original.id, status="failed",
+    )
+
+    await service._reassign_or_ask_human(db_session, goal, run, task)
+    await service._reassign_or_ask_human(db_session, goal, run, task)
+
+    actions = await _actions(db_session, run.id, "reassign_task")
+    assert len(actions) == 2
+    base = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{alternate.id}"
+    assert {a.idempotency_key for a in actions} == {base, f"{base}:a1"}
 
 
 @pytest.mark.asyncio

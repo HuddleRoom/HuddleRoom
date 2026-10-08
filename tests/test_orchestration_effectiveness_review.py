@@ -3,7 +3,13 @@ from datetime import timedelta
 import json
 
 from huddleroom.models.base import _utcnow
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import (
+    OrchestrationAction,
+    OrchestrationEvidence,
+    OrchestrationGate,
+    OrchestrationGoal,
+    OrchestrationRun,
+)
 from huddleroom.models.orchestration_process import OrchestrationProcessRun, OrchestrationWarning
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -145,32 +151,161 @@ async def test_recovery_trigger_emits_every_qualifying_gate_in_stable_order(
     ]
 
 
+def _inactivity_tokens(triggers):
+    return [trigger.token for trigger in triggers if trigger.name == "inactivity"]
+
+
+NON_PROGRESS_ACTION_TYPES = (
+    "noop",
+    "record_warning",
+    "acknowledge_warning",
+    "resolve_warning",
+    "pause_run",
+    "ask_human",
+    "suggest_agent",
+    "decision_continuation",
+)
+
+
 @pytest.mark.asyncio
-async def test_inactivity_uses_latest_durable_action_or_expanded_task_update(db_session, test_project):
+async def test_repeated_noops_do_not_reset_inactivity(db_session, test_project):
     goal, run = await _goal_run(db_session, test_project)
-    run.started_at = _utcnow() - timedelta(hours=25)
-    latest_progress = _utcnow() - timedelta(hours=25)
+    run_started = _utcnow() - timedelta(hours=25)
+    run.started_at = run_started
+    db_session.add_all(
+        OrchestrationAction(
+            run_id=run.id,
+            idempotency_key=f"noop-{offset}",
+            action_type="noop",
+            status="completed",
+            request={},
+            created_at=_utcnow() - timedelta(hours=1),
+        )
+        for offset in range(3)
+    )
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == [run_started.isoformat()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action_type", NON_PROGRESS_ACTION_TYPES)
+async def test_non_progress_action_types_do_not_reset_inactivity(db_session, test_project, action_type):
+    goal, run = await _goal_run(db_session, test_project)
+    run_started = _utcnow() - timedelta(hours=25)
+    run.started_at = run_started
     db_session.add(
         OrchestrationAction(
             run_id=run.id,
-            idempotency_key="recent-action",
-            action_type="noop",
+            idempotency_key="non-progress",
+            action_type=action_type,
+            status="completed",
             request={},
-            created_at=latest_progress,
+            created_at=_utcnow() - timedelta(hours=1),
         )
     )
     await db_session.flush()
 
     triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
 
-    assert [(trigger.name, trigger.token) for trigger in triggers] == [
-        ("inactivity", latest_progress.isoformat()),
-    ]
+    assert _inactivity_tokens(triggers) == [run_started.isoformat()]
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["reserved", "failed"])
+async def test_uncompleted_progress_action_does_not_reset_inactivity(db_session, test_project, status):
+    goal, run = await _goal_run(db_session, test_project)
+    run_started = _utcnow() - timedelta(hours=25)
+    run.started_at = run_started
+    db_session.add(
+        OrchestrationAction(
+            run_id=run.id,
+            idempotency_key="uncompleted",
+            action_type="retry_task",
+            status=status,
+            request={},
+            created_at=_utcnow() - timedelta(hours=1),
+        )
+    )
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == [run_started.isoformat()]
+
+
+@pytest.mark.asyncio
+async def test_completed_progress_action_resets_inactivity(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    run.started_at = _utcnow() - timedelta(hours=25)
+    db_session.add(
+        OrchestrationAction(
+            run_id=run.id,
+            idempotency_key="progress",
+            action_type="retry_task",
+            status="completed",
+            request={},
+            created_at=_utcnow() - timedelta(hours=1),
+        )
+    )
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == []
+
+
+@pytest.mark.asyncio
+async def test_task_completed_at_resets_inactivity(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    run.started_at = _utcnow() - timedelta(hours=25)
     task = Task(
         project_id=test_project.id,
-        title="Finished recently",
+        title="Completed recently",
         status="done",
+        completed_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add(task)
+    await db_session.flush()
+    run.plan_state = {"expanded_items": [{"task_id": str(task.id), "gate_id": "gate-one"}]}
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == []
+
+
+@pytest.mark.asyncio
+async def test_task_started_at_from_run_metadata_resets_inactivity(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    run.started_at = _utcnow() - timedelta(hours=25)
+    db_session.add(
+        Task(
+            project_id=test_project.id,
+            title="Started via metadata",
+            status="in_progress",
+            started_at=_utcnow() - timedelta(hours=1),
+            metadata_={"orchestration": {"run_id": str(run.id)}},
+        )
+    )
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == []
+
+
+@pytest.mark.asyncio
+async def test_bare_task_updated_at_bump_does_not_reset_inactivity(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    run_started = _utcnow() - timedelta(hours=25)
+    run.started_at = run_started
+    task = Task(
+        project_id=test_project.id,
+        title="Touched recently",
+        status="in_progress",
         updated_at=_utcnow(),
     )
     db_session.add(task)
@@ -178,9 +313,67 @@ async def test_inactivity_uses_latest_durable_action_or_expanded_task_update(db_
     run.plan_state = {"expanded_items": [{"task_id": str(task.id), "gate_id": "gate-one"}]}
     await db_session.flush()
 
-    refreshed = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
 
-    assert "inactivity" not in [trigger.name for trigger in refreshed]
+    assert _inactivity_tokens(triggers) == [run_started.isoformat()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp_field", ["accepted_at", "failed_at"])
+async def test_gate_decision_resets_inactivity(db_session, test_project, timestamp_field):
+    goal, run = await _goal_run(db_session, test_project)
+    run.started_at = _utcnow() - timedelta(hours=25)
+    gate_status = "accepted" if timestamp_field == "accepted_at" else "failed"
+    db_session.add_all(
+        (
+            OrchestrationGate(
+                run_id=run.id,
+                success_criterion_key="decided",
+                gate_type="implementation",
+                status=gate_status,
+                **{timestamp_field: _utcnow() - timedelta(hours=1)},
+            ),
+            OrchestrationGate(
+                run_id=run.id,
+                success_criterion_key="still-open",
+                gate_type="implementation",
+                status="open",
+            ),
+        )
+    )
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_updated_at_resets_inactivity(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    run.started_at = _utcnow() - timedelta(hours=25)
+    gate = OrchestrationGate(
+        run_id=run.id,
+        success_criterion_key="evidenced",
+        gate_type="implementation",
+        status="open",
+    )
+    db_session.add(gate)
+    await db_session.flush()
+    db_session.add(
+        OrchestrationEvidence(
+            run_id=run.id,
+            gate_id=gate.id,
+            source_type="test_run",
+            created_at=_utcnow() - timedelta(hours=25),
+            updated_at=_utcnow() - timedelta(hours=1),
+        )
+    )
+    await db_session.flush()
+
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+
+    assert _inactivity_tokens(triggers) == []
 
 
 @pytest.mark.asyncio

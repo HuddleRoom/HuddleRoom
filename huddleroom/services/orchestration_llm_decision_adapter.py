@@ -28,9 +28,12 @@ PROGRESS_CONTRACT = (
     "Progress duty: move the goal to completion. Every decision must advance or unblock a success criterion. "
     "Wait only when every useful action is blocked on a named event or time.\n"
     "Fresh run (no accepted plan and no orchestrated work): normally request_plan to the best planning agent in the roster. "
-    "Use request_human_decision only when a missing owner decision truly blocks starting. "
+    "Use ask_human only when a missing owner decision truly blocks starting, and ask the owner the exact question. "
     "If a plan task is already in flight, wait for it.\n"
-    "Run with history: review progress_view and untracked_follow_ups. Handle the first untracked follow-up. "
+    "Run with history: review progress_view and untracked_follow_ups. "
+    "Handle the highest-impact actionable follow-up; the list is already ranked. "
+    "A blocked item names its dependency — defer it and continue independent work. "
+    "After an unsuccessful wake, your diagnosis or action must differ from last time. "
     "Otherwise start work on a no_work criterion. Otherwise verify an evidence_pending criterion. "
     "Never create a second task for something that already has one. "
     "When you create a task for a criterion or a meeting action item, add criterion:<key> or meeting_action_item:<id> "
@@ -38,9 +41,14 @@ PROGRESS_CONTRACT = (
     'Authority: run.phase == "authorized" means the owner explicitly started the goal. Earlier "prepare only" or '
     '"do not start" wording is satisfied by that start. Specific restrictions still bind: live sends or messages, '
     "spending, purchases, account changes, publishing, and destructive operations. "
-    "Route those actions to request_human_decision.\n"
+    "Route those actions to ask_human with the exact question for the owner.\n"
     "Waiting: a wait (noop on the decision path, continue on the supervision path) must carry wake_when.\n"
-    "Reason: the reason states how the action advances the goal."
+    "Reason: Top-level reason is required where the action schema lists it; otherwise it is optional but recommended. "
+    "When present it states how the action advances or unblocks the goal."
+)
+# Decision-path only: the supervision prompt must not mention applies_decision_id as an instruction.
+DECISION_FOLLOW_UP_CONTRACT = (
+    "When acting on an answered_decision follow-up, set top-level applies_decision_id to that decision's id."
 )
 # ponytail: backward compatibility alias for code that may import _redact_secrets directly
 _redact_secrets = redact_secrets
@@ -127,7 +135,8 @@ def build_orchestration_decision_messages(context: Mapping[str, Any], *, project
         "Return exactly one JSON object with this shape: "
         '{"decision":{"action_type":"<allowed type>", ...required fields, "reason":"how this advances the goal"}}. '
         "The decision object must use one allowed action schema. "
-        "Top-level reason is optional for every action."
+        "Top-level reason is required where the action schema lists it; otherwise it is optional but recommended. "
+        "When present it states how the action advances or unblocks the goal."
     )
     wake_when = (
         'A wait requires wake_when. noop is a wait and must carry wake_when shaped {"events":[{"event_type":"<event>",'
@@ -141,6 +150,8 @@ def build_orchestration_decision_messages(context: Mapping[str, Any], *, project
         restrictions
         + "\n\n"
         + PROGRESS_CONTRACT
+        + "\n\n"
+        + DECISION_FOLLOW_UP_CONTRACT
         + "\n\n"
         + shape
         + "\n\n"

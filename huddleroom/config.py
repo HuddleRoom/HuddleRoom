@@ -7,7 +7,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
-from pydantic import Field, PrivateAttr, ValidationError, field_validator
+from pydantic import Field, PrivateAttr, ValidationError, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     DotEnvSettingsSource,
@@ -177,6 +177,8 @@ class Settings(BaseSettings):
     orchestration_reconcile_interval_seconds: int = Field(default=30, ge=1)
     orchestration_event_coalesce_seconds: int = Field(default=1, ge=1)
     orchestration_semantic_progress_seconds: int = Field(default=120, ge=1)
+    orchestration_judgment_timeout_seconds: int = Field(default=360, ge=1)
+    orchestration_judgment_lease_seconds: int = Field(default=420, ge=1)
     orchestration_sweep_goal_limit: int = Field(default=100, ge=1)
     orchestration_sweep_seconds_limit: int = Field(default=5, ge=1)
     orchestration_wake_max_seconds: int = Field(default=3600, ge=1)
@@ -191,6 +193,19 @@ class Settings(BaseSettings):
     onecli_gateway_url: str = "http://127.0.0.1:10255"
     onecli_native_auth_runtimes: list[str] = Field(default=["claude_code", "codex"])
     _setting_names: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_judgment_lease(self):
+        floor = self.orchestration_judgment_timeout_seconds + self.orchestration_reconcile_interval_seconds
+        if "orchestration_judgment_lease_seconds" not in self.model_fields_set:
+            # Unset lease: derive it from the timeout and reconcile interval so the default never breaks startup.
+            self.orchestration_judgment_lease_seconds = max(self.orchestration_judgment_lease_seconds, floor + 30)
+        elif self.orchestration_judgment_lease_seconds <= floor:
+            raise ValueError(
+                "orchestration_judgment_lease_seconds must exceed "
+                "orchestration_judgment_timeout_seconds + orchestration_reconcile_interval_seconds"
+            )
+        return self
 
     @field_validator("onecli_management_url", "onecli_gateway_url")
     @classmethod

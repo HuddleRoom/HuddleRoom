@@ -14,14 +14,28 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
 from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
 from huddleroom.services.orchestration_steering import OrchestrationSteeringService
+
+
+def _without_load(value):
+    """Copy of value with every dict key named "load" removed, recursively."""
+    if isinstance(value, dict):
+        return {k: _without_load(v) for k, v in value.items() if k != "load"}
+    if isinstance(value, list):
+        return [_without_load(v) for v in value]
+    return value
 
 
 def _value(value):
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value) if hasattr(value, "hex") else deepcopy(value)
+
+
+_TIMESTAMPS_FULL = ("created_at", "updated_at", "started_at", "completed_at")
 
 
 def _row(row, *fields):
@@ -79,14 +93,14 @@ class OrchestrationSupervisionContextBuilder:
             "goal": _row(goal, "id", "objective", "status", "goal_type", "success_criteria", "constraints"),
             "run": _row(run, "id", "goal_id", "status", "phase", "plan_state", "budget_state", "active_blockers"),
             "contracts": [{"action_id": str(row.id), "status": row.status, "contract": deepcopy(row.dispatch_contract)} for row in actions if row.dispatch_contract],
-            "actions": [_row(row, "id", "action_type", "status", "request", "dispatch_contract", "budget_ledger", "error") for row in actions],
-            "tasks": [_row(row, "id", "title", "status", "assigned_to", "depends_on", "metadata_") for row in tasks],
-            "sessions": [_row(row, "id", "task_id", "agent_id", "status", "error", "origin") for row in sessions],
-            "meetings": [_row(row, "id", "source_task_id", "title", "status", "meeting_type") for row in meetings],
+            "actions": [_row(row, "id", "action_type", "status", "request", "dispatch_contract", "budget_ledger", "error", "created_at", "updated_at") for row in actions],
+            "tasks": [_row(row, "id", "title", "status", "assigned_to", "depends_on", "metadata_", *_TIMESTAMPS_FULL) for row in tasks],
+            "sessions": [_row(row, "id", "task_id", "agent_id", "status", "error", "origin", "created_at", "started_at") for row in sessions],
+            "meetings": [_row(row, "id", "source_task_id", "title", "status", "meeting_type", "created_at", "updated_at") for row in meetings],
             "meeting_decisions": [_row(row, "id", "meeting_id", "chosen_option", "is_vetoed", "is_partial") for row in meeting_decisions],
             "graphs": [_row(row, "id", "name", "version", "is_active", "definition") for row in graphs],
-            "graph_runs": [_row(row, "id", "graph_id", "linked_task_id", "status", "current_node") for row in graph_runs],
-            "gates": [_row(row, "id", "gate_type", "success_criterion_key", "status", "required_evidence", "failure_reason") for row in gates],
+            "graph_runs": [_row(row, "id", "graph_id", "linked_task_id", "status", "current_node", *_TIMESTAMPS_FULL) for row in graph_runs],
+            "gates": [_row(row, "id", "gate_type", "success_criterion_key", "status", "required_evidence", "failure_reason", "created_at", "updated_at") for row in gates],
             "evidence": [_row(row, "id", "gate_id", "source_type", "source_id", "producer_agent_id", "verdict", "evidence_metadata") for row in evidence],
             "authority_decisions": [_row(row, "id", "decision_key", "status", "authority", "question", "context", "options", "recommendation", "selected_option", "reason", "consequences", "runtime_identity", "contract_version", "continuation", "related_gate_id") for row in decisions],
             "waits": [_row(row, "id", "wait_key", "status", "owner", "awaited_event", "due_recheck_at", "fallback") for row in waits],
@@ -101,9 +115,11 @@ class OrchestrationSupervisionContextBuilder:
         # ponytail: ~9 extra reads per local tick per running goal; cache per run if it ever shows up in profiles.
         situation = await OrchestrationProgressView().build_safe(db, goal, run)
         snapshot.update(situation.as_context())
+        snapshot["meeting_commitments"] = await meeting_commitments(db, run)
         steering = await OrchestrationSteeringService().context_snapshot(db, goal, run)
         if steering:
             snapshot["steering"] = steering
+        snapshot["roster"] = await OrchestrationRosterMapper().context_snapshot(db, goal.project_id)
         return snapshot
 
     async def build_for_provider(self, db: AsyncSession, goal, run: OrchestrationRun, *, string_limit: int = 4000) -> dict:
@@ -116,7 +132,8 @@ class OrchestrationSupervisionContextBuilder:
 
     @staticmethod
     def fingerprint_snapshot(snapshot: dict) -> str:
-        return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+        # roster "load" is volatile and must not change the fingerprint
+        return hashlib.sha256(json.dumps(_without_load(snapshot), sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
     @classmethod
     def provider_snapshot(cls, snapshot: dict, *, string_limit: int = 4000) -> dict:

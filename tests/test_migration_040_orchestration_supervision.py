@@ -266,6 +266,8 @@ def test_models_export_the_same_durable_contract():
         "orchestration_semantic_progress_seconds",
         "orchestration_sweep_goal_limit",
         "orchestration_sweep_seconds_limit",
+        "orchestration_judgment_timeout_seconds",
+        "orchestration_judgment_lease_seconds",
     ],
 )
 def test_settings_reject_zero_supervision_limits(field_name):

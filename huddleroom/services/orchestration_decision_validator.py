@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import UUID
 
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
@@ -13,26 +14,15 @@ ALLOWED_ACTION_SCHEMAS: dict[str, frozenset[str]] = {
     "request_plan_revision": frozenset({"plan_task_id", "revision_request"}),
     "accept_plan": frozenset({"plan_artifact_id"}),
     "create_delegation_task": frozenset({"agent_id", "deliverable", "scope", "work_function"}),
-    "expand_plan_item": frozenset({"plan_item_id", "work_function"}),
-    "open_gate": frozenset({"gate_type", "required_evidence", "success_criterion_key"}),
     "request_verification": frozenset({"gate_id", "work_function"}),
     "retry_task": frozenset({"task_id"}),
     "reassign_task": frozenset({"agent_id", "task_id"}),
-    "request_split": frozenset({"reason", "task_id"}),
     "schedule_meeting": frozenset({"participant_agent_ids", "topic"}),
     "start_graph": frozenset({"graph_id", "subject_id", "subject_type"}),
     "ask_human": frozenset({"question"}),
     "pause_run": frozenset({"reason"}),
-    "complete_run": frozenset({"reason"}),
-    "request_final_summary": frozenset({"work_function"}),
     "suggest_agent": frozenset({"missing_work_function", "reason"}),
-    "request_human_decision": frozenset({"title", "question"}),
-    "request_manager_decision": frozenset({"title", "question"}),
-    "record_authority_decision": frozenset({"decision_id", "artifact_id"}),
-    "cancel_pending_decision": frozenset({"decision_id", "reason"}),
     "record_warning": frozenset({"warning_type", "severity", "message"}),
-    "acknowledge_warning": frozenset({"warning_id", "reason", "decided_by_user_id"}),
-    "resolve_warning": frozenset({"warning_id", "reason"}),
 }
 
 OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
@@ -71,8 +61,6 @@ OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
             "suggested_system_prompt_outline",
         }
     ),
-    "request_human_decision": frozenset({"options", "context", "recommendation", "consequences"}),
-    "request_manager_decision": frozenset({"options", "context", "recommendation", "consequences"}),
     "record_warning": frozenset(
         {"run_id", "source_process_run_id", "related_gate_id", "related_action_id", "related_agent_id"}
     ),
@@ -90,7 +78,7 @@ FORBIDDEN_ARTIFACT_KEYS = {
     "file_content",
 }
 
-OPTIONAL_TOP_LEVEL_DECISION_KEYS = frozenset({"action_type", "reason"})
+OPTIONAL_TOP_LEVEL_DECISION_KEYS = frozenset({"action_type", "reason", "applies_decision_id"})
 
 MAX_VALIDATION_DEPTH = 64
 PLAN_WORK_FUNCTION = "planning"
@@ -154,14 +142,8 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
             f"Decision 'request_plan' work_function must be '{PLAN_WORK_FUNCTION}'",
         )
 
-    if (
-        action_type == "request_final_summary"
-        and str(decision.get("work_function")).strip() != FINAL_SUMMARY_WORK_FUNCTION
-    ):
-        return DecisionValidationResult(
-            False,
-            "Decision 'request_final_summary' work_function must be 'summarization'",
-        )
+    if "applies_decision_id" in decision and not _is_uuid_string(decision["applies_decision_id"]):
+        return DecisionValidationResult(False, "applies_decision_id must be a UUID")
 
     if action_type == "retry_task":
         for key in ("timeout", "max_tokens"):
@@ -169,6 +151,16 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
                 return DecisionValidationResult(False, f"Decision 'retry_task' {key} must be a positive integer")
 
     return DecisionValidationResult(True)
+
+
+def _is_uuid_string(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _is_missing_required_value(value: Any) -> bool:

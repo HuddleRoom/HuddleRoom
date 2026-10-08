@@ -40,17 +40,6 @@ ALLOWED_DECISIONS = {
         "scope": "Implement the accepted plan item.",
         "deliverable": "A task result containing changed file paths and verification output.",
     },
-    "expand_plan_item": {
-        "action_type": "expand_plan_item",
-        "plan_item_id": "item-1",
-        "work_function": "implementation",
-    },
-    "open_gate": {
-        "action_type": "open_gate",
-        "success_criterion_key": "tests-pass",
-        "gate_type": "validation_passed",
-        "required_evidence": {"required_source_types": ["task"], "min_count": 1},
-    },
     "request_verification": {
         "action_type": "request_verification",
         "gate_id": _id(),
@@ -58,11 +47,6 @@ ALLOWED_DECISIONS = {
     },
     "retry_task": {"action_type": "retry_task", "task_id": _id()},
     "reassign_task": {"action_type": "reassign_task", "task_id": _id(), "agent_id": _id()},
-    "request_split": {
-        "action_type": "request_split",
-        "task_id": _id(),
-        "reason": "The assigned task is too broad for one agent pass.",
-    },
     "schedule_meeting": {
         "action_type": "schedule_meeting",
         "topic": "Resolve contradictory validation outputs.",
@@ -76,37 +60,28 @@ ALLOWED_DECISIONS = {
     },
     "ask_human": {"action_type": "ask_human", "question": "Which agent should validate this gate?"},
     "pause_run": {"action_type": "pause_run", "reason": "Repeated failure threshold reached."},
-    "complete_run": {"action_type": "complete_run", "reason": "All gates are accepted."},
-    "request_final_summary": {
-        "action_type": "request_final_summary",
-        "work_function": "summarization",
-    },
     "suggest_agent": {
         "action_type": "suggest_agent",
         "missing_work_function": "validation",
         "reason": "No active agent can provide independent validation.",
     },
-    "request_human_decision": {
-        "action_type": "request_human_decision",
-        "title": "Continue without independent verifier?",
-        "question": "No safe independent validation agent exists. How should we proceed?",
-    },
-    "request_manager_decision": {
-        "action_type": "request_manager_decision",
-        "title": "Approve revised scope?",
-        "question": "The clarified scope changes required work functions. Approve?",
-    },
-    "record_authority_decision": {
-        "action_type": "record_authority_decision",
-        "decision_id": _id(),
-        "artifact_id": _id(),
-    },
-    "cancel_pending_decision": {
-        "action_type": "cancel_pending_decision",
-        "decision_id": _id(),
-        "reason": "Goal scope changed before the manager could answer.",
-    },
 }
+
+# Schema-only types were removed: no executor exists, so the dispatcher silently
+# dropped them. Each must now be rejected as unknown.
+REMOVED_ACTION_TYPES = (
+    "expand_plan_item",
+    "open_gate",
+    "request_split",
+    "complete_run",
+    "request_final_summary",
+    "request_human_decision",
+    "request_manager_decision",
+    "record_authority_decision",
+    "cancel_pending_decision",
+    "acknowledge_warning",
+    "resolve_warning",
+)
 
 
 @pytest.mark.parametrize("action_type", sorted(ALLOWED_DECISIONS))
@@ -122,6 +97,14 @@ def test_unknown_action_type_is_rejected():
 
     assert result.accepted is False
     assert result.rejection_reason == "Unknown orchestration action type 'write_code'"
+
+
+@pytest.mark.parametrize("action_type", REMOVED_ACTION_TYPES)
+def test_removed_schema_only_action_types_are_rejected_as_unknown(action_type):
+    result = validate_orchestration_decision({"action_type": action_type, "reason": "Attempt."})
+
+    assert result.accepted is False
+    assert result.rejection_reason == f"Unknown orchestration action type '{action_type}'"
 
 
 @pytest.mark.parametrize(
@@ -272,25 +255,13 @@ def test_missing_required_field_is_rejected():
     assert result.rejection_reason == "Decision 'request_plan' missing required fields: agent_id, scope"
 
 
-@pytest.mark.parametrize(
-    ("action_type", "work_function", "expected_function"),
-    [
-        ("request_plan", "implementation", "planning"),
-        ("request_final_summary", "implementation", "summarization"),
-    ],
-    ids=["request_plan", "request_final_summary"],
-)
-def test_work_function_must_match_action_type(action_type, work_function, expected_function):
-    decision = {"action_type": action_type, "work_function": work_function}
-    if action_type == "request_plan":
-        decision.update({"agent_id": _id(), "scope": "Ask an agent for a plan."})
+def test_request_plan_work_function_must_be_planning():
+    decision = {"action_type": "request_plan", "work_function": "implementation", "agent_id": _id(), "scope": "Ask an agent for a plan."}
 
     result = validate_orchestration_decision(decision)
 
     assert result.accepted is False
-    assert result.rejection_reason == (
-        f"Decision '{action_type}' work_function must be '{expected_function}'"
-    )
+    assert result.rejection_reason == "Decision 'request_plan' work_function must be 'planning'"
 
 
 @pytest.mark.parametrize(
@@ -301,13 +272,8 @@ def test_work_function_must_match_action_type(action_type, work_function, expect
             "participant_agent_ids",
         ),
         (
-            {
-                "action_type": "open_gate",
-                "success_criterion_key": "tests-pass",
-                "gate_type": "validation_passed",
-                "required_evidence": {},
-            },
-            "required_evidence",
+            {"action_type": "schedule_meeting", "topic": "Resolve contradictory validation outputs.", "participant_agent_ids": {}},
+            "participant_agent_ids",
         ),
     ],
 )
@@ -399,10 +365,12 @@ def test_first_forbidden_sibling_in_document_order_is_reported():
 def test_ambiguous_coordination_keys_are_allowed(coordination_key):
     result = validate_orchestration_decision(
         {
-            "action_type": "open_gate",
-            "success_criterion_key": "tests-pass",
-            "gate_type": "validation_passed",
-            "required_evidence": {coordination_key: {"required_source_types": ["task"], "min_count": 1}},
+            "action_type": "create_delegation_task",
+            "agent_id": _id(),
+            "work_function": "implementation",
+            "scope": "Implement the accepted plan item.",
+            "deliverable": "A task result containing changed file paths and verification output.",
+            "inputs": {coordination_key: {"required_source_types": ["task"], "min_count": 1}},
         }
     )
 
@@ -461,12 +429,14 @@ def test_schedule_meeting_allows_orchestration_linkage_fields():
 
 def test_deeply_nested_decision_is_rejected_without_recursion_error():
     decision = {
-        "action_type": "open_gate",
-        "success_criterion_key": "tests-pass",
-        "gate_type": "validation_passed",
-        "required_evidence": {},
+        "action_type": "create_delegation_task",
+        "agent_id": _id(),
+        "work_function": "implementation",
+        "scope": "Implement the accepted plan item.",
+        "deliverable": "A task result containing changed file paths and verification output.",
+        "inputs": {},
     }
-    cursor = decision["required_evidence"]
+    cursor = decision["inputs"]
     for index in range(70):
         cursor["nest"] = {}
         cursor = cursor["nest"]
@@ -476,7 +446,7 @@ def test_deeply_nested_decision_is_rejected_without_recursion_error():
 
     assert result.accepted is False
     assert result.rejection_reason is not None
-    assert result.rejection_reason.startswith("Decision nesting exceeds maximum depth at 'required_evidence.")
+    assert result.rejection_reason.startswith("Decision nesting exceeds maximum depth at 'inputs.")
 
 
 async def _make_run(db_session, test_project):
@@ -682,3 +652,22 @@ async def test_record_validated_decision_preserves_404_when_run_disappears_befor
     assert exc_info.value.status_code == 404
     result = await db_session.execute(sa.select(sa.func.count()).select_from(OrchestrationDecision))
     assert result.scalar_one() == 0
+
+
+def test_applies_decision_id_uuid_string_is_accepted():
+    decision = {**ALLOWED_DECISIONS["request_plan"], "applies_decision_id": _id()}
+
+    assert validate_orchestration_decision(decision).accepted is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-uuid", "", 123, None, ["%s" % _id()]],
+    ids=["text", "empty", "int", "null", "list"],
+)
+def test_applies_decision_id_must_be_uuid(value):
+    decision = {**ALLOWED_DECISIONS["request_plan"], "applies_decision_id": value}
+    result = validate_orchestration_decision(decision)
+
+    assert result.accepted is False
+    assert result.rejection_reason == "applies_decision_id must be a UUID"

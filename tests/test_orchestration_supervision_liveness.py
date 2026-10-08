@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 from copy import deepcopy
 from datetime import timedelta
 import pytest
@@ -596,3 +597,238 @@ async def test_goal_detail_http_control_state_outranks_stale_pending_direction(
     assert supervision["pending_direction"] is None
     assert supervision["transition"]["kind"] == state
     assert supervision["transition"] == second.json()["supervision"]["transition"]
+
+
+# --- Ordering, independent work, and verification exhaustion -------------------------------
+
+async def _task(db, project, agent, run, title, **kwargs):
+    task = Task(project_id=project.id, title=title, status=kwargs.pop("status", "in_progress"), assigned_to=agent.id,
+                metadata_={"orchestration": {"run_id": str(run.id)}}, **kwargs)
+    db.add(task)
+    await db.flush()
+    return task
+
+
+async def _no_release(service, monkeypatch):
+    async def release(*_args):
+        return 0
+    monkeypatch.setattr(service, "_release_ready_work", release)
+
+
+async def _meeting_on(db, project, task):
+    db.add(Meeting(project_id=project.id, title=f"M {task.title}", meeting_type="decision", status="active", source_task_id=task.id))
+    await db.flush()
+
+
+async def _graph_on(db, project, task):
+    from huddleroom.models.graph import Graph, GraphRun
+    graph = Graph(project_id=project.id, name="G", version="1", definition={}, triggers=[])
+    db.add(graph)
+    await db.flush()
+    db.add(GraphRun(graph_id=graph.id, project_id=project.id, linked_task_id=task.id, current_node="n", status="active"))
+    await db.flush()
+
+
+async def test_meeting_and_graph_sources_together_hold_liveness(db_session, test_project, test_agent):
+    goal, run = await _run(db_session, test_project)
+    first, second = await _task(db_session, test_project, test_agent, run, "a"), await _task(db_session, test_project, test_agent, run, "b")
+    await _meeting_on(db_session, test_project, first)
+    await _graph_on(db_session, test_project, second)
+    result = await OrchestrationService().supervision.reconcile_local(db_session, goal, run)
+    assert result["outcome"] == "durable_source_active"
+    assert not (await db_session.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id))).all()
+
+
+async def test_overdue_wait_is_processed_during_active_meeting(db_session, test_project, test_agent):
+    goal, run = await _run(db_session, test_project)
+    await _meeting_on(db_session, test_project, await _task(db_session, test_project, test_agent, run, "a"))
+    db_session.add(OrchestrationAuthorityDecision(
+        goal_id=goal.id, run_id=run.id, decision_key="plan:test", title="T", authority="human",
+        question="Continue?", options=[{"key": "yes"}], contract_version="start",
+    ))
+    await db_session.flush()
+    supervision = OrchestrationService().supervision
+    first = await supervision.reconcile_local(db_session, goal, run)
+    assert first["outcome"] == "durable_source_active"
+    wait = await db_session.scalar(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id))
+    wait.due_recheck_at = _utcnow() - timedelta(seconds=1)
+    assert (await supervision.reconcile_local(db_session, goal, run))["outcome"] == "due_fallback"
+
+
+async def test_independent_criterion_proceeds_during_active_graph(db_session, test_project, test_agent, monkeypatch):
+    goal, run = await _run(db_session, test_project)
+    goal.success_criteria = [{"key": "indep", "description": "Independent"}]
+    run.plan_state = {"status": "accepted"}
+    service = OrchestrationService()
+    await _no_release(service, monkeypatch)
+    await _graph_on(db_session, test_project, await _task(db_session, test_project, test_agent, run, "a"))
+    assert (await service.supervision.reconcile_local(db_session, goal, run)) == {"outcome": "continue"}
+
+
+async def _dependent_setup(db, project, agent, monkeypatch, *, dependent):
+    goal, run = await _run(db, project)
+    run.plan_state = {"status": "accepted"}
+    service = OrchestrationService()
+    await _no_release(service, monkeypatch)
+    source = await _task(db, project, agent, run, "source")
+    await _task(db, project, agent, run, "stalled", status="blocked", depends_on=[str(source.id)] if dependent else [])
+    await _meeting_on(db, project, source)
+    return await service.supervision.reconcile_local(db, goal, run)
+
+
+async def test_dependent_only_work_waits_during_active_source(db_session, test_project, test_agent, monkeypatch):
+    result = await _dependent_setup(db_session, test_project, test_agent, monkeypatch, dependent=True)
+    assert result["outcome"] == "durable_source_active"
+
+
+async def test_independent_stalled_task_proceeds_during_active_source(db_session, test_project, test_agent, monkeypatch):
+    result = await _dependent_setup(db_session, test_project, test_agent, monkeypatch, dependent=False)
+    assert result == {"outcome": "continue"}
+
+
+async def _gate_with_verifications(db, run, statuses):
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="c", gate_type="work_completed")
+    db.add(gate)
+    await db.flush()
+    for n, status in enumerate(statuses):
+        db.add(OrchestrationAction(
+            run_id=run.id, idempotency_key=f"v{n}", action_type="request_verification", status=status,
+            request={"gate_id": str(gate.id)}, error="boom" if status == "failed" else None,
+            created_at=_utcnow() + timedelta(seconds=n),
+        ))
+    await db.flush()
+    return gate
+
+
+async def _ask_actions(db, run):
+    return list((await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human"))).all())
+
+
+async def test_stale_failed_verification_followed_by_accepted_gate_raises_no_attention(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    gate = await _gate_with_verifications(db_session, run, ["failed", "failed", "failed"])
+    gate.status = "accepted"
+    result = await OrchestrationService().supervision.reconcile_local(db_session, goal, run)
+    assert result == {"outcome": "continue"} and not await _ask_actions(db_session, run)
+    assert not any(a.action_type == "record_warning" for a in (await db_session.scalars(select(OrchestrationAction))).all())
+
+
+async def test_three_failed_verifications_ask_human_with_exact_question(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    gate = await _gate_with_verifications(db_session, run, ["failed"] * 3)
+    supervision = OrchestrationService().supervision
+    result = await supervision.reconcile_local(db_session, goal, run)
+    assert result["outcome"] == "needs_attention"
+    (ask,) = await _ask_actions(db_session, run)
+    assert ask.idempotency_key == f"run:{run.id}:ask_human:verification_exhausted:{gate.id}:1"
+    assert str(gate.id) in ask.request["question"] and "boom" in ask.request["question"]
+    again = await supervision.reconcile_local(db_session, goal, run)
+    assert again["outcome"] != "needs_attention" and len(await _ask_actions(db_session, run)) == 1
+
+
+async def test_two_failed_verifications_stay_a_follow_up(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    await _gate_with_verifications(db_session, run, ["failed"] * 2)
+    result = await OrchestrationService().supervision.reconcile_local(db_session, goal, run)
+    assert result["outcome"] != "needs_attention" and not await _ask_actions(db_session, run)
+
+
+async def _verification_asks_after(db, goal, run, statuses, preexisting=False):
+    gate = await _gate_with_verifications(db, run, statuses)
+    if preexisting:
+        await OrchestrationService().execute_ask_human_action(db, run.id, {
+            "action_type": "ask_human", "question": "old", "gate_id": str(gate.id),
+        }, f"run:{run.id}:ask_human:verification_exhausted:{gate.id}:1")
+    await OrchestrationService().supervision.reconcile_local(db, goal, run)
+    return gate, [a.idempotency_key.rsplit(":", 1)[1] for a in await _ask_actions(db, run)
+                  if "verification_exhausted" in a.idempotency_key]
+
+
+async def test_verification_exhaustion_sequences(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    _, keys = await _verification_asks_after(db_session, goal, run, ["failed"] * 3)
+    assert keys == ["1"]
+
+    goal, run = await _run(db_session, test_project)
+    _, keys = await _verification_asks_after(db_session, goal, run, ["failed", "completed", "failed", "failed"])
+    assert keys == []
+
+    goal, run = await _run(db_session, test_project)
+    _, keys = await _verification_asks_after(db_session, goal, run, ["failed"] * 4)
+    assert keys == []
+
+    goal, run = await _run(db_session, test_project)
+    _, keys = await _verification_asks_after(db_session, goal, run, ["failed"] * 6)
+    assert keys == ["2"]
+
+    goal, run = await _run(db_session, test_project)
+    _, keys = await _verification_asks_after(db_session, goal, run, ["failed"] * 3, preexisting=True)
+    assert keys == ["1"]
+
+
+async def test_open_meeting_commitment_blocks_closeout_ready(db_session, test_project):
+    from tests.test_orchestration_progress_view import _action_item, _meeting, _task as _pv_task
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted"}
+    meeting = await _meeting(db_session, test_project, await _pv_task(db_session, test_project, run))
+    await _action_item(db_session, meeting, description="Open item")
+    result = await OrchestrationService().supervision.reconcile_local(db_session, goal, run)
+    assert result["outcome"] != "closeout_ready"
+
+
+async def test_pending_decision_makes_gate_not_actionable_and_uncounted(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted"}
+    gate = await _gate_with_verifications(db_session, run, ["failed"] * 3)
+    supervision = OrchestrationService().supervision
+    assert (await supervision.reconcile_local(db_session, goal, run))["outcome"] == "needs_attention"
+    for _ in range(6):
+        await supervision.reconcile_local(db_session, goal, run)
+    assert not (run.supervision_state or {}).get("unchanged")
+    assert len(await _ask_actions(db_session, run)) == 1
+    assert gate.status == "open"
+
+
+async def test_identical_supervision_question_after_answer_is_new_ask(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    supervision = OrchestrationService().supervision
+    ask = _assessment(action_type="ask_human", request={"question": "Which way?"})
+    first = await supervision.apply_disposition(db_session, goal, run, ask)
+    again = await supervision.apply_disposition(db_session, goal, run, ask)
+    assert again.id == first.id
+    decision = await db_session.get(OrchestrationAuthorityDecision, first.target_id)
+    decision.status = "answered"
+    await db_session.flush()
+    second = await supervision.apply_disposition(db_session, goal, run, ask)
+    assert second.id != first.id and second.target_id != first.target_id
+    assert (await supervision.apply_disposition(db_session, goal, run, ask)).id == second.id
+
+
+async def test_commitment_only_state_counts_then_asks_owner_naming_commitment(db_session, test_project, monkeypatch):
+    from huddleroom.config import settings
+    from tests.test_orchestration_progress_view import _action_item, _meeting, _task as _pv_task
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted"}
+    service = OrchestrationService()
+    await _no_release(service, monkeypatch)
+    source = await _pv_task(db_session, test_project, run)
+    source.status = "done"  # no active work: only the commitment remains
+    meeting = await _meeting(db_session, test_project, source)
+    meeting.status = "completed"
+    item = await _action_item(db_session, meeting, description="Ship the thing")
+    await db_session.flush()
+    now = _utcnow()
+    outcomes = []
+    for _ in range(4):
+        now += timedelta(seconds=settings.orchestration_wake_max_seconds * 2 + 1)
+        outcomes.append((await service.supervision.reconcile_local(db_session, goal, run, now=now))["outcome"])
+    assert outcomes == ["continue"] * 3 + ["needs_attention"]
+    (ask,) = await _ask_actions(db_session, run)
+    assert str(item.id) in ask.request["question"]
+    # Pending question: counting restarts after it is answered.
+    state = dict(run.supervision_state)
+    assert state["unchanged"]
+    assert await service.supervision._proactive_outcome(
+        db_session, run, SimpleNamespace(untracked_follow_ups=[], progress_view=[]), set(), state, now, []) is None
+    assert run.supervision_state["unchanged"] == {}
