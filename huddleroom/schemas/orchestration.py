@@ -2,7 +2,7 @@ import json
 import uuid
 from decimal import Decimal, DecimalException
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
@@ -26,6 +26,114 @@ def _require_nonblank_reason(value: str) -> str:
     if not text_value:
         raise ValueError("reason is required")
     return text_value
+
+
+GoalType = Literal["outcome", "roadmap", "continuous"]
+GoalTypeSelection = Literal["auto", "outcome", "roadmap", "continuous"]
+PlanningMode = Literal["roadmap", "delivery", "implementation", "continuous_policy"]
+GoalTypeSource = Literal["auto", "user", "parent_auto", "parent_explicit", "legacy"]
+ContractFingerprint = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_PLANNING_MODES_BY_GOAL_TYPE = {
+    "outcome": ("delivery", "implementation"),
+    "roadmap": ("roadmap",),
+    "continuous": ("continuous_policy",),
+}
+
+
+def _require_mode_fits(goal_type: str, planning_mode: str) -> None:
+    if planning_mode not in _PLANNING_MODES_BY_GOAL_TYPE[goal_type]:
+        raise ValueError(f"planning_mode '{planning_mode}' does not fit goal_type '{goal_type}'")
+
+
+class GoalShapeDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_type: GoalType
+    goal_type_source: GoalTypeSource
+    goal_type_rationale: str
+    planning_mode: PlanningMode
+    planning_rationale: str
+
+    @field_validator("goal_type_rationale", "planning_rationale")
+    @classmethod
+    def _rationale_nonblank(cls, value: str) -> str:
+        return _require_nonblank_reason(value)
+
+    @model_validator(mode="after")
+    def _mode_fits_type(self) -> "GoalShapeDecision":
+        _require_mode_fits(self.goal_type, self.planning_mode)
+        return self
+
+
+class GoalTypeCorrectionPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requested_goal_type: GoalType
+    expected_run_id: uuid.UUID
+    expected_contract_fingerprint: ContractFingerprint
+    rationale: str
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale_nonblank(cls, value: str) -> str:
+        return _require_nonblank_reason(value)
+
+
+class GoalTypeCorrectionApplyRequest(GoalTypeCorrectionPreviewRequest):
+    preview_fingerprint: ContractFingerprint
+
+
+class GoalTypeCorrectionBlocker(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1)
+    entity_type: str = Field(min_length=1)
+    entity_id: uuid.UUID | None
+    message: str = Field(min_length=1)
+    resolution: str = Field(min_length=1)
+
+
+class GoalTypeCorrectionRetainedEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_run_id: uuid.UUID
+    source_task_id: uuid.UUID
+    source_gate_id: uuid.UUID
+    artifact_id: uuid.UUID | None
+    source_contract_fingerprint: ContractFingerprint
+    revalidation_required: bool
+    reason: str = Field(min_length=1)
+
+
+class GoalTypeCorrectionPreviewResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    goal_id: uuid.UUID
+    current_run_id: uuid.UUID
+    current_goal_type: GoalType
+    proposed_goal_type: GoalType
+    current_planning_mode: PlanningMode
+    proposed_planning_mode: PlanningMode
+    source: GoalTypeSource
+    rationale: str
+    blockers: list[GoalTypeCorrectionBlocker]
+    retained_evidence_manifest: list[GoalTypeCorrectionRetainedEvidence]
+    remaining_budget: dict[str, Decimal]
+    missing_recurring_policy: bool
+    requires_new_start: bool
+    required_authority: list[str]
+    preview_fingerprint: ContractFingerprint
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale_nonblank(cls, value: str) -> str:
+        return _require_nonblank_reason(value)
+
+    @model_validator(mode="after")
+    def _modes_fit_types(self) -> "GoalTypeCorrectionPreviewResult":
+        _require_mode_fits(self.current_goal_type, self.current_planning_mode)
+        _require_mode_fits(self.proposed_goal_type, self.proposed_planning_mode)
+        return self
 
 
 def public_process_outputs(outputs: dict | None, process_type: str | None = None) -> dict:
