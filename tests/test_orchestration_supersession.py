@@ -296,3 +296,81 @@ async def test_supersede_rolls_back_cancellation_when_replacement_creation_fails
     await db_session.refresh(run)
     assert goal.status == "active"
     assert run.status == "running"
+
+
+# Characterization: creation never takes a goal type, so explicit Roadmap and
+# Continuous goals are reachable today only through supersession.
+@pytest.mark.parametrize("goal_type", ["roadmap", "continuous"])
+async def test_supersede_creates_explicit_non_outcome_goal_with_fresh_baseline_run(
+    db_session, test_project, goal_type
+):
+    goal, _ = await _goal(db_session, test_project)
+
+    replacement = await OrchestrationSupersessionService().supersede(
+        db_session, test_project.id, goal.id, new_goal_type=goal_type, actor="human:test"
+    )
+
+    assert replacement.goal_type == goal_type
+    assert replacement.status == "active"
+    assert replacement.supersedes_goal_id == goal.id
+    assert replacement.parent_goal_id is None
+    assert goal.goal_type == "outcome" and goal.status == "cancelled"
+    run = await OrchestrationService().get_run_for_goal(db_session, test_project.id, replacement.id)
+    assert (run.phase, run.status) == ("baseline", "running")
+
+
+async def test_supersede_route_returns_roadmap_detail_sections(
+    db_session, test_project, concurrent_sessions
+):
+    goal, _ = await _goal(db_session, test_project, phase="ready")
+    await db_session.commit()
+    route_db, _ = concurrent_sessions
+    assert await route_db.get(Project, test_project.id) is not None
+
+    detail = await supersede_goal(
+        test_project.id, goal.id, OrchestrationSupersedeRequest(goal_type="roadmap"), _ANON_USER, route_db
+    )
+
+    assert detail.goal.goal_type == "roadmap"
+    assert detail.goal.supersedes_goal_id == goal.id
+    assert detail.run.phase == "baseline"
+    assert detail.roadmap_version is None
+    assert detail.roadmap_items == []
+    assert detail.children == []
+
+
+async def test_start_superseded_continuous_goal_without_policy_conflicts(db_session, test_project):
+    goal, _ = await _goal(db_session, test_project)
+    replacement = await OrchestrationSupersessionService().supersede(
+        db_session, test_project.id, goal.id, new_goal_type="continuous", actor="human:test"
+    )
+    run = await OrchestrationService().get_run_for_goal(db_session, test_project.id, replacement.id)
+    run.phase = "ready"
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc:
+        await OrchestrationService().start_run(
+            db_session, test_project.id, replacement.id, actor="human:test"
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["conflict"] == "goal_not_runnable"
+    assert "Continuous policy is required" in exc.value.detail["message"]
+    assert run.phase == "ready"
+
+
+async def test_start_superseded_roadmap_goal_authorizes_run(db_session, test_project):
+    goal, _ = await _goal(db_session, test_project)
+    replacement = await OrchestrationSupersessionService().supersede(
+        db_session, test_project.id, goal.id, new_goal_type="roadmap", actor="human:test"
+    )
+    run = await OrchestrationService().get_run_for_goal(db_session, test_project.id, replacement.id)
+    run.phase = "ready"
+    await db_session.flush()
+
+    started_goal, started_run = await OrchestrationService().start_run(
+        db_session, test_project.id, replacement.id, actor="human:test"
+    )
+
+    assert started_goal.goal_type == "roadmap"
+    assert started_run.id == run.id and started_run.phase == "authorized"

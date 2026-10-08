@@ -1,12 +1,13 @@
 import uuid
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect as sa_inspect, select
 
 from huddleroom.models.orchestration import (
     OrchestrationAction,
     OrchestrationEvidence,
     OrchestrationGate,
+    OrchestrationGoal,
     OrchestrationRun,
 )
 from huddleroom.services.orchestration_service import OrchestrationService
@@ -92,6 +93,78 @@ async def test_create_goal_returns_goal_and_run_with_empty_ledgers(client, test_
     )
     assert processes.status_code == 200, processes.text
     assert processes.json() == []
+
+
+# Characterization: later planning-hierarchy work may add fields, never drop these.
+GOAL_RESPONSE_KEYS = {
+    "id", "project_id", "objective", "original_request", "success_criteria", "constraints", "budget",
+    "status", "goal_type", "weight", "supersedes_goal_id", "parent_goal_id", "roadmap_item_key",
+    "roadmap_version_id", "continuous_policy", "continuous_state", "continuous_origin_key",
+    "orchestrator_context", "needs_you_count", "created_at", "updated_at",
+}
+RUN_RESPONSE_KEYS = {
+    "id", "goal_id", "status", "phase", "condition", "baseline_authorized", "budget_state",
+    "plan_state", "retry_state", "active_blockers", "cycle_key", "started_at", "completed_at",
+}
+DETAIL_RESPONSE_KEYS = {
+    "goal", "run", "decisions", "actions", "gates", "evidence", "agent_suggestions", "timeline",
+    "decisions_count", "actions_count", "gates_count", "evidence_count", "agent_suggestions_count",
+    "roadmap_version", "roadmap_items", "children", "budget_summary", "supervision",
+}
+
+
+@pytest.mark.asyncio
+async def test_create_and_detail_responses_keep_existing_fields_and_outcome_type(client, test_project):
+    base = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    created = await client.post(base, json=_goal_payload())
+    assert created.status_code == 201, created.text
+    goal_id = created.json()["goal"]["id"]
+    detail = await client.get(f"{base}/{goal_id}")
+    assert detail.status_code == 200, detail.text
+
+    for body in (created.json(), detail.json()):
+        assert DETAIL_RESPONSE_KEYS <= set(body)
+        assert GOAL_RESPONSE_KEYS <= set(body["goal"])
+        assert RUN_RESPONSE_KEYS <= set(body["run"])
+        assert body["goal"]["goal_type"] == "outcome"
+        assert body["goal"]["parent_goal_id"] is None
+        assert body["goal"]["supersedes_goal_id"] is None
+        assert body["run"]["phase"] == "baseline"
+        # Outcome goals carry no roadmap sections.
+        assert body["roadmap_version"] is None
+        assert body["roadmap_items"] is None
+        assert body["children"] is None
+
+
+def _row(obj):
+    return {c.key: getattr(obj, c.key) for c in sa_inspect(type(obj)).column_attrs}
+
+
+@pytest.mark.asyncio
+async def test_create_goal_does_not_mutate_existing_active_goal_or_run(client, db_session, test_project):
+    base = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    first = await client.post(base, json=_goal_payload("Existing goal"))
+    assert first.status_code == 201, first.text
+    existing_goal_id = uuid.UUID(first.json()["goal"]["id"])
+    existing_run_id = uuid.UUID(first.json()["run"]["id"])
+    goal = await db_session.get(OrchestrationGoal, existing_goal_id)
+    run = await db_session.get(OrchestrationRun, existing_run_id)
+    goal_before, run_before = _row(goal), _row(run)
+    actions_before = (await db_session.scalar(
+        select(func.count()).select_from(OrchestrationAction).where(OrchestrationAction.run_id == run.id)
+    ))
+
+    second = await client.post(base, json=_goal_payload("Another goal"))
+    assert second.status_code == 201, second.text
+    assert second.json()["goal"]["id"] != str(existing_goal_id)
+
+    await db_session.refresh(goal)
+    await db_session.refresh(run)
+    assert _row(goal) == goal_before
+    assert _row(run) == run_before
+    assert await db_session.scalar(
+        select(func.count()).select_from(OrchestrationAction).where(OrchestrationAction.run_id == run.id)
+    ) == actions_before
 
 
 @pytest.mark.asyncio
