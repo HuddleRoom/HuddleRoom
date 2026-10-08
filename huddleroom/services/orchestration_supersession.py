@@ -8,7 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import (
+    EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE, OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGoal,
+    OrchestrationRun,
+)
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.project_service import ProjectService
@@ -89,6 +92,10 @@ class OrchestrationSupersessionService:
                     weight=goal.weight,
                     explicit_multi_work_function=goal.explicit_multi_work_function,
                     goal_type=new_goal_type,
+                    goal_type_source="user",
+                    goal_type_rationale=f"Selected by user when superseding goal {original_goal_id}.",
+                    planning_mode=EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[new_goal_type],
+                    planning_rationale=f"Default planning mode for an explicitly selected {new_goal_type} goal.",
                     supersedes_goal_id=original_goal_id,
                     created_by_user_id=goal.created_by_user_id,
                 )
@@ -96,6 +103,7 @@ class OrchestrationSupersessionService:
                 await db.flush()
                 db.add(OrchestrationRun(
                     goal_id=replacement.id, budget_state=deepcopy(replacement.budget), baseline_authorized=False,
+                    goal_type_snapshot=replacement.goal_type, planning_mode_snapshot=replacement.planning_mode,
                 ))
                 await db.flush()
         except IntegrityError:

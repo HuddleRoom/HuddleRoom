@@ -1,3 +1,5 @@
+import hashlib
+import json
 import uuid
 from datetime import datetime
 
@@ -57,6 +59,33 @@ AUTHORITY_MODEL_CHECK = (
 GOAL_TYPE_VALUES = ("outcome", "roadmap", "continuous")
 GOAL_TYPES = frozenset(GOAL_TYPE_VALUES)
 GOAL_TYPE_CHECK = _column_check("goal_type", GOAL_TYPE_VALUES)
+GOAL_TYPE_SOURCE_VALUES = ("auto", "user", "parent_auto", "parent_explicit", "legacy")
+PLANNING_MODE_VALUES = ("roadmap", "delivery", "implementation", "continuous_policy")
+RUN_TERMINAL_REASON_VALUES = ("reclassified",)
+LEGACY_PLANNING_MODE_BY_GOAL_TYPE = {
+    "outcome": "implementation", "roadmap": "roadmap", "continuous": "continuous_policy",
+}
+EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE = {
+    "outcome": "delivery", "roadmap": "roadmap", "continuous": "continuous_policy",
+}
+LEGACY_GOAL_TYPE_RATIONALE = "Existing goal type preserved by the planning-hierarchy migration."
+LEGACY_PLANNING_RATIONALE = "Planning mode mapped from the existing goal type by the planning-hierarchy migration."
+GOAL_TYPE_SOURCE_CHECK = _column_check("goal_type_source", GOAL_TYPE_SOURCE_VALUES)
+PLANNING_MODE_CHECK = _column_check("planning_mode", PLANNING_MODE_VALUES)
+PLANNING_MODE_FITS_TYPE_CHECK = (
+    "(goal_type = 'roadmap' AND planning_mode = 'roadmap') OR "
+    "(goal_type = 'continuous' AND planning_mode = 'continuous_policy') OR "
+    "(goal_type = 'outcome' AND planning_mode IN ('delivery', 'implementation'))"
+)
+RUN_TERMINAL_REASON_CHECK = (
+    "terminal_reason IS NULL OR ("
+    + _column_check("terminal_reason", RUN_TERMINAL_REASON_VALUES)
+    + " AND status IN ('completed', 'cancelled'))"
+)
+GOAL_CONTRACT_FINGERPRINT_FIELDS = (
+    "objective", "original_request", "success_criteria", "constraints", "budget",
+    "authority_model", "manager_agent_id", "manager_user_id", "goal_type", "planning_mode",
+)
 
 ROADMAP_UNIT_TYPE_VALUES = ("task", "goal")
 ROADMAP_UNIT_TYPE_CHECK = _column_check("unit_type", ROADMAP_UNIT_TYPE_VALUES)
@@ -83,6 +112,11 @@ WAIT_STATUS_VALUES = ("open", "cleared")
 WAIT_STATUS_CHECK = _status_check(WAIT_STATUS_VALUES)
 
 
+def _default_planning_mode(ctx) -> str:
+    goal_type = ctx.get_current_parameters().get("goal_type") or "outcome"
+    return LEGACY_PLANNING_MODE_BY_GOAL_TYPE[goal_type]
+
+
 class OrchestrationGoal(Base):
     __tablename__ = "orchestration_goals"
     __table_args__ = (
@@ -100,6 +134,11 @@ class OrchestrationGoal(Base):
             name="ck_orchestration_goals_no_manager_constraint",
         ),
         CheckConstraint(GOAL_TYPE_CHECK, name="ck_orchestration_goals_goal_type"),
+        CheckConstraint(GOAL_TYPE_SOURCE_CHECK, name="ck_orch_goals_goal_type_source"),
+        CheckConstraint(PLANNING_MODE_CHECK, name="ck_orch_goals_planning_mode"),
+        CheckConstraint("length(trim(goal_type_rationale)) > 0", name="ck_orch_goals_type_rationale_nonblank"),
+        CheckConstraint("length(trim(planning_rationale)) > 0", name="ck_orch_goals_planning_rationale_nonblank"),
+        CheckConstraint(PLANNING_MODE_FITS_TYPE_CHECK, name="ck_orch_goals_planning_mode_fits_type"),
         UniqueConstraint("supersedes_goal_id", name="uq_orch_goals_supersedes_goal_id"),
         CheckConstraint(
             "(parent_goal_id IS NULL AND roadmap_version_id IS NULL AND roadmap_item_key IS NULL "
@@ -139,6 +178,18 @@ class OrchestrationGoal(Base):
     )
     goal_type: Mapped[str] = mapped_column(
         String(50), nullable=False, default="outcome", server_default="outcome"
+    )
+    goal_type_source: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy", server_default="legacy"
+    )
+    goal_type_rationale: Mapped[str] = mapped_column(
+        Text, nullable=False, default=LEGACY_GOAL_TYPE_RATIONALE, server_default=LEGACY_GOAL_TYPE_RATIONALE
+    )
+    planning_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=_default_planning_mode, server_default="implementation"
+    )
+    planning_rationale: Mapped[str] = mapped_column(
+        Text, nullable=False, default=LEGACY_PLANNING_RATIONALE, server_default=LEGACY_PLANNING_RATIONALE
     )
     supersedes_goal_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("orchestration_goals.id", ondelete="SET NULL"), nullable=True
@@ -212,6 +263,19 @@ class OrchestrationRun(Base):
         CheckConstraint(RUN_STATUS_CHECK, name="ck_orchestration_runs_status"),
         CheckConstraint(RUN_PHASE_CHECK, name="ck_orchestration_runs_phase"),
         UniqueConstraint("goal_id", "cycle_key", name="uq_orch_runs_goal_cycle_key"),
+        UniqueConstraint("supersedes_run_id", name="uq_orch_runs_supersedes_run_id"),
+        CheckConstraint(
+            "supersedes_run_id IS NULL OR supersedes_run_id != id", name="ck_orch_runs_not_own_successor"
+        ),
+        CheckConstraint(RUN_TERMINAL_REASON_CHECK, name="ck_orch_runs_terminal_reason"),
+        CheckConstraint(
+            f"goal_type_snapshot IS NULL OR {_column_check('goal_type_snapshot', GOAL_TYPE_VALUES)}",
+            name="ck_orch_runs_goal_type_snapshot",
+        ),
+        CheckConstraint(
+            f"planning_mode_snapshot IS NULL OR {_column_check('planning_mode_snapshot', PLANNING_MODE_VALUES)}",
+            name="ck_orch_runs_planning_mode_snapshot",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -232,12 +296,34 @@ class OrchestrationRun(Base):
         Boolean, nullable=False, default=True, server_default=text("true")
     )
     cycle_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    supersedes_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("orchestration_runs.id", name="fk_orch_runs_supersedes_run_id"), nullable=True
+    )
+    terminal_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    goal_type_snapshot: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    planning_mode_snapshot: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    goal_contract_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
+
+    # A run's lineage and goal-shape snapshots are frozen once set; NULL -> value is
+    # allowed once so legacy runs can be frozen later.
+    @validates("supersedes_run_id", "goal_type_snapshot", "planning_mode_snapshot", "goal_contract_fingerprint")
+    def preserve_frozen_snapshot(self, key: str, value):
+        current = getattr(self, key)
+        if inspect(self).persistent and current is not None and value != current:
+            raise ValueError(f"{key} is immutable")
+        return value
+
+
+def compute_goal_contract_fingerprint(goal: OrchestrationGoal) -> str:
+    values = {key: getattr(goal, key) for key in GOAL_CONTRACT_FINGERPRINT_FIELDS}
+    canonical = json.dumps(values, default=str, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class OrchestrationRoadmapVersion(Base):

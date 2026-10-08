@@ -9,6 +9,7 @@ from huddleroom.models.orchestration import (
     OrchestrationContinuousCandidate,
     OrchestrationGoal,
     OrchestrationRun,
+    compute_goal_contract_fingerprint,
 )
 from huddleroom.models.session import Session
 from huddleroom.services.orchestration_service import OrchestrationService
@@ -116,7 +117,13 @@ async def test_scheduler_claims_creates_one_child_and_leaves_successor_without_w
 
     assert cycle.status == cycle.phase == "completed"
     assert child.status == "active" and child_run.phase == "authorized"
+    assert (child.goal_type_source, child.planning_mode) == ("parent_explicit", "implementation")
+    assert (child_run.goal_type_snapshot, child_run.planning_mode_snapshot) == ("outcome", "implementation")
+    assert child_run.goal_contract_fingerprint == compute_goal_contract_fingerprint(child)
     assert successor.phase == "waiting_activation" and successor.cycle_key is None
+    assert (successor.goal_type_snapshot, successor.planning_mode_snapshot) == ("continuous", "continuous_policy")
+    assert successor.goal_contract_fingerprint == compute_goal_contract_fingerprint(goal)
+    assert successor.supersedes_run_id is None
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
         OrchestrationAction.run_id == cycle.id,
         OrchestrationAction.action_type == "complete_cycle",

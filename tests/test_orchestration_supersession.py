@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from huddleroom.dependencies import _ANON_USER
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal
+from huddleroom.models.orchestration import EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE, OrchestrationAction, OrchestrationGoal
 from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -317,6 +317,12 @@ async def test_supersede_creates_explicit_non_outcome_goal_with_fresh_baseline_r
     assert goal.goal_type == "outcome" and goal.status == "cancelled"
     run = await OrchestrationService().get_run_for_goal(db_session, test_project.id, replacement.id)
     assert (run.phase, run.status) == ("baseline", "running")
+    assert (replacement.goal_type_source, replacement.planning_mode) == (
+        "user", EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[goal_type],
+    )
+    assert str(goal.id) in replacement.goal_type_rationale and replacement.planning_rationale.strip()
+    assert (run.goal_type_snapshot, run.planning_mode_snapshot) == (goal_type, replacement.planning_mode)
+    assert run.goal_contract_fingerprint is None and run.supersedes_run_id is None
 
 
 async def test_supersede_route_returns_roadmap_detail_sections(

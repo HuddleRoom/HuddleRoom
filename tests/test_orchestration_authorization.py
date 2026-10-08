@@ -3,10 +3,12 @@ from sqlalchemy import select
 
 from huddleroom.models.orchestration import (
     GOAL_TYPE_VALUES,
+    LEGACY_PLANNING_MODE_BY_GOAL_TYPE,
     RUN_PHASE_VALUES,
     OrchestrationAction,
     OrchestrationGoal,
     OrchestrationRun,
+    compute_goal_contract_fingerprint,
 )
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_service import OrchestrationService
@@ -119,6 +121,7 @@ async def test_baseline_ready_stops_at_phase_ready_without_completing(db_session
     await db_session.refresh(goal)
     assert run.phase == "ready"
     assert run.status == "running"                     # not completed
+    assert run.goal_contract_fingerprint == compute_goal_contract_fingerprint(goal)
     assert goal.status in {"active", "blocked"}         # not completed
     actions = (await db_session.scalars(
         select(OrchestrationAction).where(OrchestrationAction.run_id == run.id)
@@ -192,6 +195,7 @@ async def _start_ready_goal(
         goal.constraints = constraints
     if goal_type is not None:
         goal.goal_type = goal_type
+        goal.planning_mode = LEGACY_PLANNING_MODE_BY_GOAL_TYPE[goal_type]
         goal.continuous_policy = {
             "version": 1,
             "activation": {"cron": "*/5 * * * *", "timezone": "UTC", "missed_slots": "coalesce"},

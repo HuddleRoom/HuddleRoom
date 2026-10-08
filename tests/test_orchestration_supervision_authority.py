@@ -128,6 +128,7 @@ async def test_runtime_answer_records_audit_but_control_preempts_continuation(
         goal.status = run.status = "cancelled"
     else:
         goal.goal_type = "continuous"
+        goal.planning_mode = "continuous_policy"
         goal.continuous_state = {"stopped_at": "2026-09-09T00:00:00+00:00"}
     result = await service.answer_runtime_question(
         db_session, decision, "approve", actor_user_id=test_user.id, contract_version="plan:1"

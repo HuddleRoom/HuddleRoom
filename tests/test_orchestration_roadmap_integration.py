@@ -47,6 +47,7 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, team_agent_ids=(), 
     await db.flush()
     service, parent, run = await _authorized_run(db, project)
     parent.goal_type = "roadmap"
+    parent.planning_mode = "roadmap"
     parent.budget = {"caps": budget_caps or {"max_tokens": cap, "max_turns": 10, "max_hours": 10}}
     items = item if isinstance(item, list) else [item]
     request = await service.execute_request_plan_action(

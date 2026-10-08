@@ -237,6 +237,7 @@ async def test_clear_matching_waits_count_for_non_orchestrator_waits_unchanged(d
 async def test_accepted_roadmap_reconcile_clears_lingering_orchestrator_waits_only(db_session, test_project):
     goal, run = await _run(db_session, test_project)
     goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
     sys_wait = await _system_wait(db_session, run)
     await _make(db_session, run)  # created while the plan was not yet accepted
     run.plan_state = {"status": "accepted"}

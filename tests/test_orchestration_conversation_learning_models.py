@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 
@@ -284,11 +285,18 @@ def test_feedback_user_foreign_key_restricts_deletion(tmp_path):
         project = Project(name="Feedback restrict")
         session.add_all((owner, actor, project))
         session.flush()
-        goal = OrchestrationGoal(project_id=project.id, objective="Feedback restrict")
-        session.add(goal)
-        session.flush()
+        # Raw insert: the ORM model targets the head schema, this DB is pinned at 044.
+        goal_id = uuid.uuid4()
+        session.execute(
+            text(
+                "INSERT INTO orchestration_goals (id, project_id, objective, original_request, success_criteria, "
+                "constraints, budget, orchestrator_context, created_at, updated_at) "
+                "VALUES (:id, :project_id, :objective, :objective, '[]', '{}', '{}', '{}', :now, :now)"
+            ),
+            {"id": goal_id.hex, "project_id": project.id.hex, "objective": "Feedback restrict", "now": datetime.now(timezone.utc).isoformat(sep=" ")},
+        )
         message = ConversationMessage(
-            goal_id=goal.id,
+            goal_id=goal_id,
             actor_id=owner.id,
             client_request_id=uuid.uuid4(),
             sequence=1,

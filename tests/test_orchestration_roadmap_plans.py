@@ -194,6 +194,7 @@ async def _roadmap_acceptance(
     db_session.add(artifact)
     await db_session.flush()
     goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
     goal.authority_model = authority_model
     goal.manager_user_id = goal.manager_user_id if authority_model == "human_manager" else None
     goal.manager_agent_id = planner.id if authority_model == "agent_manager" else None

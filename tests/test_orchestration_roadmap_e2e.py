@@ -68,6 +68,7 @@ async def _ready_roadmap(db, project):
         ), created_by_user_id=None,
     )
     goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
     run.baseline_authorized = True
     await complete_baseline_processes(db, goal, run)
     await service.tick(db, run.id)

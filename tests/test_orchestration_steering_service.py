@@ -202,6 +202,7 @@ async def _roadmap_version(db_session, project_id, goal, run, version, items):
 async def test_roadmap_snapshot_allows_unreleased_and_retained_unstarted_items(db_session, conversation_goal_run, test_project, test_user, monkeypatch):
     service, goal, run = await _active_service(db_session, conversation_goal_run, test_user, monkeypatch)
     goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
     first = await _roadmap_version(db_session, test_project.id, goal, run, 1, [{"item_key": "retained"}])
     task = Task(project_id=test_project.id, title="retained", status="ready", metadata_={"orchestration": {"goal_id": str(goal.id), "run_id": str(run.id)}})
     gate = OrchestrationGate(run_id=run.id, success_criterion_key="retained", gate_type="item", required_evidence={})
@@ -217,6 +218,7 @@ async def test_roadmap_snapshot_allows_unreleased_and_retained_unstarted_items(d
 async def test_roadmap_released_or_child_item_expires_and_item_ownership_drift_defers(db_session, conversation_goal_run, test_project, test_user, monkeypatch):
     service, goal, run = await _active_service(db_session, conversation_goal_run, test_user, monkeypatch)
     goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
     version = await _roadmap_version(db_session, test_project.id, goal, run, 1, [{"item_key": "released"}, {"item_key": "child"}])
     task = Task(project_id=test_project.id, title="released", status="ready", metadata_={"orchestration": {"goal_id": str(goal.id), "run_id": str(run.id)}})
     child = OrchestrationGoal(project_id=test_project.id, objective="child", original_request="child", success_criteria=[], constraints={}, budget={})

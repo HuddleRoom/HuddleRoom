@@ -42,6 +42,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRoadmapItem,
     OrchestrationRoadmapVersion,
     OrchestrationRun,
+    compute_goal_contract_fingerprint,
 )
 from huddleroom.models.graph import Graph, GraphRun, GraphRunStep
 from huddleroom.models.project import Project
@@ -332,6 +333,8 @@ class OrchestrationService:
             goal_id=goal.id,
             budget_state=deepcopy(budget),
             baseline_authorized=False,
+            goal_type_snapshot=goal.goal_type,
+            planning_mode_snapshot=goal.planning_mode,
         )
         db.add(run)
         await db.flush()
@@ -6855,6 +6858,8 @@ class OrchestrationService:
                 goal_id=goal.id,
                 budget_state=deepcopy(goal.budget),
                 baseline_authorized=False,
+                goal_type_snapshot=goal.goal_type,
+                planning_mode_snapshot=goal.planning_mode,
             )
             db.add(run)
 
@@ -10055,6 +10060,8 @@ class OrchestrationService:
             # phase == "authorized".
             if baseline_ready and run.phase == "baseline":
                 run.phase = "ready"
+                if run.goal_contract_fingerprint is None:
+                    run.goal_contract_fingerprint = compute_goal_contract_fingerprint(goal)
                 await db.flush()
 
             new_events = await self._new_events(db, project_id, run.event_cursor)

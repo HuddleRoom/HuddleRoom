@@ -24,6 +24,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRoadmapItem,
     OrchestrationRoadmapVersion,
     OrchestrationRun,
+    compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.task import Task
@@ -931,7 +932,9 @@ class OrchestrationRoadmapService:
                                     **({"unstaged_authority_decision_id": str(authority.id)} if unstaged else {})},
                         "team": deepcopy(snapshot["team"]),
                         "workspace_policy": deepcopy(snapshot["workspace_policy"]),
-                    }, goal_type="outcome",
+                    }, goal_type="outcome", goal_type_source="parent_explicit",
+                    goal_type_rationale=f"Roadmap item {item.item_key} runs as a leaf Outcome.",
+                    planning_mode="implementation", planning_rationale="A leaf roadmap item needs an implementation plan.",
                     parent_goal_id=goal.id, roadmap_version_id=version.id, roadmap_item_key=item.item_key,
                     parent_contract_snapshot=snapshot,
                     goal_delta={"objective": item.objective, "constraints": deepcopy(item.constraints),
@@ -941,6 +944,8 @@ class OrchestrationRoadmapService:
                 )
                 child_run = OrchestrationRun(
                     id=child_run_id, goal_id=child.id, phase="authorized",
+                    goal_type_snapshot=child.goal_type, planning_mode_snapshot=child.planning_mode,
+                    goal_contract_fingerprint=compute_goal_contract_fingerprint(child),
                     budget_state={"caps": canonical_amounts(item.allocation, allowed=set(parent_caps(goal)))},
                     plan_state={"child_delta_baseline": {
                         "status": "accepted", "snapshot_version": 1, "parent_goal_id": str(goal.id),

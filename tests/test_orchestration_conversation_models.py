@@ -7,6 +7,7 @@ import uuid
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 
@@ -824,11 +825,17 @@ def test_migration_042_schema_allows_only_unclaimed_failed_investigations(tmp_pa
         project = Project(name="Failed zero")
         session.add_all((actor, project))
         session.flush()
-        goal = OrchestrationGoal(project_id=project.id, objective="Investigate")
-        session.add(goal)
-        session.flush()
+        # Raw insert: the ORM model targets the head schema, this DB is pinned at 042.
+        goal_id = uuid.uuid4()
+        session.execute(
+            text(
+                "INSERT INTO orchestration_goals (id, project_id, objective, original_request, success_criteria, "
+                "constraints, budget, orchestrator_context, created_at, updated_at) "
+                "VALUES (:id, :project_id, :objective, :objective, '[]', '{}', '{}', '{}', :now, :now)"
+            ),
+            {"id": goal_id.hex, "project_id": project.id.hex, "objective": "Investigate", "now": datetime.now(timezone.utc).isoformat(sep=" ")},
+        )
         actor_id = actor.id
-        goal_id = goal.id
         session.commit()
 
     def investigation_for(session, sequence, **values):

@@ -51,6 +51,7 @@ async def test_start_authorizes_ready_roadmap_but_still_rejects_continuous(db_se
 
     service, continuous, continuous_run = await _authorized_run(db_session, test_project)
     continuous.goal_type = "continuous"
+    continuous.planning_mode = "continuous_policy"
     continuous_run.phase = "ready"
     with pytest.raises(HTTPException) as exc:
         await service.start_run(db_session, test_project.id, continuous.id, actor="human:test")
@@ -228,6 +229,7 @@ async def test_reset_rejects_goal_after_roadmap_lineage_exists(db_session, test_
 async def test_reset_allows_fresh_roadmap_without_immutable_lineage(db_session, test_project):
     service, roadmap, run = await _authorized_run(db_session, test_project)
     roadmap.goal_type = "roadmap"
+    roadmap.planning_mode = "roadmap"
     await db_session.flush()
 
     _, replacement = await service.reset_goal(db_session, test_project.id, roadmap.id)

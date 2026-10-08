@@ -131,6 +131,7 @@ async def test_memory_body_is_never_disclosed(conversation_goal_run, db_session)
 async def test_roadmap_plan_requires_matching_version_and_keeps_draft_artifact(conversation_goal_run, db_session):
     goal, run = conversation_goal_run
     goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
     artifact = Artifact(project_id=goal.project_id, name="界" * 500, artifact_type="plan", status="draft", metadata_={"kind": {f"key-{number:02d}": number for number in range(51)}, "secret": "never"})
     db_session.add(artifact)
     await db_session.flush()

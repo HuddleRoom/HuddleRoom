@@ -522,6 +522,7 @@ async def test_goal_detail_http_projects_each_durable_supervision_condition(
         goal.status = run.status = "paused"
     elif state == "stopped":
         goal.goal_type = "continuous"
+        goal.planning_mode = "continuous_policy"
         goal.continuous_state = {"stopped_at": _utcnow().isoformat()}
     elif state in {"cancelled", "completed"}:
         goal.status = run.status = state
@@ -583,7 +584,8 @@ async def test_goal_detail_http_control_state_outranks_stale_pending_direction(
     if state == "paused":
         goal.status = run.status = "paused"
     elif state == "stopped":
-        goal.goal_type, goal.continuous_state = "continuous", {"stopped_at": _utcnow().isoformat()}
+        goal.goal_type, goal.planning_mode = "continuous", "continuous_policy"
+        goal.continuous_state = {"stopped_at": _utcnow().isoformat()}
     else:
         goal.status = run.status = state
         run.completed_at = _utcnow()

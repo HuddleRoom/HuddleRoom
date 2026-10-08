@@ -15,7 +15,7 @@ from huddleroom.models.artifact import Artifact
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGate,
-    OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRun,
+    OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRun, compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
@@ -61,6 +61,7 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, authority_model="hu
         parent.manager_user_id = None
         parent.manager_agent_id = planner.id
     parent.goal_type = "roadmap"
+    parent.planning_mode = "roadmap"
     parent.budget = {"caps": budget_caps or {"max_tokens": cap, "max_turns": 10, "max_hours": 10}}
     parent.constraints = {"region": "EU"}
     parent.success_criteria = [{"key": "parent"}]
@@ -235,6 +236,11 @@ async def assert_child_release(db, parent, run, version, item, *, failed_item_ke
         parent.authority_model, parent.manager_agent_id, parent.manager_user_id,
     )
     assert (child_run.phase, child_run.status) == ("authorized", "running")
+    assert (child.goal_type_source, child.planning_mode) == ("parent_explicit", "implementation")
+    assert key in child.goal_type_rationale and child.planning_rationale.strip()
+    assert (child_run.goal_type_snapshot, child_run.planning_mode_snapshot) == ("outcome", "implementation")
+    assert child_run.goal_contract_fingerprint == compute_goal_contract_fingerprint(child)
+    assert child_run.supersedes_run_id is None
     assert child_run.plan_state == {"child_delta_baseline": {
         "status": "accepted", "snapshot_version": 1, "parent_goal_id": str(parent.id),
         "roadmap_version_id": str(version.id), "roadmap_item_key": key,

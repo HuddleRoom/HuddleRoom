@@ -80,6 +80,7 @@ async def accepted_roadmap(db_session, test_project):
             items = [{**item, "agent_id": str(planner.id)} for item in items]
         service, goal, run = await _authorized_run(db_session, test_project)
         goal.goal_type = "roadmap"
+        goal.planning_mode = "roadmap"
         if setup is not None:
             await setup(planner, goal, run)
         goal.orchestrator_context = {"team": {"agent_ids": [str(agent_id) for agent_id in await db_session.scalars(

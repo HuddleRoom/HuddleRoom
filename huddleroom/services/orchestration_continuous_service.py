@@ -16,7 +16,7 @@ from sqlalchemy.orm import SessionTransactionOrigin
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationBudgetReservation, OrchestrationContinuousCandidate,
-    OrchestrationGoal, OrchestrationRun,
+    OrchestrationGoal, OrchestrationRun, compute_goal_contract_fingerprint,
 )
 from huddleroom.models.session import Session
 from huddleroom.models.agent import Agent
@@ -691,10 +691,14 @@ class OrchestrationContinuousService:
                         "success_criteria": deepcopy(candidate["success_criteria"])},
             authority_model=goal.authority_model,
             manager_agent_id=goal.manager_agent_id, manager_user_id=goal.manager_user_id,
+            goal_type_source="parent_explicit", goal_type_rationale=f"Continuous policy case {origin_key} runs as an Outcome.",
+            planning_mode="implementation", planning_rationale="A leaf continuous case needs an implementation plan.",
             orchestrator_context={"continuous": {"policy_version": policy["version"], "origin_key": origin_key},
                                   "team": deepcopy(snapshot["team"]),
                                   "workspace_policy": deepcopy(snapshot["workspace_policy"])})
         child_run = OrchestrationRun(id=child_run_id, goal_id=child.id, phase="authorized",
+            goal_type_snapshot=child.goal_type, planning_mode_snapshot=child.planning_mode,
+            goal_contract_fingerprint=compute_goal_contract_fingerprint(child),
             budget_state={"caps": deepcopy(policy["per_case_budget"])}, plan_state={"child_delta_baseline": {
                 "status": "accepted", "snapshot_version": 1, "parent_goal_id": str(goal.id),
                 "continuous_policy_version": policy["version"], "origin_key": origin_key}})
@@ -771,6 +775,8 @@ class OrchestrationContinuousService:
                         "success_criteria": deepcopy(template["success_criteria"])},
             authority_model=goal.authority_model, manager_agent_id=goal.manager_agent_id,
             manager_user_id=goal.manager_user_id,
+            goal_type_source="parent_explicit", goal_type_rationale=f"Continuous policy case {origin_key} runs as an Outcome.",
+            planning_mode="implementation", planning_rationale="A leaf continuous case needs an implementation plan.",
             orchestrator_context={"continuous": {"policy_version": policy["version"], "origin_key": origin_key,
                                                    "discovery_provenance": provenance},
                                   "team": deepcopy(contract["team"]),
@@ -778,6 +784,8 @@ class OrchestrationContinuousService:
         )
         child_run = OrchestrationRun(
             id=child_run_id, goal_id=child.id, phase="authorized",
+            goal_type_snapshot=child.goal_type, planning_mode_snapshot=child.planning_mode,
+            goal_contract_fingerprint=compute_goal_contract_fingerprint(child),
             budget_state={"caps": deepcopy(policy["per_case_budget"])}, plan_state={"child_delta_baseline": {
                 "status": "accepted", "snapshot_version": 1, "parent_goal_id": str(goal.id),
                 "continuous_policy_version": policy["version"], "origin_key": origin_key,
@@ -938,7 +946,11 @@ class OrchestrationContinuousService:
             successor_id = uuid.uuid5(uuid.NAMESPACE_URL, f"rally:continuous-successor:{run.id}")
             successor = await db.get(OrchestrationRun, successor_id)
             if successor is None:
-                successor = OrchestrationRun(id=successor_id, goal_id=goal.id, phase="waiting_activation")
+                successor = OrchestrationRun(
+                    id=successor_id, goal_id=goal.id, phase="waiting_activation",
+                    goal_type_snapshot=goal.goal_type, planning_mode_snapshot=goal.planning_mode,
+                    goal_contract_fingerprint=compute_goal_contract_fingerprint(goal),
+                )
                 db.add(successor)
                 await db.flush()
                 db.add(OrchestrationAction(
