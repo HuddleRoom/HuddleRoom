@@ -1093,3 +1093,49 @@ async def test_scenario_10_unfinished_meeting_commitment_blocks_closeout_until_r
     await db_session.flush()
     manifest = await service._closeout_preconditions_manifest(db_session, goal, run)
     assert manifest["unresolved_meeting_commitments"] == []
+
+
+async def test_no_progress_ask_state_survives_a_real_tick_and_reasks(db_session, test_project, monkeypatch, stub_decision):
+    """Through tick() (which refreshes the run after reconcile_local) the ask counter must persist."""
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.models.session import Session
+    from huddleroom.models.task import Task
+    from huddleroom.services import orchestration_supervision as sup
+
+    service, run, _parent, agent, _report = await _completed_parent_task(db_session, test_project)
+    await _seed_accepted_plan(db_session, test_project, service, run, agent, plan_items=[{
+        "id": "released-item", "work_function": "implementation", "scope": "Already released.",
+        "deliverable": "Nothing new.", "agent_id": str(agent.id)}])
+    await service.reserve_action(
+        db_session, run_id=run.id, idempotency_key=f"run:{run.id}:kind:release_item:released-item",
+        action_type="release_item", request={"plan_item_id": "released-item"})
+    task = Task(project_id=test_project.id, title="Work", status="in_progress", assigned_to=agent.id,
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db_session.add(task)
+    await db_session.flush()
+    db_session.add(Session(project_id=test_project.id, task_id=task.id, agent_id=agent.id, adapter_type="api", status="running"))
+    await db_session.flush()
+    _situation(monkeypatch, untracked_follow_ups=[STUCK])
+    stub_decision(lambda ctx: {"action_type": "noop", "reason": "wait"})
+    clock = [_utcnow()]
+    monkeypatch.setattr(sup, "_utcnow", lambda: clock[0])
+
+    async def tick_n(count):
+        for _ in range(count):
+            clock[0] += timedelta(seconds=settings.orchestration_wake_max_seconds * 2 + 1)
+            for wait in await _open_waits(db_session, run):  # the noop stub names a wake; keep the run in the proactive branch
+                wait.status, wait.cleared_at = "cleared", _utcnow()
+            await db_session.flush()
+            await service.tick(db_session, run.id)
+
+    await tick_n(4)
+    await db_session.refresh(run)
+    state = run.supervision_state
+    assert state.get("no_progress_asks") == 1 and state["unchanged"].get("ask_decision_id")
+    (first,) = await _asks(db_session, run)
+    decision = await db_session.get(OrchestrationAuthorityDecision, first.target_id)
+    decision.status = "answered"
+    await db_session.flush()
+    await tick_n(8)
+    asks = await _asks(db_session, run)
+    assert len(asks) == 2 and asks[1].idempotency_key.endswith("no_progress:1")

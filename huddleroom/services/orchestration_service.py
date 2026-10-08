@@ -10121,6 +10121,7 @@ class OrchestrationService:
                         authorized_execution = await OrchestrationRoadmapService(self).advance(db, goal, run)
                     else:
                         authorized_execution = await self._advance_authorized_execution(db, goal, run)
+                await db.flush()  # refresh below discards unflushed attribute writes (e.g. supervision_state)
                 await db.refresh(run)
                 await db.refresh(goal)
 

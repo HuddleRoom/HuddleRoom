@@ -384,7 +384,47 @@ async def _force_judge_due(env, run_id):
         await db.commit()
 
 
-async def drive(env, run_id, *, judge=False, max_ticks=MAX_TICKS - 1, fail_judge=False, refail=None, stop_when=None, sleep=0.0, expire_model_waits=False):
+async def _supervision_keys(env, run_id):
+    async with env.factory() as db:
+        run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+        st = run.supervision_state or {}
+        return {k: st.get(k) for k in ("unchanged", "no_progress_asks", "needs_judgment", "judgment_dirty", "judgment_in_flight")}
+
+
+async def answer_via_runtime_path(env, decision_id):
+    """Answer exactly like POST .../decisions/{id}/answer does for runtime decisions (answer_runtime_question)."""
+    async with env.factory() as s:
+        user = await s.scalar(select(User).where(User.email == "live-eval-owner@example.com"))
+        if user is None:
+            user = User(email="live-eval-owner@example.com", hashed_password=hash_password("pw-not-used"), display_name="Live Eval Owner", role="member")
+            s.add(user)
+            await s.flush()
+        decision = await s.get(OrchestrationAuthorityDecision, decision_id)
+        option = next(o["key"] if isinstance(o, dict) else o for o in decision.options)  # free text is not part of this path
+        result = await OrchestrationAuthorityDecisionService().answer_runtime_question(
+            s, decision, option, actor_user_id=user.id, contract_version=decision.contract_version)
+        await s.commit()
+        return {"decision_id": str(decision.id), "selected_option": option, "continuation_applied": result.continuation_applied,
+                "question": decision.question[:300], "note": "neutral: no preference; proceed with best judgment (runtime path offers option keys only)"}
+
+
+async def auto_answer_model_questions(env, run_id):
+    """Answer pending decisions created by MODEL actions; leave the system no-progress ask pending."""
+    answered = []
+    async with env.factory() as s:
+        pending = (await s.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.run_id == run_id, OrchestrationAuthorityDecision.status == "pending",
+            OrchestrationAuthorityDecision.runtime_identity.is_not(None)))).all()
+        system_ids = set((await s.scalars(select(OrchestrationAction.target_id).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "ask_human",
+            OrchestrationAction.idempotency_key.like("%:ask_human:no_progress:%")))).all())
+        ids = [d.id for d in pending if d.id not in system_ids]
+    for decision_id in ids:
+        answered.append(await answer_via_runtime_path(env, decision_id))
+    return answered
+
+
+async def drive(env, run_id, *, judge=False, max_ticks=MAX_TICKS - 1, fail_judge=False, refail=None, stop_when=None, sleep=0.0, expire_model_waits=False, auto_answer=False, tolerate_409=False):
     """Explicit ticks only (never the scheduler loop). Returns the per-tick report list."""
     budget, service, ticks = env.budget, OrchestrationService(), []
     budget.armed = True
@@ -400,10 +440,12 @@ async def drive(env, run_id, *, judge=False, max_ticks=MAX_TICKS - 1, fail_judge
             async with env.factory() as db:
                 result = await service.tick(db, run_id)
                 entry["tick_result"] = _j({k: result.get(k) for k in ("status", "run_completed", "authorized_execution", "action_ids") if k in result})
+            entry["supervision_after_tick"] = await _supervision_keys(env, run_id)
             if judge:
                 await _force_judge_due(env, run_id)
                 async with env.factory() as db:
                     entry["judge_result"] = await OrchestrationSupervisionScheduler().evaluate_run(db, run_id)
+            entry["supervision_after_judge"] = await _supervision_keys(env, run_id)
         except Exception as exc:  # noqa: BLE001 - recorded, then asserted by the test
             entry["error"] = redact_secrets(f"{type(exc).__name__}: {exc}")[:800]
         async with env.factory() as db:
@@ -422,7 +464,10 @@ async def drive(env, run_id, *, judge=False, max_ticks=MAX_TICKS - 1, fail_judge
         entry["provider_calls"], entry["tokens"] = budget.calls - calls0, budget.tokens - tokens0
         entry["violations"], entry["progress_kind"] = check_tick(previous, current, tick_result=entry.get("tick_result"), provider_failing=budget.fail_mode)
         entry["state"] = current
+        entry["auto_answers"] = await auto_answer_model_questions(env, run_id) if auto_answer and not (stop_when and stop_when(current)) else []
         ticks.append(entry)
+        if entry["error"] and tolerate_409 and entry["error"].startswith("HTTPException: 409"):
+            entry["tolerated_error"], entry["error"] = entry["error"], None  # a scheduler would retry on its next sweep; recorded as a finding
         if entry["error"] or budget.cap_hit:
             break
         stable = stable + 1 if _sig(current) == _sig(previous) else 0
@@ -845,7 +890,7 @@ async def test_model_stage(env, name, monkeypatch):
         if name in {"no_progress_ask", "recoverable_blocker_by_model"}:
             kwargs["refail"] = [seed.extra["failed_task_id"]]
         if name == "no_progress_ask":
-            kwargs.update(sleep=options["sleep"], expire_model_waits=True,
+            kwargs.update(sleep=options["sleep"], expire_model_waits=True, auto_answer=True, tolerate_409=True,
                           stop_when=lambda st: any(a["status"] == "pending" and "no progress" in a["question"] for a in st["authority"]))
         elif name == "authority_request_by_model":
             kwargs["stop_when"] = lambda st: any(a["status"] == "pending" for a in st["authority"])
@@ -864,7 +909,7 @@ async def test_model_stage(env, name, monkeypatch):
             if name == "authority_request_by_model" and replay["state"]["authority"] and len([a for a in replay["state"]["authority"] if a["status"] == "pending"]) != 1:
                 failures.append("replay changed the number of pending owner questions")
             failures += extra_check(seed, ticks, replay)
-            if name == "no_progress_ask" and not failures:
+            if name == "no_progress_ask" and any(a["status"] == "pending" and "no progress" in a["question"] for a in ticks[-1]["state"]["authority"]):
                 post = await _answer_and_confirm_restart(env, seed)
                 failures += post["problems"]
     finally:
@@ -875,19 +920,16 @@ async def test_model_stage(env, name, monkeypatch):
 
 
 async def _answer_and_confirm_restart(env, seed):
-    """Answer the no-progress ask, tick again, and confirm the counter restarted (no immediate re-ask)."""
+    """Answer the system no-progress ask via the real runtime path, tick again, confirm the counter restarted."""
     problems = []
     async with env.factory() as s:
-        user = User(email=f"live-{uuid.uuid4().hex[:8]}@example.com", hashed_password=hash_password("pw-not-used"), display_name="Live Eval Owner", role="member")
-        s.add(user)
-        await s.flush()
-        decision = (await s.scalars(select(OrchestrationAuthorityDecision).where(
-            OrchestrationAuthorityDecision.run_id == seed.run_id, OrchestrationAuthorityDecision.status == "pending"))).first()
-        option = (decision.options or [{"key": "acknowledge"}])[0]["key"]
-        await OrchestrationAuthorityDecisionService().answer_decision(s, decision, selected_option=option, reason="Proceed with reassignment.", decided_by_user_id=user.id)
-        await s.commit()
+        decision_id = (await s.scalars(select(OrchestrationAuthorityDecision.id).where(
+            OrchestrationAuthorityDecision.run_id == seed.run_id, OrchestrationAuthorityDecision.status == "pending",
+            OrchestrationAuthorityDecision.question.like("%no progress%")))).first()
+    answer = await answer_via_runtime_path(env, decision_id)
     await asyncio.sleep(1.3)
-    ticks, _ = await drive(env, seed.run_id, judge=True, max_ticks=1, refail=[seed.extra["failed_task_id"]], stop_when=lambda st: False)
+    ticks, _ = await drive(env, seed.run_id, judge=True, max_ticks=1, refail=[seed.extra["failed_task_id"]], stop_when=lambda st: False,
+                           expire_model_waits=True)
     async with env.factory() as s:
         run = await s.get(OrchestrationRun, seed.run_id, populate_existing=True)
         state = dict(run.supervision_state or {})
@@ -895,9 +937,9 @@ async def _answer_and_confirm_restart(env, seed):
     snap = ticks[-1]["state"] if ticks else {"authority": []}
     if any(a["status"] == "pending" and "no progress" in a["question"] for a in snap["authority"]):
         problems.append("answered no-progress ask was immediately re-asked")
-    if int(unchanged.get("n") or 0) > 1:
+    if int(unchanged.get("n") or 0) > 1 or unchanged.get("ask_decision_id"):
         problems.append(f"counter did not restart after the answer: unchanged={unchanged}")
     if state.get("no_progress_asks") != 1:
-        problems.append(f"no_progress_asks changed unexpectedly: {state.get('no_progress_asks')}")
-    return {"problems": problems, "unchanged_after_answer": unchanged, "no_progress_asks": state.get("no_progress_asks"),
-            "tick_error": ticks[-1]["error"] if ticks else None}
+        problems.append(f"next ask generation should be :1 (no_progress_asks == 1), got {state.get('no_progress_asks')}")
+    return {"problems": problems, "answer": answer, "unchanged_after_answer": unchanged, "no_progress_asks": state.get("no_progress_asks"),
+            "tick_error": ticks[-1]["error"] if ticks else None, "provider_calls_in_restart_tick": ticks[-1]["provider_calls"] if ticks else None}
