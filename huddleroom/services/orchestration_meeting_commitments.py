@@ -24,7 +24,9 @@ SUGGESTED_ACTIONS = {
     "open": ["create_delegation_task", "ask_human"],
     "assigned": ["create_delegation_task", "ask_human"],
     "task_failed": ["create_delegation_task"],
+    "graph_failed": ["create_delegation_task", "ask_human"],
 }
+FAILED_GRAPH_STATUSES = ("failed", "cancelled")  # engine only sets "failed"; "cancelled" is defensive
 TAG_PREFIX = "meeting_action_item:"
 
 
@@ -59,6 +61,8 @@ def _classify(item, task, gate, graph_run) -> tuple[str, bool, str | None]:
     if item.creates_graph and graph_run is not None and graph_run.status == "completed":
         return "graph_completed", True, None
     if task is None:
+        if item.creates_graph and graph_run is not None and graph_run.status in FAILED_GRAPH_STATUSES:
+            return "graph_failed", False, f"graph run {graph_run.status}"
         if item.creates_graph and graph_run is not None:
             return "graph_in_flight", False, "graph run not completed"
         has_assignee = item.assignee_agent_id or item.assignee_user_id
@@ -74,17 +78,11 @@ def _classify(item, task, gate, graph_run) -> tuple[str, bool, str | None]:
     return "task_done", True, None
 
 
-async def meeting_commitments(db: AsyncSession, run: OrchestrationRun) -> list[dict]:
-    meeting_ids = await _run_meeting_ids(db, run.id)
-    if not meeting_ids:
-        return []
-    items = list((await db.execute(
-        select(MeetingActionItem).where(MeetingActionItem.meeting_id.in_(meeting_ids))
-        .order_by(MeetingActionItem.created_at.asc(), MeetingActionItem.id.asc())
-    )).scalars().all())
+async def delegation_task_fallback(db: AsyncSession, run_id: uuid.UUID) -> dict[uuid.UUID, uuid.UUID]:
+    """item id -> task id from completed tagged delegations (historical rows lack item.task_id)."""
     fallback: dict[uuid.UUID, uuid.UUID] = {}
     actions = (await db.execute(select(OrchestrationAction).where(
-        OrchestrationAction.run_id == run.id,
+        OrchestrationAction.run_id == run_id,
         OrchestrationAction.action_type == "create_delegation_task",
         OrchestrationAction.status == "completed",
         OrchestrationAction.target_type == "task",
@@ -93,6 +91,18 @@ async def meeting_commitments(db: AsyncSession, run: OrchestrationRun) -> list[d
         for item_id in _item_ids_from_tags((action.request or {}).get("inputs")):
             if action.target_id is not None:
                 fallback[item_id] = action.target_id  # latest delegation wins
+    return fallback
+
+
+async def meeting_commitments(db: AsyncSession, run: OrchestrationRun) -> list[dict]:
+    meeting_ids = await _run_meeting_ids(db, run.id)
+    if not meeting_ids:
+        return []
+    items = list((await db.execute(
+        select(MeetingActionItem).where(MeetingActionItem.meeting_id.in_(meeting_ids))
+        .order_by(MeetingActionItem.created_at.asc(), MeetingActionItem.id.asc())
+    )).scalars().all())
+    fallback = await delegation_task_fallback(db, run.id)
     task_ids = {i.task_id or fallback.get(i.id) for i in items} - {None}
     tasks = {t.id: t for t in (await db.execute(select(Task).where(Task.id.in_(task_ids)))).scalars().all()} if task_ids else {}
     graph_ids = {i.graph_run_id for i in items if i.creates_graph and i.graph_run_id}

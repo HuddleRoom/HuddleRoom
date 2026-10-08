@@ -3,7 +3,7 @@ import uuid
 import pytest
 
 from huddleroom.models.graph import Graph, GraphRun
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationGoal
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
 from tests.test_orchestration_delegation_contracts import _agent, _delegation_request, _make_run
@@ -227,3 +227,79 @@ async def test_graph_in_flight_vs_completed(db_session, test_project):
     graph_run.status = "completed"
     await db_session.flush()
     assert (await _one(db_session, run))["state"] == "graph_completed"
+
+
+async def _graph_item(db, project, meeting, status):
+    graph = Graph(name=f"g-{uuid.uuid4()}", version=1, definition={})
+    db.add(graph)
+    await db.flush()
+    graph_run = GraphRun(graph_id=graph.id, project_id=project.id, current_node="n", status=status)
+    db.add(graph_run)
+    await db.flush()
+    return await _action_item(db, meeting, description="Ship it", creates_graph=True, graph_run_id=graph_run.id)
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+async def test_failed_graph_commitment_and_follow_up(db_session, test_project, status):
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+    run, meeting = await _setup(db_session, test_project)
+    item = await _graph_item(db_session, test_project, meeting, status)
+    entry = await _one(db_session, run)
+    assert (entry["state"], entry["fulfilled"], entry["reason"]) == ("graph_failed", False, f"graph run {status}")
+    assert entry["suggested_actions"] == ["create_delegation_task", "ask_human"]
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.untracked_follow_ups == [{
+        "kind": "meeting_action_item", "id": str(item.id),
+        "summary": f"Ship it (graph {status}; delegate or ask owner)",
+        "suggested_actions": ["create_delegation_task", "ask_human"],
+    }]
+
+
+async def test_active_graph_in_flight_no_follow_up(db_session, test_project):
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+    run, meeting = await _setup(db_session, test_project)
+    await _graph_item(db_session, test_project, meeting, "active")
+    assert (await _one(db_session, run))["state"] == "graph_in_flight"
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    assert (await OrchestrationProgressView().build(db_session, goal, run)).untracked_follow_ups == []
+
+
+async def test_tag_only_delegation_failed_then_redelegated(db_session, test_project):
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+    run, meeting = await _setup(db_session, test_project)
+    item = await _action_item(db_session, meeting, description="Do it")
+    dead = await _task(db_session, test_project, run, status="failed")
+    await _delegation(db_session, run, dead, [f"meeting_action_item:{item.id}"])
+    entry = await _one(db_session, run)
+    assert (entry["state"], entry["task_id"]) == ("task_failed", str(dead.id))
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    ups = (await OrchestrationProgressView().build(db_session, goal, run)).untracked_follow_ups
+    (follow_up,) = [u for u in ups if u["kind"] == "meeting_action_item"]
+    assert follow_up["id"] == str(item.id) and follow_up["suggested_actions"] == ["create_delegation_task"]
+    live = await _task(db_session, test_project, run, status="in_progress")
+    await _delegation(db_session, run, live, [f"meeting_action_item:{item.id}"])
+    assert (await _one(db_session, run))["state"] == "task_in_flight"
+    ups = (await OrchestrationProgressView().build(db_session, goal, run)).untracked_follow_ups
+    assert not [u for u in ups if u["kind"] == "meeting_action_item"]
+
+
+@pytest.mark.parametrize("new_status,state,fulfilled", [("active", "graph_in_flight", False), ("completed", "graph_completed", True)])
+async def test_relinked_graph_run_clears_failure(db_session, test_project, new_status, state, fulfilled):
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+    run, meeting = await _setup(db_session, test_project)
+    item = await _graph_item(db_session, test_project, meeting, "failed")
+    assert (await _one(db_session, run))["state"] == "graph_failed"
+    graph = Graph(name=f"g-{uuid.uuid4()}", version=1, definition={})
+    db_session.add(graph)
+    await db_session.flush()
+    new = GraphRun(graph_id=graph.id, project_id=test_project.id, current_node="n", status=new_status)
+    db_session.add(new)
+    await db_session.flush()
+    item.graph_run_id = new.id
+    await db_session.flush()
+    entry = await _one(db_session, run)
+    assert (entry["state"], entry["fulfilled"]) == (state, fulfilled)
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    ups = (await OrchestrationProgressView().build(db_session, goal, run)).untracked_follow_ups
+    assert not [u for u in ups if u["kind"] == "meeting_action_item"]

@@ -181,23 +181,36 @@ async def _follow_up_rows(
             "suggested_actions": ["create_delegation_task", "ask_human"],
         }))
     # Delegated items whose linked task died need re-delegation; the delegated_inputs filter must not hide them.
-    dead = list((await db.execute(
-        select(MeetingActionItem, Task)
-        .join(Task, Task.id == MeetingActionItem.task_id)
-        .where(
-            MeetingActionItem.meeting_id.in_(meeting_ids),
-            MeetingActionItem.status == "task_created",
-            Task.status.in_(("failed", "cancelled")),
-        )
+    # Task link is item.task_id, else the tagged-delegation fallback shared with meeting_commitments.
+    from huddleroom.services.orchestration_meeting_commitments import (
+        FAILED_GRAPH_STATUSES, OPEN_ITEM_STATUSES, delegation_task_fallback,
+    )
+    candidates = list((await db.execute(
+        select(MeetingActionItem)
+        .where(MeetingActionItem.meeting_id.in_(meeting_ids), MeetingActionItem.status.in_(OPEN_ITEM_STATUSES))
         .order_by(MeetingActionItem.created_at.asc(), MeetingActionItem.id.asc())
-    )).all()) if meeting_ids else []
-    for item, linked in dead:
-        suffix = f" (task {linked.status}; re-delegate)"
+    )).scalars().all()) if meeting_ids else []
+    fallback = await delegation_task_fallback(db, run.id) if candidates else {}
+    task_ids = {i.task_id or fallback.get(i.id) for i in candidates} - {None}
+    linked_tasks = {t.id: t for t in (await db.execute(select(Task).where(Task.id.in_(task_ids)))).scalars().all()} if task_ids else {}
+    graph_ids = {i.graph_run_id for i in candidates if i.creates_graph and i.graph_run_id}
+    graph_status = dict((await db.execute(
+        select(GraphRun.id, GraphRun.status).where(GraphRun.id.in_(graph_ids))
+    )).all()) if graph_ids else {}
+    for item in candidates:
+        linked = linked_tasks.get(item.task_id or fallback.get(item.id))
+        if linked is not None and linked.status in ("failed", "cancelled"):
+            suffix, actions_ = f" (task {linked.status}; re-delegate)", ["create_delegation_task"]
+        elif linked is None and item.creates_graph and graph_status.get(item.graph_run_id) in FAILED_GRAPH_STATUSES:
+            suffix = f" (graph {graph_status[item.graph_run_id]}; delegate or ask owner)"
+            actions_ = ["create_delegation_task", "ask_human"]
+        else:
+            continue
         rows.append((RANK_MEETING_ACTION_ITEM, _naive_utc(item.created_at), str(item.id), {
             "kind": "meeting_action_item",
             "id": str(item.id),
             "summary": (item.description[:FOLLOW_UP_SUMMARY_MAX - len(suffix)] + suffix)[:FOLLOW_UP_SUMMARY_MAX],
-            "suggested_actions": ["create_delegation_task"],
+            "suggested_actions": actions_,
         }))
 
     # Completed actions name the decision they applied in dispatch_contract; decision_continuation is bookkeeping, not consumption.

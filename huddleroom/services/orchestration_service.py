@@ -89,7 +89,7 @@ from huddleroom.services.task_service import TaskService
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
 # Actions that hand off to a human or pause: `_act_until_wait` must not keep acting after them.
-_LOOP_STOP_ACTIONS = frozenset({"ask_human", "pause_run", "request_human_decision", "request_manager_decision"})
+_LOOP_STOP_ACTIONS = frozenset({"ask_human", "pause_run"})
 ASK_HUMAN_EVENT_TYPE = "orchestration.human_input_required"
 NOOP_WAIT_EVENT_TYPE = "orchestration.waiting"
 AGENT_SUGGESTED_EVENT_TYPE = "orchestration.agent_suggested"
@@ -2637,112 +2637,6 @@ class OrchestrationService:
             dedup_key=f"{NOOP_WAIT_EVENT_TYPE}:action:{action.id}",
         )
         return await self._mark_action_completed(db, action, target_type="wait", target_id=None)
-
-    async def execute_request_human_decision_action(
-        self,
-        db: AsyncSession,
-        run_id: uuid.UUID,
-        request: dict,
-        idempotency_key: str,
-        decision_id: uuid.UUID | None = None,
-    ) -> OrchestrationAction:
-        existing = await self._existing_action_for_key(db, run_id, idempotency_key)
-        request_to_store = existing.request if existing is not None else dict(request)
-        action = await self.reserve_action(
-            db,
-            run_id=run_id,
-            idempotency_key=idempotency_key,
-            action_type="request_human_decision",
-            request=request_to_store,
-            decision_id=decision_id,
-        )
-        if action.status != "reserved":
-            return action
-
-        stored = action.request or {}
-        run = await db.get(OrchestrationRun, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Orchestration run not found")
-        title = await self._require_stored_string(db, action, stored.get("title"), "title")
-        question = await self._require_stored_string(db, action, stored.get("question"), "question")
-        try:
-            pending = await OrchestrationAuthorityDecisionService().create_pending(
-                db,
-                run.goal_id,
-                decision_key=f"authority_interview:{action.id}",
-                title=title,
-                question=question,
-                authority="human",
-                options=stored.get("options") or [],
-                context=self._optional_string(stored.get("context")),
-                recommendation=self._optional_string(stored.get("recommendation")),
-                consequences=self._optional_string(stored.get("consequences")),
-                run_id=run_id,
-            )
-        except ValueError as exc:
-            await self._fail_reserved_action_for_current_flow(db, action, str(exc))
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await self._mark_action_completed(db, action, target_type="authority_decision", target_id=pending.id)
-
-    async def execute_request_manager_decision_action(
-        self,
-        db: AsyncSession,
-        run_id: uuid.UUID,
-        request: dict,
-        idempotency_key: str,
-        decision_id: uuid.UUID | None = None,
-    ) -> OrchestrationAction:
-        existing = await self._existing_action_for_key(db, run_id, idempotency_key)
-        request_to_store = existing.request if existing is not None else dict(request)
-        action = await self.reserve_action(
-            db,
-            run_id=run_id,
-            idempotency_key=idempotency_key,
-            action_type="request_manager_decision",
-            request=request_to_store,
-            decision_id=decision_id,
-        )
-        if action.status != "reserved":
-            return action
-
-        stored = action.request or {}
-        run = await db.get(OrchestrationRun, run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Orchestration run not found")
-        goal = await db.get(OrchestrationGoal, run.goal_id)
-        if goal is None:
-            raise HTTPException(status_code=404, detail="Orchestration goal not found")
-        if goal.authority_model != "agent_manager" or goal.manager_agent_id is None:
-            error = "no active agent manager is selected for this goal"
-            await self._fail_reserved_action_for_current_flow(db, action, error)
-            raise HTTPException(status_code=409, detail=error)
-        manager = await db.get(Agent, goal.manager_agent_id)
-        if manager is None or not manager.is_active:
-            error = "selected manager agent is inactive"
-            await self._fail_reserved_action_for_current_flow(db, action, error)
-            raise HTTPException(status_code=409, detail=error)
-
-        title = await self._require_stored_string(db, action, stored.get("title"), "title")
-        question = await self._require_stored_string(db, action, stored.get("question"), "question")
-        try:
-            pending = await OrchestrationAuthorityDecisionService().create_pending(
-                db,
-                goal.id,
-                decision_key=f"authority_interview:{action.id}",
-                title=title,
-                question=question,
-                authority="manager",
-                authority_agent_id=goal.manager_agent_id,
-                options=stored.get("options") or [],
-                context=self._optional_string(stored.get("context")),
-                recommendation=self._optional_string(stored.get("recommendation")),
-                consequences=self._optional_string(stored.get("consequences")),
-                run_id=run_id,
-            )
-        except ValueError as exc:
-            await self._fail_reserved_action_for_current_flow(db, action, str(exc))
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await self._mark_action_completed(db, action, target_type="authority_decision", target_id=pending.id)
 
     async def execute_record_authority_decision_action(
         self,

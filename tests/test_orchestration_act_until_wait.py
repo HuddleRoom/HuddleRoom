@@ -158,7 +158,7 @@ async def test_loop_stops_when_goal_paused_or_phase_changes(db_session, test_pro
     assert calls["n"] == 1
 
 
-@pytest.mark.parametrize("action_type", ["ask_human", "pause_run", "request_human_decision", "request_manager_decision"])
+@pytest.mark.parametrize("action_type", ["ask_human", "pause_run"])
 async def test_human_handoff_actions_stop_loop(db_session, test_project, monkeypatch, action_type):
     goal, run = await _setup(db_session, test_project)
     service, calls = _wire(monkeypatch, db_session, run, [(action_type, "completed")] * 3)
