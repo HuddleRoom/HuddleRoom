@@ -164,6 +164,7 @@ function AgentFormModal({
       .filter(Boolean)
 
     const config: Record<string, unknown> = { ...(initialData?.config ?? {}), memory_enabled: form.memory_enabled }
+    delete config.cli_runtime
     if (showEffort && effortLevels(form.cli_runtime).includes(form.effort)) config.reasoning_effort = form.effort
     else delete config.reasoning_effort
 

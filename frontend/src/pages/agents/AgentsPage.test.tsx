@@ -314,6 +314,18 @@ describe('AgentsPage edit form effort/config', () => {
     } finally { mocks.agents = []; view.cleanup() }
   })
 
+  it('removes a legacy config runtime while preserving other config on edit', async () => {
+    const { view, submit, sent } = await edit(agent({
+      provider: 'claude_code', cli_runtime: 'claude_code', model: 'claude-sonnet-5-5',
+      config: { cli_runtime: 'codex', foo: 1 },
+    }))
+    try {
+      await submit()
+      expect(sent()).toEqual(expect.objectContaining({ provider: 'claude_code', cli_runtime: 'claude_code' }))
+      expect(sent().config).toEqual({ foo: 1, memory_enabled: false })
+    } finally { mocks.agents = []; view.cleanup() }
+  })
+
   it('drops reasoning_effort when switching to a runtime without effort', async () => {
     const { view, submit, sent } = await edit(agent({ config: { reasoning_effort: 'high' } }))
     try {
