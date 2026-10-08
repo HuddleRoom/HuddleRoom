@@ -444,7 +444,7 @@ async def test_runtime_commits_malformed_plan_failure_then_accepts_revision(
     assert accepted_run.plan_state["status"] == "accepted"
 
 
-async def test_runtime_reraises_invalid_revision_request_after_malformed_plan(
+async def test_runtime_records_failed_action_for_invalid_revision_request_after_malformed_plan(
     db_session, test_project, stub_decision
 ):
     planner = _agent("invalid-runtime-revision", ["planning"])
@@ -488,8 +488,12 @@ async def test_runtime_reraises_invalid_revision_request_after_malformed_plan(
             "revision_request": "This task id is invalid.",
         }
     )
-    with pytest.raises(HTTPException, match="Planning task not found"):
-        await service.tick(db_session, run.id)
+    # A 4xx executor rejection is recorded as a failed action instead of crashing the tick.
+    await service.tick(db_session, run.id)
+    rejected = (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_plan_revision",
+    ))).all()
+    assert [(a.status, a.error) for a in rejected] == [("failed", "Planning task not found")]
 
 
 async def _tasks_for_run(db_session, run_id):

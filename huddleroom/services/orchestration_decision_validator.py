@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
 
+from huddleroom.models.orchestration_process import WARNING_SEVERITIES, WARNING_SEVERITY_VALUES
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
 
@@ -144,6 +145,14 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
 
     if "applies_decision_id" in decision and not _is_uuid_string(decision["applies_decision_id"]):
         return DecisionValidationResult(False, "applies_decision_id must be a UUID")
+
+    if action_type == "record_warning" and (
+        not isinstance(decision["severity"], str) or decision["severity"] not in WARNING_SEVERITIES
+    ):
+        return DecisionValidationResult(
+            False,
+            f"Decision 'record_warning' severity must be one of: {', '.join(WARNING_SEVERITY_VALUES)}",
+        )
 
     if action_type == "retry_task":
         for key in ("timeout", "max_tokens"):

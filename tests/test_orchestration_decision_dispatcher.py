@@ -15,6 +15,20 @@ from huddleroom.services.orchestration_decision_dispatcher import OrchestrationD
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
+@pytest.fixture(autouse=True)
+def _fake_db_seams(request, monkeypatch):
+    """Fake-db unit tests bypass the savepoint and attempt-key lookup; real-db tests (db_session) do not."""
+    if "db_session" in request.fixturenames:
+        return
+    from contextlib import nullcontext
+
+    async def same_key(self, _db, _run_id, key, *_a):
+        return key, None
+
+    monkeypatch.setattr(OrchestrationDecisionDispatcher, "_savepoint", staticmethod(lambda _db: nullcontext()))
+    monkeypatch.setattr(OrchestrationDecisionDispatcher, "_attempt_key", same_key)
+
+
 @pytest.mark.asyncio
 async def test_dispatch_routes_request_plan_to_executor():
     service = OrchestrationService()

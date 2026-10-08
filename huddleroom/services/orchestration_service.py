@@ -6,6 +6,7 @@ from copy import deepcopy
 from decimal import Decimal
 from graphlib import CycleError, TopologicalSorter
 import hashlib
+import logging
 import hmac
 import json
 import logging
@@ -131,6 +132,8 @@ GATE_REPAIRED_EVENT_TYPE = "orchestration.gate_repaired"
 RECOVERY_RUN_PAUSED_EVENT_TYPE = "orchestration.run_paused"
 MEETING_SCHEDULED_EVENT_TYPE = "orchestration.meeting_scheduled"
 GRAPH_STARTED_EVENT_TYPE = "orchestration.graph_started"
+
+logger = logging.getLogger(__name__)
 
 class _ReentrantAsyncioLock:
     """Reentrant wrapper around asyncio.Lock for SQLite baseline-transition serialization.
@@ -1308,6 +1311,41 @@ class OrchestrationService:
             await self._fail_reserved_action_in_transaction(db, action, error)
             return
         await self._fail_reserved_action(db, action, error)
+
+    _SESSION_SIDE_EFFECT_KEYS = ("pending_bus_events", "pending_session_dispatches")
+
+    @classmethod
+    def _side_effect_marks(cls, db) -> dict[str, int]:
+        """Lengths of the after-commit queues, so a savepoint rollback can drop its own entries."""
+        info = getattr(getattr(db, "sync_session", None), "info", None)
+        if info is None:
+            return {}
+        return {key: len(info.get(key, ())) for key in cls._SESSION_SIDE_EFFECT_KEYS}
+
+    async def _after_savepoint_rollback(self, db, run, marks: dict[str, int]) -> None:
+        """Queued bus events/dispatches outlive a savepoint rollback; drop them and reload expired state."""
+        info = db.sync_session.info
+        for key, size in marks.items():
+            if key in info:
+                del info[key][size:]
+        try:
+            await db.refresh(run)
+            await db.get(OrchestrationGoal, run.goal_id, populate_existing=True)
+        except Exception:  # never mask the exception being handled
+            logger.exception("Could not refresh run/goal after savepoint rollback")
+
+    def _is_genuine_rejection(self, exc: HTTPException) -> bool:
+        """Only a plain 4xx rolls its work back; waits and server errors persist state on purpose."""
+        return 400 <= exc.status_code < 500 and self._waiting_step_for_http_error(exc) is None
+
+    async def _failed_action_for_key(
+        self, db: AsyncSession, run_id: uuid.UUID, key: str,
+    ) -> OrchestrationAction | None:
+        action = await self._existing_action_for_key(db, run_id, key)
+        if action is None:
+            return None
+        await db.refresh(action)
+        return action if action.status == "failed" else None
 
     async def _validate_delegation_targets(
         self,
@@ -8152,16 +8190,35 @@ class OrchestrationService:
             action_type, extra = "retry_task", {}
             key = f"run:{run.id}:kind:retry_task:task:{task.id}{attempt}"
             execute = self.execute_retry_task_action
+        request = {"action_type": action_type, "task_id": str(task.id), **extra}
+        marks = self._side_effect_marks(db)
+        kept: HTTPException | None = None
         try:
-            async with db.begin_nested():
-                await execute(
-                    db, run_id=run.id,
-                    request={"action_type": action_type, "task_id": str(task.id), **extra},
-                    idempotency_key=key,
-                )
-            return 1
-        except HTTPException:
+            async with db.begin_nested():  # executor work (budget, task metadata) is all-or-nothing
+                try:
+                    await execute(db, run_id=run.id, request=request, idempotency_key=key)
+                except HTTPException as exc:
+                    if self._is_genuine_rejection(exc):
+                        raise
+                    kept = exc  # waits/5xx persist state on purpose
+            return None if kept is not None else 1
+        except HTTPException as exc:
+            # Rolled back; keep only the failed row so the episode check sees this attempt.
+            await self._after_savepoint_rollback(db, run, marks)
+            await db.refresh(task)
+            try:
+                async with db.begin_nested():
+                    failed = await self.reserve_action(
+                        db, run_id=run.id, idempotency_key=key, action_type=action_type, request=request,
+                    )
+                    if failed.status == "reserved":
+                        await self._fail_reserved_action_in_transaction(db, failed, str(exc.detail))
+            except HTTPException:
+                pass
             return None
+        except Exception:
+            await self._after_savepoint_rollback(db, run, marks)
+            raise
 
     async def _blocked_task_awaiting(self, db: AsyncSession, task: Task) -> tuple[str, uuid.UUID] | None:
         """(label, task id whose status event ends the wait) for what a blocked task awaits, or None."""
@@ -9400,7 +9457,7 @@ class OrchestrationService:
                 db, run, refreshed, stale_retry=True,
             )
         if action is not None:
-            if action.action_type == "noop":
+            if action.action_type == "noop" or action.status == "failed":
                 await self._create_noop_waits(db, run, decision)
             return action
 

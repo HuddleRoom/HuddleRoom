@@ -167,8 +167,15 @@ async def test_steered_decision_cannot_pause_a_run(
     await db_session.flush()
 
     from huddleroom.services.orchestration_service import OrchestrationService
-    with pytest.raises(SteeringDomainError, match="steering_forbidden_effect"):
-        await OrchestrationDecisionDispatcher(OrchestrationService()).dispatch(db_session, run, decision)
+    service = OrchestrationService()
+    assert await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision) is None
+    assert decision.validator_status == "rejected" and "dedicated control" in decision.rejection_reason
+    # the tick path turns the rejection into a noop plus the backstop wait instead of raising
+    from huddleroom.models.orchestration import OrchestrationWait
+    noop = await service._dispatch_execution_decision(db_session, run, decision)
+    assert noop.action_type == "noop"
+    assert (await db_session.scalars(select(OrchestrationWait).where(
+        OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"))).all()
 
 
 async def test_stale_steering_versions_do_not_reserve_an_action(
@@ -395,6 +402,11 @@ async def test_late_item_lifetime_drift_fails_reservation_and_reevaluates_once(
 
     monkeypatch.setattr(service, "_existing_action_for_key", drift_after_early_fence)
     monkeypatch.setattr(service, "request_llm_decision", fresh_decision)
+    # The simulated concurrent writer commits session_a mid-executor, which a real savepoint cannot survive;
+    # the failed-row-kept behaviour under a real savepoint is covered in test_orchestration_failed_action_outcome.
+    from contextlib import nullcontext
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    monkeypatch.setattr(OrchestrationDecisionDispatcher, "_savepoint", staticmethod(lambda _db: nullcontext()))
 
     assert await service._dispatch_execution_decision(session_a, run, stale) is None
     action = await session_a.scalar(select(OrchestrationAction).where(

@@ -5,12 +5,15 @@ import json
 import uuid
 from typing import Any
 
+from fastapi import HTTPException
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.services.orchestration_steering import (
-    OrchestrationSteeringService, SteeringDomainError, active_direction_ids,
+    SteeringVersionsChanged,
+    OrchestrationSteeringService, active_direction_ids,
     steering_versions_from_snapshot,
 )
 
@@ -25,6 +28,10 @@ class OrchestrationDecisionDispatcher:
     _UNLINKED_ACTION_TYPES = frozenset(
         {"noop", "record_warning", "pause_run", "ask_human", "suggest_agent"}
     )
+
+    # Executors whose 4xx failure state (plan revision, replan attention) is read by the runner,
+    # so it must stay committed and the error must propagate.
+    _OWN_RECOVERY_ACTION_TYPES = frozenset({"accept_plan", "request_roadmap_replan"})
 
     def __init__(self, service: Any) -> None:
         self._service = service
@@ -80,9 +87,10 @@ class OrchestrationDecisionDispatcher:
             steering = OrchestrationSteeringService()
             await steering.assert_current_versions(db, goal, run, versions)
             if active_direction_ids(input_snapshot) and action_type in {"pause_run", "ask_human"}:
-                raise SteeringDomainError(
-                    "steering_forbidden_effect", 409, "Use the dedicated control",
-                )
+                # Model-proposed: reject (noop/backstop wait follows) rather than crash the tick.
+                decision.validator_status = "rejected"
+                decision.rejection_reason = "steering_forbidden_effect: Use the dedicated control"
+                return None
         method = getattr(self._service, executor)
         if action_type == "request_roadmap_replan":
             action_key = await self._service.roadmap_replan_action_key(db, run)
@@ -90,24 +98,43 @@ class OrchestrationDecisionDispatcher:
             action_key = self.action_key(run.id, action_type, request)
             if action_type == "request_verification":
                 action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"))
+        action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
+        if capped is not None:
+            return capped  # rejected too often: no re-run, no new row; the backstop wait still applies
         if versions is not None:
             action_key, *_ = (
                 await self._service._steering_action_fence(db, run.id, action_key, decision.id)
             )
-        if action_type == "request_roadmap_replan":
-            action = await method(
-                db, run_id=run.id, request=request,
-                idempotency_key=action_key,
-                decision_id=decision.id,
-            )
+        run_id, decision_id = run.id, decision.id
+        call = lambda: method(  # noqa: E731
+            db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id,
+        )
+        if action_type in self._OWN_RECOVERY_ACTION_TYPES:
+            action = await call()
         else:
-            action = await method(
-                db,
-                run_id=run.id,
-                request=request,
-                idempotency_key=action_key,
-                decision_id=decision.id,
-            )
+            kept: Exception | None = None
+            marks = self._service._side_effect_marks(db)
+            try:
+                # Savepoint: a rejected executor must not leave partial work (budget, meetings, graphs).
+                async with self._savepoint(db):
+                    try:
+                        action = await call()
+                    except SteeringVersionsChanged as exc:
+                        kept = exc  # its failed row must stay
+                    except HTTPException as exc:
+                        if self._service._is_genuine_rejection(exc):
+                            raise
+                        kept = exc  # waits/5xx persist state on purpose
+            except HTTPException as exc:
+                await self._service._after_savepoint_rollback(db, run, marks)
+                action = await self._record_rejection(
+                    db, run_id, decision_id, action_type, request, action_key, str(exc.detail),
+                )
+            except Exception:
+                await self._service._after_savepoint_rollback(db, run, marks)
+                raise
+            if kept is not None:
+                raise kept
         if (
             applies_decision_id is not None
             and action.status == "completed"
@@ -120,6 +147,55 @@ class OrchestrationDecisionDispatcher:
         if steering is not None and action.status != "failed":
             for request_id in active_direction_ids(input_snapshot):
                 await steering.link_result(db, request_id, decision.id, action.id)
+        return action
+
+    @staticmethod
+    def _savepoint(db: AsyncSession):
+        return db.begin_nested()
+
+    _MAX_REJECTED_ATTEMPTS = 3
+
+    async def _attempt_key(
+        self, db: AsyncSession, run_id: uuid.UUID, key: str, decision_id: uuid.UUID, fenced: bool,
+    ) -> tuple[str, OrchestrationAction | None]:
+        """A previously rejected (failed) action must not block the same decision forever:
+        retry under a new attempt key so the executor re-checks its preconditions, up to a cap.
+        Returns (key, None), or (key, latest failed action) once the cap is reached."""
+        probe = key
+        if fenced:
+            probe, *_ = await self._service._steering_action_fence(db, run_id, key, decision_id)
+        status = await db.scalar(select(OrchestrationAction.status).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.idempotency_key == probe,
+        ))
+        if status != "failed":
+            return key, None
+        failed = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id,
+            OrchestrationAction.status == "failed",
+            or_(
+                OrchestrationAction.idempotency_key == key,
+                OrchestrationAction.idempotency_key.startswith(key + ":", autoescape=True),
+            ),
+        ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id.desc()))).all()
+        progress_at = await db.scalar(select(func.max(OrchestrationAction.created_at)).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.status == "completed",
+        ))
+        since_progress = [a for a in failed if progress_at is None or a.created_at > progress_at]
+        if len(since_progress) >= self._MAX_REJECTED_ATTEMPTS:
+            return key, failed[0]
+        return f"{key}:rejected:{len(failed)}", None
+
+    async def _record_rejection(
+        self, db: AsyncSession, run_id: uuid.UUID, decision_id: uuid.UUID,
+        action_type: str, request: dict[str, Any], key: str, error: str,
+    ) -> OrchestrationAction:
+        """After the savepoint rolled back, durably keep only a failed action row."""
+        action = await self._service.reserve_action(
+            db, run_id=run_id, idempotency_key=key, action_type=action_type,
+            request=request, decision_id=decision_id,
+        )
+        if action.status == "reserved":
+            await self._service._fail_reserved_action_in_transaction(db, action, error)
         return action
 
     @staticmethod
