@@ -175,7 +175,7 @@ class CliAdapter:
     @staticmethod
     def _build_command(
         cli_runtime: str, task_content: str, agent_config: dict, workspace: Path, task_path: Path,
-        *, context_path: Path | None = None, existing_session_id: str | None = None, model: str | None = None,
+        *, existing_session_id: str | None = None, model: str | None = None,
     ) -> list[str] | None:
         effort = (agent_config or {}).get("reasoning_effort")
         effort = effort if isinstance(effort, str) and effort in (CLI_EFFORTS - {"max"} if cli_runtime == "codex" else CLI_EFFORTS) else None
@@ -185,16 +185,13 @@ class CliAdapter:
                 cmd += ["--model", model]
             if effort:
                 cmd += ["--effort", effort]
-            if context_path:
-                cmd += ["--output-format", "stream-json"]
-            else:
-                cmd += [task_content or "proceed", "--output-format", "stream-json"]
+            cmd += ["--output-format", "stream-json"]
             if existing_session_id:
                 if re.fullmatch(r"[a-zA-Z0-9_-]{8,128}", existing_session_id):
                     cmd += ["--resume", existing_session_id]
                 else:
                     logger.warning("Ignoring invalid CLI session ID: %r", existing_session_id)
-            return cmd + (["--file", str(context_path)] if context_path else [])
+            return cmd + ["--", task_content or "proceed"]
         elif cli_runtime == "codex":
             model_args = [*(["--model", model] if model else []),
                           *(["-c", f"model_reasoning_effort={effort}"] if effort else [])]
@@ -995,7 +992,6 @@ class CliAdapter:
                 agent.config,
                 workspace,
                 ctx_path,
-                context_path=ctx_path,
                 existing_session_id=existing_session_id,
                 model=agent.model,
             )

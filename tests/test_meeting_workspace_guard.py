@@ -94,8 +94,7 @@ async def test_meeting_turn_uses_workspace_cwd_and_rally_context(db_session, tmp
     assert launch.await_args.kwargs["start_new_session"] is True
     assert command == (
         "claude", "--dangerously-skip-permissions", "--print", "--verbose", "--model", "gpt-4o-mini",
-        "--output-format", "stream-json",
-        "--resume", existing_session_id, "--file", str(context_dir / "meeting_context.md"),
+        "--output-format", "stream-json", "--resume", existing_session_id, "--", "Discuss safely",
     )
     assert (context_dir / "meeting_context.md").read_text() == "Discuss safely"
     assert (context_dir / "huddleroom_context.json").is_file()

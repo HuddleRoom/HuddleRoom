@@ -376,15 +376,28 @@ def test_reasoning_effort_flags(tmp_path):
     assert "--effort" in build("claude_code", {"reasoning_effort": "max"})
 
 
-def test_claude_effort_argv_order_resume_and_context(tmp_path):
+def test_claude_effort_argv_order_resume_and_fresh_prompt(tmp_path):
     ws = tmp_path / "w"
     cfg = {"reasoning_effort": "low"}
     cmd = CliAdapter._build_command("claude_code", "P", cfg, ws, ws / "t.md", model="M", existing_session_id="sess12345")
     assert cmd[cmd.index("--model"):cmd.index("--model") + 4] == ["--model", "M", "--effort", "low"]
-    assert cmd.index("--effort") < cmd.index("P")
+    assert cmd[-2:] == ["--", "P"]
     assert cmd[cmd.index("--resume") + 1] == "sess12345"
-    cmd = CliAdapter._build_command("claude_code", "P", cfg, ws, ws / "t.md", context_path=ws / "c.md")
+    cmd = CliAdapter._build_command("claude_code", "P", cfg, ws, ws / "t.md")
     assert cmd[cmd.index("--effort") + 1] == "low"
+    assert cmd[-2:] == ["--", "P"]
+    assert "--file" not in cmd
+
+
+@pytest.mark.parametrize("session_id", [None, "sess12345"])
+def test_claude_command_marks_leading_dash_prompt_as_positional(tmp_path, session_id):
+    prompt = "--do-not-interpret-as-a-flag"
+
+    command = CliAdapter._build_command(
+        "claude_code", prompt, {}, tmp_path, tmp_path / "task.md", existing_session_id=session_id,
+    )
+
+    assert command[-2:] == ["--", prompt]
 
 
 @pytest.mark.parametrize(
