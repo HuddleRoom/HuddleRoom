@@ -2008,6 +2008,49 @@ async def test_tick_suggests_rerun_when_assignment_identity_changes_but_coverage
 
 
 @pytest.mark.asyncio
+async def test_post_baseline_task_for_covered_function_resyncs_fingerprint_without_rerun(
+    db_session, review_goal, review_run
+):
+    """Post-baseline, a new execution task for an already-reviewed agent with an
+    already-covered work function moves the assignment fingerprint but not
+    coverage: the completed review stands, no rerun row is created, and the
+    stored fingerprint is silently re-stamped."""
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    agent = await _persist_agent(db_session)
+    await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
+    await _advance(db_session, review_goal, review_run)
+    first = await _current_process(db_session, review_goal)
+    first_id = first.id
+    first_fingerprint = first.outputs["fingerprint"]
+    first_coverage = first.outputs["coverage_fingerprint"]
+
+    review_run.phase = "authorized"
+    await _assign(
+        db_session,
+        review_goal.project_id,
+        review_run.id,
+        agent,
+        "implementation",
+        title="execution task",
+    )
+    await db_session.flush()
+
+    result = await _advance(db_session, review_goal, review_run)
+    second = await _current_process(db_session, review_goal)
+
+    assert result["status"] == "completed"
+    assert second.id == first_id
+    assert second.status == "completed"
+    assert second.outputs["coverage_fingerprint"] == first_coverage
+    assert second.outputs["fingerprint"] != first_fingerprint
+    live_fingerprint = await AgentDefinitionReviewProcess().current_fingerprint(
+        db_session, review_goal, review_run
+    )
+    assert second.outputs["fingerprint"] == live_fingerprint
+
+
+@pytest.mark.asyncio
 async def test_tick_backfills_legacy_completed_audit_missing_coverage_fingerprint(
     db_session, review_goal, review_run
 ):

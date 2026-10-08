@@ -723,10 +723,16 @@ class AgentDefinitionReviewProcess:
                     run_id=run.id,
                 )
                 return self._summary("completed")
-            # Post-baseline: execution-time task assignments are part of
-            # _fingerprint and must keep coverage in sync silently -- a human
-            # is no longer actively reviewing the baseline, so restore the
-            # original auto-rerun instead of leaving a stale suggestion.
+            # Post-baseline: a rerun happens only when material coverage changed.
+            # Execution-time task assignments move _fingerprint (task ids) but
+            # not coverage_fingerprint; re-stamp the fingerprint silently.
+            if (
+                coverage_fingerprint is not None
+                and current.outputs.get("coverage_fingerprint") == coverage_fingerprint
+            ):
+                current.outputs = {**(current.outputs or {}), "fingerprint": fingerprint}
+                await db.flush()
+                return self._summary("completed")
             current = await self.process_service.start_process(
                 db,
                 goal.id,
