@@ -23,6 +23,16 @@ class TaskService:
         data: TaskCreate,
         task_id: uuid.UUID | None = None,
     ) -> Task:
+        deps = list(data.depends_on)
+        if len(set(deps)) != len(deps) or (task_id is not None and task_id in deps):
+            raise HTTPException(status_code=422, detail="depends_on must be distinct and not include the task itself")
+        if deps:
+            found = set(
+                (await db.execute(select(Task.id).where(Task.id.in_(deps), Task.project_id == project_id))).scalars()
+            )
+            for dep in deps:
+                if dep not in found:
+                    raise HTTPException(status_code=422, detail=f"depends_on task {dep} not found in project")
         task_kwargs = {
             "project_id": project_id,
             "title": data.title,
@@ -34,6 +44,7 @@ class TaskService:
             "metadata_": data.metadata,
             "due_at": data.due_at,
             "parent_id": data.parent_id,
+            "depends_on": [str(d) for d in deps] or None,
         }
         if task_id is not None:
             task_kwargs["id"] = task_id

@@ -1914,3 +1914,41 @@ async def test_api_adapter_prompt_carries_contract(db_session, test_project, pla
         _assert_planning_prompt(task_ctx)
     else:
         _assert_full_contract_prompt(task_ctx, ids)
+
+
+# --- TaskService.create depends_on -----------------------------------------
+
+@pytest.mark.asyncio
+async def test_task_create_depends_on_stored_as_strings_and_returned_as_uuids(db_session: AsyncSession, test_project):
+    from huddleroom.schemas.task import TaskResponse
+
+    svc = TaskService()
+    plain = await svc.create(db_session, test_project.id, TaskCreate(title="plain"))
+    assert plain.depends_on is None
+    assert TaskResponse.model_validate(plain).depends_on == []
+
+    dep = await svc.create(db_session, test_project.id, TaskCreate(title="dep"))
+    task = await svc.create(db_session, test_project.id, TaskCreate(title="t", depends_on=[dep.id]))
+    assert task.depends_on == [str(dep.id)]
+    assert TaskResponse.model_validate(task).depends_on == [dep.id]
+
+
+@pytest.mark.asyncio
+async def test_task_create_depends_on_rejects_invalid(db_session: AsyncSession, test_project):
+    svc = TaskService()
+    other = Project(name="Other", description="o", workspace_path="/tmp/other-dep", config={})
+    db_session.add(other)
+    await db_session.flush()
+    foreign = await svc.create(db_session, other.id, TaskCreate(title="foreign"))
+    dep = await svc.create(db_session, test_project.id, TaskCreate(title="dep"))
+
+    cases = [
+        (TaskCreate(title="a", depends_on=[uuid.uuid4()]), None),
+        (TaskCreate(title="a", depends_on=[foreign.id]), None),
+        (TaskCreate(title="a", depends_on=[dep.id, dep.id]), None),
+        (TaskCreate(title="a", depends_on=[dep.id]), dep.id),
+    ]
+    for data, task_id in cases:
+        with pytest.raises(HTTPException) as exc_info:
+            await svc.create(db_session, test_project.id, data, task_id=task_id)
+        assert exc_info.value.status_code == 422

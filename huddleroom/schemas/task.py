@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TaskCreate(BaseModel):
@@ -14,6 +14,7 @@ class TaskCreate(BaseModel):
     metadata: dict = {}
     due_at: datetime | None = None
     parent_id: UUID | None = None
+    depends_on: list[UUID] = Field(default_factory=list)
 
 
 class TaskUpdate(BaseModel):
@@ -45,6 +46,12 @@ class TaskResponse(BaseModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    depends_on: list[UUID] = Field(default_factory=list)
+
+    @field_validator("depends_on", mode="before")
+    @classmethod
+    def _none_depends_on_is_empty(cls, value):
+        return [] if value is None else value
 
 
 class StatusPatch(BaseModel):

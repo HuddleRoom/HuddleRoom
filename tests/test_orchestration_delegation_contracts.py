@@ -629,3 +629,113 @@ def test_planning_contract_wording_by_mode(mode, snapshot, deliverable):
         for i in contract.inputs
     )
     assert "You are the sole plan author: one plan that synthesizes any specialist inputs." in contract.success_evidence
+
+
+# --- orchestration_dependencies ---------------------------------------------
+
+async def _dep_task(db_session, project_id, run, *, gate=None, status="done", run_id="same", meta_key="gate_id"):
+    from huddleroom.models.orchestration import OrchestrationGate
+
+    metadata = {}
+    if gate is not False:
+        gate_row = gate
+        if gate_row is None:
+            gate_row = OrchestrationGate(run_id=run.id, success_criterion_key="delegated", gate_type="evidence")
+            db_session.add(gate_row)
+            await db_session.flush()
+        orch = {"run_id": str(run.id) if run_id == "same" else str(uuid.uuid4()), meta_key: str(gate_row.id)}
+        metadata = {"orchestration": orch}
+    elif run_id == "same":
+        metadata = {"orchestration": {"run_id": str(run.id)}}
+    task = Task(project_id=project_id, title="dep", status=status, metadata_=metadata)
+    db_session.add(task)
+    await db_session.flush()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_task_gate_id_resolution_order_and_wrong_run(db_session, test_project):
+    from huddleroom.services.orchestration_dependencies import task_gate_id
+
+    _, _, run = await _make_run(db_session, test_project.id)
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rid = str(run.id)
+    both = Task(metadata_={
+        "orchestration": {"run_id": rid, "gate_id": str(a), "plan_item_gate_id": str(b)},
+        "orchestration_plan_item": {"plan_item_gate_id": str(c)},
+    })
+    assert task_gate_id(both, run.id) == a
+    mid = Task(metadata_={
+        "orchestration": {"run_id": rid, "gate_id": "bad", "plan_item_gate_id": str(b)},
+        "orchestration_plan_item": {"plan_item_gate_id": str(c)},
+    })
+    assert task_gate_id(mid, run.id) == b
+    last = Task(metadata_={"orchestration": {"run_id": rid}, "orchestration_plan_item": {"plan_item_gate_id": str(c)}})
+    assert task_gate_id(last, run.id) == c
+    assert task_gate_id(Task(metadata_={"orchestration": {"run_id": str(uuid.uuid4()), "gate_id": str(a)}}), run.id) is None
+
+
+@pytest.mark.asyncio
+async def test_dependency_satisfied_only_for_accepted_gate(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationGate
+    from huddleroom.services.orchestration_dependencies import dependency_satisfied, first_unmet_dependency
+
+    _, _, run = await _make_run(db_session, test_project.id)
+    pid = test_project.id
+    done_open = await _dep_task(db_session, pid, run, status="done")
+    done_nogate = await _dep_task(db_session, pid, run, gate=False, status="done")
+    failed = await _dep_task(db_session, pid, run, status="failed")
+    cancelled = await _dep_task(db_session, pid, run, status="cancelled")
+    accepted = await _dep_task(db_session, pid, run, status="done")
+    gate = await db_session.get(OrchestrationGate, uuid.UUID(accepted.metadata_["orchestration"]["gate_id"]))
+    gate.status = "accepted"
+    await db_session.flush()
+
+    for t in (done_open, done_nogate, failed, cancelled):
+        assert not await dependency_satisfied(db_session, run, t.id)
+    assert not await dependency_satisfied(db_session, run, uuid.uuid4())
+    assert await dependency_satisfied(db_session, run, accepted.id)
+
+    waiter = Task(project_id=pid, title="w", depends_on=[str(accepted.id), str(done_open.id)])
+    assert await first_unmet_dependency(db_session, run, waiter) == (done_open.id, "open")
+    waiter.depends_on = [str(done_nogate.id)]
+    assert await first_unmet_dependency(db_session, run, waiter) == (done_nogate.id, "none")
+    waiter.depends_on = [str(accepted.id)]
+    assert await first_unmet_dependency(db_session, run, waiter) is None
+
+
+@pytest.mark.asyncio
+async def test_validate_dependencies_rejects_each_invalid_case(db_session, test_project):
+    from huddleroom.services.orchestration_dependencies import validate_dependencies
+
+    _, _, run = await _make_run(db_session, test_project.id)
+    pid = test_project.id
+    other = Project(name="Other", description="o", workspace_path="/tmp/other-dep", config={})
+    db_session.add(other)
+    await db_session.flush()
+
+    good = await _dep_task(db_session, pid, run)
+    await validate_dependencies(db_session, run, [good.id])
+    await validate_dependencies(db_session, run, [])
+
+    async def rejected(dep_ids, **kw):
+        with pytest.raises(HTTPException) as exc_info:
+            await validate_dependencies(db_session, run, dep_ids, **kw)
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail.startswith("dependency_invalid:")
+
+    await rejected([uuid.uuid4()])
+    await rejected([(await _dep_task(db_session, other.id, run)).id])
+    await rejected([(await _dep_task(db_session, pid, run, run_id="other")).id])
+    await rejected([good.id], self_id=good.id)
+    await rejected([(await _dep_task(db_session, pid, run, gate=False)).id])
+
+    a = await _dep_task(db_session, pid, run)
+    b = await _dep_task(db_session, pid, run)
+    a.depends_on, b.depends_on = [str(b.id)], [str(a.id)]
+    await db_session.flush()
+    await rejected([a.id])
+    new_id = uuid.uuid4()
+    good.depends_on = [str(new_id)]
+    await db_session.flush()
+    await rejected([good.id], self_id=new_id)
