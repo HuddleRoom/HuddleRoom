@@ -58,6 +58,7 @@ from huddleroom.schemas.orchestration import (
     planning_envelope_report_schema,
 )
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
+from huddleroom.services.orchestration_plan_ingestion import INGESTION_SOURCE, ingested_plan_hash
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.models.event_log import EventLog
 from huddleroom.services.event_bus import BusEvent, emit_event_once
@@ -4566,6 +4567,12 @@ class OrchestrationService:
         planning_task = await self._planning_task_for_run(db, run, plan_task_id)
         if artifact.created_by_agent is None or artifact.created_by_agent != planning_task.assigned_to:
             raise HTTPException(status_code=409, detail="Plan artifact must be created by the assigned planning agent")
+        metadata = self._json_object_or_empty(artifact.metadata_)
+        if metadata.get("source") == INGESTION_SOURCE:
+            if metadata.get("planning_version") != plan_state.get("planning_version"):
+                raise HTTPException(status_code=409, detail="Plan artifact is from a superseded planning version")
+            if ingested_plan_hash(metadata) != plan_state.get("plan_output_hash"):
+                raise HTTPException(status_code=409, detail="Plan artifact content does not match the ingested planning output")
         return artifact
 
     def _plan_items_from_artifact(self, artifact: Artifact) -> list[OrchestrationPlanItem]:
