@@ -633,6 +633,31 @@ def test_planning_contract_wording_by_mode(mode, snapshot, deliverable):
     assert "You are the sole plan author: one plan that synthesizes any specialist inputs." in contract.success_evidence
 
 
+def test_planning_contract_lists_eligible_parent_evidence_only_when_present():
+    from types import SimpleNamespace
+
+    artifact, evidence = uuid.uuid4(), uuid.uuid4()
+
+    def contract(context):
+        goal = SimpleNamespace(
+            id=uuid.uuid4(), planning_mode="roadmap", objective="Ship it", orchestrator_context=context,
+            success_criteria=[], constraints={}, budget={}, goal_type="roadmap",
+        )
+        run = SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=None, plan_state={})
+        return OrchestrationService()._planning_contract(
+            goal, run, SimpleNamespace(id=uuid.uuid4()), {"agent_id": str(uuid.uuid4()), "scope": "plan it"}
+        )
+
+    nested = contract({"eligible_evidence": {"artifact_ids": [str(artifact)], "evidence_ids": [str(evidence)]}})
+    assert nested.artifact_ids == [artifact]
+    assert (
+        "Eligible parent evidence (references only; re-verify before relying on them for any final criterion): "
+        f"artifacts {artifact}; evidence {evidence}."
+    ) in nested.inputs
+    root = contract({})
+    assert root.artifact_ids == [] and not any("Eligible parent evidence" in i for i in root.inputs)
+
+
 # --- orchestration_dependencies ---------------------------------------------
 
 async def _dep_task(db_session, project_id, run, *, gate=None, status="done", run_id="same", meta_key="gate_id"):

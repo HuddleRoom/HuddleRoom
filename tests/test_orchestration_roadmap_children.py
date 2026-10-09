@@ -1508,3 +1508,59 @@ async def test_outcome_child_settlement_is_unchanged(db_session, test_project):
     with _direct_spend(120):
         await OrchestrationBudgetService().settle_child(db_session, reservation, child_run, reason="completed")
     assert reservation.settled_spend == {"max_tokens": "120", "max_turns": "1", "max_hours": "1"}
+
+
+async def test_nested_roadmap_cli_cap_authority_keys_by_its_own_version_and_item(db_session, test_project):
+    """A nested Roadmap's own capped task item asks on its goal/run/version, as the claim side resolves it."""
+    _, parent, _, _, row = await release(db_session, test_project, NESTED_ITEM)
+    child = await db_session.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    plan = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft")
+    agent = _agent("nested-cli", ["implementation"])
+    agent.adapter_type = "cli"
+    db_session.add_all([plan, agent]); await db_session.flush()
+    version = OrchestrationRoadmapVersion(
+        goal_id=child.id, run_id=child_run.id, version=1, plan_artifact_id=plan.id,
+        snapshot={"schema_version": 1, "items": []}, fingerprint="d" * 64, approval_reference={},
+    )
+    db_session.add(version); await db_session.flush()
+    child.budget = {"caps": {"max_tokens": 800, "max_turns": 5, "max_hours": 5}}
+    context = {"roadmap": {"roadmap_version_id": str(version.id), "roadmap_item_key": "own-task"}}
+
+    result = await OrchestrationService().roadmap_pre_release_authority(db_session, child_run.id, agent, context)
+
+    assert result == {"status": "pending"}
+    decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_budget_adapter:%:cli:max_tokens"),
+        OrchestrationAuthorityDecision.status == "pending",
+    ))
+    assert (decision.goal_id, decision.run_id) == (child.id, child_run.id)
+    assert decision.decision_key.startswith(f"roadmap_budget_adapter:{version.id}:own-task:{agent.id}:")
+
+
+async def test_nested_roadmap_first_version_freezes_the_parents_workspace_policy(db_session, test_project):
+    _, parent, _, _, row = await release(db_session, test_project, NESTED_ITEM)
+    child = await db_session.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    assert child.orchestrator_context["workspace_policy"] == {"mode": "isolated"}
+    test_project.config = {"workspace_policy": {"mode": "changed-later"}}
+    planner = _agent("nested-planner", ["planning"])
+    db_session.add(planner); await db_session.flush()
+    items = [goal_item("g1", {"max_tokens": 200, "max_turns": 1, "max_hours": 1})]
+    artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
+                        created_by_agent=planner.id, metadata_={"plan_items": items})
+    db_session.add(artifact); await db_session.flush()
+    service = OrchestrationService()
+    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(items, {"max_tokens", "max_turns", "max_hours"})]
+    decision = OrchestrationAuthorityDecision(
+        goal_id=child.id, run_id=child_run.id, authority="human", title="approve", question="approve",
+        decision_key=f"roadmap_plan:{service._accepted_plan_fingerprint(normalized)}", status="answered",
+        selected_option="approve", decided_by_user_id=child.manager_user_id,
+    )
+    db_session.add(decision); await db_session.flush()
+
+    version = await OrchestrationRoadmapService(service).accept_version(
+        db_session, child, child_run, artifact, {"kind": "authority_decision", "id": str(decision.id)},
+    )
+
+    assert version.snapshot["workspace_policy"] == {"mode": "isolated"}

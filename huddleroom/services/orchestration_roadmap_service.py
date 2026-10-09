@@ -487,7 +487,8 @@ class OrchestrationRoadmapService:
         project = await db.get(Project, goal.project_id)
         # The accepted hierarchy is a contract, not a roster suggestion.  A replan
         # must retain V1's team even if the live hierarchy has since changed.
-        inherited = self.orchestration._json_object_or_empty(goal.orchestrator_context).get("team")
+        ctx = self.orchestration._json_object_or_empty(goal.orchestrator_context)
+        inherited = ctx.get("team")
         hierarchy = None if previous is not None or (isinstance(inherited, dict) and inherited) else await OrchestrationProcessService().get_current(db, goal.id, "team_hierarchy")
         team = deepcopy(previous.snapshot.get("team") if previous is not None else (
             inherited if isinstance(inherited, dict) and inherited else (hierarchy.outputs if hierarchy is not None else None)
@@ -530,7 +531,9 @@ class OrchestrationRoadmapService:
             plan_artifact_id=artifact.id, snapshot={
                 "schema_version": 1, "items": normalized, "team": team,
                 "workspace_policy": deepcopy(previous.snapshot.get("workspace_policy", {})) if previous else (
-                    deepcopy((project.config or {}).get("workspace_policy", {})) if project else {}
+                    # A nested Roadmap freezes its parent's policy, not today's project config.
+                    deepcopy(ctx["workspace_policy"]) if goal.parent_goal_id is not None and "workspace_policy" in ctx
+                    else deepcopy((project.config or {}).get("workspace_policy", {})) if project else {}
                 ),
                 "workspace_bindings": workspace_bindings,
             },

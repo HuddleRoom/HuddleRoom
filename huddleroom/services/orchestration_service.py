@@ -5278,9 +5278,14 @@ class OrchestrationService:
         goal = await db.get(OrchestrationGoal, run.goal_id) if run else None
         if run is None or goal is None:
             raise HTTPException(status_code=409, detail="Roadmap budget lineage is invalid")
-        parent = await db.get(OrchestrationGoal, goal.parent_goal_id) if goal.parent_goal_id else goal
-        version_id = goal.roadmap_version_id if goal.parent_goal_id else roadmap.get("roadmap_version_id")
-        item_key = goal.roadmap_item_key if goal.parent_goal_id else roadmap.get("roadmap_item_key")
+        # A nested Roadmap owns its own task items (same owner the claim side resolves); only a
+        # released child goal keys its authority by the parent's lineage.
+        from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+
+        parent = await OrchestrationBudgetService().roadmap_parent(db, goal) or goal
+        child = parent.id != goal.id
+        version_id = goal.roadmap_version_id if child else roadmap.get("roadmap_version_id")
+        item_key = goal.roadmap_item_key if child else roadmap.get("roadmap_item_key")
         if parent is None or version_id is None or not isinstance(item_key, str):
             raise HTTPException(status_code=409, detail="Roadmap budget lineage is invalid")
         try:
@@ -5292,7 +5297,7 @@ class OrchestrationService:
         owner_run = await db.get(OrchestrationRun, version.run_id)
         if owner_run is None or owner_run.goal_id != parent.id:
             raise HTTPException(status_code=409, detail="Roadmap budget lineage is invalid")
-        caps = self._json_object_or_empty((run.budget_state or {}).get("caps")) if goal.parent_goal_id else self._json_object_or_empty((goal.budget or {}).get("caps"))
+        caps = self._json_object_or_empty((run.budget_state or {}).get("caps")) if child else self._json_object_or_empty((goal.budget or {}).get("caps"))
         adapter_type = adapter_override or agent.adapter_type
         unsupported = sorted(key for key in ("max_tokens",) if key in caps and adapter_type == "cli")
         if not unsupported:
@@ -5714,6 +5719,14 @@ class OrchestrationService:
                 "Existing run work — adopt each via adopt_task_id or say in summary why it is not used:\n"
                 + "\n".join(pre_plan_lines)
             )
+        eligible = self._json_object_or_empty(self._json_object_or_empty(goal.orchestrator_context).get("eligible_evidence"))
+        artifact_ids = [str(a) for a in eligible.get("artifact_ids", [])]
+        if eligible:
+            evidence_ids = [str(e) for e in eligible.get("evidence_ids", [])]
+            extra_inputs.append(
+                "Eligible parent evidence (references only; re-verify before relying on them for any final "
+                f"criterion): artifacts {', '.join(artifact_ids) or 'none'}; evidence {', '.join(evidence_ids) or 'none'}."
+            )
         if plan_state.get("status") in {"revision_requested", "revision_required"}:
             extra_inputs.extend(
                 f"Plan revision request: {item['revision_request']}"
@@ -5751,6 +5764,7 @@ class OrchestrationService:
             ],
             budget=self._json_object_or_empty(goal.budget),
             report_schema=planning_envelope_report_schema(plan_kind_for(goal, run)),
+            artifact_ids=[uuid.UUID(a) for a in artifact_ids],
             parent_task_id=None,
             orchestrator_context=delegable_context(goal.orchestrator_context),
         )
