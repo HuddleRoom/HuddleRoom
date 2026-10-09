@@ -351,3 +351,63 @@ export function errorRecord(error: unknown, options?: { entity?: string }): Erro
     details,
   }
 }
+
+// ============================================================================
+// Planning hierarchy labels
+// ============================================================================
+
+function titleCase(value: string): string {
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+function labelFrom(map: Record<string, string>, value: string): string {
+  return map[value] ?? titleCase(value)
+}
+
+const GOAL_TYPE_LABELS: Record<string, string> = {
+  outcome: 'Outcome',
+  roadmap: 'Roadmap',
+  continuous: 'Continuous',
+}
+
+const GOAL_TYPE_SOURCE_LABELS: Record<string, string> = {
+  auto: 'Chosen automatically',
+  user: 'Chosen by you',
+  parent_auto: 'Chosen automatically by parent plan',
+  parent_explicit: 'Set by parent plan',
+  legacy: 'Existing goal (set before automatic selection)',
+}
+
+const PLANNING_MODE_LABELS: Record<string, string> = {
+  roadmap: 'Roadmap plan',
+  delivery: 'Delivery plan',
+  implementation: 'Implementation plan',
+  continuous_policy: 'Recurring policy',
+}
+
+const ITEM_STATE_LABELS: Record<string, string> = {
+  queued: 'Queued',
+  started: 'Started',
+  evidence_pending: 'Waiting for evidence',
+  accepted: 'Accepted',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+}
+
+const WORKSPACE_MUTATION_LABELS: Record<string, string> = {
+  read_only: 'Read only',
+  staged: 'Staged (reviewed before it lands)',
+  direct: 'Direct changes',
+}
+
+export const goalTypeLabel = (type: string): string => labelFrom(GOAL_TYPE_LABELS, type)
+export const goalTypeSourceLabel = (source: string): string => labelFrom(GOAL_TYPE_SOURCE_LABELS, source)
+export const planningModeLabel = (mode: string): string => labelFrom(PLANNING_MODE_LABELS, mode)
+export const itemStateLabel = (state: string): string => labelFrom(ITEM_STATE_LABELS, state)
+export const workspaceMutationLabel = (mode: string): string => labelFrom(WORKSPACE_MUTATION_LABELS, mode)
+
+// "Readiness · Preliminary"; the verdict is appended only when supplied
+// (callers usually render it as its own badge).
+export function evidenceLabel(role: string, stage: string, verdict?: string | null): string {
+  return [role, stage, verdict].filter(Boolean).map((part) => titleCase(part as string)).join(' · ')
+}

@@ -3,6 +3,12 @@ import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, Orchestra
 import {
   BASELINE_PROCESS_TYPES,
   errorRecord,
+  evidenceLabel,
+  goalTypeLabel,
+  goalTypeSourceLabel,
+  itemStateLabel,
+  planningModeLabel,
+  workspaceMutationLabel,
   gateOverrideDecisionLabel,
   goalStatusLabel,
   nowLine,
@@ -337,5 +343,45 @@ describe('errorRecord classifier', () => {
     const result = errorRecord(err)
     expect(result.details).toContain('Test error')
     expect(result.details).toContain('Error:')
+  })
+})
+
+describe('planning hierarchy labels', () => {
+  it.each([
+    [goalTypeLabel, { outcome: 'Outcome', roadmap: 'Roadmap', continuous: 'Continuous' }],
+    [goalTypeSourceLabel, {
+      auto: 'Chosen automatically',
+      user: 'Chosen by you',
+      parent_auto: 'Chosen automatically by parent plan',
+      parent_explicit: 'Set by parent plan',
+      legacy: 'Existing goal (set before automatic selection)',
+    }],
+    [planningModeLabel, {
+      roadmap: 'Roadmap plan',
+      delivery: 'Delivery plan',
+      implementation: 'Implementation plan',
+      continuous_policy: 'Recurring policy',
+    }],
+    [itemStateLabel, {
+      queued: 'Queued',
+      started: 'Started',
+      evidence_pending: 'Waiting for evidence',
+      accepted: 'Accepted',
+      failed: 'Failed',
+      cancelled: 'Cancelled',
+    }],
+    [workspaceMutationLabel, {
+      read_only: 'Read only',
+      staged: 'Staged (reviewed before it lands)',
+      direct: 'Direct changes',
+    }],
+  ] as const)('maps every enum value and title-cases unknowns', (fn, expected) => {
+    for (const [value, label] of Object.entries(expected)) expect(fn(value)).toBe(label)
+    expect(fn('some_new_value')).toBe('Some New Value')
+  })
+
+  it('labels evidence by role and stage, verdict optional', () => {
+    expect(evidenceLabel('readiness', 'preliminary')).toBe('Readiness · Preliminary')
+    expect(evidenceLabel('readiness', 'preliminary', 'pending')).toBe('Readiness · Preliminary · Pending')
   })
 })
