@@ -962,8 +962,10 @@ async def test_validate_plan_adoptions_rejects_goal_and_shared_state_roadmap_ite
     await service._validate_plan_adoptions(db_session, run, [unshared_item])
 
 
-async def _adopted_audit_plan(db_session, project_id, *, audits=1):
-    """Delegated pre-plan audits, then a request_plan + accepted plan adopting each one."""
+async def _adopted_audit_plan(db_session, project_id, *, audits=1, synthesis=None):
+    """Delegated pre-plan audits, then a request_plan + accepted plan adopting each one.
+
+    `synthesis` (optional item overrides) adds a join item run by the auditor that depends on every audit."""
     from tests.conftest import bind_plan_author_team
 
     planner = _agent("planner", role="planner", capabilities=["planning"])
@@ -999,6 +1001,12 @@ async def _adopted_audit_plan(db_session, project_id, *, audits=1):
         idempotency_key="run:adopted-audits:kind:request_plan",
     )
     items = [_adopting_item(task.id, item_id=f"audit-{n}", priority=70 + n) for n, task in enumerate(tasks)]
+    if synthesis is not None:
+        items.append({
+            **_raw_plan_item(auditor.id, item_id="synthesis", work_function="investigation"),
+            "depends_on": [f"audit-{n}" for n in range(audits)],
+            **synthesis,
+        })
     action = await _accept_with_items(db_session, project_id, service, run, planner, request_action, items)
     assert action.status == "completed"
     return service, goal, run, tasks

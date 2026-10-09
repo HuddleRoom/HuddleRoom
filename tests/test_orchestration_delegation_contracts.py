@@ -839,3 +839,37 @@ async def test_task_terminal_state_alone_does_not_satisfy_adhoc_dependency(db_se
     task = await db_session.get(Task, action.id)
 
     assert await first_unmet_dependency(db_session, run, task) == (dep.id, "open")
+
+
+_PASSTHROUGH_AGENT_ID = str(uuid.uuid4())
+
+
+def _passthrough_request(**fields):
+    return {
+        "action_type": "create_delegation_task", "agent_id": _PASSTHROUGH_AGENT_ID, "work_function": "investigation",
+        "scope": "Audit.", "deliverable": "Findings.", **fields,
+    }
+
+
+def test_canonical_delegation_request_keeps_plan_item_fields_only_when_non_default():
+    service = OrchestrationService()
+    artifact_id = uuid.uuid4()
+    legacy = service._canonical_delegation_task_request(_passthrough_request())
+
+    assert service._canonical_delegation_task_request(
+        _passthrough_request(priority=50, artifact_ids=[], why_runnable="  ")
+    ) == legacy
+    full = service._canonical_delegation_task_request(
+        _passthrough_request(priority=0, artifact_ids=[str(artifact_id)], why_runnable=" ready ")
+    )
+    assert full == {**legacy, "priority": 0, "artifact_ids": [str(artifact_id)], "why_runnable": "ready"}
+
+
+@pytest.mark.parametrize("fields", [
+    {"priority": True}, {"priority": 101}, {"priority": -1}, {"priority": "80"}, {"priority": 1.5},
+    {"artifact_ids": "x"}, {"artifact_ids": ["not-a-uuid"]}, {"why_runnable": 3},
+])
+def test_canonical_delegation_request_rejects_invalid_plan_item_fields_with_4xx(fields):
+    with pytest.raises(HTTPException) as exc_info:
+        OrchestrationService()._canonical_delegation_task_request(_passthrough_request(**fields))
+    assert 400 <= exc_info.value.status_code < 500

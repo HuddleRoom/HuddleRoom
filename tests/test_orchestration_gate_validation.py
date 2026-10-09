@@ -788,3 +788,60 @@ async def test_human_override_rejects_unknown_fields(client, db_session, test_pr
     )
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_synthesis_join_releases_once_only_after_every_audit_gate_is_accepted(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal
+    from tests.test_orchestration_plan_to_work_expansion import _adopted_audit_plan
+
+    service, goal, run, audits = await _adopted_audit_plan(
+        db_session, test_project.id, audits=2,
+        synthesis={"priority": 80, "why_runnable": "Both audits are accepted.",
+                   "artifact_ids": ["00000000-0000-0000-0000-0000000000a1"]},
+    )
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+
+    async def release():
+        return await service._release_ready_work(db_session, goal, run)
+
+    async def synthesis_tasks():
+        tasks = (await db_session.execute(select(Task).where(Task.project_id == test_project.id))).scalars().all()
+        return [t for t in tasks if (t.metadata_ or {}).get("orchestration", {}).get("plan_item_id") == "synthesis"]
+
+    async def gate(item_id):
+        return (await db_session.execute(select(OrchestrationGate).where(
+            OrchestrationGate.run_id == run.id, OrchestrationGate.success_criterion_key == f"plan_item:{item_id}",
+        ))).scalar_one()
+
+    assert await release() == 2  # binds both audits; the join is not runnable yet
+    for audit in audits:
+        audit.status = "done"
+    await db_session.flush()
+
+    (await gate("audit-0")).status = "accepted"  # 1 of 2 accepted
+    await db_session.flush()
+    assert await release() == 0 and await synthesis_tasks() == []
+
+    (await gate("audit-1")).status = "failed"  # a failed predecessor blocks the join
+    await db_session.flush()
+    for _ in range(2):
+        assert await release() == 0 and await synthesis_tasks() == []
+
+    (await gate("audit-1")).status = "accepted"
+    await db_session.flush()
+    assert await release() == 1
+    for _ in range(3):
+        assert await release() == 0
+
+    (task,) = await synthesis_tasks()
+    assert task.depends_on == [str(audit.id) for audit in audits]
+    assert task.priority == 80
+    contract = task.metadata_["orchestration_contract"]
+    assert contract["priority"] == 80 and contract["why_runnable"] == "Both audits are accepted."
+    assert contract["artifact_ids"] == ["00000000-0000-0000-0000-0000000000a1"]
+    assert contract["depends_on"] == [str(audit.id) for audit in audits]
+    releases = (await db_session.execute(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "release_item",
+    ))).scalars().all()
+    assert sorted(a.request["plan_item_id"] for a in releases) == ["audit-0", "audit-1", "synthesis"]

@@ -1742,6 +1742,7 @@ class OrchestrationService:
                 assigned_to=agent_id,
                 parent_id=parent_task_id,
                 depends_on=contract.depends_on,
+                priority=contract.priority,
                 metadata={
                     "orchestration": {
                         "goal_id": str(goal.id),
@@ -4491,6 +4492,23 @@ class OrchestrationService:
             if len(set(deps)) != len(deps):
                 raise HTTPException(status_code=422, detail="depends_on must not contain duplicates")
             canonical["depends_on"] = deps
+        # Plan-item passthrough fields: kept only when non-default so legacy action keys stay stable.
+        priority = request_obj.get("priority")
+        if priority is not None:
+            if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
+                raise HTTPException(status_code=422, detail="priority must be an integer from 0 to 100")
+            if priority != 50:
+                canonical["priority"] = priority
+        raw_artifacts = request_obj.get("artifact_ids")
+        if raw_artifacts is not None and not isinstance(raw_artifacts, list):
+            raise HTTPException(status_code=422, detail="artifact_ids must be a list of artifact UUIDs")
+        if raw_artifacts:
+            canonical["artifact_ids"] = [str(self._required_uuid(a, "artifact_ids")) for a in raw_artifacts]
+        why_runnable = request_obj.get("why_runnable")
+        if why_runnable is not None and not isinstance(why_runnable, str):
+            raise HTTPException(status_code=422, detail="why_runnable must be a string")
+        if why_runnable and why_runnable.strip():
+            canonical["why_runnable"] = why_runnable.strip()
         return canonical
 
     def _follow_up_delegation_key(self, run_id: uuid.UUID, request: Mapping[str, Any]) -> str:
@@ -5126,10 +5144,27 @@ class OrchestrationService:
                 },
                 "parent_task_id": None,
                 "orchestrator_context": delegable_context(orchestrator_context if orchestrator_context is not None else (goal.orchestrator_context if goal else None)),
+                "priority": item.priority,
+                "artifact_ids": [str(artifact_id) for artifact_id in item.artifact_ids],
+                "why_runnable": item.why_runnable,
+                "depends_on": self._expanded_predecessor_task_ids(run, item),
             }
         )
         await self._validate_delegation_targets(db, run_id, request)
         return request
+
+    def _expanded_predecessor_task_ids(self, run: OrchestrationRun | None, item: OrchestrationPlanItem) -> list[str]:
+        """Task ids of the item's already-expanded predecessors (released only after their gates accepted)."""
+        expanded = self._json_object_or_empty(run.plan_state if run else None).get("expanded_items")
+        task_by_item = {
+            entry.get("plan_item_id"): entry.get("task_id")
+            for entry in expanded if isinstance(entry, Mapping)
+        } if isinstance(expanded, list) else {}
+        # ponytail: Roadmap item keys are not in expanded_items, so Roadmap task items get no depends_on here.
+        return [
+            task_by_item[key] for dep in item.depends_on
+            if (key := dep.removeprefix("plan_item:")) in task_by_item and task_by_item[key]
+        ]
 
     async def roadmap_pre_release_authority(
         self,
