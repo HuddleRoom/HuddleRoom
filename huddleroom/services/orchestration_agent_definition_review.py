@@ -1276,3 +1276,19 @@ class AgentDefinitionReviewProcess:
             "status": status,
             "questions_created": 0,
         }
+
+
+async def accepted_work_functions(db: AsyncSession, goal_id) -> dict[str, list[str]] | None:
+    """Per-agent approved work functions from the current review; None when not reviewed."""
+    current = await OrchestrationProcessService().get_current(db, goal_id, PROCESS_TYPE)
+    if current is None or current.status == "skipped":
+        return None
+    eligibility = (current.outputs or {}).get("eligibility")
+    return eligibility if isinstance(eligibility, dict) else None
+
+
+async def pending_definition_repair(db: AsyncSession, goal_id, agent_id) -> OrchestrationAuthorityDecision | None:
+    """The pending approve/reject/edit definition decision for an agent, if any."""
+    return await OrchestrationAuthorityDecisionService().get_pending_by_key(
+        db, goal_id, f"{DECISION_KEY_PREFIX}{agent_id}"
+    )

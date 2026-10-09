@@ -2705,3 +2705,125 @@ def test_agent_review_route_is_read_only_and_not_agent_facing():
     assert set(paths[review_paths[0]]) == {"get"}
     assert review_paths[0].startswith("/api/v1/projects/")
     assert not review_paths[0].startswith("/api/v1/agent")
+
+
+# --- select_plan_author ---------------------------------------------------
+
+
+async def _seed_team(db_session, goal, run, assignments, eligibility=None):
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    service = OrchestrationProcessService()
+    team = await service.start_process(
+        db_session, goal.id, process_type="team_hierarchy", trigger_reason="test", run_id=run.id
+    )
+    await service.complete_process(
+        db_session, team,
+        outputs={"assignments": [{"work_function": fn, "agent_ref": str(a.id)} for fn, a in assignments]},
+    )
+    if eligibility is not None:
+        review = await service.start_process(
+            db_session, goal.id, process_type="agent_definition_review", trigger_reason="test", run_id=run.id
+        )
+        await service.complete_process(
+            db_session, review, outputs={"eligibility": {str(a.id): fns for a, fns in eligibility}}
+        )
+
+
+async def _plan_goal(db_session, project_id, mode, manager=None, **extra):
+    goal_type = {"roadmap": "roadmap", "continuous_policy": "continuous"}.get(mode, "outcome")
+    goal = OrchestrationGoal(
+        project_id=project_id, objective="Plan it", success_criteria=[], constraints={},
+        weight="standard", goal_type=goal_type, planning_mode=mode,
+        authority_model="agent_manager" if manager else "no_manager",
+        manager_agent_id=manager.id if manager else None, **extra,
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    await db_session.flush()
+    return goal, run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["roadmap", "delivery"])
+async def test_select_plan_author_prefers_eligible_manager(db_session, test_project, mode):
+    from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+    manager = await _persist_agent(db_session, name="Mgr")
+    planner = await _persist_agent(db_session, name="Plan")
+    goal, run = await _plan_goal(db_session, test_project.id, mode, manager)
+    await _seed_team(db_session, goal, run, [("planning", planner)],
+                     eligibility=[(manager, ["management"]), (planner, ["planning"])])
+    assert await select_plan_author(db_session, goal, run) == manager.id
+
+    # manager no longer approved for management -> planning owner
+    goal2, run2 = await _plan_goal(db_session, test_project.id, mode, manager)
+    await _seed_team(db_session, goal2, run2, [("planning", planner)],
+                     eligibility=[(manager, []), (planner, ["planning"])])
+    assert await select_plan_author(db_session, goal2, run2) == planner.id
+
+
+@pytest.mark.asyncio
+async def test_select_plan_author_implementation_and_unavailable(db_session, test_project):
+    from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+    planner = await _persist_agent(db_session, name="Plan")
+    dev = await _persist_agent(db_session, name="Dev")
+    team = [("planning", planner), ("implementation", dev)]
+    goal, run = await _plan_goal(db_session, test_project.id, "implementation")
+    await _seed_team(db_session, goal, run, team, eligibility=[(planner, ["planning"]), (dev, ["implementation"])])
+    assert await select_plan_author(db_session, goal, run) == planner.id
+
+    goal, run = await _plan_goal(db_session, test_project.id, "implementation")
+    await _seed_team(db_session, goal, run, team, eligibility=[(planner, []), (dev, ["implementation"])])
+    assert await select_plan_author(db_session, goal, run) == dev.id
+
+    goal, run = await _plan_goal(db_session, test_project.id, "implementation")
+    await _seed_team(db_session, goal, run, team, eligibility=[(planner, []), (dev, [])])
+    await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, goal.id, decision_key=f"agent_definition_review:proposal:{planner.id}",
+        title="Review", question="Approve?", authority="human", options=["approve", "reject", "edit"],
+    )
+    with pytest.raises(HTTPException) as exc:
+        await select_plan_author(db_session, goal, run)
+    assert exc.value.status_code == 409
+    assert exc.value.detail.startswith("plan_author_unavailable:")
+    assert "resolve agent definition decision" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_select_plan_author_no_team_none_and_continuous_rejected(db_session, test_project):
+    from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+    goal, run = await _plan_goal(db_session, test_project.id, "implementation")
+    assert await select_plan_author(db_session, goal, run) is None
+
+    goal, run = await _plan_goal(db_session, test_project.id, "continuous_policy")
+    with pytest.raises(HTTPException) as exc:
+        await select_plan_author(db_session, goal, run)
+    assert exc.value.detail.startswith("plan_not_applicable:")
+
+
+@pytest.mark.asyncio
+async def test_select_plan_author_child_team_and_parent_inheritance(db_session, test_project):
+    from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+    planner = await _persist_agent(db_session, name="Plan")
+    other = await _persist_agent(db_session, name="Other")
+    parent, parent_run = await _plan_goal(db_session, test_project.id, "roadmap")
+    await _seed_team(db_session, parent, parent_run, [("planning", planner)])
+
+    kw = {"parent_goal_id": parent.id, "parent_contract_snapshot": {}, "goal_delta": {}}
+    inheriting, run = await _plan_goal(
+        db_session, test_project.id, "implementation", continuous_origin_key="a",
+        orchestrator_context={"team": {}}, **kw,
+    )
+    assert await select_plan_author(db_session, inheriting, run) == planner.id
+
+    own, run = await _plan_goal(
+        db_session, test_project.id, "implementation", continuous_origin_key="b",
+        orchestrator_context={"team": {"role_to_agent": {"planning": str(other.id)}}}, **kw,
+    )
+    assert await select_plan_author(db_session, own, run) == other.id

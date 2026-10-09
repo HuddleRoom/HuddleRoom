@@ -1419,3 +1419,78 @@ class TeamHierarchyProcess:
             "status": status,
             "questions_created": questions_created,
         }
+
+
+PLAN_AUTHOR_FUNCTIONS = {
+    "roadmap": ("management", "planning"),
+    "delivery": ("management", "planning"),
+    "implementation": ("planning", "implementation"),
+}
+
+
+def accepted_role_map(team) -> dict[str, str]:
+    """work_function -> agent id from either accepted team shape."""
+    team = team if isinstance(team, dict) else {}
+    roles = {k: str(v) for k, v in (team.get("role_to_agent") or {}).items()}
+    for item in team.get("assignments") or []:
+        roles.setdefault(item["work_function"], str(item["agent_ref"]))
+    return roles
+
+
+async def select_plan_author(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
+) -> uuid.UUID | None:
+    """The one compatible plan author, or None when no accepted team names candidates."""
+    from fastapi import HTTPException
+    from huddleroom.services.orchestration_agent_definition_review import (
+        accepted_work_functions,
+        pending_definition_repair,
+    )
+
+    mode = run.planning_mode_snapshot or goal.planning_mode
+    if mode == "continuous_policy":
+        raise HTTPException(
+            409,
+            "plan_not_applicable: continuous_policy goals run their accepted Continuous policy; "
+            "no plan task is created",
+        )
+    root, team = goal, None
+    while True:
+        team = (root.orchestrator_context or {}).get("team") or None
+        if not team:
+            current = await OrchestrationProcessService().get_current(db, root.id, PROCESS_TYPE)
+            if current is not None and current.status == "completed":
+                team = current.outputs
+        if team or root.parent_goal_id is None:
+            break
+        root = await db.get(OrchestrationGoal, root.parent_goal_id)
+    roles = accepted_role_map(team)
+    if not roles:
+        return None
+    eligibility = await accepted_work_functions(db, root.id)
+    functions = PLAN_AUTHOR_FUNCTIONS[mode]
+    candidates: list[tuple[str, str]] = []
+    for fn in functions:
+        agent_id = str(goal.manager_agent_id) if fn == "management" and goal.manager_agent_id else roles.get(fn)
+        if agent_id:
+            candidates.append((fn, agent_id))
+    for fn, agent_id in candidates:
+        agent = await db.get(Agent, uuid.UUID(agent_id))
+        # ponytail: absent = not reviewed for this goal -> trust the accepted team
+        if agent and agent.is_active and (
+            eligibility is None or agent_id not in eligibility or fn in eligibility[agent_id]
+        ):
+            return agent.id
+    if not candidates:
+        return None
+    repair = "update the team hierarchy or the agent definition and rerun the agent definition review"
+    for _fn, agent_id in candidates:
+        decision = await pending_definition_repair(db, root.id, agent_id)
+        if decision is not None:
+            repair = f"resolve agent definition decision {decision.id} (approve or edit)"
+            break
+    raise HTTPException(
+        409,
+        f"plan_author_unavailable: no accepted {' or '.join(functions)} owner is compatible "
+        f"for {mode} planning; {repair}",
+    )
