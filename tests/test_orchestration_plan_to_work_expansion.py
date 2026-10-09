@@ -960,3 +960,184 @@ async def test_validate_plan_adoptions_rejects_goal_and_shared_state_roadmap_ite
             "only Roadmap task items with mutates_shared_state false can adopt work"
         )
     await service._validate_plan_adoptions(db_session, run, [unshared_item])
+
+
+async def _adopted_audit_plan(db_session, project_id, *, audits=1):
+    """Delegated pre-plan audits, then a request_plan + accepted plan adopting each one."""
+    from tests.conftest import bind_plan_author_team
+
+    planner = _agent("planner", role="planner", capabilities=["planning"])
+    auditor = _agent("auditor", role="developer", capabilities=["investigation"])
+    db_session.add_all([planner, auditor])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, project_id)
+    tasks = []
+    for n in range(audits):
+        action = await service.execute_create_delegation_task_action(
+            db_session,
+            run_id=run.id,
+            request={
+                "action_type": "create_delegation_task",
+                "agent_id": str(auditor.id),
+                "work_function": "investigation",
+                "scope": f"Audit area {n}.",
+                "deliverable": f"Audit findings {n}.",
+            },
+            idempotency_key=f"run:{run.id}:kind:create_delegation_task:audit-{n}",
+        )
+        tasks.append(await db_session.get(Task, action.target_id))
+    await bind_plan_author_team(db_session, goal, planner)
+    request_action = await service.execute_request_plan_action(
+        db_session,
+        run_id=run.id,
+        request={
+            "action_type": "request_plan",
+            "agent_id": str(planner.id),
+            "work_function": "planning",
+            "scope": "Plan around the running audits.",
+        },
+        idempotency_key="run:adopted-audits:kind:request_plan",
+    )
+    items = [_adopting_item(task.id, item_id=f"audit-{n}", priority=70 + n) for n, task in enumerate(tasks)]
+    action = await _accept_with_items(db_session, project_id, service, run, planner, request_action, items)
+    assert action.status == "completed"
+    return service, goal, run, tasks
+
+
+async def _expand(service, db_session, run, item_id, work_function="investigation"):
+    return await service.execute_expand_plan_item_action(
+        db_session,
+        run_id=run.id,
+        request={"action_type": "expand_plan_item", "plan_item_id": item_id, "work_function": work_function},
+        idempotency_key=f"run:{run.id}:kind:expand_plan_item:plan_item:{item_id}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_expanding_adopted_item_binds_active_task_without_new_work(db_session, test_project):
+    from huddleroom.models.session import Session
+
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    audit.status = "in_progress"
+    session = Session(
+        task_id=audit.id, agent_id=audit.assigned_to, project_id=test_project.id, adapter_type="api", status="running"
+    )
+    db_session.add(session)
+    await db_session.flush()
+    tasks_before = await _task_count(db_session, test_project.id)
+
+    action = await _expand(service, db_session, run, "audit-0")
+
+    assert action.status == "completed" and action.target_id == audit.id
+    assert await _task_count(db_session, test_project.id) == tasks_before
+    assert [s.id for s in await db_session.scalars(select(Session).where(Session.task_id == audit.id))] == [session.id]
+    gate = (await _run_rows(db_session, OrchestrationGate, run.id, success_criterion_key="plan_item:audit-0"))[0]
+    assert audit.metadata_["orchestration"]["plan_item_gate_id"] == str(gate.id)
+    assert audit.metadata_["orchestration"]["plan_item_id"] == "audit-0"
+    assert audit.priority == 70 and audit.status == "in_progress"
+    assert await _run_rows(db_session, OrchestrationAction, run.id, action_type="create_delegation_task") == [
+        await db_session.get(OrchestrationAction, audit.id)
+    ]
+    assert run.plan_state["expanded_items"] == [{
+        "plan_item_id": "audit-0",
+        "work_function": "investigation",
+        "expand_action_id": str(action.id),
+        "delegation_action_id": str(audit.id),
+        "task_id": str(audit.id),
+        "gate_id": str(gate.id),
+        "adopted": True,
+    }]
+    (event,) = await _event_rows(db_session, test_project.id, "orchestration.plan_item_expanded")
+    assert event.payload["adopted"] is True and event.payload["task_id"] == str(audit.id)
+    (marker,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")
+    assert marker.idempotency_key == f"run:{run.id}:kind:adopt_task:task:{audit.id}"
+    assert marker.status == "completed" and marker.target_id == audit.id
+    assert marker.request == {
+        "plan_item_id": "audit-0",
+        "adopt_task_id": str(audit.id),
+        "accepted_plan_fingerprint": run.plan_state["accepted_plan_snapshot"]["fingerprint"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_expanding_adopted_item_replays_terminal_task_evidence_and_consumes_report(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationEvidence
+    from huddleroom.models.session import Session
+    from huddleroom.services.event_bus import emit_event_once
+
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    audit.status = "done"
+    session = Session(
+        task_id=audit.id, agent_id=audit.assigned_to, project_id=test_project.id, adapter_type="api",
+        status="completed", output="Audit finished.",
+    )
+    db_session.add(session)
+    await db_session.flush()
+    await emit_event_once(
+        db_session, test_project.id, "task.status_changed",
+        {"task_id": str(audit.id), "status": "done", "previous_status": "in_progress"}, dedup_key=f"done:{audit.id}",
+    )
+    await emit_event_once(
+        db_session, test_project.id, "session.completed",
+        {"session_id": str(session.id), "task_id": str(audit.id)}, dedup_key=f"completed:{session.id}",
+    )
+    # Before adoption the gate-less audit's completion was skipped by evidence ingestion.
+    tasks_before = await _task_count(db_session, test_project.id)
+
+    await _expand(service, db_session, run, "audit-0")
+
+    gate = (await _run_rows(db_session, OrchestrationGate, run.id, success_criterion_key="plan_item:audit-0"))[0]
+    evidence = await _run_rows(db_session, OrchestrationEvidence, run.id, gate_id=gate.id)
+    assert sorted((e.source_type, e.source_id) for e in evidence) == sorted(
+        [("task", audit.id), ("session", session.id)]
+    )
+    assert await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{audit.id}"
+    ) is not None
+    assert await _task_count(db_session, test_project.id) == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_expanding_adopted_item_twice_binds_once(db_session, test_project):
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    tasks_before = await _task_count(db_session, test_project.id)
+
+    first = await _expand(service, db_session, run, "audit-0")
+    second = await _expand(service, db_session, run, "audit-0")
+    await service._release_ready_work(db_session, goal, run)
+
+    assert second.id == first.id
+    assert len(await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")) == 1
+    assert len(await _run_rows(db_session, OrchestrationAction, run.id, action_type="expand_plan_item")) == 1
+    assert [e["task_id"] for e in run.plan_state["expanded_items"]] == [str(audit.id)]
+    assert len(await _run_rows(db_session, OrchestrationGate, run.id, gate_type="work_completed")) == 1
+    assert await _task_count(db_session, test_project.id) == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_adoption_marker_for_another_item_conflicts(db_session, test_project):
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    await service.reserve_action(
+        db_session, run_id=run.id, idempotency_key=f"run:{run.id}:kind:adopt_task:task:{audit.id}",
+        action_type="adopt_task", request={"plan_item_id": "older", "adopt_task_id": str(audit.id),
+                                           "accepted_plan_fingerprint": "older"},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _expand(service, db_session, run, "audit-0")
+
+    assert exc_info.value.status_code == 409 and exc_info.value.detail.startswith("adoption_conflict:")
+    assert "plan_item_gate_id" not in audit.metadata_["orchestration"]
+
+
+@pytest.mark.asyncio
+async def test_release_binds_adopted_items_without_spending_release_slots(db_session, test_project):
+    service, goal, run, audits = await _adopted_audit_plan(db_session, test_project.id, audits=3)
+    tasks_before = await _task_count(db_session, test_project.id)
+
+    assert await service._release_ready_work(db_session, goal, run) == 3
+    assert await service._release_ready_work(db_session, goal, run) == 0
+
+    assert sorted(e["task_id"] for e in run.plan_state["expanded_items"]) == sorted(str(t.id) for t in audits)
+    assert len(await _run_rows(db_session, OrchestrationAction, run.id, action_type="release_item")) == 3
+    assert await _task_count(db_session, test_project.id) == tasks_before

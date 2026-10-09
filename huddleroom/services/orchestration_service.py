@@ -2597,6 +2597,10 @@ class OrchestrationService:
                 status_code=409,
                 detail=f"Expand plan item idempotency key must be '{stable_idempotency_key}'",
             )
+        if item.adopt_task_id is not None:
+            return await self._expand_adopted_item(
+                db, run, artifact, item, request_to_store, idempotency_key, decision_id
+            )
 
         existing = await self._existing_action_for_key(db, run_id, idempotency_key)
         delegation_request = None
@@ -2677,6 +2681,97 @@ class OrchestrationService:
         self._set_plan_item_expanded_state(run, item, action, delegation_action, task, gate)
         await self._emit_plan_item_expanded(db, project_id, goal, run, item, action, delegation_action, task, gate)
         return await self._mark_action_completed(db, action, target_type="task", target_id=task.id)
+
+    async def _expand_adopted_item(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun,
+        artifact: Artifact,
+        item: OrchestrationPlanItem,
+        request_to_store: dict,
+        idempotency_key: str,
+        decision_id: uuid.UUID | None,
+    ) -> OrchestrationAction:
+        """Bind the adopted task to its plan item: no delegation, no new task, its session untouched."""
+        action = await self.reserve_action(
+            db, run_id=run.id, idempotency_key=idempotency_key, action_type="expand_plan_item",
+            request=request_to_store, decision_id=decision_id,
+        )
+        if action.status != "reserved":
+            return action
+        task = await db.get(Task, item.adopt_task_id)
+        delegation_action = await db.get(OrchestrationAction, item.adopt_task_id)
+        if task is None or delegation_action is None:
+            await self._fail_reserved_action_for_current_flow(db, action, "Adopted task not found")
+            raise HTTPException(status_code=409, detail=f"adoption_invalid: item {item.id}: adopted task not found")
+        gate = await self._ensure_plan_item_gate(db, run.id, item)
+        try:
+            await self._bind_adopted_task(db, run, task, artifact, item, action, gate)
+        except HTTPException as exc:
+            await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
+            raise
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        self._set_plan_item_expanded_state(run, item, action, delegation_action, task, gate, adopted=True)
+        await self._emit_plan_item_expanded(
+            db, goal.project_id, goal, run, item, action, delegation_action, task, gate, adopted=True,
+        )
+        return await self._mark_action_completed(db, action, target_type="task", target_id=task.id)
+
+    async def _bind_adopted_task(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun,
+        task: Task,
+        artifact: Artifact,
+        item: OrchestrationPlanItem,
+        action: OrchestrationAction,
+        gate: OrchestrationGate,
+    ) -> None:
+        """Bind once per task (DB-unique marker), then replay its evidence onto the item gate."""
+        state = self._json_object_or_empty(run.plan_state)
+        fingerprint = state.get("accepted_plan_fingerprint") or self._json_object_or_empty(
+            state.get("accepted_plan_snapshot")
+        ).get("fingerprint")
+        request = {"plan_item_id": item.id, "adopt_task_id": str(task.id), "accepted_plan_fingerprint": fingerprint}
+        marker = await self.reserve_action(
+            db, run_id=run.id, idempotency_key=f"run:{run.id}:kind:adopt_task:task:{task.id}",
+            action_type="adopt_task", request=request,
+        )
+        if marker.request != request:
+            raise HTTPException(
+                status_code=409, detail=f"adoption_conflict: task {task.id} is already adopted by another plan item"
+            )
+        self._attach_plan_item_metadata(task, artifact, item, action, gate)
+        task.priority = item.priority
+        await db.flush()
+        await self._replay_task_evidence(db, run, task)
+        if marker.status == "reserved":
+            await self._mark_action_completed(db, marker, target_type="task", target_id=task.id)
+
+    async def _replay_task_evidence(self, db: AsyncSession, run: OrchestrationRun, task: Task) -> int:
+        """Re-ingest a task's already-processed events now that it has a gate (dedup is per observed event)."""
+        session_ids = [str(sid) for sid in await db.scalars(select(Session.id).where(Session.task_id == task.id))]
+        events = await db.scalars(
+            select(EventLog)
+            .where(
+                EventLog.project_id == task.project_id,
+                or_(
+                    and_(
+                        EventLog.event_type.in_(TASK_EVIDENCE_EVENT_TYPES),
+                        EventLog.payload["task_id"].as_string() == str(task.id),
+                    ),
+                    and_(
+                        EventLog.event_type.in_(SESSION_EVIDENCE_EVENT_TYPES),
+                        EventLog.payload["session_id"].as_string().in_(session_ids),
+                    ),
+                ),
+            )
+            .order_by(EventLog.seq)
+        )
+        created = 0
+        for event in events.all():
+            created += await self._ingest_evidence_from_event(db, run, event)
+        return created
 
     async def execute_ask_human_action(
         self,
@@ -5181,6 +5276,7 @@ class OrchestrationService:
         delegation_action: OrchestrationAction,
         task: Task,
         gate: OrchestrationGate,
+        adopted: bool = False,
     ) -> None:
         plan_state = OrchestrationService._json_object_or_empty(run.plan_state)
         expanded_items = plan_state.get("expanded_items")
@@ -5193,6 +5289,7 @@ class OrchestrationService:
             "delegation_action_id": str(delegation_action.id),
             "task_id": str(task.id),
             "gate_id": str(gate.id),
+            **({"adopted": True} if adopted else {}),
         }
         run.plan_state = {
             **plan_state,
@@ -5215,6 +5312,7 @@ class OrchestrationService:
         delegation_action: OrchestrationAction,
         task: Task,
         gate: OrchestrationGate,
+        adopted: bool = False,
     ) -> None:
         await emit_event_once(
             db,
@@ -5229,6 +5327,7 @@ class OrchestrationService:
                 "delegation_action_id": str(delegation_action.id),
                 "task_id": str(task.id),
                 "gate_id": str(gate.id),
+                **({"adopted": True} if adopted else {}),
             },
             source="orchestrator",
             dedup_key=f"{PLAN_ITEM_EXPANDED_EVENT_TYPE}:action:{action.id}",
@@ -10119,6 +10218,14 @@ class OrchestrationService:
             return 0
         await self._backfill_plan_criterion_links(db, run, items)
 
+        # Adopted items bind already-running/finished work: no new task, so no slot is spent.
+        bound = 0
+        for item in items:
+            if item.adopt_task_id is None:
+                continue
+            if await self._release_item_once(db, run, item):
+                bound += 1
+
         in_flight = await self._orchestrated_tasks_for_run(
             db, run.id, statuses=["backlog", "ready", "in_progress", "blocked"]
         )
@@ -10128,32 +10235,38 @@ class OrchestrationService:
         ]
         slots = self.RELEASE_TWO_TASK_CAP - len(work_in_flight)
         if slots <= 0:
-            return 0
+            return bound
 
         released = 0
         for item in items:
             if released >= slots:
                 break
-            key = f"run:{run.id}:kind:release_item:{item.id}"
-            if await self._existing_action_for_key(db, run.id, key) is not None:
+            if item.adopt_task_id is not None:
                 continue
             if not await self._item_dependencies_accepted(db, run, item):
                 continue
-            await self.execute_expand_plan_item_action(
-                db,
-                run_id=run.id,
-                request={"action_type": "expand_plan_item", "plan_item_id": item.id,
-                         "work_function": item.work_function},
-                idempotency_key=self._expand_plan_item_idempotency_key(run.id, item.id),
-            )
-            # expand_plan_item creates the delegation task for this item; mark the
-            # release so the cap accounting and idempotency hold across ticks.
-            await self.reserve_action(
-                db, run_id=run.id, idempotency_key=key,
-                action_type="release_item", request={"plan_item_id": item.id},
-            )
-            released += 1
-        return released
+            if await self._release_item_once(db, run, item):
+                released += 1
+        return bound + released
+
+    async def _release_item_once(self, db: AsyncSession, run: OrchestrationRun, item: OrchestrationPlanItem) -> bool:
+        key = f"run:{run.id}:kind:release_item:{item.id}"
+        if await self._existing_action_for_key(db, run.id, key) is not None:
+            return False
+        await self.execute_expand_plan_item_action(
+            db,
+            run_id=run.id,
+            request={"action_type": "expand_plan_item", "plan_item_id": item.id,
+                     "work_function": item.work_function},
+            idempotency_key=self._expand_plan_item_idempotency_key(run.id, item.id),
+        )
+        # expand_plan_item creates (or, for adoption, binds) this item's task; mark the
+        # release so the cap accounting and idempotency hold across ticks.
+        await self.reserve_action(
+            db, run_id=run.id, idempotency_key=key,
+            action_type="release_item", request={"plan_item_id": item.id},
+        )
+        return True
 
     async def _item_dependencies_accepted(
         self, db: AsyncSession, run: OrchestrationRun, item: "OrchestrationPlanItem"

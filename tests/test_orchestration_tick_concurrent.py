@@ -165,3 +165,141 @@ async def test_tick_reloads_goal_status_inside_lock(db_session, test_project):
     assert result2["status"] == "paused"
     assert result2["processed_events"] == 0
     assert result2["tick_emitted"] is False
+
+
+@pytest.mark.asyncio
+async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
+    db_session, test_project, stub_decision, concurrent_sessions, monkeypatch
+):
+    """Two independent audits start while the planner runs; the accepted plan adopts both and
+    concurrent ticks bind each exactly once -- no duplicate task, session, gate or marker."""
+    import asyncio
+    import json
+
+    from fastapi import HTTPException
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from huddleroom.config import settings
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate
+    from huddleroom.models.session import Session
+    from huddleroom.models.task import Task
+    from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _planner_agent_id
+
+    from huddleroom.services.session_service import SessionService
+
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
+    monkeypatch.setattr(SessionService, "_schedule_dispatch_after_commit", lambda *_args: None)
+    planner = _agent("adopting-planner", ["planning"])
+    auditor = _agent("auditor", ["investigation"])
+    db_session.add_all([planner, auditor])
+    await db_session.flush()
+    service, goal, run = await _authorized_run(db_session, test_project)
+    audit_ids = []
+    for n in range(2):
+        action = await service.execute_create_delegation_task_action(
+            db_session,
+            run_id=run.id,
+            request={
+                "action_type": "create_delegation_task", "agent_id": str(auditor.id),
+                "work_function": "investigation", "scope": f"Audit area {n}.", "deliverable": f"Findings {n}.",
+            },
+            idempotency_key=f"run:{run.id}:kind:create_delegation_task:audit-{n}",
+        )
+        audit_ids.append(action.target_id)
+
+    stub_decision(lambda ctx: {
+        "action_type": "request_plan", "agent_id": _planner_agent_id(ctx), "work_function": "planning",
+        "scope": "Plan around the running audits.",
+    })
+    assert (await service.tick(db_session, run.id))["authorized_execution"]["step"] == "plan_decision"
+    await db_session.refresh(run)
+    planning_task = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+    assert sorted(planning_task.metadata_["orchestration_plan"]["pre_plan_task_ids"]) == sorted(map(str, audit_ids))
+
+    async def sessions(db, task_id):
+        return list(await db.scalars(select(Session).where(Session.task_id == task_id)))
+
+    # The same tick started the planner and both audits: discovery runs while planning.
+    for task_id in [planning_task.id, *audit_ids]:
+        task = await db_session.get(Task, task_id)
+        await db_session.refresh(task)
+        assert task.status == "in_progress" and len(await sessions(db_session, task_id)) == 1
+
+    (planner_session,) = await sessions(db_session, planning_task.id)
+    kind = planning_task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"]
+    audit_items = [
+        {"id": f"audit-{n}", "work_function": "investigation", "scope": f"Audit area {n}.",
+         "deliverable": f"Findings {n}.", "why_runnable": "Already running.", "adopt_task_id": str(task_id)}
+        for n, task_id in enumerate(audit_ids)
+    ]
+    synthesis = {
+        "id": "synthesis", "work_function": "implementation", "scope": "Combine the audit findings.",
+        "deliverable": "One synthesis report.", "why_runnable": "Both audits accepted.",
+        "depends_on": ["audit-0", "audit-1"],
+    }
+    planner_session.output = json.dumps({
+        "schema_version": 1, "plan_kind": kind, "summary": "Adopt both audits, then synthesize.",
+        "plan_items": [*audit_items, synthesis],
+    })
+    planner_session.status, planning_task.status = "completed", "done"
+    await db_session.flush()
+    await emit_event_once(
+        db_session, test_project.id, "task.status_changed",
+        {"task_id": str(planning_task.id), "status": "done", "previous_status": "in_progress"},
+        dedup_key=f"adoption-plan-done:{planning_task.id}",
+    )
+    await emit_event_once(
+        db_session, test_project.id, "session.completed",
+        {"session_id": str(planner_session.id), "task_id": str(planning_task.id)},
+        dedup_key=f"adoption-plan-session:{planner_session.id}",
+    )
+    # The tick ingests the envelope; while the audits run, local liveness waits on them instead of
+    # asking for a decision, so the plan is accepted directly here.
+    await service.tick(db_session, run.id)
+    await db_session.refresh(run)
+    await service.execute_accept_plan_action(
+        db_session, run_id=run.id,
+        request={"action_type": "accept_plan", "plan_artifact_id": run.plan_state["plan_artifact_id"]},
+        idempotency_key=f"run:{run.id}:kind:accept_plan",
+    )
+    assert run.plan_state["status"] == "accepted"
+    run_id = run.id
+    await db_session.commit()
+
+    async def tick(db):
+        try:
+            return await OrchestrationService().tick(db, run_id)
+        except HTTPException as exc:
+            await db.rollback()
+            return exc
+
+    first, second = concurrent_sessions
+    results = await asyncio.wait_for(asyncio.gather(tick(first), tick(second)), timeout=30)
+    assert all(isinstance(result, dict) for result in results), results
+    # One tick binds both adopted audits (no slot spent); the other finds them bound and waits on them.
+    assert sorted(r["authorized_execution"]["step"] for r in results) == ["local_liveness", "release_work"]
+    assert {"step": "release_work", "released": 2} in [r["authorized_execution"] for r in results]
+
+    async with async_sessionmaker(db_session.bind, expire_on_commit=False)() as reader:
+        run = await reader.get(OrchestrationRun, run_id)
+        expanded = run.plan_state["expanded_items"]
+        assert sorted((e["plan_item_id"], e["task_id"], e.get("adopted")) for e in expanded) == [
+            ("audit-0", str(audit_ids[0]), True), ("audit-1", str(audit_ids[1]), True),
+        ]
+        run_tasks = list(await reader.scalars(
+            select(Task).where(Task.metadata_["orchestration"]["run_id"].as_string() == str(run_id))
+        ))
+        assert sorted(t.id for t in run_tasks) == sorted([planning_task.id, *audit_ids])  # no synthesis yet
+        for task_id in audit_ids:
+            assert len(await sessions(reader, task_id)) == 1
+        actions = list(await reader.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == run_id)))
+        assert sorted(a.idempotency_key for a in actions if a.action_type == "adopt_task") == sorted(
+            f"run:{run_id}:kind:adopt_task:task:{task_id}" for task_id in audit_ids
+        )
+        assert sorted(a.request["plan_item_id"] for a in actions if a.action_type == "release_item") == [
+            "audit-0", "audit-1",
+        ]
+        gates = list(await reader.scalars(select(OrchestrationGate).where(
+            OrchestrationGate.run_id == run_id, OrchestrationGate.gate_type == "work_completed",
+        )))
+        assert sorted(g.success_criterion_key for g in gates) == ["plan_item:audit-0", "plan_item:audit-1"]
