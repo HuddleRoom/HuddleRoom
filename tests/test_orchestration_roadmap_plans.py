@@ -844,6 +844,8 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         "planner_agent_id": str(artifact.created_by_agent), "artifact_id": str(candidate.id),
         "fingerprint": _roadmap_fingerprint(service, goal, candidate.metadata_["plan_items"]),
         "gate_id": str(approval_gate.id),
+        # The replan task above was completed by the verifier's session, so its output was rejected on author.
+        "ingestion_error": "planning_output_rejected: plan output author is not the assigned planning agent",
     }
     counts = await cardinalities()
     replay_wait = await service.tick(db_session, run.id)

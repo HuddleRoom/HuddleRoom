@@ -2852,3 +2852,103 @@ async def test_tick_with_accept_plan_decision_for_already_accepted_plan_waits_wi
     assert calls["n"] == 1
     assert new_waits and new_waits[0].fallback["reason"] == "Replayed accept_plan recheck"
     assert new_waits[0].awaited_event["event_type"] == WAKE_RECHECK_EVENT_TYPE
+
+
+def _envelope_for(task, item_id="deliver"):
+    kind = task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"]
+    return json.dumps({
+        "schema_version": 1,
+        "plan_kind": kind,
+        "summary": "One implementation item delivers the objective.",
+        "plan_items": [{
+            "id": item_id,
+            "work_function": "implementation",
+            "scope": "Deliver one independently verifiable change.",
+            "deliverable": "A tested implementation result.",
+            "why_runnable": "No dependencies.",
+            "success_criterion_keys": ["done"],
+        }],
+    })
+
+
+def _accept_ingested(ctx):
+    return {"action_type": "accept_plan", "plan_artifact_id": ctx["run"]["plan_state"]["plan_artifact_id"]}
+
+
+async def _request_plan_by_tick(db_session, service, run, stub_decision):
+    stub_decision(lambda ctx: {
+        "action_type": "request_plan", "agent_id": _planner_agent_id(ctx), "work_function": "planning",
+        "scope": "Plan one independently verifiable implementation item.",
+    })
+    assert (await service.tick(db_session, run.id))["authorized_execution"]["step"] == "plan_decision"
+    await db_session.refresh(run)
+    return await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+
+
+async def test_planning_envelope_is_ingested_accepted_and_released_by_tick(
+    db_session, test_project, stub_decision, monkeypatch
+):
+    from huddleroom.services.orchestration_plan_ingestion import plan_artifact_id
+
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
+    planner = _agent("envelope-planner", ["planning"])
+    producer = _agent("envelope-producer", ["implementation"])
+    db_session.add_all([planner, producer])
+    await db_session.flush()
+    service, _, run = await _authorized_run(db_session, test_project)
+    planning_task = await _request_plan_by_tick(db_session, service, run, stub_decision)
+
+    await _complete_task_session(
+        db_session, test_project.id, planning_task, planning_task.assigned_to, _envelope_for(planning_task)
+    )
+    stub_decision(_accept_ingested)
+    assert (await service.tick(db_session, run.id))["authorized_execution"]["step"] == "plan_decision"
+    await db_session.refresh(run)
+    expected = plan_artifact_id(planning_task.id, run.plan_state["planning_version"])
+    assert run.plan_state["status"] == "accepted"
+    assert run.plan_state["accepted_artifact_id"] == str(expected)
+
+    assert (await service.tick(db_session, run.id))["authorized_execution"]["step"] == "release_work"
+    work = [t for t in await _tasks_for_run(db_session, run.id) if service._task_work_function(t) == "implementation"]
+    assert len(work) == 1
+
+
+async def test_malformed_planning_output_requires_revision_then_accepts_valid_envelope(
+    db_session, test_project, stub_decision, monkeypatch
+):
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
+    planner = _agent("revising-planner", ["planning"])
+    db_session.add(planner)
+    await db_session.flush()
+    service, _, run = await _authorized_run(db_session, test_project)
+    first_task = await _request_plan_by_tick(db_session, service, run, stub_decision)
+    await _complete_task_session(
+        db_session, test_project.id, first_task, first_task.assigned_to, "Here is the plan in prose."
+    )
+
+    seen = []
+
+    def _revise(ctx):
+        state = ctx["run"]["plan_state"]
+        seen.append((state["status"], state.get("revision_reason")))
+        return {
+            "action_type": "request_plan_revision", "plan_task_id": state["planning_task_id"],
+            "revision_request": "Return only the PlanningEnvelope JSON.", "reason": state["revision_reason"],
+        }
+
+    stub_decision(_revise)
+    assert (await service.tick(db_session, run.id))["authorized_execution"]["step"] == "plan_decision"
+    assert seen == [("revision_required", "planning_output_rejected: output must be exactly one JSON object")]
+    await db_session.refresh(run)
+    revised_task = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+    assert revised_task.id != first_task.id and run.plan_state["status"] == "requested"
+
+    await _complete_task_session(
+        db_session, test_project.id, revised_task, revised_task.assigned_to, _envelope_for(revised_task)
+    )
+    stub_decision(_accept_ingested)
+    await service.tick(db_session, run.id)
+    await db_session.refresh(run)
+    assert run.plan_state["status"] == "accepted"
+    accepted = await db_session.get(Artifact, uuid.UUID(run.plan_state["accepted_artifact_id"]))
+    assert accepted.linked_task_id == revised_task.id

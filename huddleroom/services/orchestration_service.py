@@ -6478,9 +6478,15 @@ class OrchestrationService:
                 Artifact.artifact_type == "plan",
                 Artifact.id != plan_artifact_id(task.id, version),
             ).limit(1))
-            # A pending Roadmap replan sits on an accepted plan; revision_required would strand it.
-            if not exc.stale and manual_plan is None and not plan_state.get("pending_replan"):
-                self._set_plan_revision_required(run, f"planning_output_rejected: {exc.reason}")
+            if not exc.stale and manual_plan is None:
+                reason = f"planning_output_rejected: {exc.reason}"
+                pending = self._json_object_or_empty(plan_state.get("pending_replan"))
+                if pending:
+                    # A pending Roadmap replan sits on an accepted plan; revision_required would strand it,
+                    # so surface the rejection to the decision context instead.
+                    run.plan_state = {**plan_state, "pending_replan": {**pending, "ingestion_error": reason}}
+                else:
+                    self._set_plan_revision_required(run, reason)
             await self._mark_action_completed(db, marker, "task", task.id)
             return
         await self._mark_action_completed(db, marker, "artifact", artifact.id)

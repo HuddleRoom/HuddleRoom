@@ -262,3 +262,15 @@ async def test_manual_plan_artifact_survives_prose_output(db_session, test_proje
         idempotency_key=f"run:{run.id}:kind:accept_plan",
     )
     assert action.status == "completed" and run.plan_state["status"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_rejected_replan_output_is_surfaced_on_pending_replan(db_session, test_project):
+    service, _, run, task, session = await _planning_run(db_session, test_project.id)
+    run.plan_state = {**run.plan_state, "status": "accepted", "pending_replan": {"task_id": str(task.id)}}
+    await _finish(db_session, task, session, "prose")
+
+    await service._ingest_session_evidence(db_session, run, _completed(session.id))
+
+    assert run.plan_state["status"] == "accepted"
+    assert run.plan_state["pending_replan"]["ingestion_error"].startswith("planning_output_rejected: output must be")
