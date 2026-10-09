@@ -27,7 +27,7 @@ _MAX_ERROR_MESSAGE_LEN = 120
 PROGRESS_CONTRACT = (
     "Progress duty: move the goal to completion. Every decision must advance or unblock a success criterion. "
     "Wait only when every useful action is blocked on a named event or time.\n"
-    "Fresh run (no accepted plan and no orchestrated work): normally request_plan to the best planning agent in the roster. "
+    "Fresh run (no accepted plan and no orchestrated work): normally request_plan with agent_id = plan_author.agent_id (the server-selected plan author; any other agent is rejected), or the best planning agent in the roster when plan_author.agent_id is null. "
     "Use ask_human only when a missing owner decision truly blocks starting, and ask the owner the exact question. "
     "If a plan task is already in flight, wait for it.\n"
     "Run with history: review progress_view and untracked_follow_ups. "

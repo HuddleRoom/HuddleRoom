@@ -79,6 +79,9 @@ async def _ready_roadmap(db, project):
     assert await db.scalar(select(func.count()).select_from(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id,
         OrchestrationAction.action_type == "authorize_execution")) == 1
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db, goal, planner)
     return service, goal, run, planner
 
 

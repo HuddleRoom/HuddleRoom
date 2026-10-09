@@ -439,6 +439,25 @@ async def memory_agent(db_session: AsyncSession) -> Agent:
     return agent
 
 
+async def bind_plan_author_team(db_session, goal, agent):
+    """Make `agent` the accepted, review-eligible planning/implementation owner (baseline maps other agents)."""
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    functions = ["planning", "implementation"]
+    service = OrchestrationProcessService()
+    team = await service.get_current(db_session, goal.id, "team_hierarchy")
+    if team is not None:
+        team.outputs = {
+            **(team.outputs or {}),
+            "role_to_agent": {},
+            "assignments": [{"work_function": fn, "agent_ref": str(agent.id)} for fn in functions],
+        }
+    review = await service.get_current(db_session, goal.id, "agent_definition_review")
+    if review is not None and isinstance((review.outputs or {}).get("eligibility"), dict):
+        review.outputs = {**review.outputs, "eligibility": {**review.outputs["eligibility"], str(agent.id): functions}}
+    await db_session.flush()
+
+
 async def complete_baseline_processes(db_session, goal, run):
     """Complete all baseline processes so tests can exercise their own subject."""
     import uuid as _uuid

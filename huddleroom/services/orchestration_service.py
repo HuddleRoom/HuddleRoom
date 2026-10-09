@@ -1017,7 +1017,21 @@ class OrchestrationService:
             ],
             "memory_preface": memory_preface,
             "roster": roster,
+            "plan_author": await self._plan_author_hint(db, goal, run),
         }
+
+    @staticmethod
+    async def _plan_author_hint(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> dict | None:
+        from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+        mode = run.planning_mode_snapshot or goal.planning_mode
+        if mode == "continuous_policy" or (run.plan_state or {}).get("status") in {"accepted", "failed"}:
+            return None
+        try:
+            author, error = await select_plan_author(db, goal, run), None
+        except HTTPException as exc:
+            author, error = None, str(exc.detail)
+        return {"agent_id": str(author) if author else None, "planning_mode": mode, "error": error}
 
     async def _recent_events_for_decision_context(
         self,
@@ -1905,6 +1919,18 @@ class OrchestrationService:
             db, action, target_type="run", target_id=run.id
         )
 
+    @staticmethod
+    async def _require_plan_author(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, agent_id) -> None:
+        """Reject (never override) a plan request whose agent is not the selected plan author."""
+        from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+        author = await select_plan_author(db, goal, run)
+        if author is not None and str(author) != str(agent_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"plan_author_mismatch: request_plan agent_id must be the selected plan author {author}",
+            )
+
     async def execute_request_plan_action(
         self,
         db: AsyncSession,
@@ -1943,6 +1969,7 @@ class OrchestrationService:
         if existing is None:
             run = await self._run_for_plan_action(db, run_id)
             await self._ensure_plan_request_allowed(db, run)
+            await self._require_plan_author(db, inherited_goal, run, request_to_store.get("agent_id"))
             _, agent, _ = await self._validate_delegation_targets(
                 db,
                 run_id,
@@ -2183,6 +2210,8 @@ class OrchestrationService:
         stored = existing.request if existing is not None else self._canonical_roadmap_replan_request(request)
         if state.get("pending_replan"):
             raise HTTPException(status_code=409, detail="Roadmap replan is already pending")
+        if existing is None:
+            await self._require_plan_author(db, goal, run, stored.get("agent_id"))
         action = await self.reserve_action(
             db, run_id=run_id, idempotency_key=idempotency_key, action_type="request_roadmap_replan",
             request=stored, decision_id=decision_id,
@@ -5843,6 +5872,7 @@ class OrchestrationService:
                 "revision_requests",
                 "accepted_artifact_id",
                 "accept_action_id",
+                "plan_author_agent_id",
             }
         }
         revision_requests = []
@@ -5857,6 +5887,7 @@ class OrchestrationService:
             "request_action_id": str(action.id),
             "work_function": PLAN_WORK_FUNCTION,
             "plan_gate_id": str(gate.id),
+            "plan_author_agent_id": str(task.assigned_to or (action.request or {}).get("agent_id")),
             "revision_requests": revision_requests,
         }
 

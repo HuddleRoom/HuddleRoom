@@ -158,6 +158,9 @@ async def _real_planning_expansion_run(db_session, project_id, planner: Agent, d
         created_by_user_id=None,
     )
     await _complete_goal_definition(db_session, goal, run)
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db_session, goal, planner)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,

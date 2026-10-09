@@ -29,6 +29,9 @@ from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.task_service import TaskService
 
 
+from tests.conftest import bind_plan_author_team as _bind_team
+
+
 async def _complete_goal_definition(db_session, goal, run):
     from tests.conftest import complete_baseline_processes
 
@@ -172,6 +175,7 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
     db_session.add(planner)
     await db_session.flush()
     service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
 
     action = await service.execute_request_plan_action(
         db_session,
@@ -236,6 +240,7 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
         "request_action_id": str(action.id),
         "work_function": "planning",
         "plan_gate_id": str(gate.id),
+        "plan_author_agent_id": str(planner.id),
         "revision_requests": [],
     }
 
@@ -284,7 +289,8 @@ async def test_execute_request_plan_action_replay_reuses_original_task_and_gate(
     other_planner = _agent("other-planner")
     db_session.add_all([planner, other_planner])
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
 
     first = await service.execute_request_plan_action(
         db_session,
@@ -316,6 +322,7 @@ async def test_execute_request_plan_action_replay_reuses_existing_task_before_ag
     db_session.add(planner)
     await db_session.flush()
     service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
 
     request = _canonical_plan_request(planner.id)
     action = await service.reserve_action(
@@ -366,6 +373,7 @@ async def test_execute_request_plan_action_replay_reuses_existing_task_before_ag
         "request_action_id": str(action.id),
         "work_function": "planning",
         "plan_gate_id": str(gate.id),
+        "plan_author_agent_id": str(planner.id),
         "revision_requests": [],
     }
     events = await _event_rows(db_session, test_project.id, "orchestration.plan_requested")
@@ -381,6 +389,7 @@ async def test_execute_request_plan_action_replay_uses_stored_agent_id_when_task
     db_session.add(planner)
     await db_session.flush()
     service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
 
     request = _canonical_plan_request(planner.id)
     action = await service.reserve_action(
@@ -430,6 +439,7 @@ async def test_execute_request_plan_action_replay_uses_stored_agent_id_when_task
         "request_action_id": str(action.id),
         "work_function": "planning",
         "plan_gate_id": str(gate.id),
+        "plan_author_agent_id": str(planner.id),
         "revision_requests": [],
     }
     events = await _event_rows(db_session, test_project.id, "orchestration.plan_requested")
@@ -762,7 +772,8 @@ async def test_execute_request_plan_action_new_idempotency_key_supersedes_outsta
     second_planner = _agent("second-planner")
     db_session.add_all([first_planner, second_planner])
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, first_planner)
 
     first_action = await service.execute_request_plan_action(
         db_session,
@@ -787,7 +798,7 @@ async def test_execute_request_plan_action_new_idempotency_key_supersedes_outsta
     second_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
-        request=_plan_request(second_planner.id),
+        request=_plan_request(first_planner.id),
         idempotency_key=f"run:phase11:kind:request_plan:second:{prior_plan_status}",
     )
 
@@ -799,13 +810,14 @@ async def test_execute_request_plan_action_new_idempotency_key_supersedes_outsta
     assert first_task.id != second_task.id
     assert first_task.status == "cancelled"
     assert second_task.status == "backlog"
-    assert second_task.assigned_to == second_planner.id
+    assert second_task.assigned_to == first_planner.id
     assert run.plan_state == {
         "status": "requested",
         "planning_task_id": str(second_task.id),
         "request_action_id": str(second_action.id),
         "work_function": "planning",
         "plan_gate_id": str(gate.id),
+        "plan_author_agent_id": str(first_planner.id),
         "revision_requests": [],
     }
     assert await db_session.scalar(select(count(OrchestrationGate.id)).where(OrchestrationGate.run_id == run.id)) == 1
@@ -820,7 +832,8 @@ async def test_execute_request_plan_action_supersedes_in_progress_planning_task_
     second_planner = _agent("second-planner")
     db_session.add_all([first_planner, second_planner])
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, first_planner)
 
     first_action = await service.execute_request_plan_action(
         db_session,
@@ -846,7 +859,7 @@ async def test_execute_request_plan_action_supersedes_in_progress_planning_task_
     second_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
-        request=_plan_request(second_planner.id),
+        request=_plan_request(first_planner.id),
         idempotency_key="run:phase11:kind:request_plan:second:in-progress",
     )
 
@@ -1676,7 +1689,8 @@ async def test_execute_accept_plan_action_rejects_artifact_from_wrong_or_missing
     other_planner = _agent("other-planner")
     db_session.add_all([planner, other_planner])
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -2364,3 +2378,59 @@ async def test_accept_plan_same_artifact_without_completed_accept_action_still_c
             idempotency_key="run:replay:kind:accept_plan:c",
         )
     assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_request_plan_enforces_selected_plan_author(db_session, test_project):
+    author = _agent("author")
+    specialist = _agent("specialist")
+    db_session.add_all([author, specialist])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, author)
+
+    context = await service._decision_context(db_session, goal, run)
+    assert context["plan_author"]["agent_id"] == str(author.id)
+    assert context["plan_author"]["error"] is None
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.execute_request_plan_action(
+            db_session, run_id=run.id, request=_plan_request(specialist.id), idempotency_key="run:t5:specialist",
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail.startswith("plan_author_mismatch:")
+    assert await db_session.scalar(select(count(OrchestrationAction.id)).where(OrchestrationAction.run_id == run.id)) == 0
+
+    action = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(author.id), idempotency_key="run:t5:author",
+    )
+    assert (await db_session.get(Task, action.target_id)).assigned_to == author.id
+    assert run.plan_state["plan_author_agent_id"] == str(author.id)
+
+    with pytest.raises(HTTPException):
+        await service.execute_request_plan_action(
+            db_session, run_id=run.id, request=_plan_request(specialist.id), idempotency_key="run:t5:specialist2",
+        )
+    again = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(author.id), idempotency_key="run:t5:author2",
+    )
+    assert run.plan_state["plan_author_agent_id"] == str(author.id)
+    assert again.id != action.id
+
+
+@pytest.mark.asyncio
+async def test_request_plan_without_team_binds_requested_agent(db_session, test_project):
+    planner = _agent("planner")
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    current = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    current.outputs = {**(current.outputs or {}), "assignments": []}
+    await db_session.flush()
+
+    action = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key="run:t5:noteam",
+    )
+    assert (await db_session.get(Task, action.target_id)).assigned_to == planner.id

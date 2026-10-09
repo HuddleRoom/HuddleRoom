@@ -2827,3 +2827,36 @@ async def test_select_plan_author_child_team_and_parent_inheritance(db_session, 
         orchestrator_context={"team": {"role_to_agent": {"planning": str(other.id)}}}, **kw,
     )
     assert await select_plan_author(db_session, own, run) == other.id
+
+
+@pytest.mark.asyncio
+async def test_select_plan_author_surfaces_pending_definition_repair_from_real_review(db_session, test_project):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+    from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+
+    manager = await _persist_agent(
+        db_session, name="agent-0", system_prompt="You implement code yourself.", description="Original."
+    )
+    dev = await _persist_agent(db_session, name="agent-1")
+    goal, run = await _plan_goal(db_session, test_project.id, "delivery", manager)
+    run.baseline_authorized = True
+    await _assign(db_session, goal.project_id, run.id, dev, "implementation")
+    service = OrchestrationProcessService()
+    selection = await service.start_process(
+        db_session, goal.id, process_type="manager_selection", trigger_reason="test", run_id=run.id
+    )
+    await service.complete_process(db_session, selection)
+    process = AgentDefinitionReviewProcess(analyzer=ThreeProposalAnalyzer())
+    assert (await process.advance(db_session, goal, run))["status"] == "waiting_decision"
+    await _seed_team(db_session, goal, run, [("implementation", dev)])
+
+    with pytest.raises(HTTPException) as exc:
+        await select_plan_author(db_session, goal, run)
+    pending = await OrchestrationAuthorityDecisionService().get_pending_by_key(
+        db_session, goal.id, f"agent_definition_review:proposal:{manager.id}"
+    )
+    assert pending is not None and pending.options == ["approve", "reject", "edit"]
+    assert exc.value.detail.startswith("plan_author_unavailable:")
+    assert str(pending.id) in exc.value.detail
+    assert manager.system_prompt == "You implement code yourself."

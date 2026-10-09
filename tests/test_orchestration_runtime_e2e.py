@@ -122,6 +122,9 @@ async def _seed_accepted_plan(db_session, test_project, service, run, planner, p
     """Drive a real request_plan -> accept_plan cycle (bypassing the LLM decision
     loop) so run.plan_state["status"] == "accepted" with the given plan items
     (defaults to one expandable item)."""
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db_session, await db_session.get(OrchestrationGoal, run.goal_id), planner)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -207,6 +210,9 @@ async def test_accept_plan_rejects_unknown_or_uncovered_criterion_links(
     service, goal, run = await _authorized_run(
         db_session, test_project, success_criteria=criteria
     )
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db_session, goal, planner)
     request_action = await service.execute_request_plan_action(
         db_session,
         run.id,
