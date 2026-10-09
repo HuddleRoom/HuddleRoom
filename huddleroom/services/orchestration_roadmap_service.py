@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import object_session
 
+from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.agent import Agent
 from huddleroom.services.project_service import ProjectService
@@ -24,17 +25,26 @@ from huddleroom.models.orchestration import (
     OrchestrationRoadmapItem,
     OrchestrationRoadmapVersion,
     OrchestrationRun,
+    EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE,
     compute_goal_contract_fingerprint,
+    explicit_planning_rationale,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.task import Task
-from huddleroom.schemas.orchestration import OrchestrationPlanItem, OrchestrationRoadmapPlanItem, ROADMAP_BUDGET_DIMENSIONS
+from huddleroom.schemas.orchestration import (
+    OrchestrationGoalCreate, OrchestrationPlanItem, OrchestrationRoadmapPlanItem, ROADMAP_BUDGET_DIMENSIONS,
+)
+from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_budget_service import (
     BudgetMeasurementError, OrchestrationBudgetService, canonical_amounts, parent_caps, validate_declared_allocations,
 )
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+class ChildShapeRejected(Exception):
+    """A child item resolved to a shape a finite Roadmap may not create."""
+
 
 class RoadmapReplanMeasurementAttention(HTTPException):
     def __init__(self) -> None:
@@ -80,9 +90,83 @@ def parse_roadmap_items(raw: object, parent_dimensions: set[str]) -> list[Orches
     return items
 
 
+async def expansion_scope(db, goal) -> tuple[OrchestrationGoal, int, dict]:
+    """Finite root (nearest ancestor-or-self whose parent is None or Continuous), goal's depth below it, root limits."""
+    root, depth = goal, 0
+    while root.parent_goal_id is not None and depth < 64:
+        parent = await db.get(OrchestrationGoal, root.parent_goal_id)
+        if parent is None or parent.goal_type == "continuous":
+            break
+        root, depth = parent, depth + 1
+    policy = (root.orchestrator_context or {}).get("expansion_policy") or {}
+    limits = {
+        "max_concurrent_tasks": settings.orchestration_max_concurrent_tasks,
+        "max_goal_depth": settings.orchestration_max_goal_depth,
+        "max_descendant_goals": settings.orchestration_max_descendant_goals,
+    }
+    limits.update({key: value for key, value in policy.items() if key in limits})
+    return root, depth, limits
+
+
+async def descendant_count(db, root_id) -> int:
+    count, frontier = 0, [root_id]
+    while frontier:
+        frontier = list(await db.scalars(select(OrchestrationGoal.id).where(
+            OrchestrationGoal.parent_goal_id.in_(frontier)
+        )))
+        count += len(frontier)
+    return count
+
+
 class OrchestrationRoadmapService:
     def __init__(self, orchestration_service):
         self.orchestration = orchestration_service
+
+    async def _child_shape(self, goal, item) -> dict:
+        if item.goal_type is None:
+            return {
+                "goal_type": "outcome", "goal_type_source": "parent_explicit",
+                "goal_type_rationale": f"Roadmap item {item.item_key} runs as a leaf Outcome.",
+                "planning_mode": "implementation",
+                "planning_rationale": "A leaf roadmap item needs an implementation plan.",
+            }
+        if item.goal_type == "auto":
+            shape = (await OrchestrationGoalShapeService().resolve_creation_shape(
+                goal.project_id, OrchestrationGoalCreate(
+                    goal_type="auto", objective=item.objective or item.title,
+                    success_criteria=deepcopy(item.success_criteria),
+                    constraints={**goal.constraints, **item.constraints},
+                ),
+            )).model_dump()
+            if shape["goal_type"] == "continuous":
+                raise ChildShapeRejected(
+                    "continuous_child_requires_continuous_root: a finite Roadmap cannot create a Continuous child"
+                )
+            return {**shape, "goal_type_source": "parent_auto"}
+        return {
+            "goal_type": item.goal_type, "goal_type_source": "parent_explicit",
+            "goal_type_rationale": f"Roadmap item {item.item_key} declares goal_type {item.goal_type}.",
+            "planning_mode": EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE[item.goal_type],
+            "planning_rationale": explicit_planning_rationale(item.goal_type),
+        }
+
+    async def _child_expansion_context(self, db, goal, item) -> dict:
+        root, depth, limits = await expansion_scope(db, goal)
+        context = {"expansion_policy": {
+            **limits, "depth": depth + 1, "root_goal_id": str(root.id),
+            "remaining_descendant_goals": limits["max_descendant_goals"] - (await descendant_count(db, root.id) + 1),
+        }}
+        evidence_ids = list(await db.scalars(select(OrchestrationEvidence.id).join(
+            OrchestrationRoadmapItem, OrchestrationRoadmapItem.gate_id == OrchestrationEvidence.gate_id,
+        ).where(
+            OrchestrationRoadmapItem.goal_id == goal.id,
+            OrchestrationRoadmapItem.item_key.in_(item.depends_on),
+            OrchestrationEvidence.verdict == "accepted",
+        ).order_by(OrchestrationEvidence.created_at, OrchestrationEvidence.id)))
+        artifact_ids = [str(x) for x in item.artifact_ids]
+        if artifact_ids or evidence_ids:
+            context["eligible_evidence"] = {"artifact_ids": artifact_ids, "evidence_ids": [str(x) for x in evidence_ids]}
+        return context
 
     async def current_version(self, db: AsyncSession, goal_id: uuid.UUID) -> OrchestrationRoadmapVersion | None:
         return await db.scalar(select(OrchestrationRoadmapVersion).where(
@@ -935,6 +1019,16 @@ class OrchestrationRoadmapService:
             await ProjectService().require_frozen_roadmap_workspace(
                 db, goal.project_id, binding["boundary"], binding["path"]
             )
+        try:
+            shape = await self._child_shape(goal, item)
+        except GoalShapeResolutionError as exc:
+            return {"step": "waiting", "reason": f"child_shape_{exc.reason}"}
+        except ChildShapeRejected as exc:
+            self.orchestration._upsert_active_blocker(run, {
+                "kind": "child_contract", "item_key": item.item_key, "reason": str(exc),
+            })
+            await db.flush()
+            return {"step": "needs_attention"}
         release = await self.orchestration.reserve_action(
             db, run.id, f"run:{run.id}:kind:release_roadmap_item:{item.item_key}",
             "release_roadmap_item", {"item_key": item.item_key, "unit_type": "goal"},
@@ -959,9 +1053,8 @@ class OrchestrationRoadmapService:
                                     **({"unstaged_authority_decision_id": str(authority.id)} if unstaged else {})},
                         "team": deepcopy(snapshot["team"]),
                         "workspace_policy": deepcopy(snapshot["workspace_policy"]),
-                    }, goal_type="outcome", goal_type_source="parent_explicit",
-                    goal_type_rationale=f"Roadmap item {item.item_key} runs as a leaf Outcome.",
-                    planning_mode="implementation", planning_rationale="A leaf roadmap item needs an implementation plan.",
+                        **await self._child_expansion_context(db, goal, item),
+                    }, **shape,
                     parent_goal_id=goal.id, roadmap_version_id=version.id, roadmap_item_key=item.item_key,
                     parent_contract_snapshot=snapshot,
                     goal_delta={"objective": item.objective, "constraints": deepcopy(item.constraints),

@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -14,13 +15,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import (
-    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGate,
+    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationEvidence, OrchestrationGate,
     OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRun, compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.schemas.orchestration import GoalShapeDecision
+from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService, parse_roadmap_items
@@ -1129,3 +1132,129 @@ async def test_invalid_token_telemetry_is_rejected(db_session, test_project, val
         adapter_type="test", status="completed", metadata_={"token_count_in": value, "token_count_out": 1}))
     with pytest.raises(BudgetMeasurementError):
         await OrchestrationBudgetService().measured_run_spend(db_session, child_run, {"max_tokens"})
+
+
+# --- progressive child type resolution and inherited expansion snapshot ---
+
+async def _row_counts(db, parent, run):
+    return [
+        await db.scalar(select(func.count()).select_from(model).where(condition))  # pylint: disable=not-callable
+        for model, condition in [
+            (OrchestrationGoal, OrchestrationGoal.parent_goal_id == parent.id),
+            (OrchestrationRoadmapItem, OrchestrationRoadmapItem.goal_id == parent.id),
+            (OrchestrationBudgetReservation, OrchestrationBudgetReservation.parent_goal_id == parent.id),
+            (OrchestrationGate, (OrchestrationGate.run_id == run.id) & (OrchestrationGate.gate_type == "child_goal_completed")),
+            (OrchestrationAction, (OrchestrationAction.run_id == run.id) & (OrchestrationAction.action_type == "release_roadmap_item")),
+        ]
+    ]
+
+
+def _shape(goal_type, planning_mode):
+    return GoalShapeDecision(
+        goal_type=goal_type, goal_type_source="auto", goal_type_rationale="stub rationale",
+        planning_mode=planning_mode, planning_rationale="stub planning rationale",
+    )
+
+
+@pytest.mark.parametrize("goal_type,planning_mode", [("outcome", "delivery"), ("roadmap", "roadmap")])
+async def test_explicit_child_goal_type_is_preserved(db_session, test_project, goal_type, planning_mode):
+    item = {**goal_item(), "goal_type": goal_type}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    await roadmap.advance(db_session, parent, run)
+    child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent.id))
+    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    assert (child.goal_type, child.goal_type_source, child.planning_mode) == (goal_type, "parent_explicit", planning_mode)
+    assert f"declares goal_type {goal_type}" in child.goal_type_rationale and child.planning_rationale.strip()
+    assert (child_run.goal_type_snapshot, child_run.planning_mode_snapshot) == (goal_type, planning_mode)
+    assert child_run.goal_contract_fingerprint == compute_goal_contract_fingerprint(child)
+    policy = child.orchestrator_context["expansion_policy"]
+    assert policy["depth"] == 1 and policy["root_goal_id"] == str(parent.id)
+    assert policy["max_goal_depth"] == 3 and policy["max_descendant_goals"] == 50
+    assert policy["remaining_descendant_goals"] == 49
+    assert "eligible_evidence" not in child.orchestrator_context
+
+
+async def test_auto_child_is_classified_once_from_its_own_objective(db_session, test_project):
+    calls = []
+
+    async def classify(self, project_id, data):
+        calls.append(data)
+        return _shape("roadmap", "roadmap")
+
+    item = {**goal_item(constraints={"language": "Python"}), "goal_type": "auto"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        await roadmap.advance(db_session, parent, run)
+        await roadmap.advance(db_session, parent, run)
+    assert len(calls) == 1
+    assert (calls[0].objective, calls[0].success_criteria) == ("child", [{"key": "local"}])
+    assert calls[0].constraints == {"region": "EU", "language": "Python"}
+    child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent.id))
+    assert (child.goal_type, child.goal_type_source, child.planning_mode) == ("roadmap", "parent_auto", "roadmap")
+    assert child.goal_type_rationale == "stub rationale"
+
+
+async def test_auto_child_provider_error_waits_without_persisting_anything(db_session, test_project):
+    async def classify(self, project_id, data):
+        raise GoalShapeResolutionError("provider_error", "boom")
+
+    item = {**goal_item(), "goal_type": "auto"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        result = await roadmap.release_goal_item(
+            db_session, parent, run, version, parse_roadmap_items([item], set(parent.budget["caps"]))[0],
+        )
+    assert result == {"step": "waiting", "reason": "child_shape_provider_error"}
+    assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
+    assert await db_session.scalar(select(OrchestrationRun).where(
+        OrchestrationRun.id == uuid.uuid5(uuid.NAMESPACE_URL, f"rally:roadmap-child-run:{parent.id}:child"))) is None
+    await roadmap.advance(db_session, parent, run)  # retried next tick with the stubbed classifier
+    assert await _row_counts(db_session, parent, run) == [1, 1, 1, 1, 1]
+
+
+async def test_auto_child_resolving_to_continuous_is_blocked_without_rows(db_session, test_project):
+    async def classify(self, project_id, data):
+        return _shape("continuous", "continuous_policy")
+
+    item = {**goal_item(), "goal_type": "auto"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        result = await roadmap.release_goal_item(
+            db_session, parent, run, version, parse_roadmap_items([item], set(parent.budget["caps"]))[0],
+        )
+    assert result == {"step": "needs_attention"}
+    assert [b["reason"].split(":")[0] for b in run.active_blockers if b["kind"] == "child_contract"] == [
+        "continuous_child_requires_continuous_root",
+    ]
+    assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
+
+
+async def test_continuous_child_item_is_rejected_with_reason():
+    with pytest.raises(HTTPException) as exc:
+        parse_roadmap_items([{**goal_item(), "goal_type": "continuous"}], {"max_tokens", "max_turns", "max_hours"})
+    assert exc.value.status_code == 422 and "continuous_child_requires_continuous_root" in exc.value.detail
+
+
+async def test_child_inherits_root_limits_and_eligible_evidence_from_accepted_dependency(db_session, test_project):
+    artifact_id = uuid.uuid4()
+    first = goal_item("first", {"max_tokens": 300, "max_turns": 1, "max_hours": 1})
+    second = {**goal_item("second", {"max_tokens": 300, "max_turns": 1, "max_hours": 1}),
+              "depends_on": ["first"], "goal_type": "outcome", "artifact_ids": [str(artifact_id)]}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [first, second])
+    parent.orchestrator_context = {"expansion_policy": {"max_goal_depth": 2, "max_descendant_goals": 5, "depth": 0}}
+    await roadmap.advance(db_session, parent, run)
+    lineage = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.item_key == "first"))
+    gate = await db_session.get(OrchestrationGate, lineage.gate_id)
+    gate.status = "accepted"
+    evidence = OrchestrationEvidence(run_id=run.id, gate_id=gate.id, source_type="child_goal", verdict="accepted")
+    db_session.add_all([evidence, OrchestrationEvidence(
+        run_id=run.id, gate_id=gate.id, source_type="child_goal", verdict="rejected")])
+    await db_session.flush()
+    await roadmap.advance(db_session, parent, run)
+    child = await db_session.scalar(select(OrchestrationGoal).where(
+        OrchestrationGoal.parent_goal_id == parent.id, OrchestrationGoal.roadmap_item_key == "second"))
+    context = child.orchestrator_context
+    assert context["expansion_policy"]["max_goal_depth"] == 2
+    assert context["expansion_policy"]["max_descendant_goals"] == 5
+    assert context["expansion_policy"]["remaining_descendant_goals"] == 3
+    assert context["eligible_evidence"] == {"artifact_ids": [str(artifact_id)], "evidence_ids": [str(evidence.id)]}

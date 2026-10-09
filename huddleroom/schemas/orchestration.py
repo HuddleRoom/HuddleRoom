@@ -810,6 +810,15 @@ class OrchestrationRoadmapPlanItem(BaseModel):
     why_runnable: str = ""
     goal_type: Literal["auto", "outcome", "roadmap"] | None = None
 
+    @field_validator("goal_type", mode="before")
+    @classmethod
+    def reject_continuous_child(cls, value):
+        if value == "continuous":
+            raise ValueError(
+                "continuous_child_requires_continuous_root: a finite Roadmap cannot create a Continuous child"
+            )
+        return value
+
     @field_validator("why_runnable", mode="before")
     @classmethod
     def strip_why_runnable(cls, value):
