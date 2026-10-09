@@ -5278,15 +5278,11 @@ class OrchestrationService:
         goal = await db.get(OrchestrationGoal, run.goal_id) if run else None
         if run is None or goal is None:
             raise HTTPException(status_code=409, detail="Roadmap budget lineage is invalid")
-        # A nested Roadmap owns its own task items (same owner the claim side resolves); only a
-        # released child goal keys its authority by the parent's lineage.
         from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
 
-        parent = await OrchestrationBudgetService().roadmap_parent(db, goal) or goal
+        parent = await OrchestrationBudgetService().cli_authority_owner(
+            db, goal, roadmap.get("roadmap_version_id")) or goal
         child = parent.id != goal.id
-        if not child and goal.parent_goal_id and str(goal.roadmap_version_id) == str(roadmap.get("roadmap_version_id")):
-            # Its planning task still carries the lineage it was released under.
-            parent, child = await db.get(OrchestrationGoal, goal.parent_goal_id), True
         version_id = goal.roadmap_version_id if child else roadmap.get("roadmap_version_id")
         item_key = goal.roadmap_item_key if child else roadmap.get("roadmap_item_key")
         if parent is None or version_id is None or not isinstance(item_key, str):

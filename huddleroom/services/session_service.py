@@ -388,7 +388,7 @@ class SessionService:
 
         run = await OrchestrationBudgetService().owning_roadmap_run(db, task)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
-        parent = await OrchestrationBudgetService().roadmap_parent(db, goal) if goal is not None else None
+        parent = await OrchestrationBudgetService().cli_authority_owner(db, goal, version_id) if goal is not None else None
         if run is None or goal is None or parent is None:
             raise HTTPException(status_code=409, detail="Roadmap CLI budget lineage is invalid")
         try:

@@ -588,6 +588,19 @@ class OrchestrationBudgetService:
         ))
         return parent if reservation is not None else None
 
+    async def cli_authority_owner(self, db, goal: OrchestrationGoal, context_version_id) -> OrchestrationGoal | None:
+        """Goal that owns the CLI-budget decision for work whose context names `context_version_id`.
+
+        A nested Roadmap's planning task still carries the lineage it was released under, so that
+        authority belongs to its parent; its own task items carry its own version.  Release and
+        claim both resolve the owner here so their decision keys cannot diverge.
+        """
+        owner = await self.roadmap_parent(db, goal)
+        if (owner is not None and owner.id == goal.id and goal.parent_goal_id is not None
+                and str(goal.roadmap_version_id) == str(context_version_id)):
+            return await db.get(OrchestrationGoal, goal.parent_goal_id)
+        return owner
+
     async def continuous_parent(self, db, goal: OrchestrationGoal) -> OrchestrationGoal | None:
         if goal.goal_type == "continuous":
             return goal
