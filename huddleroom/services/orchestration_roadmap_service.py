@@ -34,6 +34,7 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import (
     OrchestrationGoalCreate, OrchestrationPlanItem, OrchestrationRoadmapPlanItem, ROADMAP_BUDGET_DIMENSIONS,
 )
+from huddleroom.services.orchestration_capacity import root_and_depth
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_budget_service import (
     BudgetMeasurementError, OrchestrationBudgetService, canonical_amounts, parent_caps, validate_declared_allocations,
@@ -92,12 +93,8 @@ def parse_roadmap_items(raw: object, parent_dimensions: set[str]) -> list[Orches
 
 async def expansion_scope(db, goal) -> tuple[OrchestrationGoal, int, dict]:
     """Finite root (nearest ancestor-or-self whose parent is None or Continuous), goal's depth below it, root limits."""
-    root, depth = goal, 0
-    while root.parent_goal_id is not None and depth < 64:
-        parent = await db.get(OrchestrationGoal, root.parent_goal_id)
-        if parent is None or parent.goal_type == "continuous":
-            break
-        root, depth = parent, depth + 1
+    root_id, depth = await root_and_depth(db, goal.id)
+    root = goal if root_id == goal.id else await db.get(OrchestrationGoal, root_id)
     policy = (root.orchestrator_context or {}).get("expansion_policy") or {}
     limits = {
         "max_concurrent_tasks": settings.orchestration_max_concurrent_tasks,
@@ -108,14 +105,18 @@ async def expansion_scope(db, goal) -> tuple[OrchestrationGoal, int, dict]:
     return root, depth, limits
 
 
-async def descendant_count(db, root_id) -> int:
-    count, frontier = 0, [root_id]
+async def subtree_goal_ids(db, root_id) -> list[uuid.UUID]:
+    ids, frontier = [root_id], [root_id]
     while frontier:
         frontier = list(await db.scalars(select(OrchestrationGoal.id).where(
             OrchestrationGoal.parent_goal_id.in_(frontier)
         )))
-        count += len(frontier)
-    return count
+        ids.extend(frontier)
+    return ids
+
+
+async def descendant_count(db, root_id) -> int:
+    return len(await subtree_goal_ids(db, root_id)) - 1
 
 
 def expansion_limit_error(parent_depth: int, existing: int, new_children: int, limits: dict) -> str | None:
