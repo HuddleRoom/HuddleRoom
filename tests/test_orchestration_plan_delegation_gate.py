@@ -827,10 +827,11 @@ async def test_execute_request_plan_action_new_idempotency_key_supersedes_outsta
         "plan_gate_id": str(gate.id),
         "plan_author_agent_id": str(first_planner.id),
         "revision_requests": [],
-        "planning_version": 3 if prior_plan_status == "revision_requested" else 2,
+        # revision bumps once and dispatches its own replacement task (another bump); gaps are allowed
+        "planning_version": 4 if prior_plan_status == "revision_requested" else 2,
     }
     assert second_task.metadata_["orchestration_plan"]["planning_version"] == (
-        3 if prior_plan_status == "revision_requested" else 2
+        4 if prior_plan_status == "revision_requested" else 2
     )
     assert await db_session.scalar(select(count(OrchestrationGate.id)).where(OrchestrationGate.run_id == run.id)) == 1
 
@@ -863,12 +864,14 @@ async def test_planning_version_replay_keeps_version_and_revision_increments(db_
     await service.execute_request_plan_revision_action(
         db_session, run_id=run.id, request=revision_request, idempotency_key=revision_key,
     )
-    assert run.plan_state["planning_version"] == 2
+    # +1 for the revision, +1 for the replacement planning task it dispatches
+    assert run.plan_state["planning_version"] == 3
+    revised_task_id = run.plan_state["planning_task_id"]
     await service.execute_request_plan_revision_action(
         db_session, run_id=run.id, request=revision_request, idempotency_key=revision_key,
     )
-    assert run.plan_state["planning_version"] == 2
-    assert len(run.plan_state["revision_requests"]) == 1
+    assert run.plan_state["planning_version"] == 3
+    assert run.plan_state["planning_task_id"] == revised_task_id
 
 
 @pytest.mark.asyncio
@@ -918,11 +921,8 @@ async def test_planning_contract_lists_pre_plan_tasks_and_revision_notes(db_sess
         },
         idempotency_key="run:phase11:kind:request_plan_revision:pre-plan",
     )
-    second = await service.execute_request_plan_action(
-        db_session, run_id=run.id, request=_plan_request(planner.id),
-        idempotency_key="run:phase11:kind:request_plan:pre-plan-second",
-    )
-    second_task = await db_session.get(Task, second.target_id)
+    second_task = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+    second = await db_session.get(OrchestrationAction, uuid.UUID(run.plan_state["request_action_id"]))
     assert "Plan revision request: Cover the rollback path." in second_task.metadata_["orchestration_contract"]["inputs"]
 
     run.plan_state = {**run.plan_state, "status": "revision_required", "revision_reason": "planning_output_rejected: x"}
@@ -1023,15 +1023,14 @@ async def test_execute_request_plan_revision_action_records_revision_and_emits_o
         "revision_request": "Split the plan into independently verifiable tasks.",
     }
 
-    assert run.plan_state["status"] == "revision_requested"
-    assert run.plan_state["planning_task_id"] == str(request_action.target_id)
-    assert run.plan_state["revision_requests"] == [
-        {
-            "action_id": str(first.id),
-            "plan_task_id": str(request_action.target_id),
-            "revision_request": "Split the plan into independently verifiable tasks.",
-        }
-    ]
+    # The revision dispatches a replacement planning task carrying the note; the old task is cancelled.
+    assert run.plan_state["status"] == "requested"
+    revised = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+    assert revised.id != request_action.target_id
+    assert "Plan revision request: Split the plan into independently verifiable tasks." in (
+        revised.metadata_["orchestration_contract"]["inputs"]
+    )
+    assert (await db_session.get(Task, request_action.target_id)).status == "cancelled"
 
     events = await _event_rows(db_session, test_project.id, "orchestration.plan_revision_requested")
     assert len(events) == 1

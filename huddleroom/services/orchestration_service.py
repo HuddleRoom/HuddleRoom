@@ -58,7 +58,13 @@ from huddleroom.schemas.orchestration import (
     planning_envelope_report_schema,
 )
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
-from huddleroom.services.orchestration_plan_ingestion import INGESTION_SOURCE, ingested_plan_hash
+from huddleroom.services.orchestration_plan_ingestion import (
+    INGESTION_SOURCE,
+    PlanIngestionError,
+    ingest,
+    ingested_plan_hash,
+    plan_artifact_id,
+)
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.models.event_log import EventLog
 from huddleroom.services.event_bus import BusEvent, emit_event_once
@@ -2209,6 +2215,19 @@ class OrchestrationService:
             },
             source="orchestrator",
             dedup_key=f"{PLAN_REVISION_REQUESTED_EVENT_TYPE}:action:{action.id}",
+        )
+        contract = self._json_object_or_empty(self._json_object_or_empty(planning_task.metadata_).get("orchestration_contract"))
+        await self.execute_request_plan_action(
+            db,
+            run.id,
+            {
+                "action_type": "request_plan",
+                "agent_id": self._json_object_or_empty(run.plan_state).get("plan_author_agent_id")
+                or str(planning_task.assigned_to),
+                "work_function": PLAN_WORK_FUNCTION,
+                "scope": contract.get("scope"),
+            },
+            f"run:{run.id}:kind:request_plan:revision:{action.id}",
         )
         return await self._mark_action_completed(db, action, target_type="task", target_id=planning_task.id)
 
@@ -6409,6 +6428,63 @@ class OrchestrationService:
         })
         return None, output
 
+    async def _ingest_planning_output(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task, expected_session_id: uuid.UUID | None,
+    ) -> None:
+        """Register the winning planner output as the run's plan Artifact, or require a plan revision."""
+        metadata = self._json_object_or_empty(task.metadata_)
+        orchestration = self._json_object_or_empty(metadata.get("orchestration"))
+        if (
+            task.status != "done"
+            or orchestration.get("work_function") != PLAN_WORK_FUNCTION
+            or orchestration.get("run_id") != str(run.id)
+        ):
+            return
+        key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
+        marker = await self._existing_action_for_key(db, run.id, key)
+        if marker is not None and marker.status == "completed":
+            return
+        if expected_session_id is None:
+            if marker is not None:
+                expected_session_id = self._optional_uuid(
+                    self._json_object_or_empty(marker.request).get("session_id"), "session_id"
+                )
+            else:
+                sessions = list(await db.scalars(select(Session.id).where(
+                    Session.task_id == task.id, Session.status == "completed",
+                )))
+                if len(sessions) > 1:
+                    return
+                expected_session_id = sessions[0] if sessions else None
+        try:
+            session_id, output = await self.consume_terminal_task_output(db, run, task, expected_session_id)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                return  # a nonwinning session never becomes the plan Artifact
+            raise
+        marker = await self._existing_action_for_key(db, run.id, key)
+        plan_state = self._json_object_or_empty(run.plan_state)
+        version = self._json_object_or_empty(metadata.get("orchestration_plan")).get("planning_version")
+        if version is None:
+            version = plan_state.get("planning_version")
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        try:
+            artifact = await ingest(db, goal, run, task, session_id, version, output)
+        except PlanIngestionError as exc:
+            marker.request = {**self._json_object_or_empty(marker.request), "plan_ingestion_error": exc.reason}
+            # ponytail: legacy self-registering planners keep working; drop this check once they are gone.
+            manual_plan = await db.scalar(select(Artifact.id).where(
+                Artifact.linked_task_id == task.id,
+                Artifact.artifact_type == "plan",
+                Artifact.id != plan_artifact_id(task.id, version),
+            ).limit(1))
+            # A pending Roadmap replan sits on an accepted plan; revision_required would strand it.
+            if not exc.stale and manual_plan is None and not plan_state.get("pending_replan"):
+                self._set_plan_revision_required(run, f"planning_output_rejected: {exc.reason}")
+            await self._mark_action_completed(db, marker, "task", task.id)
+            return
+        await self._mark_action_completed(db, marker, "artifact", artifact.id)
+
     async def consume_canonical_report(
         self,
         db: AsyncSession,
@@ -7508,6 +7584,8 @@ class OrchestrationService:
 
         gate_ref = await self._task_gate_for_run(db, run.id, task)
         if gate_ref is None:
+            if status == "done":
+                await self._ingest_planning_output(db, run, task, None)
             return 0
         gate, orchestration = gate_ref
         if await self._is_outcome_verification_task(db, run, gate, task, orchestration):
@@ -7556,6 +7634,8 @@ class OrchestrationService:
             return 0
         gate_ref = await self._task_gate_for_run(db, run.id, task)
         if gate_ref is None:
+            if event.event_type == "session.completed" and task.status == "done":
+                await self._ingest_planning_output(db, run, task, session.id)
             return 0
 
         gate, orchestration = gate_ref

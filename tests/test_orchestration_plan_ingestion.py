@@ -180,3 +180,85 @@ async def test_acceptance_rejects_superseded_and_tampered_ingested_artifact(db_s
     run.plan_state = {**run.plan_state, "planning_version": version + 1}
     with pytest.raises(HTTPException, match="superseded planning version"):
         await service._plan_artifact_for_run(db_session, run, artifact.id)
+
+
+def _completed(session_id):
+    return SimpleNamespace(id=uuid.uuid4(), event_type="session.completed", payload={"session_id": str(session_id)})
+
+
+async def _finish(db_session, task, session, output):
+    session.output, session.status, task.status = output, "completed", "done"
+    await db_session.flush()
+
+
+@pytest.mark.asyncio
+async def test_session_hook_ingests_winner_and_ignores_nonwinning_session(db_session, test_project):
+    service, _, run, task, winner = await _planning_run(db_session, test_project.id)
+    loser = Session(task_id=task.id, agent_id=task.assigned_to, project_id=test_project.id, adapter_type="api")
+    db_session.add(loser)
+    await _finish(db_session, task, winner, _db_output())
+    loser.output, loser.status = _db_output("other"), "completed"
+    await db_session.flush()
+
+    task_event = SimpleNamespace(id=uuid.uuid4(), payload={"status": "done", "task_id": str(task.id)})
+    assert await service._ingest_task_evidence(db_session, run, task_event) == 0
+    assert await _plan_artifacts(db_session, task.id) == 0  # two completed sessions: no canonical winner yet
+
+    assert await service._ingest_session_evidence(db_session, run, _completed(winner.id)) == 0
+    artifact = await db_session.get(Artifact, uuid.UUID(run.plan_state["plan_artifact_id"]))
+    assert artifact.metadata_["winning_session_id"] == str(winner.id)
+    state = dict(run.plan_state)
+
+    await service._ingest_session_evidence(db_session, run, _completed(loser.id))
+    assert await _plan_artifacts(db_session, task.id) == 1
+    assert run.plan_state == state
+
+
+@pytest.mark.asyncio
+async def test_invalid_output_requires_revision_and_revision_dispatches_next_version(db_session, test_project):
+    service, _, run, task, session = await _planning_run(db_session, test_project.id)
+    version = run.plan_state["planning_version"]
+    await _finish(db_session, task, session, "Here is my plan: do the work.")
+
+    await service._ingest_session_evidence(db_session, run, _completed(session.id))
+
+    assert run.plan_state["status"] == "revision_required"
+    assert run.plan_state["revision_reason"] == "planning_output_rejected: output must be exactly one JSON object"
+    assert "plan_artifact_id" not in run.plan_state and await _plan_artifacts(db_session, task.id) == 0
+    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+    assert marker.status == "completed" and marker.request["plan_ingestion_error"].startswith("output must be")
+    clarifications = (await db_session.execute(select(Task))).scalars().all()
+    assert not [t for t in clarifications if service._task_work_function(t) == "report_clarification"]
+
+    await service.execute_request_plan_revision_action(
+        db_session, run_id=run.id,
+        request={"action_type": "request_plan_revision", "plan_task_id": str(task.id), "revision_request": "Return JSON."},
+        idempotency_key=f"run:{run.id}:kind:request_plan_revision:json",
+    )
+    revised = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+    assert revised.id != task.id and run.plan_state["status"] == "requested"
+    assert revised.metadata_["orchestration_plan"]["planning_version"] == run.plan_state["planning_version"] > version
+    inputs = revised.metadata_["orchestration_contract"]["inputs"]
+    assert "Plan revision request: Return JSON." in inputs
+    assert "Plan revision reason: planning_output_rejected: output must be exactly one JSON object" in inputs
+
+
+@pytest.mark.asyncio
+async def test_manual_plan_artifact_survives_prose_output(db_session, test_project):
+    service, _, run, task, session = await _planning_run(db_session, test_project.id)
+    manual = Artifact(
+        project_id=test_project.id, name="manual-plan", artifact_type="plan", status="draft",
+        linked_task_id=task.id, created_by_agent=task.assigned_to,
+        metadata_={"plan_items": [_item(success_criterion_keys=["plan"])]},
+    )
+    db_session.add(manual)
+    await _finish(db_session, task, session, "I registered the plan artifact.")
+
+    await service._ingest_session_evidence(db_session, run, _completed(session.id))
+
+    assert run.plan_state["status"] == "requested"
+    action = await service.execute_accept_plan_action(
+        db_session, run_id=run.id, request={"action_type": "accept_plan", "plan_artifact_id": str(manual.id)},
+        idempotency_key=f"run:{run.id}:kind:accept_plan",
+    )
+    assert action.status == "completed" and run.plan_state["status"] == "accepted"

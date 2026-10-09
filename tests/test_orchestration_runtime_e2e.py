@@ -325,12 +325,15 @@ async def test_malformed_plan_requires_revision_then_accepts_corrected_plan(
         },
         idempotency_key=f"run:{run.id}:kind:malformed-plan-revision",
     )
+    # The revision dispatched a replacement planning task; the corrected plan belongs to it.
+    revised_task_id = uuid.UUID(run.plan_state["planning_task_id"])
+    assert revised_task_id != request_action.target_id
     corrected = Artifact(
         project_id=test_project.id,
         name="corrected-plan",
         artifact_type="plan",
         status="draft",
-        linked_task_id=request_action.target_id,
+        linked_task_id=revised_task_id,
         created_by_agent=planner.id,
         metadata_={
             "plan_items": [{"id": "fixed", "work_function": "planning", "scope": "s", "deliverable": "d"}]
@@ -437,12 +440,15 @@ async def test_runtime_commits_malformed_plan_failure_then_accepts_revision(
     )
     revision_result = await service.tick(execution_db, run.id)
     assert revision_result["authorized_execution"]["step"] == "plan_decision"
+    await reload_db.rollback()
+    revised_task_id = uuid.UUID((await reload_db.get(OrchestrationRun, run.id)).plan_state["planning_task_id"])
+    assert revised_task_id != request_action.target_id
     corrected = Artifact(
         project_id=test_project.id,
         name="runtime-corrected-plan",
         artifact_type="plan",
         status="draft",
-        linked_task_id=request_action.target_id,
+        linked_task_id=revised_task_id,
         created_by_agent=planner.id,
         metadata_={
             "plan_items": [{"id": "fixed", "work_function": "planning", "scope": "s", "deliverable": "d"}]

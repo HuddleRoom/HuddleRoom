@@ -608,7 +608,9 @@ async def test_advance_rejected_approval_requests_revision_without_accept_action
     result = await service._advance_authorized_execution(db_session, goal, run)
     revision = await db_session.get(OrchestrationAction, uuid.UUID(result["action_id"]))
     assert revision.action_type == "request_plan_revision" and revision.status == "completed"
-    assert run.plan_state["status"] == "revision_requested"
+    # The revision dispatches a replacement planning task.
+    assert run.plan_state["status"] == "requested"
+    assert run.plan_state["planning_task_id"] != str(artifact.linked_task_id)
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapVersion)) == 0
     assert not [a for a in await _run_actions(db_session, run.id) if a.action_type == "accept_plan"]
 
