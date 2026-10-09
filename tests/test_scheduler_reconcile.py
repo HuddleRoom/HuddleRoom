@@ -212,7 +212,7 @@ async def test_reconcile_one_bad_run_does_not_abort_sweep(db_session, test_proje
 
 
 @pytest.mark.asyncio
-async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_project, monkeypatch):
+async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_project, monkeypatch, caplog):
     from collections import Counter
 
     from sqlalchemy import func
@@ -267,18 +267,27 @@ async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_pro
                 OrchestrationAction.run_id == child_runs[0].id,
                 OrchestrationAction.action_type == "authorize_execution")) == 1
 
+    async def sweep():
+        """One sweep must tick every runnable run: the scheduler swallows and logs tick failures."""
+        runnable = await db_session.scalar(select(func.count()).select_from(OrchestrationRun).join(
+            OrchestrationGoal, OrchestrationGoal.id == OrchestrationRun.goal_id).where(
+            OrchestrationRun.status.in_(("running", "blocked")), OrchestrationGoal.status.in_(("active", "blocked"))))
+        assert runnable >= 2
+        assert await reconcile_orchestration_runs_async(db_session) == runnable
+        assert "reconcile failed" not in caplog.text and not [r for r in caplog.records if r.levelname == "ERROR"]
+
     assert await _children_of(db_session, n.child) == []
-    await reconcile_orchestration_runs_async(db_session)
+    await sweep()
     assert [g.roadmap_item_key for g in await _children_of(db_session, n.child)] == ["g1"]
     assert [g.roadmap_item_key for g in await _children_of(db_session, n.parent)] == ["area"]
     await assert_one_lineage_per_key()
     # The released child's first tick (sweep 2) is its own work; after that the sweeps are no-ops.
-    await reconcile_orchestration_runs_async(db_session)
+    await sweep()
     await assert_one_lineage_per_key()
     async def row_ids():
         return {model: [row["id"] for row in rows] for model, rows in (await _snapshot(db_session, models)).items()}
 
     settled = await row_ids()
-    await reconcile_orchestration_runs_async(db_session)
+    await sweep()
     assert await row_ids() == settled
     await assert_one_lineage_per_key()

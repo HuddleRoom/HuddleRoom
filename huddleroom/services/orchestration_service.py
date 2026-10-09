@@ -5718,14 +5718,6 @@ class OrchestrationService:
                 "Existing run work — adopt each via adopt_task_id or say in summary why it is not used:\n"
                 + "\n".join(pre_plan_lines)
             )
-        eligible = self._json_object_or_empty(self._json_object_or_empty(goal.orchestrator_context).get("eligible_evidence"))
-        artifact_ids = [str(a) for a in eligible.get("artifact_ids", [])]
-        if eligible:
-            evidence_ids = [str(e) for e in eligible.get("evidence_ids", [])]
-            extra_inputs.append(
-                "Eligible parent evidence (references only; re-verify before relying on them for any final "
-                f"criterion): artifacts {', '.join(artifact_ids) or 'none'}; evidence {', '.join(evidence_ids) or 'none'}."
-            )
         if plan_state.get("status") in {"revision_requested", "revision_required"}:
             extra_inputs.extend(
                 f"Plan revision request: {item['revision_request']}"
@@ -5734,6 +5726,14 @@ class OrchestrationService:
             )
             if plan_state.get("revision_reason"):
                 extra_inputs.append(f"Plan revision reason: {plan_state['revision_reason']}")
+        eligible = self._json_object_or_empty(self._json_object_or_empty(goal.orchestrator_context).get("eligible_evidence"))
+        artifact_ids = [str(a) for a in eligible.get("artifact_ids", [])]
+        if eligible:
+            evidence_ids = [str(e) for e in eligible.get("evidence_ids", [])]
+            extra_inputs.append(
+                "Eligible parent evidence (references only; re-verify before relying on them for any final "
+                f"criterion): artifacts {', '.join(artifact_ids) or 'none'}; evidence {', '.join(evidence_ids) or 'none'}."
+            )
         return OrchestrationDelegationContract(
             goal_id=goal.id,
             run_id=run.id,

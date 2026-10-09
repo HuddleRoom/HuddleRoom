@@ -597,7 +597,7 @@ class OrchestrationBudgetService:
         """
         owner = await self.roadmap_parent(db, goal)
         if (owner is not None and owner.id == goal.id and goal.parent_goal_id is not None
-                and str(goal.roadmap_version_id) == str(context_version_id)):
+                and goal.roadmap_version_id is not None and str(goal.roadmap_version_id) == str(context_version_id)):
             return await db.get(OrchestrationGoal, goal.parent_goal_id)
         return owner
 

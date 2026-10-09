@@ -91,7 +91,7 @@ async def _approved_roadmap(db, project, items, *, accept=True, caps=None):
     """Admit version one through the public planning and authority flow."""
     service, goal, run, planner = await _ready_roadmap(db, project)
     if caps:
-        goal.budget = run.budget_state = {"caps": caps}
+        goal.budget, run.budget_state = {"caps": dict(caps)}, {"caps": dict(caps)}
     goal.orchestrator_context = {"team": {"agent_ids": [str(agent_id) for agent_id in await db.scalars(
         select(Agent.id).where(Agent.is_active.is_(True))
     )]}}
@@ -796,6 +796,20 @@ async def _close_roadmap(db, project, service, goal, run, verifier):
     await _tick_until(db, service, run, lambda: run.status == "completed")
     await db.refresh(goal)
     assert (goal.status, run.phase) == ("completed", "completed")
+    return integration, proof
+
+
+async def _item_gates_and_evidence(db, goal, keys):
+    """Each item gate must be accepted with exactly one accepted child_goal evidence row."""
+    gates, evidence = [], []
+    for key in keys:
+        gate = await db.get(OrchestrationGate, (await _item(db, goal, key)).gate_id)
+        rows = list(await db.scalars(select(OrchestrationEvidence).where(OrchestrationEvidence.gate_id == gate.id)))
+        assert gate.status == "accepted"
+        assert [(row.source_type, row.verdict) for row in rows] == [("child_goal", "accepted")], key
+        gates.append(gate)
+        evidence.extend(rows)
+    return gates, evidence
 
 
 async def test_nested_roadmap_three_levels_releases_one_level_at_a_time(
@@ -814,7 +828,8 @@ async def test_nested_roadmap_three_levels_releases_one_level_at_a_time(
     assert len(authorizations) == 1
     build_evidence = await db.scalars(select(OrchestrationEvidence.id).where(
         OrchestrationEvidence.gate_id == n.build_row.gate_id, OrchestrationEvidence.verdict == "accepted"))
-    assert set(map(str, build_evidence)) <= set(child.orchestrator_context["eligible_evidence"]["evidence_ids"]) != set()
+    build_evidence = set(map(str, build_evidence))
+    assert build_evidence and build_evidence <= set(child.orchestrator_context["eligible_evidence"]["evidence_ids"])
     assert await _children_of(db, parent) == [child]
 
     # 2. C planned itself: no human Start, no baseline processes, the planner wrote a roadmap-kind plan.
@@ -863,23 +878,40 @@ async def test_nested_roadmap_three_levels_releases_one_level_at_a_time(
     await _tick_until(db, service, child_run, lambda: g2_row.completed_at is not None)
     assert await _children_of(db, parent) == [child]
 
-    # 6. Child gates carry evidence but satisfy no C criterion; only C's independent integration closes C.
-    assert service._criterion_evidence_manifest([g1_gate, g2_gate], g1_evidence + g2_evidence, child, str(child_version.id)) == {}
-    await _close_roadmap(db, test_project, service, child, child_run, n.verifier)
+    # Replay while C and P are still active (C's integration gate exists, nothing else is due).
+    c_version = await roadmap.current_version(db, child.id)
+    for _ in range(4):
+        await service.tick(db, child_run.id)
+        if await _integration_gate(db, roadmap, child, child_run, c_version) is not None:
+            break
+    before = await _snapshot(db, models)
+    for _ in range(2):
+        for run in (child_run, n.parent_run):
+            assert run.status == "running"
+            await service.tick(db, run.id)
+    after = await _snapshot(db, models)
+    for model, rows in before.items():
+        assert [row["id"] for row in after[model]] == [row["id"] for row in rows], model
+
+    # 6. Child gates carry evidence but satisfy no C criterion; only C's independent integration does.
+    gates, evidence = await _item_gates_and_evidence(db, child, ("g1", "g2"))
+    assert service._criterion_evidence_manifest(gates, evidence, child, str(child_version.id)) == {}
+    integration, proof = await _close_roadmap(db, test_project, service, child, child_run, n.verifier)
+    manifest = service._criterion_evidence_manifest(
+        [*gates, integration], [*evidence, proof], child, str(child_version.id))
+    assert manifest == {key: [str(proof.id)] for key in service._declared_success_criterion_keys(child)} != {}
 
     # 7. P settles C onto the area gate as one child_goal evidence row; that satisfies no P criterion.
     area_row = await _item(db, parent, "area")
     await _tick_until(db, service, n.parent_run, lambda: area_row.completed_at is not None)
-    area_gate = await db.get(OrchestrationGate, area_row.gate_id)
-    assert area_gate.status == "accepted"
-    area_evidence = list(await db.scalars(select(OrchestrationEvidence).where(
-        OrchestrationEvidence.gate_id == area_gate.id, OrchestrationEvidence.source_type == "child_goal",
-        OrchestrationEvidence.verdict == "accepted")))
-    assert len(area_evidence) == 1
-    assert service._criterion_evidence_manifest([area_gate], area_evidence, parent, str(n.version.id)) == {}
-    await _close_roadmap(db, test_project, service, parent, n.parent_run, n.verifier)
+    gates, evidence = await _item_gates_and_evidence(db, parent, ("area",))
+    assert service._criterion_evidence_manifest(gates, evidence, parent, str(n.version.id)) == {}
+    integration, proof = await _close_roadmap(db, test_project, service, parent, n.parent_run, n.verifier)
+    manifest = service._criterion_evidence_manifest(
+        [*gates, integration], [*evidence, proof], parent, str(n.version.id))
+    assert manifest == {key: [str(proof.id)] for key in service._declared_success_criterion_keys(parent)} != {}
 
-    # 8. Replaying ticks changes no durable row at any level.
+    # 8. Replaying the terminal runs changes nothing either.
     before = await _snapshot(db, models)
     for run in (child_run, n.parent_run, g1_run):
         await service.tick(db, run.id)

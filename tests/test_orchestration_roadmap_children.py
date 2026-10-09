@@ -1658,3 +1658,33 @@ async def test_nested_roadmap_own_cli_task_item_claim_keys_on_its_own_lineage(db
     session = await SessionService().create(db_session, SessionCreate(
         agent_id=agent.id, task_id=row.task_id, project_id=test_project.id))
     assert session.metadata_["_roadmap_cli_budget_approval"]["decision_id"] == str(decision.id)
+
+
+async def test_grandchild_cli_cap_authority_lands_on_the_nested_roadmap(db_session, test_project):
+    roadmap, parent, child, child_run, agent = await _released_nested_roadmap_with_cli_planner(db_session, test_project)
+    service = roadmap.orchestration
+    items = [goal_item("grand", {"max_tokens": 300, "max_turns": 2, "max_hours": 1})]
+    artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
+                        created_by_agent=agent.id, metadata_={"plan_items": items})
+    db_session.add(artifact); await db_session.flush()
+    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(items, {"max_tokens", "max_turns", "max_hours"})]
+    approval = OrchestrationAuthorityDecision(
+        goal_id=child.id, run_id=child_run.id, authority="human", title="approve", question="approve",
+        decision_key=f"roadmap_plan:{service._accepted_plan_fingerprint(normalized)}", status="answered",
+        selected_option="approve", decided_by_user_id=child.manager_user_id)
+    db_session.add(approval); await db_session.flush()
+    version = await roadmap.accept_version(
+        db_session, child, child_run, artifact, {"kind": "authority_decision", "id": str(approval.id)})
+    child_run.plan_state = {**child_run.plan_state, "status": "accepted", "accepted_artifact_id": str(artifact.id),
+                            "roadmap_version_id": str(version.id), "roadmap_version": version.version,
+                            "accepted_plan_fingerprint": version.fingerprint}
+    await roadmap.advance(db_session, child, child_run)
+    grand = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == child.id))
+    grand_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == grand.id))
+    context = {"roadmap": {"roadmap_version_id": str(version.id), "roadmap_item_key": "grand"}}
+
+    assert (await service.roadmap_pre_release_authority(db_session, grand_run.id, agent, context))["status"] == "pending"
+    decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_budget_adapter:%:grand:%:cli:max_tokens")))
+    assert (decision.goal_id, decision.run_id) == (child.id, child_run.id)
+    assert decision.decision_key.startswith(f"roadmap_budget_adapter:{version.id}:grand:")
