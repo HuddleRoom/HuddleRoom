@@ -16,7 +16,8 @@ from huddleroom.models.artifact import Artifact
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationBudgetReservation, OrchestrationEvidence, OrchestrationGate,
-    OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRun, compute_goal_contract_fingerprint,
+    OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRoadmapVersion, OrchestrationRun,
+    compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
@@ -388,7 +389,8 @@ async def test_child_delta_rejects_conflicting_parent_constraint(db_session, tes
         assert not writer.in_transaction()
     persisted_run = await reader.get(OrchestrationRun, run_id)
     assert [x for x in persisted_run.active_blockers if x["kind"] == "child_contract"] == [{
-        "kind": "child_contract", "item_key": "child", "reason": "Child constraint conflicts with parent: region",
+        "kind": "child_contract", "item_key": "child", "roadmap_version_id": str(version.id),
+        "reason": "Child constraint conflicts with parent: region",
     }]
     for model, condition in [
         (OrchestrationRoadmapItem, OrchestrationRoadmapItem.goal_id == parent_id),
@@ -1231,6 +1233,52 @@ async def test_auto_child_resolving_to_continuous_is_blocked_without_rows(db_ses
     assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
 
 
+async def test_auto_child_classifier_runs_after_the_tick_releases_its_writer(
+    db_session, test_project, concurrent_sessions, committed_roadmap_cleanup,
+):
+    item = {**goal_item(), "goal_type": "auto"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    parent_id, run_id = parent.id, run.id
+    await db_session.commit()
+    writer, reader = concurrent_sessions
+    in_transaction = []
+
+    async def classify(self, project_id, data):
+        in_transaction.append(writer.in_transaction())
+        return _shape("outcome", "delivery")
+
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        result = await roadmap.orchestration.tick(writer, run_id)
+    assert result["authorized_execution"] == {"step": "release_item", "item_key": "child", "unit_type": "goal"}
+    assert in_transaction == [False]  # the tick committed before the model round trip
+    child = await reader.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent_id))
+    assert (child.goal_type, child.goal_type_source) == ("outcome", "parent_auto")
+    assert await reader.scalar(select(func.count()).select_from(OrchestrationBudgetReservation).where(  # pylint: disable=not-callable
+        OrchestrationBudgetReservation.parent_goal_id == parent_id)) == 1
+
+
+async def test_rejected_auto_child_is_not_reclassified_until_a_new_version(db_session, test_project):
+    calls = []
+
+    async def classify(self, project_id, data):
+        calls.append(data)
+        return _shape("continuous", "continuous_policy")
+
+    item = {**goal_item(), "goal_type": "auto"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        for _ in range(3):
+            await roadmap.orchestration.tick(db_session, run.id)
+    assert len(calls) == 1
+    blocker, = [b for b in run.active_blockers if b["kind"] == "child_contract"]
+    assert blocker["roadmap_version_id"] == str(version.id) and blocker["item_key"] == "child"
+    assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
+    run.active_blockers = [{**blocker, "roadmap_version_id": str(uuid.uuid4())}]  # as if a new version was accepted
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        await roadmap.advance(db_session, parent, run)
+    assert len(calls) == 2  # stale blocker cleared, item re-classified under the current version
+
+
 async def test_continuous_child_item_is_rejected_with_reason():
     with pytest.raises(HTTPException) as exc:
         parse_roadmap_items([{**goal_item(), "goal_type": "continuous"}], {"max_tokens", "max_turns", "max_hours"})
@@ -1292,6 +1340,18 @@ async def test_release_beyond_depth_limit_is_rejected_with_no_rows(db_session, t
     assert blocker["required_decision"] == "request_roadmap_replan" and "max_goal_depth 0" in blocker["reason"]
 
 
+async def test_tick_rejects_over_depth_mutable_goal_item_before_any_authority_decision(db_session, test_project):
+    item = {**goal_item(), "mutates_shared_state": True}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    parent.orchestrator_context = _policy(max_goal_depth=0)
+    decisions = await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision))  # pylint: disable=not-callable
+    await roadmap.orchestration.tick(db_session, run.id)
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision)) == decisions  # pylint: disable=not-callable
+    assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
+    blocker, = [b for b in run.active_blockers if b["kind"] == "expansion_limit"]
+    assert blocker["item_key"] == "child" and "max_goal_depth 0" in blocker["reason"]
+
+
 async def test_release_beyond_descendant_limit_is_rejected_after_the_first_child(db_session, test_project):
     small = {"max_tokens": 300, "max_turns": 1, "max_hours": 1}
     roadmap, parent, run, version = await accepted_goal_roadmap(
@@ -1347,23 +1407,38 @@ async def test_stale_expansion_limit_blocker_is_cleared_for_a_new_version(db_ses
 
 # --- nested budget: a child reservation carries its whole subtree ---
 
-NESTED_ITEM = goal_item("child", {"max_tokens": 800, "max_turns": 5, "max_hours": 5})
+NESTED_ITEM = {**goal_item("child", {"max_tokens": 800, "max_turns": 5, "max_hours": 5}), "goal_type": "roadmap"}
 
 
 async def _nested_child(db, project, *grand):
-    """Release roadmap child C and give it grandchild reservations: (settled_tokens | None for active, allocation)."""
+    """Release Roadmap child C and give it roadmap-item grandchildren: (settled_tokens | None for active, allocation)."""
     _, parent, run, _, row = await release(db, project, NESTED_ITEM)
     child = await db.get(OrchestrationGoal, row.child_goal_id)
+    assert child.goal_type == "roadmap"
     child_run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    plan = Artifact(project_id=project.id, name="c-plan", artifact_type="plan", status="draft")
+    db.add(plan); await db.flush()
+    child_version = OrchestrationRoadmapVersion(
+        goal_id=child.id, run_id=child_run.id, version=1, plan_artifact_id=plan.id,
+        snapshot={"schema_version": 1, "items": []}, fingerprint="c" * 64, approval_reference={},
+    )
+    db.add(child_version); await db.flush()
     for index, (settled, tokens, complete) in enumerate(grand):
         grandchild = OrchestrationGoal(
             project_id=project.id, parent_goal_id=child.id, objective=f"g{index}", original_request=f"g{index}",
             success_criteria=[], constraints={}, budget={}, goal_type="outcome", status="active",
-            continuous_origin_key=f"g{index}", parent_contract_snapshot={}, goal_delta={},
+            roadmap_version_id=child_version.id, roadmap_item_key=f"g{index}", parent_contract_snapshot={}, goal_delta={},
         )
-        db.add(grandchild); await db.flush()
+        gate = OrchestrationGate(run_id=child_run.id, success_criterion_key=f"roadmap_item:g{index}",
+                                 gate_type="child_goal_completed", required_evidence={})
+        db.add_all([grandchild, gate]); await db.flush()
+        lineage = OrchestrationRoadmapItem(
+            goal_id=child.id, first_version_id=child_version.id, item_key=f"g{index}", unit_type="goal",
+            item_snapshot={}, child_goal_id=grandchild.id, gate_id=gate.id,
+        )
+        db.add(lineage); await db.flush()
         reservation = OrchestrationBudgetReservation(
-            parent_goal_id=child.id, child_goal_id=grandchild.id, continuous_origin_key=f"g{index}",
+            parent_goal_id=child.id, child_goal_id=grandchild.id, roadmap_item_id=lineage.id,
             allocation={"max_tokens": str(tokens), "max_turns": "1", "max_hours": "1"},
         )
         if settled is not None:

@@ -746,6 +746,26 @@ class OrchestrationService:
         await nested.commit()
         return decision
 
+    @staticmethod
+    async def _commit_tick_owned_transaction(db: AsyncSession) -> bool:
+        """Release a tick-owned SQLite writer before a model round trip; True when committed."""
+        # A tick-owned SQLite write transaction must release the sole writer
+        # before isolated sessions read decision context and write the result.
+        if (
+            db.info.get("orchestration_tick_owns_transaction")
+            and db.bind is not None
+            and db.bind.dialect.name == "sqlite"
+        ):
+            transaction = db.sync_session.get_transaction()
+            if (
+                transaction is not None
+                and transaction.origin == SessionTransactionOrigin.AUTOBEGIN
+                and not db.in_nested_transaction()
+            ):
+                await db.commit()
+                return True
+        return False
+
     async def request_llm_decision(
         self,
         db: AsyncSession,
@@ -774,20 +794,7 @@ class OrchestrationService:
         project_ctx = None
         goal_ctx = None
         context = None
-        # A tick-owned SQLite write transaction must release the sole writer
-        # before isolated sessions read decision context and write the result.
-        if (
-            db.info.get("orchestration_tick_owns_transaction")
-            and db.bind is not None
-            and db.bind.dialect.name == "sqlite"
-        ):
-            transaction = db.sync_session.get_transaction()
-            if (
-                transaction is not None
-                and transaction.origin == SessionTransactionOrigin.AUTOBEGIN
-                and not db.in_nested_transaction()
-            ):
-                await db.commit()
+        await self._commit_tick_owned_transaction(db)
         async with AsyncSessionLocal() as read_db:
             caller_bind = db.get_bind()
             factory_bind = read_db.get_bind()

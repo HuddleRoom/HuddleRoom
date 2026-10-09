@@ -172,11 +172,20 @@ class OrchestrationRoadmapService:
             "planning_rationale": explicit_planning_rationale(item.goal_type),
         }
 
-    async def _child_expansion_context(self, db, goal, item) -> dict:
-        root, depth, limits = await expansion_scope(db, goal)
+    async def _require_expansion_limits(self, db, goal, items) -> None:
+        released = set(await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
+            OrchestrationRoadmapItem.goal_id == goal.id
+        )))
+        reason = await self._expansion_limit_error(db, goal, sum(
+            1 for item in items if item.unit_type == "goal" and item.item_key not in released
+        ))
+        if reason is not None:
+            raise HTTPException(status_code=409, detail=reason)
+
+    async def _child_expansion_context(self, db, goal, item, root, depth, limits, existing) -> dict:
         context = {"expansion_policy": {
             **limits, "depth": depth + 1, "root_goal_id": str(root.id),
-            "remaining_descendant_goals": limits["max_descendant_goals"] - (await descendant_count(db, root.id) + 1),
+            "remaining_descendant_goals": limits["max_descendant_goals"] - (existing + 1),
         }}
         evidence_ids = list(await db.scalars(select(OrchestrationEvidence.id).join(
             OrchestrationRoadmapItem, OrchestrationRoadmapItem.gate_id == OrchestrationEvidence.gate_id,
@@ -339,14 +348,7 @@ class OrchestrationRoadmapService:
 
     async def ensure_plan_approval(self, db, goal, run, artifact):
         items = self.parse_items(artifact, goal)
-        released = set(await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
-            OrchestrationRoadmapItem.goal_id == goal.id
-        )))
-        reason = await self._expansion_limit_error(db, goal, sum(
-            1 for item in items if item.unit_type == "goal" and item.item_key not in released
-        ))
-        if reason is not None:
-            raise HTTPException(status_code=409, detail=reason)
+        await self._require_expansion_limits(db, goal, items)
         fingerprint = self.orchestration._accepted_plan_fingerprint(
             [item.model_dump(mode="json") for item in items]
         )
@@ -567,6 +569,8 @@ class OrchestrationRoadmapService:
             raise HTTPException(status_code=409, detail="Roadmap child allocation exceeds remaining parent budget")
 
     async def _require_expansion_approval(self, db, goal, run, previous, items, fingerprint):
+        # Limit rejection precedes any expansion authority decision.
+        await self._require_expansion_limits(db, goal, items)
         prior = {item["item_key"]: item for item in previous.snapshot["items"]}
         expansion = any(
             item.unit_type == "goal" and item.item_key not in prior
@@ -771,6 +775,8 @@ class OrchestrationRoadmapService:
             if item.mutates_shared_state and await self._mutable_item_active(db, goal.id):
                 continue
             if item.mutates_shared_state and await self._requires_mutation_authority(db, goal, version, item):
+                if item.unit_type == "goal" and await self._expansion_limit_error(db, goal, 1):
+                    return item  # release_goal_item records the expansion_limit blocker before any authority
                 authority = await self._mutation_authority(db, goal, run, version, item)
                 if authority.status == "answered" and authority.selected_option == "reject":
                     return None
@@ -1016,7 +1022,7 @@ class OrchestrationRoadmapService:
                if self._workspace_binding(version, item) else {}),
         }
 
-    async def release_goal_item(self, db, goal, run, version, item):
+    async def release_goal_item(self, db, goal, run, version, item, shape=None):
         existing = await db.scalar(select(OrchestrationRoadmapItem).where(
             OrchestrationRoadmapItem.goal_id == goal.id,
             OrchestrationRoadmapItem.item_key == item.item_key,
@@ -1029,7 +1035,9 @@ class OrchestrationRoadmapService:
                 raise HTTPException(status_code=409, detail="Roadmap child reservation is missing")
             return {"step": "release_item", "item_key": item.item_key, "unit_type": "goal"}
         # ponytail: backstop for cousin races and legacy versions, mirrors child_contract; T13 root lock removes the race
-        reason = await self._expansion_limit_error(db, goal, 1)
+        root, depth, limits = await expansion_scope(db, goal)
+        existing_descendants = await descendant_count(db, root.id)
+        reason = expansion_limit_error(depth, existing_descendants, 1, limits)
         if reason is not None:
             self.orchestration._upsert_active_blocker(run, {
                 "kind": "expansion_limit", "item_key": item.item_key, "roadmap_version_id": str(version.id),
@@ -1040,7 +1048,7 @@ class OrchestrationRoadmapService:
         for key, value in item.constraints.items():
             if key in goal.constraints and goal.constraints[key] != value:
                 self.orchestration._upsert_active_blocker(run, {
-                    "kind": "child_contract", "item_key": item.item_key,
+                    "kind": "child_contract", "item_key": item.item_key, "roadmap_version_id": str(version.id),
                     "reason": f"Child constraint conflicts with parent: {key}",
                 })
                 await db.flush()
@@ -1058,16 +1066,39 @@ class OrchestrationRoadmapService:
             await ProjectService().require_frozen_roadmap_workspace(
                 db, goal.project_id, binding["boundary"], binding["path"]
             )
-        try:
-            shape = await self._child_shape(goal, item)
-        except GoalShapeResolutionError as exc:
-            return {"step": "waiting", "reason": f"child_shape_{exc.reason}"}
-        except ChildShapeRejected as exc:
-            self.orchestration._upsert_active_blocker(run, {
-                "kind": "child_contract", "item_key": item.item_key, "reason": str(exc),
-            })
-            await db.flush()
-            return {"step": "needs_attention"}
+        if shape is None:
+            auto = item.goal_type == "auto"
+            if auto and any(
+                isinstance(blocker, dict) and blocker.get("kind") == "child_contract"
+                and blocker.get("item_key") == item.item_key and blocker.get("roadmap_version_id") == str(version.id)
+                and str(blocker.get("reason", "")).startswith("continuous_child_requires_continuous_root")
+                for blocker in run.active_blockers
+            ):
+                return {"step": "needs_attention"}  # already rejected for this version; no re-classification
+            # The classifier is a model round trip: release a tick-owned writer first (as request_llm_decision does).
+            committed = auto and await self.orchestration._commit_tick_owned_transaction(db)
+            try:
+                shape = await self._child_shape(goal, item)
+            except GoalShapeResolutionError as exc:
+                return {"step": "waiting", "reason": f"child_shape_{exc.reason}"}
+            except ChildShapeRejected as exc:
+                if committed:
+                    await db.refresh(run)
+                self.orchestration._upsert_active_blocker(run, {
+                    "kind": "child_contract", "item_key": item.item_key, "roadmap_version_id": str(version.id),
+                    "reason": str(exc),
+                })
+                await db.flush()
+                return {"step": "needs_attention"}
+            if committed:
+                from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES
+                # Other writers may have moved while the writer was released: re-read and re-run every check.
+                await db.refresh(goal)
+                await db.refresh(run)
+                current = await self.current_version(db, goal.id)
+                if run.status not in LLM_DECISION_RUN_STATUSES or current is None or current.id != version.id:
+                    return {"step": "waiting", "reason": "child_shape_state_changed"}
+                return await self.release_goal_item(db, goal, run, version, item, shape=shape)
         release = await self.orchestration.reserve_action(
             db, run.id, f"run:{run.id}:kind:release_roadmap_item:{item.item_key}",
             "release_roadmap_item", {"item_key": item.item_key, "unit_type": "goal"},
@@ -1092,7 +1123,9 @@ class OrchestrationRoadmapService:
                                     **({"unstaged_authority_decision_id": str(authority.id)} if unstaged else {})},
                         "team": deepcopy(snapshot["team"]),
                         "workspace_policy": deepcopy(snapshot["workspace_policy"]),
-                        **await self._child_expansion_context(db, goal, item),
+                        **await self._child_expansion_context(
+                            db, goal, item, root, depth, limits, existing_descendants,
+                        ),
                     }, **shape,
                     parent_goal_id=goal.id, roadmap_version_id=version.id, roadmap_item_key=item.item_key,
                     parent_contract_snapshot=snapshot,
@@ -1177,7 +1210,7 @@ class OrchestrationRoadmapService:
         )]
         run.active_blockers = [blocker for blocker in run.active_blockers if not (
             isinstance(blocker, dict)
-            and blocker.get("kind") == "expansion_limit"
+            and blocker.get("kind") in ("expansion_limit", "child_contract")
             and blocker.get("roadmap_version_id") != str(version.id)
         )]
         if any(self.orchestration._has_active_blocker(run, kind) for kind in (

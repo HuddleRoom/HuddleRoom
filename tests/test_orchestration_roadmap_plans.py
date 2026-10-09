@@ -1695,6 +1695,30 @@ async def test_advance_turns_expansion_limit_into_plan_revision(db_session, test
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
 
 
+async def test_replan_over_the_descendant_limit_is_rejected_before_expansion_authority(
+    db_session, test_project, test_user,
+):
+    base = _roadmap_goal("a", allocation=_SMALL)
+    service, goal, run, artifact = await _accept_version_one(
+        db_session, test_project, test_user, items=[base], budget=_BUDGET, authority_model="agent_manager",
+    )
+    goal.orchestrator_context = {**goal.orchestrator_context, "expansion_policy": {"max_descendant_goals": 1, "depth": 0}}
+    _, candidate = await _replan_artifact(
+        db_session, test_project, service, goal, run, artifact, [base, _roadmap_goal("new", allocation=_SMALL)],
+    )
+    with pytest.raises(HTTPException) as exc:
+        await service.execute_accept_plan_action(
+            db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)},
+            f"run:{run.id}:kind:over-limit-replan",
+        )
+    assert exc.value.status_code == 409 and "2 descendant goals exceed max_descendant_goals 1" in exc.value.detail
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision).where(  # pylint: disable=not-callable
+        OrchestrationAuthorityDecision.run_id == run.id,
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_expansion:%"),
+    )) == 0
+    assert (await OrchestrationRoadmapService(service).current_version(db_session, goal.id)).version == 1
+
+
 async def test_replan_rejects_changing_released_child_goal_type(db_session, test_project, test_user):
     original = {**_roadmap_goal("a", allocation=_SMALL), "goal_type": "outcome"}
     service, goal, run, artifact = await _accept_version_one(
