@@ -141,6 +141,18 @@ async def test_delegation_lineage_contract_keys(db_session, test_project, test_a
 
 
 @pytest.mark.asyncio
+async def test_roadmap_replan_task_lineage_is_valid(db_session, test_project, test_agent):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, _, action, task, session = await _owned(db_session, test_project, test_agent)
+    action.action_type = "request_roadmap_replan"
+    action.request = {}
+    action.target_type, action.target_id = "task", task.id
+    action.dispatch_contract = {}
+
+    assert await orchestration_lineage_state(db_session, session) is True
+
+
+@pytest.mark.asyncio
 async def test_pending_session_with_invalid_lineage_fails_immediately(db_session, test_project, test_agent, monkeypatch):
     _, _, action, task, session = await _owned(
         db_session, test_project, test_agent, session_status="pending", task_status="in_progress",

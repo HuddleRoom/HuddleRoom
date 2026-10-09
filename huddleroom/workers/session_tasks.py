@@ -17,7 +17,9 @@ from huddleroom.services.session_sync import sync_task_from_session
 
 logger = logging.getLogger(__name__)
 
-_TASK_DISPATCH_ACTIONS = frozenset(("create_delegation_task", "request_plan", "request_plan_revision"))
+_TASK_DISPATCH_ACTIONS = frozenset((
+    "create_delegation_task", "request_plan", "request_plan_revision", "request_roadmap_replan",
+))
 _RECOVERY_DISPATCH_ACTIONS = frozenset(("retry_task", "reassign_task"))
 
 
