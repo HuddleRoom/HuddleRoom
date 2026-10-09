@@ -49,6 +49,7 @@ class ProgressSituation:
     progress_view: list[dict] = field(default_factory=list)
     untracked_follow_ups: list[dict] = field(default_factory=list)
     untracked_follow_ups_total: int = 0
+    plan_items: list[dict] = field(default_factory=list)
     error: bool = False
 
     def as_context(self) -> dict[str, Any]:
@@ -57,9 +58,56 @@ class ProgressSituation:
             "untracked_follow_ups": self.untracked_follow_ups,
             "untracked_follow_ups_total": self.untracked_follow_ups_total,
         }
+        if self.plan_items:
+            context["plan_items"] = self.plan_items
         if self.error:
             context["progress_view_error"] = True
         return context
+
+
+def plan_item_state(released: bool, task_status: str | None, gate_status: str | None) -> str:
+    """One plan item's state; `accepted` comes only from its gate, never from a done task."""
+    if not released:
+        return "queued"
+    if task_status == "cancelled":
+        return "cancelled"
+    if gate_status == "accepted":
+        return "accepted"
+    if gate_status == "failed" or task_status == "failed":
+        return "failed"
+    if task_status == "backlog":
+        return "queued"
+    if task_status == "done":
+        return "evidence_pending"
+    return "started"
+
+
+def _plan_items(run: OrchestrationRun, tasks: list[Task], gates: list[OrchestrationGate]) -> list[dict]:
+    state = run.plan_state if isinstance(run.plan_state, dict) else {}
+    if state.get("status") != "accepted":
+        return []
+    snapshot = state.get("accepted_plan_snapshot")
+    items = snapshot.get("items") if isinstance(snapshot, dict) else None
+    expanded = state.get("expanded_items")
+    entries = {
+        e["plan_item_id"]: e for e in expanded if isinstance(e, dict) and isinstance(e.get("plan_item_id"), str)
+    } if isinstance(expanded, list) else {}
+    task_by_id = {str(t.id): t for t in tasks}
+    gate_by_id = {str(g.id): g for g in gates}
+    result = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        entry = entries.get(item["id"])
+        task = task_by_id.get(str(entry.get("task_id"))) if entry else None
+        gate = gate_by_id.get(str(entry.get("gate_id"))) if entry else None
+        result.append({
+            "item_id": item["id"],
+            "task_id": str(entry["task_id"]) if entry and entry.get("task_id") else None,
+            "adopted": bool(entry and entry.get("adopted")),
+            "state": plan_item_state(entry is not None, task.status if task else None, gate.status if gate else None),
+        })
+    return result
 
 
 def _criteria(goal: OrchestrationGoal) -> list[tuple[str, str]]:
@@ -451,6 +499,7 @@ class OrchestrationProgressView:
             progress_view=entries,
             untracked_follow_ups=[item for *_, item in _select_follow_ups(untracked)],
             untracked_follow_ups_total=len(untracked),
+            plan_items=_plan_items(run, tasks, gates),
         )
 
     async def build_safe(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> ProgressSituation:

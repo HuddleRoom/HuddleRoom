@@ -20,6 +20,7 @@ from huddleroom.services.orchestration_progress_view import (
     ACTIVE_TASK_STATUSES,
     OrchestrationProgressView,
     ProgressSituation,
+    plan_item_state,
 )
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
 
@@ -970,3 +971,52 @@ async def test_stalled_representative_prefers_item_with_suggested_actions(db_ses
     await db_session.flush()
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     assert [f["id"] for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"] == [str(failed.id)]
+
+
+@pytest.mark.parametrize("args,expected", [
+    ((False, "done", "accepted"), "queued"),
+    ((True, "cancelled", "accepted"), "cancelled"),
+    ((True, "done", "accepted"), "accepted"),
+    ((True, "in_progress", "failed"), "failed"),
+    ((True, "failed", "open"), "failed"),
+    ((True, "backlog", "open"), "queued"),
+    ((True, "done", "open"), "evidence_pending"),
+    ((True, "done", None), "evidence_pending"),
+    ((True, "ready", "open"), "started"),
+    ((True, "blocked", "open"), "started"),
+    ((True, "in_progress", "open"), "started"),
+])
+async def test_plan_item_state_table(args, expected):
+    assert plan_item_state(*args) == expected
+
+
+@pytest.mark.parametrize("task_status,gate_status,expected", [
+    ("backlog", "open", "queued"),
+    ("in_progress", "open", "started"),
+    ("done", "open", "evidence_pending"),
+    ("done", "accepted", "accepted"),
+    ("failed", "open", "failed"),
+    ("cancelled", "open", "cancelled"),
+])
+async def test_build_plan_items_state_per_item(db_session, test_project, task_status, gate_status, expected):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "c1", "description": "d"}])
+    task = await _task(db_session, test_project, run, status=task_status)
+    gate = await _gate(db_session, run, "c1", status=gate_status)
+    run.plan_state = {
+        "status": "accepted",
+        "accepted_plan_snapshot": {"items": [{"id": "a"}, {"id": "b"}]},
+        "expanded_items": [{"plan_item_id": "a", "task_id": str(task.id), "gate_id": str(gate.id), "adopted": True}],
+    }
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.plan_items == [
+        {"item_id": "a", "task_id": str(task.id), "adopted": True, "state": expected},
+        {"item_id": "b", "task_id": None, "adopted": False, "state": "queued"},
+    ]
+    assert situation.as_context()["plan_items"] == situation.plan_items
+
+
+async def test_plan_items_omitted_from_context_when_empty(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [])
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.plan_items == []
+    assert "plan_items" not in situation.as_context()
