@@ -1820,3 +1820,97 @@ def test_knowledge_search_request_has_no_tags_field():
         "KnowledgeSearchRequest.tags is silently ignored by the search service. "
         "Remove it until tag filtering is implemented."
     )
+
+
+# --- Adapter prompt coverage for the shared delegation contract (mocked; no live model) ---
+
+def _prompt_contract(**kw):
+    from huddleroom.schemas.orchestration import AuthorizationScope, OrchestrationDelegationContract
+
+    ids = dict(dep=uuid.uuid4(), art=uuid.uuid4())
+    base = dict(
+        goal_id=uuid.uuid4(), run_id=uuid.uuid4(), action_id=uuid.uuid4(), agent_id=uuid.uuid4(),
+        work_function="build", scope="the scope", deliverable="the deliverable",
+        why_runnable="deps accepted", depends_on=[ids["dep"]], artifact_ids=[ids["art"]],
+        forbidden_work=["no deploys"], success_evidence=["tests green"],
+        authorization_scope=AuthorizationScope(workspace_mutation="staged"),
+    )
+    return OrchestrationDelegationContract(**{**base, **kw}), ids
+
+
+def _prompt_description(**kw):
+    from types import SimpleNamespace
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    goal = SimpleNamespace(
+        objective="Ship it", orchestrator_context={}, success_criteria=[], goal_type="outcome", planning_mode=None,
+    )
+    contract, ids = _prompt_contract(**kw)
+    return OrchestrationService._delegation_task_description(goal, contract), ids
+
+
+def _assert_full_contract_prompt(text: str, ids: dict) -> None:
+    import json
+    from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
+
+    for expected in (
+        "Scope: the scope", "Why runnable: deps accepted", f"- {ids['dep']}", f"- {ids['art']}",
+        "- no deploys", "- tests green", "Authorization scope:", "- Workspace mutation: staged",
+        "- Model spend: not allowed", json.dumps(CANONICAL_WORK_REPORT_SCHEMA, indent=2),
+        "do not register Artifacts",
+    ):
+        assert expected in text
+
+
+def _assert_planning_prompt(text: str) -> None:
+    import json
+    from huddleroom.schemas.orchestration import planning_envelope_report_schema
+
+    assert json.dumps(planning_envelope_report_schema("implementation"), indent=2) in text
+    assert "artifact_id\"" not in text
+    assert "do not register Artifacts" in text
+
+
+def test_cli_adapter_prompt_carries_full_contract():
+    from types import SimpleNamespace
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    description, ids = _prompt_description()
+    task = SimpleNamespace(title="T", description=description, id=uuid.uuid4(), project_id=uuid.uuid4())
+    agent = SimpleNamespace(name="dev", role="developer", system_prompt=None)
+    _assert_full_contract_prompt(CliAdapter._compose_task_content(task, agent, uuid.uuid4()), ids)
+
+
+def test_cli_adapter_prompt_renders_planning_envelope():
+    from types import SimpleNamespace
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    description, _ = _prompt_description(work_function="planning", report_schema={"plan_kind": "implementation"})
+    task = SimpleNamespace(title="T", description=description, id=uuid.uuid4(), project_id=uuid.uuid4())
+    agent = SimpleNamespace(name="dev", role="developer", system_prompt=None)
+    _assert_planning_prompt(CliAdapter._compose_task_content(task, agent, uuid.uuid4()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("planning", [False, True])
+async def test_api_adapter_prompt_carries_contract(db_session, test_project, planning):
+    from huddleroom.adapters.api_adapter import ApiAdapter
+
+    kw = dict(work_function="planning", report_schema={"plan_kind": "implementation"}) if planning else {}
+    description, ids = _prompt_description(**kw)
+    agent = Agent(
+        name=f"api-agent-{uuid.uuid4()}", role="developer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={"memory_enabled": True},
+    )
+    db_session.add(agent)
+    task = Task(title="T", description=description, project_id=test_project.id, status="in_progress")
+    db_session.add(task)
+    await db_session.flush()
+
+    with patch("huddleroom.adapters.api_adapter.memory_service_instance.search", new_callable=AsyncMock, return_value=[]):
+        _, task_ctx, _, _ = await ApiAdapter()._build_messages(agent, task, db_session)
+
+    if planning:
+        _assert_planning_prompt(task_ctx)
+    else:
+        _assert_full_contract_prompt(task_ctx, ids)
