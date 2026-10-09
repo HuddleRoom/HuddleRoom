@@ -14,8 +14,9 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.models.graph import Graph, GraphRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.services.orchestration_dependencies import dependency_ids
 from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
-from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+from huddleroom.services.orchestration_progress_view import ACTIVE_TASK_STATUSES, OrchestrationProgressView
 from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
 from huddleroom.services.orchestration_steering import OrchestrationSteeringService
 
@@ -38,6 +39,39 @@ def _value(value):
 _TIMESTAMPS_FULL = ("created_at", "updated_at", "started_at", "completed_at")
 
 
+REPORT_LIST_LIMIT = 3
+REPORT_STRING_LIMIT = 300
+
+
+def _capped(value):
+    if isinstance(value, str):
+        return value[:REPORT_STRING_LIMIT]
+    if isinstance(value, list):
+        return [_capped(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _capped(v) for k, v in value.items()}
+    return value
+
+
+def concise_report(report: dict) -> dict:
+    """Planner-facing summary of a consumed work report; the full report stays in the marker, Details and fingerprint."""
+    concise = {
+        key: _capped(report[key])
+        for key in ("status", "next_step", "collaboration_need", "criterion_progress", "open_questions")
+        if key in report
+    }
+    truncated = {}
+    for key in ("changes", "evidence", "decisions", "risks"):
+        items = report.get(key)
+        if isinstance(items, list):
+            concise[key] = _capped(items[:REPORT_LIST_LIMIT])
+            if len(items) > REPORT_LIST_LIMIT:
+                truncated[key] = len(items)
+    if truncated:
+        concise["truncated"] = truncated
+    return concise
+
+
 def _row(row, *fields):
     return {field: _value(getattr(row, field)) for field in fields}
 
@@ -45,7 +79,9 @@ def _row(row, *fields):
 class OrchestrationSupervisionContextBuilder:
     """A deterministic, durable-only snapshot for orchestration decisions."""
 
-    async def build(self, db: AsyncSession, goal, run: OrchestrationRun, *, body_limit: int | None = 1000) -> dict:
+    async def build(
+        self, db: AsyncSession, goal, run: OrchestrationRun, *, body_limit: int | None = 1000, full_reports: bool = False,
+    ) -> dict:
         if run.goal_id != goal.id:
             raise ValueError("orchestration run does not belong to goal")
         actions = list((await db.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == run.id).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all())
@@ -55,6 +91,8 @@ class OrchestrationSupervisionContextBuilder:
             Task.project_id == goal.project_id,
         ).order_by(Task.created_at, Task.id))).all())
         task_ids = [row.id for row in tasks]
+        # Reports of unfinished work's dependencies are disclosed in full; every other report is summarized.
+        required = {str(d) for task in tasks if task.status in ACTIVE_TASK_STATUSES for d in dependency_ids(task)}
         sessions = list((await db.scalars(select(Session).where(
             Session.task_id.in_(task_ids) if task_ids else False,
             Session.project_id == goal.project_id,
@@ -93,7 +131,7 @@ class OrchestrationSupervisionContextBuilder:
             "goal": _row(goal, "id", "objective", "status", "goal_type", "success_criteria", "constraints"),
             "run": _row(run, "id", "goal_id", "status", "phase", "plan_state", "budget_state", "active_blockers"),
             "contracts": [{"action_id": str(row.id), "status": row.status, "contract": deepcopy(row.dispatch_contract)} for row in actions if row.dispatch_contract],
-            "actions": [_row(row, "id", "action_type", "status", "request", "dispatch_contract", "budget_ledger", "error", "created_at", "updated_at") for row in actions],
+            "actions": [self._action_row(row, required, full_reports) for row in actions],
             "tasks": [_row(row, "id", "title", "status", "assigned_to", "depends_on", "metadata_", *_TIMESTAMPS_FULL) for row in tasks],
             "sessions": [_row(row, "id", "task_id", "agent_id", "status", "error", "origin", "created_at", "started_at") for row in sessions],
             "meetings": [_row(row, "id", "source_task_id", "title", "status", "meeting_type", "created_at", "updated_at") for row in meetings],
@@ -122,13 +160,24 @@ class OrchestrationSupervisionContextBuilder:
         snapshot["roster"] = await OrchestrationRosterMapper().context_snapshot(db, goal.project_id)
         return snapshot
 
+    @staticmethod
+    def _action_row(row, required: set[str], full_reports: bool) -> dict:
+        out = _row(row, "id", "action_type", "status", "request", "dispatch_contract", "budget_ledger", "error", "created_at", "updated_at")
+        request = out["request"]
+        if (
+            not full_reports and row.action_type == "report_consumed" and isinstance(request, dict)
+            and isinstance(request.get("report"), dict) and str(request.get("task_id")) not in required
+        ):
+            out["request"] = {**request, "report": concise_report(request["report"])}
+        return out
+
     async def build_for_provider(self, db: AsyncSession, goal, run: OrchestrationRun, *, string_limit: int = 4000) -> dict:
         """Bound model input without mutating the complete durable snapshot."""
         return self.provider_snapshot(await self.build(db, goal, run, body_limit=None), string_limit=string_limit)
 
     async def fingerprint(self, db: AsyncSession, goal, run: OrchestrationRun) -> str:
         """Fingerprint the full state; truncation is only a provider transport concern."""
-        return self.fingerprint_snapshot(await self.build(db, goal, run, body_limit=None))
+        return self.fingerprint_snapshot(await self.build(db, goal, run, body_limit=None, full_reports=True))
 
     @staticmethod
     def fingerprint_snapshot(snapshot: dict) -> str:

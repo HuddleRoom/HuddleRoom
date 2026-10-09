@@ -2120,7 +2120,9 @@ class OrchestrationService:
 
             pre_plan_tasks = await self._pre_plan_tasks(db, run)
             planning_version = int(self._json_object_or_empty(run.plan_state).get("planning_version") or 0) + 1
-            contract = self._planning_contract(goal, run, action, stored_request, pre_plan_tasks=pre_plan_tasks)
+            contract = self._planning_contract(
+                goal, run, action, stored_request, pre_plan_lines=await self._pre_plan_lines(db, run, pre_plan_tasks)
+            )
             task = await TaskService().create(
                 db,
                 project_id,
@@ -5681,7 +5683,7 @@ class OrchestrationService:
         run: OrchestrationRun,
         action: OrchestrationAction,
         request: Mapping[str, Any],
-        pre_plan_tasks: Sequence[Task] = (),
+        pre_plan_lines: Sequence[str] = (),
     ) -> OrchestrationDelegationContract:
         from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 
@@ -5696,13 +5698,10 @@ class OrchestrationService:
         )
         plan_state = self._json_object_or_empty(run.plan_state)
         extra_inputs = []
-        if pre_plan_tasks:
+        if pre_plan_lines:
             extra_inputs.append(
                 "Existing run work — adopt each via adopt_task_id or say in summary why it is not used:\n"
-                + "\n".join(
-                    f"{pre.id} | {self._task_work_function(pre)} | {pre.status} | {pre.title}"
-                    for pre in pre_plan_tasks
-                )
+                + "\n".join(pre_plan_lines)
             )
         if plan_state.get("status") in {"revision_requested", "revision_required"}:
             extra_inputs.extend(
@@ -9196,6 +9195,25 @@ class OrchestrationService:
                 }
                 task.metadata_ = metadata
         return 1
+
+    async def _pre_plan_lines(self, db: AsyncSession, run: OrchestrationRun, tasks: Sequence[Task]) -> list[str]:
+        """One planner-facing line per pre-plan task: id | function | status | gate | title [| report: status: next step]."""
+        from huddleroom.services.orchestration_work_report import persisted_report_validation
+
+        lines = []
+        for pre in tasks:
+            gate_ref = await self._task_gate_for_run(db, run.id, pre)
+            marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{pre.id}")
+            request = self._json_object_or_empty(marker.request) if marker is not None else {}
+            report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
+            line = (
+                f"{pre.id} | {self._task_work_function(pre)} | {pre.status} | "
+                f"gate {gate_ref[0].status if gate_ref else 'none'} | {pre.title}"
+            )
+            if report is not None:
+                line += f" | report: {report.status}: {(report.recommended_next_step or '')[:120]}"
+            lines.append(line)
+        return lines
 
     async def _pre_plan_tasks(self, db: AsyncSession, run: OrchestrationRun) -> list[Task]:
         """Run work that exists before a plan is requested; the plan must adopt or explain each."""

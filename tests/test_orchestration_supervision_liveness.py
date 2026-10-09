@@ -834,3 +834,21 @@ async def test_commitment_only_state_counts_then_asks_owner_naming_commitment(db
     assert await service.supervision._proactive_outcome(
         db_session, run, SimpleNamespace(untracked_follow_ups=[], progress_view=[]), set(), state, now, []) is None
     assert run.supervision_state["unchanged"] == {}
+
+
+@pytest.mark.parametrize(("gate_type", "outcome"), [("adhoc_work_accepted", "closeout_ready"), ("work_completed", "continue")])
+async def test_only_non_adhoc_open_gates_block_closeout_readiness(db_session, test_project, monkeypatch, gate_type, outcome):
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted", "version": 1}
+    db_session.add(OrchestrationGate(run_id=run.id, success_criterion_key="k", gate_type=gate_type))
+    await db_session.flush()
+    service = OrchestrationService()
+
+    async def no_release(*_args):
+        return 0
+
+    monkeypatch.setattr(service, "_release_ready_work", no_release)
+
+    result = await service.supervision.reconcile_local(db_session, goal, run)
+
+    assert result["outcome"] == outcome

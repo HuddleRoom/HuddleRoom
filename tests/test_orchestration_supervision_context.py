@@ -375,3 +375,85 @@ async def test_fingerprint_ignores_roster_load_only():
     assert fp(a) == fp(b)
     assert fp(a) != fp({**b, "state": "t"})
     assert fp(a) != fp({"roster": [{"id": "y", "load": 1, "nested": {}}], "state": "s"})
+
+
+def _big_report(**over):
+    return {
+        "status": "done", "changes": [f"change {n}" for n in range(5)], "evidence": ["e" * 500, "e2"],
+        "criterion_progress": {"c": "partial"}, "decisions": ["d1", "d2", "d3", "d4"], "risks": [],
+        "open_questions": ["q1"], "next_step": "n" * 400, "collaboration_need": None, **over,
+    }
+
+
+async def _report_run(db_session, project_id):
+    goal, run = await _goal_and_run(db_session, project_id)
+    tasks = {}
+    for name, status, deps in (("unrelated", "done", None), ("dep", "done", None), ("waiter", "in_progress", "dep")):
+        task = Task(
+            project_id=project_id, title=name, status=status,
+            depends_on=[str(tasks[deps].id)] if deps else None,
+            metadata_={"orchestration": {"run_id": str(run.id)}},
+        )
+        db_session.add(task)
+        await db_session.flush()
+        tasks[name] = task
+        db_session.add(OrchestrationAction(
+            run_id=run.id, idempotency_key=f"delegation:{name}", action_type="create_delegation_task",
+            request={}, status="completed", target_type="task", target_id=task.id,
+        ))
+    markers = {}
+    for name in ("unrelated", "dep"):
+        markers[name] = OrchestrationAction(
+            run_id=run.id, idempotency_key=f"run:{run.id}:kind:report_consumed:task:{tasks[name].id}",
+            action_type="report_consumed", status="completed", target_type="task", target_id=tasks[name].id,
+            request={"task_id": str(tasks[name].id), "session_id": None, "report": _big_report()},
+        )
+        db_session.add(markers[name])
+    await db_session.flush()
+    return goal, run, tasks, markers
+
+
+def _report_of(context, task):
+    (row,) = [a for a in context["actions"] if a["action_type"] == "report_consumed" and a["request"]["task_id"] == str(task.id)]
+    return row["request"]["report"]
+
+
+async def test_unrelated_report_is_concise_and_dependency_report_is_full(db_session, test_project):
+    goal, run, tasks, markers = await _report_run(db_session, test_project.id)
+
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    concise = _report_of(context, tasks["unrelated"])
+    assert concise["changes"] == ["change 0", "change 1", "change 2"]
+    assert concise["decisions"] == ["d1", "d2", "d3"]
+    assert concise["evidence"] == ["e" * 300, "e2"]
+    assert concise["next_step"] == "n" * 300
+    assert concise["truncated"] == {"changes": 5, "decisions": 4}
+    assert concise["status"] == "done" and concise["criterion_progress"] == {"c": "partial"}
+    assert concise["open_questions"] == ["q1"] and concise["risks"] == []
+    assert _report_of(context, tasks["dep"]) == _big_report()  # required by in-flight work
+    assert markers["unrelated"].request["report"] == _big_report()  # durable marker untouched
+
+
+async def test_short_report_has_no_truncated_marker(db_session, test_project):
+    goal, run, tasks, markers = await _report_run(db_session, test_project.id)
+    markers["unrelated"].request = {**markers["unrelated"].request, "report": _big_report(changes=["a"], decisions=[], evidence=[])}
+    await db_session.flush()
+
+    context = await OrchestrationSupervisionContextBuilder().build(db_session, goal, run)
+
+    assert "truncated" not in _report_of(context, tasks["unrelated"])
+
+
+async def test_fingerprint_uses_full_reports(db_session, test_project):
+    goal, run, tasks, markers = await _report_run(db_session, test_project.id)
+    builder = OrchestrationSupervisionContextBuilder()
+    before = await builder.fingerprint(db_session, goal, run)
+
+    # Only the 5th change differs: invisible in the concise view, visible in the fingerprint.
+    changes = [f"change {n}" for n in range(4)] + ["changed"]
+    markers["unrelated"].request = {**markers["unrelated"].request, "report": _big_report(changes=changes)}
+    await db_session.flush()
+
+    assert await builder.fingerprint(db_session, goal, run) != before
+    assert _report_of(await builder.build(db_session, goal, run), tasks["unrelated"])["changes"] == changes[:3]

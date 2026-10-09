@@ -905,7 +905,7 @@ async def test_planning_contract_lists_pre_plan_tasks_and_revision_notes(db_sess
     )
     first_task = await db_session.get(Task, first.target_id)
     assert first_task.metadata_["orchestration_plan"]["pre_plan_task_ids"] == [str(existing.id)]
-    line = f"{existing.id} | implementation | {existing.status} | Draft the API"
+    line = f"{existing.id} | implementation | {existing.status} | gate none | Draft the API"
     inputs = first_task.metadata_["orchestration_contract"]["inputs"]
     assert any(item.startswith("Existing run work") and line in item for item in inputs)
     assert not any("Dropped work" in item or "Clarify report" in item for item in inputs)
@@ -2561,3 +2561,38 @@ async def test_request_plan_rejected_for_continuous_policy_goal(db_session, test
     assert exc_info.value.detail.startswith("plan_not_applicable:")
     assert await db_session.scalar(select(count(OrchestrationAction.id)).where(OrchestrationAction.run_id == run.id)) == 0
     assert await db_session.scalar(select(count(Task.id)).where(Task.project_id == test_project.id)) == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_plan_line_shows_gate_status_and_consumed_report_summary(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationGate
+
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="adhoc_task:x", gate_type="adhoc_work_accepted")
+    db_session.add(gate)
+    await db_session.flush()
+    audited = await TaskService().create(db_session, test_project.id, TaskCreate(
+        title="Audit auth",
+        metadata={"orchestration": {
+            "goal_id": str(goal.id), "run_id": str(run.id), "work_function": "investigation", "gate_id": str(gate.id),
+        }},
+    ))
+    bare = await TaskService().create(db_session, test_project.id, TaskCreate(
+        title="Draft API",
+        metadata={"orchestration": {"goal_id": str(goal.id), "run_id": str(run.id), "work_function": "implementation"}},
+    ))
+    report = {
+        "status": "done", "changes": [], "evidence": ["x"], "criterion_progress": {}, "decisions": [], "risks": [],
+        "open_questions": [], "next_step": "N" * 200, "collaboration_need": None,
+    }
+    await service.reserve_action(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{audited.id}", "report_consumed",
+        {"task_id": str(audited.id), "session_id": None, "report": report, "report_validation_errors": []},
+    )
+
+    lines = await service._pre_plan_lines(db_session, run, [audited, bare])
+
+    assert lines == [
+        f"{audited.id} | investigation | backlog | gate open | Audit auth | report: done: {'N' * 120}",
+        f"{bare.id} | implementation | backlog | gate none | Draft API",
+    ]
