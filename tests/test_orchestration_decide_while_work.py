@@ -418,3 +418,56 @@ async def test_dispatcher_creates_two_independent_audits(db_session, test_projec
 
     assert [(a.status, a.error) for a in actions] == [("completed", None)] * 2
     assert len(tasks) == 2 and all(not t.depends_on for t in tasks)
+
+
+# --- decision opportunity while planning (T10e) -----------------------------------------
+
+async def _planning_setup(db, project, agent, status="requested", tasks=1):
+    goal, run = await _setup(db, project, agent, tasks=tasks, accepted=False)
+    run.plan_state = {"status": status, "planning_task_id": str(uuid.uuid4())}
+    await db.flush()
+    return goal, run
+
+
+@pytest.mark.parametrize("status", ["requested", "revision_requested", "revision_required"])
+async def test_plan_in_flight_with_no_work_criterion_asks_for_a_decision(db_session, test_project, test_agent, monkeypatch, status):
+    goal, run = await _planning_setup(db_session, test_project, test_agent, status)
+    _situation(monkeypatch, progress_view=NO_WORK)
+    assert await _reconcile(db_session, goal, run) == {"outcome": "continue"}
+
+
+async def test_plan_in_flight_with_orchestrator_wait_still_waits(db_session, test_project, test_agent, monkeypatch):
+    goal, run = await _planning_setup(db_session, test_project, test_agent, tasks=0)
+    await _orch_wait(db_session, run)
+    _situation(monkeypatch, progress_view=NO_WORK)
+    assert (await _reconcile(db_session, goal, run))["outcome"] == "waiting"
+
+
+async def test_plan_in_flight_at_cap_waits(db_session, test_project, test_agent, monkeypatch):
+    goal, run = await _planning_setup(
+        db_session, test_project, test_agent, tasks=OrchestrationService.RELEASE_TWO_TASK_CAP
+    )
+    _situation(monkeypatch, progress_view=NO_WORK)
+    assert (await _reconcile(db_session, goal, run))["outcome"] == "waiting"
+
+
+async def test_plan_in_flight_without_proactive_work_waits(db_session, test_project, test_agent, monkeypatch):
+    goal, run = await _planning_setup(db_session, test_project, test_agent)
+    _situation(monkeypatch)
+    assert (await _reconcile(db_session, goal, run))["outcome"] == "waiting"
+
+
+async def test_failed_plan_does_not_open_a_decision(db_session, test_project, test_agent, monkeypatch):
+    goal, run = await _planning_setup(db_session, test_project, test_agent, status="failed")
+    _situation(monkeypatch, progress_view=NO_WORK)
+    assert (await _reconcile(db_session, goal, run))["outcome"] == "waiting"
+
+
+async def test_progress_contract_allows_independent_work_while_planning():
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    assert "wait for it unless an independent investigation or review would improve" in PROGRESS_CONTRACT
+    assert "decision_use naming that decision" in PROGRESS_CONTRACT
+    assert "keep agents busy" in PROGRESS_CONTRACT
+    assert "(not while a plan task is in flight)" in PROGRESS_CONTRACT
+    assert "If a plan task is already in flight, wait for it. " not in PROGRESS_CONTRACT

@@ -253,15 +253,15 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
         {"session_id": str(planner_session.id), "task_id": str(planning_task.id)},
         dedup_key=f"adoption-plan-session:{planner_session.id}",
     )
-    # The tick ingests the envelope; while the audits run, local liveness waits on them instead of
-    # asking for a decision, so the plan is accepted directly here.
+    # The tick ingests the envelope; the audits are still running, so the proactive decision path
+    # (not a direct call) accepts the ingested plan.
     await service.tick(db_session, run.id)
     await db_session.refresh(run)
-    await service.execute_accept_plan_action(
-        db_session, run_id=run.id,
-        request={"action_type": "accept_plan", "plan_artifact_id": run.plan_state["plan_artifact_id"]},
-        idempotency_key=f"run:{run.id}:kind:accept_plan",
-    )
+    assert run.plan_state["status"] == "requested" and run.plan_state["plan_artifact_id"]
+    stub_decision(lambda ctx: {"action_type": "accept_plan", "plan_artifact_id": ctx["run"]["plan_state"]["plan_artifact_id"]})
+    result = await service.tick(db_session, run.id)
+    await db_session.refresh(run)
+    assert result["authorized_execution"]["step"] == "plan_decision", result
     assert run.plan_state["status"] == "accepted"
     run_id = run.id
     await db_session.commit()

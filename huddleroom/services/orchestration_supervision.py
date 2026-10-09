@@ -16,7 +16,7 @@ from huddleroom.models.session import Session
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
-from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, first_unmet_dependency
+from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, first_unmet_dependency, plan_in_flight
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE as _ORCH_OWNER
 
 from huddleroom.services.orchestration_decision_validator import (
@@ -638,7 +638,7 @@ class OrchestrationSupervisionService:
                 OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()} - {"None", ""}
         future = [wait for wait in waits if not is_due(wait)]
         proactive = (
-            plan_accepted
+            (plan_accepted or plan_in_flight(run.plan_state))
             and (future or active_meeting is not None or active_graph_run is not None)
             and all((w.owner or {}).get("type") in SYSTEM_WAIT_OWNER_TYPES for w in future)
             and await self._has_proactive_work(active_tasks, situation_getter, held)
