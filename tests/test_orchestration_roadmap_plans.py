@@ -1282,7 +1282,10 @@ async def test_rejected_replan_leaves_current_version_projection_unchanged(db_se
     current = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     persisted = await db_session.get(OrchestrationRoadmapItem, released.id)
     assert (current.id, current.fingerprint) == (version.id, version.fingerprint)
-    assert {key: value for key, value in run.plan_state.items() if key != "pending_replan"} == projection
+    assert {
+        key: value for key, value in run.plan_state.items() if key not in {"pending_replan", "planning_version"}
+    } == {key: value for key, value in projection.items() if key != "planning_version"}
+    assert run.plan_state["planning_version"] == projection["planning_version"] + 1
     assert run.plan_state["pending_replan"] == {
         "task_id": str(replan.target_id), "action_id": str(replan.id), "version_id": str(version.id),
         "planner_agent_id": str(artifact.created_by_agent),

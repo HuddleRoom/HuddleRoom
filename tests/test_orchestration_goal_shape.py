@@ -466,6 +466,6 @@ def test_planning_contract_excludes_expansion_policy():
     )
     request = {"agent_id": str(uuid.uuid4()), "scope": "plan it"}
     contract = OrchestrationService()._planning_contract(
-        goal, SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=None), SimpleNamespace(id=uuid.uuid4()), request,
+        goal, SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=None, plan_state={}), SimpleNamespace(id=uuid.uuid4()), request,
     )
     assert contract.orchestrator_context == {"team": {"agent_ids": ["x"]}}

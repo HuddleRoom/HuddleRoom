@@ -13,7 +13,7 @@ import logging
 from textwrap import shorten
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -2068,7 +2068,9 @@ class OrchestrationService:
                         await db.refresh(action)
                     raise
 
-            contract = self._planning_contract(goal, run, action, stored_request)
+            pre_plan_tasks = await self._pre_plan_tasks(db, run)
+            planning_version = int(self._json_object_or_empty(run.plan_state).get("planning_version") or 0) + 1
+            contract = self._planning_contract(goal, run, action, stored_request, pre_plan_tasks=pre_plan_tasks)
             task = await TaskService().create(
                 db,
                 project_id,
@@ -2085,6 +2087,8 @@ class OrchestrationService:
                         },
                         "orchestration_plan": {
                             "status": "requested",
+                            "planning_version": planning_version,
+                            "pre_plan_task_ids": [str(pre.id) for pre in pre_plan_tasks],
                         },
                         "orchestration_contract": contract.model_dump(mode="json"),
                     },
@@ -2249,6 +2253,7 @@ class OrchestrationService:
         )
         task = await self._find_task_for_action(db, project_id, action, run_id=run_id, work_function=PLAN_WORK_FUNCTION)
         if task is None:
+            planning_version = int(state.get("planning_version") or 0) + 1
             released = list((await db.scalars(select(OrchestrationRoadmapItem).where(
                 OrchestrationRoadmapItem.goal_id == goal.id
             ))).all())
@@ -2263,14 +2268,19 @@ class OrchestrationService:
                 TaskCreate(title="Planning: Roadmap replan", description="Produce a replacement plan for unstarted Roadmap work.",
                     assigned_to=agent.id, metadata={
                         "orchestration": {"goal_id": str(goal.id), "run_id": str(run.id), "action_id": str(action.id), "work_function": PLAN_WORK_FUNCTION},
-                        "orchestration_plan": {"status": "replan_requested"},
+                        "orchestration_plan": {
+                            "status": "replan_requested", "planning_version": planning_version, "pre_plan_task_ids": [],
+                        },
                         "orchestration_contract": contract.model_dump(mode="json"),
                         "roadmap_replan": {"current_version": version.snapshot,
                             "released_items": [row.item_snapshot for row in released],
                             "forbidden_work": "Do not change or remove any released Roadmap item."},
                     }), task_id=action.id,
             )
-        run.plan_state = {**state, "pending_replan": {
+        planning_version = self._json_object_or_empty(
+            self._json_object_or_empty(task.metadata_).get("orchestration_plan")
+        ).get("planning_version") or int(state.get("planning_version") or 0) + 1
+        run.plan_state = {**state, "planning_version": planning_version, "pending_replan": {
             "task_id": str(task.id), "action_id": str(action.id), "version_id": str(version.id),
             "planner_agent_id": str(agent.id),
         }}
@@ -5316,6 +5326,7 @@ class OrchestrationService:
         run: OrchestrationRun,
         action: OrchestrationAction,
         request: Mapping[str, Any],
+        pre_plan_tasks: Sequence[Task] = (),
     ) -> OrchestrationDelegationContract:
         from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 
@@ -5328,6 +5339,24 @@ class OrchestrationService:
             plan_mode(goal, run),
             "Implementation plan: a leaf technical plan for this outcome.",
         )
+        plan_state = self._json_object_or_empty(run.plan_state)
+        extra_inputs = []
+        if pre_plan_tasks:
+            extra_inputs.append(
+                "Existing run work — adopt each via adopt_task_id or say in summary why it is not used:\n"
+                + "\n".join(
+                    f"{pre.id} | {self._task_work_function(pre)} | {pre.status} | {pre.title}"
+                    for pre in pre_plan_tasks
+                )
+            )
+        if plan_state.get("status") in {"revision_requested", "revision_required"}:
+            extra_inputs.extend(
+                f"Plan revision request: {item['revision_request']}"
+                for item in plan_state.get("revision_requests") or []
+                if isinstance(item, Mapping) and item.get("revision_request")
+            )
+            if plan_state.get("revision_reason"):
+                extra_inputs.append(f"Plan revision reason: {plan_state['revision_reason']}")
         return OrchestrationDelegationContract(
             goal_id=goal.id,
             run_id=run.id,
@@ -5342,6 +5371,7 @@ class OrchestrationService:
                 "Optional specialist inputs (only when a named risk or missing decision benefits; inputs to this "
                 "plan, never co-authors): product strategist — sequencing; tester — qualification and evidence; "
                 "UI/UX designer — interaction and accessibility.",
+                *extra_inputs,
             ],
             deliverable=deliverable,
             forbidden_work=[
@@ -5350,26 +5380,12 @@ class OrchestrationService:
                 "Do not create tasks, meetings, graphs, rules, hooks, or automations.",
             ],
             success_evidence=[
-                "A plan artifact linked to this planning task.",
+                "One PlanningEnvelope JSON object as your final output; HuddleRoom registers the plan Artifact.",
                 "Plan items are independently actionable and verifiable.",
                 "You are the sole plan author: one plan that synthesizes any specialist inputs.",
             ],
             budget=self._json_object_or_empty(goal.budget),
-            report_schema=(
-                {
-                    "artifact_id": "uuid",
-                    "plan_items": (
-                        "list[{item_key, unit_type, title, depends_on, mutates_shared_state, staging_boundary, "
-                        "work_function, scope, deliverable, agent_id, inputs, forbidden_work, success_evidence, "
-                        "required_capabilities, objective, success_criteria, constraints, allocation}]"
-                    ),
-                }
-                if goal.goal_type == "roadmap"
-                else {
-                    "artifact_id": "uuid",
-                    "plan_items": "list[{id, title, work_function, scope, deliverable, success_evidence, success_criterion_keys}]",
-                }
-            ),
+            report_schema=planning_envelope_report_schema(plan_kind_for(goal, run)),
             parent_task_id=None,
             orchestrator_context=delegable_context(goal.orchestrator_context),
         )
@@ -5916,8 +5932,15 @@ class OrchestrationService:
                 "accepted_artifact_id",
                 "accept_action_id",
                 "plan_author_agent_id",
+                "plan_artifact_id",
+                "plan_output_hash",
+                "planning_version",
             }
         }
+        current_version = int(plan_state.get("planning_version") or 0)
+        recorded_version = OrchestrationService._json_object_or_empty(
+            OrchestrationService._json_object_or_empty(task.metadata_).get("orchestration_plan")
+        ).get("planning_version")
         revision_requests = []
         if plan_state.get("request_action_id") == str(action.id):
             existing_revision_requests = plan_state.get("revision_requests")
@@ -5931,6 +5954,11 @@ class OrchestrationService:
             "work_function": PLAN_WORK_FUNCTION,
             "plan_gate_id": str(gate.id),
             "revision_requests": revision_requests,
+            "planning_version": (
+                current_version or recorded_version or 1
+                if plan_state.get("request_action_id") == str(action.id)
+                else recorded_version or current_version + 1
+            ),
         }
         author_id = task.assigned_to or (action.request or {}).get("agent_id")
         if author_id:
@@ -5948,10 +5976,12 @@ class OrchestrationService:
         if not isinstance(revision_requests, list):
             revision_requests = []
         action_id = str(action.id)
+        planning_version = int(plan_state.get("planning_version") or 0)
         if not any(
             isinstance(item, Mapping) and item.get("action_id") == action_id
             for item in revision_requests
         ):
+            planning_version += 1
             revision_requests = [
                 *revision_requests,
                 {
@@ -5966,6 +5996,7 @@ class OrchestrationService:
             "status": "revision_requested",
             "planning_task_id": str(plan_task_id),
             "revision_requests": revision_requests,
+            "planning_version": planning_version,
         }
 
     @staticmethod
@@ -8751,6 +8782,16 @@ class OrchestrationService:
                 }
                 task.metadata_ = metadata
         return 1
+
+    async def _pre_plan_tasks(self, db: AsyncSession, run: OrchestrationRun) -> list[Task]:
+        """Run work that exists before a plan is requested; the plan must adopt or explain each."""
+        tasks = await self._orchestrated_tasks_for_run(
+            db, run.id, statuses=[status for status in Task.VALID_TRANSITIONS if status != "cancelled"],
+        )
+        return [
+            task for task in tasks
+            if self._task_work_function(task) not in {PLAN_WORK_FUNCTION, FINAL_SUMMARY_WORK_FUNCTION, "report_clarification", "decision"}
+        ]
 
     async def _orchestrated_tasks_for_run(
         self,

@@ -616,7 +616,7 @@ def test_planning_contract_wording_by_mode(mode, snapshot, deliverable):
         id=uuid.uuid4(), planning_mode=mode, objective="Ship it", orchestrator_context={},
         success_criteria=[], constraints={}, budget={}, goal_type="goal",
     )
-    run = SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=snapshot)
+    run = SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=snapshot, plan_state={})
     action = SimpleNamespace(id=uuid.uuid4())
     contract = OrchestrationService()._planning_contract(
         goal, run, action, {"agent_id": str(uuid.uuid4()), "scope": "plan it"}

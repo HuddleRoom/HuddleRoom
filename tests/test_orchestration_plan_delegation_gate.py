@@ -23,7 +23,7 @@ from huddleroom.models.orchestration import (
 from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
-from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+from huddleroom.schemas.orchestration import OrchestrationGoalCreate, planning_envelope_report_schema
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.services.orchestration_decision_validator import validate_orchestration_decision
 from huddleroom.services.orchestration_service import OrchestrationService
@@ -205,7 +205,9 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
         "action_id": str(action.id),
         "work_function": "planning",
     }
-    assert task.metadata_["orchestration_plan"] == {"status": "requested"}
+    assert task.metadata_["orchestration_plan"] == {
+        "status": "requested", "planning_version": 1, "pre_plan_task_ids": [],
+    }
     contract = task.metadata_["orchestration_contract"]
     assert contract["inputs"] == [
         f"Goal objective: {goal.objective}",
@@ -222,17 +224,15 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
         "Do not create tasks, meetings, graphs, rules, hooks, or automations.",
     ]
     assert contract["success_evidence"] == [
-        "A plan artifact linked to this planning task.",
+        "One PlanningEnvelope JSON object as your final output; HuddleRoom registers the plan Artifact.",
         "Plan items are independently actionable and verifiable.",
         "You are the sole plan author: one plan that synthesizes any specialist inputs.",
     ]
     # The terminal test analyzer leaves goal fields untouched; the planning
     # contract copies that original budget.
     assert contract["budget"] == {"max_tokens": 20000}
-    assert contract["report_schema"] == {
-        "artifact_id": "uuid",
-        "plan_items": "list[{id, title, work_function, scope, deliverable, success_evidence, success_criterion_keys}]",
-    }
+    assert contract["report_schema"] == planning_envelope_report_schema("implementation")
+    assert "artifact_id" not in contract["report_schema"]
 
     gate = await _single_plan_gate(db_session, run.id)
     assert gate.status == "open"
@@ -247,6 +247,7 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
         "plan_gate_id": str(gate.id),
         "plan_author_agent_id": str(planner.id),
         "revision_requests": [],
+        "planning_version": 1,
     }
 
     events = await _event_rows(db_session, test_project.id, "orchestration.plan_requested")
@@ -380,6 +381,7 @@ async def test_execute_request_plan_action_replay_reuses_existing_task_before_ag
         "plan_gate_id": str(gate.id),
         "plan_author_agent_id": str(planner.id),
         "revision_requests": [],
+        "planning_version": 1,
     }
     events = await _event_rows(db_session, test_project.id, "orchestration.plan_requested")
     assert len(events) == 1
@@ -446,6 +448,7 @@ async def test_execute_request_plan_action_replay_uses_stored_agent_id_when_task
         "plan_gate_id": str(gate.id),
         "plan_author_agent_id": str(planner.id),
         "revision_requests": [],
+        "planning_version": 1,
     }
     events = await _event_rows(db_session, test_project.id, "orchestration.plan_requested")
     assert len(events) == 1
@@ -824,8 +827,107 @@ async def test_execute_request_plan_action_new_idempotency_key_supersedes_outsta
         "plan_gate_id": str(gate.id),
         "plan_author_agent_id": str(first_planner.id),
         "revision_requests": [],
+        "planning_version": 3 if prior_plan_status == "revision_requested" else 2,
     }
+    assert second_task.metadata_["orchestration_plan"]["planning_version"] == (
+        3 if prior_plan_status == "revision_requested" else 2
+    )
     assert await db_session.scalar(select(count(OrchestrationGate.id)).where(OrchestrationGate.run_id == run.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_planning_version_replay_keeps_version_and_revision_increments(db_session, test_project):
+    planner = _agent("planner")
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
+    key = "run:phase11:kind:request_plan:version-replay"
+
+    action = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key=key,
+    )
+    assert run.plan_state["planning_version"] == 1
+    replayed = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key=key,
+    )
+    assert replayed.id == action.id
+    assert run.plan_state["planning_version"] == 1
+
+    revision_request = {
+        "action_type": "request_plan_revision",
+        "plan_task_id": str(action.target_id),
+        "revision_request": "Split the work into smaller items.",
+    }
+    revision_key = "run:phase11:kind:request_plan_revision:version-bump"
+    await service.execute_request_plan_revision_action(
+        db_session, run_id=run.id, request=revision_request, idempotency_key=revision_key,
+    )
+    assert run.plan_state["planning_version"] == 2
+    await service.execute_request_plan_revision_action(
+        db_session, run_id=run.id, request=revision_request, idempotency_key=revision_key,
+    )
+    assert run.plan_state["planning_version"] == 2
+    assert len(run.plan_state["revision_requests"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_planning_contract_lists_pre_plan_tasks_and_revision_notes(db_session, test_project):
+    planner = _agent("planner")
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+
+    def _orchestrated_task(title, work_function):
+        return TaskService().create(
+            db_session,
+            test_project.id,
+            TaskCreate(
+                title=title,
+                metadata={"orchestration": {
+                    "goal_id": str(goal.id), "run_id": str(run.id), "work_function": work_function,
+                }},
+            ),
+        )
+
+    existing = await _orchestrated_task("Draft the API", "implementation")
+    cancelled = await _orchestrated_task("Dropped work", "implementation")
+    await TaskService().cancel(db_session, test_project.id, cancelled.id)
+    await _orchestrated_task("Clarify report", "report_clarification")
+    await _bind_team(db_session, goal, planner)
+
+    first = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id),
+        idempotency_key="run:phase11:kind:request_plan:pre-plan-first",
+    )
+    first_task = await db_session.get(Task, first.target_id)
+    assert first_task.metadata_["orchestration_plan"]["pre_plan_task_ids"] == [str(existing.id)]
+    line = f"{existing.id} | implementation | {existing.status} | Draft the API"
+    inputs = first_task.metadata_["orchestration_contract"]["inputs"]
+    assert any(item.startswith("Existing run work") and line in item for item in inputs)
+    assert not any("Dropped work" in item or "Clarify report" in item for item in inputs)
+    assert not any(item.startswith("Plan revision") for item in inputs)
+
+    await service.execute_request_plan_revision_action(
+        db_session,
+        run_id=run.id,
+        request={
+            "action_type": "request_plan_revision",
+            "plan_task_id": str(first.target_id),
+            "revision_request": "Cover the rollback path.",
+        },
+        idempotency_key="run:phase11:kind:request_plan_revision:pre-plan",
+    )
+    second = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id),
+        idempotency_key="run:phase11:kind:request_plan:pre-plan-second",
+    )
+    second_task = await db_session.get(Task, second.target_id)
+    assert "Plan revision request: Cover the rollback path." in second_task.metadata_["orchestration_contract"]["inputs"]
+
+    run.plan_state = {**run.plan_state, "status": "revision_required", "revision_reason": "planning_output_rejected: x"}
+    contract = service._planning_contract(goal, run, second, _canonical_plan_request(planner.id))
+    assert "Plan revision reason: planning_output_rejected: x" in contract.inputs
 
 
 @pytest.mark.asyncio
