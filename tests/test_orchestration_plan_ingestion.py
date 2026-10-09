@@ -399,3 +399,30 @@ async def test_ingest_rejects_invalid_adoption_before_disposition(db_session, te
     assert exc.value.reason == f"adoption_invalid: item a: task {audit.id} was not created by a delegation"
     assert not exc.value.stale
     assert await _plan_artifacts(db_session, task.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_plan_item_artifact_outside_project(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    ghost = uuid.uuid4()
+    output = json.dumps(_env(items=[_item(success_criterion_keys=["plan"], artifact_ids=[str(ghost)])]))
+
+    with pytest.raises(PlanIngestionError) as exc:
+        await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert exc.value.reason == f"artifact_invalid: item a: artifact {ghost} not found in project"
+    assert not exc.value.stale
+    assert await _plan_artifacts(db_session, task.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_ingest_accepts_plan_item_artifact_in_project(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    known = Artifact(project_id=test_project.id, name="spec", artifact_type="document")
+    db_session.add(known)
+    await db_session.flush()
+    output = json.dumps(_env(items=[_item(success_criterion_keys=["plan"], artifact_ids=[str(known.id)])]))
+
+    await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert await _plan_artifacts(db_session, task.id) == 1

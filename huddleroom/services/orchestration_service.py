@@ -102,6 +102,7 @@ from huddleroom.services.graph_engine import GraphEngineService
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
+from huddleroom.services.orchestration_decision_validator import independent_work_rejection
 from huddleroom.services.orchestration_dependencies import (
     first_unmet_dependency,
     task_gate_id,
@@ -1623,14 +1624,18 @@ class OrchestrationService:
             await validate_dependencies(
                 db, gate_run, [uuid.UUID(d) for d in request_to_store.get("depends_on") or []]
             )
-            artifact_ids = {uuid.UUID(a) for a in request_to_store.get("artifact_ids") or []}
-            if artifact_ids:
-                found = set((await db.execute(
-                    select(Artifact.id).where(Artifact.id.in_(artifact_ids), Artifact.project_id == project_id)
-                )).scalars())
-                if artifact_ids - found:
-                    missing = min(artifact_ids - found, key=str)
-                    raise HTTPException(status_code=409, detail=f"artifact_invalid: artifact {missing} not found in project")
+            missing = await self._first_missing_artifact(db, project_id, request_to_store.get("artifact_ids") or [])
+            if missing is not None:
+                raise HTTPException(status_code=409, detail=f"artifact_invalid: artifact {missing} not found in project")
+            if ad_hoc:
+                run_goal = await db.get(OrchestrationGoal, gate_run.goal_id)
+                rejection = independent_work_rejection(
+                    request_to_store,
+                    [c.get("key") for c in run_goal.success_criteria or [] if isinstance(c, Mapping)],
+                    gate_run.plan_state,
+                )
+                if rejection is not None:
+                    raise HTTPException(status_code=409, detail=rejection)
             authority = await self.roadmap_pre_release_authority(
                 db, run_id, agent,
                 self._json_object_or_empty(request_to_store.get("orchestrator_context")),
@@ -4907,6 +4912,16 @@ class OrchestrationService:
         if declared_set - covered:
             raise HTTPException(status_code=409, detail="Plan does not cover every declared success criterion")
 
+    @staticmethod
+    async def _first_missing_artifact(db: AsyncSession, project_id: uuid.UUID, artifact_ids: Sequence[Any]) -> uuid.UUID | None:
+        wanted = {uuid.UUID(str(a)) for a in artifact_ids}
+        if not wanted:
+            return None
+        found = set((await db.execute(
+            select(Artifact.id).where(Artifact.id.in_(wanted), Artifact.project_id == project_id)
+        )).scalars())
+        return min(wanted - found, key=str) if wanted - found else None
+
     async def _validate_plan_adoptions(self, db: AsyncSession, run: OrchestrationRun, items: Sequence[Any]) -> None:
         """Each adopt_task_id must name this run's own delegated discovery work, adopted by one item only.
 
@@ -4922,11 +4937,17 @@ class OrchestrationService:
             )))
         seen: set[uuid.UUID] = set()
         for item in items:
+            roadmap = hasattr(item, "unit_type")
+            key = item.item_key if roadmap else item.id
+            if goal is not None and key not in bound_keys:
+                missing = await self._first_missing_artifact(db, goal.project_id, getattr(item, "artifact_ids", None) or [])
+                if missing is not None:
+                    raise HTTPException(
+                        status_code=409, detail=f"artifact_invalid: item {key}: artifact {missing} not found in project"
+                    )
             task_id = getattr(item, "adopt_task_id", None)
             if task_id is None:
                 continue
-            roadmap = hasattr(item, "unit_type")
-            key = item.item_key if roadmap else item.id
 
             def invalid(reason: str) -> HTTPException:
                 return HTTPException(status_code=409, detail=f"adoption_invalid: item {key}: {reason}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
@@ -8,6 +9,7 @@ from pydantic import ValidationError
 
 from huddleroom.models.orchestration_process import WARNING_SEVERITIES, WARNING_SEVERITY_VALUES
 from huddleroom.schemas.orchestration import AuthorizationScope
+from huddleroom.services.orchestration_dependencies import ADHOC_GATED_WORK_FUNCTIONS, plan_in_flight
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
 
@@ -202,6 +204,54 @@ def delegation_optional_field_error(request: Mapping[str, Any]) -> str | None:
             return "authorization_scope is not a valid authorization scope"
         if scope.external_writes.allowed or scope.live_sends.allowed:
             return "authorization_scope cannot self-grant external writes or live sends; route them to ask_human"
+    return None
+
+
+LABEL_WORDS = frozenset({
+    "criterion", "criteria", "success", "for", "the", "a", "an", "to", "on", "of", "advance", "advances",
+    "progress", "work", "complete", "satisfy", "meet", "cover",
+})
+FILLER_PHRASES = (
+    "keep busy", "stay busy", "keep the team busy", "busy work", "busywork", "fill time", "fill capacity",
+    "idle capacity", "show activity", "show progress",
+)
+
+
+def _normalized(text: Any) -> str:
+    return re.sub(r"[^a-z0-9_:]", " ", str(text).lower())
+
+
+def independent_work_rejection(
+    request: Mapping[str, Any], criterion_keys: Any, plan_state: Any
+) -> str | None:
+    """Reject investigation/review proposed while planning is in flight unless it names real use and evidence."""
+    if request.get("work_function") not in ADHOC_GATED_WORK_FUNCTIONS or not plan_in_flight(plan_state):
+        return None
+    keys = {t for k in criterion_keys or [] if isinstance(k, str) for t in _normalized(k).split()}
+    ignored = LABEL_WORDS | keys | {f"criterion:{k}" for k in keys}
+
+    def residual(text: Any) -> list[str]:
+        return [t for t in _normalized(text).split() if t not in ignored]
+
+    def invalid(reason: str) -> str:
+        return f"independent_work_invalid: {reason}"
+
+    decision_use = request.get("decision_use")
+    if not isinstance(decision_use, str) or not decision_use.strip():
+        return invalid("name the decision or execution step this work improves")
+    if not residual(decision_use):
+        return invalid("decision_use only names a success criterion")
+    evidence = [e for e in request.get("success_evidence") or [] if isinstance(e, str)]
+    texts = [decision_use, request.get("scope"), request.get("deliverable"), request.get("why_runnable"), *evidence]
+    if any(phrase in " ".join(_normalized(t).split()) for t in texts if t for phrase in FILLER_PHRASES):
+        return invalid("work whose only rationale is keeping agents busy is not allowed")
+    if not any(residual(e) for e in evidence):
+        return invalid("name concrete expected evidence")
+    unfinished = {
+        str(plan_state.get(k)) for k in ("planning_task_id", "plan_artifact_id") if plan_state.get(k)
+    }
+    if unfinished & {str(i) for i in [*(request.get("depends_on") or []), *(request.get("artifact_ids") or [])]}:
+        return invalid("depends on unfinished planning output")
     return None
 
 

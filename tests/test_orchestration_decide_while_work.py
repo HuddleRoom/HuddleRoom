@@ -299,3 +299,122 @@ async def test_new_follow_up_after_post_action_wait_continues(db_session, test_p
     assert await _reconcile_no_release(db_session, goal, run) == {"outcome": "continue"}
     assert [w.status for w in await _orchestrator_waits(db_session, run)] == ["cleared"]
 
+
+
+# --- independent work while planning is in flight (T10b) --------------------------------
+
+from huddleroom.services.orchestration_decision_validator import independent_work_rejection  # noqa: E402
+
+IN_FLIGHT = {"status": "requested", "planning_task_id": str(uuid.uuid4()), "plan_artifact_id": str(uuid.uuid4())}
+
+
+def _audit(**over):
+    return {
+        "work_function": "investigation", "scope": "Audit the auth module", "deliverable": "Findings list",
+        "decision_use": "Decide whether to keep the session store", "success_evidence": ["List of failing call sites"],
+        **over,
+    }
+
+
+def _rejection(**over):
+    return independent_work_rejection(_audit(**over), ["c1"], IN_FLIGHT)
+
+
+async def test_valid_independent_audit_is_allowed_and_not_ordered():
+    assert _rejection() is None
+    assert _rejection(work_function="review", scope="Review the cache layer") is None  # no depends_on needed
+
+
+@pytest.mark.parametrize("plan_state", [{"status": "accepted"}, {"status": "failed"}, None, {}])
+async def test_rule_skipped_when_plan_not_in_flight(plan_state):
+    assert independent_work_rejection(_audit(decision_use=None), ["c1"], plan_state) is None
+
+
+async def test_rule_skipped_for_other_work_functions():
+    assert _rejection(work_function="implementation", decision_use="keep busy") is None
+
+
+@pytest.mark.parametrize("status", ["requested", "revision_requested", "revision_required"])
+async def test_rule_applies_for_every_in_flight_status(status):
+    assert independent_work_rejection(_audit(decision_use=" "), ["c1"], {"status": status}) is not None
+
+
+async def test_blank_decision_use_rejected():
+    for value in (None, "", "   "):
+        assert "name the decision or execution step" in _rejection(decision_use=value)
+
+
+@pytest.mark.parametrize("use", ["criterion:c1", "c1", "advance the criterion c1", "Success criteria for C1"])
+async def test_decision_use_naming_only_a_criterion_rejected(use):
+    assert "only names a success criterion" in _rejection(decision_use=use)
+
+
+@pytest.mark.parametrize("phrase", ["keep busy", "Keep the team busy", "busywork", "show-progress"])
+async def test_filler_rationale_rejected(phrase):
+    assert "keeping agents busy" in _rejection(decision_use=f"Choose cache TTL and {phrase}")
+
+
+async def test_filler_in_why_runnable_rejected():
+    assert "keeping agents busy" in _rejection(why_runnable="Fill idle capacity")
+
+
+@pytest.mark.parametrize("evidence", [[], [" "], ["criterion:c1"], ["the c1"]])
+async def test_evidence_must_be_concrete(evidence):
+    assert "concrete expected evidence" in _rejection(success_evidence=evidence)
+
+
+@pytest.mark.parametrize("field", ["planning_task_id", "plan_artifact_id"])
+async def test_dependency_on_unfinished_plan_rejected(field):
+    key = "depends_on" if field == "planning_task_id" else "artifact_ids"
+    assert "unfinished planning output" in _rejection(**{key: [IN_FLIGHT[field]]})
+    assert _rejection(**{key: [str(uuid.uuid4())]}) is None
+
+
+async def _dispatch_adhoc(db, project, **over):
+    from sqlalchemy import select as sa_select
+    from huddleroom.models.orchestration import OrchestrationDecision
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    from tests.test_orchestration_delegation_contracts import _adhoc_dep_setup, _delegation_request
+
+    service, run, agent = await _adhoc_dep_setup(db, project)
+    run.plan_state = {"status": "requested", "planning_task_id": str(uuid.uuid4())}
+    project_id, agent_id = project.id, agent.id
+    decisions = []
+    for n, extra in enumerate(over.get("requests", [over])):
+        request = {
+            **_delegation_request(agent_id), "work_function": "investigation",
+            "budget": {"max_tokens": 5000}, "scope": f"Audit module {n}", "decision_use": "Decide whether to keep the session store",
+            "success_evidence": ["List of failing call sites"], **extra,
+        }
+        decisions.append(OrchestrationDecision(
+            run_id=run.id, decision_type="execution", validator_status="accepted", input_snapshot={},
+            parsed_decision=request,
+        ))
+    db.add_all(decisions)
+    await db.flush()
+    actions = [await OrchestrationDecisionDispatcher(service).dispatch(db, run, d) for d in decisions]
+    tasks = (await db.execute(sa_select(Task).where(Task.project_id == project_id))).scalars().all()
+    return actions, tasks
+
+
+@pytest.mark.parametrize(
+    ("over", "needle"),
+    [
+        ({"decision_use": None}, "name the decision"),
+        ({"decision_use": "criterion:delegated"}, "only names a success criterion"),
+        ({"decision_use": "Pick a TTL and keep busy"}, "keeping agents busy"),
+        ({"success_evidence": []}, "concrete expected evidence"),
+    ],
+)
+async def test_dispatcher_rejects_filler_audit_with_failed_action_and_no_task(db_session, test_project, over, needle):
+    actions, tasks = await _dispatch_adhoc(db_session, test_project, **over)
+
+    assert actions[0].status == "failed" and "independent_work_invalid" in actions[0].error and needle in actions[0].error
+    assert tasks == []
+
+
+async def test_dispatcher_creates_two_independent_audits(db_session, test_project):
+    actions, tasks = await _dispatch_adhoc(db_session, test_project, requests=[{}, {"work_function": "review"}])
+
+    assert [(a.status, a.error) for a in actions] == [("completed", None)] * 2
+    assert len(tasks) == 2 and all(not t.depends_on for t in tasks)

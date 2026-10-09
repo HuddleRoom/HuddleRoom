@@ -1278,3 +1278,21 @@ async def test_release_blocks_plan_integrity_when_adopted_binding_fails(db_sessi
     (blocker,) = [b for b in run.active_blockers if b.get("kind") == "plan_criterion_integrity"]
     assert blocker["reason"].startswith("Adopted plan item 'audit-0' could not bind: adoption_conflict:")
     assert "plan_item_gate_id" not in audit.metadata_["orchestration"]
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_item_artifact_outside_project(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    ghost = uuid.uuid4()
+    tasks_before = await _task_count(db_session, test_project.id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _accept_with_items(
+            db_session, test_project.id, service, run, planner, request_action,
+            [_adopting_item(task.id, artifact_ids=[str(ghost)])],
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == f"artifact_invalid: item audit-api: artifact {ghost} not found in project"
+    assert run.plan_state["status"] == "revision_required"
+    assert await _task_count(db_session, test_project.id) == tasks_before
