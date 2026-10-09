@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from decimal import Decimal
 from graphlib import CycleError, TopologicalSorter
@@ -915,6 +915,40 @@ class OrchestrationService:
 
     @asynccontextmanager
     async def _lock_goal_for_baseline_transition(
+        self,
+        db: AsyncSession,
+        goal_id: uuid.UUID,
+        *,
+        tick_owns_transaction: bool = False,
+    ):
+        """Lock the goal's finite-tree root first, then the goal (root->leaf, one fixed order).
+
+        Sibling/cousin ticks share root-wide slots, depth, descendant count and
+        budget, so they must serialize on the root; a single fixed order means two
+        goals of one tree never wait on each other in reverse. Continuous cases are
+        their own roots. Same task / same transaction re-entry stays reentrant. A
+        Postgres commit inside the section drops both row locks together (same
+        precedent as the goal lock); the SQLite asyncio locks span commits, so
+        _commit_tick_owned_transaction keeps the tree serialized.
+        """
+        # ponytail: one lock per finite tree serializes sibling ticks; finer locks if throughput matters.
+        if db.in_transaction() or db.new or db.bind is None:
+            root_id = await root_goal_id(db, goal_id)
+        else:
+            # Keep a fresh session fresh: callers may db.begin() under the lock (supersession).
+            # It holds no uncommitted rows, so an independent read sees the same tree.
+            async with AsyncSession(db.bind) as probe:
+                root_id = await root_goal_id(probe, goal_id)
+        async with AsyncExitStack() as stack:
+            if root_id != goal_id:
+                await stack.enter_async_context(self._lock_single_goal(db, root_id))
+            await stack.enter_async_context(
+                self._lock_single_goal(db, goal_id, tick_owns_transaction=tick_owns_transaction)
+            )
+            yield
+
+    @asynccontextmanager
+    async def _lock_single_goal(
         self,
         db: AsyncSession,
         goal_id: uuid.UUID,
