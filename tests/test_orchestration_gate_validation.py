@@ -987,11 +987,11 @@ async def test_adhoc_gate_accepts_only_completed_task_with_valid_evidence_report
 @pytest.mark.parametrize(
     ("report", "reason"),
     [
-        ("not a report", "Task report is missing or invalid"),
+        ("not a report", "Task report is invalid"),
         ({**VALID_REPORT, "evidence": []}, "Task report has no evidence"),
     ],
 )
-async def test_adhoc_gate_stays_open_for_invalid_or_evidence_free_report(db_session, test_project, report, reason):
+async def test_adhoc_gate_fails_for_final_invalid_or_evidence_free_report(db_session, test_project, report, reason):
     service, run, agent = await _adhoc_run(db_session, test_project.id)
     task = await _delegate_adhoc(db_session, service, run, agent, "a2")
     gate = await _adhoc_gate(db_session, task)
@@ -1000,7 +1000,7 @@ async def test_adhoc_gate_stays_open_for_invalid_or_evidence_free_report(db_sess
     await service.tick(db_session, run.id)
     await service.tick(db_session, run.id)
 
-    assert gate.status == "open" and gate.failure_reason == reason
+    assert gate.status == "failed" and gate.failure_reason == reason
 
 
 @pytest.mark.asyncio
@@ -1069,15 +1069,16 @@ async def test_adhoc_gate_accepts_report_repaired_on_the_clarification_task_mark
     service, run, agent = await _adhoc_run(db_session, test_project.id)
     task = await _delegate_adhoc(db_session, service, run, agent, "r1")
     gate = await _adhoc_gate(db_session, task)
-    await _finish(db_session, test_project.id, task, "not a report")
-    await service.tick(db_session, run.id)
-    assert gate.status == "open"
-
     clarification_id = uuid.uuid4()
     repair = await service.reserve_action(
         db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}", "create_delegation_task", {},
     )
     repair.target_id = clarification_id
+    await _finish(db_session, test_project.id, task, "not a report")
+    await service.tick(db_session, run.id)
+    # The repair is still pending, so the invalid first report is not final.
+    assert gate.status == "open" and gate.failure_reason == "Task report is invalid"
+
     marker = await service.reserve_action(
         db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{clarification_id}", "report_consumed",
         {"task_id": str(clarification_id), "session_id": None, "report": VALID_REPORT, "report_validation_errors": []},

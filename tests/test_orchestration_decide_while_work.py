@@ -377,7 +377,7 @@ async def _dispatch_adhoc(db, project, **over):
     from tests.test_orchestration_delegation_contracts import _adhoc_dep_setup, _delegation_request
 
     service, run, agent = await _adhoc_dep_setup(db, project)
-    run.plan_state = {"status": "requested", "planning_task_id": str(uuid.uuid4())}
+    run.plan_state = {"status": "requested", "planning_task_id": str(uuid.uuid4()), **over.pop("plan_state_extra", {})}
     project_id, agent_id = project.id, agent.id
     decisions = []
     for n, extra in enumerate(over.get("requests", [over])):
@@ -485,3 +485,50 @@ async def test_repeated_ticks_while_planning_after_noop_wake_when_do_not_ask_aga
     for _ in range(5):
         assert (await _reconcile_no_release(db_session, goal, run))["outcome"] == "waiting"
     assert len(await _orchestrator_waits(db_session, run)) == 1
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"decision_use": "Investigate whether to backfill timestamps"},
+        {"decision_use": "Why are busy workers dropped"},
+        {"scope": "audit idle capacity in autoscaling", "deliverable": "Show progress of the rollout audit"},
+    ],
+)
+async def test_filler_check_matches_whole_tokens_in_rationale_fields_only(over):
+    assert _rejection(**over) is None
+
+
+async def test_dispatcher_rejects_audit_depending_on_plan_output_artifact(db_session, test_project):
+    from huddleroom.models.artifact import Artifact
+
+    artifact = Artifact(project_id=test_project.id, name="plan", artifact_type="plan")
+    db_session.add(artifact)
+    await db_session.flush()
+    artifact_id = str(artifact.id)
+
+    actions, tasks = await _dispatch_adhoc(
+        db_session, test_project, artifact_ids=[artifact_id], plan_state_extra={"plan_artifact_id": artifact_id},
+    )
+
+    assert actions[0].status == "failed" and "depends on unfinished planning output" in actions[0].error
+    assert tasks == []
+
+
+async def test_planning_ticks_never_count_toward_the_no_progress_ask(db_session, test_project, test_agent):
+    from huddleroom.services.orchestration_supervision import UNCHANGED_WAKE_LIMIT
+
+    goal, run = await _planning_setup(db_session, test_project, test_agent)
+    situation = ProgressSituation(untracked_follow_ups=[STUCK], progress_view=NO_WORK)
+    supervision = OrchestrationService().supervision
+    now = _utcnow()
+    for _ in range(UNCHANGED_WAKE_LIMIT + 2):
+        now += timedelta(seconds=settings.orchestration_wake_max_seconds * 2 + 1)
+        state = dict(run.supervision_state or {})
+        assert await supervision._proactive_outcome(db_session, run, situation, frozenset(), state, now) == {"outcome": "continue"}
+    assert await _asks(db_session, run) == [] and not (run.supervision_state or {}).get("unchanged")
+
+    run.plan_state = {"status": "accepted"}  # control: once accepted the same stuck work is counted
+    state = dict(run.supervision_state or {})
+    await supervision._proactive_outcome(db_session, run, situation, frozenset(), state, now)
+    assert run.supervision_state["unchanged"]["n"] == 1

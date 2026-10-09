@@ -181,6 +181,7 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
 
 def delegation_optional_field_error(request: Mapping[str, Any]) -> str | None:
     """Type-check the optional create_delegation_task fields; None when all present ones are valid."""
+    request = {k: v for k, v in request.items() if v is not None}  # null means absent
     for key in ("title", "decision_use", "why_runnable"):
         if key in request and not isinstance(request[key], str):
             return f"{key} must be a string"
@@ -203,7 +204,7 @@ def delegation_optional_field_error(request: Mapping[str, Any]) -> str | None:
         except ValidationError:
             return "authorization_scope is not a valid authorization scope"
         if scope.external_writes.allowed or scope.live_sends.allowed:
-            return "authorization_scope cannot self-grant external writes or live sends; route them to ask_human"
+            return SELF_GRANT_ERROR
     return None
 
 
@@ -211,6 +212,7 @@ LABEL_WORDS = frozenset({
     "criterion", "criteria", "success", "for", "the", "a", "an", "to", "on", "of", "advance", "advances",
     "progress", "work", "complete", "satisfy", "meet", "cover",
 })
+SELF_GRANT_ERROR = "authorization_scope cannot self-grant external writes or live sends; route them to ask_human"
 FILLER_PHRASES = (
     "keep busy", "stay busy", "keep the team busy", "busy work", "busywork", "fill time", "fill capacity",
     "idle capacity", "show activity", "show progress",
@@ -242,8 +244,9 @@ def independent_work_rejection(
     if not residual(decision_use):
         return invalid("decision_use only names a success criterion")
     evidence = [e for e in request.get("success_evidence") or [] if isinstance(e, str)]
-    texts = [decision_use, request.get("scope"), request.get("deliverable"), request.get("why_runnable"), *evidence]
-    if any(phrase in " ".join(_normalized(t).split()) for t in texts if t for phrase in FILLER_PHRASES):
+    # Whole-token phrase match on the rationale fields only: scope/deliverable may legitimately mention such words.
+    rationale = [f" {' '.join(_normalized(t).split())} " for t in (decision_use, request.get("why_runnable")) if t]
+    if any(f" {phrase} " in text for text in rationale for phrase in FILLER_PHRASES):
         return invalid("work whose only rationale is keeping agents busy is not allowed")
     if not any(residual(e) for e in evidence):
         return invalid("name concrete expected evidence")

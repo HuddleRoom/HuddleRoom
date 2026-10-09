@@ -87,7 +87,9 @@ class OrchestrationSupervisionScheduler:
             "contract_version": await service.supervision._contract_version(db, goal, run),
             "context": snapshot,
         }
-        return payload, context.fingerprint_snapshot(payload)
+        # The provider sees concise unrelated reports; the fence fingerprints the full state.
+        full = await context.build(db, goal, run, body_limit=None, full_reports=True)
+        return payload, context.fingerprint_snapshot({**payload, "context": full})
 
     # pylint: disable=too-many-boolean-expressions
     async def _claim_judgment(self, run_id, now):

@@ -944,3 +944,20 @@ def test_canonical_request_rejects_invalid_authorization_scope(scope):
             {**_delegation_request(uuid.uuid4()), "authorization_scope": scope}
         )
     assert exc.value.status_code == 422
+
+
+@pytest.mark.parametrize("scope", [{"external_writes": {"allowed": True}}, {"live_sends": {"allowed": True}}])
+def test_canonical_request_rejects_self_granted_authorization_scope(scope):
+    with pytest.raises(HTTPException) as exc:
+        OrchestrationService()._canonical_delegation_task_request(
+            {**_delegation_request(uuid.uuid4()), "authorization_scope": scope}
+        )
+    assert exc.value.status_code == 422 and "self-grant" in exc.value.detail
+
+
+def test_canonical_request_accepts_null_optional_fields():
+    request = OrchestrationService()._canonical_delegation_task_request({
+        **_delegation_request(uuid.uuid4()), "decision_use": None, "authorization_scope": None, "priority": None,
+        "artifact_ids": None, "why_runnable": None, "title": None, "depends_on": None,
+    })
+    assert "decision_use" not in request and "authorization_scope" not in request

@@ -102,7 +102,7 @@ from huddleroom.services.graph_engine import GraphEngineService
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
-from huddleroom.services.orchestration_decision_validator import independent_work_rejection
+from huddleroom.services.orchestration_decision_validator import SELF_GRANT_ERROR, independent_work_rejection
 from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
     ADHOC_GATED_WORK_FUNCTIONS,
@@ -1049,6 +1049,7 @@ class OrchestrationService:
                 }
                 for gate in (await db.scalars(select(OrchestrationGate).where(
                     OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
+                    OrchestrationGate.gate_type != ADHOC_GATE_TYPE,
                 ).order_by(OrchestrationGate.created_at, OrchestrationGate.id)))
             ],
             "memory_preface": memory_preface,
@@ -4557,9 +4558,12 @@ class OrchestrationService:
         raw_scope = request_obj.get("authorization_scope")
         if raw_scope is not None:
             try:
-                canonical["authorization_scope"] = AuthorizationScope.model_validate(raw_scope).model_dump(mode="json")
+                scope = AuthorizationScope.model_validate(raw_scope)
             except ValidationError:
                 raise HTTPException(status_code=422, detail="authorization_scope is not a valid authorization scope")
+            if scope.external_writes.allowed or scope.live_sends.allowed:
+                raise HTTPException(status_code=422, detail=SELF_GRANT_ERROR)
+            canonical["authorization_scope"] = scope.model_dump(mode="json")
         return canonical
 
     def _follow_up_delegation_key(self, run_id: uuid.UUID, request: Mapping[str, Any]) -> str:
@@ -9697,7 +9701,11 @@ class OrchestrationService:
         if len(selected) < min_count:
             gate.failure_reason = "Missing evidence"
             return False
-        if gate.gate_type == ADHOC_GATE_TYPE and (reason := await self._adhoc_report_failure(db, gate)):
+        if gate.gate_type == ADHOC_GATE_TYPE and (failure := await self._adhoc_report_failure(db, gate)):
+            reason, final = failure
+            if final:
+                self._fail_gate(gate, reason)
+                return True
             gate.failure_reason = reason
             return False
 
@@ -9741,29 +9749,34 @@ class OrchestrationService:
         self._accept_gate(gate, selected)
         return True
 
-    async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> str | None:
-        """An ad-hoc audit gate accepts only a completed task whose consumed report is valid and has evidence."""
+    async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
+        """(reason, final) unless the done task's consumed report is valid with evidence.
+
+        An unusable report is final (the gate fails) unless a report-clarification repair is still pending."""
         from huddleroom.services.orchestration_work_report import persisted_report_validation
 
         task_id = self._optional_uuid(self._json_object_or_empty(gate.required_evidence).get("task_id"), "task_id")
         task = await db.get(Task, task_id) if task_id is not None else None
         if task is None or task.status != "done":
-            return "Task is not completed"
-        # A corrected report lands on the report-clarification task's own marker.
+            return "Task is not completed", False
         clarification = await self._existing_action_for_key(
             db, gate.run_id, f"run:{gate.run_id}:kind:report_clarification:task:{task.id}"
         )
-        for source_id in (task.id, clarification.target_id if clarification is not None else None):
-            marker = await self._existing_action_for_key(
-                db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{source_id}"
-            ) if source_id is not None else None
+        sources = [task.id, clarification.target_id if clarification is not None else None]
+        markers = [
+            await self._existing_action_for_key(db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{source}")
+            if source is not None else None
+            for source in sources
+        ]
+        for marker in markers:
             request = self._json_object_or_empty(marker.request) if marker is not None else {}
-            report = persisted_report_validation(
-                request.get("report"), request.get("report_validation_errors", [])
-            ).report
+            report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
             if report is not None:
-                return None if report.candidate_evidence else "Task report has no evidence"
-        return "Task report is missing or invalid"
+                return None if report.candidate_evidence else ("Task report has no evidence", True)
+        if markers[0] is None:
+            return "Task report is missing", False
+        repair_pending = clarification is not None and markers[1] is None
+        return "Task report is invalid", not repair_pending
 
     def _select_required_evidence(
         self,

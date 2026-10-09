@@ -293,6 +293,8 @@ class OrchestrationSupervisionService:
 
         # ponytail: time-gated counter (wake_max_seconds * 2**asks between increments), not per-wake tracking.
         """
+        if plan_in_flight(run.plan_state):
+            return {"outcome": "continue"}  # planning is the expected wait: never count it as "no progress"
         follow_ups, no_work = self._actionable(situation, held)
         digest = self.orchestration._stable_hash({
             "follow_up_ids": sorted(i["id"] for i in follow_ups), "no_work_ids": no_work,

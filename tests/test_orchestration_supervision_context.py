@@ -457,3 +457,16 @@ async def test_fingerprint_uses_full_reports(db_session, test_project):
 
     assert await builder.fingerprint(db_session, goal, run) != before
     assert _report_of(await builder.build(db_session, goal, run), tasks["unrelated"])["changes"] == changes[:3]
+
+
+async def test_decision_context_open_gates_exclude_adhoc_gates(db_session, test_project):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    db_session.add_all([
+        OrchestrationGate(run_id=run.id, success_criterion_key="adhoc_task:x", gate_type="adhoc_work_accepted"),
+        OrchestrationGate(run_id=run.id, success_criterion_key="plan_item:a", gate_type="work_completed"),
+    ])
+    await db_session.flush()
+
+    context = await OrchestrationService()._decision_context(db_session, goal, run)
+
+    assert [g["gate_type"] for g in context["open_gates"]] == ["work_completed"]

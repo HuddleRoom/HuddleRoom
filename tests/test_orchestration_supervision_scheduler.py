@@ -73,3 +73,28 @@ async def test_steering_change_wakes_the_matching_run(db_session, test_project):
     assert await OrchestrationSupervisionScheduler().record_event(
         db_session, "orchestration.steering_changed", {"run_id": str(run.id)}
     ) == [run.id]
+
+
+async def test_judgment_fence_fingerprints_full_reports_while_payload_is_concise(db_session, test_project):
+    from types import SimpleNamespace
+
+    from huddleroom.services.orchestration_supervision_context import OrchestrationSupervisionContextBuilder
+    from tests.test_orchestration_supervision_context import _report_run
+
+    goal, run, _tasks, _markers = await _report_run(db_session, test_project.id)
+
+    async def contract_version(db, goal, run):
+        return "v1"
+
+    service = SimpleNamespace(supervision=SimpleNamespace(_contract_version=contract_version))
+    builder = OrchestrationSupervisionContextBuilder()
+    payload, fingerprint = await OrchestrationSupervisionScheduler._judgment_payload(db_session, service, builder, goal, run)
+
+    full = await builder.build(db_session, goal, run, body_limit=None, full_reports=True)
+    assert fingerprint == builder.fingerprint_snapshot({**payload, "context": full})
+    assert fingerprint != builder.fingerprint_snapshot(payload)  # the provider payload itself is concise
+    (unrelated,) = [
+        a for a in payload["context"]["actions"]
+        if a["action_type"] == "report_consumed" and a["request"]["task_id"] == str(_tasks["unrelated"].id)
+    ]
+    assert unrelated["request"]["report"]["truncated"] == {"changes": 5, "decisions": 4}

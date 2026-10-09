@@ -753,3 +753,10 @@ def test_create_delegation_task_unknown_key_still_rejected():
     result = validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], "colour": "red"})
 
     assert result.accepted is False and "unknown top-level key: colour" in result.rejection_reason
+
+
+@pytest.mark.parametrize(
+    "key", ["title", "decision_use", "why_runnable", "priority", "artifact_ids", "depends_on", "authorization_scope"]
+)
+def test_create_delegation_task_null_optional_fields_are_treated_as_absent(key):
+    assert validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], key: None}).accepted is True
