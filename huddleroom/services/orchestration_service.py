@@ -4383,9 +4383,9 @@ class OrchestrationService:
         if isinstance(title, str) and title.strip():
             canonical["title"] = title.strip()
         raw_deps = request_obj.get("depends_on")
+        if raw_deps is not None and not isinstance(raw_deps, list):
+            raise HTTPException(status_code=422, detail="depends_on must be a list of task UUIDs")
         if raw_deps:  # absent/empty keeps legacy action keys byte-identical
-            if not isinstance(raw_deps, list):
-                raise HTTPException(status_code=422, detail="depends_on must be a list of task UUIDs")
             deps = [str(self._required_uuid(d, "depends_on")) for d in raw_deps]
             if len(set(deps)) != len(deps):
                 raise HTTPException(status_code=422, detail="depends_on must not contain duplicates")
@@ -8483,7 +8483,10 @@ class OrchestrationService:
         # ponytail: no gate-accepted event; a done dependency with an open gate is released by the wait recheck (orchestration_wake_max_seconds)
         unmet = await first_unmet_dependency(db, run, task)
         if unmet is not None:
-            return f"dependency task {unmet[0]} (gate {unmet[1]})", unmet[0]
+            dep = await db.get(Task, unmet[0])
+            # A cancelled or missing predecessor never finishes: not a wait, so the owner is asked at once.
+            if dep is not None and dep.status != "cancelled":
+                return f"dependency task {unmet[0]} (gate {unmet[1]})", unmet[0]
         session_id = await self._first_id(db, select(Session.id).where(
             Session.task_id == task.id, Session.status.in_(["pending", "running"])))
         if session_id is not None:
@@ -8957,7 +8960,9 @@ class OrchestrationService:
             # ponytail: only never-started tasks; recovery/retry/reassign own tasks that already had a session.
             if await db.scalar(select(Session.id).where(Session.task_id == task.id).limit(1)) is not None:
                 continue
-            if await self._blocked_task_awaiting(db, run, task) is not None:  # open dependency / meeting / graph run
+            if await first_unmet_dependency(db, run, task) is not None:  # predecessor gate not accepted
+                continue
+            if await self._blocked_task_awaiting(db, run, task) is not None:  # meeting / graph run
                 continue
             await TaskService().auto_start(db, task)
             if task.status == "in_progress":

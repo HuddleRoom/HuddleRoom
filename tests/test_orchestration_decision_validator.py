@@ -696,3 +696,12 @@ def test_create_delegation_task_depends_on_rejects_duplicates():
     result = validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], "depends_on": [dep, dep]})
 
     assert result.accepted is False
+
+
+def test_create_delegation_task_depends_on_rejects_case_variant_duplicates():
+    dep = _id()
+    result = validate_orchestration_decision(
+        {**ALLOWED_DECISIONS["create_delegation_task"], "depends_on": [dep, dep.upper()]}
+    )
+
+    assert result.accepted is False

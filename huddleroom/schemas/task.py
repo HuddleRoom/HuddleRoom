@@ -50,8 +50,15 @@ class TaskResponse(BaseModel):
 
     @field_validator("depends_on", mode="before")
     @classmethod
-    def _none_depends_on_is_empty(cls, value):
-        return [] if value is None else value
+    def _tolerant_depends_on(cls, value):
+        # Stored JSON may be None or hold malformed entries; skip those like dependency_ids does.
+        ids = []
+        for raw in value if isinstance(value, list) else []:
+            try:
+                ids.append(UUID(str(raw)))
+            except ValueError:
+                continue
+        return ids
 
 
 class StatusPatch(BaseModel):

@@ -787,7 +787,7 @@ async def test_adhoc_delegation_without_dependency_keeps_legacy_request(db_sessi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["missing", "cross_project", "cross_run", "no_gate", "duplicate", "malformed", "not_list"])
+@pytest.mark.parametrize("case", ["missing", "cross_project", "cross_run", "no_gate", "duplicate", "duplicate_case", "malformed", "not_list", "empty_string", "empty_object", "zero"])
 async def test_adhoc_delegation_rejects_invalid_dependency_without_side_effects(db_session, test_project, case):
     from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 
@@ -802,9 +802,17 @@ async def test_adhoc_delegation_rejects_invalid_dependency_without_side_effects(
         "cross_run": [str((await _dep_task(db_session, test_project.id, run, run_id="other")).id)],
         "no_gate": [str((await _dep_task(db_session, test_project.id, run, gate=False)).id)],
         "duplicate": [str(good.id), str(good.id)],
+        "duplicate_case": [str(good.id), str(good.id).upper()],
         "malformed": ["not-a-uuid"],
         "not_list": str(good.id),
+        "empty_string": "",
+        "empty_object": {},
+        "zero": 0,
     }[case]
+    expected_detail = (
+        "depends_on" if case in {"duplicate", "duplicate_case", "malformed", "not_list", "empty_string", "empty_object", "zero"}
+        else "dependency_invalid:"
+    )
     tasks_before = await _task_count(db_session, test_project.id)
     actions_before = await _action_count(db_session, run.id)
     decisions_before = await db_session.scalar(select(count(OrchestrationAuthorityDecision.id)))
@@ -814,6 +822,7 @@ async def test_adhoc_delegation_rejects_invalid_dependency_without_side_effects(
         await _delegate(service, run, agent, case, db=db_session, depends_on=deps)
 
     assert 400 <= exc_info.value.status_code < 500
+    assert expected_detail in exc_info.value.detail
     assert await _task_count(db_session, test_project.id) == tasks_before
     assert await _action_count(db_session, run.id) == actions_before
     assert await db_session.scalar(select(count(OrchestrationAuthorityDecision.id))) == decisions_before

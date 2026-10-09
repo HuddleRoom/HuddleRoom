@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from huddleroom.models.orchestration import OrchestrationGate
+from huddleroom.models.orchestration import OrchestrationGate, OrchestrationGoal
 from huddleroom.models.task import Task
 
 
@@ -44,18 +44,19 @@ def gate_satisfies(gate: OrchestrationGate | None, run_id: uuid.UUID) -> bool:
     return gate is not None and gate.run_id == run_id and gate.status == "accepted"
 
 
-async def dependency_satisfied(db: AsyncSession, run, task_id: uuid.UUID) -> bool:
+async def _gate_for_dependency(db: AsyncSession, run, task_id: uuid.UUID) -> OrchestrationGate | None:
     dep = await db.get(Task, task_id)
     gate_id = task_gate_id(dep, run.id) if dep is not None else None
-    gate = await db.get(OrchestrationGate, gate_id) if gate_id is not None else None
-    return gate_satisfies(gate, run.id)
+    return await db.get(OrchestrationGate, gate_id) if gate_id is not None else None
+
+
+async def dependency_satisfied(db: AsyncSession, run, task_id: uuid.UUID) -> bool:
+    return gate_satisfies(await _gate_for_dependency(db, run, task_id), run.id)
 
 
 async def first_unmet_dependency(db: AsyncSession, run, task: Task) -> tuple[uuid.UUID, str] | None:
     for dep_id in dependency_ids(task):
-        dep = await db.get(Task, dep_id)
-        gate_id = task_gate_id(dep, run.id) if dep is not None else None
-        gate = await db.get(OrchestrationGate, gate_id) if gate_id is not None else None
+        gate = await _gate_for_dependency(db, run, dep_id)
         if not gate_satisfies(gate, run.id):
             return dep_id, gate.status if gate is not None else "none"
     return None
@@ -76,8 +77,6 @@ async def validate_dependencies(
         return
     if self_id is not None and self_id in dep_ids:
         raise _invalid("task cannot depend on itself")
-    from huddleroom.models.orchestration import OrchestrationGoal
-
     goal = await db.get(OrchestrationGoal, run.goal_id)
     tasks = {t.id: t for t in (await db.execute(select(Task).where(Task.id.in_(dep_ids)))).scalars()}
     for dep_id in dep_ids:

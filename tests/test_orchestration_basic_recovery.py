@@ -572,15 +572,26 @@ async def test_blocked_task_asks_owner_once_wait_bound_is_exceeded(db_session, t
 
 
 @pytest.mark.asyncio
-async def test_blocked_task_with_cancelled_dependency_and_open_gate_still_awaits(db_session, test_project):
+async def test_blocked_task_with_cancelled_dependency_is_not_awaiting(db_session, test_project):
     service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="dep failed")
     await _with_dependency(db_session, test_project, run, task, agent, status="cancelled")
 
     await service.recover_run(db_session, run.id, baseline_ready=True)
 
-    # Only an accepted gate releases a dependency; the bounded wait later escalates to the owner.
-    assert len(await _task_waits(db_session, run.id)) == 1
-    assert await _actions(db_session, run.id, "ask_human") == []
+    assert await _task_waits(db_session, run.id) == []
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_missing_dependency_is_not_awaiting(db_session, test_project):
+    service, _goal, run, task, _agent = await _blocked_setup(db_session, test_project, reason="dep gone")
+    task.depends_on = [str(uuid.uuid4())]
+    await db_session.flush()
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert await _task_waits(db_session, run.id) == []
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
 
 
 @pytest.mark.asyncio

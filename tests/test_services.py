@@ -1932,6 +1932,9 @@ async def test_task_create_depends_on_stored_as_strings_and_returned_as_uuids(db
     assert task.depends_on == [str(dep.id)]
     assert TaskResponse.model_validate(task).depends_on == [dep.id]
 
+    task.depends_on = [str(dep.id), "not-a-uuid", 7]  # corrupt stored entries are skipped, not a 500
+    assert TaskResponse.model_validate(task).depends_on == [dep.id]
+
 
 @pytest.mark.asyncio
 async def test_task_create_depends_on_rejects_invalid(db_session: AsyncSession, test_project):

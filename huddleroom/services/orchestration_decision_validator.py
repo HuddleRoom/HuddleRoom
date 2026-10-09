@@ -158,7 +158,11 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
 
     if action_type == "create_delegation_task" and "depends_on" in decision:
         deps = decision["depends_on"]
-        if not isinstance(deps, list) or not all(_is_uuid_string(d) for d in deps) or len(set(deps)) != len(deps):
+        if (
+            not isinstance(deps, list)
+            or not all(_is_uuid_string(d) for d in deps)
+            or len({str(UUID(d)) for d in deps}) != len(deps)
+        ):
             return DecisionValidationResult(
                 False, "Decision 'create_delegation_task' depends_on must be a list of distinct task UUIDs"
             )
