@@ -16,6 +16,7 @@ from huddleroom.models.session import Session
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
+from huddleroom.services.orchestration_dependencies import first_unmet_dependency
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE as _ORCH_OWNER
 
 from huddleroom.services.orchestration_decision_validator import (
@@ -625,8 +626,8 @@ class OrchestrationSupervisionService:
         task_by_id = {str(t.id): t for t in active_tasks}
         held = (
             {str(i) for i in provider_task_ids} | {str(i) for i in sessions_by_task}
-            | {tid for tid, t in task_by_id.items() if any(str(d) in task_by_id for d in (t.depends_on or []))}
         )
+        held |= {tid for tid, t in task_by_id.items() if t.depends_on and await first_unmet_dependency(db, run, t)}
         # A gate whose owner question is pending is not actionable (ask_human links decision -> gate via the action).
         pending = (await db.execute(select(OrchestrationAuthorityDecision.id, OrchestrationAuthorityDecision.related_gate_id).where(
             OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending"))).all()

@@ -240,12 +240,14 @@ async def test_blocked_task_waiting_on_unmet_dependency_has_no_actions(db_sessio
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task"]
     assert stalled[0]["suggested_actions"] == []
-    assert stalled[0]["summary"] == f"{task.title} is blocked (waiting on task {dependency.title} (in_progress))"
+    assert stalled[0]["summary"] == f"{task.title} is blocked (waiting on task {dependency.title} (in_progress, gate none))"
 
 
 async def test_blocked_task_with_done_dependency_is_not_waiting(db_session, test_project):
     goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
     dependency = await _task(db_session, test_project, run, status="done")
+    gate = await _gate(db_session, run, "dep", status="accepted")
+    dependency.metadata_ = {"orchestration": {"run_id": str(run.id), "gate_id": str(gate.id)}}
     task = await _task(db_session, test_project, run, status="blocked")
     task.depends_on = [str(dependency.id)]
     await db_session.flush()
@@ -255,7 +257,21 @@ async def test_blocked_task_with_done_dependency_is_not_waiting(db_session, test
     assert stalled[0]["summary"] == f"{task.title} is blocked"
 
 
-async def test_blocked_task_with_failed_dependency_is_not_waiting(db_session, test_project):
+async def test_blocked_task_with_done_dependency_and_open_gate_waits(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    dependency = await _task(db_session, test_project, run, status="done")
+    gate = await _gate(db_session, run, "dep", status="open")
+    dependency.metadata_ = {"orchestration": {"run_id": str(run.id), "gate_id": str(gate.id)}}
+    task = await _task(db_session, test_project, run, status="blocked")
+    task.depends_on = [str(dependency.id)]
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    stalled = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task" and f["id"] == str(task.id)]
+    assert stalled[0]["suggested_actions"] == []
+    assert stalled[0]["summary"] == f"{task.title} is blocked (waiting on task {dependency.title} (done, gate open))"
+
+
+async def test_blocked_task_with_failed_dependency_waits_without_gate(db_session, test_project):
     goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
     dependency = await _task(db_session, test_project, run, status="failed")
     task = await _task(db_session, test_project, run, status="blocked")
@@ -263,8 +279,8 @@ async def test_blocked_task_with_failed_dependency_is_not_waiting(db_session, te
     await db_session.flush()
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     blocked = [f for f in situation.untracked_follow_ups if f["kind"] == "stalled_task" and f["id"] == str(task.id)]
-    assert blocked[0]["summary"] == f"{task.title} is blocked"
-    assert blocked[0]["suggested_actions"] == ["reassign_task", "ask_human"]
+    assert blocked[0]["summary"] == f"{task.title} is blocked (waiting on task {dependency.title} (failed, gate none))"
+    assert blocked[0]["suggested_actions"] == []
 
 
 async def test_blocked_task_with_live_session_waits_on_it(db_session, test_project, test_agent):

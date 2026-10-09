@@ -101,6 +101,11 @@ from huddleroom.services.graph_engine import GraphEngineService
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
+from huddleroom.services.orchestration_dependencies import (
+    first_unmet_dependency,
+    task_gate_id,
+    validate_dependencies,
+)
 
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
@@ -1609,6 +1614,9 @@ class OrchestrationService:
         parent_task_id = None
         if existing is None:
             _, agent, parent_task_id = await self._validate_delegation_targets(db, run_id, request_to_store)
+            await validate_dependencies(
+                db, gate_run, [uuid.UUID(d) for d in request_to_store.get("depends_on") or []]
+            )
             authority = await self.roadmap_pre_release_authority(
                 db, run_id, agent,
                 self._json_object_or_empty(request_to_store.get("orchestrator_context")),
@@ -1729,6 +1737,7 @@ class OrchestrationService:
                 description=self._delegation_task_description(goal, contract),
                 assigned_to=agent_id,
                 parent_id=parent_task_id,
+                depends_on=contract.depends_on,
                 metadata={
                     "orchestration": {
                         "goal_id": str(goal.id),
@@ -4373,6 +4382,14 @@ class OrchestrationService:
         title = request_obj.get("title")
         if isinstance(title, str) and title.strip():
             canonical["title"] = title.strip()
+        raw_deps = request_obj.get("depends_on")
+        if raw_deps:  # absent/empty keeps legacy action keys byte-identical
+            if not isinstance(raw_deps, list):
+                raise HTTPException(status_code=422, detail="depends_on must be a list of task UUIDs")
+            deps = [str(self._required_uuid(d, "depends_on")) for d in raw_deps]
+            if len(set(deps)) != len(deps):
+                raise HTTPException(status_code=422, detail="depends_on must not contain duplicates")
+            canonical["depends_on"] = deps
         return canonical
 
     def _follow_up_delegation_key(self, run_id: uuid.UUID, request: Mapping[str, Any]) -> str:
@@ -7499,23 +7516,14 @@ class OrchestrationService:
         run_id: uuid.UUID,
         task: Task,
     ) -> tuple[OrchestrationGate, dict[str, Any]] | None:
-        task_metadata = self._json_object_or_empty(task.metadata_)
-        orchestration = self._json_object_or_empty(task_metadata.get("orchestration"))
-        if orchestration.get("run_id") != str(run_id):
-            return None
-
-        gate_id = self._event_uuid(orchestration.get("gate_id"))
-        if gate_id is None:
-            gate_id = self._event_uuid(orchestration.get("plan_item_gate_id"))
-        if gate_id is None:
-            plan_item_metadata = self._json_object_or_empty(task_metadata.get("orchestration_plan_item"))
-            gate_id = self._event_uuid(plan_item_metadata.get("plan_item_gate_id"))
+        gate_id = task_gate_id(task, run_id)
         if gate_id is None:
             return None
 
         gate = await db.get(OrchestrationGate, gate_id)
         if gate is None or gate.run_id != run_id:
             return None
+        orchestration = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))
         return gate, orchestration
 
     async def _record_evidence_once(
@@ -8387,7 +8395,7 @@ class OrchestrationService:
         )))
         if any(wait.status == "open" for wait in waits):
             return 0
-        awaiting = await self._blocked_task_awaiting(db, task)
+        awaiting = await self._blocked_task_awaiting(db, run, task)
         # ponytail: waiting is bounded by elapsed time (24 wake windows since the episode's first wait), not wait count.
         stamps = [w.created_at if w.created_at.tzinfo else w.created_at.replace(tzinfo=timezone.utc)
                   for w in waits if in_episode(w)]
@@ -8468,19 +8476,14 @@ class OrchestrationService:
             await self._after_savepoint_rollback(db, run, marks)
             raise
 
-    async def _blocked_task_awaiting(self, db: AsyncSession, task: Task) -> tuple[str, uuid.UUID] | None:
+    async def _blocked_task_awaiting(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task
+    ) -> tuple[str, uuid.UUID] | None:
         """(label, task id whose status event ends the wait) for what a blocked task awaits, or None."""
-        dep_ids = []
-        for raw in task.depends_on or []:
-            try:
-                dep_ids.append(uuid.UUID(str(raw)))
-            except ValueError:
-                continue
-        if dep_ids:
-            dep = await db.scalar(select(Task.id).where(
-                Task.id.in_(dep_ids), Task.status.in_(["backlog", "ready", "in_progress", "blocked"])).limit(1))
-            if dep is not None:
-                return f"dependency task {dep}", dep
+        # ponytail: no gate-accepted event; a done dependency with an open gate is released by the wait recheck (orchestration_wake_max_seconds)
+        unmet = await first_unmet_dependency(db, run, task)
+        if unmet is not None:
+            return f"dependency task {unmet[0]} (gate {unmet[1]})", unmet[0]
         session_id = await self._first_id(db, select(Session.id).where(
             Session.task_id == task.id, Session.status.in_(["pending", "running"])))
         if session_id is not None:
@@ -8954,7 +8957,7 @@ class OrchestrationService:
             # ponytail: only never-started tasks; recovery/retry/reassign own tasks that already had a session.
             if await db.scalar(select(Session.id).where(Session.task_id == task.id).limit(1)) is not None:
                 continue
-            if await self._blocked_task_awaiting(db, task) is not None:  # open dependency / meeting / graph run
+            if await self._blocked_task_awaiting(db, run, task) is not None:  # open dependency / meeting / graph run
                 continue
             await TaskService().auto_start(db, task)
             if task.status == "in_progress":

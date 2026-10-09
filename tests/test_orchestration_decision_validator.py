@@ -671,3 +671,28 @@ def test_applies_decision_id_must_be_uuid(value):
 
     assert result.accepted is False
     assert result.rejection_reason == "applies_decision_id must be a UUID"
+
+
+def test_create_delegation_task_depends_on_accepts_distinct_uuids():
+    decision = {**ALLOWED_DECISIONS["create_delegation_task"], "depends_on": [_id(), _id()]}
+
+    assert validate_orchestration_decision(decision).accepted is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-list", [123], ["not-a-uuid"], [None], [{"id": "x"}]],
+    ids=["scalar", "int", "text", "null", "object"],
+)
+def test_create_delegation_task_depends_on_rejects_malformed(value):
+    result = validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], "depends_on": value})
+
+    assert result.accepted is False
+    assert result.rejection_reason == "Decision 'create_delegation_task' depends_on must be a list of distinct task UUIDs"
+
+
+def test_create_delegation_task_depends_on_rejects_duplicates():
+    dep = _id()
+    result = validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], "depends_on": [dep, dep]})
+
+    assert result.accepted is False

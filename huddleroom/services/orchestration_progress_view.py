@@ -25,6 +25,7 @@ from huddleroom.models.orchestration import (
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.services.orchestration_dependencies import dependency_ids, gate_satisfies, task_gate_id
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
 
 logger = logging.getLogger(__name__)
@@ -82,16 +83,6 @@ def _orchestration_meta(task: Task) -> dict:
     return orchestration if isinstance(orchestration, dict) else {}
 
 
-def _depends_on_ids(task: Task) -> list[uuid.UUID]:
-    ids: list[uuid.UUID] = []
-    for raw in task.depends_on or []:
-        try:
-            ids.append(uuid.UUID(str(raw)))
-        except ValueError:
-            continue
-    return ids
-
-
 def _block_reason(task: Task) -> str | None:
     meta = task.metadata_ if isinstance(task.metadata_, dict) else {}
     blocked = meta.get("blocked")
@@ -102,14 +93,20 @@ def _block_reason(task: Task) -> str | None:
 
 
 def _blocked_wait(
-    task: Task, live_sessions: dict[str, str], dependencies: dict[str, tuple[str, str]],
+    task: Task, live_sessions: dict[str, str], dependencies: dict[str, Task],
+    gates_by_id: dict[uuid.UUID, OrchestrationGate], run_id: uuid.UUID,
     meetings: dict[str, str], graph_runs: dict[str, str],
 ) -> str | None:
     """What a blocked task waits on, in service order: unmet dependency, live session, active meeting, active graph run."""
-    for dep_id in _depends_on_ids(task):
+    for dep_id in dependency_ids(task):
         dep = dependencies.get(str(dep_id))
-        if dep is not None and dep[1] in {"backlog", "ready", "in_progress", "blocked"}:
-            return f"waiting on task {dep[0]} ({dep[1]})"
+        gate_id = task_gate_id(dep, run_id) if dep is not None else None
+        gate = gates_by_id.get(gate_id) if gate_id is not None else None
+        if not gate_satisfies(gate, run_id):
+            return (
+                f"waiting on task {dep.title if dep else dep_id} "
+                f"({dep.status if dep else 'missing'}, gate {gate.status if gate else 'none'})"
+            )
     session_status = live_sessions.get(str(task.id))
     if session_status:
         return f"session {session_status}"
@@ -294,9 +291,10 @@ async def _follow_up_rows(
             continue
         stalled.append(task)
     blocked = [task for task in stalled if task.status == "blocked"]
+    gates_by_id = {gate.id: gate for gate in gates}
     # Blocked tasks: batched queries for live sessions, dependency tasks, active meetings and active graph runs.
     live_sessions: dict[str, str] = {}
-    dependencies: dict[str, tuple[str, str]] = {}
+    dependencies: dict[str, Task] = {}
     meetings: dict[str, str] = {}
     graph_runs: dict[str, str] = {}
     if blocked:
@@ -308,13 +306,11 @@ async def _follow_up_rows(
             ).order_by(Session.created_at.asc(), Session.id.asc())
         )).all():
             live_sessions.setdefault(str(session_task_id), session_status)
-        dependency_ids = {dep for task in blocked for dep in _depends_on_ids(task)}
-        if dependency_ids:
+        dep_ids = {dep for task in blocked for dep in dependency_ids(task)}
+        if dep_ids:
             dependencies = {
-                str(dep_id): (dep_title, dep_status)
-                for dep_id, dep_title, dep_status in (await db.execute(
-                    select(Task.id, Task.title, Task.status).where(Task.id.in_(list(dependency_ids)))
-                )).all()
+                str(dep.id): dep
+                for dep in (await db.execute(select(Task).where(Task.id.in_(list(dep_ids))))).scalars()
             }
         for meeting_task_id, meeting_title in (await db.execute(
             select(Meeting.source_task_id, Meeting.title).where(
@@ -336,7 +332,7 @@ async def _follow_up_rows(
             summary = f"{task.title} is failed"
             suggested = ["retry_task", "reassign_task"]
         else:
-            waiting = _blocked_wait(task, live_sessions, dependencies, meetings, graph_runs)
+            waiting = _blocked_wait(task, live_sessions, dependencies, gates_by_id, run.id, meetings, graph_runs)
             summary = f"{task.title} is blocked" + (f" ({waiting})" if waiting else "")
             suggested = [] if waiting else ["reassign_task", "ask_human"]
             reason = _block_reason(task)

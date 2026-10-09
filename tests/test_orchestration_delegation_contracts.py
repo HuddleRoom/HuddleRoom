@@ -8,7 +8,9 @@ from sqlalchemy.sql.functions import count
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.event_log import EventLog
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import (
+    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun,
+)
 from huddleroom.models.project import Project
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationDelegationContract, OrchestrationGoalCreate
@@ -739,3 +741,92 @@ async def test_validate_dependencies_rejects_each_invalid_case(db_session, test_
     good.depends_on = [str(new_id)]
     await db_session.flush()
     await rejected([good.id], self_id=new_id)
+
+
+# --- ad-hoc create_delegation_task.depends_on --------------------------------
+
+async def _adhoc_dep_setup(db_session, project):
+    agent = _agent("delegate", capabilities=["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, project.id)
+    return service, run, agent
+
+
+async def _delegate(service, run, agent, key, *, db, **extra):
+    return await service.execute_create_delegation_task_action(
+        db, run_id=run.id, request={**_delegation_request(agent.id), **extra}, idempotency_key=f"run:t8b:{key}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_adhoc_delegation_stores_validated_dependency_everywhere(db_session, test_project):
+    from huddleroom.schemas.task import TaskResponse
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    dep = await _dep_task(db_session, test_project.id, run)
+
+    action = await _delegate(service, run, agent, "ok", db=db_session, depends_on=[f" {dep.id} "])
+
+    task = await db_session.get(Task, action.id)
+    assert action.request["depends_on"] == [str(dep.id)]
+    assert task.depends_on == [str(dep.id)]
+    assert task.metadata_["orchestration_contract"]["depends_on"] == [str(dep.id)]
+    assert TaskResponse.model_validate(task).depends_on == [dep.id]
+
+
+@pytest.mark.asyncio
+async def test_adhoc_delegation_without_dependency_keeps_legacy_request(db_session, test_project):
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+
+    action = await _delegate(service, run, agent, "none", db=db_session, depends_on=[])
+
+    assert "depends_on" not in action.request
+    assert action.request == _canonical_request(agent.id)
+    assert (await db_session.get(Task, action.id)).depends_on is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "cross_project", "cross_run", "no_gate", "duplicate", "malformed", "not_list"])
+async def test_adhoc_delegation_rejects_invalid_dependency_without_side_effects(db_session, test_project, case):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    other = Project(name="Other", description="o", workspace_path="/tmp/other-dep-8b", config={})
+    db_session.add(other)
+    await db_session.flush()
+    good = await _dep_task(db_session, test_project.id, run)
+    deps = {
+        "missing": [str(uuid.uuid4())],
+        "cross_project": [str((await _dep_task(db_session, other.id, run)).id)],
+        "cross_run": [str((await _dep_task(db_session, test_project.id, run, run_id="other")).id)],
+        "no_gate": [str((await _dep_task(db_session, test_project.id, run, gate=False)).id)],
+        "duplicate": [str(good.id), str(good.id)],
+        "malformed": ["not-a-uuid"],
+        "not_list": str(good.id),
+    }[case]
+    tasks_before = await _task_count(db_session, test_project.id)
+    actions_before = await _action_count(db_session, run.id)
+    decisions_before = await db_session.scalar(select(count(OrchestrationAuthorityDecision.id)))
+    reservations_before = await db_session.scalar(select(count(OrchestrationBudgetReservation.id)))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _delegate(service, run, agent, case, db=db_session, depends_on=deps)
+
+    assert 400 <= exc_info.value.status_code < 500
+    assert await _task_count(db_session, test_project.id) == tasks_before
+    assert await _action_count(db_session, run.id) == actions_before
+    assert await db_session.scalar(select(count(OrchestrationAuthorityDecision.id))) == decisions_before
+    assert await db_session.scalar(select(count(OrchestrationBudgetReservation.id))) == reservations_before
+
+
+@pytest.mark.asyncio
+async def test_task_terminal_state_alone_does_not_satisfy_adhoc_dependency(db_session, test_project):
+    from huddleroom.services.orchestration_dependencies import first_unmet_dependency
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    dep = await _dep_task(db_session, test_project.id, run, status="done")
+    action = await _delegate(service, run, agent, "gated", db=db_session, depends_on=[str(dep.id)])
+    task = await db_session.get(Task, action.id)
+
+    assert await first_unmet_dependency(db_session, run, task) == (dep.id, "open")

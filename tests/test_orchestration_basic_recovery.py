@@ -424,7 +424,8 @@ async def test_blocked_task_with_unfinished_dependency_waits(db_session, test_pr
 async def test_blocked_task_with_done_dependency_is_not_a_wait(db_session, test_project):
     service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="why")
     dep = await _make_orchestrated_task(
-        db_session, test_project.id, run.id, (await _make_gate(db_session, run.id)).id, agent.id, status="done",
+        db_session, test_project.id, run.id, (await _make_gate(db_session, run.id, status="accepted")).id, agent.id,
+        status="done",
     )
     task.depends_on = [str(dep.id)]
     await db_session.flush()
@@ -433,6 +434,17 @@ async def test_blocked_task_with_done_dependency_is_not_a_wait(db_session, test_
 
     assert await _task_waits(db_session, run.id) == []
     assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_done_dependency_and_open_gate_waits(db_session, test_project):
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="why")
+    await _with_dependency(db_session, test_project, run, task, agent, status="done")
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert len(await _task_waits(db_session, run.id)) == 1
+    assert await _actions(db_session, run.id, "ask_human") == []
 
 
 @pytest.mark.asyncio
@@ -560,14 +572,15 @@ async def test_blocked_task_asks_owner_once_wait_bound_is_exceeded(db_session, t
 
 
 @pytest.mark.asyncio
-async def test_blocked_task_with_cancelled_dependency_is_not_awaiting(db_session, test_project):
+async def test_blocked_task_with_cancelled_dependency_and_open_gate_still_awaits(db_session, test_project):
     service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="dep failed")
     await _with_dependency(db_session, test_project, run, task, agent, status="cancelled")
 
     await service.recover_run(db_session, run.id, baseline_ready=True)
 
-    assert await _task_waits(db_session, run.id) == []
-    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+    # Only an accepted gate releases a dependency; the bounded wait later escalates to the owner.
+    assert len(await _task_waits(db_session, run.id)) == 1
+    assert await _actions(db_session, run.id, "ask_human") == []
 
 
 @pytest.mark.asyncio

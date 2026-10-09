@@ -44,6 +44,7 @@ OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
             "report_schema",
             "parent_task_id",
             "source_session_id",
+            "depends_on",
         }
     ),
     "ask_human": frozenset(
@@ -154,6 +155,13 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
             False,
             f"Decision 'record_warning' severity must be one of: {', '.join(WARNING_SEVERITY_VALUES)}",
         )
+
+    if action_type == "create_delegation_task" and "depends_on" in decision:
+        deps = decision["depends_on"]
+        if not isinstance(deps, list) or not all(_is_uuid_string(d) for d in deps) or len(set(deps)) != len(deps):
+            return DecisionValidationResult(
+                False, "Decision 'create_delegation_task' depends_on must be a list of distinct task UUIDs"
+            )
 
     if action_type == "retry_task":
         for key in ("timeout", "max_tokens"):

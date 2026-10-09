@@ -61,3 +61,31 @@ async def test_tick_leaves_task_with_open_dependency_in_backlog(db_session, test
     await service.tick(db_session, run.id)
     await db_session.refresh(task)
     assert task.status == "backlog" and await _sessions(db_session, task) == []
+
+
+async def test_adhoc_task_starts_once_only_after_predecessor_gate_accepted(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationGate
+
+    service, run, task = await _setup(db_session, test_project, "authorized")
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="a", gate_type="work_completed")
+    db_session.add(gate)
+    await db_session.flush()
+    dep = Task(project_id=test_project.id, title="plan item A", status="done",
+               metadata_={"orchestration": {"run_id": str(run.id), "plan_item_gate_id": str(gate.id)}})
+    db_session.add(dep)
+    await db_session.flush()
+    task.depends_on = [str(dep.id)]
+    await db_session.flush()
+
+    for _ in range(2):  # done + open gate does not release the dependent
+        await service.tick(db_session, run.id)
+        await db_session.refresh(task)
+        assert task.status == "backlog" and await _sessions(db_session, task) == []
+
+    gate.status = "accepted"
+    await db_session.flush()
+    await service.tick(db_session, run.id)
+    await db_session.refresh(task)
+    assert task.status == "in_progress" and len(await _sessions(db_session, task)) == 1
+    await service.tick(db_session, run.id)
+    assert len(await _sessions(db_session, task)) == 1
