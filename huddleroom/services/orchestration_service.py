@@ -4353,9 +4353,6 @@ class OrchestrationService:
         }
         if context:
             canonical["orchestrator_context"] = context
-        title = request_obj.get("title")
-        if isinstance(title, str) and title.strip():
-            canonical["title"] = title.strip()
         return canonical
 
     @staticmethod
@@ -6044,7 +6041,9 @@ class OrchestrationService:
     @staticmethod
     def _delegation_task_title(work_function: str, deliverable: str, title: str = "") -> str:
         if title.strip():
-            return shorten(title.strip(), width=80, placeholder="...")
+            title = title.strip()
+            short = shorten(title, width=80, placeholder="...")
+            return short if short != "..." else title[:77] + "..."
         title = f"{work_function.replace('_', ' ').title()}: {deliverable.strip()}"
         return shorten(title, width=80, placeholder="...")
 
@@ -6110,7 +6109,12 @@ class OrchestrationService:
             "Read-only work reports its findings in this JSON.\n" + json.dumps(schema, indent=2)
         )
         if strict:
-            output += "\nUse only IDs given in this task; never invent IDs, and do not register Artifacts for this output."
+            output += (
+                "\nNever invent task, agent, or Artifact UUIDs; plan item ids/item_keys and their depends_on "
+                "references are yours to define; do not register Artifacts for this output."
+                if contract.work_function == PLAN_WORK_FUNCTION
+                else "\nUse only IDs given in this task; never invent IDs, and do not register Artifacts for this output."
+            )
         sections.append(output)
         return "\n\n".join(sections)
 
@@ -6467,10 +6471,7 @@ class OrchestrationService:
         if continuous.get("discovery_run_id") == str(run.id):
             return
         report_schema = self._json_object_or_empty(contract.get("report_schema"))
-        if contract.get("expected_result") != "canonical_work_report" and set(report_schema) != {
-            "status", "changes", "evidence", "criterion_progress", "decisions",
-            "risks", "open_questions", "next_step", "collaboration_need",
-        }:
+        if contract.get("expected_result") != "canonical_work_report" and set(report_schema) != set(CANONICAL_WORK_REPORT_SCHEMA):
             return
 
         parent_task_id = self._optional_uuid(

@@ -53,10 +53,7 @@ def validate_work_report(output: str | None) -> ReportValidation:
         return ReportValidation(None, (f"report contains duplicate key: {exc}",))
     except (TypeError, ValueError):
         return ReportValidation(None, ("report must be one JSON object",))
-    required = {
-        "status", "changes", "evidence", "criterion_progress", "decisions",
-        "risks", "open_questions", "next_step", "collaboration_need",
-    }
+    required = set(CANONICAL_WORK_REPORT_SCHEMA)
     if not isinstance(data, dict):
         return ReportValidation(None, ("report must be one JSON object",))
     errors: list[str] = []

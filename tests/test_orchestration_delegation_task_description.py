@@ -177,3 +177,28 @@ def test_tester_read_only_task_told_to_return_json_and_not_register_artifacts():
     assert "Read-only work reports its findings in this JSON" in text
     assert "return exactly one JSON object" in text
     assert "never invent IDs" in text and "do not register Artifacts" in text
+
+
+def test_raw_legacy_create_decision_action_key_pinned():
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+    raw = {
+        "action_type": "create_delegation_task", "agent_id": str(uuid.UUID(int=1)),
+        "work_function": "build", "scope": "s", "deliverable": "d",
+    }
+    assert OrchestrationDecisionDispatcher.action_key(uuid.UUID(int=2), "create_delegation_task", raw) == (
+        "run:00000000-0000-0000-0000-000000000002:kind:create_delegation_task:request:6bb1f99f8a8b959c"
+    )
+
+
+def test_long_single_token_title_is_truncated_not_ellipsis_only():
+    assert OrchestrationService._delegation_task_title("build", "d", "x" * 200) == "x" * 77 + "..."
+
+
+def test_strict_id_instruction_differs_for_planning():
+    plan = OrchestrationService._delegation_task_description(
+        _goal(), _contract(work_function="planning", report_schema={}))
+    other = OrchestrationService._delegation_task_description(_goal(), _contract())
+    assert "plan item ids/item_keys and their depends_on references are yours to define" in plan
+    assert "Use only IDs given" not in plan
+    assert "Use only IDs given in this task" in other

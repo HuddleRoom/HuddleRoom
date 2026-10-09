@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 from pydantic import (
     BaseModel, ConfigDict, Field, StrictBool, StrictInt, TypeAdapter, ValidationInfo,
-    computed_field, field_validator, model_validator,
+    computed_field, field_validator, model_serializer, model_validator,
 )
 from pydantic_core import PydanticCustomError
 
@@ -716,9 +716,10 @@ class OrchestrationDelegationContract(BaseModel):
     decision_use: str | None = None
     authorization_scope: AuthorizationScope | None = None  # None = not declared
 
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler) -> dict[str, Any]:
         """Keep the persisted contract canonical when no context is present."""
-        payload = super().model_dump(**kwargs)
+        payload = handler(self)
         if not self.orchestrator_context:
             payload.pop("orchestrator_context", None)
         return _drop_default_keys(self, payload, _CONTRACT_NEW_DEFAULTS)
@@ -755,8 +756,9 @@ class OrchestrationPlanItem(BaseModel):
     def _strip_why_runnable(cls, value):
         return value.strip() if isinstance(value, str) else value
 
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        return _drop_default_keys(self, super().model_dump(**kwargs), _ITEM_NEW_DEFAULTS)
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler) -> dict[str, Any]:
+        return _drop_default_keys(self, handler(self), _ITEM_NEW_DEFAULTS)
 
     @field_validator("id", "title", "work_function", "scope", "deliverable", "agent_id", mode="before")
     @classmethod
@@ -813,8 +815,9 @@ class OrchestrationRoadmapPlanItem(BaseModel):
     def strip_why_runnable(cls, value):
         return value.strip() if isinstance(value, str) else value
 
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        payload = _drop_default_keys(self, super().model_dump(**kwargs), _ITEM_NEW_DEFAULTS)
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler) -> dict[str, Any]:
+        payload = _drop_default_keys(self, handler(self), _ITEM_NEW_DEFAULTS)
         if self.goal_type is None:
             payload.pop("goal_type", None)
         return payload

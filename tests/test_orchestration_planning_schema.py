@@ -128,3 +128,12 @@ def test_canonical_report_schema_matches_validator():
     assert set(sample) == set(CANONICAL_WORK_REPORT_SCHEMA)
     import json
     assert validate_work_report(json.dumps(sample)).report is not None
+
+
+@pytest.mark.parametrize("cls,data,expected", PINNED)
+def test_legacy_item_json_serialization_matches_dump(cls, data, expected):
+    import json
+
+    item = cls(**data)
+    assert json.loads(item.model_dump_json()) == item.model_dump(mode="json")
+    assert not (NEW_ITEM_KEYS | {"goal_type"}) & set(json.loads(item.model_dump_json()))
