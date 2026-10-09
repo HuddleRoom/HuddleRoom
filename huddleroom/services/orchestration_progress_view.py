@@ -59,7 +59,11 @@ class ProgressSituation:
             "untracked_follow_ups_total": self.untracked_follow_ups_total,
         }
         if self.plan_items:
-            context["plan_items"] = self.plan_items
+            # Capped like follow-ups: unfinished items first (plan order kept within each group).
+            done = ("accepted", "cancelled")
+            ranked = sorted(self.plan_items, key=lambda item: item["state"] in done)
+            context["plan_items"] = ranked[:FOLLOW_UP_CAP]
+            context["plan_items_total"] = len(self.plan_items)
         if self.error:
             context["progress_view_error"] = True
         return context

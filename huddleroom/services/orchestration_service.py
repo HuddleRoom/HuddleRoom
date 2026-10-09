@@ -4889,8 +4889,18 @@ class OrchestrationService:
             raise HTTPException(status_code=409, detail="Plan does not cover every declared success criterion")
 
     async def _validate_plan_adoptions(self, db: AsyncSession, run: OrchestrationRun, items: Sequence[Any]) -> None:
-        """Each adopt_task_id must name this run's own delegated discovery work, adopted by one item only."""
+        """Each adopt_task_id must name this run's own delegated discovery work, adopted by one item only.
+
+        Items already bound (Roadmap lineage row / expanded Outcome entry) are immutable and skipped."""
         goal = await db.get(OrchestrationGoal, run.goal_id)
+        expanded = self._json_object_or_empty(run.plan_state).get("expanded_items")
+        bound_keys = {
+            entry.get("plan_item_id") for entry in expanded if isinstance(entry, Mapping)
+        } if isinstance(expanded, list) else set()
+        if goal is not None:
+            bound_keys |= set(await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
+                OrchestrationRoadmapItem.goal_id == goal.id
+            )))
         seen: set[uuid.UUID] = set()
         for item in items:
             task_id = getattr(item, "adopt_task_id", None)
@@ -4905,6 +4915,8 @@ class OrchestrationService:
             if task_id in seen:
                 raise invalid(f"task {task_id} is adopted by more than one item")
             seen.add(task_id)
+            if key in bound_keys:
+                continue
             if roadmap and (item.unit_type != "task" or item.mutates_shared_state):
                 raise invalid("only Roadmap task items with mutates_shared_state false can adopt work")
             if item.depends_on:
@@ -4920,7 +4932,10 @@ class OrchestrationService:
                 raise invalid(f"task {task_id} is not work of this run")
             if task.status == "cancelled":
                 raise invalid(f"task {task_id} is cancelled")
-            if not self._json_object_or_empty(task.metadata_).get("orchestration_contract"):
+            if (
+                not self._json_object_or_empty(task.metadata_).get("orchestration_contract")
+                or await db.get(OrchestrationAction, task_id) is None
+            ):
                 raise invalid(f"task {task_id} was not created by a delegation")
             work_function = self._task_work_function(task)
             if work_function in NON_ADOPTABLE_WORK_FUNCTIONS:
@@ -10258,7 +10273,7 @@ class OrchestrationService:
         for item in items:
             if item.adopt_task_id is None:
                 continue
-            if await self._release_item_once(db, run, item):
+            if await self._release_item_once(db, goal, run, item):
                 bound += 1
 
         in_flight = await self._orchestrated_tasks_for_run(
@@ -10280,21 +10295,35 @@ class OrchestrationService:
                 continue
             if not await self._item_dependencies_accepted(db, run, item):
                 continue
-            if await self._release_item_once(db, run, item):
+            if await self._release_item_once(db, goal, run, item):
                 released += 1
         return bound + released
 
-    async def _release_item_once(self, db: AsyncSession, run: OrchestrationRun, item: OrchestrationPlanItem) -> bool:
+    async def _release_item_once(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, item: OrchestrationPlanItem
+    ) -> bool:
         key = f"run:{run.id}:kind:release_item:{item.id}"
         if await self._existing_action_for_key(db, run.id, key) is not None:
             return False
-        await self.execute_expand_plan_item_action(
-            db,
-            run_id=run.id,
-            request={"action_type": "expand_plan_item", "plan_item_id": item.id,
-                     "work_function": item.work_function},
-            idempotency_key=self._expand_plan_item_idempotency_key(run.id, item.id),
-        )
+        expand_key = self._expand_plan_item_idempotency_key(run.id, item.id)
+        try:
+            action = await self.execute_expand_plan_item_action(
+                db,
+                run_id=run.id,
+                request={"action_type": "expand_plan_item", "plan_item_id": item.id,
+                         "work_function": item.work_function},
+                idempotency_key=expand_key,
+            )
+        except HTTPException as exc:
+            if item.adopt_task_id is None or exc.status_code != 409:
+                raise
+            action = await self._existing_action_for_key(db, run.id, expand_key)
+        if item.adopt_task_id is not None and (action is None or action.status != "completed"):
+            # A binding that cannot complete (conflicting adoption, vanished task) needs a human, not a release.
+            self._block_plan_integrity(
+                goal, run, f"Adopted plan item '{item.id}' could not bind: {action.error if action else 'unknown'}"
+            )
+            return False
         # expand_plan_item creates (or, for adoption, binds) this item's task; mark the
         # release so the cap accounting and idempotency hold across ticks.
         await self.reserve_action(

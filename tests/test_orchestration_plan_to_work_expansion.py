@@ -699,14 +699,21 @@ async def test_expand_accepted_plan_rejects_unaccepted_plan(db_session, test_pro
 
 
 async def _adoption_setup(db_session, project_id):
-    from huddleroom.schemas.task import TaskCreate
-    from huddleroom.services.task_service import TaskService
-
     planner = _agent("planner", role="planner", capabilities=["planning"])
     developer = _agent("developer", role="developer", capabilities=["investigation"])
     db_session.add_all([planner, developer])
     await db_session.flush()
     service, goal, run = await _make_run(db_session, project_id)
+    audit_action = await service.execute_create_delegation_task_action(
+        db_session,
+        run_id=run.id,
+        request={
+            "action_type": "create_delegation_task", "agent_id": str(developer.id),
+            "work_function": "investigation", "scope": "Audit the API.", "deliverable": "Audit findings.",
+        },
+        idempotency_key=f"run:{run.id}:kind:create_delegation_task:adoption-audit",
+    )
+    task = await db_session.get(Task, audit_action.target_id)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -717,18 +724,6 @@ async def _adoption_setup(db_session, project_id):
             "scope": "Create a plan that adopts the running audit.",
         },
         idempotency_key="run:adoption:kind:request_plan",
-    )
-    task = await TaskService().create(
-        db_session,
-        project_id,
-        TaskCreate(
-            # Unassigned: assigning work changes the roster fingerprint and trips the baseline gate.
-            title="Audit the API",
-            metadata={
-                "orchestration": {"goal_id": str(goal.id), "run_id": str(run.id), "work_function": "investigation"},
-                "orchestration_contract": {"work_function": "investigation", "scope": "Audit the API."},
-            },
-        ),
     )
     return service, goal, run, planner, developer, request_action, task
 
@@ -1262,3 +1257,24 @@ async def test_second_plan_version_readopting_a_bound_task_is_rejected_or_replay
             [_adopting_item(audit.id, item_id="renamed", priority=10)],
         )
     assert exc_info.value.status_code == 409 and exc_info.value.detail.startswith("adoption_invalid:")
+
+
+@pytest.mark.asyncio
+async def test_release_blocks_plan_integrity_when_adopted_binding_fails(db_session, test_project):
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    await service.reserve_action(
+        db_session, run_id=run.id, idempotency_key=f"run:{run.id}:kind:adopt_task:task:{audit.id}",
+        action_type="adopt_task", request={"plan_item_id": "older", "adopt_task_id": str(audit.id),
+                                           "accepted_plan_fingerprint": "older"},
+    )
+
+    for _ in range(2):  # the failed expansion replays; it never raises out of release
+        assert await service._release_ready_work(db_session, goal, run) == 0
+
+    assert await _run_rows(db_session, OrchestrationAction, run.id, action_type="release_item") == []
+    (expand,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="expand_plan_item")
+    assert expand.status == "failed" and expand.error.startswith("adoption_conflict:")
+    assert not run.plan_state.get("expanded_items")
+    (blocker,) = [b for b in run.active_blockers if b.get("kind") == "plan_criterion_integrity"]
+    assert blocker["reason"].startswith("Adopted plan item 'audit-0' could not bind: adoption_conflict:")
+    assert "plan_item_gate_id" not in audit.metadata_["orchestration"]

@@ -1012,7 +1012,9 @@ async def test_build_plan_items_state_per_item(db_session, test_project, task_st
         {"item_id": "a", "task_id": str(task.id), "adopted": True, "state": expected},
         {"item_id": "b", "task_id": None, "adopted": False, "state": "queued"},
     ]
-    assert situation.as_context()["plan_items"] == situation.plan_items
+    context = situation.as_context()
+    assert sorted(context["plan_items"], key=lambda i: i["item_id"]) == situation.plan_items
+    assert context["plan_items_total"] == 2
 
 
 async def test_plan_items_omitted_from_context_when_empty(db_session, test_project):
@@ -1020,3 +1022,18 @@ async def test_plan_items_omitted_from_context_when_empty(db_session, test_proje
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     assert situation.plan_items == []
     assert "plan_items" not in situation.as_context()
+
+
+async def test_plan_items_context_is_capped_with_unfinished_items_first():
+    from huddleroom.services.orchestration_progress_view import FOLLOW_UP_CAP, ProgressSituation
+
+    items = [{"item_id": f"done-{n}", "task_id": None, "adopted": False, "state": "accepted"} for n in range(8)]
+    items += [{"item_id": f"open-{n}", "task_id": None, "adopted": False, "state": "started"} for n in range(5)]
+    situation = ProgressSituation(plan_items=items)
+
+    context = situation.as_context()
+
+    assert situation.plan_items == items
+    assert len(context["plan_items"]) == FOLLOW_UP_CAP and context["plan_items_total"] == 13
+    assert [i["item_id"] for i in context["plan_items"][:5]] == [f"open-{n}" for n in range(5)]
+    assert [i["item_id"] for i in context["plan_items"][5:]] == [f"done-{n}" for n in range(5)]

@@ -822,8 +822,8 @@ class OrchestrationRoadmapService:
             # Adopted discovery work keeps its task and session; no delegation is created.
             task = await db.get(Task, item.adopt_task_id)
             if task is None:
-                raise HTTPException(
-                    status_code=409, detail=f"adoption_invalid: item {item.item_key}: adopted task not found"
+                return await self._adoption_failed(
+                    db, goal, run, release, item, f"adoption_invalid: item {item.item_key}: adopted task not found"
                 )
         else:
             released_task_keys = set((await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
@@ -844,13 +844,18 @@ class OrchestrationRoadmapService:
                 f"run:{run.id}:kind:create_delegation_task:roadmap_item:{item.item_key}",
             )
             task = await db.get(Task, delegation.target_id)
+        original_metadata = task.metadata_
         metadata = self.orchestration._json_object_or_empty(task.metadata_)
         orchestration = self.orchestration._json_object_or_empty(metadata.get("orchestration"))
         task.metadata_ = {**metadata, "orchestration": {
             **orchestration, "roadmap_version_id": str(version.id), "roadmap_item_key": item.item_key,
         }}
         if item.adopt_task_id is not None:
-            await self.orchestration._bind_adopted_task(db, run, task, artifact, task_item, release, gate)
+            try:
+                await self.orchestration._bind_adopted_task(db, run, task, artifact, task_item, release, gate)
+            except HTTPException as exc:
+                task.metadata_ = original_metadata  # no half-bound task
+                return await self._adoption_failed(db, goal, run, release, item, str(exc.detail))
         else:
             self.orchestration._attach_plan_item_metadata(task, artifact, task_item, release, gate)
         lineage = OrchestrationRoadmapItem(
@@ -863,6 +868,16 @@ class OrchestrationRoadmapService:
         await db.flush()
         await self.orchestration._mark_action_completed(db, release, target_type="task", target_id=task.id)
         return {"step": "release_item", "item_key": item.item_key, "unit_type": "task"}
+
+    async def _adoption_failed(self, db, goal, run, release, item, reason):
+        """Same as Outcome: fail the release and block on plan integrity instead of raising every tick."""
+        if release.status == "reserved":
+            await self.orchestration._fail_reserved_action_for_current_flow(db, release, reason)
+        self.orchestration._block_plan_integrity(
+            goal, run, f"Adopted plan item '{item.item_key}' could not bind: {reason}"
+        )
+        await db.flush()
+        return {"step": "needs_attention"}
 
     async def _parent_contract_snapshot(self, db, parent, version, item):
         team = deepcopy(version.snapshot.get("team"))

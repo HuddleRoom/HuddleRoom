@@ -395,8 +395,7 @@ async def test_ingest_rejects_invalid_adoption_before_disposition(db_session, te
     with pytest.raises(PlanIngestionError) as exc:
         await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
 
-    assert exc.value.reason == (
-        f"adoption_invalid: item a: task {audit.id} work_function 'investigation' does not match 'implementation'"
-    )
+    # Contract metadata alone is not enough: no delegation action created this task.
+    assert exc.value.reason == f"adoption_invalid: item a: task {audit.id} was not created by a delegation"
     assert not exc.value.stale
     assert await _plan_artifacts(db_session, task.id) == 0

@@ -970,3 +970,87 @@ async def test_roadmap_acceptance_rejects_adoption_by_goal_or_shared_state_item(
     assert run.plan_state["status"] == "revision_required"
     assert await OrchestrationRoadmapService(service).current_version(db_session, goal.id) is None
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
+
+
+async def _accepted_adopting_roadmap(db_session, accepted_roadmap, *, conflicting_marker=False):
+    adopted = roadmap_task("audit")
+    audits = []
+
+    async def setup(planner, goal, run):
+        service = OrchestrationService()
+        audit = await _delegated_audit(service, db_session, run, planner.id)
+        adopted["adopt_task_id"] = str(audit.id)
+        audits.append(audit)
+        if conflicting_marker:
+            await service.reserve_action(
+                db_session, run.id, f"run:{run.id}:kind:adopt_task:task:{audit.id}", "adopt_task",
+                {"plan_item_id": "older", "adopt_task_id": str(audit.id), "accepted_plan_fingerprint": "older"},
+            )
+
+    service, goal, run, _ = await accepted_roadmap([adopted], setup=setup, assign_agents=False)
+    return service, goal, run, audits[0], adopted
+
+
+async def test_replan_skips_adoption_checks_for_already_bound_roadmap_item(db_session, test_project, accepted_roadmap):
+    service, goal, run, audit, adopted = await _accepted_adopting_roadmap(db_session, accepted_roadmap)
+    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "audit"
+    await TaskService().cancel(db_session, test_project.id, audit.id)  # bound work cancelled afterwards
+    first = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
+    first_artifact = await db_session.get(Artifact, first.plan_artifact_id)
+    replan = await service.execute_request_roadmap_replan_action(
+        db_session, run.id,
+        {"action_type": "request_roadmap_replan", "agent_id": str(first_artifact.created_by_agent),
+         "scope": "Add a follow-up.", "reason": "New information."},
+        f"run:{run.id}:kind:request_roadmap_replan:version:{first.version}",
+    )
+    candidate_items = [adopted, roadmap_task("follow-up")]
+    candidate = Artifact(
+        project_id=test_project.id, name="roadmap-replan", artifact_type="plan", status="draft",
+        linked_task_id=replan.target_id, created_by_agent=first_artifact.created_by_agent,
+        metadata_={"plan_items": candidate_items},
+    )
+    db_session.add(candidate)
+    await db_session.flush()
+    fingerprint = service._accepted_plan_fingerprint([
+        item.model_dump(mode="json") for item in parse_roadmap_items(candidate_items, set())
+    ])
+    accept = {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)}
+    with pytest.raises(HTTPException, match="waiting_plan_authority"):  # past adoption validation
+        await service.execute_accept_plan_action(db_session, run.id, accept, f"run:{run.id}:kind:adopted-replan")
+    approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id,
+        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
+    ))
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, approval, selected_option="approve", decided_by_user_id=goal.manager_user_id,
+    )
+
+    action = await service.execute_accept_plan_action(db_session, run.id, accept, f"run:{run.id}:kind:adopted-replan")
+
+    assert action.status == "completed" and run.plan_state["roadmap_version"] == 2
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
+        OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "audit",
+    ))
+    assert row.task_id == audit.id
+
+
+async def test_roadmap_adoption_conflict_fails_release_and_blocks_without_half_binding(db_session, accepted_roadmap):
+    service, goal, run, audit, _ = await _accepted_adopting_roadmap(
+        db_session, accepted_roadmap, conflicting_marker=True,
+    )
+    metadata_before = dict(audit.metadata_)
+
+    for _ in range(2):  # replay-safe: blocks again instead of raising
+        await OrchestrationRoadmapService(service).advance(db_session, goal, run)
+
+    await db_session.refresh(audit)
+    assert audit.metadata_ == metadata_before
+    release = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:release_roadmap_item:audit",
+    )
+    assert release.status == "failed" and release.error.startswith("adoption_conflict:")
+    assert any(
+        b.get("kind") == "plan_criterion_integrity" and "'audit' could not bind" in b.get("reason", "")
+        for b in run.active_blockers
+    )
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
