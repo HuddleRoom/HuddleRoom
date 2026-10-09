@@ -2,7 +2,7 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -1323,3 +1323,93 @@ async def test_stale_expansion_limit_blocker_is_cleared_for_a_new_version(db_ses
     await roadmap.advance(db_session, parent, run)
     assert not [b for b in run.active_blockers if b["kind"] == "expansion_limit"]
     assert await _row_counts(db_session, parent, run) == [1, 1, 1, 1, 1]
+
+
+# --- nested budget: a child reservation carries its whole subtree ---
+
+NESTED_ITEM = goal_item("child", {"max_tokens": 800, "max_turns": 5, "max_hours": 5})
+
+
+async def _nested_child(db, project, *grand):
+    """Release roadmap child C and give it grandchild reservations: (settled_tokens | None for active, allocation)."""
+    _, parent, run, _, row = await release(db, project, NESTED_ITEM)
+    child = await db.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    for index, (settled, tokens, complete) in enumerate(grand):
+        grandchild = OrchestrationGoal(
+            project_id=project.id, parent_goal_id=child.id, objective=f"g{index}", original_request=f"g{index}",
+            success_criteria=[], constraints={}, budget={}, goal_type="outcome", status="active",
+            continuous_origin_key=f"g{index}", parent_contract_snapshot={}, goal_delta={},
+        )
+        db.add(grandchild); await db.flush()
+        reservation = OrchestrationBudgetReservation(
+            parent_goal_id=child.id, child_goal_id=grandchild.id, continuous_origin_key=f"g{index}",
+            allocation={"max_tokens": str(tokens), "max_turns": "1", "max_hours": "1"},
+        )
+        if settled is not None:
+            reservation.status, reservation.settlement_reason = "settled", "completed"
+            reservation.settled_spend = {"max_tokens": str(settled), "max_turns": "1", "max_hours": "1"}
+            reservation.measurement_complete, reservation.settled_at = complete, datetime.now(timezone.utc)
+        db.add(reservation)
+    await db.flush()
+    reservation = await db.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.child_goal_id == child.id))
+    return parent, child_run, reservation
+
+
+def _direct_spend(tokens):
+    async def measured(self, db, run, dimensions, **_kwargs):
+        return {key: (str(tokens) if key == "max_tokens" else "1") for key in dimensions}
+
+    async def known(self, db, run, dimensions):
+        return await measured(self, db, run, dimensions), True
+    return patch.multiple(OrchestrationBudgetService, measured_run_spend=measured, known_run_spend=known)
+
+
+async def test_settle_folds_the_subtree_into_the_child_reservation(db_session, test_project):
+    parent, child_run, reservation = await _nested_child(db_session, test_project, (250, 300, True))
+    before = await OrchestrationBudgetService().remaining(db_session, parent)
+    with _direct_spend(100):  # C's own run spends 100, G settled 250 -> 350 charged to P once
+        await OrchestrationBudgetService().settle_child(db_session, reservation, child_run, reason="completed")
+    assert reservation.settled_spend["max_tokens"] == "350"
+    assert reservation.measurement_complete is True
+    after = await OrchestrationBudgetService().remaining(db_session, parent)
+    assert before["remaining"]["max_tokens"] == "200" and after["remaining"]["max_tokens"] == "650"
+
+
+async def test_active_reservation_hides_grandchild_spend_from_the_parent(db_session, test_project):
+    parent, _, _ = await _nested_child(db_session, test_project, (250, 300, True), (None, 200, True))
+    summary = await OrchestrationBudgetService().remaining(db_session, parent)
+    assert summary["active_reservations"]["max_tokens"] == "800" and summary["remaining"]["max_tokens"] == "200"
+
+
+async def test_cancelled_child_counts_active_grandchild_allocation(db_session, test_project):
+    parent, child_run, reservation = await _nested_child(db_session, test_project, (250, 300, True), (None, 200, True))
+    with _direct_spend(100):
+        await OrchestrationBudgetService().settle_child(
+            db_session, reservation, child_run, reason="cancelled", conservative_cancel=False)
+    assert reservation.settled_spend["max_tokens"] == "550"  # 100 direct + 250 settled + 200 still reserved
+
+
+async def test_conservative_cancel_and_overage_apply_to_the_subtree_total(db_session, test_project):
+    parent, child_run, reservation = await _nested_child(db_session, test_project, (700, 700, True))
+    with _direct_spend(200), pytest.raises(HTTPException) as exc:  # 900 > 800 allocation
+        await OrchestrationBudgetService().settle_child(db_session, reservation, child_run, reason="completed")
+    assert exc.value.detail == "Child exceeded reserved max_tokens"
+    with _direct_spend(200):
+        await OrchestrationBudgetService().settle_child(db_session, reservation, child_run, reason="cancelled")
+    assert reservation.settled_spend["max_tokens"] == "900"  # conservative max(actual, allocation) keeps the larger
+
+
+async def test_incomplete_grandchild_measurement_marks_the_child_incomplete(db_session, test_project):
+    parent, child_run, reservation = await _nested_child(db_session, test_project, (50, 300, False))
+    with _direct_spend(10):
+        await OrchestrationBudgetService().settle_child(db_session, reservation, child_run, reason="completed")
+    assert reservation.settled_spend["max_tokens"] == "60" and reservation.measurement_complete is False
+
+
+async def test_outcome_child_settlement_is_unchanged(db_session, test_project):
+    parent, child_run, reservation = await _nested_child(db_session, test_project)
+    with _direct_spend(120):
+        await OrchestrationBudgetService().settle_child(db_session, reservation, child_run, reason="completed")
+    assert reservation.settled_spend == {"max_tokens": "120", "max_turns": "1", "max_hours": "1"}

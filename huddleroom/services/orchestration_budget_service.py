@@ -573,6 +573,8 @@ class OrchestrationBudgetService:
         return canonical_amounts(reservation.allocation, allowed=set(parent_caps(parent)))
 
     async def roadmap_parent(self, db, goal: OrchestrationGoal) -> OrchestrationGoal | None:
+        # ponytail: a nested Roadmap is its own budget parent for its own claims and a child of its parent's
+        # reservation; settle_child folds its subtree into that one reservation, so remaining() needs no change.
         if goal.goal_type == "roadmap":
             return goal
         if goal.parent_goal_id is None:
@@ -1000,6 +1002,13 @@ class OrchestrationBudgetService:
         if reservation.status == "settled":
             return reservation
         actual, measurement_complete = {}, True
+        # A nested Roadmap child's amount already includes its subtree: add its own children's spend once.
+        grandchildren = list(await db.scalars(select(OrchestrationBudgetReservation).where(
+            OrchestrationBudgetReservation.parent_goal_id == reservation.child_goal_id
+        )))
+        for grandchild in grandchildren:
+            if grandchild.status == "settled":
+                measurement_complete = measurement_complete and grandchild.measurement_complete
         for dimension, allocation in reservation.allocation.items():
             if reason == "cancelled":
                 spend, complete = await self.known_run_spend(db, child_run, {dimension})
@@ -1007,6 +1016,11 @@ class OrchestrationBudgetService:
                 measurement_complete = measurement_complete and complete
             else:
                 actual[dimension] = (await self.measured_run_spend(db, child_run, {dimension}))[dimension]
+            below = sum((Decimal(str(
+                (g.settled_spend if g.status == "settled" else g.allocation).get(dimension, 0)
+            )) for g in grandchildren), Decimal(0))
+            if below:
+                actual[dimension] = format(Decimal(actual[dimension]) + below, "f")
             if reason == "cancelled" and conservative_cancel:
                 actual[dimension] = format(max(Decimal(actual[dimension]), Decimal(allocation)), "f")
         if reason != "cancelled" or not conservative_cancel:
