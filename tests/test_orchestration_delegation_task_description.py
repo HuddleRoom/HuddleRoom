@@ -1,4 +1,6 @@
 import uuid
+
+import pytest
 from types import SimpleNamespace
 
 from huddleroom.schemas.orchestration import OrchestrationDelegationContract
@@ -136,3 +138,42 @@ def test_legacy_create_request_has_no_title_and_stable_action_key():
     run_id = uuid.UUID(int=2)
     assert OrchestrationDecisionDispatcher.action_key(run_id, "create_delegation_task", request) != \
         OrchestrationDecisionDispatcher.action_key(run_id, "create_delegation_task", with_title)
+
+
+def test_tester_canonical_report_and_item_schemas_match_brief_literally():
+    from huddleroom.schemas.orchestration import PLAN_ITEM_PROMPT_FIELDS, ROADMAP_ITEM_PROMPT_FIELDS
+    from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
+
+    assert CANONICAL_WORK_REPORT_SCHEMA == {
+        "status": "str", "changes": "list[str]", "evidence": "list[str]",
+        "criterion_progress": "dict[str,str]", "decisions": "list[str]", "risks": "list[str]",
+        "open_questions": "list[str]", "next_step": "str", "collaboration_need": "str|null",
+    }
+    new = {"adopt_task_id", "artifact_ids", "priority", "why_runnable"}
+    assert set(PLAN_ITEM_PROMPT_FIELDS) == {
+        "id", "title", "work_function", "scope", "deliverable", "agent_id", "inputs", "forbidden_work",
+        "success_evidence", "required_capabilities", "required_evidence", "success_criterion_keys", "depends_on",
+    } | new
+    assert set(ROADMAP_ITEM_PROMPT_FIELDS) == {
+        "item_key", "unit_type", "title", "depends_on", "mutates_shared_state", "staging_boundary", "allocation",
+        "work_function", "scope", "deliverable", "agent_id", "inputs", "forbidden_work", "success_evidence",
+        "required_capabilities", "objective", "success_criteria", "constraints",
+    } | new | {"goal_type"}
+
+
+@pytest.mark.parametrize("kind", ["delivery", "implementation", "roadmap"])
+def test_tester_planning_prompt_advertises_each_schema_without_translation(kind):
+    import json
+    from huddleroom.schemas.orchestration import planning_envelope_report_schema
+
+    text = OrchestrationService._delegation_task_description(
+        _goal(), _contract(work_function="planning", report_schema={"plan_kind": kind}),
+    )
+    assert json.dumps(planning_envelope_report_schema(kind), indent=2) in text
+
+
+def test_tester_read_only_task_told_to_return_json_and_not_register_artifacts():
+    text = OrchestrationService._delegation_task_description(_goal(), _contract())
+    assert "Read-only work reports its findings in this JSON" in text
+    assert "return exactly one JSON object" in text
+    assert "never invent IDs" in text and "do not register Artifacts" in text
