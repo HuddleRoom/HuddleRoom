@@ -24,6 +24,7 @@ from huddleroom.schemas.orchestration import OrchestrationContinuousPolicy, pars
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService, parent_caps
 from huddleroom.services.project_service import ProjectService
+from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, available_slots
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.session_service import SessionClaimAttention, SessionService
 from huddleroom.services.task_service import TaskService
@@ -1036,6 +1037,7 @@ class OrchestrationContinuousService:
         repair_task = await TaskService().get(db, goal.project_id, action.target_id)
         if repair_task is None:
             return None
+        # ponytail: not slot-checked; the source task that failed validation has just freed its slot.
         state.update({"recovery": "repair", "repair_task_id": str(repair_task.id),
                       "active_task_id": str(repair_task.id), "active_session_id": None})
         run.plan_state = {**self.orchestration._json_object_or_empty(run.plan_state), "discovery": state}
@@ -1164,6 +1166,8 @@ class OrchestrationContinuousService:
             )
             if discovery.get("active_task_id") or discovery.get("accepted_batch") is not None:
                 return await self._advance_discovery(db, goal, run, policy, now)
+            if await available_slots(db, goal.id) <= 0:  # no source budget is reserved while the root is full
+                return {"step": "waiting", "reason": CAPACITY_WAIT}
             try:
                 task = await self.dispatch_discovery_source(db, goal, run, now)
             except HTTPException as exc:

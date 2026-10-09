@@ -3,6 +3,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, select
 
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.models.session import Session
@@ -223,3 +224,44 @@ async def test_release_headroom_subtracts_startable_queue_but_not_dependency_blo
     assert await service._release_headroom(db_session, root.id) == 1  # blocked backlog holds no slot
     await _task(db_session, test_project, run, agent=agent)  # startable backlog holds one
     assert await service._release_headroom(db_session, root.id) == 0
+
+
+async def test_tick_fills_root_slots_by_rank_queues_the_rest_and_starts_it_when_a_slot_frees(db_session, test_project):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+
+    agent = await _agent_row(db_session)
+    root, run = await _root(db_session, test_project)
+    low = await _task(db_session, test_project, run, agent=agent, priority=10)  # earliest, lowest priority
+    mid = await _task(db_session, test_project, run, agent=agent, priority=50)
+    high = await _task(db_session, test_project, run, agent=agent, priority=90)
+    service = OrchestrationService()
+    await service.tick(db_session, run.id)
+    statuses = {name: (await db_session.get(Task, task.id)).status for name, task in (("low", low), ("mid", mid), ("high", high))}
+    assert statuses == {"low": "backlog", "mid": "in_progress", "high": "in_progress"}
+    await db_session.refresh(run)
+    await db_session.refresh(root)
+    situation = await OrchestrationProgressView().build(db_session, root, run)
+    assert situation.capacity_wait["available_slots"] == 0
+    assert situation.capacity_wait["queued_task_ids"] == [str(low.id)]
+    assert not [b for b in run.active_blockers if isinstance(b, dict)]
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id)) == 0
+    (await db_session.get(Task, high.id)).status = "done"
+    for session in await db_session.scalars(select(Session).where(Session.task_id == high.id)):
+        session.status = "completed"
+    await db_session.flush()
+    await service.tick(db_session, run.id)
+    assert (await db_session.get(Task, low.id)).status == "in_progress"
+
+
+async def test_root_child_and_grandchild_ready_work_starts_at_most_two_in_total(db_session, test_project):
+    agent = await _agent_row(db_session)
+    root, root_run = await _root(db_session, test_project)
+    child, child_run = await _child(db_session, test_project, root, "roadmap")
+    grand, grand_run = await _child(db_session, test_project, child)
+    tasks = [await _task(db_session, test_project, run, agent=agent) for run in (root_run, child_run, grand_run)]
+    await OrchestrationService().tick(db_session, root_run.id)
+    statuses = [(await db_session.get(Task, t.id)).status for t in tasks]
+    assert statuses.count("in_progress") == 2 and statuses.count("backlog") == 1
+    assert await available_slots(db_session, root.id) == 0

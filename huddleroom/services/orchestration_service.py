@@ -95,7 +95,7 @@ from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProces
 from huddleroom.services.orchestration_effectiveness_review import EffectivenessReviewProcess
 from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
 from huddleroom.services.orchestration_capacity import (
-    available_slots, dependency_counts, queued_tasks, rank_queued, root_goal_id,
+    activate_ready, available_slots, dependency_counts, queued_tasks, rank_queued, root_goal_id,
 )
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_llm_decision_adapter import LLMDecisionAdapter, OrchestrationDecisionAdapter
@@ -9282,11 +9282,23 @@ class OrchestrationService:
         )
         return list(result.scalars().all())
 
+    async def _task_start_blocked(self, db: AsyncSession, run: OrchestrationRun, task: Task):
+        """Truthy while a predecessor gate is unaccepted or a meeting / graph run / live session holds the task."""
+        return await first_unmet_dependency(db, run, task) or await self._blocked_task_awaiting(db, run, task)
+
     async def _start_released_tasks(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Start never-started backlog tasks the orchestrator delegated (nothing else runs them)."""
         if goal.status != "active" or run.status != "running" or run.phase not in {"baseline", "authorized"}:
             return 0
+        if run.phase == "authorized":
+            # Best-ranked startable tasks of the whole root tree, into the root's free slots.
+            result = await activate_ready(db, await root_goal_id(db, goal.id), is_blocked=self._task_start_blocked)
+            await db.flush()
+            await db.refresh(run)  # a refused start rolled back a savepoint, which expires run/goal
+            await db.refresh(goal)
+            return len(result["started"])
         started = 0
+        # ponytail: pre-Start baseline delivery is not capacity-gated (it is still counted by available_slots).
         for task in await self._orchestrated_tasks_for_run(db, run.id, statuses=["backlog"]):
             if task.assigned_to is None:
                 continue
@@ -10419,7 +10431,7 @@ class OrchestrationService:
         startable = 0
         for task in await queued_tasks(db, root_id):
             run = await db.get(OrchestrationRun, uuid.UUID(task.metadata_["orchestration"]["run_id"]))
-            if await self._blocked_task_awaiting(db, run, task) is None:
+            if not await self._task_start_blocked(db, run, task):
                 startable += 1
         return await available_slots(db, root_id) - startable
 

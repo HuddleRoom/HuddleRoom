@@ -206,6 +206,7 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
             idempotency_key=f"run:{run.id}:kind:create_delegation_task:audit-{n}",
         )
         audit_ids.append(action.target_id)
+        (await db_session.get(Task, action.target_id)).priority = 10  # the planner outranks the audits
 
     stub_decision(lambda ctx: {
         "action_type": "request_plan", "agent_id": _planner_agent_id(ctx), "work_function": "planning",
@@ -219,11 +220,17 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
     async def sessions(db, task_id):
         return list(await db.scalars(select(Session).where(Session.task_id == task_id)))
 
-    # The same tick started the planner and both audits: discovery runs while planning.
+    # Planner and audits share the root's two slots: the planner and one audit start in the same tick
+    # (discovery runs while planning), the other audit stays queued in backlog until a slot frees.
+    started, queued = [], []
     for task_id in [planning_task.id, *audit_ids]:
         task = await db_session.get(Task, task_id)
         await db_session.refresh(task)
-        assert task.status == "in_progress" and len(await sessions(db_session, task_id)) == 1
+        (started if task.status == "in_progress" else queued).append(task_id)
+        assert len(await sessions(db_session, task_id)) == (1 if task.status == "in_progress" else 0)
+    assert planning_task.id in started and len(started) == 2 and len(queued) == 1
+    (queued_id,) = queued
+    assert (await db_session.get(Task, queued_id)).status == "backlog"
 
     (planner_session,) = await sessions(db_session, planning_task.id)
     kind = planning_task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"]
