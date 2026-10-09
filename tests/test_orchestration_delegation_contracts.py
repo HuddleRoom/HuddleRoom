@@ -598,3 +598,34 @@ async def test_execute_create_delegation_task_action_missing_parent_fails_before
     ).scalar_one_or_none()
     assert action is None
     assert await _task_count(db_session, test_project.id) == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "snapshot", "deliverable"),
+    [
+        ("roadmap", None, "Roadmap plan: a finite graph of distinct outcomes, defined progressively."),
+        ("delivery", None, "Delivery plan: one bounded plan coordinating every work function this outcome needs."),
+        ("implementation", None, "Implementation plan: a leaf technical plan for this outcome."),
+        ("implementation", "roadmap", "Roadmap plan: a finite graph of distinct outcomes, defined progressively."),
+    ],
+)
+def test_planning_contract_wording_by_mode(mode, snapshot, deliverable):
+    from types import SimpleNamespace
+
+    goal = SimpleNamespace(
+        id=uuid.uuid4(), planning_mode=mode, objective="Ship it", orchestrator_context={},
+        success_criteria=[], constraints={}, budget={}, goal_type="goal",
+    )
+    run = SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=snapshot)
+    action = SimpleNamespace(id=uuid.uuid4())
+    contract = OrchestrationService()._planning_contract(
+        goal, run, action, {"agent_id": str(uuid.uuid4()), "scope": "plan it"}
+    )
+    assert contract.deliverable == deliverable
+    assert any(
+        i.startswith("Optional specialist inputs") and "inputs to this plan, never co-authors" in i
+        and "product strategist — sequencing" in i and "tester — qualification and evidence" in i
+        and "UI/UX designer — interaction and accessibility" in i
+        for i in contract.inputs
+    )
+    assert "You are the sole plan author: one plan that synthesizes any specialist inputs." in contract.success_evidence
