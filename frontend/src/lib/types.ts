@@ -1030,4 +1030,5 @@ export interface OrchestrationGoalCreateInput {
   success_criteria: { description: string }[]
   constraints?: Record<string, unknown>
   budget?: Record<string, unknown>
+  goal_type?: 'auto' | 'outcome' | 'roadmap' | 'continuous'
 }

@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
+import { changeControl, descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import type { OrchestrationGoalDetail, Task } from '@/lib/types'
 
 const state = vi.hoisted(() => ({
@@ -18,6 +18,8 @@ const state = vi.hoisted(() => ({
   taskHasNextPage: false,
   taskFetchingNextPage: false,
   taskRefetch: vi.fn(),
+  createMutation: { isPending: false, mutate: vi.fn() },
+  announceError: vi.fn(),
   startMutation: { isPending: false, mutate: vi.fn() },
   commandMutation: { isPending: false, mutate: vi.fn() },
   healthDebugEnabled: false,
@@ -38,13 +40,31 @@ vi.mock('react-router-dom', () => ({
   useLocation: () => state.location,
 }))
 
+vi.mock('@radix-ui/react-dialog', () => ({
+  Root: ({ open, children }: { open?: boolean; children: React.ReactNode }) => open ? <>{children}</> : null,
+  Portal: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  Overlay: (props: React.HTMLAttributes<HTMLDivElement>) => <div {...props} />,
+  Content: ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => <div {...props}>{children}</div>,
+  Title: ({ children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => <h2 {...props}>{children}</h2>,
+  Description: ({ children, ...props }: React.HTMLAttributes<HTMLParagraphElement>) => <p {...props}>{children}</p>,
+  Close: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+}))
+
+vi.mock('./goalAnnouncer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./goalAnnouncer')>()
+  return {
+    ...actual,
+    useGoalAnnouncer: () => ({ ...actual.useGoalAnnouncer(), announceError: state.announceError }),
+  }
+})
+
 vi.mock('@/stores/ui', () => ({
   useUIStore: (selector: (value: { activeProjectId: string | null }) => unknown) =>
     selector({ activeProjectId: state.activeProjectId }),
 }))
 
 vi.mock('@/api/orchestration', () => ({
-  useCreateOrchestrationGoal: () => ({ isPending: false, mutate: vi.fn() }),
+  useCreateOrchestrationGoal: () => state.createMutation,
   useOrchestrationGoals: () => ({
     data: { pages: [{ items: state.goals, next_cursor: null }] },
     isLoading: false,
@@ -301,6 +321,9 @@ beforeEach(() => {
   state.taskHasNextPage = false
   state.taskFetchingNextPage = false
   state.taskRefetch.mockReset()
+  state.createMutation.isPending = false
+  state.createMutation.mutate.mockReset()
+  state.announceError.mockReset()
   state.startMutation.isPending = false
   state.startMutation.mutate.mockReset()
   state.commandMutation.isPending = false
@@ -809,5 +832,93 @@ describe('OrchestrationPage', () => {
       expect(debugPanelStart).toBeGreaterThan(-1)
       expect(supervisionIndex).toBeGreaterThan(debugPanelStart)
     })
+  })
+})
+
+describe('CreateGoalModal goal type selector', () => {
+  async function mountModal() {
+    const { CreateGoalModal } = await import('./OrchestrationPage')
+    return mountWithTestDom(() => <CreateGoalModal projectId="project-1" open onClose={vi.fn()} />, React.act)
+  }
+  const radios = (root: Parameters<typeof descendants>[0]) =>
+    descendants(root).filter((n) => n.tagName === 'INPUT' && n.getAttribute('name') === 'goal-type')
+  async function fill(view: Awaited<ReturnType<typeof mountModal>>) {
+    const [objective, criteria] = descendants(view.document.body).filter((n) => n.tagName === 'TEXTAREA')
+    await React.act(async () => {
+      changeControl(objective, 'Do it')
+      changeControl(criteria, 'It works')
+    })
+  }
+  async function submit(view: Awaited<ReturnType<typeof mountModal>>) {
+    await React.act(async () => {
+      const form = descendants(view.document.body).find((n) => n.tagName === 'FORM')!
+      const key = Object.keys(form).find((k) => k.startsWith('__reactProps$'))!
+      ;(form as unknown as Record<string, { onSubmit: (e: { preventDefault: () => void }) => void }>)[key].onSubmit({ preventDefault() {} })
+    })
+  }
+
+  it('defaults to Auto and describes all four choices', async () => {
+    const view = await mountModal()
+    try {
+      const text = textOf(view.document.body)
+      expect(text).toContain('Goal type')
+      for (const copy of [
+        'Auto (recommended)', 'HuddleRoom picks the shape from your objective and criteria. You can correct it later.',
+        'One bounded result, even if it is large.',
+        'A finite sequence of outcomes, planned one level at a time.',
+        'Ongoing, recurring work with no natural end. Needs an accepted recurring policy before it can start.',
+      ]) expect(text).toContain(copy)
+      expect(radios(view.document.body).map((r) => r.checked)).toEqual([true, false, false, false])
+    } finally { view.cleanup() }
+  })
+
+  it('sends auto by default and the picked type otherwise', async () => {
+    const view = await mountModal()
+    try {
+      await fill(view)
+      await submit(view)
+      expect(state.createMutation.mutate.mock.calls[0][0]).toMatchObject({ goal_type: 'auto' })
+      await React.act(async () => changeControl(radios(view.document.body)[2], true))
+      await submit(view)
+      expect(state.createMutation.mutate.mock.calls[1][0]).toMatchObject({ goal_type: 'roadmap' })
+    } finally { view.cleanup() }
+  })
+
+  it('explains a classifier failure, announces it, and focuses Auto', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    const view = await mountModal()
+    try {
+      await fill(view)
+      await React.act(async () => changeControl(radios(view.document.body)[1], true))
+      await submit(view)
+      const copy = "We couldn't choose a goal type automatically. Pick Outcome, Roadmap, or Continuous and try again."
+      await React.act(async () => {
+        state.createMutation.mutate.mock.calls[0][1].onError(
+          new ApiError(503, 'HTTP 503', { code: 'goal_shape_unresolved', reason: 'x', message: 'y' }))
+      })
+      expect(textOf(view.document.body)).toContain(copy)
+      expect(state.announceError).toHaveBeenCalledWith(copy)
+      expect(view.activeElement).toBe(radios(view.document.body)[0])
+    } finally { view.cleanup() }
+  })
+
+  it('restores Auto after a successful create', async () => {
+    const view = await mountModal()
+    try {
+      await fill(view)
+      await React.act(async () => changeControl(radios(view.document.body)[2], true))
+      await submit(view)
+      await React.act(async () => state.createMutation.mutate.mock.calls[0][1].onSuccess({ goal: { id: 'g' } }))
+      expect(radios(view.document.body).map((r) => r.checked)).toEqual([true, false, false, false])
+    } finally { view.cleanup() }
+  })
+
+  it('disables the type inputs while creating', async () => {
+    state.createMutation.isPending = true
+    const view = await mountModal()
+    try {
+      const fieldset = descendants(view.document.body).find((n) => n.tagName === 'FIELDSET')!
+      expect(fieldset.getAttribute('disabled')).not.toBeNull()
+    } finally { view.cleanup() }
   })
 })

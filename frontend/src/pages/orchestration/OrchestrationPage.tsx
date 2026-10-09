@@ -5,7 +5,7 @@ import { Dialog } from '@/components/common/Dialog'
 import { useAllTasks } from '@/api/tasks'
 import { useAgents } from '@/api/agents'
 import { meetingKeys, useMeetingDecisions } from '@/api/meetings'
-import { apiFetch } from '@/lib/api-client'
+import { ApiError, apiFetch } from '@/lib/api-client'
 import {
   useBaselineDashboard,
   useCreateOrchestrationGoal,
@@ -472,7 +472,19 @@ function GoalListView({ projectId }: { projectId: string }) {
 
 // ─── Create Goal Modal ────────────────────────────────────────────────────────
 
-function CreateGoalModal({
+type GoalTypeChoice = 'auto' | 'outcome' | 'roadmap' | 'continuous'
+
+const GOAL_TYPE_CHOICES: { value: GoalTypeChoice; title: string; description: string }[] = [
+  { value: 'auto', title: 'Auto (recommended)', description: 'HuddleRoom picks the shape from your objective and criteria. You can correct it later.' },
+  { value: 'outcome', title: 'Outcome', description: 'One bounded result, even if it is large.' },
+  { value: 'roadmap', title: 'Roadmap', description: 'A finite sequence of outcomes, planned one level at a time.' },
+  { value: 'continuous', title: 'Continuous', description: 'Ongoing, recurring work with no natural end. Needs an accepted recurring policy before it can start.' },
+]
+
+const GOAL_SHAPE_UNRESOLVED_COPY =
+  "We couldn't choose a goal type automatically. Pick Outcome, Roadmap, or Continuous and try again."
+
+export function CreateGoalModal({
   projectId,
   open,
   onClose,
@@ -486,7 +498,10 @@ function CreateGoalModal({
   const [form, setForm] = useState({
     objective: '',
     successCriteria: '',
+    goalType: 'auto' as GoalTypeChoice,
   })
+  const autoRadioRef = useRef<HTMLInputElement>(null)
+  const [focusAuto, setFocusAuto] = useState(false)
   const [validationError, setValidationError] = useState<string | null>(null)
   const [createError, setCreateError] = useState<string | null>(null)
   const { announceError } = useGoalAnnouncer()
@@ -494,9 +509,14 @@ function CreateGoalModal({
     const message = validationError ?? createError
     if (message) announceError(message)
   }, [validationError, createError, announceError])
+  useEffect(() => {
+    if (!focusAuto) return
+    autoRadioRef.current?.focus()
+    setFocusAuto(false)
+  }, [focusAuto])
 
   function reset() {
-    setForm({ objective: '', successCriteria: '' })
+    setForm({ objective: '', successCriteria: '', goalType: 'auto' })
     setValidationError(null)
     setCreateError(null)
   }
@@ -523,6 +543,7 @@ function CreateGoalModal({
         success_criteria: criteria.map((description) => ({ description })),
         constraints: {},
         budget: {},
+        goal_type: form.goalType,
       },
       {
         onSuccess: (detail) => {
@@ -530,7 +551,17 @@ function CreateGoalModal({
           onClose()
           navigate(`/orchestration/${detail.goal.id}`)
         },
-        onError: (e) => setCreateError(errorRecord(e).what),
+        onError: (e) => {
+          const code = e instanceof ApiError && e.status === 503
+            ? (e.detail as { code?: string } | undefined)?.code
+            : undefined
+          if (code === 'goal_shape_unresolved') {
+            setCreateError(GOAL_SHAPE_UNRESOLVED_COPY)
+            setFocusAuto(true)
+          } else {
+            setCreateError(errorRecord(e).what)
+          }
+        },
       },
     )
   }
@@ -579,13 +610,47 @@ function CreateGoalModal({
             placeholder="Success criterion 1&#10;Success criterion 2"
             rows={4}
           />
-          {validationError && (
-            <p className="mt-2 text-xs text-huddleroom-status-red">{validationError}</p>
-          )}
-          {createError && (
-            <p className="mt-2 text-xs text-huddleroom-status-red">{createError}</p>
-          )}
         </div>
+
+        <fieldset disabled={createGoal.isPending} className="min-w-0">
+          <legend className="text-sm font-medium text-huddleroom-text-primary mb-2">Goal type</legend>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {GOAL_TYPE_CHOICES.map((choice) => {
+              const checked = form.goalType === choice.value
+              return (
+                <label
+                  key={choice.value}
+                  className={`flex cursor-pointer items-start gap-2 rounded-md border p-3 ${
+                    checked
+                      ? 'border-huddleroom-primary bg-huddleroom-depth'
+                      : 'border-huddleroom-border'
+                  }`}
+                >
+                  <input
+                    ref={choice.value === 'auto' ? autoRadioRef : undefined}
+                    type="radio"
+                    name="goal-type"
+                    value={choice.value}
+                    checked={checked}
+                    onChange={() => setForm((p) => ({ ...p, goalType: choice.value }))}
+                    className="mt-1"
+                  />
+                  <span className="flex flex-col gap-1">
+                    <span className="text-sm font-medium text-huddleroom-text-primary">{choice.title}</span>
+                    <span className="text-xs text-huddleroom-text-secondary">{choice.description}</span>
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+        </fieldset>
+
+        {validationError && (
+          <p className="text-xs text-huddleroom-status-red">{validationError}</p>
+        )}
+        {createError && (
+          <p className="text-xs text-huddleroom-status-red">{createError}</p>
+        )}
       </form>
     </Dialog>
   )
