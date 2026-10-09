@@ -1316,6 +1316,26 @@ async def test_depth_is_measured_from_the_finite_root_through_released_children(
     assert await roadmap._expansion_limit_error(db_session, child, 1) is None
 
 
+async def test_literal_three_deep_goal_tree_allows_depth_three_and_rejects_depth_four(db_session, test_project):
+    item = {**goal_item(), "goal_type": "roadmap"}
+    roadmap, root, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    await roadmap.advance(db_session, root, run)  # root -> child (depth 1, real release)
+    chain = [root, await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == root.id))]
+    for depth, goal_type in ((2, "roadmap"), (3, "outcome")):
+        node = OrchestrationGoal(
+            project_id=test_project.id, parent_goal_id=chain[-1].id, objective=f"d{depth}", original_request=f"d{depth}",
+            success_criteria=[], constraints={}, budget={}, goal_type=goal_type, status="active",
+            continuous_origin_key=f"d{depth}", parent_contract_snapshot={}, goal_delta={},
+        )
+        db_session.add(node); await db_session.flush()
+        chain.append(node)
+    assert root.orchestrator_context.get("expansion_policy", {}).get("max_goal_depth") in (None, 3)
+    # parents at depth 0,1,2 may add a child (child depth 1,2,3); the depth-3 goal may not (child depth 4)
+    for parent in chain[:3]:
+        assert await roadmap._expansion_limit_error(db_session, parent, 1) is None
+    assert "child depth 4 exceeds max_goal_depth 3" in await roadmap._expansion_limit_error(db_session, chain[3], 1)
+
+
 async def test_stale_expansion_limit_blocker_is_cleared_for_a_new_version(db_session, test_project):
     roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item())
     run.active_blockers = [{"kind": "expansion_limit", "item_key": "child", "roadmap_version_id": str(uuid.uuid4()),
