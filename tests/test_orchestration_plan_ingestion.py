@@ -274,3 +274,46 @@ async def test_rejected_replan_output_is_surfaced_on_pending_replan(db_session, 
 
     assert run.plan_state["status"] == "accepted"
     assert run.plan_state["pending_replan"]["ingestion_error"].startswith("planning_output_rejected: output must be")
+
+
+async def _race_ingest(db_session, test_project, row_summary):
+    """Row for (task, version) lands between the existence check and the insert."""
+    from sqlalchemy import insert
+
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    version = run.plan_state["planning_version"]
+    normalized = parse_envelope(_db_output(row_summary), "implementation", goal)
+    aid = plan_artifact_id(task.id, version)
+    await db_session.execute(insert(Artifact.__table__).values(
+        id=aid, project_id=test_project.id, name="raced", artifact_type="plan", status="draft",
+        linked_task_id=task.id, created_by_agent=task.assigned_to,
+        content_hash=plan_output_hash(normalized), metadata={"output_hash": plan_output_hash(normalized)},
+    ))
+    real_get, calls = db_session.get, []
+
+    async def get(model, ident, *a, **kw):
+        if model is Artifact:
+            calls.append(ident)
+            if len(calls) == 1:
+                return None  # simulate: row not yet visible at check time
+        return await real_get(model, ident, *a, **kw)
+
+    db_session.get = get
+    try:
+        return await ingest(db_session, goal, run, task, session.id, version, _db_output()), run, task
+    finally:
+        del db_session.get
+
+
+@pytest.mark.asyncio
+async def test_ingest_integrity_race_same_hash_returns_existing(db_session, test_project):
+    artifact, run, task = await _race_ingest(db_session, test_project, "sum")
+    assert artifact.id == plan_artifact_id(task.id, run.plan_state["planning_version"])
+    assert run.plan_state["plan_artifact_id"] == str(artifact.id)
+    assert await _plan_artifacts(db_session, task.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_ingest_integrity_race_different_hash_conflicts(db_session, test_project):
+    with pytest.raises(PlanIngestionError, match="conflicting plan output"):
+        await _race_ingest(db_session, test_project, "other")
