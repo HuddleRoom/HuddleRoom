@@ -26,7 +26,9 @@ from huddleroom.schemas.orchestration import GoalShapeDecision
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
-from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService, parse_roadmap_items
+from huddleroom.services.orchestration_roadmap_service import (
+    OrchestrationRoadmapService, expansion_limit_error, parse_roadmap_items,
+)
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionClaimAttention, SessionService
 from huddleroom.schemas.session import SessionCreate
@@ -1258,3 +1260,66 @@ async def test_child_inherits_root_limits_and_eligible_evidence_from_accepted_de
     assert context["expansion_policy"]["max_descendant_goals"] == 5
     assert context["expansion_policy"]["remaining_descendant_goals"] == 3
     assert context["eligible_evidence"] == {"artifact_ids": [str(artifact_id)], "evidence_ids": [str(evidence.id)]}
+
+
+# --- atomic depth / descendant-count rejection ---
+
+def _policy(**limits):
+    return {"expansion_policy": {"depth": 0, **limits}}
+
+
+async def test_expansion_limit_error_messages():
+    limits = {"max_goal_depth": 3, "max_descendant_goals": 50}
+    assert expansion_limit_error(2, 49, 1, limits) is None
+    assert expansion_limit_error(3, 0, 0, limits) is None
+    assert "child depth 4 exceeds max_goal_depth 3" in expansion_limit_error(3, 0, 1, limits)
+    assert "51 descendant goals exceed max_descendant_goals 50" in expansion_limit_error(1, 49, 2, limits)
+
+
+async def test_release_beyond_depth_limit_is_rejected_with_no_rows(db_session, test_project):
+    item = {**goal_item(), "mutates_shared_state": True}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    parent.orchestrator_context = _policy(max_goal_depth=0)
+    decisions = await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision))  # pylint: disable=not-callable
+    result = await roadmap.release_goal_item(
+        db_session, parent, run, version, parse_roadmap_items([item], set(parent.budget["caps"]))[0],
+    )
+    assert result == {"step": "needs_attention"}
+    assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision)) == decisions  # pylint: disable=not-callable
+    blocker, = [b for b in run.active_blockers if b["kind"] == "expansion_limit"]
+    assert blocker["item_key"] == "child" and blocker["roadmap_version_id"] == str(version.id)
+    assert blocker["required_decision"] == "request_roadmap_replan" and "max_goal_depth 0" in blocker["reason"]
+
+
+async def test_release_beyond_descendant_limit_is_rejected_after_the_first_child(db_session, test_project):
+    small = {"max_tokens": 300, "max_turns": 1, "max_hours": 1}
+    roadmap, parent, run, version = await accepted_goal_roadmap(
+        db_session, test_project, [goal_item("one", small), goal_item("two", small)],
+    )
+    parent.orchestrator_context = _policy(max_descendant_goals=1)
+    await roadmap.advance(db_session, parent, run)
+    await roadmap.advance(db_session, parent, run)
+    assert await _row_counts(db_session, parent, run) == [1, 1, 1, 1, 1]
+    blocker, = [b for b in run.active_blockers if b["kind"] == "expansion_limit"]
+    assert blocker["item_key"] == "two" and "max_descendant_goals 1" in blocker["reason"]
+
+
+async def test_depth_is_measured_from_the_finite_root_through_released_children(db_session, test_project):
+    item = {**goal_item(), "goal_type": "roadmap"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    await roadmap.advance(db_session, parent, run)
+    child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent.id))
+    parent.orchestrator_context = _policy(max_goal_depth=1)
+    assert "child depth 2 exceeds max_goal_depth 1" in await roadmap._expansion_limit_error(db_session, child, 1)
+    parent.orchestrator_context = _policy(max_goal_depth=2)
+    assert await roadmap._expansion_limit_error(db_session, child, 1) is None
+
+
+async def test_stale_expansion_limit_blocker_is_cleared_for_a_new_version(db_session, test_project):
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item())
+    run.active_blockers = [{"kind": "expansion_limit", "item_key": "child", "roadmap_version_id": str(uuid.uuid4()),
+                            "reason": "expansion_limit: stale", "required_decision": "request_roadmap_replan"}]
+    await roadmap.advance(db_session, parent, run)
+    assert not [b for b in run.active_blockers if b["kind"] == "expansion_limit"]
+    assert await _row_counts(db_session, parent, run) == [1, 1, 1, 1, 1]

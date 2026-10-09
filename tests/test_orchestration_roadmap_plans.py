@@ -1662,3 +1662,59 @@ async def test_rejected_replan_output_is_revised_into_a_new_replan_task_and_acce
     )
     assert acceptance.status == "completed" and run.plan_state["pending_replan"] is None
     assert run.plan_state["roadmap_version"] == 2
+
+
+# --- expansion limits at acceptance, replan immutability of explicit child type ---
+
+_SMALL = {"max_tokens": 100, "max_turns": 1, "max_hours": 1}
+_BUDGET = {"max_tokens": 1_000, "max_turns": 10, "max_hours": 10}
+
+
+async def test_acceptance_rejects_goal_items_beyond_descendant_limit(db_session, test_project, test_user):
+    service, goal, run, artifact, _, _ = await _roadmap_acceptance(
+        db_session, test_project, test_user, budget=_BUDGET,
+        items=[_roadmap_goal("a", allocation=_SMALL), _roadmap_goal("b", allocation=_SMALL)],
+    )
+    goal.orchestrator_context = {**goal.orchestrator_context, "expansion_policy": {"max_descendant_goals": 1, "depth": 0}}
+    with pytest.raises(HTTPException) as exc:
+        await OrchestrationRoadmapService(service).ensure_plan_approval(db_session, goal, run, artifact)
+    assert exc.value.status_code == 409 and "max_descendant_goals 1" in exc.value.detail
+
+
+async def test_advance_turns_expansion_limit_into_plan_revision(db_session, test_project, test_user, stub_decision):
+    service, goal, run, artifact, _, _ = await _roadmap_acceptance(
+        db_session, test_project, test_user, budget=_BUDGET, seed_approval=False,
+        items=[_roadmap_goal("a", allocation=_SMALL)],
+    )
+    goal.orchestrator_context = {**goal.orchestrator_context, "expansion_policy": {"max_goal_depth": 0, "depth": 0}}
+    _accept_decision(stub_decision, artifact)
+    result = await service._advance_authorized_execution(db_session, goal, run)
+    assert result["step"] == "plan_revision_required" and "max_goal_depth 0" in result["reason"]
+    assert run.plan_state["status"] == "revision_required" and "expansion_limit" in run.plan_state["revision_reason"]
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapVersion)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
+
+
+async def test_replan_rejects_changing_released_child_goal_type(db_session, test_project, test_user):
+    original = {**_roadmap_goal("a", allocation=_SMALL), "goal_type": "outcome"}
+    service, goal, run, artifact = await _accept_version_one(
+        db_session, test_project, test_user, items=[original], budget=_BUDGET,
+    )
+    await _release_roadmap_item(db_session, service, goal, run, "a", "goal")
+    _, candidate = await _replan_artifact(
+        db_session, test_project, service, goal, run, artifact, [{**original, "goal_type": "roadmap"}],
+    )
+    with pytest.raises(HTTPException, match="Released roadmap item 'a' cannot be changed"):
+        await service.execute_accept_plan_action(
+            db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)},
+            f"run:{run.id}:kind:changed-goal-type",
+        )
+
+
+async def test_unreleased_child_goal_type_change_needs_a_new_plan_approval(db_session, test_project, test_user):
+    service, goal, *_ = await _roadmap_acceptance(
+        db_session, test_project, test_user, budget=_BUDGET, items=[_roadmap_goal("a", allocation=_SMALL)],
+    )
+    outcome = [{**_roadmap_goal("a", allocation=_SMALL), "goal_type": "outcome"}]
+    roadmap = [{**_roadmap_goal("a", allocation=_SMALL), "goal_type": "roadmap"}]
+    assert _roadmap_fingerprint(service, goal, outcome) != _roadmap_fingerprint(service, goal, roadmap)

@@ -118,9 +118,31 @@ async def descendant_count(db, root_id) -> int:
     return count
 
 
+def expansion_limit_error(parent_depth: int, existing: int, new_children: int, limits: dict) -> str | None:
+    if new_children <= 0:
+        return None
+    if parent_depth + 1 > limits["max_goal_depth"]:
+        return (
+            f"expansion_limit: child depth {parent_depth + 1} exceeds max_goal_depth {limits['max_goal_depth']}; "
+            "replan: make this item an Outcome task or merge it into its parent"
+        )
+    if existing + new_children > limits["max_descendant_goals"]:
+        return (
+            f"expansion_limit: {existing + new_children} descendant goals exceed max_descendant_goals "
+            f"{limits['max_descendant_goals']}; replan with fewer goal items"
+        )
+    return None
+
+
 class OrchestrationRoadmapService:
     def __init__(self, orchestration_service):
         self.orchestration = orchestration_service
+
+    async def _expansion_limit_error(self, db, goal, new_children: int) -> str | None:
+        if new_children <= 0:
+            return None
+        root, depth, limits = await expansion_scope(db, goal)
+        return expansion_limit_error(depth, await descendant_count(db, root.id), new_children, limits)
 
     async def _child_shape(self, goal, item) -> dict:
         if item.goal_type is None:
@@ -317,6 +339,14 @@ class OrchestrationRoadmapService:
 
     async def ensure_plan_approval(self, db, goal, run, artifact):
         items = self.parse_items(artifact, goal)
+        released = set(await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
+            OrchestrationRoadmapItem.goal_id == goal.id
+        )))
+        reason = await self._expansion_limit_error(db, goal, sum(
+            1 for item in items if item.unit_type == "goal" and item.item_key not in released
+        ))
+        if reason is not None:
+            raise HTTPException(status_code=409, detail=reason)
         fingerprint = self.orchestration._accepted_plan_fingerprint(
             [item.model_dump(mode="json") for item in items]
         )
@@ -998,6 +1028,15 @@ class OrchestrationRoadmapService:
             if reservation is None:
                 raise HTTPException(status_code=409, detail="Roadmap child reservation is missing")
             return {"step": "release_item", "item_key": item.item_key, "unit_type": "goal"}
+        # ponytail: backstop for cousin races and legacy versions, mirrors child_contract; T13 root lock removes the race
+        reason = await self._expansion_limit_error(db, goal, 1)
+        if reason is not None:
+            self.orchestration._upsert_active_blocker(run, {
+                "kind": "expansion_limit", "item_key": item.item_key, "roadmap_version_id": str(version.id),
+                "reason": reason, "required_decision": "request_roadmap_replan",
+            })
+            await db.flush()
+            return {"step": "needs_attention"}
         for key, value in item.constraints.items():
             if key in goal.constraints and goal.constraints[key] != value:
                 self.orchestration._upsert_active_blocker(run, {
@@ -1135,6 +1174,11 @@ class OrchestrationRoadmapService:
             isinstance(blocker, dict)
             and blocker.get("kind") == "budget_integrity"
             and str(blocker.get("reason", "")).startswith("Roadmap parent budget exhausted")
+        )]
+        run.active_blockers = [blocker for blocker in run.active_blockers if not (
+            isinstance(blocker, dict)
+            and blocker.get("kind") == "expansion_limit"
+            and blocker.get("roadmap_version_id") != str(version.id)
         )]
         if any(self.orchestration._has_active_blocker(run, kind) for kind in (
             "staging_boundary", "budget_measurement", "budget_integrity", "child_cancelled",
