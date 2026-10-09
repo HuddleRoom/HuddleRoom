@@ -1225,3 +1225,40 @@ async def test_unadopted_pre_plan_audit_must_be_explained_and_then_continues_unb
     assert "orchestration_plan_item" not in audit.metadata_
     assert [e["plan_item_id"] for e in run.plan_state["expanded_items"]] == ["implement-api"]
     assert await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task") == []
+
+
+@pytest.mark.asyncio
+async def test_second_plan_version_readopting_a_bound_task_is_rejected_or_replayed_never_rebound(db_session, test_project):
+    """Tester gap: a replan may not silently re-adopt a task already bound by an earlier accepted plan."""
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    await _expand(service, db_session, run, "audit-0")
+    request_action = (await _run_rows(db_session, OrchestrationAction, run.id, action_type="request_plan"))[0]
+    planner = await db_session.get(Agent, uuid.UUID(request_action.request["agent_id"]))
+
+    # A replan: put the run back in the revision state a request_plan_revision would leave it in.
+    run.plan_state = {**run.plan_state, "status": "revision_requested"}
+    await db_session.flush()
+    # Same item id, different content (new fingerprint): passes gate-identity validation, expansion must not rebind.
+    await _accept_with_items(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(audit.id, item_id="audit-0", priority=99)],
+    )
+    first_expand = (await _run_rows(db_session, OrchestrationAction, run.id, action_type="expand_plan_item"))[0]
+    (marker,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")
+    v1_request = dict(marker.request)
+    # Observed behavior: the expand idempotency key is plan-version independent, so v2 replays v1's binding
+    # (no adoption_conflict is reachable here; v2 priority is ignored) and nothing is bound twice.
+    assert (await _expand(service, db_session, run, "audit-0")).id == first_expand.id
+    assert audit.priority == 70
+    (marker,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")
+    assert marker.request == v1_request
+
+    run.plan_state = {**run.plan_state, "status": "revision_requested"}
+    await db_session.flush()
+    # Different item id: the task is already bound to audit-0's gate, so acceptance rejects it.
+    with pytest.raises(HTTPException) as exc_info:
+        await _accept_with_items(
+            db_session, test_project.id, service, run, planner, request_action,
+            [_adopting_item(audit.id, item_id="renamed", priority=10)],
+        )
+    assert exc_info.value.status_code == 409 and exc_info.value.detail.startswith("adoption_invalid:")

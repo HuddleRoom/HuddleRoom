@@ -845,3 +845,36 @@ async def test_synthesis_join_releases_once_only_after_every_audit_gate_is_accep
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "release_item",
     ))).scalars().all()
     assert sorted(a.request["plan_item_id"] for a in releases) == ["audit-0", "audit-1", "synthesis"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_adopted_audit_without_verification_keeps_synthesis_queued(db_session, test_project):
+    """Tester gap: a finished adopted audit whose gate still needs verification must not release the join."""
+    from huddleroom.models.session import Session
+    from huddleroom.services.event_bus import emit_event_once
+    from tests.test_orchestration_plan_to_work_expansion import _adopted_audit_plan
+
+    service, goal, run, (audit,) = await _adopted_audit_plan(
+        db_session, test_project.id, audits=1, synthesis={"priority": 80},
+    )
+    audit.status = "done"
+    session = Session(task_id=audit.id, agent_id=audit.assigned_to, project_id=test_project.id,
+                      adapter_type="api", status="completed", output="Audit finished.")
+    db_session.add(session)
+    await db_session.flush()
+    await emit_event_once(db_session, test_project.id, "task.status_changed",
+                          {"task_id": str(audit.id), "status": "done", "previous_status": "in_progress"},
+                          dedup_key=f"done:{audit.id}")
+    await emit_event_once(db_session, test_project.id, "session.completed",
+                          {"session_id": str(session.id), "task_id": str(audit.id)},
+                          dedup_key=f"completed:{session.id}")
+
+    for _ in range(3):
+        await service._release_ready_work(db_session, goal, run)
+
+    gate = (await db_session.execute(select(OrchestrationGate).where(
+        OrchestrationGate.run_id == run.id, OrchestrationGate.success_criterion_key == "plan_item:audit-0",
+    ))).scalar_one()
+    assert gate.status not in ("accepted", "failed")  # open: terminal task + report, verification still missing
+    tasks = (await db_session.execute(select(Task).where(Task.project_id == test_project.id))).scalars().all()
+    assert not [t for t in tasks if (t.metadata_ or {}).get("orchestration", {}).get("plan_item_id") == "synthesis"]
