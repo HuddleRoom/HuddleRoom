@@ -856,7 +856,7 @@ describe('goal header shape provenance', () => {
     expect(html).toContain('Outcome')
     expect(html).toContain('Existing goal (set before automatic selection)')
     expect(html).toContain('Delivery plan')
-    expect(html).toContain('Why <!-- -->Outcome<!-- -->: <!-- -->One bounded result.')
+    expect(html).toContain('Why Outcome: One bounded result.')
     expect(html).toContain('Why this plan depth')
     expect(html).toContain('Small enough for one plan level.')
     expect(html).not.toContain('replaces an earlier run')

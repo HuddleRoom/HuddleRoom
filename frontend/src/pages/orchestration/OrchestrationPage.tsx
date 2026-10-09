@@ -1210,7 +1210,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           </div>
 
           {goal.goal_type_rationale ? (
-            <p className="mt-2 text-sm text-huddleroom-text-secondary">Why {goalTypeLabel(goal.goal_type)}: {goal.goal_type_rationale}</p>
+            <p className="mt-2 text-sm text-huddleroom-text-secondary">{`Why ${goalTypeLabel(goal.goal_type)}: ${goal.goal_type_rationale}`}</p>
           ) : null}
           {goal.planning_rationale ? (
             <details className="mt-2 text-sm text-huddleroom-text-secondary">
