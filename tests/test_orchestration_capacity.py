@@ -272,6 +272,26 @@ async def test_root_child_and_grandchild_ready_work_starts_at_most_two_in_total(
     assert await available_slots(db_session, root.id) == 0
 
 
+async def test_queued_planning_task_is_not_starved_by_later_lower_ranked_work(db_session, test_project):
+    agent = await _agent_row(db_session)
+    root, run = await _root(db_session, test_project)
+    audits = [await _task(db_session, test_project, run, "in_progress", agent=agent, priority=10) for _ in range(2)]
+    planner = await _task(db_session, test_project, run, agent=agent, priority=70)
+    later = [await _task(db_session, test_project, run, agent=agent, priority=50) for _ in range(2)]
+    service = OrchestrationService()
+    await service.tick(db_session, run.id)
+    assert (await db_session.get(Task, planner.id)).status == "backlog"  # root full: queued, not dropped
+    order = [t.id for t in rank_queued(await queued_tasks(db_session, root.id), {})]
+    assert order[0] == planner.id and order == [t.id for t in rank_queued(await queued_tasks(db_session, root.id), {})]
+    for audit in audits:  # both audits finish
+        audit.status = "done"
+    await db_session.flush()
+    await service.tick(db_session, run.id)
+    assert (await db_session.get(Task, planner.id)).status == "in_progress"
+    started = [(await db_session.get(Task, t.id)).status for t in later]
+    assert sorted(started) == ["backlog", "in_progress"]  # planner + one best-ranked later task
+
+
 # --- 13e: every goal lock takes the finite-tree root lock first (committed sessions, real concurrency) ---
 
 @pytest_asyncio.fixture

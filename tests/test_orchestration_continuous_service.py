@@ -447,6 +447,43 @@ async def test_discovery_dispatch_replays_one_task_session_and_reservation(
     assert session.metadata_["_run_config"]["max_tokens"] == 100
 
 
+async def test_discovery_waits_with_capacity_wait_and_reserves_no_source_budget_when_root_full(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    goal, run = await discovery_ready(db_session, test_project, test_agent)
+    service = OrchestrationService()
+
+    async def baseline_ready(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_ensure_baseline_processes_ready", baseline_ready)
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:test")
+    due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
+    continuous = OrchestrationContinuousService(service)
+    assert await continuous.claim_due_cycle(db_session, goal.id, due) is run
+    reserved = await db_session.scalar(select(func.count()).select_from(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.discovery_run_id == run.id))
+    busy = []
+    for _ in range(2):  # fill both root slots with running work of this root
+        busy.append(Task(project_id=test_project.id, title="busy", status="in_progress",
+                            metadata_={"orchestration": {"run_id": str(run.id)}}))
+    db_session.add_all(busy)
+    await db_session.flush()
+    assert await continuous.advance(db_session, goal, run, due) == {"step": "waiting", "reason": "capacity_wait"}
+    # the gate adds no reservation (note: claim_due_cycle already reserved the source budget before advance)
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.discovery_run_id == run.id)) == reserved
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "create_delegation_task")) == 0
+    assert not (run.plan_state or {}).get("discovery", {}).get("active_task_id")
+    for task in busy:  # a freed slot lets the same cycle dispatch, still on one reservation
+        task.status = "done"
+    await db_session.flush()
+    assert (await continuous.advance(db_session, goal, run, due))["step"] == "discovery_running"
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.discovery_run_id == run.id)) == 1
+
+
 async def dispatched_discovery_source(db_session, test_project, test_agent, monkeypatch, **overrides):
     goal, run = await discovery_ready(db_session, test_project, test_agent, **overrides)
     service = OrchestrationService()
