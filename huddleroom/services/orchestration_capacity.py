@@ -85,18 +85,22 @@ async def queued_tasks(db, root_id) -> list[Task]:
     ))
 
 
-def _dependency_counts(items) -> Counter:
+def _key(item) -> str:
+    return str(getattr(item, "item_key", None) or item.id)
+
+
+def dependency_counts(items) -> Counter:
     return Counter(
         str(dep).removeprefix("plan_item:") for item in items for dep in (getattr(item, "depends_on", None) or [])
     )
 
 
 def rank_queued(items, plan_order: Mapping[str, int], unlocks: Mapping[str, int] | None = None) -> list:
-    """Priority, then dependents unlocked, then plan order, then stable id. Works for tasks and plan items."""
+    """Priority, then dependents unlocked, then plan order, then stable id. Works for tasks, plan items, roadmap items."""
     if unlocks is None:
-        unlocks = _dependency_counts(items)
+        unlocks = dependency_counts(items)
     return sorted(items, key=lambda item: (
-        -item.priority, -unlocks.get(str(item.id), 0), plan_order.get(str(item.id), float("inf")), str(item.id)
+        -item.priority, -unlocks.get(_key(item), 0), plan_order.get(_key(item), float("inf")), _key(item)
     ))
 
 
@@ -114,7 +118,7 @@ async def activate_ready(
             runs[run_id] = await db.get(OrchestrationRun, uuid.UUID(run_id))
         if await is_blocked(db, runs[run_id], task) is None:
             startable.append(task)
-    counts = _dependency_counts(queued)
+    counts = dependency_counts(queued)
     plan_order, unlocks = {}, {}
     for task in queued:
         meta = task.metadata_.get("orchestration") or {}

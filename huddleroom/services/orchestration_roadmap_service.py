@@ -34,7 +34,9 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import (
     OrchestrationGoalCreate, OrchestrationPlanItem, OrchestrationRoadmapPlanItem, ROADMAP_BUDGET_DIMENSIONS,
 )
-from huddleroom.services.orchestration_capacity import root_and_depth
+from huddleroom.services.orchestration_capacity import (
+    CAPACITY_WAIT, dependency_counts, rank_queued, root_and_depth, root_goal_id,
+)
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_budget_service import (
     BudgetMeasurementError, OrchestrationBudgetService, canonical_amounts, parent_caps, validate_declared_allocations,
@@ -685,15 +687,6 @@ class OrchestrationRoadmapService:
                 return False
         return True
 
-    async def _active_task_count(self, db, goal_id) -> int:
-        return await db.scalar(select(func.count(OrchestrationRoadmapItem.id)).join(  # pylint: disable=not-callable
-            Task, OrchestrationRoadmapItem.task_id == Task.id,
-        ).where(
-            OrchestrationRoadmapItem.goal_id == goal_id,
-            OrchestrationRoadmapItem.unit_type == "task",
-            Task.status.in_(("backlog", "ready", "in_progress", "blocked")),
-        )) or 0
-
     async def _mutable_item_active(self, db, goal_id) -> bool:
         return await db.scalar(select(OrchestrationRoadmapItem.id).join(
             OrchestrationGate, OrchestrationRoadmapItem.gate_id == OrchestrationGate.id,
@@ -769,12 +762,13 @@ class OrchestrationRoadmapService:
                 OrchestrationRoadmapItem.goal_id == goal.id
             ))).all()
         }
-        for item in items:
+        headroom = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id))
+        for item in rank_queued(items, {item.item_key: index for index, item in enumerate(items)}, dependency_counts(items)):
             if item.item_key in released or not await self._dependencies_accepted(
                 db, goal.id, run.id, version, item.depends_on
             ):
                 continue
-            if item.unit_type == "task" and await self._active_task_count(db, goal.id) >= self.orchestration.RELEASE_TWO_TASK_CAP:
+            if item.unit_type == "task" and headroom <= 0:
                 continue
             if item.mutates_shared_state and await self._mutable_item_active(db, goal.id):
                 continue
@@ -841,13 +835,14 @@ class OrchestrationRoadmapService:
         released = set((await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
                 OrchestrationRoadmapItem.goal_id == goal.id
             ))).all())
-        for item in items:
+        headroom = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id))
+        for item in rank_queued(items, {item.item_key: index for index, item in enumerate(items)}, dependency_counts(items)):
             if item.item_key in released:
                 continue
             if not await self._dependencies_accepted(db, goal.id, run.id, version, item.depends_on):
                 continue
-            if item.unit_type == "task" and await self._active_task_count(db, goal.id) >= self.orchestration.RELEASE_TWO_TASK_CAP:
-                return "waiting_active_work"
+            if item.unit_type == "task" and headroom <= 0:
+                return CAPACITY_WAIT
             if item.mutates_shared_state and await self._mutable_item_active(db, goal.id):
                 return "waiting_shared_workspace"
             if item.mutates_shared_state and await self._requires_mutation_authority(db, goal, version, item):

@@ -66,6 +66,16 @@ def roadmap_task(key, *, depends_on=(), mutates_shared_state=False):
     }
 
 
+async def finish_planning_tasks(db, run):
+    """Accepted plans have finished their planning task; it must not hold a root slot."""
+    for task in await db.scalars(select(Task).where(
+        Task.metadata_["orchestration"]["run_id"].as_string() == str(run.id), Task.status == "backlog",
+    )):
+        if OrchestrationService._task_work_function(task) == "planning":
+            task.status = "done"
+    await db.flush()
+
+
 @pytest.fixture
 async def accepted_roadmap(db_session, test_project):
     planner = _agent("roadmap-planner", ["planning", "implementation"])
@@ -110,6 +120,7 @@ async def accepted_roadmap(db_session, test_project):
             db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
             f"run:{run.id}:kind:roadmap-accept",
         )
+        await finish_planning_tasks(db_session, run)
         return service, goal, run, verifier
 
     return create
@@ -591,7 +602,7 @@ async def test_roadmap_task_release_stops_at_two_active_tasks(db_session, accept
     ])
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "one"
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "two"
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_work"}
+    assert (await service.tick(db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "capacity_wait"}
     first = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "one",
     ))

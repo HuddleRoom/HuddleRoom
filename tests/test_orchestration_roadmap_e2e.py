@@ -119,6 +119,7 @@ async def _approved_roadmap(db, project, items, *, accept=True, caps=None):
         f"run:{run.id}:kind:e2e-roadmap-accept")
     version = await OrchestrationRoadmapService(service).current_version(db, goal.id)
     assert version is not None
+    (await db.get(Task, request.target_id)).status = "done"  # a finished planning task holds no capacity slot
     goal.weight = "trivial"  # Keep the unrelated effectiveness analyzer deterministic.
     return service, goal, run, version
 

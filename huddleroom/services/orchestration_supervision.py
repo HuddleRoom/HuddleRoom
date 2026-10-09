@@ -21,10 +21,9 @@ from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_
 
 from huddleroom.services.orchestration_decision_validator import (
     ALLOWED_ACTION_SCHEMAS,
-    FINAL_SUMMARY_WORK_FUNCTION,
     OPTIONAL_ACTION_FIELDS,
-    PLAN_WORK_FUNCTION,
 )
+from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, root_goal_id
 
 UNCHANGED_WAKE_LIMIT = 3
 VERIFICATION_ATTEMPT_LIMIT = 3
@@ -338,21 +337,14 @@ class OrchestrationSupervisionService:
         run.supervision_state = state
         return {"outcome": "needs_attention", "action_id": str(action.id)}
 
-    async def _has_proactive_work(self, active_tasks, situation_getter, held=frozenset()) -> bool:
+    async def _has_proactive_work(self, situation_getter, held=frozenset(), has_slot=True) -> bool:
         """True when the orchestrator can usefully decide while system work is still running."""
         situation = await situation_getter()
         if situation.error:
             return False
         if self._actionable(situation, held)[0]:
             return True
-        work_in_flight = [
-            t for t in active_tasks
-            if self.orchestration._task_work_function(t) not in (PLAN_WORK_FUNCTION, FINAL_SUMMARY_WORK_FUNCTION)
-        ]
-        return (
-            any(c["state"] == "no_work" for c in situation.progress_view)
-            and len(work_in_flight) < self.orchestration.RELEASE_TWO_TASK_CAP
-        )
+        return has_slot and any(c["state"] == "no_work" for c in situation.progress_view)
 
     async def reconcile_local(self, db, goal, run, now=None, events=(), *, allow_release=True):
         """Deterministic local liveness pass; it never asks a provider or dispatches recovery."""
@@ -639,11 +631,12 @@ class OrchestrationSupervisionService:
                 OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human",
                 OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()} - {"None", ""}
         future = [wait for wait in waits if not is_due(wait)]
+        has_slot = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id)) > 0
         proactive = (
             (plan_accepted or plan_in_flight(run.plan_state))
             and (future or active_meeting is not None or active_graph_run is not None)
             and all((w.owner or {}).get("type") in SYSTEM_WAIT_OWNER_TYPES for w in future)
-            and await self._has_proactive_work(active_tasks, situation_getter, held)
+            and await self._has_proactive_work(situation_getter, held, has_slot)
         )
         if proactive:
             result = await self._proactive_outcome(db, run, await situation_getter(), held, state, now)
@@ -684,10 +677,14 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "closeout_ready", "fingerprint": fingerprint}
             run.supervision_state = state
             return {"outcome": "closeout_ready", "action_id": str(action.id), "fingerprint": fingerprint}
-        if plan_accepted and (idle_commitments or await self._has_proactive_work(active_tasks, situation_getter, held)):
+        if plan_accepted and (idle_commitments or await self._has_proactive_work(situation_getter, held, has_slot)):
             result = await self._proactive_outcome(db, run, await situation_getter(), held, state, now, idle_commitments)
             if result is not None:
                 return result
+        if not has_slot:  # every root slot is taken: a typed bounded wait, no provider call or blocker
+            state["last_assessment"] = {"at": now.isoformat(), "outcome": "waiting", "reason": CAPACITY_WAIT}
+            run.supervision_state = state
+            return {"outcome": "waiting", "reason": CAPACITY_WAIT, "root_goal_id": str(await root_goal_id(db, goal.id))}
         state["last_assessment"] = {"at": now.isoformat(), "outcome": "continue"}
         run.supervision_state = state
         return {"outcome": "continue"}

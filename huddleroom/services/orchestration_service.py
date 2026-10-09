@@ -94,6 +94,9 @@ from huddleroom.services.orchestration_agent_definition_review import AgentDefin
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess, plan_mode
 from huddleroom.services.orchestration_effectiveness_review import EffectivenessReviewProcess
 from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
+from huddleroom.services.orchestration_capacity import (
+    available_slots, dependency_counts, queued_tasks, rank_queued, root_goal_id,
+)
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_llm_decision_adapter import LLMDecisionAdapter, OrchestrationDecisionAdapter
 from huddleroom.services.orchestration_memory_preface import OrchestrationMemoryPrefaceBuilder
@@ -10411,7 +10414,14 @@ class OrchestrationService:
             return {"step": "next_action", "action_id": str(action.id), "reused": True}
         return {"step": "next_action", "action_id": str(action.id)}
 
-    RELEASE_TWO_TASK_CAP = 2
+    async def _release_headroom(self, db: AsyncSession, root_id: uuid.UUID) -> int:
+        """Free root slots minus startable queued tasks; dependency-blocked backlog holds no slot."""
+        startable = 0
+        for task in await queued_tasks(db, root_id):
+            run = await db.get(OrchestrationRun, uuid.UUID(task.metadata_["orchestration"]["run_id"]))
+            if await self._blocked_task_awaiting(db, run, task) is None:
+                startable += 1
+        return await available_slots(db, root_id) - startable
 
     async def _release_ready_work(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
@@ -10436,25 +10446,20 @@ class OrchestrationService:
             if await self._release_item_once(db, goal, run, item):
                 bound += 1
 
-        in_flight = await self._orchestrated_tasks_for_run(
-            db, run.id, statuses=["backlog", "ready", "in_progress", "blocked"]
-        )
-        work_in_flight = [
-            t for t in in_flight
-            if self._task_work_function(t) not in (PLAN_WORK_FUNCTION, FINAL_SUMMARY_WORK_FUNCTION)
-        ]
-        slots = self.RELEASE_TWO_TASK_CAP - len(work_in_flight)
+        slots = await self._release_headroom(db, await root_goal_id(db, goal.id))
         if slots <= 0:
             return bound
 
+        ready = [
+            item for item in items
+            if item.adopt_task_id is None and await self._item_dependencies_accepted(db, run, item)
+        ]
         released = 0
-        for item in items:
+        for item in rank_queued(
+            ready, {item.id: index for index, item in enumerate(items)}, dependency_counts(items)
+        ):
             if released >= slots:
                 break
-            if item.adopt_task_id is not None:
-                continue
-            if not await self._item_dependencies_accepted(db, run, item):
-                continue
             if await self._release_item_once(db, goal, run, item):
                 released += 1
         return bound + released

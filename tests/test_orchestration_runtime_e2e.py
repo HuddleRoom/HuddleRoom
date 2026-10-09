@@ -118,7 +118,7 @@ async def _run_actions(db_session, run_id):
     ).all()
 
 
-async def _seed_accepted_plan(db_session, test_project, service, run, planner, plan_items=None):
+async def _seed_accepted_plan(db_session, test_project, service, run, planner, plan_items=None, finish_planning=True):
     """Drive a real request_plan -> accept_plan cycle (bypassing the LLM decision
     loop) so run.plan_state["status"] == "accepted" with the given plan items
     (defaults to one expandable item)."""
@@ -167,6 +167,9 @@ async def _seed_accepted_plan(db_session, test_project, service, run, planner, p
     )
     await db_session.refresh(run)
     assert run.plan_state["status"] == "accepted"
+    if finish_planning:  # left in backlog the planning task would hold a root capacity slot
+        (await db_session.get(Task, request_action.target_id)).status = "done"
+        await db_session.flush()
 
 
 async def test_plan_item_criterion_keys_are_normalized():
@@ -741,7 +744,10 @@ async def test_tick_replay_deduplicates_regenerated_follow_up_decisions(
                 "agent_id": str(agent.id),
             }
         ],
+        finish_planning=False,  # the open planning task keeps the run from closing out between the two ticks
     )
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    goal.orchestrator_context = {**goal.orchestrator_context, "expansion_policy": {"max_concurrent_tasks": 3}}
     await service.reserve_action(
         db_session,
         run_id=run.id,
@@ -1141,7 +1147,7 @@ async def test_cancel_terminates_active_session_and_ignores_late_output(
     service, goal, run = await _authorized_run(db_session, test_project)
     await _seed_accepted_plan(db_session, test_project, service, run, planner)
     await service.tick(db_session, run.id)
-    task = (await _tasks_for_run(db_session, run.id))[0]
+    task = next(t for t in await _tasks_for_run(db_session, run.id) if t.status == "backlog")
     gate = (
         await db_session.execute(
             select(OrchestrationGate).where(

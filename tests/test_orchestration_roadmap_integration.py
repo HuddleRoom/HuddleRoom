@@ -21,7 +21,7 @@ from huddleroom.services.orchestration_authority_service import OrchestrationAut
 from huddleroom.services.session_sync import sync_task_from_session
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 from tests.test_orchestration_roadmap_children import goal_item
-from tests.test_orchestration_roadmap_task_items import roadmap_task
+from tests.test_orchestration_roadmap_task_items import finish_planning_tasks, roadmap_task
 from tests.test_orchestration_runtime_e2e import (
     _agent, _authorized_run, _complete_task_session, _run_actions, _seed_accepted_plan, _tasks_for_run,
 )
@@ -80,6 +80,7 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, team_agent_ids=(), 
     roadmap = OrchestrationRoadmapService(service)
     version = await roadmap.current_version(db, parent.id)
     assert run.plan_state["status"] == "accepted" and version is not None
+    await finish_planning_tasks(db, run)
     return roadmap, parent, run, version
 
 
@@ -192,6 +193,7 @@ async def _complete_child(db, project, roadmap, row, planner, producer, verifier
             "success_criterion_keys": ["local"],
         }],
     )
+    await finish_planning_tasks(db, child_run)
     assert (await service.tick(db, child_run.id))["authorized_execution"]["step"] == "release_work"
     work_task = next(task for task in await _tasks_for_run(db, child_run.id)
                      if service._task_work_function(task) == "implementation")
@@ -562,7 +564,7 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
     await capped.orchestration.tick(db_session, capped_run.id)
     await capped.orchestration.tick(db_session, capped_run.id)
     assert (await capped.orchestration.tick(db_session, capped_run.id))["authorized_execution"] == {
-        "step": "waiting", "reason": "waiting_active_work",
+        "step": "waiting", "reason": "capacity_wait",
     }
     unstaged_item = roadmap_task("unstaged", mutates_shared_state=True)
     unstaged_item["staging_boundary"] = None

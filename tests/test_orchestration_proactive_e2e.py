@@ -384,7 +384,10 @@ async def test_in_tick_follow_up_decisions_deduplicate_with_loop(
             "deliverable": "No duplicate work should release.",
             "agent_id": str(agent.id),
         }],
+        finish_planning=False,  # the open planning task keeps the run from closing out
     )
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    goal.orchestrator_context = {**goal.orchestrator_context, "expansion_policy": {"max_concurrent_tasks": 3}}
     await service.reserve_action(
         db_session,
         run_id=run.id,

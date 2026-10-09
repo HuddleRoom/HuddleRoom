@@ -80,7 +80,7 @@ async def test_system_wait_with_no_work_criterion_below_cap_continues(db_session
 
 
 async def test_no_work_criterion_at_cap_waits(db_session, test_project, test_agent, monkeypatch):
-    goal, run = await _setup(db_session, test_project, test_agent, tasks=OrchestrationService.RELEASE_TWO_TASK_CAP)
+    goal, run = await _setup(db_session, test_project, test_agent, tasks=settings.orchestration_max_concurrent_tasks)
     _situation(monkeypatch, progress_view=NO_WORK)
     assert (await _reconcile(db_session, goal, run))["outcome"] == "waiting"
 
@@ -445,7 +445,7 @@ async def test_plan_in_flight_with_orchestrator_wait_still_waits(db_session, tes
 
 async def test_plan_in_flight_at_cap_waits(db_session, test_project, test_agent, monkeypatch):
     goal, run = await _planning_setup(
-        db_session, test_project, test_agent, tasks=OrchestrationService.RELEASE_TWO_TASK_CAP
+        db_session, test_project, test_agent, tasks=settings.orchestration_max_concurrent_tasks
     )
     _situation(monkeypatch, progress_view=NO_WORK)
     assert (await _reconcile(db_session, goal, run))["outcome"] == "waiting"

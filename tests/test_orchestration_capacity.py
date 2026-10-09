@@ -209,3 +209,17 @@ async def test_attach_plan_item_metadata_records_index_and_unlocks():
     OrchestrationService._attach_plan_item_metadata(task, artifact, plan_item, action, gate)
     assert task.metadata_["orchestration"]["plan_index"] == 2
     assert task.metadata_["orchestration"]["plan_unlocks"] == 0
+
+
+async def test_release_headroom_subtracts_startable_queue_but_not_dependency_blocked(db_session, test_project):
+    agent = await _agent_row(db_session)
+    root, run = await _root(db_session, test_project)
+    service = OrchestrationService()
+    assert await service._release_headroom(db_session, root.id) == 2
+    dep = await _task(db_session, test_project, run, "in_progress", agent=agent)
+    blocked = await _task(db_session, test_project, run, agent=agent)
+    blocked.depends_on = [str(dep.id)]
+    await db_session.flush()
+    assert await service._release_headroom(db_session, root.id) == 1  # blocked backlog holds no slot
+    await _task(db_session, test_project, run, agent=agent)  # startable backlog holds one
+    assert await service._release_headroom(db_session, root.id) == 0
