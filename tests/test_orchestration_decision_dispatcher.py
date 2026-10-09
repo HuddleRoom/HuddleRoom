@@ -577,3 +577,37 @@ def test_advertised_action_schemas_match_dispatchable_executors():
 def test_every_dispatcher_executor_method_exists_on_orchestration_service():
     for action_type, method_name in OrchestrationDecisionDispatcher._EXECUTORS.items():
         assert callable(getattr(OrchestrationService, method_name, None)), (action_type, method_name)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_invalid_depends_on_records_failed_action_without_raising(db_session, test_project):
+    """Task 8 tester: an LLM create_delegation_task with a missing dependency is a failed action, no Task, no raise."""
+    from sqlalchemy import select
+    from sqlalchemy.sql.functions import count
+    from huddleroom.models.orchestration import OrchestrationAction
+    from tests.test_orchestration_delegation_contracts import (
+        _adhoc_dep_setup, _delegation_request, _task_count,
+    )
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    bad = str(uuid.uuid4())
+    from huddleroom.models.orchestration import OrchestrationDecision
+
+    decision = OrchestrationDecision(
+        run_id=run.id, decision_type="execution", validator_status="accepted", input_snapshot={},
+        parsed_decision={**_delegation_request(agent.id), "depends_on": [bad]},
+    )
+    db_session.add(decision)
+    await db_session.flush()
+    project_id, run_id = test_project.id, run.id
+    tasks_before = await _task_count(db_session, project_id)
+
+    action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
+
+    assert action is not None and action.status == "failed"
+    assert action.action_type == "create_delegation_task"
+    assert bad in (action.error or "") or "depend" in (action.error or "").lower()
+    assert await _task_count(db_session, project_id) == tasks_before
+    rows = await db_session.scalar(select(count(OrchestrationAction.id)).where(
+        OrchestrationAction.run_id == run_id, OrchestrationAction.status == "failed"))
+    assert rows == 1
