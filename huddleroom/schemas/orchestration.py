@@ -7,8 +7,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 from pydantic import (
-    BaseModel, ConfigDict, Field, StrictInt, ValidationInfo, computed_field,
-    field_validator, model_validator,
+    BaseModel, ConfigDict, Field, StrictBool, StrictInt, TypeAdapter, ValidationInfo,
+    computed_field, field_validator, model_validator,
 )
 from pydantic_core import PydanticCustomError
 
@@ -643,6 +643,56 @@ class OrchestrationGoalWeightOverrideRequest(BaseModel):
         return _require_nonblank_reason(value)
 
 
+class ModelSpendScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: StrictBool = False
+    remaining_by_dimension: dict[str, Annotated[Decimal, Field(ge=0)]] = Field(default_factory=dict)
+
+
+class ExternalWritesScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: StrictBool = False
+    targets: list[str] = Field(default_factory=list)
+
+
+class LiveSendsScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: StrictBool = False
+    channels: list[str] = Field(default_factory=list)
+
+
+class AuthorizationScope(BaseModel):
+    """Fail-closed: every capability defaults to not allowed."""
+    model_config = ConfigDict(extra="forbid")
+
+    model_spend: ModelSpendScope = Field(default_factory=ModelSpendScope)
+    external_writes: ExternalWritesScope = Field(default_factory=ExternalWritesScope)
+    live_sends: LiveSendsScope = Field(default_factory=LiveSendsScope)
+    workspace_mutation: Literal["read_only", "staged", "direct"] = "read_only"
+    tool_constraints: list[str] = Field(default_factory=list)
+
+
+# New keys are dropped from dumps while default-valued so legacy persisted
+# contracts, plan snapshots, and fingerprints stay byte-identical.
+_CONTRACT_NEW_DEFAULTS: dict[str, Any] = {
+    "title": "", "depends_on": [], "artifact_ids": [], "why_runnable": "",
+    "priority": 50, "decision_use": None, "authorization_scope": None,
+}
+_ITEM_NEW_DEFAULTS: dict[str, Any] = {
+    "adopt_task_id": None, "artifact_ids": [], "priority": 50, "why_runnable": "",
+}
+
+
+def _drop_default_keys(model: BaseModel, payload: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    for key, default in defaults.items():
+        if getattr(model, key) == default:
+            payload.pop(key, None)
+    return payload
+
+
 class OrchestrationDelegationContract(BaseModel):
     goal_id: uuid.UUID
     run_id: uuid.UUID
@@ -658,13 +708,20 @@ class OrchestrationDelegationContract(BaseModel):
     report_schema: dict = Field(default_factory=dict)
     parent_task_id: uuid.UUID | None = None
     orchestrator_context: dict = Field(default_factory=dict)
+    title: str = ""
+    depends_on: list[uuid.UUID] = Field(default_factory=list)
+    artifact_ids: list[uuid.UUID] = Field(default_factory=list)
+    why_runnable: str = ""
+    priority: StrictInt = Field(50, ge=0, le=100)
+    decision_use: str | None = None
+    authorization_scope: AuthorizationScope | None = None  # None = not declared
 
     def model_dump(self, **kwargs: Any) -> dict[str, Any]:
         """Keep the persisted contract canonical when no context is present."""
         payload = super().model_dump(**kwargs)
         if not self.orchestrator_context:
             payload.pop("orchestrator_context", None)
-        return payload
+        return _drop_default_keys(self, payload, _CONTRACT_NEW_DEFAULTS)
 
 
 class OrchestrationPlanItem(BaseModel):
@@ -688,6 +745,18 @@ class OrchestrationPlanItem(BaseModel):
     # plan item id or its gate key ("plan_item:<id>") -- see
     # OrchestrationService._item_dependencies_accepted.
     depends_on: list[str] = Field(default_factory=list)
+    adopt_task_id: uuid.UUID | None = None
+    artifact_ids: list[uuid.UUID] = Field(default_factory=list)
+    priority: StrictInt = Field(50, ge=0, le=100)
+    why_runnable: str = ""
+
+    @field_validator("why_runnable", mode="before")
+    @classmethod
+    def _strip_why_runnable(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        return _drop_default_keys(self, super().model_dump(**kwargs), _ITEM_NEW_DEFAULTS)
 
     @field_validator("id", "title", "work_function", "scope", "deliverable", "agent_id", mode="before")
     @classmethod
@@ -733,6 +802,22 @@ class OrchestrationRoadmapPlanItem(BaseModel):
     objective: str | None = None
     success_criteria: list[dict] = Field(default_factory=list)
     constraints: dict = Field(default_factory=dict)
+    adopt_task_id: uuid.UUID | None = None
+    artifact_ids: list[uuid.UUID] = Field(default_factory=list)
+    priority: StrictInt = Field(50, ge=0, le=100)
+    why_runnable: str = ""
+    goal_type: Literal["auto", "outcome", "roadmap"] | None = None
+
+    @field_validator("why_runnable", mode="before")
+    @classmethod
+    def strip_why_runnable(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        payload = _drop_default_keys(self, super().model_dump(**kwargs), _ITEM_NEW_DEFAULTS)
+        if self.goal_type is None:
+            payload.pop("goal_type", None)
+        return payload
 
     @field_validator("item_key", "title", "work_function", "scope", "deliverable", "objective", mode="before")
     @classmethod
@@ -764,6 +849,8 @@ class OrchestrationRoadmapPlanItem(BaseModel):
             if boundary.get("reversible") is not True or not str(boundary.get("identifier", "")).strip():
                 raise ValueError("mutable work requires a named reversible staging boundary")
         if self.unit_type == "task":
+            if self.goal_type is not None:
+                raise ValueError("task item cannot define goal_type")
             if not all((self.work_function, self.scope, self.deliverable)):
                 raise ValueError("task item requires work_function, scope, and deliverable")
             if self.objective is not None or self.success_criteria or self.constraints or self.allocation:
@@ -774,6 +861,65 @@ class OrchestrationRoadmapPlanItem(BaseModel):
             if any((self.work_function, self.scope, self.deliverable, self.agent_id)):
                 raise ValueError("goal item cannot define task-only fields")
         return self
+
+
+PLAN_ITEM_PROMPT_FIELDS: dict[str, str] = {
+    "id": "str", "title": "str|null", "work_function": "str", "scope": "str", "deliverable": "str",
+    "agent_id": "uuid|null", "inputs": "list[str]", "forbidden_work": "list[str]",
+    "success_evidence": "list[str]", "required_capabilities": "list[str]",
+    "required_evidence": "dict", "success_criterion_keys": "list[str]", "depends_on": "list[str]",
+    "adopt_task_id": "uuid|null", "artifact_ids": "list[uuid]",
+    "priority": "int 0..100 (default 50)", "why_runnable": "str (required, nonblank)",
+}
+ROADMAP_ITEM_PROMPT_FIELDS: dict[str, str] = {
+    "item_key": "str", "unit_type": "task|goal", "title": "str", "depends_on": "list[str]",
+    "mutates_shared_state": "bool", "staging_boundary": "dict|null", "allocation": "dict[str,number]",
+    "work_function": "str|null", "scope": "str|null", "deliverable": "str|null",
+    "agent_id": "uuid|null", "inputs": "list[str]", "forbidden_work": "list[str]",
+    "success_evidence": "list[str]", "required_capabilities": "list[str]",
+    "objective": "str|null", "success_criteria": "list[dict]", "constraints": "dict",
+    "adopt_task_id": "uuid|null", "artifact_ids": "list[uuid]",
+    "priority": "int 0..100 (default 50)", "why_runnable": "str (required, nonblank)",
+    "goal_type": "auto|outcome|roadmap|null (goal items only)",
+}
+
+
+class _PlanningEnvelopeBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    summary: str = Field(min_length=1)
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _strip_summary(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _why_runnable_required(self):
+        for i, item in enumerate(self.plan_items):
+            if not item.why_runnable.strip():
+                raise ValueError(f"plan_items[{i}].why_runnable must be nonblank")
+        return self
+
+
+class OutcomePlanningEnvelope(_PlanningEnvelopeBase):
+    plan_kind: Literal["delivery", "implementation"]
+    plan_items: list[OrchestrationPlanItem] = Field(min_length=1)
+
+
+class RoadmapPlanningEnvelope(_PlanningEnvelopeBase):
+    plan_kind: Literal["roadmap"]
+    plan_items: list[OrchestrationRoadmapPlanItem] = Field(min_length=1)
+
+
+PlanningEnvelope = Annotated[OutcomePlanningEnvelope | RoadmapPlanningEnvelope, Field(discriminator="plan_kind")]
+PLANNING_ENVELOPE_ADAPTER = TypeAdapter(PlanningEnvelope)
+
+
+def planning_envelope_report_schema(plan_kind: str) -> dict[str, Any]:
+    fields = ROADMAP_ITEM_PROMPT_FIELDS if plan_kind == "roadmap" else PLAN_ITEM_PROMPT_FIELDS
+    return {"schema_version": 1, "plan_kind": plan_kind, "summary": "str (nonblank)", "plan_items": [fields]}
 
 
 class OrchestrationRunResponse(BaseModel):

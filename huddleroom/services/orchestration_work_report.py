@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# Prompt-facing shape of the canonical report; keep in sync with validate_work_report.
+CANONICAL_WORK_REPORT_SCHEMA: dict[str, str] = {
+    "status": "str", "changes": "list[str]", "evidence": "list[str]",
+    "criterion_progress": "dict[str,str]", "decisions": "list[str]", "risks": "list[str]",
+    "open_questions": "list[str]", "next_step": "str", "collaboration_need": "str|null",
+}
+
+
 @dataclass(frozen=True)
 class WorkReport:
     status: str
