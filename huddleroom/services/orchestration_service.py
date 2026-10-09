@@ -1022,15 +1022,19 @@ class OrchestrationService:
 
     @staticmethod
     async def _plan_author_hint(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> dict | None:
-        from huddleroom.services.orchestration_team_hierarchy import select_plan_author
+        from huddleroom.services.orchestration_team_hierarchy import plan_mode, select_plan_author
 
-        mode = run.planning_mode_snapshot or goal.planning_mode
-        if mode == "continuous_policy" or (run.plan_state or {}).get("status") in {"accepted", "failed"}:
+        mode = plan_mode(goal, run)
+        status = (run.plan_state or {}).get("status")
+        # accepted Roadmap plans advertise the author for the replan path
+        if mode == "continuous_policy" or status == "failed" or (status == "accepted" and mode != "roadmap"):
             return None
         try:
             author, error = await select_plan_author(db, goal, run), None
         except HTTPException as exc:
             author, error = None, str(exc.detail)
+        except (ValueError, KeyError, TypeError) as exc:
+            author, error = None, f"plan_author_unavailable: malformed team data ({exc})"
         return {"agent_id": str(author) if author else None, "planning_mode": mode, "error": error}
 
     async def _recent_events_for_decision_context(
@@ -1925,7 +1929,7 @@ class OrchestrationService:
         from huddleroom.services.orchestration_team_hierarchy import select_plan_author
 
         author = await select_plan_author(db, goal, run)
-        if author is not None and str(author) != str(agent_id):
+        if author is not None and str(author) != str(agent_id or "").strip():
             raise HTTPException(
                 status_code=409,
                 detail=f"plan_author_mismatch: request_plan agent_id must be the selected plan author {author}",
@@ -5289,11 +5293,13 @@ class OrchestrationService:
     ) -> OrchestrationDelegationContract:
         from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 
+        from huddleroom.services.orchestration_team_hierarchy import plan_mode
+
         deliverable = {
             "roadmap": "Roadmap plan: a finite graph of distinct outcomes, defined progressively.",
             "delivery": "Delivery plan: one bounded plan coordinating every work function this outcome needs.",
         }.get(
-            run.planning_mode_snapshot or goal.planning_mode,
+            plan_mode(goal, run),
             "Implementation plan: a leaf technical plan for this outcome.",
         )
         return OrchestrationDelegationContract(
@@ -5898,9 +5904,11 @@ class OrchestrationService:
             "request_action_id": str(action.id),
             "work_function": PLAN_WORK_FUNCTION,
             "plan_gate_id": str(gate.id),
-            "plan_author_agent_id": str(task.assigned_to or (action.request or {}).get("agent_id")),
             "revision_requests": revision_requests,
         }
+        author_id = task.assigned_to or (action.request or {}).get("agent_id")
+        if author_id:
+            run.plan_state["plan_author_agent_id"] = str(author_id)
 
     @staticmethod
     def _append_plan_revision(

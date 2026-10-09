@@ -1428,12 +1428,17 @@ PLAN_AUTHOR_FUNCTIONS = {
 }
 
 
+def plan_mode(goal: OrchestrationGoal, run: OrchestrationRun) -> str:
+    return run.planning_mode_snapshot or goal.planning_mode
+
+
 def accepted_role_map(team) -> dict[str, str]:
     """work_function -> agent id from either accepted team shape."""
     team = team if isinstance(team, dict) else {}
     roles = {k: str(v) for k, v in (team.get("role_to_agent") or {}).items()}
     for item in team.get("assignments") or []:
-        roles.setdefault(item["work_function"], str(item["agent_ref"]))
+        if isinstance(item, dict) and item.get("work_function") and item.get("agent_ref"):
+            roles.setdefault(item["work_function"], str(item["agent_ref"]))
     return roles
 
 
@@ -1447,7 +1452,7 @@ async def select_plan_author(
         pending_definition_repair,
     )
 
-    mode = run.planning_mode_snapshot or goal.planning_mode
+    mode = plan_mode(goal, run)
     if mode == "continuous_policy":
         raise HTTPException(
             409,
@@ -1467,7 +1472,13 @@ async def select_plan_author(
     roles = accepted_role_map(team)
     if not roles:
         return None
-    eligibility = await accepted_work_functions(db, root.id)
+    # nearest ancestor (self first) with a reviewed eligibility map
+    review_goal, eligibility = goal, None
+    while True:
+        eligibility = await accepted_work_functions(db, review_goal.id)
+        if eligibility is not None or review_goal.parent_goal_id is None:
+            break
+        review_goal = await db.get(OrchestrationGoal, review_goal.parent_goal_id)
     functions = PLAN_AUTHOR_FUNCTIONS[mode]
     candidates: list[tuple[str, str]] = []
     for fn in functions:
@@ -1475,7 +1486,10 @@ async def select_plan_author(
         if agent_id:
             candidates.append((fn, agent_id))
     for fn, agent_id in candidates:
-        agent = await db.get(Agent, uuid.UUID(agent_id))
+        try:
+            agent = await db.get(Agent, uuid.UUID(agent_id))
+        except ValueError:
+            continue
         # ponytail: absent = not reviewed for this goal -> trust the accepted team
         if agent and agent.is_active and (
             eligibility is None or agent_id not in eligibility or fn in eligibility[agent_id]
@@ -1485,7 +1499,7 @@ async def select_plan_author(
         return None
     repair = "update the team hierarchy or the agent definition and rerun the agent definition review"
     for _fn, agent_id in candidates:
-        decision = await pending_definition_repair(db, root.id, agent_id)
+        decision = await pending_definition_repair(db, review_goal.id, agent_id)
         if decision is not None:
             repair = f"resolve agent definition decision {decision.id} (approve or edit)"
             break

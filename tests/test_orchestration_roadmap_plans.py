@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from huddleroom.config import settings
@@ -1551,3 +1551,54 @@ async def test_admission_failure_rolls_back_version_gate_and_projection_but_comm
         assert await reader.scalar(select(func.count()).select_from(EventLog).where(
             EventLog.project_id == test_project.id, EventLog.event_type == "orchestration.plan_accepted",
         )) == 0
+
+
+async def test_roadmap_replan_requires_selected_plan_author(db_session, test_project, test_user, monkeypatch):
+    from huddleroom.models.orchestration import OrchestrationDecision
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+    outsider = _agent("replan-non-author", ["planning"])
+    db_session.add(outsider)
+    await db_session.flush()
+    service, goal, run, artifact = await _accept_version_one(
+        db_session, test_project, test_user, items=[_roadmap_task("v1")],
+    )
+    author = artifact.created_by_agent
+    goal.orchestrator_context = {"team": {"agent_ids": [str(author), str(outsider.id)], "assignments": [
+        {"work_function": "planning", "agent_ref": str(author)},
+    ]}}
+    # the fixture flips the goal to roadmap after run creation; align the frozen snapshot
+    await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == run.id).values(planning_mode_snapshot="roadmap"))
+    await db_session.refresh(run)
+
+    # accepted Roadmap plans still advertise the author (replan path)
+    hint = (await service._decision_context(db_session, goal, run))["plan_author"]
+    assert hint["agent_id"] == str(author) and hint["planning_mode"] == "roadmap"
+
+    request = {"action_type": "request_roadmap_replan", "agent_id": str(outsider.id),
+               "scope": "Revise remaining work.", "reason": "New information."}
+    before = len(await _run_actions(db_session, run.id))
+
+    # supervision: rejected before reserving anything
+    supervision = service.supervision
+
+    async def contract(*_args):
+        return "plan:1"
+
+    monkeypatch.setattr(supervision, "_contract_version", contract)
+    with pytest.raises(HTTPException, match="plan_author_mismatch"):
+        await supervision.apply_disposition(db_session, goal, run, SimpleNamespace(disposition={
+            "action_type": "replan", "origin": "test", "reason": "Why", "expected_result": "Expected",
+            "contract_version": "plan:1", "request": {"agent_id": str(outsider.id), "scope": "Adjust remaining work."},
+        }))
+    assert len(await _run_actions(db_session, run.id)) == before
+
+    # dispatcher: recorded as a failed action, no raise
+    decision = OrchestrationDecision(
+        run_id=run.id, decision_type="orchestration", parsed_decision=request, validator_status="accepted",
+    )
+    db_session.add(decision)
+    await db_session.flush()
+    action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
+    assert action.status == "failed" and action.action_type == "request_roadmap_replan"
+    assert "plan_author_mismatch" in action.error

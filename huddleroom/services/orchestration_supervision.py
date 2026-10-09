@@ -743,6 +743,8 @@ class OrchestrationSupervisionService:
                 key += f":{answered}"
             if kind == "verify":
                 key += await self.orchestration.verification_attempt_suffix(db, run.id, canonical.get("gate_id"))
+        if kind == "replan" and await self.orchestration._existing_action_for_key(db, run.id, key) is None:
+            await self.orchestration._require_plan_author(db, goal, run, canonical.get("agent_id"))
         action = await self.orchestration.reserve_action(db, run_id=run.id, idempotency_key=key, action_type=action_type, request=canonical)
         self._set_contract(action, goal, run, origin, key, disposition, reason)
         await db.flush()

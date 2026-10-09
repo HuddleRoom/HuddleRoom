@@ -110,6 +110,19 @@ class OrchestrationDecisionDispatcher:
             db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id,
         )
         if action_type in self._OWN_RECOVERY_ACTION_TYPES:
+            if action_type == "request_roadmap_replan" and await self._service._existing_action_for_key(
+                db, run_id, action_key
+            ) is None:
+                try:
+                    await self._service._require_plan_author(
+                        db, await db.get(OrchestrationGoal, run.goal_id), run, request.get("agent_id")
+                    )
+                except HTTPException as exc:
+                    if not str(exc.detail).startswith("plan_author_"):
+                        raise
+                    return await self._record_rejection(
+                        db, run_id, decision_id, action_type, request, action_key, str(exc.detail),
+                    )
             action = await call()
         else:
             kept: Exception | None = None

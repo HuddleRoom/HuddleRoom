@@ -2860,3 +2860,25 @@ async def test_select_plan_author_surfaces_pending_definition_repair_from_real_r
     assert exc.value.detail.startswith("plan_author_unavailable:")
     assert str(pending.id) in exc.value.detail
     assert manager.system_prompt == "You implement code yourself."
+
+
+@pytest.mark.asyncio
+async def test_select_plan_author_child_team_uses_nearest_ancestor_eligibility(db_session, test_project):
+    from huddleroom.services.orchestration_team_hierarchy import accepted_role_map, select_plan_author
+
+    ineligible = await _persist_agent(db_session, name="Ineligible")
+    parent, parent_run = await _plan_goal(db_session, test_project.id, "roadmap")
+    await _seed_team(db_session, parent, parent_run, [("planning", ineligible)], eligibility=[(ineligible, [])])
+    child, run = await _plan_goal(
+        db_session, test_project.id, "implementation", parent_goal_id=parent.id, continuous_origin_key="c",
+        parent_contract_snapshot={}, goal_delta={},
+        orchestrator_context={"team": {"role_to_agent": {"planning": str(ineligible.id)}}},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await select_plan_author(db_session, child, run)
+    assert exc.value.detail.startswith("plan_author_unavailable:")
+
+    assert accepted_role_map({"assignments": [{"work_function": "planning"}, "bad", {"work_function": "x", "agent_ref": "y"}]}) == {"x": "y"}
+    child.orchestrator_context = {"team": {"role_to_agent": {"planning": "not-a-uuid", "implementation": "also-bad"}}}
+    with pytest.raises(HTTPException):
+        await select_plan_author(db_session, child, run)

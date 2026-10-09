@@ -81,6 +81,7 @@ async def test_dispatch_routes_roadmap_replan_with_version_stable_key():
     service = OrchestrationService()
     service.execute_request_roadmap_replan_action = AsyncMock()
     service.roadmap_replan_action_key = AsyncMock()
+    service._existing_action_for_key = AsyncMock(return_value=object())
     dispatcher = OrchestrationDecisionDispatcher(service)
     run = type("R", (), {"id": uuid.uuid4(), "plan_state": {"roadmap_version": 2}})()
     decision = type("D", (), {
