@@ -209,3 +209,76 @@ async def test_reconcile_one_bad_run_does_not_abort_sweep(db_session, test_proje
     assert good.id in attempted
     assert good.id in ticked
     assert result == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_project, monkeypatch):
+    from collections import Counter
+
+    from sqlalchemy import func
+
+    from huddleroom.models.orchestration import (
+        OrchestrationAction, OrchestrationBudgetReservation, OrchestrationEvidence, OrchestrationGate,
+        OrchestrationRoadmapItem, OrchestrationRoadmapVersion,
+    )
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_roadmap_e2e import _children_of, _snapshot, nested_roadmap
+
+    async def noop_start(self, db, goal, run):
+        return 0
+
+    monkeypatch.setattr(OrchestrationService, "_start_released_tasks", noop_start)
+    n = await nested_roadmap(db_session, test_project, monkeypatch)
+
+    async def no_external_decision(self, db, run_id, adapter=None):
+        run = await db.get(OrchestrationRun, run_id)
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        context = await self._decision_context(db, goal, run)
+        return await self.record_validated_decision(
+            db, run_id, context, {}, {"action_type": "noop", "reason": "scheduler replay"})
+
+    monkeypatch.setattr(OrchestrationService, "request_llm_decision", no_external_decision)
+    models = (OrchestrationAction, Task, OrchestrationGate, OrchestrationEvidence, OrchestrationRoadmapItem,
+              OrchestrationRoadmapVersion, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun)
+
+    async def assert_one_lineage_per_key():
+        items = (await db_session.execute(select(OrchestrationRoadmapItem.goal_id, OrchestrationRoadmapItem.item_key))).all()
+        assert set(Counter(items).values()) <= {1}
+        reservations = (await db_session.execute(select(
+            OrchestrationBudgetReservation.parent_goal_id, OrchestrationBudgetReservation.roadmap_item_id))).all()
+        assert set(Counter(reservations).values()) <= {1} and len(reservations) == len(items) - 1  # build is a task
+        for goal in (n.parent, n.child):
+            runs = list(await db_session.scalars(select(OrchestrationRun).where(OrchestrationRun.goal_id == goal.id)))
+            versions = list(await db_session.scalars(select(OrchestrationRoadmapVersion).where(
+                OrchestrationRoadmapVersion.goal_id == goal.id)))
+            assert len(runs) == len(versions) == 1 and versions[0].run_id == runs[0].id
+        for goal_id, key in items:
+            releases = await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+                OrchestrationAction.action_type == "release_roadmap_item",
+                OrchestrationAction.idempotency_key.like(f"run:%:kind:release_roadmap_item:{key}"),
+                OrchestrationAction.run_id == (await db_session.scalar(select(OrchestrationRun.id).where(
+                    OrchestrationRun.goal_id == goal_id)))))
+            assert releases == 1, key
+        for child in [*await _children_of(db_session, n.parent), *await _children_of(db_session, n.child)]:
+            child_runs = list(await db_session.scalars(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id)))
+            assert len(child_runs) == 1
+            assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+                OrchestrationAction.run_id == child_runs[0].id,
+                OrchestrationAction.action_type == "authorize_execution")) == 1
+
+    assert await _children_of(db_session, n.child) == []
+    await reconcile_orchestration_runs_async(db_session)
+    assert [g.roadmap_item_key for g in await _children_of(db_session, n.child)] == ["g1"]
+    assert [g.roadmap_item_key for g in await _children_of(db_session, n.parent)] == ["area"]
+    await assert_one_lineage_per_key()
+    # The released child's first tick (sweep 2) is its own work; after that the sweeps are no-ops.
+    await reconcile_orchestration_runs_async(db_session)
+    await assert_one_lineage_per_key()
+    async def row_ids():
+        return {model: [row["id"] for row in rows] for model, rows in (await _snapshot(db_session, models)).items()}
+
+    settled = await row_ids()
+    await reconcile_orchestration_runs_async(db_session)
+    assert await row_ids() == settled
+    await assert_one_lineage_per_key()

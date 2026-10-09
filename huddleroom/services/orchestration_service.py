@@ -5284,6 +5284,9 @@ class OrchestrationService:
 
         parent = await OrchestrationBudgetService().roadmap_parent(db, goal) or goal
         child = parent.id != goal.id
+        if not child and goal.parent_goal_id and str(goal.roadmap_version_id) == str(roadmap.get("roadmap_version_id")):
+            # Its planning task still carries the lineage it was released under.
+            parent, child = await db.get(OrchestrationGoal, goal.parent_goal_id), True
         version_id = goal.roadmap_version_id if child else roadmap.get("roadmap_version_id")
         item_key = goal.roadmap_item_key if child else roadmap.get("roadmap_item_key")
         if parent is None or version_id is None or not isinstance(item_key, str):

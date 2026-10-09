@@ -8,12 +8,14 @@ import uuid
 from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete, event, func, inspect, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import (
@@ -21,7 +23,7 @@ from huddleroom.models.orchestration import (
     OrchestrationGate, OrchestrationGoal, OrchestrationRoadmapItem,
     OrchestrationRoadmapVersion, OrchestrationRun,
 )
-from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.event_bus import emit_event_once
@@ -85,9 +87,11 @@ async def _ready_roadmap(db, project):
     return service, goal, run, planner
 
 
-async def _approved_roadmap(db, project, items, *, accept=True):
+async def _approved_roadmap(db, project, items, *, accept=True, caps=None):
     """Admit version one through the public planning and authority flow."""
     service, goal, run, planner = await _ready_roadmap(db, project)
+    if caps:
+        goal.budget = run.budget_state = {"caps": caps}
     goal.orchestrator_context = {"team": {"agent_ids": [str(agent_id) for agent_id in await db.scalars(
         select(Agent.id).where(Agent.is_active.is_(True))
     )]}}
@@ -661,3 +665,224 @@ async def test_roadmap_failures_wait_without_scope_or_budget_expansion(
             settled = await _snapshot(db_session, (OrchestrationBudgetReservation,))
             await service.tick(db_session, run.id)
             assert await _snapshot(db_session, (OrchestrationBudgetReservation,)) == settled
+
+
+# --- three-level Roadmap -> Roadmap -> Outcome ---------------------------------
+
+def _scripted_decisions(monkeypatch, service, script):
+    """Like `_local_decisions`, but `script(run)` picks the decision per run (None = noop)."""
+    async def request(db, run_id, adapter=None):
+        run = await db.get(OrchestrationRun, run_id)
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        context = await service._decision_context(db, goal, run)
+        decision = script(run) or {"action_type": "noop", "reason": "Events drive E2E."}
+        return await service.record_validated_decision(db, run_id, context, {}, decision)
+
+    monkeypatch.setattr(service, "request_llm_decision", request)
+
+
+async def _children_of(db, goal):
+    return list(await db.scalars(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == goal.id)))
+
+
+async def _run_of(db, goal):
+    return await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == goal.id))
+
+
+async def nested_roadmap(db, project, monkeypatch):
+    """P (build -> area) -> C (area, a Roadmap) with C's plan accepted; g1/g2 are C's Outcome children."""
+    default_actions = settings.orchestration_max_actions_per_tick
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)  # one decision per tick, as in the T7 e2e
+    planner, producer, verifier, summarizer = await _child_actors(db)
+    builder = _agent("nested-builder", ["implementation"])
+    db.add(builder)
+    await db.flush()
+    build = {**roadmap_task("build"), "agent_id": str(builder.id)}
+    area = {**goal_item("area", allocation={"max_tokens": 600, "max_turns": 12, "max_hours": 4}),
+            "goal_type": "roadmap", "depends_on": ["build"]}
+    # Every session is one turn, so the turn caps leave room for each level's own planning/verification/summary.
+    service, parent, parent_run, version = await _approved_roadmap(
+        db, project, [build, area], caps={"max_tokens": 1000, "max_turns": 30, "max_hours": 10})
+    parent.weight = "trivial"
+    await heal_baseline_drift_for_test(db, parent, parent_run)
+    plans = {}  # child run id -> request_plan/accept_plan script state
+
+    def script(run):
+        if run.id != plans.get("run"):
+            return None
+        state = run.plan_state or {}
+        if state.get("plan_artifact_id") and state.get("status") not in {"accepted"}:
+            return {"action_type": "accept_plan", "plan_artifact_id": state["plan_artifact_id"]}
+        if not state.get("planning_task_id"):
+            return {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
+                    "scope": "Plan the area Roadmap."}
+        return None
+
+    _scripted_decisions(monkeypatch, service, script)
+    await service.tick(db, parent_run.id)
+    assert await _children_of(db, parent) == []
+    build_row = await _item(db, parent, "build")
+    await _complete_roadmap_task(db, project.id, service, parent_run, build_row, verifier.id)
+    await service.tick(db, parent_run.id)
+    (child,) = await _children_of(db, parent)
+    child.weight = "trivial"
+    child_run = await _run_of(db, child)
+    plans["run"] = child_run.id
+    # C plans in its own run: the scripted decision requests the plan, the planner answers with a
+    # Roadmap envelope, the human approves it, and the next tick accepts it as C's version one.
+    await service.tick(db, child_run.id)
+    planning_task = await db.get(Task, uuid.UUID(child_run.plan_state["planning_task_id"]))
+    assert await _children_of(db, child) == []
+    items = [{**goal_item(key, allocation={"max_tokens": 200, "max_turns": 4, "max_hours": 1}),
+              "goal_type": "outcome", "why_runnable": "ready", **({"depends_on": ["g1"]} if key == "g2" else {})}
+             for key in ("g1", "g2")]
+    envelope = json.dumps({"schema_version": 1, "plan_kind": "roadmap", "summary": "Two outcomes.", "plan_items": items})
+    await _record_measured_completion(db, project.id, child_run, planning_task, planning_task.assigned_to, envelope)
+    await service.tick(db, child_run.id)  # ingests the envelope and asks the human to approve it
+    decision = await db.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.goal_id == child.id, OrchestrationAuthorityDecision.status == "pending",
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_plan:%")))
+    assert decision is not None
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option="approve", decided_by_user_id=child.manager_user_id)
+    await service.tick(db, child_run.id)
+    await db.refresh(child_run)
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", default_actions)
+    return SimpleNamespace(
+        service=service, parent=parent, parent_run=parent_run, version=version, child=child, child_run=child_run,
+        planner=planner, producer=producer, verifier=verifier, summarizer=summarizer, build_row=build_row,
+        planning_task=planning_task,
+    )
+
+
+
+
+async def _tick_until(db, service, run, done, limit=6):
+    for _ in range(limit):
+        await service.tick(db, run.id)
+        if done():
+            return
+    raise AssertionError(f"run {run.id} did not reach the expected state")
+
+
+async def _close_roadmap(db, project, service, goal, run, verifier):
+    """Independent integration -> final summary -> completion for one Roadmap goal."""
+    roadmap = OrchestrationRoadmapService(service)
+    version = await roadmap.current_version(db, goal.id)
+    integration = None
+    for _ in range(4):
+        await service.tick(db, run.id)
+        integration = await _integration_gate(db, roadmap, goal, run, version)
+        if integration is not None:
+            break
+    assert integration is not None and integration.status == "open"
+    assert not await service._run_ready_for_final_summary_request(db, goal, run)
+    await service.execute_request_verification_action(
+        db, run.id,
+        {"action_type": "request_verification", "gate_id": str(integration.id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:integration:{version.id}")
+    await _finish_integration_verification(db, project.id, service, run, integration, verifier.id)
+    await service.tick(db, run.id)
+    proof = await db.scalar(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == integration.id, OrchestrationEvidence.source_type == "verification",
+        OrchestrationEvidence.verdict == "accepted"))
+    assert proof is not None and await roadmap.integration_gate_accepted(db, goal, run)
+    summary = next(action for action in await _run_actions(db, run.id) if action.action_type == "request_final_summary")
+    await _record_measured_completion(
+        db, project.id, run, await db.get(Task, summary.target_id), (await db.get(Task, summary.target_id)).assigned_to,
+        json.dumps({"summary": "Independent integration accepted.", "criteria": [
+            {"criterion_key": key, "evidence_ids": [str(proof.id)]}
+            for key in service._declared_success_criterion_keys(goal)], "unresolved_gaps": []}))
+    await _tick_until(db, service, run, lambda: run.status == "completed")
+    await db.refresh(goal)
+    assert (goal.status, run.phase) == ("completed", "completed")
+
+
+async def test_nested_roadmap_three_levels_releases_one_level_at_a_time(
+    db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
+):
+    n = await nested_roadmap(db_session, test_project, monkeypatch)
+    db, service, parent, child, child_run = db_session, n.service, n.parent, n.child, n.child_run
+    roadmap = OrchestrationRoadmapService(service)
+    models = (OrchestrationAction, Task, OrchestrationGate, OrchestrationEvidence, OrchestrationRoadmapItem,
+              OrchestrationRoadmapVersion, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun)
+
+    # 1. P released only C, after build's gate was accepted; C is a Roadmap that starts authorized.
+    assert (child.goal_type, child.planning_mode) == ("roadmap", "roadmap")
+    assert child_run.phase == "authorized" and child_run.plan_state["child_delta_baseline"]["status"] == "accepted"
+    authorizations = [a for a in await _run_actions(db, child_run.id) if a.action_type == "authorize_execution"]
+    assert len(authorizations) == 1
+    build_evidence = await db.scalars(select(OrchestrationEvidence.id).where(
+        OrchestrationEvidence.gate_id == n.build_row.gate_id, OrchestrationEvidence.verdict == "accepted"))
+    assert set(map(str, build_evidence)) <= set(child.orchestrator_context["eligible_evidence"]["evidence_ids"]) != set()
+    assert await _children_of(db, parent) == [child]
+
+    # 2. C planned itself: no human Start, no baseline processes, the planner wrote a roadmap-kind plan.
+    assert await db.scalar(select(func.count()).select_from(OrchestrationProcessRun).where(
+        OrchestrationProcessRun.goal_id == child.id)) == 0
+    task = n.planning_task
+    assert task.assigned_to == n.planner.id
+    assert task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"] == "roadmap"
+    assert "Eligible parent evidence" in task.description
+    assert child_run.plan_state["plan_author_agent_id"] == str(n.planner.id)
+
+    # 3. C has exactly one version, owned by C's own run.
+    versions = list(await db.scalars(select(OrchestrationRoadmapVersion).where(
+        OrchestrationRoadmapVersion.goal_id == child.id)))
+    assert len(versions) == 1 and versions[0].run_id == child_run.id
+    child_version = versions[0]
+    assert await _children_of(db, child) == []
+
+    # 4. The next C tick releases g1 only, one level below C, under P's root limits.
+    assert (await service.tick(db, child_run.id))["authorized_execution"]["item_key"] == "g1"
+    (g1,) = await _children_of(db, child)
+    assert (g1.goal_type, g1.planning_mode, g1.roadmap_item_key) == ("outcome", "delivery", "g1")
+    policy = g1.orchestrator_context["expansion_policy"]
+    assert policy["depth"] == 2 and policy["root_goal_id"] == str(parent.id)
+    assert await db.scalar(select(func.count()).select_from(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.parent_goal_id == child.id)) == 1
+    p_reservation = await db.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.parent_goal_id == parent.id, OrchestrationBudgetReservation.child_goal_id == child.id))
+    assert p_reservation.status == "active"
+    assert await _children_of(db, parent) == [child]
+
+    # 5. g1's accepted gate settles it and only then releases g2.
+    g1_row = await _item(db, child, "g1")
+    g1_goal, g1_run, g1_gate, g1_evidence, _ = await _complete_child(
+        db, test_project, roadmap, g1_row, n.planner, n.producer, n.verifier, n.summarizer)
+    assert await _item(db, child, "g2") is None
+    g2_row = None
+    for _ in range(3):
+        await service.tick(db, child_run.id)
+        g2_row = await _item(db, child, "g2")
+        if g2_row is not None:
+            break
+    assert g1_row.completed_at is not None and g2_row is not None and g2_row.child_goal_id is not None
+    g2_goal, g2_run, g2_gate, g2_evidence, _ = await _complete_child(
+        db, test_project, roadmap, g2_row, n.planner, n.producer, n.verifier, n.summarizer)
+    await _tick_until(db, service, child_run, lambda: g2_row.completed_at is not None)
+    assert await _children_of(db, parent) == [child]
+
+    # 6. Child gates carry evidence but satisfy no C criterion; only C's independent integration closes C.
+    assert service._criterion_evidence_manifest([g1_gate, g2_gate], g1_evidence + g2_evidence, child, str(child_version.id)) == {}
+    await _close_roadmap(db, test_project, service, child, child_run, n.verifier)
+
+    # 7. P settles C onto the area gate as one child_goal evidence row; that satisfies no P criterion.
+    area_row = await _item(db, parent, "area")
+    await _tick_until(db, service, n.parent_run, lambda: area_row.completed_at is not None)
+    area_gate = await db.get(OrchestrationGate, area_row.gate_id)
+    assert area_gate.status == "accepted"
+    area_evidence = list(await db.scalars(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == area_gate.id, OrchestrationEvidence.source_type == "child_goal",
+        OrchestrationEvidence.verdict == "accepted")))
+    assert len(area_evidence) == 1
+    assert service._criterion_evidence_manifest([area_gate], area_evidence, parent, str(n.version.id)) == {}
+    await _close_roadmap(db, test_project, service, parent, n.parent_run, n.verifier)
+
+    # 8. Replaying ticks changes no durable row at any level.
+    before = await _snapshot(db, models)
+    for run in (child_run, n.parent_run, g1_run):
+        await service.tick(db, run.id)
+    after = await _snapshot(db, models)
+    for model, rows in before.items():
+        assert [row["id"] for row in after[model]] == [row["id"] for row in rows], model

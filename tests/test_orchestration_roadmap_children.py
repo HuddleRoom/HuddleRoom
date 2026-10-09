@@ -1564,3 +1564,24 @@ async def test_nested_roadmap_first_version_freezes_the_parents_workspace_policy
     )
 
     assert version.snapshot["workspace_policy"] == {"mode": "isolated"}
+
+
+async def test_nested_roadmap_planning_task_keeps_the_lineage_it_was_released_under(db_session, test_project):
+    """C's own planning claim carries P's version/item (inherited context), so it is authorized on P."""
+    _, parent, parent_run, _ = await accepted_goal_roadmap(
+        db_session, test_project, NESTED_ITEM, include_planner_in_team=True)
+    roadmap = OrchestrationRoadmapService(OrchestrationService())
+    await roadmap.advance(db_session, parent, parent_run)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    child = await db_session.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    agent = await db_session.get(Agent, uuid.UUID(child.orchestrator_context["team"]["agent_ids"][0]))
+    agent.adapter_type = "cli"
+    context = {"roadmap": {"roadmap_version_id": str(child.roadmap_version_id), "roadmap_item_key": row.item_key}}
+
+    assert (await roadmap.orchestration.roadmap_pre_release_authority(
+        db_session, child_run.id, agent, context))["status"] == "pending"
+    decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_budget_adapter:%:cli:max_tokens")))
+    assert decision.goal_id == parent.id and decision.run_id == parent_run.id
+    assert decision.decision_key.startswith(f"roadmap_budget_adapter:{child.roadmap_version_id}:{row.item_key}:")
