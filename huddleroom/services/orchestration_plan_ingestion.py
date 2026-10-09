@@ -108,10 +108,20 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
         raise PlanIngestionError("plan output author is not the assigned planning agent")
 
     report_schema = ((task.metadata_ or {}).get("orchestration_contract") or {}).get("report_schema") or {}
-    from huddleroom.services.orchestration_service import plan_kind_for  # circular at import time
+    from huddleroom.services.orchestration_service import OrchestrationService, plan_kind_for  # circular at import time
 
     kind = report_schema.get("plan_kind") or plan_kind_for(goal, run)
     normalized = parse_envelope(output, kind, goal)
+    service = OrchestrationService()
+    raw_items = normalized["plan_items"]
+    try:
+        # Validated before disposition: an invalid adoption never counts as disposing of pre-plan work.
+        await service._validate_plan_adoptions(db, run, (
+            parse_roadmap_items(raw_items, set(parent_caps(goal))) if kind == "roadmap"
+            else service._plan_items_from_raw(raw_items)
+        ))
+    except HTTPException as exc:
+        raise PlanIngestionError(str(exc.detail)) from exc
     required = [uuid.UUID(str(i)) for i in plan_meta.get("pre_plan_task_ids") or []]
     live = (
         await db.execute(select(Task.id).where(Task.id.in_(required), Task.status != "cancelled"))

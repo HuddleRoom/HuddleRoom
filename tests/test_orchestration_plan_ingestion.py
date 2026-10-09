@@ -373,3 +373,30 @@ async def test_ingest_integrity_race_same_hash_returns_existing(db_session, test
 async def test_ingest_integrity_race_different_hash_conflicts(db_session, test_project):
     with pytest.raises(PlanIngestionError, match="conflicting plan output"):
         await _race_ingest(db_session, test_project, "other")
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_invalid_adoption_before_disposition(db_session, test_project):
+    from huddleroom.schemas.task import TaskCreate
+    from huddleroom.services.task_service import TaskService
+
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    audit = await TaskService().create(db_session, test_project.id, TaskCreate(
+        title="Audit",
+        metadata={
+            "orchestration": {"goal_id": str(goal.id), "run_id": str(run.id), "work_function": "investigation"},
+            "orchestration_contract": {"work_function": "investigation"},
+        },
+    ))
+    plan_meta = task.metadata_["orchestration_plan"]
+    task.metadata_ = {**task.metadata_, "orchestration_plan": {**plan_meta, "pre_plan_task_ids": [str(audit.id)]}}
+    output = json.dumps(_env(items=[_item(success_criterion_keys=["plan"], adopt_task_id=str(audit.id))]))
+
+    with pytest.raises(PlanIngestionError) as exc:
+        await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert exc.value.reason == (
+        f"adoption_invalid: item a: task {audit.id} work_function 'investigation' does not match 'implementation'"
+    )
+    assert not exc.value.stale
+    assert await _plan_artifacts(db_session, task.id) == 0

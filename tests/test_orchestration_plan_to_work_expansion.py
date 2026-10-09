@@ -696,3 +696,267 @@ async def test_expand_accepted_plan_rejects_unaccepted_plan(db_session, test_pro
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == "Plan must be accepted before expansion"
+
+
+async def _adoption_setup(db_session, project_id):
+    from huddleroom.schemas.task import TaskCreate
+    from huddleroom.services.task_service import TaskService
+
+    planner = _agent("planner", role="planner", capabilities=["planning"])
+    developer = _agent("developer", role="developer", capabilities=["investigation"])
+    db_session.add_all([planner, developer])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, project_id)
+    request_action = await service.execute_request_plan_action(
+        db_session,
+        run_id=run.id,
+        request={
+            "action_type": "request_plan",
+            "agent_id": str(planner.id),
+            "work_function": "planning",
+            "scope": "Create a plan that adopts the running audit.",
+        },
+        idempotency_key="run:adoption:kind:request_plan",
+    )
+    task = await TaskService().create(
+        db_session,
+        project_id,
+        TaskCreate(
+            # Unassigned: assigning work changes the roster fingerprint and trips the baseline gate.
+            title="Audit the API",
+            metadata={
+                "orchestration": {"goal_id": str(goal.id), "run_id": str(run.id), "work_function": "investigation"},
+                "orchestration_contract": {"work_function": "investigation", "scope": "Audit the API."},
+            },
+        ),
+    )
+    return service, goal, run, planner, developer, request_action, task
+
+
+def _adopting_item(task_id, item_id="audit-api", **overrides) -> dict:
+    return {
+        **_raw_plan_item(item_id=item_id, work_function="investigation"),
+        "adopt_task_id": str(task_id),
+        **overrides,
+    }
+
+
+async def _accept_with_items(db_session, project_id, service, run, planner, request_action, items):
+    artifact = Artifact(
+        project_id=project_id,
+        name="adoption-plan",
+        artifact_type="plan",
+        status="draft",
+        linked_task_id=request_action.target_id,
+        created_by_agent=planner.id,
+        metadata_={"kind": "implementation_plan", "plan_items": items},
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    return await service.execute_accept_plan_action(
+        db_session,
+        run_id=run.id,
+        request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+        idempotency_key=f"run:{run.id}:kind:accept_plan:{artifact.id}",
+    )
+
+
+async def _task_count(db_session, project_id) -> int:
+    return len((await db_session.execute(select(Task.id).where(Task.project_id == project_id))).scalars().all())
+
+
+async def _assert_adoption_rejected(db_session, project_id, service, run, planner, request_action, items, reason):
+    tasks_before = await _task_count(db_session, project_id)
+    with pytest.raises(HTTPException) as exc_info:
+        await _accept_with_items(db_session, project_id, service, run, planner, request_action, items)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail.startswith("adoption_invalid: item ")
+    assert reason in exc_info.value.detail
+    assert run.plan_state["status"] == "revision_required"
+    assert "accepted_artifact_id" not in run.plan_state
+    assert await _run_rows(db_session, OrchestrationGate, run.id, gate_type="work_completed") == []
+    assert await _task_count(db_session, project_id) == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_accepts_valid_adoption_without_creating_work(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    tasks_before = await _task_count(db_session, test_project.id)
+
+    action = await _accept_with_items(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id)],
+    )
+
+    assert action.status == "completed"
+    assert run.plan_state["status"] == "accepted"
+    assert run.plan_state["accepted_plan_snapshot"]["items"][0]["adopt_task_id"] == str(task.id)
+    assert await _task_count(db_session, test_project.id) == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_allows_adopted_task_already_bound_to_the_same_item_gate(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    gate = await service._ensure_plan_item_gate(
+        db_session, run.id, OrchestrationPlanItem.model_validate(_adopting_item(task.id))
+    )
+    task.metadata_ = {
+        **task.metadata_,
+        "orchestration": {**task.metadata_["orchestration"], "plan_item_gate_id": str(gate.id)},
+    }
+    await db_session.flush()
+
+    action = await _accept_with_items(
+        db_session, test_project.id, service, run, planner, request_action, [_adopting_item(task.id)]
+    )
+
+    assert action.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_task_adopted_by_two_items(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id, "audit-a"), _adopting_item(task.id, "audit-b")],
+        "adopted by more than one item",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_work_of_another_run(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    task.metadata_ = {
+        **task.metadata_,
+        "orchestration": {**task.metadata_["orchestration"], "run_id": str(uuid.uuid4())},
+    }
+    await db_session.flush()
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id)], "is not work of this run",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_missing_task(db_session, test_project):
+    service, _, run, planner, _, request_action, _ = await _adoption_setup(db_session, test_project.id)
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(uuid.uuid4())], "is not work of this run",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_cancelled_task(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    task.status = "cancelled"
+    await db_session.flush()
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id)], "is cancelled",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_task_without_delegation_contract(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    task.metadata_ = {"orchestration": task.metadata_["orchestration"]}
+    await db_session.flush()
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id)], "was not created by a delegation",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adoption_with_mismatched_work_function(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id, work_function="implementation")],
+        "work_function 'investigation' does not match 'implementation'",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_non_adoptable_work_function(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    task.metadata_ = {
+        **task.metadata_,
+        "orchestration": {**task.metadata_["orchestration"], "work_function": "verification"},
+    }
+    await db_session.flush()
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id, work_function="verification")],
+        "non-adoptable work_function 'verification'",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adoption_assigned_to_another_agent(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id, agent_id=str(planner.id))], "assigned to another agent",
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_task_bound_to_another_gate(db_session, test_project):
+    service, _, run, planner, _, request_action, task = await _adoption_setup(db_session, test_project.id)
+    other_gate = OrchestrationGate(
+        run_id=run.id, success_criterion_key="plan_item:other", gate_type="work_completed", required_evidence={}
+    )
+    db_session.add(other_gate)
+    await db_session.flush()
+    task.metadata_ = {
+        **task.metadata_,
+        "orchestration": {**task.metadata_["orchestration"], "plan_item_gate_id": str(other_gate.id)},
+    }
+    await db_session.flush()
+    with pytest.raises(HTTPException) as exc_info:
+        await _accept_with_items(
+            db_session, test_project.id, service, run, planner, request_action, [_adopting_item(task.id)]
+        )
+    assert exc_info.value.detail == f"adoption_invalid: item audit-api: task {task.id} is already bound to another gate"
+    assert run.plan_state["status"] == "revision_required"
+    assert [g.id for g in await _run_rows(db_session, OrchestrationGate, run.id, gate_type="work_completed")] == [
+        other_gate.id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_accept_plan_rejects_adopting_item_with_dependencies(db_session, test_project):
+    service, _, run, planner, developer, request_action, task = await _adoption_setup(db_session, test_project.id)
+    await _assert_adoption_rejected(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_raw_plan_item(developer.id, item_id="first"), _adopting_item(task.id, depends_on=["first"])],
+        "an adopting item cannot have depends_on",
+    )
+
+
+@pytest.mark.asyncio
+async def test_validate_plan_adoptions_rejects_goal_and_shared_state_roadmap_items(db_session, test_project):
+    from huddleroom.schemas.orchestration import OrchestrationRoadmapPlanItem
+
+    service, _, run, _, _, _, task = await _adoption_setup(db_session, test_project.id)
+    goal_item = OrchestrationRoadmapPlanItem.model_validate({
+        "item_key": "child", "unit_type": "goal", "title": "Child", "objective": "o",
+        "success_criteria": [{"key": "k", "description": "d"}], "allocation": {"max_tokens": 10},
+        "adopt_task_id": str(task.id),
+    })
+    shared_item = OrchestrationRoadmapPlanItem.model_validate({
+        "item_key": "shared", "unit_type": "task", "title": "Shared", "work_function": "investigation",
+        "scope": "s", "deliverable": "d", "adopt_task_id": str(task.id),
+    })
+    unshared_item = shared_item.model_copy(update={"mutates_shared_state": False})
+
+    for item in (goal_item, shared_item):
+        with pytest.raises(HTTPException) as exc_info:
+            await service._validate_plan_adoptions(db_session, run, [item])
+        assert exc_info.value.detail == (
+            f"adoption_invalid: item {item.item_key}: "
+            "only Roadmap task items with mutates_shared_state false can adopt work"
+        )
+    await service._validate_plan_adoptions(db_session, run, [unshared_item])

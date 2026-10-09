@@ -138,6 +138,10 @@ FINAL_SUMMARY_GATE_KEY = "final_summary"
 FINAL_SUMMARY_GATE_TYPE = "final_summary_accepted"
 FINAL_SUMMARY_WORK_FUNCTION = "summarization"
 FINAL_SUMMARY_REQUESTED_EVENT_TYPE = "orchestration.final_summary_requested"
+# Run work a plan can never adopt (and need not disposition): coordination, not discovery.
+NON_ADOPTABLE_WORK_FUNCTIONS = frozenset(
+    {PLAN_WORK_FUNCTION, FINAL_SUMMARY_WORK_FUNCTION, "report_clarification", "decision", "verification"}
+)
 RUN_COMPLETED_EVENT_TYPE = "orchestration.run_completed"
 DECISION_CONTEXT_EVENT_LIMIT = 20
 TICK_EVENT_BATCH_LIMIT = 500
@@ -2438,6 +2442,7 @@ class OrchestrationService:
             if goal.goal_type == "roadmap":
                 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
 
+                await self._validate_plan_adoptions(db, run, OrchestrationRoadmapService(self).parse_items(artifact, goal))
                 async with db.begin_nested():
                     version = await OrchestrationRoadmapService(self).accept_version(
                         db, goal, run, artifact, None
@@ -2465,6 +2470,7 @@ class OrchestrationService:
             else:
                 items = self._plan_items_from_artifact(artifact)
                 self._validate_plan_criterion_links(goal, items)
+                await self._validate_plan_adoptions(db, run, items)
                 version = None
         except HTTPException as exc:
             # Savepoint rollback expires a projection that was already flushed.
@@ -4768,6 +4774,57 @@ class OrchestrationService:
             covered.update(item.success_criterion_keys)
         if declared_set - covered:
             raise HTTPException(status_code=409, detail="Plan does not cover every declared success criterion")
+
+    async def _validate_plan_adoptions(self, db: AsyncSession, run: OrchestrationRun, items: Sequence[Any]) -> None:
+        """Each adopt_task_id must name this run's own delegated discovery work, adopted by one item only."""
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        seen: set[uuid.UUID] = set()
+        for item in items:
+            task_id = getattr(item, "adopt_task_id", None)
+            if task_id is None:
+                continue
+            roadmap = hasattr(item, "unit_type")
+            key = item.item_key if roadmap else item.id
+
+            def invalid(reason: str) -> HTTPException:
+                return HTTPException(status_code=409, detail=f"adoption_invalid: item {key}: {reason}")
+
+            if task_id in seen:
+                raise invalid(f"task {task_id} is adopted by more than one item")
+            seen.add(task_id)
+            if roadmap and (item.unit_type != "task" or item.mutates_shared_state):
+                raise invalid("only Roadmap task items with mutates_shared_state false can adopt work")
+            if item.depends_on:
+                raise invalid("an adopting item cannot have depends_on")
+            task = await db.get(Task, task_id)
+            orchestration = self._json_object_or_empty(
+                self._json_object_or_empty(task.metadata_ if task is not None else None).get("orchestration")
+            )
+            if (
+                task is None or goal is None or task.project_id != goal.project_id
+                or orchestration.get("run_id") != str(run.id) or orchestration.get("goal_id") != str(run.goal_id)
+            ):
+                raise invalid(f"task {task_id} is not work of this run")
+            if task.status == "cancelled":
+                raise invalid(f"task {task_id} is cancelled")
+            if not self._json_object_or_empty(task.metadata_).get("orchestration_contract"):
+                raise invalid(f"task {task_id} was not created by a delegation")
+            work_function = self._task_work_function(task)
+            if work_function in NON_ADOPTABLE_WORK_FUNCTIONS:
+                raise invalid(f"task {task_id} has non-adoptable work_function '{work_function}'")
+            if work_function != item.work_function:
+                raise invalid(f"task {task_id} work_function '{work_function}' does not match '{item.work_function}'")
+            if item.agent_id is not None and item.agent_id != task.assigned_to:
+                raise invalid(f"task {task_id} is assigned to another agent")
+            gate_id = task_gate_id(task, run.id)
+            if gate_id is not None:
+                gate = await db.get(OrchestrationGate, gate_id)
+                gate_key = f"roadmap_item:{key}" if roadmap else self._plan_item_gate_key(key)
+                if (
+                    gate is None or gate.run_id != run.id or gate.gate_type != PLAN_ITEM_GATE_TYPE
+                    or gate.success_criterion_key != gate_key
+                ):
+                    raise invalid(f"task {task_id} is already bound to another gate")
 
     async def _backfill_plan_criterion_links(
         self, db: AsyncSession, run: OrchestrationRun, items: list[OrchestrationPlanItem]
@@ -8929,7 +8986,7 @@ class OrchestrationService:
         )
         return [
             task for task in tasks
-            if self._task_work_function(task) not in {PLAN_WORK_FUNCTION, FINAL_SUMMARY_WORK_FUNCTION, "report_clarification", "decision"}
+            if self._task_work_function(task) not in NON_ADOPTABLE_WORK_FUNCTIONS
         ]
 
     async def _orchestrated_tasks_for_run(
