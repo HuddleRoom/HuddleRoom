@@ -835,6 +835,38 @@ describe('OrchestrationPage', () => {
   })
 })
 
+describe('goal header shape provenance', () => {
+  const shaped = {
+    ...richDetail,
+    goal: {
+      ...richDetail.goal,
+      goal_type_source: 'legacy',
+      goal_type_rationale: 'One bounded result.',
+      planning_mode: 'delivery',
+      planning_rationale: 'Small enough for one plan level.',
+    },
+  }
+
+  it('renders type, source, planning and rationales without raw JSON; successor line only when superseding', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    state.detail = shaped
+    const html = renderToStaticMarkup(<OrchestrationPage />)
+    expect(html).toContain('Outcome')
+    expect(html).toContain('Existing goal (set before automatic selection)')
+    expect(html).toContain('Delivery plan')
+    expect(html).toContain('Why <!-- -->Outcome<!-- -->: <!-- -->One bounded result.')
+    expect(html).toContain('Why this plan depth')
+    expect(html).toContain('Small enough for one plan level.')
+    expect(html).not.toContain('replaces an earlier run')
+    expect(html).not.toContain('{&quot;')
+
+    state.detail = { ...shaped, run: { ...shaped.run!, supersedes_run_id: 'run-0' } }
+    expect(renderToStaticMarkup(<OrchestrationPage />)).toContain('Current run replaces an earlier run')
+  })
+})
+
 describe('CreateGoalModal goal type selector', () => {
   async function mountModal() {
     const { CreateGoalModal } = await import('./OrchestrationPage')

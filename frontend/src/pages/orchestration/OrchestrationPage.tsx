@@ -30,6 +30,7 @@ import {
 } from '@/components/common/uiPrimitives'
 import { ErrorRecord } from '@/components/common/ErrorRecord'
 import { Record } from '@/components/common/Record'
+import { Tag } from '@/components/common/Tag'
 import { STATUS_COLORS } from '@/lib/statusColors'
 import { useDocumentTitle } from '@/hooks/useDocumentTitle'
 import type {
@@ -48,7 +49,7 @@ import type {
 import { useUIStore } from '@/stores/ui'
 import { BaselineDashboard, currentProcesses, type BaselineMutationOwner } from './BaselineDashboard'
 import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
-import { errorRecord, gateOverrideDecisionLabel, goalStatusLabel, runStatusLabel } from './humanize'
+import { errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
@@ -1172,6 +1173,19 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           {/* SECONDARY: compact reference cluster; gate counts grouped */}
           <div className="mt-2 flex flex-wrap gap-x-6 gap-y-2 text-xs">
             <div className="flex flex-col gap-1">
+              <span className="text-huddleroom-text-muted">Type</span>
+              <Tag>{goalTypeLabel(goal.goal_type)}</Tag>
+              {goal.goal_type_source ? (
+                <span className="text-xs text-huddleroom-text-secondary">{goalTypeSourceLabel(goal.goal_type_source)}</span>
+              ) : null}
+            </div>
+            {goal.planning_mode ? (
+              <div className="flex flex-col gap-1">
+                <span className="text-huddleroom-text-muted">Planning</span>
+                <span className="text-huddleroom-text-primary">{planningModeLabel(goal.planning_mode)}</span>
+              </div>
+            ) : null}
+            <div className="flex flex-col gap-1">
               <span className="text-huddleroom-text-muted">Plan</span>
               <StatusBadge status={String(run?.plan_state.status ?? 'pending')} label={runStatusLabel(String(run?.plan_state.status ?? 'pending'))} />
             </div>
@@ -1194,6 +1208,21 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
               <time dateTime={goal.updated_at} className="font-mono text-huddleroom-text-primary">{absolute(goal.updated_at)}</time>
             </div>
           </div>
+
+          {goal.goal_type_rationale ? (
+            <p className="mt-2 text-sm text-huddleroom-text-secondary">Why {goalTypeLabel(goal.goal_type)}: {goal.goal_type_rationale}</p>
+          ) : null}
+          {goal.planning_rationale ? (
+            <details className="mt-2 text-sm text-huddleroom-text-secondary">
+              <summary className="cursor-pointer">Why this plan depth</summary>
+              <p className="mt-1">{goal.planning_rationale}</p>
+            </details>
+          ) : null}
+          {run?.supersedes_run_id ? (
+            <p className="mt-2 text-xs text-huddleroom-text-muted">
+              Current run replaces an earlier run (reclassified). History stays in Details › Plan.
+            </p>
+          ) : null}
 
           {/* Freshness cue (reuses react-query dataUpdatedAt/isFetching) */}
           {query.dataUpdatedAt ? (

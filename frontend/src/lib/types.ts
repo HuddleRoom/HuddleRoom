@@ -469,6 +469,10 @@ export interface OrchestrationGoal {
   constraints: Record<string, unknown>
   budget: Record<string, unknown>
   goal_type: 'outcome' | 'roadmap' | 'continuous'
+  goal_type_source?: string | null
+  goal_type_rationale?: string | null
+  planning_mode?: string | null
+  planning_rationale?: string | null
   supersedes_goal_id: string | null
   status: OrchestrationGoalStatus
   weight: OrchestrationGoalWeight
@@ -704,6 +708,11 @@ export interface OrchestrationRun {
   active_blockers: OrchestrationBlocker[]
   budget_state: Record<string, unknown>
   retry_state: Record<string, unknown>
+  supersedes_run_id?: string | null
+  terminal_reason?: string | null
+  goal_type_snapshot?: string | null
+  planning_mode_snapshot?: string | null
+  goal_contract_fingerprint?: string | null
   started_at: string
   completed_at: string | null
   created_at: string
