@@ -8,7 +8,7 @@ pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.event_log import EventLog
-from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
+from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate, OrchestrationGoal
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
@@ -885,3 +885,206 @@ async def test_terminal_adopted_audit_without_verification_keeps_synthesis_queue
     assert gate.status not in ("accepted", "failed")  # open: terminal task + report, verification still missing
     tasks = (await db_session.execute(select(Task).where(Task.project_id == test_project.id))).scalars().all()
     assert not [t for t in tasks if (t.metadata_ or {}).get("orchestration", {}).get("plan_item_id") == "synthesis"]
+
+
+# --- ad-hoc discovery/readiness gates (T10c) --------------------------------------------
+
+import json  # noqa: E402
+
+from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE  # noqa: E402
+
+VALID_REPORT = {
+    "status": "done", "changes": [], "evidence": ["Found 3 failing call sites"], "criterion_progress": {},
+    "decisions": [], "risks": [], "open_questions": [], "next_step": "Decide", "collaboration_need": None,
+}
+
+
+async def _adhoc_run(db_session, project_id):
+    service, goal, run = await _make_run(db_session, project_id)
+    goal.status, run.status, run.phase = "active", "running", "authorized"
+    agent = _agent("auditor", "developer", ["investigation"])
+    db_session.add(agent)
+    await db_session.flush()
+    return service, run, agent
+
+
+async def _delegate_adhoc(db_session, service, run, agent, key, *, work_function="investigation", ad_hoc=True, **extra):
+    action = await service.execute_create_delegation_task_action(
+        db_session, run_id=run.id, skip_baseline_gate=True, ad_hoc=ad_hoc,
+        request={
+            "action_type": "create_delegation_task", "agent_id": str(agent.id), "work_function": work_function,
+            "scope": f"Audit {key}", "deliverable": "Findings", **extra,
+        },
+        idempotency_key=f"run:{run.id}:kind:create_delegation_task:{key}",
+    )
+    return await db_session.get(Task, action.target_id)
+
+
+async def _finish(db_session, project_id, task, report=VALID_REPORT, status="done"):
+    task.status = status
+    task.completed_at = datetime.now(timezone.utc)
+    task.metadata_ = {
+        **task.metadata_,
+        "orchestration": {**task.metadata_["orchestration"], "terminal_output": report if isinstance(report, str) else json.dumps(report)},
+    }
+    await emit_event_once(
+        db_session, project_id, "task.status_changed",
+        {"task_id": str(task.id), "status": status, "previous_status": "in_progress", "project_id": str(project_id)},
+        dedup_key=f"t10c-finish:{task.id}:{status}",
+    )
+
+
+async def _adhoc_gate(db_session, task):
+    return await db_session.get(OrchestrationGate, uuid.UUID(task.metadata_["orchestration"]["gate_id"]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("work_function", "role"), [("investigation", "discovery"), ("review", "readiness")])
+async def test_adhoc_investigation_and_review_get_a_deterministic_gate(db_session, test_project, work_function, role):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    agent.capabilities = ["investigation", "review"]
+
+    task = await _delegate_adhoc(db_session, service, run, agent, "g1", work_function=work_function)
+
+    gate = await _adhoc_gate(db_session, task)
+    assert gate.id == uuid.uuid5(
+        uuid.NAMESPACE_URL, f"rally:orchestration:gate:{run.id}:{ADHOC_GATE_TYPE}:adhoc_task:{task.id}"
+    )
+    assert gate.gate_type == ADHOC_GATE_TYPE and gate.status == "open"
+    assert gate.required_evidence == {
+        "required_source_types": ["task"], "min_count": 1, "evidence_role": role,
+        "review_stage": "preliminary", "task_id": str(task.id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_plan_item_and_non_ad_hoc_work_get_no_adhoc_gate(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    agent.capabilities = ["investigation", "implementation"]
+
+    plan_item_style = await _delegate_adhoc(db_session, service, run, agent, "p1", ad_hoc=False)
+    implementation = await _delegate_adhoc(db_session, service, run, agent, "p2", work_function="implementation")
+
+    for task in (plan_item_style, implementation):
+        assert "gate_id" not in task.metadata_["orchestration"]
+    assert (await db_session.scalars(select(OrchestrationGate).where(OrchestrationGate.run_id == run.id))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gate_accepts_only_completed_task_with_valid_evidence_report(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "a1")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task)
+
+    result = await service.tick(db_session, run.id)
+
+    assert result["gates_validated"] == 1 and gate.status == "accepted"
+    assert [e.verdict for e in await _evidence_rows(db_session, gate.id)] == ["accepted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("report", "reason"),
+    [
+        ("not a report", "Task report is missing or invalid"),
+        ({**VALID_REPORT, "evidence": []}, "Task report has no evidence"),
+    ],
+)
+async def test_adhoc_gate_stays_open_for_invalid_or_evidence_free_report(db_session, test_project, report, reason):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "a2")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task, report)
+
+    await service.tick(db_session, run.id)
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "open" and gate.failure_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gate_fails_when_task_fails(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "a3")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task, status="failed")
+
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gates_block_neither_closeout_manifest_nor_unverified_gate_follow_ups(db_session, test_project):
+    from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    open_task = await _delegate_adhoc(db_session, service, run, agent, "c1")
+    failed_task = await _delegate_adhoc(db_session, service, run, agent, "c2")
+    open_gate, failed_gate = await _adhoc_gate(db_session, open_task), await _adhoc_gate(db_session, failed_task)
+    failed_gate.status = "failed"
+    await db_session.flush()
+
+    assert await service._current_run_gates(db_session, run.id) == []
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    flagged = {item["id"] for item in situation.untracked_follow_ups if item["kind"] == "unverified_gate"}
+    assert not flagged & {str(open_gate.id), str(failed_gate.id)}
+
+    open_gate.status = "accepted"
+    await db_session.flush()
+    assert [g.id for g in await service._current_run_gates(db_session, run.id)] == [open_gate.id]
+
+
+@pytest.mark.asyncio
+async def test_adhoc_dependent_starts_once_only_after_predecessor_gate_accepted(db_session, test_project):
+    from huddleroom.models.session import Session
+
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    first = await _delegate_adhoc(db_session, service, run, agent, "d1")
+    first.status = "done"
+    second = await _delegate_adhoc(db_session, service, run, agent, "d2", depends_on=[str(first.id)])
+    gate = await _adhoc_gate(db_session, first)
+
+    async def sessions():
+        return list(await db_session.scalars(select(Session).where(Session.task_id == second.id)))
+
+    for _ in range(2):  # done but gate open: dependent stays in backlog
+        await service.tick(db_session, run.id)
+        await db_session.refresh(second)
+        assert second.status == "backlog" and await sessions() == []
+
+    await _finish(db_session, test_project.id, first)
+    await service.tick(db_session, run.id)
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "accepted"
+    await db_session.refresh(second)
+    assert second.status == "in_progress" and len(await sessions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gate_accepts_report_repaired_on_the_clarification_task_marker(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "r1")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task, "not a report")
+    await service.tick(db_session, run.id)
+    assert gate.status == "open"
+
+    clarification_id = uuid.uuid4()
+    repair = await service.reserve_action(
+        db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}", "create_delegation_task", {},
+    )
+    repair.target_id = clarification_id
+    marker = await service.reserve_action(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{clarification_id}", "report_consumed",
+        {"task_id": str(clarification_id), "session_id": None, "report": VALID_REPORT, "report_validation_errors": []},
+    )
+    await db_session.flush()
+    assert marker.request["report"] == VALID_REPORT
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "accepted"

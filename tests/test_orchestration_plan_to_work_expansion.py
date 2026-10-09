@@ -957,7 +957,7 @@ async def test_validate_plan_adoptions_rejects_goal_and_shared_state_roadmap_ite
     await service._validate_plan_adoptions(db_session, run, [unshared_item])
 
 
-async def _adopted_audit_plan(db_session, project_id, *, audits=1, synthesis=None):
+async def _adopted_audit_plan(db_session, project_id, *, audits=1, synthesis=None, ad_hoc=False):
     """Delegated pre-plan audits, then a request_plan + accepted plan adopting each one.
 
     `synthesis` (optional item overrides) adds a join item run by the auditor that depends on every audit."""
@@ -973,6 +973,7 @@ async def _adopted_audit_plan(db_session, project_id, *, audits=1, synthesis=Non
         action = await service.execute_create_delegation_task_action(
             db_session,
             run_id=run.id,
+            ad_hoc=ad_hoc,
             request={
                 "action_type": "create_delegation_task",
                 "agent_id": str(auditor.id),
@@ -1296,3 +1297,23 @@ async def test_accept_plan_rejects_item_artifact_outside_project(db_session, tes
     assert exc_info.value.detail == f"artifact_invalid: item audit-api: artifact {ghost} not found in project"
     assert run.plan_state["status"] == "revision_required"
     assert await _task_count(db_session, test_project.id) == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_adopting_a_gated_ad_hoc_audit_hands_over_to_the_item_gate(db_session, test_project):
+    from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, task_gate_id
+
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id, ad_hoc=True)
+    adhoc_gate_id = audit.metadata_["orchestration"]["gate_id"]  # rule 7 let the plan be accepted
+    assert (await db_session.get(OrchestrationGate, uuid.UUID(adhoc_gate_id))).gate_type == ADHOC_GATE_TYPE
+
+    action = await _expand(service, db_session, run, "audit-0")
+
+    assert action.status == "completed" and action.target_id == audit.id
+    item_gate = (await _run_rows(db_session, OrchestrationGate, run.id, success_criterion_key="plan_item:audit-0"))[0]
+    orchestration = audit.metadata_["orchestration"]
+    assert "gate_id" not in orchestration and orchestration["adhoc_gate_id"] == adhoc_gate_id
+    assert orchestration["plan_item_gate_id"] == str(item_gate.id)
+    assert task_gate_id(audit, run.id) == item_gate.id
+    assert run.plan_state["expanded_items"][0]["gate_id"] == str(item_gate.id)
+    assert (await db_session.get(OrchestrationGate, uuid.UUID(adhoc_gate_id))) is not None

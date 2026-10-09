@@ -104,6 +104,8 @@ from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_decision_validator import independent_work_rejection
 from huddleroom.services.orchestration_dependencies import (
+    ADHOC_GATE_TYPE,
+    ADHOC_GATED_WORK_FUNCTIONS,
     first_unmet_dependency,
     task_gate_id,
     validate_dependencies,
@@ -1748,6 +1750,23 @@ class OrchestrationService:
                 db, goal, run, action, budget_amounts, enforceable=agent.adapter_type in {"api", "cli"},
                 closeout=protected,
             )
+        orchestration_metadata = {
+            "goal_id": str(goal.id),
+            "run_id": str(run.id),
+            "action_id": str(action.id),
+            "work_function": contract.work_function,
+        }
+        if ad_hoc and contract.work_function in ADHOC_GATED_WORK_FUNCTIONS:
+            # Task id == action id, so the gate key is replay-stable. Completion alone never accepts it.
+            adhoc_gate = await self._ensure_keyed_gate(
+                db, run.id, ADHOC_GATE_TYPE, f"adhoc_task:{action.id}",
+                {
+                    "required_source_types": ["task"], "min_count": 1,
+                    "evidence_role": ADHOC_GATED_WORK_FUNCTIONS[contract.work_function],
+                    "review_stage": "preliminary", "task_id": str(action.id),
+                },
+            )
+            orchestration_metadata["gate_id"] = str(adhoc_gate.id)
         task = await task_service.create(
             db,
             project_id,
@@ -1759,12 +1778,7 @@ class OrchestrationService:
                 depends_on=contract.depends_on,
                 priority=contract.priority,
                 metadata={
-                    "orchestration": {
-                        "goal_id": str(goal.id),
-                        "run_id": str(run.id),
-                        "action_id": str(action.id),
-                        "work_function": contract.work_function,
-                    },
+                    "orchestration": orchestration_metadata,
                     "orchestration_contract": contract_payload,
                 },
             ),
@@ -2757,6 +2771,17 @@ class OrchestrationService:
             raise HTTPException(
                 status_code=409, detail=f"adoption_conflict: task {task.id} is already adopted by another plan item"
             )
+        orchestration = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))
+        current_gate_id = task_gate_id(task, run.id)
+        current_gate = await db.get(OrchestrationGate, current_gate_id) if current_gate_id else None
+        if current_gate is not None and current_gate.gate_type == ADHOC_GATE_TYPE:
+            # The item gate takes over; the ad-hoc gate and its evidence stay as history.
+            task.metadata_ = {
+                **self._json_object_or_empty(task.metadata_),
+                "orchestration": {
+                    **{k: v for k, v in orchestration.items() if k != "gate_id"}, "adhoc_gate_id": str(current_gate.id),
+                },
+            }
         self._attach_plan_item_metadata(task, artifact, item, action, gate)
         task.priority = item.priority
         await db.flush()
@@ -4988,7 +5013,11 @@ class OrchestrationService:
             if gate_id is not None:
                 gate = await db.get(OrchestrationGate, gate_id)
                 gate_key = f"roadmap_item:{key}" if roadmap else self._plan_item_gate_key(key)
-                if (
+                own_adhoc = (
+                    gate is not None and gate.gate_type == ADHOC_GATE_TYPE
+                    and self._json_object_or_empty(gate.required_evidence).get("task_id") == str(task.id)
+                )
+                if not own_adhoc and (
                     gate is None or gate.run_id != run.id or gate.gate_type != PLAN_ITEM_GATE_TYPE
                     or gate.success_criterion_key != gate_key
                 ):
@@ -5074,20 +5103,6 @@ class OrchestrationService:
         item: OrchestrationPlanItem,
     ) -> OrchestrationGate:
         gate_key = self._plan_item_gate_key(item.id)
-        result = await db.execute(
-            select(OrchestrationGate)
-            .where(
-                OrchestrationGate.run_id == run_id,
-                OrchestrationGate.success_criterion_key == gate_key,
-                OrchestrationGate.gate_type == PLAN_ITEM_GATE_TYPE,
-            )
-            .order_by(OrchestrationGate.created_at.asc(), OrchestrationGate.id.asc())
-            .limit(1)
-        )
-        gate = result.scalar_one_or_none()
-        if gate is not None:
-            return gate
-
         required_evidence = self._json_object_or_empty(item.required_evidence)
         run = await db.get(OrchestrationRun, run_id)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
@@ -5097,14 +5112,36 @@ class OrchestrationService:
             required_evidence["requires_independent_agent"] = True
         required_evidence["plan_item_id"] = item.id
         required_evidence["success_criterion_keys"] = list(item.success_criterion_keys)
+        return await self._ensure_keyed_gate(db, run_id, PLAN_ITEM_GATE_TYPE, gate_key, required_evidence)
+
+    async def _ensure_keyed_gate(
+        self,
+        db: AsyncSession,
+        run_id: uuid.UUID,
+        gate_type: str,
+        gate_key: str,
+        required_evidence: dict[str, Any],
+    ) -> OrchestrationGate:
+        """Get-or-create the deterministic gate for (run, type, key); concurrent creators converge."""
+        lookup = (
+            select(OrchestrationGate)
+            .where(
+                OrchestrationGate.run_id == run_id,
+                OrchestrationGate.success_criterion_key == gate_key,
+                OrchestrationGate.gate_type == gate_type,
+            )
+            .order_by(OrchestrationGate.created_at.asc(), OrchestrationGate.id.asc())
+            .limit(1)
+        )
+        gate = (await db.execute(lookup)).scalar_one_or_none()
+        if gate is not None:
+            return gate
+
         gate = OrchestrationGate(
-            id=uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"rally:orchestration:gate:{run_id}:{PLAN_ITEM_GATE_TYPE}:{gate_key}",
-            ),
+            id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:orchestration:gate:{run_id}:{gate_type}:{gate_key}"),
             run_id=run_id,
             success_criterion_key=gate_key,
-            gate_type=PLAN_ITEM_GATE_TYPE,
+            gate_type=gate_type,
             required_evidence=required_evidence,
         )
         nested = await db.begin_nested()
@@ -5116,17 +5153,7 @@ class OrchestrationService:
             session = object_session(gate)
             if session is not None:
                 session.expunge(gate)
-            result = await db.execute(
-                select(OrchestrationGate)
-                .where(
-                    OrchestrationGate.run_id == run_id,
-                    OrchestrationGate.success_criterion_key == gate_key,
-                    OrchestrationGate.gate_type == PLAN_ITEM_GATE_TYPE,
-                )
-                .order_by(OrchestrationGate.created_at.asc(), OrchestrationGate.id.asc())
-                .limit(1)
-            )
-            gate = result.scalar_one_or_none()
+            gate = (await db.execute(lookup)).scalar_one_or_none()
             if gate is not None:
                 return gate
             raise
@@ -5864,6 +5891,8 @@ class OrchestrationService:
                 )
             ).scalars().all()
         )
+        # Ad-hoc audit gates are advisory: only an accepted one joins closeout and the summary manifest.
+        gates = [gate for gate in gates if gate.gate_type != ADHOC_GATE_TYPE or gate.status == "accepted"]
         run = await db.get(OrchestrationRun, run_id)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
         if goal is not None and goal.goal_type == "roadmap":
@@ -9650,6 +9679,9 @@ class OrchestrationService:
         if len(selected) < min_count:
             gate.failure_reason = "Missing evidence"
             return False
+        if gate.gate_type == ADHOC_GATE_TYPE and (reason := await self._adhoc_report_failure(db, gate)):
+            gate.failure_reason = reason
+            return False
 
         run = await db.get(OrchestrationRun, gate.run_id)
         if (
@@ -9690,6 +9722,30 @@ class OrchestrationService:
 
         self._accept_gate(gate, selected)
         return True
+
+    async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> str | None:
+        """An ad-hoc audit gate accepts only a completed task whose consumed report is valid and has evidence."""
+        from huddleroom.services.orchestration_work_report import persisted_report_validation
+
+        task_id = self._optional_uuid(self._json_object_or_empty(gate.required_evidence).get("task_id"), "task_id")
+        task = await db.get(Task, task_id) if task_id is not None else None
+        if task is None or task.status != "done":
+            return "Task is not completed"
+        # A corrected report lands on the report-clarification task's own marker.
+        clarification = await self._existing_action_for_key(
+            db, gate.run_id, f"run:{gate.run_id}:kind:report_clarification:task:{task.id}"
+        )
+        for source_id in (task.id, clarification.target_id if clarification is not None else None):
+            marker = await self._existing_action_for_key(
+                db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{source_id}"
+            ) if source_id is not None else None
+            request = self._json_object_or_empty(marker.request) if marker is not None else {}
+            report = persisted_report_validation(
+                request.get("report"), request.get("report_validation_errors", [])
+            ).report
+            if report is not None:
+                return None if report.candidate_evidence else "Task report has no evidence"
+        return "Task report is missing or invalid"
 
     def _select_required_evidence(
         self,

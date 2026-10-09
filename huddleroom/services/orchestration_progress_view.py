@@ -25,7 +25,7 @@ from huddleroom.models.orchestration import (
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
-from huddleroom.services.orchestration_dependencies import dependency_ids, gate_satisfies, task_gate_id
+from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, dependency_ids, gate_satisfies, task_gate_id
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
 
 logger = logging.getLogger(__name__)
@@ -399,7 +399,7 @@ async def _follow_up_rows(
 
     for gate in gates:
         gate_id = str(gate.id)
-        if gate.status != "open" or gate_id in producer_gate_ids:
+        if gate.status != "open" or gate.gate_type == ADHOC_GATE_TYPE or gate_id in producer_gate_ids:
             continue
         verification = latest_verification.get(gate_id)
         if verification is not None and verification.status != "failed":
