@@ -471,3 +471,17 @@ async def test_progress_contract_allows_independent_work_while_planning():
     assert "keep agents busy" in PROGRESS_CONTRACT
     assert "(not while a plan task is in flight)" in PROGRESS_CONTRACT
     assert "If a plan task is already in flight, wait for it. " not in PROGRESS_CONTRACT
+
+
+async def test_repeated_ticks_while_planning_after_noop_wake_when_do_not_ask_again(db_session, test_project, test_agent, monkeypatch):
+    """T10 tester: a noop with wake_when while the plan is in flight bounds the decision count (no repeated LLM calls)."""
+    goal, run = await _planning_setup(db_session, test_project, test_agent)
+    await _session_wait(db_session, test_project, run)
+    _situation(monkeypatch, progress_view=NO_WORK)
+    # first tick: exactly one decision opportunity
+    assert await _reconcile_no_release(db_session, goal, run) == {"outcome": "continue"}
+    # the model answers noop + wake_when -> orchestrator wait snapshotting the unchanged state
+    await _post_action_wait(db_session, run)
+    for _ in range(5):
+        assert (await _reconcile_no_release(db_session, goal, run))["outcome"] == "waiting"
+    assert len(await _orchestrator_waits(db_session, run)) == 1
