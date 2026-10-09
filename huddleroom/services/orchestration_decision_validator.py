@@ -36,6 +36,7 @@ OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
     ),
     "create_delegation_task": frozenset(
         {
+            "title",
             "inputs",
             "forbidden_work",
             "success_evidence",

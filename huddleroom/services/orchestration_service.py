@@ -51,7 +51,13 @@ from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.models.user import User
 from huddleroom.models.base import _utcnow
-from huddleroom.schemas.orchestration import OrchestrationDelegationContract, OrchestrationGoalCreate, OrchestrationPlanItem
+from huddleroom.schemas.orchestration import (
+    OrchestrationDelegationContract,
+    OrchestrationGoalCreate,
+    OrchestrationPlanItem,
+    planning_envelope_report_schema,
+)
+from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.models.event_log import EventLog
 from huddleroom.services.event_bus import BusEvent, emit_event_once
@@ -77,7 +83,7 @@ from huddleroom.services.orchestration_goal_definition import (
 )
 from huddleroom.services.orchestration_manager_selection import ManagerSelectionProcess
 from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
-from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
+from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess, plan_mode
 from huddleroom.services.orchestration_effectiveness_review import EffectivenessReviewProcess
 from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
@@ -106,6 +112,16 @@ PLAN_GATE_KEY = "plan"
 PLAN_GATE_TYPE = "plan_accepted"
 ACCEPTED_PLAN_SNAPSHOT_VERSION = 1
 PLAN_WORK_FUNCTION = "planning"
+PLAN_KINDS = ("roadmap", "delivery", "implementation")
+# ponytail: a new non-canonical report consumer = add its key here
+SPECIAL_REPORT_KEYS = frozenset({"verdict", "criteria", "candidates", "selected_option"})
+
+
+def plan_kind_for(goal, run=None) -> str:
+    mode = plan_mode(goal, run) if run is not None else getattr(goal, "planning_mode", None)
+    if mode in PLAN_KINDS:
+        return mode
+    return "roadmap" if getattr(goal, "goal_type", None) == "roadmap" else "implementation"
 FINAL_SUMMARY_GATE_KEY = "final_summary"
 FINAL_SUMMARY_GATE_TYPE = "final_summary_accepted"
 FINAL_SUMMARY_WORK_FUNCTION = "summarization"
@@ -1655,6 +1671,12 @@ class OrchestrationService:
             report_schema=self._json_object_or_empty(stored_request.get("report_schema")),
             parent_task_id=parent_task_id,
             orchestrator_context=self._json_object_or_empty(stored_request.get("orchestrator_context")),
+            title=stored_request.get("title") or "",
+            **{
+                key: stored_request[key]
+                for key in ("depends_on", "artifact_ids", "why_runnable", "priority", "decision_use", "authorization_scope")
+                if key in stored_request
+            },
         )
         contract_payload = contract.model_dump(mode="json")
         budget_amounts = self._json_object_or_empty(contract.budget)
@@ -1696,7 +1718,7 @@ class OrchestrationService:
             db,
             project_id,
             TaskCreate(
-                title=self._delegation_task_title(contract.work_function, contract.deliverable),
+                title=self._delegation_task_title(contract.work_function, contract.deliverable, contract.title),
                 description=self._delegation_task_description(goal, contract),
                 assigned_to=agent_id,
                 parent_id=parent_task_id,
@@ -4285,6 +4307,9 @@ class OrchestrationService:
         }
         if context:
             canonical["orchestrator_context"] = context
+        title = request_obj.get("title")
+        if isinstance(title, str) and title.strip():
+            canonical["title"] = title.strip()
         return canonical
 
     def _follow_up_delegation_key(self, run_id: uuid.UUID, request: Mapping[str, Any]) -> str:
@@ -4328,6 +4353,9 @@ class OrchestrationService:
         }
         if context:
             canonical["orchestrator_context"] = context
+        title = request_obj.get("title")
+        if isinstance(title, str) and title.strip():
+            canonical["title"] = title.strip()
         return canonical
 
     @staticmethod
@@ -4835,6 +4863,7 @@ class OrchestrationService:
                         self._json_object_or_empty(orchestrator_context or {}).get("team")
                     ),
                 )),
+                "title": item.title,
                 "work_function": item.work_function,
                 "scope": item.scope,
                 "inputs": [
@@ -6013,7 +6042,9 @@ class OrchestrationService:
             raise HTTPException(status_code=400, detail=f"{field_name} must be a valid UUID") from exc
 
     @staticmethod
-    def _delegation_task_title(work_function: str, deliverable: str) -> str:
+    def _delegation_task_title(work_function: str, deliverable: str, title: str = "") -> str:
+        if title.strip():
+            return shorten(title.strip(), width=80, placeholder="...")
         title = f"{work_function.replace('_', ' ').title()}: {deliverable.strip()}"
         return shorten(title, width=80, placeholder="...")
 
@@ -6026,6 +6057,10 @@ class OrchestrationService:
             f"Scope: {contract.scope}",
             f"Deliverable: {contract.deliverable}",
         ]
+        if contract.why_runnable:
+            sections.append(f"Why runnable: {contract.why_runnable}")
+        if contract.decision_use:
+            sections.append(f"Decision use: {contract.decision_use}")
         if contract.inputs:
             criterion_descriptions: dict[str, str] = {}
             criteria = getattr(goal, "success_criteria", None)
@@ -6043,14 +6078,60 @@ class OrchestrationService:
                 return item
 
             sections.append("Inputs:\n" + "\n".join(f"- {_render_input(item)}" for item in contract.inputs))
+        if contract.depends_on:
+            sections.append(
+                "Dependencies (accepted predecessor task IDs; use their reports as inputs):\n"
+                + "\n".join(f"- {item}" for item in contract.depends_on)
+            )
+        if contract.artifact_ids:
+            sections.append(
+                "Artifacts (existing Artifact IDs to read):\n" + "\n".join(f"- {item}" for item in contract.artifact_ids)
+            )
         if contract.forbidden_work:
             sections.append("Forbidden work:\n" + "\n".join(f"- {item}" for item in contract.forbidden_work))
         if contract.success_evidence:
             sections.append("Success evidence:\n" + "\n".join(f"- {item}" for item in contract.success_evidence))
+        sections.append(OrchestrationService._authorization_scope_text(contract.authorization_scope))
         roadmap = OrchestrationService._json_object_or_empty(contract.orchestrator_context).get("roadmap")
         if isinstance(roadmap, dict):
             sections.append("Roadmap execution policy:\n" + json.dumps(roadmap, sort_keys=True))
+        report_schema = contract.report_schema or {}
+        strict = True
+        if contract.work_function == PLAN_WORK_FUNCTION:
+            kind = report_schema.get("plan_kind")
+            schema = planning_envelope_report_schema(kind if kind in PLAN_KINDS else plan_kind_for(goal))
+        elif report_schema.keys() & SPECIAL_REPORT_KEYS:
+            schema, strict = report_schema, False
+        else:
+            schema = CANONICAL_WORK_REPORT_SCHEMA
+        output = (
+            "Required output:\nWhen done, return exactly one JSON object as your final message: no prose, "
+            "no Markdown fences, no missing or extra keys (values show types). "
+            "Read-only work reports its findings in this JSON.\n" + json.dumps(schema, indent=2)
+        )
+        if strict:
+            output += "\nUse only IDs given in this task; never invent IDs, and do not register Artifacts for this output."
+        sections.append(output)
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _authorization_scope_text(scope) -> str:
+        if scope is None:
+            return (
+                "Authorization scope: not separately declared; goal constraints and owner-approval rules apply. "
+                "Do not spend, write to external systems, send live messages, publish, or run destructive "
+                "operations unless the scope explicitly authorizes it."
+            )
+        spend, writes, sends = scope.model_spend, scope.external_writes, scope.live_sends
+        remaining = ", ".join(f"{k}={v}" for k, v in spend.remaining_by_dimension.items())
+        return "\n".join([
+            "Authorization scope:",
+            "- Model spend: " + (f"allowed (remaining: {remaining})" if spend.allowed and remaining else "allowed" if spend.allowed else "not allowed"),
+            "- External writes: " + (f"allowed to {', '.join(writes.targets)}" if writes.allowed and writes.targets else "allowed" if writes.allowed else "not allowed"),
+            "- Live sends: " + (f"allowed on {', '.join(sends.channels)}" if sends.allowed and sends.channels else "allowed" if sends.allowed else "not allowed"),
+            f"- Workspace mutation: {scope.workspace_mutation}",
+            "- Tool constraints: " + (", ".join(scope.tool_constraints) or "none"),
+        ])
 
     async def _emit_delegation_task_created(
         self,
