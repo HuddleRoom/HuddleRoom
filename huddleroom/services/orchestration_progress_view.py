@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from huddleroom.models.graph import GraphRun
 from huddleroom.models.meeting import Meeting, MeetingActionItem
 from huddleroom.models.orchestration import (
+    ACTIVE_RUN_STATUSES,
     OrchestrationAction,
     OrchestrationGate,
     OrchestrationGoal,
@@ -25,6 +26,7 @@ from huddleroom.models.orchestration import (
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.services.orchestration_capacity import available_slots, root_goal_id
 from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, dependency_ids, gate_satisfies, task_gate_id
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
 
@@ -51,6 +53,7 @@ class ProgressSituation:
     untracked_follow_ups_total: int = 0
     plan_items: list[dict] = field(default_factory=list)
     error: bool = False
+    capacity_wait: dict | None = None
 
     def as_context(self) -> dict[str, Any]:
         context: dict[str, Any] = {
@@ -64,6 +67,8 @@ class ProgressSituation:
             ranked = sorted(self.plan_items, key=lambda item: item["state"] in done)
             context["plan_items"] = ranked[:FOLLOW_UP_CAP]
             context["plan_items_total"] = len(self.plan_items)
+        if self.capacity_wait:
+            context["capacity_wait"] = self.capacity_wait
         if self.error:
             context["progress_view_error"] = True
         return context
@@ -499,7 +504,18 @@ class OrchestrationProgressView:
             for value in ((wait.awaited_event or {}).get("matcher") or {}).values()
         }
         untracked = [row for row in follow_up_rows if row[2] not in tracked_ids]
+        capacity_wait = None
+        queued_ids = [t.id for t in tasks if t.status == "backlog" and t.assigned_to]
+        if queued_ids and run.status in ACTIVE_RUN_STATUSES:
+            started = set(await db.scalars(select(Session.task_id).where(Session.task_id.in_(queued_ids))))
+            queued_ids = [i for i in queued_ids if i not in started]
+            root = await root_goal_id(db, goal.id) if queued_ids else None
+            if queued_ids and await available_slots(db, root) == 0:
+                capacity_wait = {
+                    "root_goal_id": str(root), "available_slots": 0, "queued_task_ids": [str(i) for i in queued_ids],
+                }
         return ProgressSituation(
+            capacity_wait=capacity_wait,
             progress_view=entries,
             untracked_follow_ups=[item for *_, item in _select_follow_ups(untracked)],
             untracked_follow_ups_total=len(untracked),

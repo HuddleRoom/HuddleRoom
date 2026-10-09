@@ -5389,8 +5389,21 @@ class OrchestrationService:
     ) -> None:
         metadata = OrchestrationService._json_object_or_empty(task.metadata_)
         orchestration = OrchestrationService._json_object_or_empty(metadata.get("orchestration"))
+        raw_items = [
+            raw for raw in OrchestrationService._json_object_or_empty(artifact.metadata_).get("plan_items") or []
+            if isinstance(raw, dict)
+        ]
+        plan_index = next(
+            (i for i, raw in enumerate(raw_items) if item.id in (raw.get("id"), raw.get("item_key"))), None
+        )
+        plan_unlocks = sum(
+            1 for raw in raw_items
+            if item.id in {str(dep).removeprefix("plan_item:") for dep in raw.get("depends_on") or []}
+        )
         metadata["orchestration"] = {
             **orchestration,
+            **({"plan_index": plan_index} if plan_index is not None else {}),
+            "plan_unlocks": plan_unlocks,
             "plan_item_id": item.id,
             "plan_item_gate_id": str(gate.id),
             "success_criterion_keys": list(item.success_criterion_keys),

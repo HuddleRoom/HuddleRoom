@@ -188,3 +188,24 @@ async def test_blocked_and_refused_tasks_do_not_consume_slots(db_session, test_p
     result = await activate_ready(db_session, root.id, is_blocked=is_blocked)
     assert [t.id for t in result["started"]] == [ok1.id, ok2.id]
     assert {t.id for t in result["queued"]} == {refused.id}
+
+
+async def test_attach_plan_item_metadata_records_index_and_unlocks():
+    from huddleroom.models.artifact import Artifact
+    from huddleroom.schemas.orchestration import OrchestrationPlanItem
+
+    raw = [
+        {"id": "a", "title": "A"}, {"id": "b", "depends_on": ["a"]}, {"id": "c", "depends_on": ["plan_item:a", "b"]},
+    ]
+    artifact = Artifact(id=uuid.uuid4(), metadata_={"plan_items": raw})
+    task = Task(metadata_={"orchestration": {"run_id": "r"}})
+    plan_item = SimpleNamespace(id="a", success_criterion_keys=[], model_dump=lambda mode: {"id": "a"})
+    action = SimpleNamespace(id=uuid.uuid4())
+    gate = SimpleNamespace(id=uuid.uuid4())
+    OrchestrationService._attach_plan_item_metadata(task, artifact, plan_item, action, gate)
+    assert task.metadata_["orchestration"]["plan_index"] == 0
+    assert task.metadata_["orchestration"]["plan_unlocks"] == 2
+    plan_item.id = "c"
+    OrchestrationService._attach_plan_item_metadata(task, artifact, plan_item, action, gate)
+    assert task.metadata_["orchestration"]["plan_index"] == 2
+    assert task.metadata_["orchestration"]["plan_unlocks"] == 0

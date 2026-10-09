@@ -1037,3 +1037,26 @@ async def test_plan_items_context_is_capped_with_unfinished_items_first():
     assert len(context["plan_items"]) == FOLLOW_UP_CAP and context["plan_items_total"] == 13
     assert [i["item_id"] for i in context["plan_items"][:5]] == [f"open-{n}" for n in range(5)]
     assert [i["item_id"] for i in context["plan_items"][5:]] == [f"done-{n}" for n in range(5)]
+
+
+async def test_capacity_wait_set_only_when_queued_work_has_no_free_slot(db_session, test_project):
+    from huddleroom.models.agent import Agent  # noqa: F401
+    from tests.test_orchestration_runtime_e2e import _agent
+
+    goal, run = await _run_with_criteria(db_session, test_project, [])
+    agent = _agent("cap-wait", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    queued = await _task(db_session, test_project, run, status="backlog")
+    queued.assigned_to = agent.id
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.capacity_wait is None and "capacity_wait" not in situation.as_context()
+
+    await _task(db_session, test_project, run, status="in_progress")
+    await _task(db_session, test_project, run, status="ready")
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.capacity_wait == {
+        "root_goal_id": str(goal.id), "available_slots": 0, "queued_task_ids": [str(queued.id)],
+    }
+    assert situation.as_context()["capacity_wait"] == situation.capacity_wait
