@@ -19,7 +19,7 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import PLANNING_ENVELOPE_ADAPTER
 from huddleroom.services.orchestration_budget_service import parent_caps
 from huddleroom.services.orchestration_roadmap_service import parse_roadmap_items
-from huddleroom.services.orchestration_work_report import _report_object
+from huddleroom.services.orchestration_work_report import _DuplicateReportKey, _report_object
 
 INGESTION_SOURCE = "planning_output_ingestion"
 
@@ -42,9 +42,10 @@ def plan_output_hash(normalized: dict) -> str:
 def parse_envelope(output: str | None, expected_kind: str, goal: Any) -> dict:
     try:
         data = json.loads(output or "", object_pairs_hook=_report_object)
+    except _DuplicateReportKey as exc:
+        raise PlanIngestionError(f"duplicate key: {exc}") from exc
     except (TypeError, ValueError) as exc:
-        detail = f"duplicate key: {exc}" if type(exc).__name__ == "_DuplicateReportKey" else "output must be exactly one JSON object"
-        raise PlanIngestionError(detail) from exc
+        raise PlanIngestionError("output must be exactly one JSON object") from exc
     if not isinstance(data, dict):
         raise PlanIngestionError("output must be exactly one JSON object")
     try:

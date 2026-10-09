@@ -2202,7 +2202,25 @@ class OrchestrationService:
         project_id = await self._project_id_for_run(db, run_id)
         stored_request = action.request or {}
         revision_request = self._required_string(stored_request.get("revision_request"), "revision_request")
-        self._append_plan_revision(run, action, planning_task.id, revision_request)
+        pending = self._json_object_or_empty(self._json_object_or_empty(run.plan_state).get("pending_replan"))
+        if pending:
+            # A rejected Roadmap replan is retried as a new replan task; the accepted version stays current.
+            original = await db.get(OrchestrationAction, uuid.UUID(pending["action_id"]))
+            replan = await self.reserve_action(
+                db, run_id=run.id, idempotency_key=f"run:{run.id}:kind:request_roadmap_replan:revision:{action.id}",
+                action_type="request_roadmap_replan", request=original.request,
+            )
+            if replan.status == "reserved":
+                await self._dispatch_roadmap_replan_task(
+                    db, await db.get(OrchestrationGoal, run.goal_id), run, replan, original.request,
+                    await db.get(OrchestrationRoadmapVersion, uuid.UUID(pending["version_id"])),
+                    extra_inputs=[
+                        f"Plan revision request: {revision_request}",
+                        f"Plan revision reason: {pending.get('ingestion_error')}",
+                    ],
+                )
+        else:
+            self._append_plan_revision(run, action, planning_task.id, revision_request)
         await emit_event_once(
             db,
             project_id,
@@ -2216,8 +2234,10 @@ class OrchestrationService:
             source="orchestrator",
             dedup_key=f"{PLAN_REVISION_REQUESTED_EVENT_TYPE}:action:{action.id}",
         )
+        if pending:
+            return await self._mark_action_completed(db, action, target_type="task", target_id=planning_task.id)
         contract = self._json_object_or_empty(self._json_object_or_empty(planning_task.metadata_).get("orchestration_contract"))
-        await self.execute_request_plan_action(
+        plan_action = await self.execute_request_plan_action(
             db,
             run.id,
             {
@@ -2229,6 +2249,9 @@ class OrchestrationService:
             },
             f"run:{run.id}:kind:request_plan:revision:{action.id}",
         )
+        if plan_action.status != "completed":
+            await self._fail_reserved_action(db, action, plan_action.error or "Plan revision could not start a planning task")
+            return action
         return await self._mark_action_completed(db, action, target_type="task", target_id=planning_task.id)
 
     async def execute_request_roadmap_replan_action(
@@ -2268,6 +2291,14 @@ class OrchestrationService:
         )
         if action.status != "reserved":
             return action
+        return await self._dispatch_roadmap_replan_task(db, goal, run, action, stored, version)
+
+    async def _dispatch_roadmap_replan_task(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, action: OrchestrationAction,
+        stored: dict, version: OrchestrationRoadmapVersion, extra_inputs: Sequence[str] = (),
+    ) -> OrchestrationAction:
+        run_id = run.id
+        state = self._json_object_or_empty(run.plan_state)
         project_id, agent, _ = await self._validate_delegation_targets(
             db, run_id, {**stored, "work_function": PLAN_WORK_FUNCTION, "parent_task_id": None},
         )
@@ -2279,9 +2310,11 @@ class OrchestrationService:
             ))).all())
             contract = self._planning_contract(goal, run, action, {**stored, "work_function": PLAN_WORK_FUNCTION})
             contract = contract.model_copy(update={
-                "inputs": [*contract.inputs, f"Current immutable Roadmap version: {json.dumps(version.snapshot, sort_keys=True)}",
+                "inputs": [*contract.inputs, *extra_inputs, f"Current immutable Roadmap version: {json.dumps(version.snapshot, sort_keys=True)}",
                            f"Released immutable item snapshots: {json.dumps([row.item_snapshot for row in released], sort_keys=True)}"],
                 "forbidden_work": [*contract.forbidden_work, "Do not change or remove any released Roadmap item."],
+                # A Roadmap replan always returns a Roadmap plan, whatever the run's planning-mode snapshot says.
+                "report_schema": planning_envelope_report_schema("roadmap"),
             })
             task = await TaskService().create(
                 db, project_id,
@@ -4587,7 +4620,8 @@ class OrchestrationService:
         if artifact.created_by_agent is None or artifact.created_by_agent != planning_task.assigned_to:
             raise HTTPException(status_code=409, detail="Plan artifact must be created by the assigned planning agent")
         metadata = self._json_object_or_empty(artifact.metadata_)
-        if metadata.get("source") == INGESTION_SOURCE:
+        # The server-held plan_artifact_id keeps the binding even if the Artifact's metadata is rewritten.
+        if metadata.get("source") == INGESTION_SOURCE or str(artifact.id) == plan_state.get("plan_artifact_id"):
             if metadata.get("planning_version") != plan_state.get("planning_version"):
                 raise HTTPException(status_code=409, detail="Plan artifact is from a superseded planning version")
             if ingested_plan_hash(metadata) != plan_state.get("plan_output_hash"):
@@ -5296,6 +5330,11 @@ class OrchestrationService:
 
     async def _ensure_plan_revision_allowed(self, db: AsyncSession, run: OrchestrationRun) -> None:
         await self._ensure_baseline_processes_ready(db, run.goal_id)
+        pending = self._json_object_or_empty(self._json_object_or_empty(run.plan_state).get("pending_replan"))
+        if pending:
+            if not pending.get("ingestion_error"):
+                raise HTTPException(status_code=409, detail="Pending Roadmap replan can only be revised after its output is rejected")
+            return
         self._ensure_plan_not_accepted(run)
         plan_state = OrchestrationService._json_object_or_empty(run.plan_state)
         if plan_state.get("status") == "failed":
@@ -5961,6 +6000,7 @@ class OrchestrationService:
                 "plan_artifact_id",
                 "plan_output_hash",
                 "planning_version",
+                "revision_reason",
             }
         }
         current_version = int(plan_state.get("planning_version") or 0)

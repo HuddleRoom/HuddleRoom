@@ -807,9 +807,15 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         OrchestrationAction, uuid.UUID(integration_tick["authorized_execution"]["action_id"]),
     )
     integration_task = await db_session.get(Task, integration_verification.target_id)
+    v2_items = [
+        artifact.metadata_["plan_items"][0],
+        {**_roadmap_task("v2"), "agent_id": str(artifact.created_by_agent)},
+    ]
+    # The dispatched action is the replan; its planner (the assignee) returns the replacement plan.
     await _complete_task_session(
-        db_session, test_project.id, integration_task, verifier.id,
-        json.dumps({"status": "done", "verdict": "accepted", "evidence": ["V1 integration reviewed"]}),
+        db_session, test_project.id, integration_task, integration_task.assigned_to,
+        json.dumps({"schema_version": 1, "plan_kind": "roadmap", "summary": "Add v2.",
+                    "plan_items": [{**item, "why_runnable": "Unstarted work."} for item in v2_items]}),
     )
     replan_tick = await service.tick(db_session, run.id)
     assert replan_tick["authorized_execution"]["step"] == "replan_decision"
@@ -823,10 +829,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
     candidate = Artifact(
         project_id=test_project.id, name="tick-v2", artifact_type="plan", status="draft",
         linked_task_id=replan.target_id, created_by_agent=artifact.created_by_agent,
-        metadata_={"plan_items": [
-            artifact.metadata_["plan_items"][0],
-            {**_roadmap_task("v2"), "agent_id": str(artifact.created_by_agent)},
-        ]},
+        metadata_={"plan_items": v2_items},
     )
     db_session.add(candidate)
     await db_session.flush()
@@ -844,8 +847,6 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         "planner_agent_id": str(artifact.created_by_agent), "artifact_id": str(candidate.id),
         "fingerprint": _roadmap_fingerprint(service, goal, candidate.metadata_["plan_items"]),
         "gate_id": str(approval_gate.id),
-        # The replan task above was completed by the verifier's session, so its output was rejected on author.
-        "ingestion_error": "planning_output_rejected: plan output author is not the assigned planning agent",
     }
     counts = await cardinalities()
     replay_wait = await service.tick(db_session, run.id)
@@ -1609,3 +1610,55 @@ async def test_roadmap_replan_requires_selected_plan_author(db_session, test_pro
     action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
     assert action.status == "failed" and action.action_type == "request_roadmap_replan"
     assert "plan_author_mismatch" in action.error
+
+
+async def test_rejected_replan_output_is_revised_into_a_new_replan_task_and_accepted(
+    db_session, test_project, test_user,
+):
+    service, goal, run, artifact = await _accept_version_one(
+        db_session, test_project, test_user, items=[_roadmap_task()],
+    )
+    replan = await _request_replan(db_session, service, goal, run, artifact)
+    first = await db_session.get(Task, replan.target_id)
+
+    async def _finish(task, output):
+        session = await _complete_task_session(
+            db_session, test_project.id, task, task.assigned_to, output, emit_task_event=False,
+        )
+        await service._ingest_session_evidence(db_session, run, SimpleNamespace(
+            event_type="session.completed", payload={"session_id": str(session.id)},
+        ))
+
+    await _finish(first, "Here is the new roadmap in prose.")
+    assert run.plan_state["status"] == "accepted"
+    assert run.plan_state["pending_replan"]["ingestion_error"] == (
+        "planning_output_rejected: output must be exactly one JSON object"
+    )
+    version = run.plan_state["planning_version"]
+
+    revision = await service.execute_request_plan_revision_action(
+        db_session, run.id,
+        {"action_type": "request_plan_revision", "plan_task_id": str(first.id),
+         "revision_request": "Return the Roadmap envelope."},
+        f"run:{run.id}:kind:request_plan_revision:replan",
+    )
+    assert revision.status == "completed"
+    pending = run.plan_state["pending_replan"]
+    second = await db_session.get(Task, uuid.UUID(pending["task_id"]))
+    assert second.id != first.id and "ingestion_error" not in pending
+    assert run.plan_state["status"] == "accepted" and run.plan_state["planning_version"] == version + 1
+    inputs = second.metadata_["orchestration_contract"]["inputs"]
+    assert "Plan revision request: Return the Roadmap envelope." in inputs
+    assert "Plan revision reason: planning_output_rejected: output must be exactly one JSON object" in inputs
+
+    await _finish(second, json.dumps({
+        "schema_version": 1, "plan_kind": "roadmap", "summary": "Replace task-1 with task-2.",
+        "plan_items": [{**_roadmap_task("task-2"), "why_runnable": "Unstarted work."}],
+    }))
+    candidate = await db_session.get(Artifact, uuid.UUID(run.plan_state["plan_artifact_id"]))
+    assert candidate.linked_task_id == second.id
+    acceptance = await _accept_replan_after_selected_authority(
+        db_session, service, goal, run, candidate, f"run:{run.id}:kind:replan-accept",
+    )
+    assert acceptance.status == "completed" and run.plan_state["pending_replan"] is None
+    assert run.plan_state["roadmap_version"] == 2

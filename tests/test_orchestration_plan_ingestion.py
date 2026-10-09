@@ -182,6 +182,19 @@ async def test_acceptance_rejects_superseded_and_tampered_ingested_artifact(db_s
         await service._plan_artifact_for_run(db_session, run, artifact.id)
 
 
+@pytest.mark.asyncio
+async def test_acceptance_binds_ingested_artifact_even_after_metadata_rewrite_drops_source(db_session, test_project):
+    service, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], _db_output())
+
+    # PUT /artifacts replaces metadata wholesale; the server-held plan_artifact_id still binds the content.
+    artifact.metadata_ = {"plan_items": [_item(id="b", success_criterion_keys=["plan"])]}
+    await db_session.flush()
+    with pytest.raises(HTTPException) as exc:
+        await service._plan_artifact_for_run(db_session, run, artifact.id)
+    assert exc.value.status_code == 409
+
+
 def _completed(session_id):
     return SimpleNamespace(id=uuid.uuid4(), event_type="session.completed", payload={"session_id": str(session_id)})
 
@@ -212,6 +225,49 @@ async def test_session_hook_ingests_winner_and_ignores_nonwinning_session(db_ses
     await service._ingest_session_evidence(db_session, run, _completed(loser.id))
     assert await _plan_artifacts(db_session, task.id) == 1
     assert run.plan_state == state
+
+    # A replayed task event after completed ingestion is a no-op.
+    assert await service._ingest_task_evidence(db_session, run, task_event) == 0
+    assert await _plan_artifacts(db_session, task.id) == 1
+    assert run.plan_state == state
+
+
+@pytest.mark.asyncio
+async def test_gated_planning_work_item_is_not_ingested_as_plan_output(db_session, test_project):
+    from huddleroom.models.event_log import EventLog
+    from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
+    from huddleroom.schemas.task import TaskCreate
+    from huddleroom.services.event_bus import emit_event_once
+    from huddleroom.services.task_service import TaskService
+
+    service, goal, run, _, _ = await _planning_run(db_session, test_project.id)
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="plan_item:p", gate_type="work_completed", required_evidence={})
+    db_session.add(gate)
+    await db_session.flush()
+    item_task = await TaskService().create(db_session, test_project.id, TaskCreate(
+        title="Planning work item", metadata={"orchestration": {
+            "goal_id": str(goal.id), "run_id": str(run.id), "work_function": "planning", "gate_id": str(gate.id),
+        }},
+    ))
+    session = Session(task_id=item_task.id, agent_id=(await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))).assigned_to,
+                      project_id=test_project.id, adapter_type="api")
+    db_session.add(session)
+    await _finish(db_session, item_task, session, _db_output())
+    await emit_event_once(
+        db_session, test_project.id, "task.status_changed", {"task_id": str(item_task.id), "status": "done"},
+        dedup_key=f"gated-planning-item:{item_task.id}",
+    )
+    event = await db_session.scalar(
+        select(EventLog).where(EventLog.event_type == "task.status_changed").order_by(EventLog.seq.desc()).limit(1)
+    )
+    state = dict(run.plan_state)
+
+    assert await service._ingest_task_evidence(db_session, run, event) == 1
+
+    assert await _plan_artifacts(db_session, item_task.id) == 0 and run.plan_state == state
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == gate.id
+    )) == 1
 
 
 @pytest.mark.asyncio
