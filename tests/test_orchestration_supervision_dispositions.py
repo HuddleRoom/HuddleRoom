@@ -19,7 +19,7 @@ EXPECTED_FIELDS = {
     "pause": (frozenset(), frozenset()),
     "follow_up": (
         frozenset({"agent_id", "deliverable", "scope", "parent_task_id"}),
-        frozenset({"title", "inputs", "forbidden_work", "success_evidence", "budget", "report_schema", "source_session_id", "depends_on"}),
+        frozenset({"title", "inputs", "forbidden_work", "success_evidence", "budget", "report_schema", "source_session_id", "depends_on", "decision_use", "why_runnable", "priority", "artifact_ids", "authorization_scope"}),
     ),
     "verify": (frozenset({"gate_id"}), frozenset()),
     "reassign": (frozenset({"agent_id", "task_id"}), frozenset()),

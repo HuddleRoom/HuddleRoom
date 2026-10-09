@@ -9,7 +9,9 @@ from huddleroom.config import settings
 from huddleroom.services.orchestration_completion import get_orchestration_completion
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_agent_definition_analyzer import _unfence_json, redact_semantic_payload
-from huddleroom.services.orchestration_decision_validator import _is_missing_required_value, _is_uuid_string
+from huddleroom.services.orchestration_decision_validator import (
+    _is_missing_required_value, _is_uuid_string, delegation_optional_field_error,
+)
 from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT, orchestrator_preamble
 from huddleroom.services.orchestration_supervision import DISPOSITIONS, SupervisionAssessment, disposition_request_fields
 from huddleroom.services.orchestration_wake_when import normalize_wake_when, wake_when_prompt_table
@@ -45,6 +47,8 @@ def _validate_request(kind: str, request: Mapping[str, Any]) -> None:
         ids = request["participant_agent_ids"]
         if not isinstance(ids, list) or not all(_is_uuid_string(i) for i in ids):
             raise ValueError(f"{kind} disposition participant_agent_ids must be a list of UUIDs")
+    if kind == "follow_up" and (error := delegation_optional_field_error(request)):
+        raise ValueError(f"{kind} disposition {error}")
 
 
 def parse_supervision_assessment(payload: Any) -> SupervisionAssessment:

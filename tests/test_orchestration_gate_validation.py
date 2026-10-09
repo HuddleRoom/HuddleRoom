@@ -795,6 +795,13 @@ async def test_synthesis_join_releases_once_only_after_every_audit_gate_is_accep
     from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal
     from tests.test_orchestration_plan_to_work_expansion import _adopted_audit_plan
 
+    from huddleroom.models.artifact import Artifact
+
+    db_session.add(Artifact(
+        id=uuid.UUID("00000000-0000-0000-0000-0000000000a1"), project_id=test_project.id,
+        name="spec", artifact_type="document",
+    ))
+    await db_session.flush()
     service, goal, run, audits = await _adopted_audit_plan(
         db_session, test_project.id, audits=2,
         synthesis={"priority": 80, "why_runnable": "Both audits are accepted.",

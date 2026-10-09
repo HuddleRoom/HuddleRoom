@@ -1233,3 +1233,15 @@ def test_prompt_schema_lists_wake_when_as_noop_required():
     schemas = json.loads(system_text.split("Allowed action schemas: ", 1)[1])
 
     assert schemas["noop"]["required"] == ["wake_when"]
+
+
+def test_advertised_create_delegation_task_optional_fields_are_exact():
+    messages = build_orchestration_decision_messages({})
+    text = "\n".join(m["content"] for m in messages)
+    line = next(l for l in text.splitlines() if '"create_delegation_task"' in l and '"optional"' in l)
+    optional = json.loads(line[line.index("{"):])["create_delegation_task"]["optional"]
+    assert optional == sorted({
+        "title", "inputs", "forbidden_work", "success_evidence", "budget", "report_schema", "parent_task_id",
+        "source_session_id", "depends_on", "decision_use", "why_runnable", "priority", "artifact_ids",
+        "authorization_scope",
+    })

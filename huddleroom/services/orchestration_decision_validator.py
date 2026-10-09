@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from huddleroom.models.orchestration_process import WARNING_SEVERITIES, WARNING_SEVERITY_VALUES
+from huddleroom.schemas.orchestration import AuthorizationScope
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
 
@@ -45,6 +48,11 @@ OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
             "parent_task_id",
             "source_session_id",
             "depends_on",
+            "decision_use",
+            "why_runnable",
+            "priority",
+            "artifact_ids",
+            "authorization_scope",
         }
     ),
     "ask_human": frozenset(
@@ -156,16 +164,10 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
             f"Decision 'record_warning' severity must be one of: {', '.join(WARNING_SEVERITY_VALUES)}",
         )
 
-    if action_type == "create_delegation_task" and "depends_on" in decision:
-        deps = decision["depends_on"]
-        if (
-            not isinstance(deps, list)
-            or not all(_is_uuid_string(d) for d in deps)
-            or len({str(UUID(d)) for d in deps}) != len(deps)
-        ):
-            return DecisionValidationResult(
-                False, "Decision 'create_delegation_task' depends_on must be a list of distinct task UUIDs"
-            )
+    if action_type == "create_delegation_task":
+        error = delegation_optional_field_error(decision)
+        if error is not None:
+            return DecisionValidationResult(False, f"Decision 'create_delegation_task' {error}")
 
     if action_type == "retry_task":
         for key in ("timeout", "max_tokens"):
@@ -173,6 +175,34 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
                 return DecisionValidationResult(False, f"Decision 'retry_task' {key} must be a positive integer")
 
     return DecisionValidationResult(True)
+
+
+def delegation_optional_field_error(request: Mapping[str, Any]) -> str | None:
+    """Type-check the optional create_delegation_task fields; None when all present ones are valid."""
+    for key in ("title", "decision_use", "why_runnable"):
+        if key in request and not isinstance(request[key], str):
+            return f"{key} must be a string"
+    if "priority" in request:
+        priority = request["priority"]
+        if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
+            return "priority must be an integer from 0 to 100"
+    for key, label in (("depends_on", "task"), ("artifact_ids", "artifact")):
+        if key in request:
+            ids = request[key]
+            if (
+                not isinstance(ids, list)
+                or not all(_is_uuid_string(i) for i in ids)
+                or len({str(UUID(i)) for i in ids}) != len(ids)
+            ):
+                return f"{key} must be a list of distinct {label} UUIDs"
+    if "authorization_scope" in request:
+        try:
+            scope = AuthorizationScope.model_validate(request["authorization_scope"])
+        except ValidationError:
+            return "authorization_scope is not a valid authorization scope"
+        if scope.external_writes.allowed or scope.live_sends.allowed:
+            return "authorization_scope cannot self-grant external writes or live sends; route them to ask_human"
+    return None
 
 
 def _is_uuid_string(value: Any) -> bool:

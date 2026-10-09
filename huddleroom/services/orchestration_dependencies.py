@@ -12,6 +12,15 @@ from huddleroom.models.orchestration import OrchestrationGate, OrchestrationGoal
 from huddleroom.models.task import Task
 
 
+ADHOC_GATE_TYPE = "adhoc_work_accepted"
+ADHOC_GATED_WORK_FUNCTIONS = {"investigation": "discovery", "review": "readiness"}
+PLAN_IN_FLIGHT_STATUSES = frozenset({"requested", "revision_requested", "revision_required"})
+
+
+def plan_in_flight(plan_state: Any) -> bool:
+    return isinstance(plan_state, dict) and plan_state.get("status") in PLAN_IN_FLIGHT_STATUSES
+
+
 def _uuid(value: Any) -> uuid.UUID | None:
     try:
         return uuid.UUID(str(value).strip()) if value is not None else None

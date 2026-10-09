@@ -873,3 +873,74 @@ def test_canonical_delegation_request_rejects_invalid_plan_item_fields_with_4xx(
     with pytest.raises(HTTPException) as exc_info:
         OrchestrationService()._canonical_delegation_task_request(_passthrough_request(**fields))
     assert 400 <= exc_info.value.status_code < 500
+
+
+@pytest.mark.asyncio
+async def test_adhoc_optional_fields_flow_into_request_contract_and_task(db_session, test_project):
+    from huddleroom.models.artifact import Artifact
+    from huddleroom.schemas.task import TaskResponse
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    artifact = Artifact(project_id=test_project.id, name="spec", artifact_type="document")
+    db_session.add(artifact)
+    await db_session.flush()
+    scope = {"workspace_mutation": "staged"}
+
+    action = await _delegate(
+        service, run, agent, "opt", db=db_session, decision_use=" pick engine ", why_runnable=" no plan needed ",
+        priority=80, artifact_ids=[f" {artifact.id} "], authorization_scope=scope,
+    )
+
+    task = await db_session.get(Task, action.id)
+    contract = task.metadata_["orchestration_contract"]
+    assert action.request["decision_use"] == "pick engine"
+    assert action.request["why_runnable"] == "no plan needed"
+    assert action.request["priority"] == 80 and action.request["artifact_ids"] == [str(artifact.id)]
+    assert action.request["authorization_scope"]["workspace_mutation"] == "staged"
+    assert contract["decision_use"] == "pick engine" and contract["priority"] == 80
+    assert contract["authorization_scope"]["workspace_mutation"] == "staged"
+    assert contract["artifact_ids"] == [str(artifact.id)]
+    assert TaskResponse.model_validate(task).priority == 80
+
+
+@pytest.mark.asyncio
+async def test_adhoc_defaults_keep_legacy_request_and_unknown_artifact_creates_nothing(db_session, test_project):
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    legacy = await _delegate(service, run, agent, "legacy", db=db_session, decision_use=" ", priority=50)
+    assert legacy.request == _canonical_request(agent.id)
+
+    before = await _task_count(db_session, test_project.id)
+    with pytest.raises(HTTPException) as exc:
+        await _delegate(service, run, agent, "bad-art", db=db_session, artifact_ids=[str(uuid.uuid4())])
+    assert exc.value.status_code == 409 and exc.value.detail.startswith("artifact_invalid:")
+    assert await _task_count(db_session, test_project.id) == before
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_artifact_is_failed_action_with_zero_tasks(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationDecision
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    decision = OrchestrationDecision(
+        run_id=run.id, decision_type="execution", validator_status="accepted", input_snapshot={},
+        parsed_decision={**_delegation_request(agent.id), "artifact_ids": [str(uuid.uuid4())]},
+    )
+    db_session.add(decision)
+    await db_session.flush()
+    project_id = test_project.id
+    before = await _task_count(db_session, project_id)
+
+    action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
+
+    assert action.status == "failed" and "artifact_invalid" in (action.error or "")
+    assert await _task_count(db_session, project_id) == before
+
+
+@pytest.mark.parametrize("scope", ["wide", {"bogus": 1}])
+def test_canonical_request_rejects_invalid_authorization_scope(scope):
+    with pytest.raises(HTTPException) as exc:
+        OrchestrationService()._canonical_delegation_task_request(
+            {**_delegation_request(uuid.uuid4()), "authorization_scope": scope}
+        )
+    assert exc.value.status_code == 422

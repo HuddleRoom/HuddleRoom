@@ -52,6 +52,7 @@ from huddleroom.models.task import Task
 from huddleroom.models.user import User
 from huddleroom.models.base import _utcnow
 from huddleroom.schemas.orchestration import (
+    AuthorizationScope,
     OrchestrationDelegationContract,
     OrchestrationGoalCreate,
     OrchestrationPlanItem,
@@ -1582,6 +1583,7 @@ class OrchestrationService:
         idempotency_key: str,
         decision_id: uuid.UUID | None = None,
         skip_baseline_gate: bool = False,
+        ad_hoc: bool = False,
     ) -> OrchestrationAction:
         gate_run = await db.get(OrchestrationRun, run_id)
         if gate_run is None:
@@ -1621,6 +1623,14 @@ class OrchestrationService:
             await validate_dependencies(
                 db, gate_run, [uuid.UUID(d) for d in request_to_store.get("depends_on") or []]
             )
+            artifact_ids = {uuid.UUID(a) for a in request_to_store.get("artifact_ids") or []}
+            if artifact_ids:
+                found = set((await db.execute(
+                    select(Artifact.id).where(Artifact.id.in_(artifact_ids), Artifact.project_id == project_id)
+                )).scalars())
+                if artifact_ids - found:
+                    missing = min(artifact_ids - found, key=str)
+                    raise HTTPException(status_code=409, detail=f"artifact_invalid: artifact {missing} not found in project")
             authority = await self.roadmap_pre_release_authority(
                 db, run_id, agent,
                 self._json_object_or_empty(request_to_store.get("orchestrator_context")),
@@ -4509,6 +4519,15 @@ class OrchestrationService:
             raise HTTPException(status_code=422, detail="why_runnable must be a string")
         if why_runnable and why_runnable.strip():
             canonical["why_runnable"] = why_runnable.strip()
+        decision_use = request_obj.get("decision_use")
+        if isinstance(decision_use, str) and decision_use.strip():
+            canonical["decision_use"] = decision_use.strip()
+        raw_scope = request_obj.get("authorization_scope")
+        if raw_scope is not None:
+            try:
+                canonical["authorization_scope"] = AuthorizationScope.model_validate(raw_scope).model_dump(mode="json")
+            except ValidationError:
+                raise HTTPException(status_code=422, detail="authorization_scope is not a valid authorization scope")
         return canonical
 
     def _follow_up_delegation_key(self, run_id: uuid.UUID, request: Mapping[str, Any]) -> str:

@@ -705,3 +705,51 @@ def test_create_delegation_task_depends_on_rejects_case_variant_duplicates():
     )
 
     assert result.accepted is False
+
+
+_SELF_GRANT = "authorization_scope cannot self-grant external writes or live sends; route them to ask_human"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"decision_use": "Pick the storage engine", "why_runnable": "Needs no plan", "priority": 0},
+        {"priority": 100, "artifact_ids": [_id(), _id()]},
+        {"authorization_scope": {"workspace_mutation": "staged", "tool_constraints": ["no network"]}},
+    ],
+)
+def test_create_delegation_task_optional_fields_accept_valid(extra):
+    assert validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], **extra}).accepted is True
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("title", 5), ("decision_use", ["x"]), ("why_runnable", 1),
+        ("priority", True), ("priority", "80"), ("priority", 101), ("priority", -1), ("priority", 1.5),
+        ("artifact_ids", "x"), ("artifact_ids", ["nope"]), ("artifact_ids", [_id(), _id().upper()][:1] * 2),
+        ("authorization_scope", "wide"), ("authorization_scope", {"bogus": 1}),
+        ("authorization_scope", {"workspace_mutation": "root"}),
+    ],
+)
+def test_create_delegation_task_optional_fields_reject_bad_types(key, value):
+    result = validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], key: value})
+
+    assert result.accepted is False
+    assert key in result.rejection_reason
+
+
+@pytest.mark.parametrize("scope", [{"external_writes": {"allowed": True}}, {"live_sends": {"allowed": True}}])
+def test_create_delegation_task_rejects_self_granted_authorization(scope):
+    result = validate_orchestration_decision(
+        {**ALLOWED_DECISIONS["create_delegation_task"], "authorization_scope": scope}
+    )
+
+    assert result.accepted is False
+    assert result.rejection_reason == f"Decision 'create_delegation_task' {_SELF_GRANT}"
+
+
+def test_create_delegation_task_unknown_key_still_rejected():
+    result = validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], "colour": "red"})
+
+    assert result.accepted is False and "unknown top-level key: colour" in result.rejection_reason

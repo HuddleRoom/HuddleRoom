@@ -106,8 +106,10 @@ class OrchestrationDecisionDispatcher:
                 await self._service._steering_action_fence(db, run.id, action_key, decision.id)
             )
         run_id, decision_id = run.id, decision.id
+        # Only model-proposed delegation is ad hoc; internal callers keep the default.
+        extra = {"ad_hoc": True} if action_type == "create_delegation_task" else {}
         call = lambda: method(  # noqa: E731
-            db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id,
+            db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id, **extra,
         )
         if action_type in self._OWN_RECOVERY_ACTION_TYPES:
             if action_type == "request_roadmap_replan" and await self._service._existing_action_for_key(

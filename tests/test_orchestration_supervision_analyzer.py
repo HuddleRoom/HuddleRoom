@@ -233,3 +233,10 @@ async def test_assess_repairs_malformed_request_then_returns_valid_assessment():
     assert len(calls) == 2
     assert result.disposition["action_type"] == "follow_up"
     assert result.disposition["request"]["deliverable"] == "report"
+
+
+def test_follow_up_rejects_bad_optional_delegation_fields():
+    for field, bad in (("depends_on", ["nope"]), ("priority", 500), ("authorization_scope", {"live_sends": {"allowed": True}})):
+        with pytest.raises(ValueError, match=field):
+            parse_supervision_assessment(_assessment({
+                "action_type": "follow_up", "request": _valid_request("follow_up", **{field: bad})}))
