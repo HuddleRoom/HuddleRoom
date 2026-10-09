@@ -1149,3 +1149,79 @@ async def test_release_binds_adopted_items_without_spending_release_slots(db_ses
     assert sorted(e["task_id"] for e in run.plan_state["expanded_items"]) == sorted(str(t.id) for t in audits)
     assert len(await _run_rows(db_session, OrchestrationAction, run.id, action_type="release_item")) == 3
     assert await _task_count(db_session, test_project.id) == tasks_before
+
+
+@pytest.mark.asyncio
+async def test_unadopted_pre_plan_audit_must_be_explained_and_then_continues_unbound(db_session, test_project):
+    import json
+
+    from huddleroom.models.session import Session
+    from tests.conftest import bind_plan_author_team
+
+    planner = _agent("planner", role="planner", capabilities=["planning"])
+    auditor = _agent("auditor", role="developer", capabilities=["investigation"])
+    db_session.add_all([planner, auditor])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    audit_action = await service.execute_create_delegation_task_action(
+        db_session, run_id=run.id,
+        request={"action_type": "create_delegation_task", "agent_id": str(auditor.id),
+                 "work_function": "investigation", "scope": "Audit the API.", "deliverable": "Findings."},
+        idempotency_key=f"run:{run.id}:kind:create_delegation_task:disposition-audit",
+    )
+    audit = await db_session.get(Task, audit_action.target_id)
+    audit.status = "in_progress"
+    await bind_plan_author_team(db_session, goal, planner)
+    await service.execute_request_plan_action(
+        db_session, run_id=run.id,
+        request={"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
+                 "scope": "Plan the work."},
+        idempotency_key="run:disposition:kind:request_plan",
+    )
+
+    async def finish_planning(summary):
+        task = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+        assert task.metadata_["orchestration_plan"]["pre_plan_task_ids"] == [str(audit.id)]
+        session = Session(
+            task_id=task.id, agent_id=planner.id, project_id=test_project.id, adapter_type="api",
+            status="completed", output=json.dumps({
+                "schema_version": 1,
+                "plan_kind": task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"],
+                "summary": summary,
+                "plan_items": [{**_raw_plan_item(planner.id), "why_runnable": "No dependencies."}],
+            }),
+        )
+        task.status = "done"
+        db_session.add(session)
+        await db_session.flush()
+        await service._ingest_planning_output(db_session, run, task, session.id)
+        return task
+
+    first = await finish_planning("Implement the API.")
+    assert run.plan_state["status"] == "revision_required"
+    assert run.plan_state["revision_reason"] == (
+        f"planning_output_rejected: pre-plan task {audit.id} is neither adopted (adopt_task_id) nor explained in summary"
+    )
+    assert "plan_artifact_id" not in run.plan_state
+
+    await service.execute_request_plan_revision_action(
+        db_session, run_id=run.id,
+        request={"action_type": "request_plan_revision", "plan_task_id": str(first.id),
+                 "revision_request": "Disposition the running audit."},
+        idempotency_key="run:disposition:kind:request_plan_revision",
+    )
+    await finish_planning(f"Implement the API; audit {audit.id} keeps running as independent context.")
+    await service.execute_accept_plan_action(
+        db_session, run_id=run.id,
+        request={"action_type": "accept_plan", "plan_artifact_id": run.plan_state["plan_artifact_id"]},
+        idempotency_key="run:disposition:kind:accept_plan",
+    )
+    assert run.plan_state["status"] == "accepted"
+
+    assert await service._release_ready_work(db_session, goal, run) == 1
+    await db_session.refresh(audit)
+    assert audit.status == "in_progress"
+    assert "plan_item_gate_id" not in audit.metadata_["orchestration"]
+    assert "orchestration_plan_item" not in audit.metadata_
+    assert [e["plan_item_id"] for e in run.plan_state["expanded_items"]] == ["implement-api"]
+    assert await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task") == []

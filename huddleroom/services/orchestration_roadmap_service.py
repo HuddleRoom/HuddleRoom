@@ -777,7 +777,8 @@ class OrchestrationRoadmapService:
             scope=item.scope, deliverable=item.deliverable, agent_id=item.agent_id,
             inputs=item.inputs, forbidden_work=item.forbidden_work,
             success_evidence=item.success_evidence, required_capabilities=item.required_capabilities,
-            depends_on=item.depends_on,
+            depends_on=item.depends_on, priority=item.priority, artifact_ids=item.artifact_ids,
+            why_runnable=item.why_runnable,
         )
         required_evidence = {
             "plan_item_id": item.item_key,
@@ -817,39 +818,50 @@ class OrchestrationRoadmapService:
                 "decision_id": budget_authority["decision_id"],
                 "unsupported_dimensions": budget_authority["unsupported_dimensions"],
             }
-        released_task_keys = set((await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
-            OrchestrationRoadmapItem.goal_id == goal.id,
-            OrchestrationRoadmapItem.unit_type == "task",
-        ))).all())
-        discretionary_divisor = max(1, sum(
-            candidate.unit_type == "task" and candidate.item_key not in released_task_keys
-            for candidate in parse_roadmap_items(version.snapshot["items"], set(parent_caps(goal)))
-        ))
-        delegation_request = await self.orchestration._plan_item_delegation_request(
-            db, run.id, goal.project_id, artifact, task_item, orchestrator_context=context,
-            discretionary_divisor=discretionary_divisor,
-        )
-        delegation = await self.orchestration.execute_create_delegation_task_action(
-            db, run.id,
-            delegation_request,
-            f"run:{run.id}:kind:create_delegation_task:roadmap_item:{item.item_key}",
-        )
-        task = await db.get(Task, delegation.target_id)
-        self.orchestration._attach_plan_item_metadata(task, artifact, task_item, release, gate)
+        if item.adopt_task_id is not None:
+            # Adopted discovery work keeps its task and session; no delegation is created.
+            task = await db.get(Task, item.adopt_task_id)
+            if task is None:
+                raise HTTPException(
+                    status_code=409, detail=f"adoption_invalid: item {item.item_key}: adopted task not found"
+                )
+        else:
+            released_task_keys = set((await db.scalars(select(OrchestrationRoadmapItem.item_key).where(
+                OrchestrationRoadmapItem.goal_id == goal.id,
+                OrchestrationRoadmapItem.unit_type == "task",
+            ))).all())
+            discretionary_divisor = max(1, sum(
+                candidate.unit_type == "task" and candidate.item_key not in released_task_keys
+                for candidate in parse_roadmap_items(version.snapshot["items"], set(parent_caps(goal)))
+            ))
+            delegation_request = await self.orchestration._plan_item_delegation_request(
+                db, run.id, goal.project_id, artifact, task_item, orchestrator_context=context,
+                discretionary_divisor=discretionary_divisor,
+            )
+            delegation = await self.orchestration.execute_create_delegation_task_action(
+                db, run.id,
+                delegation_request,
+                f"run:{run.id}:kind:create_delegation_task:roadmap_item:{item.item_key}",
+            )
+            task = await db.get(Task, delegation.target_id)
         metadata = self.orchestration._json_object_or_empty(task.metadata_)
         orchestration = self.orchestration._json_object_or_empty(metadata.get("orchestration"))
         task.metadata_ = {**metadata, "orchestration": {
             **orchestration, "roadmap_version_id": str(version.id), "roadmap_item_key": item.item_key,
         }}
+        if item.adopt_task_id is not None:
+            await self.orchestration._bind_adopted_task(db, run, task, artifact, task_item, release, gate)
+        else:
+            self.orchestration._attach_plan_item_metadata(task, artifact, task_item, release, gate)
         lineage = OrchestrationRoadmapItem(
             id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:roadmap-item:{goal.id}:{item.item_key}"),
             goal_id=goal.id, first_version_id=version.id, item_key=item.item_key,
-            unit_type="task", item_snapshot=item.model_dump(mode="json"), task_id=delegation.target_id,
+            unit_type="task", item_snapshot=item.model_dump(mode="json"), task_id=task.id,
             child_goal_id=None, gate_id=gate.id,
         )
         db.add(lineage)
         await db.flush()
-        await self.orchestration._mark_action_completed(db, release, target_type="task", target_id=delegation.target_id)
+        await self.orchestration._mark_action_completed(db, release, target_type="task", target_id=task.id)
         return {"step": "release_item", "item_key": item.item_key, "unit_type": "task"}
 
     async def _parent_contract_snapshot(self, db, parent, version, item):

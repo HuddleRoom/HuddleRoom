@@ -878,3 +878,95 @@ async def test_roadmap_parent_contract_excludes_active_agents_outside_accepted_t
     )
 
     assert str(outsider.id) not in snapshot["team"]["agent_ids"]
+
+
+async def _delegated_audit(service, db, run, agent_id, work_function="implementation"):
+    action = await service.execute_create_delegation_task_action(
+        db, run.id,
+        {"action_type": "create_delegation_task", "agent_id": str(agent_id), "work_function": work_function,
+         "scope": "Audit the current state.", "deliverable": "Audit findings."},
+        f"run:{run.id}:kind:create_delegation_task:pre-plan-audit",
+    )
+    return await db.get(Task, action.target_id)
+
+
+async def test_adopted_roadmap_task_item_binds_existing_task_without_new_work(db_session, accepted_roadmap):
+    adopted = roadmap_task("audit")
+    audits = []
+
+    async def setup(planner, goal, run):
+        audit = await _delegated_audit(OrchestrationService(), db_session, run, planner.id)
+        adopted["adopt_task_id"] = str(audit.id)
+        audits.append(audit)
+
+    service, goal, run, _ = await accepted_roadmap([adopted], setup=setup, assign_agents=False)
+    (audit,) = audits
+    task_count = await db_session.scalar(select(func.count()).select_from(Task))
+
+    result = await service.tick(db_session, run.id)
+
+    assert result["authorized_execution"] == {"step": "release_item", "item_key": "audit", "unit_type": "task"}
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id))
+    assert row.task_id == audit.id and row.unit_type == "task"
+    assert await db_session.scalar(select(func.count()).select_from(Task)) == task_count
+    await db_session.refresh(audit)
+    orchestration = audit.metadata_["orchestration"]
+    assert orchestration["plan_item_gate_id"] == str(row.gate_id)
+    assert orchestration["roadmap_item_key"] == "audit"
+    assert orchestration["roadmap_version_id"] == run.plan_state["roadmap_version_id"]
+    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:adopt_task:task:{audit.id}")
+    assert marker.status == "completed" and marker.request["plan_item_id"] == "audit"
+    assert marker.request["accepted_plan_fingerprint"] == run.plan_state["accepted_plan_fingerprint"]
+    assert await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:create_delegation_task:roadmap_item:audit"
+    ) is None
+
+    await service.tick(db_session, run.id)  # replay binds nothing new
+    assert await db_session.scalar(select(func.count()).select_from(Task)) == task_count
+    assert len((await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "adopt_task",
+    ))).all()) == 1
+
+
+@pytest.mark.parametrize("kind", ["goal_item", "shared_state_task"])
+async def test_roadmap_acceptance_rejects_adoption_by_goal_or_shared_state_item(db_session, test_project, kind):
+    planner = _agent("adoption-planner", ["planning", "implementation"])
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _authorized_run(db_session, test_project)
+    goal.goal_type, goal.planning_mode = "roadmap", "roadmap"
+    audit = await _delegated_audit(service, db_session, run, planner.id)
+    goal.budget = {"caps": {"max_tokens": 1000, "max_turns": 10, "max_hours": 10}}
+    request = await service.execute_request_plan_action(
+        db_session, run.id,
+        {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Plan."},
+        f"run:{run.id}:kind:roadmap-request",
+    )
+    if kind == "goal_item":
+        item = {"item_key": "child", "unit_type": "goal", "title": "child", "objective": "child",
+                "success_criteria": [{"key": "local"}], "mutates_shared_state": False,
+                "allocation": {"max_tokens": 400, "max_turns": 1, "max_hours": 1}}
+    else:
+        item = roadmap_task("shared", mutates_shared_state=True)
+    artifact = Artifact(
+        project_id=test_project.id, name="roadmap-plan", artifact_type="plan", status="draft",
+        linked_task_id=request.target_id, created_by_agent=planner.id,
+        metadata_={"plan_items": [{**item, "adopt_task_id": str(audit.id)}]},
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.execute_accept_plan_action(
+            db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+            f"run:{run.id}:kind:roadmap-accept",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == (
+        f"adoption_invalid: item {item['item_key']}: "
+        "only Roadmap task items with mutates_shared_state false can adopt work"
+    )
+    assert run.plan_state["status"] == "revision_required"
+    assert await OrchestrationRoadmapService(service).current_version(db_session, goal.id) is None
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
