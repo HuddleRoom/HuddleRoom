@@ -3,6 +3,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy.orm.attributes import set_committed_value
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -194,7 +195,7 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
     assert task is not None
     assert task.assigned_to == planner.id
     assert task.status == "backlog"
-    assert task.title == "Planning: Agent-produced implementation plan."
+    assert task.title == "Planning: Implementation plan: a leaf technical plan for this outcome."
     assert task.description is not None
     assert goal.objective in task.description
     assert "Scope: Create a phase implementation plan with independently verifiable tasks." in task.description
@@ -210,8 +211,11 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
         f"Goal objective: {goal.objective}",
         f"Success criteria: {json.dumps(goal.success_criteria, sort_keys=True)}",
         f"Constraints: {json.dumps(goal.constraints, sort_keys=True)}",
+        "Optional specialist inputs (only when a named risk or missing decision benefits; inputs to this "
+        "plan, never co-authors): product strategist — sequencing; tester — qualification and evidence; "
+        "UI/UX designer — interaction and accessibility.",
     ]
-    assert contract["deliverable"] == "Agent-produced implementation plan."
+    assert contract["deliverable"] == "Implementation plan: a leaf technical plan for this outcome."
     assert contract["forbidden_work"] == [
         "Do not implement the plan.",
         "Do not edit project artifacts.",
@@ -220,6 +224,7 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
     assert contract["success_evidence"] == [
         "A plan artifact linked to this planning task.",
         "Plan items are independently actionable and verifiable.",
+        "You are the sole plan author: one plan that synthesizes any specialist inputs.",
     ]
     # The terminal test analyzer leaves goal fields untouched; the planning
     # contract copies that original budget.
@@ -2434,3 +2439,24 @@ async def test_request_plan_without_team_binds_requested_agent(db_session, test_
         db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key="run:t5:noteam",
     )
     assert (await db_session.get(Task, action.target_id)).assigned_to == planner.id
+
+
+@pytest.mark.asyncio
+async def test_request_plan_rejected_for_continuous_policy_goal(db_session, test_project):
+    planner = _agent("planner")
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
+    # the snapshot validator forbids reassignment; mark this run as a continuous one
+    set_committed_value(run, "planning_mode_snapshot", "continuous_policy")
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.execute_request_plan_action(
+            db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key="run:t5c:continuous",
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail.startswith("plan_not_applicable:")
+    assert await db_session.scalar(select(count(OrchestrationAction.id)).where(OrchestrationAction.run_id == run.id)) == 0
+    assert await db_session.scalar(select(count(Task.id)).where(Task.project_id == test_project.id)) == 0

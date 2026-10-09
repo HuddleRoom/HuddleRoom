@@ -461,10 +461,11 @@ def test_planning_contract_excludes_expansion_policy():
 
     goal = SimpleNamespace(
         id=uuid.uuid4(), objective="Ship", success_criteria=[], constraints={}, budget={}, goal_type="outcome",
+        planning_mode="implementation",
         orchestrator_context={"expansion_policy": {"depth": 0}, "team": {"agent_ids": ["x"]}},
     )
     request = {"agent_id": str(uuid.uuid4()), "scope": "plan it"}
     contract = OrchestrationService()._planning_contract(
-        goal, SimpleNamespace(id=uuid.uuid4()), SimpleNamespace(id=uuid.uuid4()), request,
+        goal, SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=None), SimpleNamespace(id=uuid.uuid4()), request,
     )
     assert contract.orchestrator_context == {"team": {"agent_ids": ["x"]}}

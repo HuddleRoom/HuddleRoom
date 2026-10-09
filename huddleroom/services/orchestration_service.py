@@ -5289,6 +5289,13 @@ class OrchestrationService:
     ) -> OrchestrationDelegationContract:
         from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 
+        deliverable = {
+            "roadmap": "Roadmap plan: a finite graph of distinct outcomes, defined progressively.",
+            "delivery": "Delivery plan: one bounded plan coordinating every work function this outcome needs.",
+        }.get(
+            run.planning_mode_snapshot or goal.planning_mode,
+            "Implementation plan: a leaf technical plan for this outcome.",
+        )
         return OrchestrationDelegationContract(
             goal_id=goal.id,
             run_id=run.id,
@@ -5300,8 +5307,11 @@ class OrchestrationService:
                 f"Goal objective: {goal_objective_with_clarifications(goal)}",
                 f"Success criteria: {json.dumps(goal.success_criteria, sort_keys=True)}",
                 f"Constraints: {json.dumps(goal.constraints, sort_keys=True)}",
+                "Optional specialist inputs (only when a named risk or missing decision benefits; inputs to this "
+                "plan, never co-authors): product strategist — sequencing; tester — qualification and evidence; "
+                "UI/UX designer — interaction and accessibility.",
             ],
-            deliverable="Agent-produced implementation plan.",
+            deliverable=deliverable,
             forbidden_work=[
                 "Do not implement the plan.",
                 "Do not edit project artifacts.",
@@ -5310,6 +5320,7 @@ class OrchestrationService:
             success_evidence=[
                 "A plan artifact linked to this planning task.",
                 "Plan items are independently actionable and verifiable.",
+                "You are the sole plan author: one plan that synthesizes any specialist inputs.",
             ],
             budget=self._json_object_or_empty(goal.budget),
             report_schema=(
