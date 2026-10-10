@@ -15,7 +15,7 @@ from huddleroom.models.orchestration import (
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 
-from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService, run_lineage
 
 
 def _goal(caps):
@@ -439,3 +439,127 @@ async def test_settle_action_budget_after_pause_uses_goal_lock_but_control_gates
 def test_snapshot_rejects_nonfinite_or_negative_caps(caps):
     with pytest.raises(HTTPException, match="Invalid amount"):
         OrchestrationBudgetService().snapshot(_goal(caps))
+
+
+async def _spend(db_session, test_project, test_agent, run, tokens):
+    """One completed, measured session charged to `run` through its delegation-task lineage."""
+    task = Task(project_id=test_project.id, title="spent", status="done")
+    db_session.add(task)
+    await db_session.flush()
+    db_session.add_all([
+        OrchestrationAction(
+            run_id=run.id, idempotency_key=f"spend-{task.id}", action_type="create_delegation_task", request={},
+            status="completed", target_type="task", target_id=task.id,
+        ),
+        Session(
+            task_id=task.id, agent_id=test_agent.id, project_id=test_project.id, adapter_type="test",
+            status="completed", metadata_={"token_count_in": tokens, "token_count_out": 0},
+        ),
+    ])
+    await db_session.flush()
+
+
+async def _corrected_pair(db_session, test_project, *, goal_type="outcome", cap=100):
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="budget", original_request="budget", goal_type=goal_type,
+        budget={"caps": {"max_tokens": cap}},
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    old = OrchestrationRun(goal_id=goal.id, status="cancelled", phase="authorized", terminal_reason="reclassified")
+    db_session.add(old)
+    await db_session.flush()
+    new = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized", supersedes_run_id=old.id)
+    db_session.add(new)
+    await db_session.flush()
+    return goal, old, new
+
+
+@pytest.mark.asyncio
+async def test_run_lineage_follows_supersedes_only_and_ignores_continuous_cycles(db_session, test_project):
+    goal, old, new = await _corrected_pair(db_session, test_project)
+    cycle = OrchestrationRun(goal_id=goal.id, status="completed", phase="completed", cycle_key="c1")
+    db_session.add(cycle)
+    await db_session.flush()
+
+    assert [run.id for run in await run_lineage(db_session, new)] == [new.id, old.id]
+    assert [run.id for run in await run_lineage(db_session, old)] == [old.id]
+    assert [run.id for run in await run_lineage(db_session, cycle)] == [cycle.id]
+
+
+@pytest.mark.asyncio
+async def test_successor_remaining_is_caps_minus_predecessor_spend_and_reservations_counted_once(
+    db_session, test_project, test_agent,
+):
+    goal, old, new = await _corrected_pair(db_session, test_project, goal_type="roadmap")
+    await _spend(db_session, test_project, test_agent, old, 30)
+    await _spend(db_session, test_project, test_agent, new, 5)
+    other = OrchestrationGoal(
+        project_id=test_project.id, objective="other", original_request="other", budget={"caps": {"max_tokens": 10}},
+    )
+    db_session.add(other)
+    await db_session.flush()
+    db_session.add(OrchestrationBudgetReservation(
+        parent_goal_id=goal.id, child_goal_id=other.id, continuous_origin_key="origin",
+        allocation={"max_tokens": "10"},
+    ))
+    await db_session.flush()
+    service = OrchestrationBudgetService()
+
+    summary = await service.remaining(db_session, goal)
+    assert summary["direct_spend"] == {"max_tokens": "35"}
+    assert summary["remaining"] == {"max_tokens": "55"}
+    snapshot = await service.snapshot_for_run(db_session, goal, new)
+    assert snapshot["caps"] == {"max_tokens": "100"}
+    assert snapshot["consumed"] == {"max_tokens": "35"}
+    assert snapshot["reserved"] == {"max_tokens": "10"}
+    assert snapshot["remaining"] == summary["remaining"]
+    assert (await service.run_remaining(db_session, new, {"max_tokens": "100"})) == {"max_tokens": "65"}
+    # The predecessor's own view never sees successor spend.
+    assert (await service.run_remaining(db_session, old, {"max_tokens": "100"})) == {"max_tokens": "70"}
+
+
+@pytest.mark.asyncio
+async def test_settle_child_counts_spend_over_the_child_run_lineage(db_session, test_project, test_agent):
+    parent = OrchestrationGoal(
+        project_id=test_project.id, objective="parent", original_request="parent", goal_type="roadmap",
+        budget={"caps": {"max_tokens": 100}},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    child, old, new = await _corrected_pair(db_session, test_project)
+    await _spend(db_session, test_project, test_agent, old, 20)
+    await _spend(db_session, test_project, test_agent, new, 10)
+    reservation = OrchestrationBudgetReservation(
+        parent_goal_id=parent.id, child_goal_id=child.id, continuous_origin_key="origin",
+        allocation={"max_tokens": "50"},
+    )
+    db_session.add(reservation)
+    await db_session.flush()
+
+    await OrchestrationBudgetService().settle_child(db_session, reservation, new, reason="completed")
+
+    assert reservation.settled_spend == {"max_tokens": "30"}
+    assert (await OrchestrationBudgetService().remaining(db_session, parent))["remaining"] == {"max_tokens": "70"}
+
+
+@pytest.mark.asyncio
+async def test_continuous_cycle_spend_is_unaffected_by_lineage_walk(db_session, test_project, test_agent):
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="cont", original_request="cont", goal_type="continuous",
+        budget={"caps": {"max_tokens": 100}},
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    cycle1 = OrchestrationRun(goal_id=goal.id, status="completed", phase="completed", cycle_key="c1")
+    db_session.add(cycle1)
+    await db_session.flush()
+    cycle2 = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized", cycle_key="c2")
+    db_session.add(cycle2)
+    await db_session.flush()
+    await _spend(db_session, test_project, test_agent, cycle1, 40)
+    await _spend(db_session, test_project, test_agent, cycle2, 5)
+
+    assert [run.id for run in await run_lineage(db_session, cycle2)] == [cycle2.id]
+    # Legacy behavior: only the latest run's own spend is direct spend.
+    assert (await OrchestrationBudgetService().remaining(db_session, goal))["direct_spend"] == {"max_tokens": "5"}

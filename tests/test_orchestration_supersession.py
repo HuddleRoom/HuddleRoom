@@ -6,7 +6,9 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from huddleroom.dependencies import _ANON_USER
-from huddleroom.models.orchestration import EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE, OrchestrationAction, OrchestrationGoal
+from huddleroom.models.orchestration import (
+    EXPLICIT_PLANNING_MODE_BY_GOAL_TYPE, OrchestrationAction, OrchestrationGoal, OrchestrationRun,
+)
 from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -380,3 +382,35 @@ async def test_start_superseded_roadmap_goal_authorizes_run(db_session, test_pro
 
     assert started_goal.goal_type == "roadmap"
     assert started_run.id == run.id and started_run.phase == "authorized"
+
+
+async def test_supersede_refuses_goal_with_type_correction_lineage(db_session, test_project):
+    goal, run = await _goal(db_session, test_project)
+    run.status, run.terminal_reason = "cancelled", "reclassified"
+    await db_session.flush()
+    successor = OrchestrationRun(goal_id=goal.id, supersedes_run_id=run.id)
+    db_session.add(successor)
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc:
+        await OrchestrationSupersessionService().supersede(
+            db_session, test_project.id, goal.id, new_goal_type="outcome", actor="human:test"
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == {
+        "conflict": "supersession_not_ready", "message": "goal has type-correction lineage",
+    }
+    assert goal.status == "active"
+    assert await db_session.scalar(select(OrchestrationGoal.id).where(
+        OrchestrationGoal.supersedes_goal_id == goal.id)) is None
+
+
+async def test_supersede_legacy_scope_without_lineage_still_passes(db_session, test_project):
+    goal, _ = await _goal(db_session, test_project)
+
+    replacement = await OrchestrationSupersessionService().supersede(
+        db_session, test_project.id, goal.id, new_goal_type="outcome", actor="human:test"
+    )
+
+    assert replacement.supersedes_goal_id == goal.id

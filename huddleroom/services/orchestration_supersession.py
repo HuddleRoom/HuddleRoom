@@ -123,6 +123,8 @@ class OrchestrationSupersessionService:
     ) -> None:
         if goal.status != "active" or run is None or run.status != "running" or run.phase not in ("baseline", "ready"):
             raise self._not_ready("goal must be active in baseline or ready phase")
+        if await self._orch.has_type_correction_lineage(db, goal.id):
+            raise self._not_ready("goal has type-correction lineage")
         if await self._orch._orchestrated_tasks_for_run(
             db, run.id, statuses=["backlog", "ready", "in_progress", "blocked"]
         ):

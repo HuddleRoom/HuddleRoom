@@ -67,6 +67,21 @@ def validate_declared_allocations(goal, items) -> None:
             raise HTTPException(status_code=409, detail=f"Roadmap allocations exceed parent cap '{key}'")
 
 
+async def run_lineage(db, run: OrchestrationRun) -> list[OrchestrationRun]:
+    """The run followed by the runs it supersedes, newest first.
+
+    Only type-correction successors are linked by supersedes_run_id; Continuous cycles are not.
+    """
+    lineage = [run]
+    # ponytail: 64 is a loop guard against corrupt data, not a real depth limit
+    while len(lineage) < 64 and getattr(lineage[-1], "supersedes_run_id", None) is not None:
+        predecessor = await db.get(OrchestrationRun, lineage[-1].supersedes_run_id)
+        if predecessor is None:
+            break
+        lineage.append(predecessor)
+    return lineage
+
+
 class BudgetMeasurementError(Exception):
     def __init__(self, dimension: str, session_id):
         self.dimension = dimension
@@ -310,6 +325,11 @@ class OrchestrationBudgetService:
                 ledger_task_ids=ledger_task_ids,
             )
         ).items()}
+        for key, value in (await self.predecessor_spend(
+            db, run, dimensions,
+            discovery_run_ids={row.discovery_run_id for row in reservations} if parent_run else set(),
+        )).items():
+            consumed[key] += Decimal(value)
         committed = {key: Decimal(value) for key, value in (
             await self.active_run_commitments(
                 db, run, dimensions, caps, excluded_task_ids=excluded_task_ids, excluded_action_ids=ledger_action_ids,
@@ -747,6 +767,22 @@ class OrchestrationBudgetService:
             ), dimensions,
         )
 
+    async def predecessor_spend(
+        self, db, run: OrchestrationRun | None, dimensions: set[str], *, discovery_run_ids: set[uuid.UUID] | None = None,
+    ) -> dict[str, str]:
+        """Measured spend of the runs `run` supersedes; discovery tasks settled by reservations are skipped.
+
+        `discovery_run_ids` limits that skip to runs owning a discovery reservation (None skips every run's).
+        """
+        totals = []
+        for predecessor in (await run_lineage(db, run))[1:] if run is not None else []:
+            skip = discovery_run_ids is None or predecessor.id in discovery_run_ids
+            totals.append(await self.measured_run_spend(
+                db, predecessor, dimensions,
+                excluded_task_ids=self._discovery_task_ids(predecessor) if skip else None,
+            ))
+        return self._sum(totals, dimensions)
+
     async def known_run_spend(self, db, run: OrchestrationRun | None, dimensions: set[str]) -> tuple[dict[str, str], bool]:
         """Return valid terminal spend without letting one bad row hide another."""
         if run is None:
@@ -822,6 +858,7 @@ class OrchestrationBudgetService:
     async def run_remaining(self, db, run: OrchestrationRun, caps: dict[str, str]) -> dict[str, str]:
         dimensions = set(caps)
         direct = await self.measured_run_spend(db, run, dimensions)
+        direct = self._sum([direct, await self.predecessor_spend(db, run, dimensions)], dimensions)
         active = await self.active_run_commitments(db, run, dimensions, caps)
         return {
             key: format(Decimal(caps[key]) - Decimal(direct[key]) - Decimal(active[key]), "f")
@@ -835,6 +872,7 @@ class OrchestrationBudgetService:
         ).order_by(OrchestrationRun.started_at.desc()).limit(1))
         excluded = self._discovery_task_ids(parent_run) if parent_run is not None else set()
         direct = await self.measured_run_spend(db, parent_run, set(caps), excluded_task_ids=excluded)
+        direct = self._sum([direct, await self.predecessor_spend(db, parent_run, set(caps))], set(caps))
         commitments = await self.active_run_commitments(
             db, parent_run, set(caps), caps, excluded_task_ids=excluded,
         )
@@ -1022,13 +1060,23 @@ class OrchestrationBudgetService:
         for grandchild in grandchildren:
             if grandchild.status == "settled":
                 measurement_complete = measurement_complete and grandchild.measurement_complete
+        # A type-corrected child's spend spans its whole supersedes_run_id lineage.
+        predecessors = (await run_lineage(db, child_run))[1:] if child_run is not None else []
         for dimension, allocation in reservation.allocation.items():
             if reason == "cancelled":
                 spend, complete = await self.known_run_spend(db, child_run, {dimension})
                 actual[dimension] = spend[dimension]
                 measurement_complete = measurement_complete and complete
+                for predecessor in predecessors:
+                    spend, complete = await self.known_run_spend(db, predecessor, {dimension})
+                    actual[dimension] = format(Decimal(actual[dimension]) + Decimal(spend[dimension]), "f")
+                    measurement_complete = measurement_complete and complete
             else:
                 actual[dimension] = (await self.measured_run_spend(db, child_run, {dimension}))[dimension]
+                for predecessor in predecessors:
+                    actual[dimension] = format(
+                        Decimal(actual[dimension])
+                        + Decimal((await self.measured_run_spend(db, predecessor, {dimension}))[dimension]), "f")
             below = sum((Decimal(str(
                 (g.settled_spend if g.status == "settled" else g.allocation).get(dimension, 0)
             )) for g in grandchildren), Decimal(0))

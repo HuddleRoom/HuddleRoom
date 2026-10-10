@@ -7454,6 +7454,14 @@ class OrchestrationService:
             run.completed_at = _utcnow()
         await db.flush()
 
+    @staticmethod
+    async def has_type_correction_lineage(db: AsyncSession, goal_id: uuid.UUID) -> bool:
+        """True once any run of the goal is a type-correction successor or was retired by one."""
+        return await db.scalar(select(OrchestrationRun.id).where(
+            OrchestrationRun.goal_id == goal_id,
+            or_(OrchestrationRun.supersedes_run_id.is_not(None), OrchestrationRun.terminal_reason.is_not(None)),
+        ).limit(1)) is not None
+
     async def reset_goal(
         self,
         db: AsyncSession,
@@ -7512,7 +7520,8 @@ class OrchestrationService:
                     OrchestrationBudgetReservation.continuous_origin_key.is_not(None),
                 ).limit(1)) is not None
             )
-            if child_lineage or owned_roadmap_lineage or owned_continuous_lineage:
+            if (child_lineage or owned_roadmap_lineage or owned_continuous_lineage
+                    or await self.has_type_correction_lineage(db, goal.id)):
                 raise HTTPException(status_code=409, detail="Cannot reset goal with immutable execution lineage")
 
             # Bulk-delete goal-keyed tables (goal-keyed deletes first, then the run)

@@ -169,3 +169,32 @@ async def test_reset_goal_unknown_goal_404(client, test_project):
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{uuid.uuid4()}/reset"
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lineage", ["supersedes_run_id", "terminal_reason"])
+async def test_reset_goal_refuses_type_correction_lineage(db_session, test_project, lineage):
+    from fastapi import HTTPException
+
+    from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    service = OrchestrationService()
+    goal, run = await service.create_goal(
+        db_session, test_project.id,
+        OrchestrationGoalCreate(objective="Corrected.", success_criteria=[{"key": "k", "description": "d"}]),
+        created_by_user_id=None,
+    )
+    run.status = "cancelled"
+    if lineage == "terminal_reason":
+        run.terminal_reason = "reclassified"
+    await db_session.flush()
+    if lineage == "supersedes_run_id":
+        db_session.add(OrchestrationRun(goal_id=goal.id, supersedes_run_id=run.id))
+        await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc:
+        await service.reset_goal(db_session, test_project.id, goal.id)
+
+    assert exc.value.status_code == 409
+    assert await _count(db_session, OrchestrationRun, goal_id=goal.id) >= 1
