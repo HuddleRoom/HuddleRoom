@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 from sqlalchemy import select
 
@@ -291,3 +293,151 @@ async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_pro
     await sweep()
     assert await row_ids() == settled
     await assert_one_lineage_per_key()
+
+
+# --- Task 14g: goal-type correction successors and Continuous rollover (R14-7: no scheduler change) ---
+
+@pytest.mark.asyncio
+async def test_sweep_ticks_correction_successor_never_the_reclassified_run(db_session, test_project, monkeypatch):
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_goal_shape import _goal_run
+    from tests.test_orchestration_goal_type_correction import _apply, _request
+
+    goal, old = await _goal_run(db_session, test_project, goal_type="outcome")
+    request, _ = await _request(db_session, goal, old)
+    _, successor = await _apply(db_session, goal, request)
+    assert (old.status, old.terminal_reason) == ("cancelled", "reclassified")
+    ticked: list = []
+
+    async def record_tick(_self, _db, run_id):
+        ticked.append(run_id)
+        return {"run_id": run_id, "status": "running"}
+
+    monkeypatch.setattr(OrchestrationService, "tick", record_tick)
+    for _ in range(2):
+        ticked.clear()
+        assert await reconcile_orchestration_runs_async(db_session) == 1
+        assert ticked == [successor.id]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_type_corrections_on_committed_sessions_create_one_successor(
+    db_session, test_project, test_engine,
+):
+    import asyncio
+
+    from fastapi import HTTPException
+    from sqlalchemy import func
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from huddleroom.services.orchestration_goal_shape import OrchestrationGoalShapeService
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_goal_shape import _goal_run
+    from tests.test_orchestration_goal_type_correction import _request
+
+    # clean_test_database (autouse) wipes the committed rows after the test.
+    goal, old = await _goal_run(db_session, test_project, goal_type="outcome")
+    request, _ = await _request(db_session, goal, old)
+    project_id, goal_id, old_id = test_project.id, goal.id, old.id
+    await db_session.commit()
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    service = OrchestrationService()
+
+    async def apply():
+        # Same lock/commit/rollback shape as the apply_goal_type_correction router.
+        async with factory() as db, service._lock_goal_for_baseline_transition(db, goal_id):
+            try:
+                live = await service.get_goal(db, project_id, goal_id)
+                _, successor = await OrchestrationGoalShapeService().apply_correction(db, live, request, "human:u1")
+                result = successor.id
+                await db.commit()
+                return result
+            except Exception:
+                await db.rollback()
+                raise
+
+    results = await asyncio.wait_for(asyncio.gather(apply(), apply(), return_exceptions=True), timeout=30)
+
+    successes = [r for r in results if not isinstance(r, BaseException)]
+    losers = [r for r in results if isinstance(r, BaseException)]
+    assert successes and len(set(successes)) == 1
+    for loser in losers:  # the loser either replays the same successor (above) or is stale
+        assert isinstance(loser, HTTPException) and loser.status_code == 409
+        assert loser.detail["conflict"] == "stale_run"
+    async with factory() as reader:
+        successor_ids = list(await reader.scalars(select(OrchestrationRun.id).where(
+            OrchestrationRun.supersedes_run_id == old_id)))
+        assert successor_ids == [successes[0]]
+        assert await reader.scalar(select(func.count()).select_from(OrchestrationRun).where(
+            OrchestrationRun.goal_id == goal_id)) == 2
+        assert (await reader.get(OrchestrationRun, old_id)).terminal_reason == "reclassified"
+
+
+@pytest.mark.asyncio
+async def test_continuous_rollover_reconciles_cycle_one_artifacts_in_cycle_two(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    from datetime import datetime
+
+    from fastapi import HTTPException
+    from sqlalchemy import func
+
+    from huddleroom.models.orchestration import OrchestrationBudgetReservation, OrchestrationContinuousCandidate
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService, run_lineage
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_continuous_service import dispatched_discovery_source
+
+    goal, cycle1, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch)
+    task.status = "done"
+    session.status = "completed"
+    session.output = (
+        '{"schema_version":1,"candidates":['
+        '{"origin_key":"source:1","objective":"First","source_refs":["record:1"]},'
+        '{"origin_key":"source:2","objective":"Second","source_refs":["record:2"]}]}'
+    )
+    session.metadata_ = {**session.metadata_, "token_count_in": 7, "token_count_out": 0,
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0}
+    real_reserve = OrchestrationBudgetService.reserve_continuous_child
+    calls = []
+
+    async def first_reserves_second_waits(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:
+            raise HTTPException(status_code=409, detail="continuous_budget_wait")
+        return await real_reserve(self, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationBudgetService, "reserve_continuous_child", first_reserves_second_waits)
+    assert (await continuous.advance(db_session, goal, cycle1))["outcome"] == "children_created"
+    monkeypatch.setattr(OrchestrationBudgetService, "reserve_continuous_child", real_reserve)
+
+    # Cycle 1 leaves a child goal, a pending intake candidate and a settled discovery reservation behind.
+    child1 = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == goal.id))
+    child1_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child1.id))
+    assert len(goal.continuous_state["pending_candidates"]) == 1
+    discovery = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.discovery_run_id == cycle1.id))
+    child1_reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.child_goal_id == child1.id))
+    assert (discovery.status, child1_reservation.status) == ("settled", "active")
+    assert discovery.settled_spend["max_tokens"] == "7"
+    child1.status = "completed"
+    child1_run.status = child1_run.phase = "completed"
+
+    cycle2 = await OrchestrationService().get_active_run_for_goal(db_session, test_project.id, goal.id)
+    assert cycle2.id != cycle1.id
+    due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
+    assert await continuous.claim_due_cycle(db_session, goal.id, due) is cycle2
+
+    # Cycle 2 settled the finished cycle-1 child and drained the cycle-1 backlog.
+    assert goal.continuous_state["pending_candidates"] == []
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationContinuousCandidate).where(
+        OrchestrationContinuousCandidate.parent_goal_id == goal.id,
+        OrchestrationContinuousCandidate.child_goal_id.is_not(None))) == 2
+    await db_session.refresh(child1_reservation)
+    assert child1_reservation.status == "settled"
+    # Cycle-1 spend still counts toward the parent; cycle 2 has no lineage predecessor.
+    remaining = await OrchestrationBudgetService().remaining(db_session, goal)
+    assert remaining["direct_spend"]["max_tokens"] == "0"
+    assert Decimal(remaining["settled_child_spend"]["max_tokens"]) >= 7
+    assert [run.id for run in await run_lineage(db_session, cycle2)] == [cycle2.id]
