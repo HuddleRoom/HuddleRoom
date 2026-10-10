@@ -5633,7 +5633,10 @@ class OrchestrationService:
             # gained candidates, weight tier changed) have no equivalent
             # readiness check here and rely solely on the stale-inputs
             # suggestion to prompt a human rerun.
-            if manager_selection_current is not None:
+            _phase_run = await self.get_active_run_for_goal(db, goal.project_id, goal.id)
+            if manager_selection_current is not None and (
+                _phase_run is None or _phase_run.phase in ("baseline", "ready")
+            ):
                 stale_reason = await ManagerSelectionProcess()._stale_manager_reason(
                     db, goal, manager_selection_current
                 )
@@ -5646,7 +5649,9 @@ class OrchestrationService:
             )
             if agent_review_current is not None and agent_review_current.status == "completed":
                 active_run = await self.get_active_run_for_goal(db, goal.project_id, goal.id)
-                if active_run is not None:
+                # Past Start, reruns are user-initiated only: stale review/hierarchy
+                # no longer blocks delegation (suggestion still surfaces).
+                if active_run is not None and active_run.phase in ("baseline", "ready"):
                     coverage_fingerprint = (
                         await AgentDefinitionReviewProcess().current_coverage_fingerprint(
                             db,
@@ -5676,7 +5681,9 @@ class OrchestrationService:
                 active_run = await self.get_active_run_for_goal(
                     db, goal.project_id, goal.id
                 )
-                if active_run is not None:
+                # Past Start, reruns are user-initiated only: stale review/hierarchy
+                # no longer blocks delegation (suggestion still surfaces).
+                if active_run is not None and active_run.phase in ("baseline", "ready"):
                     current_fingerprint = await TeamHierarchyProcess().current_fingerprint(
                         db, goal, active_run
                     )

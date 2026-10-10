@@ -1944,6 +1944,29 @@ async def test_weight_promotion_trivial_to_standard_suggests_rerun(
 
 
 @pytest.mark.asyncio
+async def test_post_baseline_weight_change_never_auto_reruns(
+    db_session, trivial_goal, orch_run, test_user
+):
+    """Post-baseline, a stale completed selection does not restart or clear
+    manager columns on tick; only a manual advance reruns."""
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    assert (await _advance(db_session, trivial_goal, orch_run))["status"] == "completed"
+    orch_run.phase = "authorized"
+    trivial_goal.weight = "standard"
+    await db_session.flush()
+
+    summary = await _advance(db_session, trivial_goal, orch_run)
+    assert summary["status"] == "completed"
+    await db_session.refresh(trivial_goal)
+    assert trivial_goal.authority_model == "human_manager"
+    runs = await OrchestrationProcessService().list_process_runs(
+        db_session, trivial_goal.id, process_type="manager_selection"
+    )
+    assert len(runs) == 1
+
+
+@pytest.mark.asyncio
 async def test_weight_demotion_standard_to_trivial_suggests_rerun(
     db_session, standard_goal, standard_run, test_user
 ):

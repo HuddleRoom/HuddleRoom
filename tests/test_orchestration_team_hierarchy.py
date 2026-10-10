@@ -1891,6 +1891,28 @@ async def test_orchestrated_process_version_bump_does_not_absorb_real_drift(
 
 
 @pytest.mark.asyncio
+async def test_post_baseline_stale_hierarchy_never_auto_reruns(
+    db_session, test_project, test_user
+):
+    """Post-baseline, a stale completed hierarchy does not start a new
+    process row on tick (user-initiated reruns only)."""
+    goal, run, agents, process, current = await _completed_orchestrated_hierarchy(
+        db_session, test_project, test_user
+    )
+    first_id = current.id
+    run.phase = "authorized"
+    agents["planning"].system_prompt = "Updated planning instructions."
+    await db_session.flush()
+
+    result = await process.advance(db_session, goal, run)
+
+    assert result["status"] == "completed"
+    refreshed = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    assert refreshed.id == first_id
+    assert refreshed.superseded_by_id is None
+
+
+@pytest.mark.asyncio
 async def test_hierarchy_skip_is_terminal_until_force_start_begins_new_orchestration(
     db_session, test_project, test_user
 ):

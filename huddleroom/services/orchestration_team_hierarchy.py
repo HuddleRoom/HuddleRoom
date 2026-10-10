@@ -142,7 +142,7 @@ class TeamHierarchyProcess:
             return self._summary("not_started")
 
         if goal.weight != "trivial":
-            return await self._advance_orchestrated(db, goal, run, current)
+            return await self._advance_orchestrated(db, goal, run, current, manual=manual)
 
         proposal = await self.build_proposal(db, goal, run)
         fingerprint = self._fingerprint(goal, proposal)
@@ -178,20 +178,22 @@ class TeamHierarchyProcess:
         ):
             # Stale inputs while a decision is pending: park stays parked,
             # one-time suggestion instead of cancel+restart (item 3).
-            await self.warning_service.suggest_stale_inputs(
-                db,
-                goal.id,
-                process_type=PROCESS_TYPE,
-                process_run_id=current.id,
-                step_label="team hierarchy",
-                run_id=run.id,
-            )
+            if run.phase in ("baseline", "ready"):
+                await self.warning_service.suggest_stale_inputs(
+                    db,
+                    goal.id,
+                    process_type=PROCESS_TYPE,
+                    process_run_id=current.id,
+                    step_label="team hierarchy",
+                    run_id=run.id,
+                )
             return self._summary("waiting_decision")
         if (
             current is not None
             and current.status == "running"
             and stored_fingerprint
             and stored_fingerprint != fingerprint
+            and (manual or run.phase == "baseline")
         ):
             await self._cancel_pending_for_run(db, goal.id, current.id)
             superseded = current
@@ -215,19 +217,30 @@ class TeamHierarchyProcess:
             if run.phase == "baseline":
                 # Baseline phase: stale inputs get a one-time suggestion, no
                 # auto-rerun.
-                await self.warning_service.suggest_stale_inputs(
-                    db,
-                    goal.id,
-                    process_type=PROCESS_TYPE,
-                    process_run_id=current.id,
-                    step_label="team hierarchy",
-                    run_id=run.id,
-                )
+                if run.phase in ("baseline", "ready"):
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type=PROCESS_TYPE,
+                        process_run_id=current.id,
+                        step_label="team hierarchy",
+                        run_id=run.id,
+                    )
                 return self._summary("completed")
-            # Post-baseline: execution-time task assignments are part of the
-            # fingerprint and must keep coverage in sync silently -- a human
-            # is no longer actively reviewing the baseline, so restore the
-            # original auto-rerun instead of leaving a stale suggestion.
+            # Post-baseline: reruns are user-initiated only (manual=True);
+            # the tick never restarts a completed step on stale inputs.
+            if not manual:
+                # Gate only applies until Start; later it stays silent.
+                if run.phase == "ready":
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type=PROCESS_TYPE,
+                        process_run_id=current.id,
+                        step_label="team hierarchy",
+                        run_id=run.id,
+                    )
+                return self._summary("completed")
             current = await self.process_service.start_process(
                 db,
                 goal.id,
@@ -382,6 +395,8 @@ class TeamHierarchyProcess:
         goal: OrchestrationGoal,
         run: OrchestrationRun,
         current: OrchestrationProcessRun | None,
+        *,
+        manual: bool = False,
     ) -> dict:
         payload = await self._analysis_input(db, goal)
         input_fingerprint = self._semantic_fingerprint(self._strip_volatile(payload))
@@ -408,8 +423,8 @@ class TeamHierarchyProcess:
             # else: genuine drift co-occurring with the version bump -- the
             # version is bumped now so it isn't rechecked every tick, but the
             # stored fingerprint is left stale so the normal stale-inputs
-            # path below fires (suggestion in baseline / auto-rerun
-            # post-baseline).
+            # path below fires (suggestion in baseline / no rerun
+            # post-baseline unless user-initiated).
             await db.flush()
         if (
             current is not None and current.status == "completed"
@@ -421,19 +436,30 @@ class TeamHierarchyProcess:
             if run.phase == "baseline":
                 # Baseline phase: stale inputs get a one-time suggestion, no
                 # auto-rerun.
-                await self.warning_service.suggest_stale_inputs(
-                    db,
-                    goal.id,
-                    process_type=PROCESS_TYPE,
-                    process_run_id=current.id,
-                    step_label="team hierarchy",
-                    run_id=run.id,
-                )
+                if run.phase in ("baseline", "ready"):
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type=PROCESS_TYPE,
+                        process_run_id=current.id,
+                        step_label="team hierarchy",
+                        run_id=run.id,
+                    )
                 return self._summary("completed")
-            # Post-baseline: execution-time task assignments are part of the
-            # fingerprint and must keep coverage in sync silently -- a human
-            # is no longer actively reviewing the baseline, so restore the
-            # original auto-rerun instead of leaving a stale suggestion.
+            # Post-baseline: reruns are user-initiated only (manual=True);
+            # the tick never restarts a completed step on stale inputs.
+            if not manual:
+                # Gate only applies until Start; later it stays silent.
+                if run.phase == "ready":
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type=PROCESS_TYPE,
+                        process_run_id=current.id,
+                        step_label="team hierarchy",
+                        run_id=run.id,
+                    )
+                return self._summary("completed")
             current = await self.process_service.start_process(
                 db, goal.id, process_type=PROCESS_TYPE,
                 trigger_reason="tick: orchestrate team hierarchy",
@@ -456,16 +482,21 @@ class TeamHierarchyProcess:
             # one-time suggestion instead of cancel+restart (item 3). The
             # sentinel marker (deliberate batch-continuation rerun, not
             # background drift) is excluded and falls through below.
-            await self.warning_service.suggest_stale_inputs(
-                db,
-                goal.id,
-                process_type=PROCESS_TYPE,
-                process_run_id=current.id,
-                step_label="team hierarchy",
-                run_id=run.id,
-            )
+            if run.phase in ("baseline", "ready"):
+                await self.warning_service.suggest_stale_inputs(
+                    db,
+                    goal.id,
+                    process_type=PROCESS_TYPE,
+                    process_run_id=current.id,
+                    step_label="team hierarchy",
+                    run_id=run.id,
+                )
             return self._summary("waiting_decision")
-        elif current.input_snapshot.get("fingerprint") != input_fingerprint:
+        elif current.input_snapshot.get("fingerprint") != input_fingerprint and (
+            manual
+            or run.phase == "baseline"
+            or current.input_snapshot.get("fingerprint") in INTERNAL_RERUN_SENTINELS
+        ):
             await self._cancel_pending_for_run(db, goal.id, current.id)
             current = await self.process_service.start_process(
                 db, goal.id, process_type=PROCESS_TYPE,

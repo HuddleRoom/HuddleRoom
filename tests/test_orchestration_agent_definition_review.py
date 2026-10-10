@@ -2051,6 +2051,30 @@ async def test_post_baseline_task_for_covered_function_resyncs_fingerprint_witho
 
 
 @pytest.mark.asyncio
+async def test_post_baseline_stale_coverage_never_auto_reruns(
+    db_session, review_goal, review_run
+):
+    """Post-baseline, material coverage drift does not start a new process
+    row on tick; only a user-initiated (manual) advance reruns."""
+    agent = await _persist_agent(db_session)
+    await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
+    await _advance(db_session, review_goal, review_run)
+    first = await _current_process(db_session, review_goal)
+    first_id = first.id
+
+    review_run.phase = "authorized"
+    unsafe = await _persist_agent(db_session, name="other-agent", config={"allow_global_scope": True})
+    await _assign(db_session, review_goal.project_id, review_run.id, unsafe, "implementation")
+    await db_session.flush()
+
+    result = await _advance(db_session, review_goal, review_run)
+    assert result["status"] == "completed"
+    assert (await _current_process(db_session, review_goal)).id == first_id
+    assert len((await db_session.execute(select(OrchestrationProcessRun))).scalars().all()) == 1
+    assert (await db_session.execute(select(OrchestrationWarning))).scalars().first() is None
+
+
+@pytest.mark.asyncio
 async def test_tick_backfills_legacy_completed_audit_missing_coverage_fingerprint(
     db_session, review_goal, review_run
 ):

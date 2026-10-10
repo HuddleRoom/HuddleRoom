@@ -235,11 +235,24 @@ class ManagerSelectionProcess:
                     "status": current.status,
                     "questions_created": 0,
                 }
-            # Post-baseline: execution-time task assignments are part of
-            # _fingerprint and must keep coverage in sync silently -- a
-            # human is no longer actively reviewing the baseline, so restore
-            # the original auto-rerun (spec 8.1) instead of leaving a stale
-            # suggestion.
+            # Post-baseline: reruns are user-initiated only. The tick never
+            # restarts a completed selection nor clears manager columns.
+            if not manual:
+                # Gate only applies until Start; later it stays silent.
+                if run.phase == "ready":
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type="manager_selection",
+                        process_run_id=current.id,
+                        step_label=f"manager selection ({rerun_reason})",
+                        run_id=run.id,
+                    )
+                return {
+                    "process_type": "manager_selection",
+                    "status": current.status,
+                    "questions_created": 0,
+                }
             current = await self.process_service.start_process(
                 db,
                 goal.id,

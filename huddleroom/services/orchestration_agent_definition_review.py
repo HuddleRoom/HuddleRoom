@@ -574,14 +574,15 @@ class AgentDefinitionReviewProcess:
             # Stale inputs while a decision is pending: never cancel the
             # pending decision or restart -- park stays parked, a one-time
             # suggestion is raised instead (item 3).
-            await self.warning_service.suggest_stale_inputs(
-                db,
-                goal.id,
-                process_type=PROCESS_TYPE,
-                process_run_id=current.id,
-                step_label="agent definition review",
-                run_id=run.id,
-            )
+            if run.phase in ("baseline", "ready"):
+                await self.warning_service.suggest_stale_inputs(
+                    db,
+                    goal.id,
+                    process_type=PROCESS_TYPE,
+                    process_run_id=current.id,
+                    step_label="agent definition review",
+                    run_id=run.id,
+                )
             await self.process_service.park_process(db, current)
             return self._summary("waiting_decision")
         current_decisions = [
@@ -669,7 +670,7 @@ class AgentDefinitionReviewProcess:
             # version is bumped now so it isn't rechecked every tick, but the
             # stored fingerprint/coverage_fingerprint are left stale so the
             # normal stale-inputs path below fires (suggestion in baseline
-            # phase / auto-rerun post-baseline).
+            # phase / no rerun post-baseline unless user-initiated).
             await db.flush()
         if (
             current is not None
@@ -690,6 +691,7 @@ class AgentDefinitionReviewProcess:
             and current.status == "running"
             and bool(stored_fingerprint)
             and stored_fingerprint != fingerprint
+            and (manual or run.phase == "baseline")
         )
         if running_inputs_changed:
             superseded = current
@@ -714,17 +716,18 @@ class AgentDefinitionReviewProcess:
                 # Baseline phase: stale inputs get a one-time suggestion, no
                 # auto-rerun (item 3) -- the completed review stands until a
                 # human approves a rerun.
-                await self.warning_service.suggest_stale_inputs(
-                    db,
-                    goal.id,
-                    process_type=PROCESS_TYPE,
-                    process_run_id=current.id,
-                    step_label="agent definition review",
-                    run_id=run.id,
-                )
+                if run.phase in ("baseline", "ready"):
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type=PROCESS_TYPE,
+                        process_run_id=current.id,
+                        step_label="agent definition review",
+                        run_id=run.id,
+                    )
                 return self._summary("completed")
-            # Post-baseline: a rerun happens only when material coverage changed.
-            # Execution-time task assignments move _fingerprint (task ids) but
+            # Post-baseline: the tick never reruns; only a user-initiated
+            # (manual) rerun restarts the review. Execution-time task assignments move _fingerprint (task ids) but
             # not coverage_fingerprint; re-stamp the fingerprint silently.
             if (
                 coverage_fingerprint is not None
@@ -732,6 +735,18 @@ class AgentDefinitionReviewProcess:
             ):
                 current.outputs = {**(current.outputs or {}), "fingerprint": fingerprint}
                 await db.flush()
+                return self._summary("completed")
+            if not manual:
+                # Gate only applies until Start; later it stays silent.
+                if run.phase == "ready":
+                    await self.warning_service.suggest_stale_inputs(
+                        db,
+                        goal.id,
+                        process_type=PROCESS_TYPE,
+                        process_run_id=current.id,
+                        step_label="agent definition review",
+                        run_id=run.id,
+                    )
                 return self._summary("completed")
             current = await self.process_service.start_process(
                 db,
