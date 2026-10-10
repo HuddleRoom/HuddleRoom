@@ -289,23 +289,6 @@ def _warning_types(assessment: dict) -> set[str]:
             [],
         ),
         (
-            _agent(adapter_type="cli", cli_runtime="claude_code", config={}),
-            ["implementation"],
-            False,
-            "agent_review_unsafe_permissions",
-            [],
-        ),
-        *[
-            (
-                _agent(adapter_type="cli", cli_runtime=runtime, config={}),
-                ["implementation"],
-                False,
-                "agent_review_unsafe_permissions",
-                [],
-            )
-            for runtime in ("copilot", "opencode", "pi")
-        ],
-        (
             _agent(is_active=False),
             ["implementation", "review"],
             True,
@@ -345,6 +328,31 @@ def test_assessment_applies_each_warning_to_only_relevant_functions(
         vague_warning = next((w for w in assessment["warnings"] if w["warning_type"] == "agent_review_vague_definition"), None)
         assert vague_warning is not None
         assert agent.name in vague_warning["message"]
+
+
+@pytest.mark.parametrize("runtime", ["claude_code", "copilot", "opencode", "pi", "codex", "aider"])
+def test_cli_runtime_alone_is_not_flagged_as_unsafe(runtime):
+    from huddleroom.services.orchestration_agent_definition_review import assess_agent_definition
+
+    assessment = assess_agent_definition(
+        _agent(adapter_type="cli", cli_runtime=runtime, config={}),
+        ["implementation"],
+    )
+
+    assert "agent_review_unsafe_permissions" not in _warning_types(assessment)
+    assert assessment["approved_for_work_functions"] == ["implementation"]
+
+
+def test_cli_runtime_config_override_is_not_flagged_as_unsafe():
+    from huddleroom.services.orchestration_agent_definition_review import assess_agent_definition
+
+    assessment = assess_agent_definition(
+        _agent(adapter_type="cli", cli_runtime="codex", config={"cli_runtime": "claude_code"}),
+        ["implementation"],
+    )
+
+    assert "agent_review_unsafe_permissions" not in _warning_types(assessment)
+    assert assessment["approved_for_work_functions"] == ["implementation"]
 
 
 def test_safe_validation_definition_retains_eligibility():

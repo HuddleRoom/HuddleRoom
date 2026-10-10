@@ -43,7 +43,6 @@ from huddleroom.services.orchestration_warning_service import OrchestrationWarni
 
 CRITICAL_VALIDATION_FUNCTIONS = {"review", "validation"}
 WEAK_REASONING_EFFORTS = {"none", "minimal", "low"}
-UNSAFE_CLI_RUNTIMES = {"claude_code", "copilot", "opencode", "pi"}
 PROCESS_TYPE = "agent_definition_review"
 PROCESS_VERSION = 3
 DECISION_KEY_PREFIX = "agent_definition_review:proposal:"
@@ -194,19 +193,17 @@ def assess_agent_definition(
             "Use API temperature at or below 0.3 and reasoning_effort above low for review work."
         )
 
-    effective_cli_runtime = config.get("cli_runtime", agent.cli_runtime or "claude_code")
-    unsafe_permissions = config.get("allow_global_scope") is True or (
-        agent.adapter_type == "cli" and effective_cli_runtime in UNSAFE_CLI_RUNTIMES
-    )
-    if unsafe_permissions:
+    if config.get("allow_global_scope") is True:
         warnings.append(
             _warning(
                 "agent_review_unsafe_permissions",
-                "Agent explicitly has global scope or an unrestricted CLI runtime.",
+                "Agent explicitly has global scope.",
             )
         )
         disqualified.update(normalized.values())
-        recommended_changes.append("Restrict the agent's effective runtime permissions.")
+        recommended_changes.append(
+            "Remove allow_global_scope from the agent config, or confirm global scope is intended."
+        )
 
     if inactive_assignee and not bool(agent.is_active):
         warnings.append(
