@@ -23,6 +23,9 @@ import {
   putOrchestrationConversationFeedback,
   startOrchestrationGoal,
   postOrchestrationGateOverride,
+  createOrchestrationGoal,
+  previewGoalTypeCorrection,
+  applyGoalTypeCorrection,
   orchestrationBaselineKey,
   orchestrationConversationKey,
   rerunOrchestrationBaselineStep,
@@ -43,6 +46,8 @@ import {
   useRerunLastOrchestrationBaseline,
   useResetOrchestrationGoal,
   useStartOrchestrationGoal,
+  usePreviewGoalTypeCorrection,
+  useApplyGoalTypeCorrection,
   useRerunOrchestrationBaselineStep,
   useRunOrchestrationBaselineStep,
   useRetryOrchestrationBaselineStep,
@@ -81,7 +86,12 @@ const detail: OrchestrationGoalDetail = {
     constraints: {},
     budget: {},
     goal_type: 'outcome',
+    goal_type_source: 'auto',
+    goal_type_rationale: 'Single deliverable.',
+    planning_mode: 'delivery',
+    planning_rationale: 'Plan then deliver.',
     supersedes_goal_id: null,
+    parent_goal_id: null,
     status: 'active',
     weight: 'standard',
     weight_overridden_by: null,
@@ -119,6 +129,14 @@ const detail: OrchestrationGoalDetail = {
   agent_suggestions_count: 0,
   agent_suggestions: [],
   timeline: [],
+  supervision: null,
+  contract_fingerprint: null,
+  runs: [],
+  child_goals: [],
+  task_reports: [],
+  plan: null,
+  effective_authorization: null,
+  authorization_wait: null,
 }
 
 function okJson(value: unknown) {
@@ -353,6 +371,91 @@ describe('orchestration API', () => {
       '/api/v1/projects/project-1/orchestration/goals/goal-1/start',
       expect.objectContaining({ method: 'POST' }),
     )
+  })
+
+  it('creates goals with goal_type auto unless one is given', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(okJson(detail)))
+    vi.stubGlobal('fetch', fetchMock)
+    const base = { objective: 'Ship', success_criteria: [{ description: 'Done' }] }
+
+    await createOrchestrationGoal('project-1', base)
+    await createOrchestrationGoal('project-1', { ...base, goal_type: 'roadmap' })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/projects/project-1/orchestration/goals')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).goal_type).toBe('auto')
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).goal_type).toBe('roadmap')
+  })
+
+  const fp = 'a'.repeat(64)
+  const correction = {
+    goalId: 'goal-1',
+    requestedGoalType: 'roadmap' as const,
+    expectedRunId: 'run-1',
+    expectedContractFingerprint: fp,
+    rationale: '  Needs a roadmap.  ',
+  }
+  const correctionBody = {
+    requested_goal_type: 'roadmap',
+    expected_run_id: 'run-1',
+    expected_contract_fingerprint: fp,
+    rationale: 'Needs a roadmap.',
+  }
+
+  it('previews a goal type correction with a snake_case trimmed body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({ preview_fingerprint: 'b'.repeat(64) }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await previewGoalTypeCorrection('project-1', correction)
+
+    const [url, request] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/v1/projects/project-1/orchestration/goals/goal-1/type-preview')
+    expect(request).toEqual(expect.objectContaining({ method: 'POST', body: JSON.stringify(correctionBody) }))
+  })
+
+  it('applies a goal type correction including the preview fingerprint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson(detail))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await applyGoalTypeCorrection('project-1', { ...correction, previewFingerprint: 'b'.repeat(64) })
+
+    const [url, request] = fetchMock.mock.calls[0]
+    expect(url).toBe('/api/v1/projects/project-1/orchestration/goals/goal-1/type')
+    expect(JSON.parse(request.body)).toEqual({ ...correctionBody, preview_fingerprint: 'b'.repeat(64) })
+  })
+
+  it('rejects a stale correction with the 409 status and detail', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: 'stale_contract' }), {
+      status: 409,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(
+      applyGoalTypeCorrection('project-1', { ...correction, previewFingerprint: 'b'.repeat(64) }),
+    ).rejects.toMatchObject({ status: 409, detail: 'stale_contract' })
+  })
+
+  it('does not retry the correction preview', () => {
+    const mutation = usePreviewGoalTypeCorrection('project-1') as unknown as { retry: boolean }
+    expect(mutation.retry).toBe(false)
+  })
+
+  it('apply correction syncs the returned detail then invalidates goal and Baseline', async () => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    const setQueryData = vi.fn()
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
+
+    const mutation = useApplyGoalTypeCorrection('project-1') as unknown as {
+      onSuccess: (detail: OrchestrationGoalDetail, variables: { goalId: string }) => Promise<void>
+    }
+    await mutation.onSuccess(detail, { goalId: 'goal-1' })
+
+    expect(setQueryData).toHaveBeenCalledWith(['orchestration-goal', 'project-1', 'goal-1'], detail)
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
+      exact: true,
+    })
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: orchestrationBaselineKey('project-1', 'goal-1') })
   })
 
   it('posts the gate override decision reason and metadata', async () => {

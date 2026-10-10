@@ -445,6 +445,14 @@ export interface OrchestrationPlanItemState extends Record<string, unknown> {
   gate_id?: string
 }
 
+export type OrchestrationGoalType = 'outcome' | 'roadmap' | 'continuous'
+export type OrchestrationGoalTypeSelection = 'auto' | OrchestrationGoalType
+export type OrchestrationGoalTypeSource = 'auto' | 'user' | 'parent_auto' | 'parent_explicit' | 'legacy'
+export type OrchestrationPlanningMode = 'roadmap' | 'delivery' | 'implementation' | 'continuous_policy'
+// Plan view item state (distinct from OrchestrationPlanItemState, the run plan_state item).
+export type OrchestrationPlanViewItemState =
+  | 'queued' | 'started' | 'evidence_pending' | 'accepted' | 'failed' | 'cancelled'
+
 export interface OrchestrationPlanState extends Record<string, unknown> {
   status?: string
   planning_task_id?: string
@@ -468,12 +476,13 @@ export interface OrchestrationGoal {
   orchestrator_context: Record<string, unknown>
   constraints: Record<string, unknown>
   budget: Record<string, unknown>
-  goal_type: 'outcome' | 'roadmap' | 'continuous'
-  goal_type_source?: string | null
-  goal_type_rationale?: string | null
-  planning_mode?: string | null
-  planning_rationale?: string | null
+  goal_type: OrchestrationGoalType
+  goal_type_source: OrchestrationGoalTypeSource
+  goal_type_rationale: string
+  planning_mode: OrchestrationPlanningMode
+  planning_rationale: string
   supersedes_goal_id: string | null
+  parent_goal_id: string | null
   status: OrchestrationGoalStatus
   weight: OrchestrationGoalWeight
   weight_overridden_by: string | null
@@ -710,8 +719,9 @@ export interface OrchestrationRun {
   retry_state: Record<string, unknown>
   supersedes_run_id?: string | null
   terminal_reason?: string | null
-  goal_type_snapshot?: string | null
-  planning_mode_snapshot?: string | null
+  cycle_key?: string | null
+  goal_type_snapshot?: OrchestrationGoalType | null
+  planning_mode_snapshot?: OrchestrationPlanningMode | null
   goal_contract_fingerprint?: string | null
   started_at: string
   completed_at: string | null
@@ -772,6 +782,9 @@ export interface OrchestrationEvidence {
   producer_agent_id: string | null
   verdict: 'candidate' | 'accepted' | 'rejected'
   evidence_metadata: Record<string, unknown>
+  evidence_role?: 'discovery' | 'readiness' | 'delivery' | 'verification' | 'integration' | null
+  review_stage?: 'preliminary' | 'final' | null
+  acceptance_verdict?: 'pending' | 'accepted' | 'rejected' | 'superseded' | null
   created_at: string
   updated_at: string
 }
@@ -1003,6 +1016,135 @@ export interface OrchestrationGoalDetail {
   agent_suggestions: OrchestrationAgentSuggestion[]
   timeline: unknown[]
   supervision: OrchestrationSupervision | null
+  contract_fingerprint: string | null
+  runs: OrchestrationRunSummary[]
+  child_goals: OrchestrationChildGoal[]
+  task_reports: OrchestrationTaskReport[]
+  plan: OrchestrationPlanView | null
+  effective_authorization: OrchestrationAuthorization | null
+  authorization_wait: {
+    task_ids: string[]
+    reason_code: string
+    required_decision: string | null
+  } | null
+}
+
+export interface OrchestrationRunSummary {
+  id: string
+  status: string
+  phase: string
+  cycle_key: string | null
+  supersedes_run_id: string | null
+  terminal_reason: string | null
+  goal_type_snapshot: OrchestrationGoalType | null
+  planning_mode_snapshot: OrchestrationPlanningMode | null
+  goal_contract_fingerprint: string | null
+  started_at: string
+  completed_at: string | null
+  version_label: string
+  is_current: boolean
+}
+
+export interface OrchestrationChildGoal {
+  id: string
+  objective: string
+  status: string
+  goal_type: OrchestrationGoalType
+  goal_type_source: OrchestrationGoalTypeSource
+  planning_mode: OrchestrationPlanningMode
+  roadmap_item_key: string | null
+  roadmap_version: number | null
+  current_run_id: string | null
+  current_run_status: string | null
+  run_version_label: string | null
+}
+
+export interface OrchestrationPlanItemView {
+  key: string
+  unit_type: 'task' | 'goal'
+  title: string | null
+  work_function: string | null
+  agent_id: string | null
+  depends_on: string[]
+  artifact_ids: string[]
+  why_runnable: string
+  priority: number
+  adopt_task_id: string | null
+  adopted: boolean
+  task_id: string | null
+  child_goal_id: string | null
+  gate_id: string | null
+  state: OrchestrationPlanViewItemState
+}
+
+export interface OrchestrationPlanView {
+  status: string | null
+  artifact_id: string | null
+  kind: 'roadmap' | 'delivery' | 'implementation' | null
+  author_agent_id: string | null
+  planning_version: number | null
+  planning_task_id: string | null
+  summary: string | null
+  scope: string | null
+  items: OrchestrationPlanItemView[]
+}
+
+export interface OrchestrationTaskReport {
+  task_id: string
+  session_id: string | null
+  summary: string | null
+  report: Record<string, unknown> | null
+}
+
+export interface OrchestrationAuthorization {
+  allowed: boolean
+  reason_code: string | null
+  required_decision: string | null
+  authority_source: 'baseline' | 'root_start' | 'parent_release'
+  run_id: string
+  contract_fingerprint: string
+  model_spend_remaining: Record<string, string>
+  external_write_targets: string[]
+  live_send_channels: string[]
+  workspace_mutation: 'read_only' | 'staged' | 'direct'
+  tool_constraints: string[]
+}
+
+export interface GoalTypeCorrectionBlocker {
+  code: string
+  entity_type: string
+  entity_id: string | null
+  message: string
+  resolution: string
+}
+
+export interface GoalTypeCorrectionRetainedEvidence {
+  source_run_id: string
+  source_task_id: string
+  source_gate_id: string
+  artifact_id: string | null
+  source_contract_fingerprint: string
+  revalidation_required: boolean
+  reason: string
+}
+
+export interface GoalTypeCorrectionPreview {
+  goal_id: string
+  current_run_id: string
+  current_goal_type: OrchestrationGoalType
+  proposed_goal_type: OrchestrationGoalType
+  current_planning_mode: OrchestrationPlanningMode
+  proposed_planning_mode: OrchestrationPlanningMode
+  source: OrchestrationGoalTypeSource
+  rationale: string
+  blockers: GoalTypeCorrectionBlocker[]
+  retained_evidence_manifest: GoalTypeCorrectionRetainedEvidence[]
+  remaining_budget: Record<string, string>
+  missing_recurring_policy: boolean
+  requires_new_start: boolean
+  required_authority: string[]
+  preview_fingerprint: string
+  tool_constraints: string[]
 }
 
 export type OrchestrationSupervisionCondition =
@@ -1034,10 +1176,22 @@ export interface OrchestrationGateOverrideInput {
   evidenceMetadata?: Record<string, unknown>
 }
 
+export interface GoalTypeCorrectionPreviewInput {
+  goalId: string
+  requestedGoalType: OrchestrationGoalType
+  expectedRunId: string
+  expectedContractFingerprint: string
+  rationale: string
+}
+
+export interface GoalTypeCorrectionApplyInput extends GoalTypeCorrectionPreviewInput {
+  previewFingerprint: string
+}
+
 export interface OrchestrationGoalCreateInput {
   objective: string
   success_criteria: { description: string }[]
   constraints?: Record<string, unknown>
   budget?: Record<string, unknown>
-  goal_type?: 'auto' | 'outcome' | 'roadmap' | 'continuous'
+  goal_type?: OrchestrationGoalTypeSelection
 }

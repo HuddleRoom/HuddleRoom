@@ -12,6 +12,9 @@ import type { AgentCreatePayload } from '@/api/agents'
 import type {
   CursorPage,
   OrchestrationGateOverrideInput,
+  GoalTypeCorrectionApplyInput,
+  GoalTypeCorrectionPreview,
+  GoalTypeCorrectionPreviewInput,
   OrchestrationGoal,
   OrchestrationGoalCommand,
   OrchestrationGoalCreateInput,
@@ -391,6 +394,32 @@ export function postOrchestrationGateOverride(
   })
 }
 
+function goalTypeCorrectionBody(input: GoalTypeCorrectionPreviewInput) {
+  return {
+    requested_goal_type: input.requestedGoalType,
+    expected_run_id: input.expectedRunId,
+    expected_contract_fingerprint: input.expectedContractFingerprint,
+    rationale: input.rationale.trim(),
+  }
+}
+
+export function previewGoalTypeCorrection(projectId: string, input: GoalTypeCorrectionPreviewInput) {
+  return apiFetch<GoalTypeCorrectionPreview>(`${root(projectId)}/${input.goalId}/type-preview`, {
+    method: 'POST',
+    body: JSON.stringify(goalTypeCorrectionBody(input)),
+  })
+}
+
+export function applyGoalTypeCorrection(projectId: string, input: GoalTypeCorrectionApplyInput) {
+  return apiFetch<OrchestrationGoalDetail>(`${root(projectId)}/${input.goalId}/type`, {
+    method: 'POST',
+    body: JSON.stringify({
+      ...goalTypeCorrectionBody(input),
+      preview_fingerprint: input.previewFingerprint,
+    }),
+  })
+}
+
 export function recoverGoalDefinition(
   projectId: string,
   goalId: string,
@@ -741,6 +770,26 @@ export function useOverrideOrchestrationGate(projectId: string | null) {
   })
 }
 
+export function usePreviewGoalTypeCorrection(projectId: string | null) {
+  return useMutation({
+    mutationFn: (input: GoalTypeCorrectionPreviewInput) =>
+      previewGoalTypeCorrection(projectId!, input),
+    retry: false,
+  })
+}
+
+export function useApplyGoalTypeCorrection(projectId: string | null) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: GoalTypeCorrectionApplyInput) => applyGoalTypeCorrection(projectId!, input),
+    retry: false,
+    onSuccess: (detail, { goalId }) => {
+      syncOrchestrationGoalCache(queryClient, projectId, goalId, detail)
+      return invalidateGoalAndBaseline(queryClient, projectId, goalId)
+    },
+  })
+}
+
 export function useRecoverGoalDefinition(projectId: string | null) {
   const queryClient = useQueryClient()
   return useMutation({
@@ -758,7 +807,7 @@ export function createOrchestrationGoal(
 ) {
   return apiFetch<OrchestrationGoalDetail>(root(projectId), {
     method: 'POST',
-    body: JSON.stringify(input),
+    body: JSON.stringify({ goal_type: 'auto', ...input }),
   })
 }
 
