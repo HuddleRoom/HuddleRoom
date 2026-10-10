@@ -44,6 +44,9 @@ from huddleroom.schemas.orchestration import (
     OrchestrationGoalDetailResponse,
     OrchestrationGoalResponse,
     OrchestrationSupersedeRequest,
+    GoalTypeCorrectionApplyRequest,
+    GoalTypeCorrectionPreviewRequest,
+    GoalTypeCorrectionPreviewResult,
     OrchestrationGoalWeightOverrideRequest,
     OrchestrationConversationAllowanceResponse,
     OrchestrationConversationFeedbackRequest,
@@ -68,7 +71,7 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
 from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService
-from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError
+from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_supersession import OrchestrationSupersessionService
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
@@ -951,6 +954,46 @@ async def supersede_goal(
             )
             run = await service.get_run_for_goal(db, project_id, replacement.id)
             detail = await _detail(db, replacement, run)
+            await db.commit()
+            return detail
+        except Exception:
+            await db.rollback()
+            raise
+
+
+@router.post("/goals/{goal_id}/type-preview", response_model=GoalTypeCorrectionPreviewResult)
+async def preview_goal_type_correction(
+    project_id: uuid.UUID,
+    goal_id: uuid.UUID,
+    data: GoalTypeCorrectionPreviewRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await ensure_project_exists(db, project_id)
+    goal = await service.get_goal(db, project_id, goal_id)
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Orchestration goal not found")
+    return await OrchestrationGoalShapeService().preview_correction(db, goal, data, f"human:{user.id}")
+
+
+@router.post("/goals/{goal_id}/type", response_model=OrchestrationGoalDetailResponse)
+async def apply_goal_type_correction(
+    project_id: uuid.UUID,
+    goal_id: uuid.UUID,
+    data: GoalTypeCorrectionApplyRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    async with service._lock_goal_for_baseline_transition(db, goal_id):
+        try:
+            await ensure_project_exists(db, project_id)
+            goal = await service.get_goal(db, project_id, goal_id)
+            if goal is None:
+                raise HTTPException(status_code=404, detail="Orchestration goal not found")
+            goal, run = await OrchestrationGoalShapeService().apply_correction(
+                db, goal, data, f"human:{user.id}"
+            )
+            detail = await _detail(db, goal, run)
             await db.commit()
             return detail
         except Exception:

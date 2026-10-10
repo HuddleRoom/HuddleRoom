@@ -599,3 +599,94 @@ async def test_continuous_policy_and_start_are_public_and_idempotent(
         OrchestrationAction.run_id == run.id,
         OrchestrationAction.action_type == "authorize_execution",
     )) == 1
+
+
+def _type_url(project, goal, suffix="type"):
+    return f"/api/v1/projects/{project.id}/orchestration/goals/{goal.id}/{suffix}"
+
+
+async def _type_body(db, goal, run, **kw):
+    from huddleroom.models.orchestration import compute_goal_contract_fingerprint
+
+    return {
+        "requested_goal_type": "roadmap", "expected_run_id": str(run.id),
+        "expected_contract_fingerprint": compute_goal_contract_fingerprint(goal),
+        "rationale": "fits better", **kw,
+    }
+
+
+async def _type_preview(client, db, project, goal, run, headers):
+    body = await _type_body(db, goal, run)
+    resp = await client.post(_type_url(project, goal, "type-preview"), json=body, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return body, resp.json()
+
+
+@pytest.mark.asyncio
+async def test_goal_type_preview_and_apply_http(client, db_session, auth_headers, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+
+    goal, run = await _goal_run(db_session, test_project)
+    body, preview = await _type_preview(client, db_session, test_project, goal, run, auth_headers)
+    assert preview["blockers"] == [] and preview["preview_fingerprint"]
+    assert preview["proposed_goal_type"] == "roadmap"
+
+    resp = await client.post(
+        _type_url(test_project, goal), json={**body, "preview_fingerprint": preview["preview_fingerprint"]},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    detail = resp.json()
+    assert detail["goal"]["goal_type"] == "roadmap"
+    assert detail["run"]["id"] != str(run.id)
+    assert detail["run"]["supersedes_run_id"] == str(run.id)
+
+
+@pytest.mark.asyncio
+async def test_goal_type_apply_stale_preview_409(client, db_session, auth_headers, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+
+    goal, run = await _goal_run(db_session, test_project)
+    body = await _type_body(db_session, goal, run)
+    resp = await client.post(
+        _type_url(test_project, goal), json={**body, "preview_fingerprint": "0" * 64},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["conflict"] == "stale_preview" and "preview" in detail
+
+
+@pytest.mark.asyncio
+async def test_goal_type_apply_blocked_409(client, db_session, auth_headers, test_project, test_agent):
+    from huddleroom.models.session import Session
+    from tests.test_orchestration_goal_shape import _goal_run, _run_task
+
+    goal, run = await _goal_run(db_session, test_project)
+    task = await _run_task(db_session, test_project, run, status="in_progress")
+    db_session.add(Session(project_id=test_project.id, task_id=task.id, agent_id=test_agent.id,
+                           adapter_type="api", status="running"))
+    await db_session.flush()
+    body, preview = await _type_preview(client, db_session, test_project, goal, run, auth_headers)
+    assert preview["blockers"]
+    resp = await client.post(
+        _type_url(test_project, goal), json={**body, "preview_fingerprint": preview["preview_fingerprint"]},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["conflict"] == "correction_blocked" and detail["blockers"] and "preview" in detail
+
+
+@pytest.mark.asyncio
+async def test_goal_type_unknown_goal_404_and_bad_body_422(client, db_session, auth_headers, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+
+    goal, run = await _goal_run(db_session, test_project)
+    body = await _type_body(db_session, goal, run)
+    ghost = type("G", (), {"id": uuid.uuid4()})()
+    fp = {"preview_fingerprint": "0" * 64}
+    assert (await client.post(_type_url(test_project, ghost, "type-preview"), json=body, headers=auth_headers)).status_code == 404
+    assert (await client.post(_type_url(test_project, ghost), json={**body, **fp}, headers=auth_headers)).status_code == 404
+    assert (await client.post(_type_url(test_project, goal, "type-preview"), json={}, headers=auth_headers)).status_code == 422
+    assert (await client.post(_type_url(test_project, goal), json=body, headers=auth_headers)).status_code == 422
