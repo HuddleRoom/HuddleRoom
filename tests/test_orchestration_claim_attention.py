@@ -395,11 +395,12 @@ async def test_child_tick_recovers_only_its_claim_when_parent_is_paused_and_keep
 
 async def test_router_resume_refusal_commits_once_then_child_tick_recovers_exact_cap_claim(committed_db):
     db_session, test_project, claim_engine = committed_db
+    # The agent exists before the Roadmap is accepted so it is on the accepted team (resume is authorization-gated).
+    agent = _agent("router-resume-claim", ["implementation"])
+    db_session.add(agent); await db_session.flush()
     _roadmap, parent, parent_run, _result, row = await release(db_session, test_project, child_item())
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
-    agent = _agent("router-resume-claim", ["implementation"])
-    db_session.add(agent); await db_session.flush()
     tasks = [Task(project_id=test_project.id, title=title, status="failed", assigned_to=agent.id,
         metadata_={"orchestration": {"run_id": str(child_run.id)}}) for title in ("first", "second")]
     db_session.add_all(tasks); await db_session.flush()
@@ -463,6 +464,10 @@ async def test_router_resume_refusal_commits_once_then_child_tick_recovers_exact
         assert not any(item.get("scope") == f"claim:{child_id}" for item in recovered_child_run.active_blockers)
         assert await recovery_db.scalar(select(func.count()).select_from(Session)) == 2
 
+        # Pause only kept the tick from dispatching; resuming a session is authorization-gated on an active run.
+        recovered_child.status, recovered_child_run.status = "active", "running"
+        recovered_parent.status, recovered_parent_run.status = "active", "running"
+        await recovery_db.commit()
         resumed = await sessions_router.resume_session(second_id, None, recovery_db)
         assert resumed.status == "pending"
     finally:

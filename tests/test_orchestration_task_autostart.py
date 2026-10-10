@@ -38,7 +38,15 @@ async def _sessions(db, task):
 
 
 @pytest.mark.parametrize("phase", ["baseline", "authorized"])
-async def test_tick_starts_delegated_backlog_task_once(db_session, test_project, phase):
+async def test_tick_starts_delegated_backlog_task_once(db_session, test_project, phase, monkeypatch):
+    if phase == "baseline":
+        # An authorized baseline that is still pending (open question) keeps phase=baseline; a completed one moves to ready (no starts).
+        from huddleroom.services.orchestration_goal_analyzer import GoalAnalysis, GoalClarificationAnalyzer, GoalQuestion
+
+        async def analyze(self, request, *, project_id=None):
+            return GoalAnalysis((), (GoalQuestion("Which scope?", "Changes scope", "objective"),), False)
+
+        monkeypatch.setattr(GoalClarificationAnalyzer, "analyze_request", analyze)
     service, run, task = await _setup(db_session, test_project, phase)
     await service.tick(db_session, run.id)
     await db_session.refresh(task)

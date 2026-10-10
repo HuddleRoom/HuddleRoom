@@ -889,12 +889,16 @@ async def test_unrelated_completed_action_does_not_grant_budget_ownership(db_ses
 
 
 async def test_competing_exact_cap_resume_refuses_then_recovers_after_terminal_usage(db_session, test_project):
-    _, _, _, _, row = await release(
+    # The tasks carry orchestration metadata, so the resume authorization applies: the agent must be on the accepted team.
+    roadmap, parent, parent_run, _version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 5, "max_hours": 5}),
+        include_planner_in_team=True,
     )
-    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
-    agent = _agent("child-budget-resume", ["implementation"])
-    db_session.add(agent); await db_session.flush()
+    await roadmap.advance(db_session, parent, parent_run)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    child = await db_session.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    agent = await db_session.get(Agent, uuid.UUID(child.orchestrator_context["team"]["agent_ids"][0]))
     tasks = [Task(project_id=test_project.id, title=title, status="failed", assigned_to=agent.id,
         metadata_={"orchestration": {"run_id": str(child_run.id)}}) for title in ("first", "second")]
     db_session.add_all(tasks); await db_session.flush()
