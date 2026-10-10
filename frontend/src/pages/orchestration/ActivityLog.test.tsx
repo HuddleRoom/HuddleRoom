@@ -64,6 +64,7 @@ function action(index: number, overrides: Partial<OrchestrationAction> = {}): Or
     target_id: null,
     error: null,
     created_at: new Date(new Date(ISO).getTime() + index * 1000).toISOString(),
+    ...overrides,
   }
 }
 
@@ -325,5 +326,29 @@ describe('ActivityLog steering anchors', () => {
       timestamp: authority.created_at,
       processType: null,
     })
+  })
+  it('labels goal type, plan and adoption actions and gives each its own filter chip', async () => {
+    const detail = goalDetail({
+      actions: [
+        action(1, { action_type: 'correct_goal_type', request: { requested_goal_type: 'roadmap', previous_goal_type: 'outcome', rationale: 'Too big' } }),
+        action(2, { action_type: 'accept_plan' }),
+        action(3, { action_type: 'adopt_task' }),
+        action(4),
+      ],
+    })
+    const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+    const byKind = (kind: string) => entries.find((entry) => entry.kind === kind)
+    expect(byKind('type-corrected')).toMatchObject({ label: 'Goal type corrected', message: 'Outcome → Roadmap: Too big' })
+    expect(byKind('plan-accepted')?.label).toBe('Plan accepted')
+    expect(byKind('work-adopted')?.label).toBe('Existing work adopted')
+    expect(entries.find((entry) => entry.label === 'action-type-4')?.kind).toBe('action')
+
+    const view = await mount({ detail })
+    try {
+      const text = textOf(view.container)
+      for (const label of ['Goal type corrected', 'Plan accepted', 'Existing work adopted']) expect(text).toContain(label)
+    } finally {
+      view.cleanup()
+    }
   })
 })

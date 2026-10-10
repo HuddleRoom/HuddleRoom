@@ -12,7 +12,7 @@ import type {
   OrchestrationProcessRunRecord,
   OrchestrationWarningRecord,
 } from '@/lib/types'
-import { errorRecord, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
+import { errorRecord, goalTypeLabel, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
 import { scoped } from './ProcessFocus'
 
 // Goal-wide orchestrator decision/action ledger (run-scoped, not attributable
@@ -166,21 +166,56 @@ function perStepEvents(
   return events
 }
 
+// Backend action_type/decision_type -> ledger kind. Only types that really
+// reach the goal ledger (orchestration actions/decisions) are mapped.
+// ponytail: type-resolved, plan-ingested, work-queued/started, evidence-recorded
+// and work-accepted have no action/decision source today; add when they do.
+const KIND_BY_TYPE: Record<string, string> = {
+  correct_goal_type: 'type-corrected',
+  accept_plan: 'plan-accepted',
+  adopt_task: 'work-adopted',
+}
+
+const KIND_LABEL: Record<string, string> = {
+  'type-resolved': 'Goal type chosen',
+  'type-corrected': 'Goal type corrected',
+  'plan-ingested': 'Plan received',
+  'plan-accepted': 'Plan accepted',
+  'work-adopted': 'Existing work adopted',
+  'work-queued': 'Work queued',
+  'work-started': 'Work started',
+  'evidence-recorded': 'Evidence recorded',
+  'work-accepted': 'Accepted',
+}
+
+function ledgerMessage(kind: string | undefined, item: TimelineItem): string {
+  const request = (item.detail ?? {}) as Record<string, unknown>
+  if (kind === 'type-corrected' && item.kind === 'action' && typeof request.requested_goal_type === 'string') {
+    const from = typeof request.previous_goal_type === 'string' ? goalTypeLabel(request.previous_goal_type) : 'Previous type'
+    const rationale = typeof request.rationale === 'string' && request.rationale ? `: ${request.rationale}` : ''
+    return `${from} → ${goalTypeLabel(request.requested_goal_type)}${rationale}`
+  }
+  return item.reason
+}
+
 function goalLedgerEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
-  return buildOrchestrationTimeline(detail).map((item) => ({
+  return buildOrchestrationTimeline(detail).map((item) => {
+    const mapped = KIND_BY_TYPE[item.label]
+    return {
     id: `${item.kind}-${item.id}`,
     anchorId: item.kind === 'decision' ? `decision-${item.id}` : `action-${item.id}`,
-    kind: item.kind,
-    label: item.label,
+    kind: mapped ?? item.kind,
+    label: mapped ? KIND_LABEL[mapped] : item.label,
     timestamp: item.createdAt,
-    message: item.reason,
+    message: ledgerMessage(mapped, item),
     processType: null,
     status: item.status,
     error: item.error,
     target: item.target,
     decisionRef: item.decisionRef,
     detail: item.detail,
-  }))
+    }
+  })
 }
 
 // Mirrors the old goal-wide Timeline's debug gating exactly: the raw payload
@@ -212,6 +247,7 @@ export function buildActivityEntries({
 }
 
 function humanizeKind(kind: string): string {
+  if (KIND_LABEL[kind]) return KIND_LABEL[kind]
   const spaced = kind.replace(/-/g, ' ')
   return spaced.charAt(0).toUpperCase() + spaced.slice(1)
 }
