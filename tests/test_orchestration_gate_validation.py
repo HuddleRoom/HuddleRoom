@@ -1119,3 +1119,30 @@ async def test_accepted_readiness_gate_unblocks_dependent_but_never_feeds_criter
     )
     assert service._criterion_evidence_manifest([gate], [ev]) == {}
     assert service._criterion_evidence_manifest([gate, plan_gate], [ev, final_ev]) == {"c1": [str(final_ev.id)]}
+
+
+@pytest.mark.asyncio
+async def test_verification_request_scope_states_final_evidence_fit(db_session, test_project, monkeypatch):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    agent.capabilities = ["investigation", "review", "validation"]
+    task = await _delegate_adhoc(db_session, service, run, agent, "v1", work_function="review")
+    gate = await _adhoc_gate(db_session, task)
+    async def _ready(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_ensure_baseline_processes_ready", _ready)
+    verifier_agent = _agent("verifier", "developer", ["validation"])
+    db_session.add(verifier_agent)
+    await db_session.flush()
+    await _add_evidence(db_session, run.id, gate.id, source_type="task", producer_agent_id=agent.id,
+                        verdict="candidate", event_seq=1, source_id=task.id)
+    action = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:fit",
+    )
+    verifier = await db_session.get(Task, action.target_id)
+    text = json.dumps([verifier.description, verifier.metadata_])
+    for phrase in ("live observation", "unit tests", "document review", "static analysis",
+                   "Preliminary readiness reports never satisfy a final criterion"):
+        assert phrase in text
