@@ -524,10 +524,17 @@ class SessionService:
         if run is None or goal is None:
             return
         result = await effective_authorization(db, goal, run, task)
+        scope = f"authorization:{task.id}"
         if result.allowed:
+            run.active_blockers = [
+                blocker for blocker in (run.active_blockers or [])
+                if not (isinstance(blocker, dict) and blocker.get("scope") == scope)
+            ]
             return
+        if result.reason_code == "run_not_active":  # not a claim problem: no attention blocker on a stopped run
+            raise HTTPException(status_code=409, detail="authorization_denied: run_not_active")
         raise SessionClaimAttention(run.id, {
-            "kind": "authorization", "scope": f"authorization:{task.id}",
+            "kind": "authorization", "scope": scope,
             "reason_code": result.reason_code, "required_decision": result.required_decision,
             "reason": f"Task cannot be claimed: {result.reason_code}.",
         }, f"authorization_denied: {result.reason_code}")

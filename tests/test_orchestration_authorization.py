@@ -405,12 +405,16 @@ async def test_effective_authorization_baseline_source(db_session, test_project)
     goal, run = await _goal_run(db_session, test_project, started=False)
     result = await effective_authorization(db_session, goal, run)
     assert (result.allowed, result.authority_source, result.workspace_mutation) == (True, "baseline", "read_only")
-    run.phase = "ready"
-    assert (await effective_authorization(db_session, goal, run)).authority_source == "baseline"
-
     run.baseline_authorized = False
     assert _denial(await effective_authorization(db_session, goal, run)) == (
         False, "baseline_not_authorized", "authorize_baseline")
+    run.baseline_authorized = True
+
+    run.phase = "ready"  # baseline authority ends at ready: only Start authorizes execution work
+    ready = await effective_authorization(db_session, goal, run)
+    assert (_denial(ready), ready.authority_source) == ((False, "start_required", "start"), "root_start")
+    task = await _scoped_task(db_session, test_project, run, None)
+    assert _denial(await effective_authorization(db_session, goal, run, task)) == (False, "start_required", "start")
 
 
 @pytest.mark.asyncio
@@ -560,23 +564,46 @@ async def test_renewed_corrected_child_is_authorized_by_parent_release(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_effective_authorization_budget_exhausted_and_measurement_error(
-    db_session, test_project, monkeypatch,
-):
+async def test_effective_authorization_budget_parity_with_outcome_stop(db_session, test_project, monkeypatch):
     from huddleroom.services.orchestration_authority_service import effective_authorization
     from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 
     goal, run = await _started_root(db_session, test_project, budget={"caps": {"max_turns": "0", "max_tokens": "5"}})
-    exhausted = await effective_authorization(db_session, goal, run)
-    assert _denial(exhausted) == (False, "budget_exhausted", "increase_budget")
-    assert exhausted.model_spend_remaining["max_turns"] == 0
+    # Only the Outcome stop (budget_state.status) denies; a zero cap alone is per-claim headroom.
+    zero_cap = await effective_authorization(db_session, goal, run)
+    assert zero_cap.allowed and zero_cap.model_spend_remaining["max_turns"] == 0
+
+    run.budget_state = {"status": "exceeded"}
+    assert _denial(await effective_authorization(db_session, goal, run)) == (
+        False, "budget_exhausted", "increase_budget")
+    run.budget_state = {"status": "exceeded", "overridden": True}
+    assert (await effective_authorization(db_session, goal, run)).allowed
 
     async def unmeasured(self, db, run, caps):
         raise BudgetMeasurementError("max_tokens", uuid.uuid4())
 
+    run.budget_state = {}
     monkeypatch.setattr(OrchestrationBudgetService, "run_remaining", unmeasured)
-    assert _denial(await effective_authorization(db_session, goal, run)) == (
-        False, "budget_measurement", "resolve_budget_measurement")
+    unmeasured_result = await effective_authorization(db_session, goal, run)  # attention blocker only, not a denial
+    assert unmeasured_result.allowed and unmeasured_result.model_spend_remaining == {}
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_roadmap_fully_reserved_is_not_denied(db_session, test_project, monkeypatch):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+
+    from tests.test_orchestration_goal_shape import _goal_run
+
+    goal, run = await _goal_run(db_session, test_project, goal_type="roadmap")
+    await _authorize(db_session, run)
+
+    async def fully_reserved(self, db, goal):  # the task being authorized is funded by that reservation
+        return {"remaining": {"max_tokens": "0"}}
+
+    monkeypatch.setattr(OrchestrationBudgetService, "remaining", fully_reserved)
+    result = await effective_authorization(db_session, goal, run)
+    assert result.allowed and result.model_spend_remaining["max_tokens"] == 0
 
 
 @pytest.mark.asyncio
@@ -614,6 +641,17 @@ async def test_effective_authorization_declared_task_scope(db_session, test_proj
     within = await check({**spend, "workspace_mutation": "staged"}, staged)
     assert (within.allowed, within.workspace_mutation) == (True, "staged")
     assert "no_publish_before_integration" in within.tool_constraints
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_declared_zero_allowance_denied(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _started_root(db_session, test_project, budget={"caps": {"max_tokens": "1000"}})
+    zero = {"model_spend": {"allowed": True, "remaining_by_dimension": {"max_tokens": "0"}}}
+    task = await _scoped_task(db_session, test_project, run, zero)
+    assert _denial(await effective_authorization(db_session, goal, run, task)) == (
+        False, "model_spend_not_granted", "revise_task_scope")
 
 
 @pytest.mark.asyncio
@@ -804,6 +842,7 @@ async def test_corrupt_lineage_is_an_authorization_denial_not_a_tick_crash(db_se
     assert task.status == "backlog" and await _session_count(db_session, task) == 0
     assert task.metadata_["orchestration"]["authorization_wait"] == {
         "reason_code": "lineage_invalid", "required_decision": "ask_human", "authority_source": "root_start",
+        "detail": "Roadmap task lineage is invalid",
     }
 
 

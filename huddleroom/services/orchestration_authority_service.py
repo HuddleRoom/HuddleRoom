@@ -574,7 +574,7 @@ async def effective_authorization(
     fp = compute_goal_contract_fingerprint(goal)
     if goal.parent_goal_id is not None:
         source = "parent_release"
-    elif run.phase in ("baseline", "ready"):
+    elif run.phase == "baseline":  # ready is baseline-complete: only Start authorizes execution
         source = "baseline"
     else:
         source = "root_start"
@@ -653,9 +653,9 @@ async def effective_authorization(
             caps = canonical_amounts(state_caps, allowed=ROADMAP_BUDGET_DIMENSIONS) if state_caps else parent_caps(goal)
             raw = await budget.run_remaining(db, run, caps) if caps else {}
     except BudgetMeasurementError:
-        return result("budget_measurement", "resolve_budget_measurement")
+        raw = {}  # ponytail: parity with the Outcome stop: measurement error is an attention blocker, not a denial
     remaining = {key: Decimal(value) for key, value in raw.items()}
-    if any(value <= 0 for value in remaining.values()):
+    if svc._budget_is_exhausted(run):  # per-claim headroom is enforced in _orchestration_budget_limits
         return result("budget_exhausted", "increase_budget")
 
     if task is not None and roadmap and task.assigned_to is not None:
@@ -665,7 +665,9 @@ async def effective_authorization(
             return result("agent_outside_accepted_team", "reassign_task")
 
     if scope is not None:
-        if not scope.model_spend.allowed:
+        if not scope.model_spend.allowed or any(
+            value <= 0 for value in scope.model_spend.remaining_by_dimension.values()
+        ):
             return result("model_spend_not_granted", "revise_task_scope")
         for key, value in scope.model_spend.remaining_by_dimension.items():
             remaining[key] = min(remaining[key], value) if key in remaining else value

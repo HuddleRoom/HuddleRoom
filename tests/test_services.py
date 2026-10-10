@@ -757,6 +757,31 @@ async def test_orchestration_claim_denied_without_authority_persists_no_session(
 
 
 @pytest.mark.asyncio
+async def test_claim_on_paused_run_refused_without_blocker(
+    db_session: AsyncSession, runnable_project, test_agent,
+):
+    from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+    from huddleroom.services.session_service import SessionClaimAttention
+
+    task = await _orchestration_task(db_session, runnable_project, test_agent, authorized=True)
+    run = await db_session.get(OrchestrationRun, uuid.UUID(task.metadata_["orchestration"]["run_id"]))
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    goal.status, run.status = "paused", "paused"
+    blockers = list(run.active_blockers or [])
+    svc = SessionService()
+    for call in (
+        lambda: svc.preflight_claim(db_session, task, test_agent),
+        lambda: svc.create(db_session, SessionCreate(
+            agent_id=test_agent.id, project_id=runnable_project.id, task_id=task.id)),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await call()
+        assert exc.value.status_code == 409 and not isinstance(exc.value, SessionClaimAttention)
+        assert exc.value.detail == "authorization_denied: run_not_active"
+    assert (run.active_blockers or []) == blockers
+
+
+@pytest.mark.asyncio
 async def test_orchestration_claim_allowed_and_plain_task_unaffected(
     db_session: AsyncSession, runnable_project, test_agent,
 ):
@@ -2034,3 +2059,29 @@ async def test_resume_refused_when_orchestration_start_is_stale(db_session: Asyn
     assert exc_info.value.blocker["kind"] == "authorization"
     assert exc_info.value.blocker["reason_code"] == "contract_changed_since_start"
     assert session.status == "failed" and session.resumable is True
+
+
+@pytest.mark.asyncio
+async def test_allowed_claim_clears_authorization_blocker(db_session: AsyncSession, test_project):
+    from huddleroom.services.session_service import SessionClaimAttention, SessionService
+    from tests.test_orchestration_authorization import _started_with_backlog_task
+
+    svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    session = Session(
+        project_id=test_project.id, task_id=task.id, agent_id=task.assigned_to, adapter_type="api",
+        status="failed", resumable=True, metadata_={"_run_config": {}},
+    )
+    db_session.add(session)
+    goal.objective = "Changed after Start"
+    await db_session.flush()
+
+    with pytest.raises(SessionClaimAttention) as exc_info:
+        await SessionService().resume(db_session, session.id)
+    scope = f"authorization:{task.id}"
+    assert exc_info.value.blocker["scope"] == scope
+    run.active_blockers = [*(run.active_blockers or []), exc_info.value.blocker]  # the router persists it
+
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")  # re-Start
+    with patch("huddleroom.workers.task_runner.dispatch_session", new=AsyncMock(return_value="x")):
+        await SessionService().resume(db_session, session.id)
+    assert not [b for b in run.active_blockers or [] if b.get("scope") == scope]
