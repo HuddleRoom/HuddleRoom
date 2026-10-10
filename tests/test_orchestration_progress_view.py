@@ -991,6 +991,7 @@ async def test_stalled_representative_prefers_item_with_suggested_actions(db_ses
     ((True, "backlog", "open"), "queued"),
     ((True, "done", "open"), "evidence_pending"),
     ((True, "done", None), "evidence_pending"),
+    ((False, "in_progress", None), "queued"),
     ((True, "ready", "open"), "started"),
     ((True, "blocked", "open"), "started"),
     ((True, "in_progress", "open"), "started"),

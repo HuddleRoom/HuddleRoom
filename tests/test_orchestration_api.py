@@ -3,6 +3,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func, inspect as sa_inspect, select
 
 from huddleroom.models.artifact import Artifact
@@ -1033,3 +1034,33 @@ async def test_detail_exposes_authorization_wait_for_stale_start_queued_task(cli
     await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")  # re-Start
     assert await svc._start_released_tasks(db_session, goal, run) == 1
     assert (await client.get(url)).json()["authorization_wait"] is None
+
+
+@pytest.mark.asyncio
+async def test_detail_proposed_roadmap_plan_shows_item_key_items_queued(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    run = await db_session.get(OrchestrationRun, uuid.UUID(body["run"]["id"]))
+    artifact = Artifact(project_id=test_project.id, name="plan", artifact_type="plan",
+                        metadata_={"plan_kind": "roadmap", "plan_items": [{"item_key": "alpha", "title": "A"}]})
+    db_session.add(artifact)
+    await db_session.flush()
+    run.plan_state = {"status": "proposed", "plan_artifact_id": str(artifact.id)}
+    await db_session.flush()
+
+    plan = (await client.get(url)).json()["plan"]
+    assert [(i["key"], i["state"]) for i in plan["items"]] == [("alpha", "queued")]
+
+
+@pytest.mark.asyncio
+async def test_detail_ignores_malformed_authorization_wait(client, db_session, test_project):
+    from tests.test_orchestration_authorization import _started_with_backlog_task
+
+    _, goal, _, task = await _started_with_backlog_task(db_session, test_project)
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}"
+    for bad in ("x", {}):
+        task.metadata_ = {**(task.metadata_ or {}), "orchestration": {"authorization_wait": bad}}
+        flag_modified(task, "metadata_")
+        await db_session.flush()
+        response = await client.get(url)
+        assert response.status_code == 200
+        assert response.json()["authorization_wait"] is None

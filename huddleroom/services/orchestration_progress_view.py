@@ -117,7 +117,7 @@ def _plan_items(run: OrchestrationRun, tasks: list[Task], gates: list[Orchestrat
             "item_id": item["id"],
             "task_id": str(entry["task_id"]) if entry and entry.get("task_id") else None,
             "adopted": bool(entry and entry.get("adopted")),
-            "state": plan_item_state(entry is not None, task.status if task else None, gate.status if gate else None),
+            "state": plan_item_state(bool(entry and entry.get("task_id")), task.status if task else None, gate.status if gate else None),
         })
     return result
 
@@ -456,7 +456,7 @@ def _authorization_wait(tasks: list[Task], queued_ids: list[uuid.UUID]) -> dict 
         (t, ((t.metadata_ or {}).get("orchestration") or {}).get("authorization_wait"))
         for t in tasks if t.id in queued_ids
     ]
-    waiting = [(t, wait) for t, wait in waiting if wait]
+    waiting = [(t, w) for t, w in waiting if isinstance(w, dict) and isinstance(w.get("reason_code"), str)]
     if not waiting:
         return None
     # ponytail: reason and decision of the first waiting task; per-reason groups if they diverge in practice

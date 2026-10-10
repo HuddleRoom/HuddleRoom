@@ -382,7 +382,7 @@ async def _child_goals(db: AsyncSession, goal: OrchestrationGoal) -> list[Orches
             roadmap_item_key=child.roadmap_item_key, roadmap_version=versions.get(child.roadmap_version_id),
             current_run_id=latest.id if latest else None,
             current_run_status=latest.status if latest else None,
-            run_version_label=_version_labels(runs)[latest.id] if latest else None,
+            run_version_label=f"v{len(runs)}" if latest else None,
         ))
     return result
 
@@ -425,6 +425,9 @@ async def _plan_view(
 ) -> OrchestrationPlanView | None:
     """Read-only, lenient projection of the run's plan; never raises on malformed plan state."""
     state = run.plan_state if isinstance(run.plan_state, dict) else {}
+    # A not-yet-accepted proposal (first plan or replan) is shown whole; the old version's items would mix sources.
+    if state.get("status") != "accepted" and _uuid_or_none(state.get("plan_artifact_id")):
+        version = None
     artifact_id = next((u for u in (
         version.plan_artifact_id if version else None,
         _uuid_or_none(state.get("accepted_artifact_id")), _uuid_or_none(state.get("plan_artifact_id")),
@@ -434,20 +437,18 @@ async def _plan_view(
         return None
     metadata = artifact.metadata_ if isinstance(artifact.metadata_, dict) else {}
     planning_task = await db.get(Task, artifact.linked_task_id) if artifact.linked_task_id else None
-    contract = (planning_task.metadata_ or {}).get("orchestration_contract") if planning_task else None
+    contract = planning_task.metadata_.get("orchestration_contract") if planning_task and isinstance(planning_task.metadata_, dict) else None
     planning_version = metadata.get("planning_version") or state.get("planning_version")
 
     links: dict[str, dict] = {}
     if version is not None:
         raws = version.snapshot.get("items") if isinstance(version.snapshot, dict) else None
-        key_field = "item_key"
         for row in await db.scalars(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id)):
             links[row.item_key] = {"task_id": row.task_id, "child_goal_id": row.child_goal_id, "gate_id": row.gate_id}
     else:
         snapshot = state.get("accepted_plan_snapshot")
         accepted = state.get("status") == "accepted" and isinstance(snapshot, dict)
         raws = snapshot.get("items") if accepted else metadata.get("plan_items")
-        key_field = "id"
         for entry in state.get("expanded_items") if isinstance(state.get("expanded_items"), list) else []:
             if isinstance(entry, dict) and isinstance(entry.get("plan_item_id"), str):
                 links[entry["plan_item_id"]] = {
@@ -470,7 +471,7 @@ async def _plan_view(
 
     items = []
     for raw in raws:
-        key = _text(raw.get(key_field))
+        key = _text(raw.get("item_key")) or _text(raw.get("id"))
         if key is None:
             continue
         link = dict(links.get(key) or {})
@@ -482,7 +483,7 @@ async def _plan_view(
             if link.get("child_goal_id") else task_status.get(link.get("task_id"))
         )
         items.append(_plan_item_view(
-            raw, key, link, plan_item_state(bool(link), unit_status, gate_status.get(link.get("gate_id")))))
+            raw, key, link, plan_item_state(bool(link.get("task_id") or link.get("child_goal_id")), unit_status, gate_status.get(link.get("gate_id")))))
     scope = contract.get("scope") if isinstance(contract, dict) else None
     return OrchestrationPlanView(
         status=_text(state.get("status")), artifact_id=artifact.id,

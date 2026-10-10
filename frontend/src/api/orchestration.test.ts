@@ -424,7 +424,8 @@ describe('orchestration API', () => {
   })
 
   it('rejects a stale correction with the 409 status and detail', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: 'stale_contract' }), {
+    const staleDetail = { conflict: 'stale_preview', message: 'Preview is stale', preview: {} }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: staleDetail }), {
       status: 409,
       headers: { 'Content-Type': 'application/json' },
     }))
@@ -432,7 +433,7 @@ describe('orchestration API', () => {
 
     await expect(
       applyGoalTypeCorrection('project-1', { ...correction, previewFingerprint: 'b'.repeat(64) }),
-    ).rejects.toMatchObject({ status: 409, detail: 'stale_contract' })
+    ).rejects.toMatchObject({ status: 409, detail: staleDetail })
   })
 
   it('does not retry the correction preview', () => {
