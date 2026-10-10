@@ -369,3 +369,20 @@ async def test_parent_auto_child_waits_for_parent_renewal_then_runs_without_star
     monkeypatch.setattr(svc, "_advance_authorized_execution", probe)
     ran = await svc.tick(db_session, successor.id)  # no human Start
     assert ran["authorized_execution"] == {"step": "probe", "run_id": str(successor.id)}
+
+
+async def test_apply_stale_run_and_stale_contract_conflicts_write_nothing(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    request, _ = await _request(db_session, goal, run)
+    before = await _counts(db_session)
+    for bad, code in (
+        (request.model_copy(update={"expected_run_id": uuid.uuid4()}), "stale_run"),
+        (request.model_copy(update={"expected_contract_fingerprint": "0" * 64}), "stale_contract"),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await _apply(db_session, goal, bad)
+        # The request change alters the preview fingerprint, so stale_preview wins; the fresh preview names the blocker.
+        assert exc.value.status_code == 409 and exc.value.detail["conflict"] in ("stale_preview", code)
+        assert code in {b["code"] for b in exc.value.detail["preview"]["blockers"]}
+    assert await _counts(db_session) == before
+    assert (goal.goal_type, run.status, run.terminal_reason) == ("outcome", "running", None)
