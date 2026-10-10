@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, OrchestrationProcessRunRecord } from '@/lib/types'
 import {
+  acceptanceVerdictLabel,
+  planStatusLabel,
+  runLabel,
+  runTerminalReasonLabel,
   correctionAuthorityLabel,
   BASELINE_PROCESS_TYPES,
   authorizationReasonLabel,
@@ -396,5 +400,17 @@ describe('planning hierarchy labels', () => {
     expect(authorizationReasonLabel('contract_changed_since_start')).toBe('the goal changed after you started it')
     expect(authorizationReasonLabel('budget_exhausted')).toBe('the budget is used up')
     expect(authorizationReasonLabel('some_new_reason')).toBe('some new reason')
+  })
+})
+
+describe('plan tab labels', () => {
+  it('labels run terminal reasons, plan statuses, verdicts and run versions', () => {
+    expect(runTerminalReasonLabel('reclassified')).toBe('Reclassified')
+    expect(runTerminalReasonLabel('timed_out')).toBe('Timed Out')
+    expect(planStatusLabel('revision_requested')).toBe('Revision requested')
+    expect(planStatusLabel('requested')).toBe('Being drafted')
+    expect(planStatusLabel('weird_status')).toBe('Weird Status')
+    expect(acceptanceVerdictLabel('superseded')).toBe('Superseded')
+    expect(runLabel('v2')).toBe('Run 2')
   })
 })

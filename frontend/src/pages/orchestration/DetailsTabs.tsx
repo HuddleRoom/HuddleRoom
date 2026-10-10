@@ -21,6 +21,9 @@ import { ActivityLog, type ActivityScope } from './ActivityLog'
 import { ConversationPanel } from './ConversationPanel'
 import { BASELINE_PROCESS_TYPES, errorRecord, processLabel } from './humanize'
 import { useGoalAnnouncer } from './goalAnnouncer'
+import { PlanTab } from './PlanTab'
+
+export { ChildGoalList, PlanItemList, PlanOverview, PlanTab } from './PlanTab'
 
 // requestAnimationFrame doesn't exist in the vitest unit-test environment
 // (`environment: 'node'`, no browser globals) — same reason SecondarySection
@@ -189,6 +192,9 @@ export interface DetailsTabsProps {
   decisionFocusId?: string | null
   decisionNavigation?: string | null
   goalPlanContent: ReactNode
+  // Optional lookups so the Plan tab can name agents and adopted tasks.
+  taskTitles?: Readonly<Record<string, string>>
+  agentRoles?: Readonly<Record<string, string>>
   gatesContent: ReactNode
   delegationsContent: ReactNode
   suggestionsContent: ReactNode
@@ -205,7 +211,7 @@ const BASE_TABS: { key: DetailsTabKey; label: string }[] = [
 
 export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(function DetailsTabs({
   projectId, goalId, detail, processes, decisions, warnings, selectedStepType, memory, debug,
-  goalPlanContent, gatesContent, delegationsContent, suggestionsContent, debugContent, decisionFocusId = null, decisionNavigation = null,
+  goalPlanContent, taskTitles, agentRoles, gatesContent, delegationsContent, suggestionsContent, debugContent, decisionFocusId = null, decisionNavigation = null,
 }, ref) {
   const tabs = debug ? [...BASE_TABS, { key: 'debug' as const, label: 'Debug' }] : BASE_TABS
   const [activeTab, setActiveTab] = useState<DetailsTabKey>('ledger')
@@ -297,6 +303,7 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
         <Panel>
           <div className="flex flex-col gap-4">
             {goalPlanContent}
+            <PlanTab projectId={projectId} detail={detail} decisions={decisions} taskTitles={taskTitles} agentRoles={agentRoles} onViewDecision={showDecisionActivity} />
             {suggestionsContent}
           </div>
         </Panel>

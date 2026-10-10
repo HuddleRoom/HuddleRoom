@@ -438,3 +438,26 @@ const AUTHORIZATION_REASON_LABELS: Record<string, string> = {
 
 export const authorizationReasonLabel = (code: string): string =>
   AUTHORIZATION_REASON_LABELS[code] ?? titleCase(code).toLowerCase()
+
+const RUN_TERMINAL_REASON_LABELS: Record<string, string> = {
+  reclassified: 'Reclassified',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+  failed: 'Failed',
+}
+export const runTerminalReasonLabel = (reason: string): string => labelFrom(RUN_TERMINAL_REASON_LABELS, reason)
+
+const PLAN_STATUS_LABELS: Record<string, string> = {
+  requested: 'Being drafted',
+  proposed: 'Proposed',
+  accepted: 'Accepted',
+  revision_requested: 'Revision requested',
+  revision_required: 'Revision required',
+}
+export const planStatusLabel = (status: string): string => labelFrom(PLAN_STATUS_LABELS, status)
+
+// pending / accepted / rejected / superseded; plain title case is the label.
+export const acceptanceVerdictLabel = (verdict: string): string => titleCase(verdict)
+
+// "v3" -> "Run 3" (the API's run version_label is "v{n}").
+export const runLabel = (versionLabel: string): string => `Run ${versionLabel.replace(/^v/i, '')}`

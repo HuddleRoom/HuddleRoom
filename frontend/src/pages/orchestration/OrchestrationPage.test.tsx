@@ -397,7 +397,7 @@ describe('OrchestrationPage', () => {
     const { OrchestrationPage } = await import('./OrchestrationPage')
     const markup = renderToStaticMarkup(<OrchestrationPage />)
 
-    expect(markup).toContain('Accepted plan')
+    expect(markup).toContain('aria-label="Runs"')
     expect(markup).toContain('Request independent validation')
     expect(markup).toContain('release-ready')
     expect(markup).toContain('No evidence recorded')

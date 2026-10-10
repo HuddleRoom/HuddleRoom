@@ -1657,6 +1657,8 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           debug={debug}
           decisionFocusId={decisionFocusId}
           decisionNavigation={decisionNavigation}
+          taskTitles={Object.fromEntries((tasksQuery.items ?? []).map((task) => [task.id, task.title]))}
+          agentRoles={Object.fromEntries([...agentsById].map(([id, agent]) => [id, agent.role]))}
           goalPlanContent={<>
             {/* The tab itself is the disclosure (item 4: unwrap double-
                 disclosure) — these no longer need their own collapsible. */}
@@ -1675,28 +1677,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
               <ScalarRecord label="Budget" value={goal.budget} />
             </section>
 
-            {run ? <section className="mt-4 border-t border-huddleroom-border pt-4">
-              <h3 className="text-xs font-medium text-huddleroom-text-muted">{run.plan_state.status === 'accepted' ? 'Accepted plan' : 'Plan state'}</h3>
-              <div className="mt-2 grid gap-2 text-sm sm:grid-cols-2">
-                <span>Status <StatusBadge status={String(run.plan_state.status ?? 'pending')} /></span>
-                <span title={`Planning task ${run.plan_state.planning_task_id ?? '—'}`}>Planning task</span>
-                <span title={`Artifact ${run.plan_state.accepted_artifact_id ?? '—'}`}>Artifact</span>
-                <span>{run.plan_state.revision_requests?.length ?? 0} revisions</span>
-              </div>
-              {(run.plan_state.expanded_items ?? []).length > 0 && (
-                <ul className="mt-3 divide-y divide-huddleroom-border border-t border-huddleroom-border">
-                  {(run.plan_state.expanded_items ?? []).map((item, index) => (
-                    <li key={item.plan_item_id ?? index} className="py-2 text-xs" title={`work function ${item.work_function ?? 'unspecified'} · task ${item.task_id ?? '—'} · gate ${item.gate_id ?? '—'}`}>
-                      <span className="font-medium text-huddleroom-text-primary">{item.plan_item_id ?? `item-${index + 1}`}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {debug && <JsonDetails label="Raw plan state" value={run.plan_state} />}
-            </section> : <section className="mt-4 border-t border-huddleroom-border pt-4">
-              <h3 className="text-xs font-medium text-huddleroom-text-muted">Plan state</h3>
-              <p className="mt-2 text-sm text-huddleroom-text-secondary">No orchestration run is attached to this goal.</p>
-            </section>}
+            {debug && run && <JsonDetails label="Raw plan state" value={run.plan_state} />}
           </>}
           gatesContent={
             <GatesPanel

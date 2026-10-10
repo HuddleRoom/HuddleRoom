@@ -1,9 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import React, { act, createRef } from 'react'
+import { MemoryRouter } from 'react-router-dom'
 import { descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import type {
   OrchestrationAuthorityDecisionRecord,
+  OrchestrationChildGoal,
+  OrchestrationEvidence,
   OrchestrationGoalDetail,
+  OrchestrationPlanItemView,
+  OrchestrationRunSummary,
   OrchestrationProcessRunRecord,
   OrchestrationWarningRecord,
 } from '@/lib/types'
@@ -24,7 +29,12 @@ const conversationMock = {
   isLoading: false, isError: false, refetch: vi.fn(),
 }
 
+const goalDetailMock = vi.fn((_projectId: string | null, _goalId: string | undefined): {
+  data?: OrchestrationGoalDetail; isLoading: boolean; isError: boolean
+} => ({ data: undefined, isLoading: false, isError: false }))
+
 vi.mock('@/api/orchestration', () => ({
+  useOrchestrationGoal: (projectId: string | null, goalId: string | undefined) => goalDetailMock(projectId, goalId),
   useOrchestrationMemorySection: (...args: [string | null, string | undefined, string | undefined]) => memorySectionMock(...args),
   useStepOrchestrationBaseline: () => debugStepMock,
   useRerunLastOrchestrationBaseline: () => debugRerunMock,
@@ -36,7 +46,7 @@ vi.mock('@/api/orchestration', () => ({
   useDismissOrchestrationSteeringProposal: () => ({ isPending: false, isError: false, error: null, mutate: vi.fn() }),
 }))
 
-import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
+import { ChildGoalList, DetailsTabs, PlanItemList, PlanOverview, PlanTab, type DetailsTabsHandle } from './DetailsTabs'
 
 const ISO = { started: '2026-08-05T08:00:00Z', completed: '2026-08-05T09:00:00Z' }
 
@@ -166,6 +176,7 @@ beforeEach(() => {
   memorySectionMock.mockClear()
   debugStepMock.mutate.mockReset()
   debugRerunMock.mutate.mockReset()
+  goalDetailMock.mockClear()
 })
 
 describe('DetailsTabs', () => {
@@ -433,5 +444,248 @@ describe('DetailsTabs', () => {
     } finally {
       view.cleanup()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Plan tab
+// ---------------------------------------------------------------------------
+
+function run(overrides: Partial<OrchestrationRunSummary> = {}): OrchestrationRunSummary {
+  return {
+    id: 'run-2', status: 'running', phase: 'planning', cycle_key: null, supersedes_run_id: 'run-1',
+    terminal_reason: null, goal_type_snapshot: 'roadmap', planning_mode_snapshot: 'roadmap',
+    goal_contract_fingerprint: 'fp-2', started_at: '2026-08-06T08:00:00Z', completed_at: null,
+    version_label: 'v2', is_current: true,
+    ...overrides,
+  }
+}
+
+function item(overrides: Partial<OrchestrationPlanItemView> = {}): OrchestrationPlanItemView {
+  return {
+    key: 'build', unit_type: 'task', title: 'Build the thing', work_function: 'implementation', agent_id: 'agent-1',
+    depends_on: [], artifact_ids: [], why_runnable: 'No dependencies', priority: 50, adopt_task_id: null,
+    adopted: false, task_id: 'task-build', child_goal_id: null, gate_id: 'gate-build', state: 'started',
+    ...overrides,
+  }
+}
+
+function evidenceRow(overrides: Partial<OrchestrationEvidence> = {}): OrchestrationEvidence {
+  return {
+    id: 'evidence-1', run_id: 'run-2', gate_id: 'gate-build', source_type: 'task', source_id: null,
+    observed_event_id: null, producer_agent_id: null, verdict: 'candidate', evidence_metadata: {},
+    evidence_role: 'readiness', review_stage: 'preliminary', acceptance_verdict: 'pending',
+    created_at: ISO.started, updated_at: ISO.started,
+    ...overrides,
+  }
+}
+
+function child(overrides: Partial<OrchestrationChildGoal> = {}): OrchestrationChildGoal {
+  return {
+    id: 'child-1', objective: 'Deliver phase one', status: 'active', goal_type: 'roadmap', goal_type_source: 'parent_auto',
+    planning_mode: 'roadmap', roadmap_item_key: 'phase-1', roadmap_version: 3, current_run_id: 'child-run-1',
+    current_run_status: 'running', run_version_label: 'v1',
+    ...overrides,
+  }
+}
+
+const planBase = {
+  status: 'accepted', artifact_id: 'artifact-abcdef123456', kind: 'delivery' as const, author_agent_id: 'agent-planner',
+  planning_version: 3, planning_task_id: 'task-plan', summary: null, scope: null,
+}
+
+async function mountPlan(detail: OrchestrationGoalDetail, props: Partial<React.ComponentProps<typeof PlanTab>> = {}) {
+  return mountWithTestDom(() => <MemoryRouter><PlanTab projectId="project-1" detail={detail} {...props} /></MemoryRouter>, act)
+}
+
+function detailsBySummary(container: Parameters<typeof descendants>[0], summary: string) {
+  const found = descendants(container).find((node) => node.tagName === 'DETAILS'
+    && node.childNodes.some((c) => 'tagName' in c && (c as typeof node).tagName === 'SUMMARY' && textOf(c).startsWith(summary)))
+  if (!found) throw new Error(`details not found: ${summary}`)
+  return found
+}
+
+function summaryOf(details: ReturnType<typeof detailsBySummary>) {
+  return details.childNodes.find((c) => 'tagName' in c && (c as typeof details).tagName === 'SUMMARY') as typeof details
+}
+
+describe('Plan tab', () => {
+  it('labels current and historical runs and plan versions', async () => {
+    const runs = [
+      run({ id: 'run-1', version_label: 'v1', is_current: false, supersedes_run_id: null, terminal_reason: 'reclassified', status: 'cancelled', goal_type_snapshot: 'outcome' }),
+      run(),
+    ]
+    const view = await mountPlan(goalDetail({ runs, plan: { ...planBase, items: [] }, run: null }))
+    try {
+      const text = textOf(view.container)
+      expect(text).toContain('Run 2 · Current')
+      expect(text).toContain('Earlier runs (1)')
+      expect(text).toContain('Run 1 · Historical')
+      expect(text).toContain('Reclassified to Roadmap')
+      expect(text).toContain('v3 · Current')
+      expect(text).toContain('Earlier plan versions (2)')
+      expect(text).toContain('v2 · Historical (read-only)')
+      expect(text).toContain('Delivery plan')
+      expect(descendants(view.container).some((n) => n.getAttribute('title') === 'artifact-abcdef123456')).toBe(true)
+      expect(detailsBySummary(view.container, 'Earlier runs').getAttribute('open')).toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('shows empty, drafting and empty-proposal states', async () => {
+    const empty = await mountPlan(goalDetail({ runs: [run()], plan: null, run: null }))
+    try { expect(textOf(empty.container)).toContain("No plan yet. Items appear here once the plan author's plan is accepted.") } finally { empty.cleanup() }
+    const drafting = await mountPlan(goalDetail({ runs: [run()], plan: { ...planBase, status: 'requested', artifact_id: null, items: [] }, run: null }), { agentRoles: { 'agent-planner': 'Planner' } })
+    try { expect(textOf(drafting.container)).toContain('Plan is being drafted by Planner.') } finally { drafting.cleanup() }
+    const proposed = await mountPlan(goalDetail({ runs: [run()], plan: { ...planBase, status: 'proposed', items: [] }, run: null }))
+    try { expect(textOf(proposed.container)).toContain('No items in this proposal yet.') } finally { proposed.cleanup() }
+  })
+
+  it('shows the pending-replan callout and the revision heading', async () => {
+    const pendingRun = { plan_state: { pending_replan: { gate_id: 'gate-replan' } } } as unknown as OrchestrationGoalDetail['run']
+    const view = await mountPlan(goalDetail({ runs: [run()], run: pendingRun, plan: { ...planBase, items: [item()] } }))
+    try { expect(textOf(view.container)).toContain('A revised plan is proposed and awaiting approval. Items below are the current accepted plan.') } finally { view.cleanup() }
+    const revision = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, status: 'revision_requested', items: [item()] } }))
+    try { expect(textOf(revision.container)).toContain('Current accepted plan (revision requested)') } finally { revision.cleanup() }
+  })
+
+  it('renders item cards with dependencies, artifacts, adoption, owner and priority', async () => {
+    const plan = { ...planBase, items: [
+      item({ key: 'design', title: 'Design it', state: 'started', task_id: null, gate_id: null }),
+      item({ key: 'build', depends_on: ['design'], state: 'queued', artifact_ids: ['artifact-zzzzzzzz9999'], adopt_task_id: 'task-old', priority: 80, why_runnable: 'Design finished' }),
+    ] }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan }), { taskTitles: { 'task-old': 'Earlier spike' }, agentRoles: { 'agent-1': 'Developer' } })
+    try {
+      const text = textOf(view.container)
+      expect(text).toContain('Preliminary evidence can unblock dependent work but never satisfies a final criterion.')
+      expect(text).toContain('Waiting on: Design it')
+      expect(text).toContain('Depends onDesign it')
+      expect(text).toContain('Reuses taskEarlier spike')
+      expect(text).toContain('OwnerDeveloper · implementation')
+      expect(text).toContain('Priority 80')
+      expect(text).not.toContain('Priority 50')
+      expect(text).toContain('Queued')
+      expect(descendants(view.container).some((n) => n.getAttribute('title') === 'artifact-zzzzzzzz9999')).toBe(true)
+      expect(descendants(view.container).some((n) => n.getAttribute('aria-label') === 'Plan items')).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('shows why-runnable once dependencies are met', async () => {
+    const plan = { ...planBase, items: [
+      item({ key: 'design', title: 'Design it', state: 'accepted' }),
+      item({ key: 'build', depends_on: ['design'], state: 'queued', why_runnable: 'Design finished' }),
+    ] }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan }))
+    try { expect(textOf(view.container)).toContain('Why runnable: Design finished') } finally { view.cleanup() }
+  })
+
+  it('never shows a pending-evidence item as Accepted and keeps stage and verdict separate', async () => {
+    const plan = { ...planBase, items: [item({ state: 'evidence_pending' })] }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan, evidence: [evidenceRow()] }))
+    try {
+      const card = descendants(view.container).find((n) => n.tagName === 'LI' && textOf(n).startsWith('Build the thing'))!
+      const evidence = descendants(card).find((n) => n.getAttribute('aria-label') === 'Evidence')!
+      expect(textOf(evidence)).toContain('Readiness · Preliminary')
+      expect(textOf(evidence)).toContain('Pending')
+      expect(textOf(evidence)).not.toContain('Accepted')
+      expect(textOf(descendants(card)[0]!)).toContain('Waiting for evidence')
+      expect(textOf(descendants(card)[0]!)).not.toContain('Accepted')
+    } finally { view.cleanup() }
+  })
+
+  it('shows the concise summary while the full report stays in a collapsed details as lists', async () => {
+    const plan = { ...planBase, items: [item()] }
+    const report = {
+      status: 'Implemented', changes: ['Added parser'], evidence: ['Test run green'], criterion_progress: { c1: 'half done' },
+      decisions: ['Use streams'], risks: ['Slow on big files'], open_questions: ['Which encoding?'], next_step: 'Review', collaboration_need: 'Needs QA',
+    }
+    const view = await mountPlan(goalDetail({
+      runs: [run()], run: null, plan, contract_fingerprint: 'contract-fp-123456',
+      task_reports: [{ task_id: 'task-build', session_id: 'session-abcdef12', summary: 'Implemented · next: Review', report }],
+    }))
+    try {
+      const full = detailsBySummary(view.container, 'Full report and provenance')
+      expect(full.getAttribute('open')).toBeNull()
+      expect(textOf(full)).not.toContain('Implemented · next: Review')
+      const card = descendants(view.container).find((n) => n.tagName === 'LI' && textOf(n).startsWith('Build the thing'))!
+      expect(textOf(card)).toContain('Implemented · next: Review')
+      const fullText = textOf(full)
+      for (const expected of ['Added parser', 'Test run green', 'c1: half done', 'Use streams', 'Slow on big files', 'Which encoding?', 'Review', 'Needs QA', 'Run 2']) {
+        expect(fullText).toContain(expected)
+      }
+      expect(fullText).not.toContain('{')
+      expect(descendants(full).some((n) => n.tagName === 'UL')).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('says when there is no report and scopes the agent context to titles', async () => {
+    const plan = { ...planBase, items: [
+      item({ key: 'design', title: 'Design it', state: 'accepted', task_id: 'task-design', gate_id: 'gate-design' }),
+      item({ key: 'build', depends_on: ['design'], adopt_task_id: 'task-old' }),
+    ] }
+    const goal = { ...goalDetail().goal, objective: 'Ship the details tabs.', success_criteria: [{ key: 'crit-1', description: 'Parser handles big files' }] }
+    const view = await mountPlan(goalDetail({
+      goal, runs: [run()], run: null, plan,
+      evidence: [evidenceRow({ id: 'e2', gate_id: 'gate-design', evidence_role: 'delivery', review_stage: 'final', acceptance_verdict: 'accepted' })],
+      task_reports: [{ task_id: 'task-design', session_id: 'session-x', summary: 'Designed', report: { status: 'Designed' } }],
+    }), { taskTitles: { 'task-old': 'Earlier spike' } })
+    try {
+      const cards = descendants(view.container).filter((n) => n.tagName === 'LI' && textOf(n).startsWith('Build the thing'))
+      expect(textOf(cards[0]!)).toContain('No report yet.')
+      const context = detailsBySummary(cards[0]!, 'Context given to the agent')
+      const text = textOf(context)
+      expect(text).toContain('Ship the details tabs.')
+      expect(text).toContain('Parser handles big files')
+      expect(text).toContain('Design it · Delivery · Final')
+      expect(text).toContain('Earlier spike')
+      expect(text).not.toContain('task-design')
+      expect(text).not.toContain('session-x')
+      expect(context.getAttribute('open')).toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('renders direct children only and fetches the next level lazily, one level deep', async () => {
+    const grandchild = child({ id: 'grand-1', objective: 'Deliver sub-phase', goal_type: 'roadmap', roadmap_version: 1 })
+    goalDetailMock.mockImplementation((_p, goalId) => goalId === 'child-1'
+      ? { data: goalDetail({ child_goals: [grandchild] }), isLoading: false, isError: false }
+      : { data: undefined, isLoading: false, isError: false })
+    const view = await mountPlan(goalDetail({
+      goal: { ...goalDetail().goal, goal_type: 'roadmap' }, runs: [run()], run: null, plan: { ...planBase, kind: 'roadmap', items: [] },
+      child_goals: [child(), child({ id: 'child-2', objective: 'Ship docs', goal_type: 'outcome', current_run_id: null })],
+    }))
+    try {
+      let text = textOf(view.container)
+      expect(text).toContain('Child goals')
+      expect(text).toContain('Deliver phase one')
+      expect(text).toContain('Run 1 · Current')
+      expect(text).toContain('Plan v3')
+      expect(text).toContain('Run 1 · Historical')
+      expect(text).not.toContain('Deliver sub-phase')
+      expect(goalDetailMock.mock.calls.every(([, goalId]) => goalId === undefined)).toBe(true)
+      expect(descendants(view.container).filter((n) => n.tagName === 'SUMMARY' && textOf(n) === 'Next level')).toHaveLength(1)
+
+      await act(async () => summaryOf(detailsBySummary(view.container, 'Next level')).click())
+      expect(goalDetailMock).toHaveBeenCalledWith('project-1', 'child-1')
+      text = textOf(view.container)
+      expect(text).toContain('Deliver sub-phase')
+      // grandchildren do not offer another level
+      expect(descendants(view.container).filter((n) => n.tagName === 'SUMMARY' && textOf(n) === 'Next level')).toHaveLength(1)
+      const links = descendants(view.container).filter((n) => n.tagName === 'A').map((n) => n.getAttribute('href'))
+      expect(links).toContain('/orchestration/child-1')
+    } finally { view.cleanup() }
+  })
+
+  it('shows an empty child list and exports the building blocks', async () => {
+    expect(typeof PlanOverview).toBe('function')
+    expect(typeof PlanItemList).toBe('function')
+    const view = await mountWithTestDom(() => <MemoryRouter><ChildGoalList projectId="project-1" goals={[]} /></MemoryRouter>, act)
+    try { expect(textOf(view.container)).toContain('No child goals released yet.') } finally { view.cleanup() }
+  })
+
+  it('mounts the plan inside the Plan tab', async () => {
+    const view = await mountWithTestDom(() => <MemoryRouter><Harness detail={goalDetail({ runs: [run()], plan: { ...planBase, items: [item()] }, run: null })} /></MemoryRouter>, act)
+    try {
+      expect(textOf(tabPanel(view.container, 'plan'))).toContain('Build the thing')
+      expect(textOf(tabPanel(view.container, 'plan'))).toContain('Goal-plan content.')
+    } finally { view.cleanup() }
   })
 })
