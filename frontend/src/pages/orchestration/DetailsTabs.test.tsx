@@ -613,6 +613,17 @@ describe('Plan tab', () => {
     } finally { view.cleanup() }
   })
 
+  it('Report row shows placeholder for an empty summary', async () => {
+    const plan = { ...planBase, items: [item()] }
+    const view = await mountPlan(goalDetail({
+      runs: [run()], run: null, plan,
+      task_reports: [{ task_id: 'task-build', session_id: 's1', summary: '  ', report: { status: 'done', changes: [], risks: [] } }],
+    }))
+    try {
+      expect(textOf(view.container)).toContain('ReportNo report yet.')
+    } finally { view.cleanup() }
+  })
+
   it('shows one earlier version singularly and drafting copy from the run plan state', async () => {
     const one = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, planning_version: 2, items: [] } }))
     try { expect(textOf(one.container)).toContain('1 earlier version (v1), not shown here.') } finally { one.cleanup() }

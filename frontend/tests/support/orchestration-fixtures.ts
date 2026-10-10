@@ -944,7 +944,7 @@ export function planningDetail(corrected: boolean) {
         task_id: null, child_goal_id: childGoalId, gate_id: null, state: 'started',
       }] : [],
     },
-    effective_authorization: realisticAuthorization(),
+    effective_authorization: { ...realisticAuthorization(), run_id: runId, contract_fingerprint: corrected ? 'fp-contract-roadmap' : 'fp-contract-outcome' },
     authorization_wait: null,
   }
 }

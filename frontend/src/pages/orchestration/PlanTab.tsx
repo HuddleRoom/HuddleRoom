@@ -219,7 +219,7 @@ export function PlanItemList({
         { key: 'Artifacts', value: item.artifact_ids.length > 0 ? <span className="flex flex-wrap gap-1">{item.artifact_ids.map((id) => <Tag key={id} className="font-mono"><span title={id}>{shortId(id)}</span></Tag>)}</span> : null },
         { key: 'Reuses task', value: item.adopt_task_id ? (adoptedTitle ?? <MonoId id={item.adopt_task_id} />) : null },
         { key: 'Owner', value: owner || null },
-        { key: 'Report', value: report?.summary ?? <span className="text-huddleroom-text-muted">No report yet.</span> },
+        { key: 'Report', value: report?.summary?.trim() || <span className="text-huddleroom-text-muted">No report yet.</span> },
       ]} />
       {itemEvidence.length > 0 && <ul aria-label="Evidence" className="flex flex-col gap-1 text-sm">
         {itemEvidence.map((entry) => {

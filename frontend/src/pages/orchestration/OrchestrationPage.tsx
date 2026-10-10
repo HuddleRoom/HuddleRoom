@@ -725,6 +725,8 @@ export function CorrectGoalTypeDialog({
   const applyButton = useRef<HTMLButtonElement>(null)
   const previewButton = useRef<HTMLButtonElement>(null)
   const previewHeading = useRef<HTMLHeadingElement>(null)
+  // Bumped on reset so a preview response that lands after the dialog was dismissed is ignored.
+  const generation = useRef(0)
   const applyFocusIntent = useRef(false)
   // The fieldset is disabled while previewing, which drops focus to the body; a manual
   // Preview lands on the result (heading) or, on failure, back on the Preview button.
@@ -759,10 +761,11 @@ export function CorrectGoalTypeDialog({
     setPhase('idle')
     applyFocusIntent.current = false
     previewFocusIntent.current = null
+    generation.current += 1
   }
 
   function handleOpenChange(next: boolean) {
-    if (busy) return
+    if (phase === 'applying') return
     if (!next) reset()
     onOpenChange(next)
   }
@@ -770,18 +773,22 @@ export function CorrectGoalTypeDialog({
   // Sends a preview request; the caller already holds the 'correct' mutation.
   function sendPreview(type: OrchestrationGoalType, text: string, expected: CorrectionExpected, manual: boolean) {
     setPhase('previewing')
+    const gen = generation.current
     previewMutation.mutate(
       { goalId, requestedGoalType: type, expectedRunId: expected.runId, expectedContractFingerprint: expected.fingerprint, rationale: text },
       {
         onSuccess: (data) => {
           releaseMutation('correct')
+          if (gen !== generation.current) return
           if (manual) previewFocusIntent.current = 'heading'
           setPreview({ data, selection: type, rationale: text, expected })
           setPhase('idle')
         },
         onError: (error) => {
           releaseMutation('correct')
-          if (manual) previewFocusIntent.current = 'button'
+          if (gen !== generation.current) return
+          applyFocusIntent.current = false
+          previewFocusIntent.current = 'button'
           setPreview(null)
           setNotice({ kind: 'error', text: correctionErrorText(error) })
           setPhase('idle')
@@ -801,11 +808,16 @@ export function CorrectGoalTypeDialog({
   // Stale 409: refetch the goal and preview against its current run/contract (the props
   // would still be the stale ones). The 'correct' mutation stays held throughout.
   async function refreshAndPreview(type: OrchestrationGoalType, text: string) {
+    const gen = generation.current
     let fresh: OrchestrationGoalDetail | undefined
     try {
       fresh = await refreshDetail()
     } catch {
       fresh = undefined
+    }
+    if (gen !== generation.current) {
+      releaseMutation('correct')
+      return
     }
     if (fresh?.run && fresh.contract_fingerprint) {
       sendPreview(type, text, { runId: fresh.run.id, fingerprint: fresh.contract_fingerprint }, false)

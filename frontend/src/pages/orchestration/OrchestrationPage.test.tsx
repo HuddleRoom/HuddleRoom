@@ -42,14 +42,20 @@ vi.mock('react-router-dom', () => ({
   useLocation: () => state.location,
 }))
 
+// Root shares onOpenChange so the footer Close (Cancel) can dismiss the dialog.
+const dialogClose = vi.hoisted(() => ({ current: undefined as undefined | ((open: boolean) => void) }))
 vi.mock('@radix-ui/react-dialog', () => ({
-  Root: ({ open, children }: { open?: boolean; children: React.ReactNode }) => open ? <>{children}</> : null,
+  Root: ({ open, onOpenChange, children }: { open?: boolean; onOpenChange?: (open: boolean) => void; children: React.ReactNode }) => {
+    dialogClose.current = onOpenChange
+    return open ? <>{children}</> : null
+  },
   Portal: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   Overlay: (props: React.HTMLAttributes<HTMLDivElement>) => <div {...props} />,
   Content: ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => <div {...props}>{children}</div>,
   Title: ({ children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => <h2 {...props}>{children}</h2>,
   Description: ({ children, ...props }: React.HTMLAttributes<HTMLParagraphElement>) => <p {...props}>{children}</p>,
-  Close: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  Close: ({ children }: { children: React.ReactElement<{ onClick?: () => void }> }) =>
+    React.cloneElement(children, { onClick: () => dialogClose.current?.(false) }),
 }))
 
 vi.mock('./goalAnnouncer', async (importOriginal) => {
@@ -1234,6 +1240,38 @@ describe('CorrectGoalTypeDialog', () => {
     const view = await mountDialog()
     try {
       await fillAndPreview(view)
+      expect(textOf(view.container)).toContain('Cannot preview this change.')
+      expect(view.activeElement).toBe(getButton(view.container, 'Preview change'))
+    } finally { view.cleanup() }
+  })
+
+  it('cancel while previewing closes the dialog and a late preview response is ignored', async () => {
+    let late: { onSuccess: (d: unknown) => void } | null = null
+    state.previewMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onSuccess: (d: unknown) => void }) => { late = opts })
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      await press(view, 'Cancel')
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+      await React.act(async () => { late?.onSuccess(previewFixture()) })
+      expect(textOf(view.container)).not.toContain('Retained evidence')
+      expect(state.previewMutation.mutate).toHaveBeenCalledTimes(1)
+      // Reopened: the form starts clean and Preview runs again.
+      await fillAndPreview(view)
+      expect(state.previewMutation.mutate).toHaveBeenCalledTimes(2)
+    } finally { view.cleanup() }
+  })
+
+  it('failed stale re-preview returns focus to the Preview button', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+      opts.onError(new ApiError(409, 'HTTP 409', { conflict: 'stale_contract', message: 'out of date' })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      state.previewMutation.mutate.mockImplementation((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+        opts.onError(new ApiError(422, 'HTTP 422', { message: 'Cannot preview this change.' })))
+      await press(view, 'Apply correction')
       expect(textOf(view.container)).toContain('Cannot preview this change.')
       expect(view.activeElement).toBe(getButton(view.container, 'Preview change'))
     } finally { view.cleanup() }
