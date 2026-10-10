@@ -962,8 +962,8 @@ class OrchestrationRunResponse(BaseModel):
     cycle_key: str | None = None
     supersedes_run_id: uuid.UUID | None = None
     terminal_reason: str | None = None
-    goal_type_snapshot: str | None = None
-    planning_mode_snapshot: str | None = None
+    goal_type_snapshot: GoalType | None = None
+    planning_mode_snapshot: PlanningMode | None = None
     goal_contract_fingerprint: str | None = None
     # ponytail: default lets the response validate before `condition` (a
     # derived, non-column value) is injected by the router; always
@@ -1058,8 +1058,44 @@ class OrchestrationEvidenceResponse(BaseModel):
     producer_agent_id: uuid.UUID | None
     verdict: str
     evidence_metadata: dict
+    # Derived from the gate by the router (evidence_semantics); not stored on the row.
+    evidence_role: Literal["discovery", "readiness", "delivery", "verification", "integration"] | None = None
+    review_stage: Literal["preliminary", "final"] | None = None
+    acceptance_verdict: Literal["pending", "accepted", "rejected", "superseded"] | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class OrchestrationRunSummaryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: str
+    phase: str
+    cycle_key: str | None = None
+    supersedes_run_id: uuid.UUID | None = None
+    terminal_reason: str | None = None
+    goal_type_snapshot: GoalType | None = None
+    planning_mode_snapshot: PlanningMode | None = None
+    goal_contract_fingerprint: str | None = None
+    started_at: datetime
+    completed_at: datetime | None = None
+    version_label: str
+    is_current: bool
+
+
+class OrchestrationChildGoalResponse(BaseModel):
+    id: uuid.UUID
+    objective: str
+    status: str
+    goal_type: GoalType
+    goal_type_source: GoalTypeSource
+    planning_mode: PlanningMode
+    roadmap_item_key: str | None = None
+    roadmap_version: int | None = None
+    current_run_id: uuid.UUID | None = None
+    current_run_status: str | None = None
+    run_version_label: str | None = None
 
 
 class OrchestrationGoalResponse(BaseModel):
@@ -1079,10 +1115,10 @@ class OrchestrationGoalResponse(BaseModel):
     manager_agent_id: uuid.UUID | None = None
     manager_user_id: uuid.UUID | None = None
     authority_model: str | None = None
-    goal_type: str
-    goal_type_source: str
+    goal_type: GoalType
+    goal_type_source: GoalTypeSource
     goal_type_rationale: str
-    planning_mode: str
+    planning_mode: PlanningMode
     planning_rationale: str
     supersedes_goal_id: uuid.UUID | None = None
     parent_goal_id: uuid.UUID | None = None
@@ -1170,6 +1206,10 @@ class OrchestrationGoalDetailResponse(BaseModel):
     children: list[uuid.UUID] | None = None
     budget_summary: OrchestrationRoadmapBudgetResponse | None = None
     supervision: OrchestrationSupervisionResponse | None = None
+    contract_fingerprint: str | None = None
+    runs: list[OrchestrationRunSummaryResponse] = Field(default_factory=list)
+    child_goals: list[OrchestrationChildGoalResponse] = Field(default_factory=list)
+    effective_authorization: AuthorizationResult | None = None
 
 
 class OrchestrationProcessRunResponse(BaseModel):

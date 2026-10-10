@@ -18,8 +18,10 @@ from huddleroom.models.orchestration import (
     OrchestrationGate,
     OrchestrationGoal,
     OrchestrationRoadmapItem,
+    OrchestrationRoadmapVersion,
     OrchestrationRun,
     OrchestrationWait,
+    compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
@@ -30,6 +32,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationActionResponse,
     OrchestrationAgentSuggestionResponse,
     OrchestrationAuthorityDecisionResponse,
+    OrchestrationChildGoalResponse,
     OrchestrationDebugActionResponse,
     OrchestrationDebugRerunRequest,
     OrchestrationDebugStepRequest,
@@ -65,10 +68,13 @@ from huddleroom.schemas.orchestration import (
     OrchestrationRoadmapItemResponse,
     OrchestrationRoadmapVersionResponse,
     OrchestrationRunResponse,
+    OrchestrationRunSummaryResponse,
     OrchestrationSupervisionResponse,
     OrchestrationTickResponse,
 )
+from huddleroom.services.orchestration_authority_service import effective_authorization
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
+from huddleroom.services.orchestration_dependencies import evidence_semantics
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
 from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
@@ -319,6 +325,61 @@ async def _conversation_allowance(
     )
 
 
+def _version_labels(runs: list[OrchestrationRun]) -> dict[uuid.UUID, str]:
+    # ponytail: Continuous cycle runs unbounded; paginate if a goal exceeds ~100 runs.
+    return {run.id: f"v{index}" for index, run in enumerate(runs, start=1)}
+
+
+async def _run_history(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+) -> list[OrchestrationRunSummaryResponse]:
+    runs = (await db.scalars(
+        select(OrchestrationRun).where(OrchestrationRun.goal_id == goal.id)
+        .order_by(OrchestrationRun.started_at.asc(), OrchestrationRun.id.asc())
+    )).all()
+    labels = _version_labels(runs)
+    return [
+        OrchestrationRunSummaryResponse(
+            **{name: getattr(item, name) for name in OrchestrationRunSummaryResponse.model_fields
+               if name not in ("version_label", "is_current")},
+            version_label=labels[item.id], is_current=item.id == run.id)
+        for item in runs
+    ]
+
+
+async def _child_goals(db: AsyncSession, goal: OrchestrationGoal) -> list[OrchestrationChildGoalResponse]:
+    children = (await db.scalars(
+        select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == goal.id)
+        .order_by(OrchestrationGoal.created_at.asc(), OrchestrationGoal.id.asc())
+    )).all()
+    if not children:
+        return []
+    child_runs: dict[uuid.UUID, list[OrchestrationRun]] = {}
+    for item in await db.scalars(
+        select(OrchestrationRun).where(OrchestrationRun.goal_id.in_([child.id for child in children]))
+        .order_by(OrchestrationRun.started_at.asc(), OrchestrationRun.id.asc())
+    ):
+        child_runs.setdefault(item.goal_id, []).append(item)
+    version_ids = {child.roadmap_version_id for child in children if child.roadmap_version_id}
+    versions = dict((await db.execute(
+        select(OrchestrationRoadmapVersion.id, OrchestrationRoadmapVersion.version)
+        .where(OrchestrationRoadmapVersion.id.in_(version_ids))
+    )).all()) if version_ids else {}
+    result = []
+    for child in children:
+        runs = child_runs.get(child.id, [])
+        latest = runs[-1] if runs else None
+        result.append(OrchestrationChildGoalResponse(
+            id=child.id, objective=child.objective, status=child.status, goal_type=child.goal_type,
+            goal_type_source=child.goal_type_source, planning_mode=child.planning_mode,
+            roadmap_item_key=child.roadmap_item_key, roadmap_version=versions.get(child.roadmap_version_id),
+            current_run_id=latest.id if latest else None,
+            current_run_status=latest.status if latest else None,
+            run_version_label=_version_labels(runs)[latest.id] if latest else None,
+        ))
+    return result
+
+
 async def _detail(
     db: AsyncSession,
     goal: OrchestrationGoal,
@@ -357,19 +418,27 @@ async def _detail(
             .where(OrchestrationGate.run_id == run.id)
             .order_by(OrchestrationGate.created_at.asc(), OrchestrationGate.id.asc())
         )
-        gates = [
-            OrchestrationGateResponse.model_validate(gate)
-            for gate in gate_rows.scalars().all()
-        ]
+        gate_models = gate_rows.scalars().all()
+        gates = [OrchestrationGateResponse.model_validate(gate) for gate in gate_models]
 
         evidence_rows = await db.execute(
             select(OrchestrationEvidence)
             .where(OrchestrationEvidence.run_id == run.id)
             .order_by(OrchestrationEvidence.created_at.asc(), OrchestrationEvidence.id.asc())
         )
+        evidence_models = evidence_rows.scalars().all()
+        # Evidence may sit on a gate from an older run (post-correction), so load any gate not in this run.
+        gate_by_id = {gate.id: gate for gate in gate_models}
+        missing_gate_ids = {row.gate_id for row in evidence_models} - gate_by_id.keys()
+        if missing_gate_ids:
+            gate_by_id.update({gate.id: gate for gate in await db.scalars(
+                select(OrchestrationGate).where(OrchestrationGate.id.in_(missing_gate_ids)))})
         evidence = [
-            OrchestrationEvidenceResponse.model_validate(row)
-            for row in evidence_rows.scalars().all()
+            OrchestrationEvidenceResponse.model_validate(row).model_copy(update=evidence_semantics(
+                gate_by_id[row.gate_id].gate_type, gate_by_id[row.gate_id].required_evidence,
+                row.source_type, row.verdict, run.terminal_reason,
+            ))
+            for row in evidence_models
         ]
 
         suggestion_rows = await db.execute(
@@ -595,6 +664,13 @@ async def _detail(
         children=children,
         budget_summary=budget_summary,
         supervision=supervision,
+        contract_fingerprint=compute_goal_contract_fingerprint(goal),
+        runs=await _run_history(db, goal, run) if run is not None else [],
+        child_goals=await _child_goals(db, goal),
+        effective_authorization=(
+            await effective_authorization(db, goal, run)
+            if run is not None and goal.status not in ("completed", "cancelled") else None
+        ),
     )
 
 

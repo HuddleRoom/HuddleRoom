@@ -1,4 +1,6 @@
+import json
 import uuid
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import func, inspect as sa_inspect, select
@@ -9,7 +11,9 @@ from huddleroom.models.orchestration import (
     OrchestrationGate,
     OrchestrationGoal,
     OrchestrationRun,
+    compute_goal_contract_fingerprint,
 )
+from huddleroom.schemas.orchestration import AuthorizationResult
 from huddleroom.services.orchestration_service import OrchestrationService
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 
@@ -113,6 +117,7 @@ DETAIL_RESPONSE_KEYS = {
     "goal", "run", "decisions", "actions", "gates", "evidence", "agent_suggestions", "timeline",
     "decisions_count", "actions_count", "gates_count", "evidence_count", "agent_suggestions_count",
     "roadmap_version", "roadmap_items", "children", "budget_summary", "supervision",
+    "contract_fingerprint", "runs", "child_goals", "effective_authorization",
 }
 
 
@@ -690,3 +695,122 @@ async def test_goal_type_unknown_goal_404_and_bad_body_422(client, db_session, a
     assert (await client.post(_type_url(test_project, ghost), json={**body, **fp}, headers=auth_headers)).status_code == 404
     assert (await client.post(_type_url(test_project, goal, "type-preview"), json={}, headers=auth_headers)).status_code == 422
     assert (await client.post(_type_url(test_project, goal), json=body, headers=auth_headers)).status_code == 422
+
+
+async def _create_detail(client, test_project, objective="Detail goal"):
+    base = f"/api/v1/projects/{test_project.id}/orchestration/goals"
+    created = await client.post(base, json=_goal_payload(objective))
+    assert created.status_code == 201, created.text
+    return f"{base}/{created.json()['goal']['id']}", created.json()
+
+
+@pytest.mark.asyncio
+async def test_detail_exposes_contract_fingerprint_and_baseline_authorization(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    goal = await db_session.get(OrchestrationGoal, uuid.UUID(body["goal"]["id"]))
+    detail = (await client.get(url)).json()
+
+    assert detail["contract_fingerprint"] == compute_goal_contract_fingerprint(goal)
+    auth = detail["effective_authorization"]
+    assert set(auth) == set(AuthorizationResult.model_fields)
+    assert auth["run_id"] == body["run"]["id"]
+
+    goal.status = "cancelled"
+    await db_session.flush()
+    cancelled = (await client.get(url)).json()
+    assert cancelled["effective_authorization"] is None
+    assert cancelled["contract_fingerprint"] == compute_goal_contract_fingerprint(goal)
+
+
+@pytest.mark.asyncio
+async def test_detail_without_run_has_no_runs_or_authorization(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    await db_session.delete(await db_session.get(OrchestrationRun, uuid.UUID(body["run"]["id"])))
+    await db_session.flush()
+    detail = (await client.get(url)).json()
+
+    assert detail["runs"] == [] and detail["effective_authorization"] is None
+    assert detail["child_goals"] == []
+    assert len(detail["contract_fingerprint"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_detail_run_history_labels_versions_and_marks_current(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    run1 = await db_session.get(OrchestrationRun, uuid.UUID(body["run"]["id"]))
+    # Cancel first: one active run per goal.
+    run1.status, run1.terminal_reason = "cancelled", "reclassified"
+    await db_session.flush()
+    run2 = OrchestrationRun(
+        goal_id=run1.goal_id, supersedes_run_id=run1.id, goal_type_snapshot="roadmap",
+        planning_mode_snapshot="roadmap", started_at=run1.started_at + timedelta(seconds=5),
+    )
+    db_session.add(run2)
+    await db_session.flush()
+
+    runs = (await client.get(url)).json()["runs"]
+
+    assert [(r["id"], r["version_label"], r["is_current"]) for r in runs] == [
+        (str(run1.id), "v1", False), (str(run2.id), "v2", True),
+    ]
+    assert (runs[0]["status"], runs[0]["terminal_reason"], runs[0]["supersedes_run_id"]) == (
+        "cancelled", "reclassified", None)
+    assert runs[1]["supersedes_run_id"] == str(run1.id)
+    assert (runs[1]["goal_type_snapshot"], runs[1]["planning_mode_snapshot"]) == ("roadmap", "roadmap")
+
+
+@pytest.mark.asyncio
+async def test_detail_evidence_semantics_are_derived_for_legacy_rows(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    run_id = uuid.UUID(body["run"]["id"])
+    declared = OrchestrationGate(
+        run_id=run_id, success_criterion_key="declared", gate_type="validation_passed",
+        required_evidence={"evidence_role": "discovery", "review_stage": "preliminary"}, status="open",
+    )
+    legacy = OrchestrationGate(
+        run_id=run_id, success_criterion_key="legacy", gate_type="validation_passed",
+        required_evidence={}, status="accepted",
+    )
+    db_session.add_all([declared, legacy])
+    await db_session.flush()
+    db_session.add_all([
+        OrchestrationEvidence(run_id=run_id, gate_id=declared.id, source_type="task", verdict="candidate",
+                              evidence_metadata={}),
+        OrchestrationEvidence(run_id=run_id, gate_id=legacy.id, source_type="verification", verdict="accepted",
+                              evidence_metadata={}),
+    ])
+    await db_session.flush()
+
+    rows = {e["gate_id"]: e for e in (await client.get(url)).json()["evidence"]}
+
+    assert {k: rows[str(declared.id)][k] for k in ("evidence_role", "review_stage", "acceptance_verdict")} == {
+        "evidence_role": "discovery", "review_stage": "preliminary", "acceptance_verdict": "pending"}
+    assert {k: rows[str(legacy.id)][k] for k in ("evidence_role", "review_stage", "acceptance_verdict")} == {
+        "evidence_role": "verification", "review_stage": "final", "acceptance_verdict": "accepted"}
+
+
+@pytest.mark.asyncio
+async def test_detail_lists_released_roadmap_child_with_private_key_set(client, db_session, test_project):
+    from tests.test_orchestration_roadmap_children import goal_item, release
+
+    _, parent, _, _, _ = await release(db_session, test_project, goal_item("alpha"))
+    detail = (await client.get(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{parent.id}")).json()
+
+    assert len(detail["child_goals"]) == 1
+    child = detail["child_goals"][0]
+    assert set(child) == {
+        "id", "objective", "status", "goal_type", "goal_type_source", "planning_mode", "roadmap_item_key",
+        "roadmap_version", "current_run_id", "current_run_status", "run_version_label",
+    }
+    assert child["id"] == detail["children"][0]
+    assert (child["roadmap_item_key"], child["roadmap_version"], child["run_version_label"]) == ("alpha", 1, "v1")
+    assert child["current_run_status"] == "running" and child["current_run_id"]
+    assert detail["runs"] and detail["runs"][0]["is_current"]
+    dumped = json.dumps(detail["child_goals"])
+    assert "parent_contract_snapshot" not in dumped and "workspace_policy" not in dumped
+
+    # Direct children only: the child's own detail lists no grandchild.
+    child_detail = (await client.get(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{child['id']}")).json()
+    assert child_detail["child_goals"] == []
