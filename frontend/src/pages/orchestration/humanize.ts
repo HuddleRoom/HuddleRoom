@@ -411,3 +411,24 @@ export const workspaceMutationLabel = (mode: string): string => labelFrom(WORKSP
 export function evidenceLabel(role: string, stage: string, verdict?: string | null): string {
   return [role, stage, verdict].filter(Boolean).map((part) => titleCase(part as string)).join(' · ')
 }
+
+// Lowercase clause that completes "Start isn't available: ..." style sentences.
+const AUTHORIZATION_REASON_LABELS: Record<string, string> = {
+  run_not_active: 'the goal is not active',
+  parent_release_pending: 'the parent plan has not accepted this goal yet',
+  parent_release_missing: 'the parent plan has not released this goal yet',
+  parent_reservation_inactive: "the parent's budget reservation for this goal is no longer active",
+  contract_changed_since_release: 'the goal changed after the parent plan released it',
+  baseline_not_authorized: 'the baseline has not been authorized',
+  start_required: 'work has not been started yet',
+  contract_changed_since_start: 'the goal changed after you started it',
+  budget_exhausted: 'the budget is used up',
+  agent_outside_accepted_team: 'the assigned agent is not on the accepted team',
+  model_spend_not_granted: 'model spend is not granted for this task',
+  external_write_not_granted: 'external writes are not granted',
+  live_send_not_granted: 'live sends are not granted',
+  workspace_mutation_exceeds_policy: 'the task asks for more workspace access than the goal allows',
+}
+
+export const authorizationReasonLabel = (code: string): string =>
+  AUTHORIZATION_REASON_LABELS[code] ?? titleCase(code).toLowerCase()

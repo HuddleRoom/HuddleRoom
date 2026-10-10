@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, OrchestrationProcessRunRecord } from '@/lib/types'
 import {
   BASELINE_PROCESS_TYPES,
+  authorizationReasonLabel,
   errorRecord,
   evidenceLabel,
   goalTypeLabel,
@@ -383,5 +384,11 @@ describe('planning hierarchy labels', () => {
   it('labels evidence by role and stage, verdict optional', () => {
     expect(evidenceLabel('readiness', 'preliminary')).toBe('Readiness · Preliminary')
     expect(evidenceLabel('readiness', 'preliminary', 'pending')).toBe('Readiness · Preliminary · Pending')
+  })
+
+  it('words authorization reasons as lowercase clauses with a readable fallback', () => {
+    expect(authorizationReasonLabel('contract_changed_since_start')).toBe('the goal changed after you started it')
+    expect(authorizationReasonLabel('budget_exhausted')).toBe('the budget is used up')
+    expect(authorizationReasonLabel('some_new_reason')).toBe('some new reason')
   })
 })

@@ -481,6 +481,7 @@ export interface OrchestrationGoal {
   goal_type_rationale: string
   planning_mode: OrchestrationPlanningMode
   planning_rationale: string
+  continuous_policy?: Record<string, unknown> | null
   supersedes_goal_id: string | null
   parent_goal_id: string | null
   status: OrchestrationGoalStatus
@@ -1144,7 +1145,6 @@ export interface GoalTypeCorrectionPreview {
   requires_new_start: boolean
   required_authority: string[]
   preview_fingerprint: string
-  tool_constraints: string[]
 }
 
 export type OrchestrationSupervisionCondition =

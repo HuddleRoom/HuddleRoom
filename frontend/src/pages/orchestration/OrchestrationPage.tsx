@@ -29,6 +29,7 @@ import {
   NoProjectSelected,
 } from '@/components/common/uiPrimitives'
 import { ErrorRecord } from '@/components/common/ErrorRecord'
+import { Callout } from '@/components/common/Callout'
 import { Record } from '@/components/common/Record'
 import { Tag } from '@/components/common/Tag'
 import { STATUS_COLORS } from '@/lib/statusColors'
@@ -49,7 +50,7 @@ import type {
 import { useUIStore } from '@/stores/ui'
 import { BaselineDashboard, currentProcesses, type BaselineMutationOwner } from './BaselineDashboard'
 import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
-import { errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
+import { authorizationReasonLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
@@ -956,9 +957,20 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
     : null
   const { goal, run } = detail
   const terminal = goal.status === 'completed' || goal.status === 'cancelled'
-  const canStart = run?.phase === 'ready'
-    && (goal.status === 'active' || goal.status === 'blocked')
-    && goal.goal_type === 'outcome'
+  const startable = goal.status === 'active' || goal.status === 'blocked'
+  // Already-started run that is paused on a decision (e.g. the contract changed): Start re-authorizes.
+  const effectiveAuth = detail.effective_authorization
+  const pausedOn = run?.phase === 'authorized' && !terminal
+    ? (effectiveAuth && !effectiveAuth.allowed
+      ? effectiveAuth
+      : detail.authorization_wait)
+    : null
+  const pausedReason = pausedOn?.reason_code ? authorizationReasonLabel(pausedOn.reason_code) : null
+  const needsRestart = pausedOn?.required_decision === 'start' && startable
+  const canStart = (run?.phase === 'ready' && startable) || needsRestart
+  // Continuous goals need an accepted policy; shape validity is left to the Start 409.
+  const missingRecurringPolicy = goal.goal_type === 'continuous'
+    && Object.keys(goal.continuous_policy ?? {}).length === 0
   const gateCounts = detail.gates.reduce(
     (counts, gate) => {
       if (gate.status === 'open' || gate.status === 'accepted' || gate.status === 'failed') {
@@ -1222,6 +1234,14 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
             <p className="mt-2 text-xs text-huddleroom-text-muted">
               Current run replaces an earlier run (reclassified). History stays in Details › Plan.
             </p>
+          ) : null}
+
+          {pausedReason && pausedOn?.required_decision ? (
+            <Callout variant="warning" className="mt-2">
+              {pausedOn.required_decision === 'start'
+                ? `Work is paused until you start again: ${pausedReason}.`
+                : `Work is paused: ${pausedReason}. Needed: ${pausedOn.required_decision.replace(/_/g, ' ')}.`}
+            </Callout>
           ) : null}
 
           {/* Freshness cue (reuses react-query dataUpdatedAt/isFetching) */}
@@ -1515,6 +1535,8 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
       <StartWorkDialog
         open={startOpen}
         goal={goal}
+        authorization={effectiveAuth}
+        missingRecurringPolicy={missingRecurringPolicy}
         isPending={mutationOwner === 'start' || start.isPending}
         error={startError}
         onOpenChange={setStartDialogOpen}

@@ -572,7 +572,7 @@ describe('OrchestrationPage', () => {
     expect(markup).not.toContain('Pause goal')
   })
 
-  it('only offers Start work to ready outcome goals that are active or blocked', async () => {
+  it('only offers Start work to ready goals of any type that are active or blocked', async () => {
     state.activeProjectId = 'project-1'
     state.goalId = 'goal-1'
     const { OrchestrationPage } = await import('./OrchestrationPage')
@@ -584,10 +584,51 @@ describe('OrchestrationPage', () => {
     expect(renderToStaticMarkup(<OrchestrationPage />)).not.toContain('Start work')
 
     state.detail = { ...richDetail, goal: { ...richDetail.goal, goal_type: 'roadmap' } }
-    expect(renderToStaticMarkup(<OrchestrationPage />)).not.toContain('Start work')
+    expect(renderToStaticMarkup(<OrchestrationPage />)).toContain('Start work')
 
     state.detail = { ...richDetail, goal: { ...richDetail.goal, status: 'paused' } }
     expect(renderToStaticMarkup(<OrchestrationPage />)).not.toContain('Start work')
+  })
+
+  describe('paused authorization prompts', () => {
+    const authorized = (auth: Partial<NonNullable<OrchestrationGoalDetail['effective_authorization']>> | null, wait: OrchestrationGoalDetail['authorization_wait'] = null): OrchestrationGoalDetail => ({
+      ...richDetail,
+      run: { ...richDetail.run!, phase: 'authorized' },
+      effective_authorization: auth && {
+        allowed: false, reason_code: null, required_decision: null, authority_source: 'root_start',
+        run_id: 'run-1', contract_fingerprint: 'fp', model_spend_remaining: {}, external_write_targets: [],
+        live_send_channels: [], workspace_mutation: 'direct', tool_constraints: [], ...auth,
+      },
+      authorization_wait: wait,
+    })
+
+    it('asks for a re-Start and keeps Start work when the decision is start', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      state.detail = authorized({ reason_code: 'contract_changed_since_start', required_decision: 'start' })
+      const html = renderToStaticMarkup(<OrchestrationPage />)
+      expect(html).toContain('Work is paused until you start again: the goal changed after you started it.')
+      expect(html).toContain('Start work')
+    })
+
+    it('falls back to authorization_wait and shows the reason without Start for other decisions', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      state.detail = authorized(null, { task_ids: ['task-1'], reason_code: 'budget_exhausted', required_decision: 'increase_budget' })
+      const html = renderToStaticMarkup(<OrchestrationPage />)
+      expect(html).toContain('Work is paused: the budget is used up. Needed: increase budget.')
+      expect(html).not.toContain('Start work')
+    })
+
+    it('shows no prompt when the run is allowed', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      state.detail = authorized({ allowed: true })
+      expect(renderToStaticMarkup(<OrchestrationPage />)).not.toContain('Work is paused')
+    })
   })
 
   it('starts work once and reflects the returned ready-run replacement', async () => {

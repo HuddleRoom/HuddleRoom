@@ -2,7 +2,7 @@ import React, { act } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
-import type { OrchestrationGoal } from '@/lib/types'
+import type { OrchestrationAuthorization, OrchestrationGoal } from '@/lib/types'
 
 vi.mock('@radix-ui/react-dialog', () => ({
   Root: ({ children }: { children: React.ReactNode }) => <>{children}</>,
@@ -24,8 +24,14 @@ const goal: OrchestrationGoal = {
   created_by_user_id: null, created_at: '2026-09-02T00:00:00Z', updated_at: '2026-09-02T00:00:00Z', needs_you_count: 0,
 }
 
+const allowed: OrchestrationAuthorization = {
+  allowed: true, reason_code: null, required_decision: null, authority_source: 'root_start',
+  run_id: 'run-1', contract_fingerprint: 'fp', model_spend_remaining: { tokens: '120000', usd: '4.20' },
+  external_write_targets: [], live_send_channels: [], workspace_mutation: 'staged', tool_constraints: [],
+}
+
 function renderDialog(overrides: Partial<React.ComponentProps<typeof StartWorkDialog>> = {}) {
-  return <StartWorkDialog open goal={goal} isPending={false} error={null} onOpenChange={vi.fn()} onConfirm={vi.fn()} {...overrides} />
+  return <StartWorkDialog open goal={goal} authorization={allowed} missingRecurringPolicy={false} isPending={false} error={null} onOpenChange={vi.fn()} onConfirm={vi.fn()} {...overrides} />
 }
 
 describe('StartWorkDialog', () => {
@@ -100,6 +106,87 @@ describe('StartWorkDialog', () => {
     try {
       expect(getButton(view.document.body, 'Working…').getAttribute('disabled')).not.toBeNull()
       expect(getButton(view.document.body, 'Cancel').getAttribute('disabled')).not.toBeNull()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('lists the effective authorization envelope', async () => {
+    const view = await mountWithTestDom(() => renderDialog({
+      goal: { ...goal, goal_type: 'roadmap' },
+      authorization: {
+        ...allowed,
+        external_write_targets: ['github:main'],
+        live_send_channels: ['slack'],
+        tool_constraints: ['no_live_sends', 'no_external_writes'],
+      },
+    }), act)
+    try {
+      const text = textOf(view.document.body)
+      expect(text).toContain('Roadmap')
+      expect(text).toContain('What Start allows')
+      expect(text).toContain('tokens 120,000 · usd 4.20')
+      expect(text).toContain('Allowed: github:main')
+      expect(text).toContain('Allowed: slack')
+      expect(text).toContain('Staged (reviewed before it lands)')
+      expect(text).toContain('no_live_sends, no_external_writes')
+      expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).toBeNull()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('uses explicit fallbacks for an empty envelope', async () => {
+    const view = await mountWithTestDom(() => renderDialog({ authorization: { ...allowed, model_spend_remaining: {} } }), act)
+    try {
+      const text = textOf(view.document.body)
+      expect(text).toContain('No measured budget')
+      expect(text).toContain('Not allowed')
+      expect(text).toContain('None')
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('blocks Start for a Continuous goal without a recurring policy', async () => {
+    const view = await mountWithTestDom(() => renderDialog({ missingRecurringPolicy: true }), act)
+    try {
+      expect(textOf(view.document.body)).toContain('This Continuous goal has no accepted recurring policy yet.')
+      expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).not.toBeNull()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('blocks Start with the reason and needed decision when authorization is denied', async () => {
+    const view = await mountWithTestDom(() => renderDialog({
+      authorization: { ...allowed, allowed: false, reason_code: 'budget_exhausted', required_decision: 'increase_budget' },
+    }), act)
+    try {
+      expect(textOf(view.document.body)).toContain("Start isn't available: the budget is used up. Needed: increase budget.")
+      expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).not.toBeNull()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('keeps Start enabled when the needed decision is Start itself (first Start or re-Start)', async () => {
+    const view = await mountWithTestDom(() => renderDialog({
+      authorization: { ...allowed, allowed: false, reason_code: 'contract_changed_since_start', required_decision: 'start' },
+    }), act)
+    try {
+      expect(textOf(view.document.body)).not.toContain("Start isn't available")
+      expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).toBeNull()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('disables Start when authorization details are unavailable', async () => {
+    const view = await mountWithTestDom(() => renderDialog({ authorization: null }), act)
+    try {
+      expect(textOf(view.document.body)).toContain('Authorization details are unavailable. Refresh and try again.')
+      expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).not.toBeNull()
     } finally {
       view.cleanup()
     }
