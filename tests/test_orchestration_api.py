@@ -1058,7 +1058,8 @@ async def test_detail_ignores_malformed_authorization_wait(client, db_session, t
     _, goal, _, task = await _started_with_backlog_task(db_session, test_project)
     url = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}"
     for bad in ("x", {}):
-        task.metadata_ = {**(task.metadata_ or {}), "orchestration": {"authorization_wait": bad}}
+        orch = {**(task.metadata_ or {}).get("orchestration", {}), "authorization_wait": bad}  # keep run_id
+        task.metadata_ = {**(task.metadata_ or {}), "orchestration": orch}
         flag_modified(task, "metadata_")
         await db_session.flush()
         response = await client.get(url)
