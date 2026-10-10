@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping
 
 from sqlalchemy import exists, select
 
+from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import ACTIVE_RUN_STATUSES, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -67,7 +68,10 @@ async def available_slots(db, root_id) -> int:
 
 
 async def queued_tasks(db, root_id) -> list[Task]:
-    """Never-started assigned backlog tasks of authorized, running runs of active goals, oldest first."""
+    """Never-started backlog tasks of authorized, running runs of active goals, oldest first.
+
+    Assigned to an active agent (auto_start's precondition).
+    """
     goal_ids = await _subtree_goal_ids(db, root_id)
     run_ids = list(await db.scalars(
         select(OrchestrationRun.id).join(OrchestrationGoal, OrchestrationGoal.id == OrchestrationRun.goal_id).where(
@@ -79,7 +83,8 @@ async def queued_tasks(db, root_id) -> list[Task]:
         return []
     return list(await db.scalars(
         select(Task).where(
-            _in_runs(run_ids), Task.status == "backlog", Task.assigned_to.is_not(None),
+            _in_runs(run_ids), Task.status == "backlog",
+            Task.assigned_to.in_(select(Agent.id).where(Agent.is_active.is_(True))),
             ~exists().where(Session.task_id == Task.id),
         ).order_by(Task.created_at.asc(), Task.id.asc())
     ))
@@ -96,11 +101,14 @@ def dependency_counts(items) -> Counter:
 
 
 def rank_queued(items, plan_order: Mapping[str, int], unlocks: Mapping[str, int] | None = None) -> list:
-    """Priority, then dependents unlocked, then plan order, then stable id. Works for tasks, plan items, roadmap items."""
+    """Priority, then dependents unlocked, then plan order, then input order (stable sort; queued_tasks yields created_at, id).
+
+    Works for tasks, plan items, roadmap items.
+    """
     if unlocks is None:
         unlocks = dependency_counts(items)
     return sorted(items, key=lambda item: (
-        -item.priority, -unlocks.get(_key(item), 0), plan_order.get(_key(item), float("inf")), _key(item)
+        -item.priority, -unlocks.get(_key(item), 0), plan_order.get(_key(item), float("inf"))
     ))
 
 
@@ -126,12 +134,16 @@ async def activate_ready(
         if meta.get("plan_index") is not None:
             plan_order[key] = meta["plan_index"]
         unlocks[key] = max(meta.get("plan_unlocks") or 0, counts.get(key, 0))
-    started = []
+    started, refused = [], False
     for task in rank_queued(startable, plan_order, unlocks):
         if slots <= 0:
             break
+        if refused:  # a refused start rolled back a savepoint, which expires every loaded task
+            await db.refresh(task)
         await TaskService().auto_start(db, task)
         if task.status == "in_progress":  # ponytail: local decrement is valid under the root lock
             started.append(task)
             slots -= 1
+        else:
+            refused = True
     return {"started": started, "queued": [t for t in startable if t not in started], "available_slots": slots}

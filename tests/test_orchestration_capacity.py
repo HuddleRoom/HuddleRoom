@@ -1,10 +1,12 @@
 """Root-wide capacity: slot counting across a finite goal tree and ranked activation."""
 import asyncio
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -19,6 +21,7 @@ from huddleroom.services.orchestration_capacity import (
 )
 from huddleroom.services.orchestration_roadmap_service import descendant_count, expansion_scope
 from huddleroom.services.orchestration_service import OrchestrationService
+from huddleroom.services.task_service import TaskService
 from tests.test_orchestration_runtime_e2e import _agent
 
 pytestmark = pytest.mark.asyncio
@@ -73,7 +76,7 @@ async def _unblocked(db, run, task):
     return None
 
 
-async def test_rank_order_priority_then_unlocks_then_plan_order_then_id():
+async def test_rank_order_priority_then_unlocks_then_plan_order():
     a, b, c, d, e = (item(x) for x in "abcde")
     a.priority = 90
     items = [e, d, c, b, a]
@@ -81,7 +84,6 @@ async def test_rank_order_priority_then_unlocks_then_plan_order_then_id():
     items.append(item("dep", priority=1, depends_on=["plan_item:b"]))
     ranked = rank_queued(items, {"c": 1, "d": 0, "dep": 9})
     assert [i.id for i in ranked] == ["a", "b", "d", "c", "e", "dep"]
-    assert [i.id for i in rank_queued([item("y"), item("x")], {})] == ["x", "y"]
 
 
 async def test_slots_count_ready_in_progress_and_live_sessions_once(db_session, test_project):
@@ -193,7 +195,8 @@ async def test_blocked_and_refused_tasks_do_not_consume_slots(db_session, test_p
 
     result = await activate_ready(db_session, root.id, is_blocked=is_blocked)
     assert [t.id for t in result["started"]] == [ok1.id, ok2.id]
-    assert {t.id for t in result["queued"]} == {refused.id}
+    assert result["queued"] == []  # the inactive assignee is not queued at all
+    assert (await db_session.get(Task, refused.id)).status == "backlog"
 
 
 async def test_attach_plan_item_metadata_records_index_and_unlocks():
@@ -229,6 +232,94 @@ async def test_release_headroom_subtracts_startable_queue_but_not_dependency_blo
     assert await service._release_headroom(db_session, root.id) == 1  # blocked backlog holds no slot
     await _task(db_session, test_project, run, agent=agent)  # startable backlog holds one
     assert await service._release_headroom(db_session, root.id) == 0
+
+
+async def _stopped_sibling_setup(db, project, stop):
+    agent = await _agent_row(db)
+    root, _ = await _root(db, project)
+    c1, run1 = await _child(db, project, root)
+    c2, run2 = await _child(db, project, root)
+    stop(run2)
+    await db.flush()
+    stopped_task = await _task(db, project, run2, agent=agent)
+    return agent, root, (c1, run1), (c2, run2), stopped_task
+
+
+def _exhaust_budget(run):
+    run.budget_state = {"status": "exceeded"}
+
+
+async def test_activate_ready_skips_budget_exhausted_sibling_run(db_session, test_project):
+    _, root, (c1, run1), _, stopped = await _stopped_sibling_setup(db_session, test_project, _exhaust_budget)
+    ok = await _task(db_session, test_project, run1, agent=await _agent_row(db_session))
+    assert await OrchestrationService()._start_released_tasks(db_session, c1, run1) == 1
+    assert (await db_session.get(Task, ok.id)).status == "in_progress"
+    assert (await db_session.get(Task, stopped.id)).status == "backlog"
+    assert await db_session.scalar(select(func.count()).select_from(Session).where(Session.task_id == stopped.id)) == 0
+
+
+@pytest.mark.parametrize("kind", ["repeated_failure", "plan_criterion_integrity", "goal_definition_analyzer_error"])
+async def test_activate_ready_skips_sibling_with_stop_blocker(db_session, test_project, kind):
+    def block(run):
+        run.active_blockers = [{"kind": kind, "reason": "stopped"}]
+
+    _, root, (c1, run1), _, stopped = await _stopped_sibling_setup(db_session, test_project, block)
+    await _task(db_session, test_project, run1, agent=await _agent_row(db_session))
+    await OrchestrationService()._start_released_tasks(db_session, c1, run1)
+    assert (await db_session.get(Task, stopped.id)).status == "backlog"
+    assert await db_session.scalar(select(func.count()).select_from(Session).where(Session.task_id == stopped.id)) == 0
+
+
+async def test_release_headroom_ignores_stopped_sibling_queued_tasks(db_session, test_project):
+    _, root, _, _, _ = await _stopped_sibling_setup(db_session, test_project, _exhaust_budget)
+    assert await OrchestrationService()._release_headroom(db_session, root.id) == await available_slots(db_session, root.id)
+
+
+async def test_inactive_assignee_does_not_pin_headroom(db_session, test_project):
+    inactive = _agent("inactive", ["implementation"])
+    inactive.is_active = False
+    db_session.add(inactive)
+    await db_session.flush()
+    root, run = await _root(db_session, test_project)
+    await _task(db_session, test_project, run, agent=inactive)
+    assert await queued_tasks(db_session, root.id) == []
+    assert await OrchestrationService()._release_headroom(db_session, root.id) == 2
+
+
+async def test_rank_queued_ties_keep_creation_order(db_session, test_project):
+    agent = await _agent_row(db_session)
+    root, run = await _root(db_session, test_project)
+    older = await _task(db_session, test_project, run, agent=agent, id=uuid.UUID(int=2 ** 127 + 1))
+    newer = await _task(db_session, test_project, run, agent=agent, id=uuid.UUID(int=1))
+    older.created_at = newer.created_at - timedelta(seconds=5)
+    await db_session.flush()
+    assert str(older.id) > str(newer.id)
+    ranked = rank_queued(await queued_tasks(db_session, root.id), {})
+    assert [t.id for t in ranked] == [older.id, newer.id]
+
+
+async def test_activate_ready_refusal_then_success_starts_next(db_session, test_project, monkeypatch):
+    agent = await _agent_row(db_session)
+    root, run = await _root(db_session, test_project)
+    first = await _task(db_session, test_project, run, agent=agent, priority=90)
+    second = await _task(db_session, test_project, run, agent=agent, priority=10)
+    first_id, second_id = first.id, second.id
+    real = TaskService.transition_status
+
+    async def refusing(self, db, project_id, task_id, *args, **kwargs):
+        if task_id == first_id:
+            # SQLAlchemy expires only objects dirtied inside the rolled-back savepoint: dirty the next task too.
+            for written in (task_id, second_id):
+                (await db.get(Task, written)).title = "written then rolled back"
+            await db.flush()
+            raise HTTPException(status_code=409, detail="refused")
+        return await real(self, db, project_id, task_id, *args, **kwargs)
+
+    monkeypatch.setattr(TaskService, "transition_status", refusing)
+    result = await activate_ready(db_session, root.id, is_blocked=_unblocked)
+    assert [t.id for t in result["started"]] == [second_id]
+    assert (await db_session.get(Task, first_id)).status == "backlog"
+    assert (await db_session.get(Task, second_id)).status == "in_progress"
 
 
 async def test_tick_fills_root_slots_by_rank_queues_the_rest_and_starts_it_when_a_slot_frees(db_session, test_project):
@@ -435,7 +526,7 @@ async def test_racing_cousin_releases_cannot_exceed_the_root_descendant_limit(
     db_session, test_project, test_engine, committed_tree_cleanup,
 ):
     root, child_ids, run_ids = await _roadmap_children(db_session, test_project, ("c1", "c2"), [("g", 100)])
-    root.orchestrator_context = {**root.orchestrator_context, "expansion_policy": {"depth": 0, "max_descendant_goals": 3}}
+    root.orchestrator_context = {**root.orchestrator_context, "expansion_policy": {"max_descendant_goals": 3}}
     await db_session.commit()
     _, reader = await _race_ticks(test_engine, run_ids)
     async with reader:

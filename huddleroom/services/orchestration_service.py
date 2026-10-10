@@ -797,6 +797,7 @@ class OrchestrationService:
         project_ctx = None
         goal_ctx = None
         context = None
+        # ponytail: the finite-tree root lock stays held across this model call (SQLite asyncio lock outlives the commit; PG holds FOR UPDATE until tick commit); drop root+leaf with post-call revalidation if tree throughput matters.
         await self._commit_tick_owned_transaction(db)
         async with AsyncSessionLocal() as read_db:
             caller_bind = db.get_bind()
@@ -9317,8 +9318,27 @@ class OrchestrationService:
         return list(result.scalars().all())
 
     async def _task_start_blocked(self, db: AsyncSession, run: OrchestrationRun, task: Task):
-        """Truthy while a predecessor gate is unaccepted or a meeting / graph run / live session holds the task."""
-        return await first_unmet_dependency(db, run, task) or await self._blocked_task_awaiting(db, run, task)
+        """Truthy while the run is stopped, a predecessor gate is unaccepted, or a meeting / graph run / live session holds the task."""
+        # ponytail: re-checks per task; cache per run if queues grow
+        return (
+            await self._run_activation_stopped(db, run)
+            or await first_unmet_dependency(db, run, task)
+            or await self._blocked_task_awaiting(db, run, task)
+        )
+
+    async def _run_activation_stopped(self, db: AsyncSession, run: OrchestrationRun) -> str | None:
+        """Why this run's own tick would refuse to spend; None when it may start work."""
+        if await self._hard_stop_active(db, run.goal_id):
+            return "hard_stop"
+        if self._budget_is_exhausted(run):
+            return "budget_exhausted"
+        for kind in (
+            "repeated_failure", "goal_definition_analyzer_error", "agent_definition_review_analyzer_error",
+            "plan_criterion_integrity", "budget_exhausted",
+        ):
+            if self._has_active_blocker(run, kind):
+                return kind
+        return None
 
     async def _start_released_tasks(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Start never-started backlog tasks the orchestrator delegated (nothing else runs them)."""
