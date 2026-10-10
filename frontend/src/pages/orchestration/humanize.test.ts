@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, OrchestrationProcessRunRecord } from '@/lib/types'
 import {
+  correctionAuthorityLabel,
   BASELINE_PROCESS_TYPES,
   authorizationReasonLabel,
   errorRecord,
@@ -384,6 +385,11 @@ describe('planning hierarchy labels', () => {
   it('labels evidence by role and stage, verdict optional', () => {
     expect(evidenceLabel('readiness', 'preliminary')).toBe('Readiness · Preliminary')
     expect(evidenceLabel('readiness', 'preliminary', 'pending')).toBe('Readiness · Preliminary · Pending')
+  })
+
+  it('labels correction authorities with a title-cased fallback', () => {
+    expect(correctionAuthorityLabel('continuous_policy')).toBe('Recurring policy')
+    expect(correctionAuthorityLabel('parent_release')).toBe('Parent Release')
   })
 
   it('words authorization reasons as lowercase clauses with a readable fallback', () => {

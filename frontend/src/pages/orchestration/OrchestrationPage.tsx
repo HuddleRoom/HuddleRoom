@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react'
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQueries } from '@tanstack/react-query'
 import { Dialog } from '@/components/common/Dialog'
@@ -7,6 +7,7 @@ import { useAgents } from '@/api/agents'
 import { meetingKeys, useMeetingDecisions } from '@/api/meetings'
 import { ApiError, apiFetch } from '@/lib/api-client'
 import {
+  useApplyGoalTypeCorrection,
   useBaselineDashboard,
   useCreateOrchestrationGoal,
   useOrchestrationGoal,
@@ -14,6 +15,7 @@ import {
   useOrchestrationGoals,
   useOrchestrationHealth,
   useOverrideOrchestrationGate,
+  usePreviewGoalTypeCorrection,
   useRecoverGoalDefinition,
   useResetOrchestrationGoal,
   useStartOrchestrationGoal,
@@ -45,12 +47,14 @@ import type {
   OrchestrationGate,
   OrchestrationGateOverrideDecision,
   OrchestrationGoalDetail,
+  OrchestrationGoalType,
+  GoalTypeCorrectionPreview,
   Task,
 } from '@/lib/types'
 import { useUIStore } from '@/stores/ui'
 import { BaselineDashboard, currentProcesses, type BaselineMutationOwner } from './BaselineDashboard'
 import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
-import { authorizationReasonLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
+import { authorizationReasonLabel, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
@@ -60,7 +64,7 @@ import { GoalAnnouncerProvider, useGoalAnnouncer } from './goalAnnouncer'
 
 const ACTIVE_TASK_STATUSES = new Set(['backlog', 'ready', 'in_progress', 'blocked'])
 
-type MutationOwner = `lifecycle:${'pause' | 'resume'}` | 'start' | 'cancel' | 'reset' | 'recover' | `override:${string}` | BaselineMutationOwner
+type MutationOwner = `lifecycle:${'pause' | 'resume'}` | 'start' | 'correct' | 'cancel' | 'reset' | 'recover' | `override:${string}` | BaselineMutationOwner
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : 'The request failed. Check your connection and try again.'
@@ -658,6 +662,277 @@ export function CreateGoalModal({
   )
 }
 
+// ─── Correct Goal Type Dialog ─────────────────────────────────────────────────
+
+const CORRECTABLE_TYPES: OrchestrationGoalType[] = ['outcome', 'roadmap', 'continuous']
+const STALE_CONFLICTS = new Set(['stale_preview', 'stale_run', 'stale_contract'])
+const STALE_PREVIEW_COPY = 'The goal changed since your preview. We refreshed it. Review and apply again.'
+
+type CorrectionConflict = { conflict?: string; message?: string; preview?: GoalTypeCorrectionPreview }
+
+function correctionConflict(error: unknown): CorrectionConflict | null {
+  if (!(error instanceof ApiError) || typeof error.detail !== 'object' || error.detail === null) return null
+  return error.detail as CorrectionConflict
+}
+
+function correctionErrorText(error: unknown) {
+  return correctionConflict(error)?.message ?? errorText(error)
+}
+
+function budgetLeftText(remaining: Record<string, string>) {
+  const entries = Object.entries(remaining)
+  if (entries.length === 0) return 'No measured budget'
+  return entries
+    .map(([key, value]) => `${key.replace(/_/g, ' ')} ${/^\d+$/.test(value) ? Number(value).toLocaleString('en-US') : value}`)
+    .join(' · ')
+}
+
+export function CorrectGoalTypeDialog({
+  projectId,
+  open,
+  goalId,
+  currentType,
+  runId,
+  contractFingerprint,
+  acquireMutation,
+  releaseMutation,
+  onOpenChange,
+  onCloseAutoFocus,
+  onApplied,
+}: {
+  projectId: string
+  open: boolean
+  goalId: string
+  currentType: OrchestrationGoalType
+  runId: string
+  contractFingerprint: string
+  acquireMutation: (owner: 'correct') => boolean
+  releaseMutation: (owner: 'correct') => void
+  onOpenChange: (open: boolean) => void
+  onCloseAutoFocus?: (event: Event) => void
+  onApplied: (detail: OrchestrationGoalDetail) => void
+}) {
+  const previewMutation = usePreviewGoalTypeCorrection(projectId)
+  const applyMutation = useApplyGoalTypeCorrection(projectId)
+  const { announceError } = useGoalAnnouncer()
+  const headingId = useId()
+  const [selection, setSelection] = useState<OrchestrationGoalType | null>(null)
+  const [rationale, setRationale] = useState('')
+  // The inputs a preview was produced for; Apply requires the form to still match.
+  const [preview, setPreview] = useState<{ data: GoalTypeCorrectionPreview; selection: OrchestrationGoalType; rationale: string } | null>(null)
+  const [phase, setPhase] = useState<'idle' | 'previewing' | 'applying'>('idle')
+  const [notice, setNotice] = useState<{ kind: 'stale' | 'error'; text: string } | null>(null)
+  const applyButton = useRef<HTMLButtonElement>(null)
+  const previewHeading = useRef<HTMLHeadingElement>(null)
+  const applyFocusIntent = useRef(false)
+
+  useEffect(() => { if (notice) announceError(notice.text) }, [notice, announceError])
+  useEffect(() => {
+    if (phase !== 'idle' || !applyFocusIntent.current) return
+    applyFocusIntent.current = false
+    // A refreshed preview that now has blockers leaves Apply disabled; land on the preview instead.
+    const target = applyButton.current && !applyButton.current.disabled ? applyButton.current : previewHeading.current
+    target?.focus()
+  }, [phase, preview, notice])
+
+  const trimmedRationale = rationale.trim()
+  const inputsChanged = preview !== null && (preview.selection !== selection || preview.rationale !== trimmedRationale)
+  const busy = phase !== 'idle'
+  const canApply = preview !== null && !inputsChanged && preview.data.blockers.length === 0 && !busy
+
+  function reset() {
+    setSelection(null)
+    setRationale('')
+    setPreview(null)
+    setNotice(null)
+    setPhase('idle')
+    applyFocusIntent.current = false
+  }
+
+  function handleOpenChange(next: boolean) {
+    if (busy) return
+    if (!next) reset()
+    onOpenChange(next)
+  }
+
+  function runPreview(type: OrchestrationGoalType, text: string) {
+    if (!acquireMutation('correct')) return
+    setPhase('previewing')
+    previewMutation.mutate(
+      { goalId, requestedGoalType: type, expectedRunId: runId, expectedContractFingerprint: contractFingerprint, rationale: text },
+      {
+        onSuccess: (data) => {
+          releaseMutation('correct')
+          setPreview({ data, selection: type, rationale: text })
+          setPhase('idle')
+        },
+        onError: (error) => {
+          releaseMutation('correct')
+          setPreview(null)
+          setNotice({ kind: 'error', text: correctionErrorText(error) })
+          setPhase('idle')
+        },
+      },
+    )
+  }
+
+  function runApply() {
+    if (!preview || !canApply || !acquireMutation('correct')) return
+    const { data, selection: type, rationale: text } = preview
+    setNotice(null)
+    setPhase('applying')
+    applyFocusIntent.current = true
+    applyMutation.mutate(
+      {
+        goalId,
+        requestedGoalType: type,
+        expectedRunId: runId,
+        expectedContractFingerprint: contractFingerprint,
+        rationale: text,
+        previewFingerprint: data.preview_fingerprint,
+      },
+      {
+        onSuccess: (detail) => {
+          releaseMutation('correct')
+          reset()
+          onApplied(detail)
+        },
+        onError: (error) => {
+          releaseMutation('correct')
+          const conflict = correctionConflict(error)
+          if (conflict?.conflict && STALE_CONFLICTS.has(conflict.conflict)) {
+            // Refresh in place: same selection and rationale, never reset the form.
+            setNotice({ kind: 'stale', text: STALE_PREVIEW_COPY })
+            setPhase('idle')
+            runPreview(type, text)
+            return
+          }
+          if (conflict?.conflict === 'correction_blocked' && conflict.preview) {
+            setPreview({ data: conflict.preview, selection: type, rationale: text })
+          }
+          setNotice({ kind: 'error', text: correctionErrorText(error) })
+          setPhase('idle')
+        },
+      },
+    )
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={handleOpenChange}
+      title="Correct goal type"
+      description="Preview what changes before applying. Nothing changes until you apply."
+      size="md"
+      onCloseAutoFocus={onCloseAutoFocus}
+    >
+      <div className="flex flex-col gap-3">
+        <fieldset disabled={busy} className="min-w-0">
+          <legend className="mb-2 text-sm font-medium text-huddleroom-text-primary">New type</legend>
+          <div className="flex flex-wrap gap-4">
+            {CORRECTABLE_TYPES.map((type) => (
+              <label key={type} className="flex min-h-11 items-center gap-2 text-sm text-huddleroom-text-primary">
+                <input
+                  type="radio"
+                  name="corrected-goal-type"
+                  value={type}
+                  checked={selection === type}
+                  disabled={type === currentType}
+                  onChange={() => setSelection(type)}
+                />
+                {goalTypeLabel(type)}{type === currentType ? ' (current)' : ''}
+              </label>
+            ))}
+          </div>
+          <Textarea
+            label="Why the current type is wrong"
+            value={rationale}
+            onChange={(event) => setRationale(event.target.value)}
+            rows={3}
+            required
+          />
+          <Button
+            type="button"
+            variant="secondary"
+            className="min-h-11"
+            disabled={!selection || !trimmedRationale}
+            onClick={() => {
+              setNotice(null)
+              runPreview(selection!, trimmedRationale)
+            }}
+          >
+            {phase === 'previewing' ? 'Previewing…' : 'Preview change'}
+          </Button>
+        </fieldset>
+
+        <div aria-live="polite" aria-busy={phase === 'previewing'}>
+          {preview ? (
+            <section aria-labelledby={headingId} className="flex flex-col gap-3">
+              <h3 id={headingId} ref={previewHeading} tabIndex={-1} className="text-sm font-medium text-huddleroom-text-primary">Preview</h3>
+              <Record
+                keyWidth={120}
+                rows={[
+                  { key: 'Type', value: `${goalTypeLabel(preview.data.current_goal_type)} → ${goalTypeLabel(preview.data.proposed_goal_type)}` },
+                  { key: 'Planning', value: `${planningModeLabel(preview.data.current_planning_mode)} → ${planningModeLabel(preview.data.proposed_planning_mode)}` },
+                  { key: 'Needs a new Start', value: preview.data.requires_new_start ? 'Yes' : 'No' },
+                  { key: 'Needs approval from', value: preview.data.required_authority.map(correctionAuthorityLabel).join(', ') },
+                  { key: 'Budget left', value: budgetLeftText(preview.data.remaining_budget) },
+                ]}
+              />
+              {preview.data.missing_recurring_policy ? (
+                <Callout variant="warning">A recurring policy must be accepted before this goal can start.</Callout>
+              ) : null}
+              <div className="flex flex-col gap-2">
+                <h4 className="text-xs font-medium text-huddleroom-text-muted">{`Resolve before applying (${preview.data.blockers.length})`}</h4>
+                {preview.data.blockers.length === 0 ? (
+                  <p className="text-sm text-huddleroom-text-secondary">No blockers.</p>
+                ) : preview.data.blockers.map((blocker, index) => (
+                  <Callout key={`${blocker.code}-${blocker.entity_id ?? index}`} variant="warning">
+                    <p>{blocker.message}</p>
+                    <p className="mt-1">{`How to fix: ${blocker.resolution}`}</p>
+                  </Callout>
+                ))}
+              </div>
+              <div className="flex flex-col gap-2">
+                <h4 className="text-xs font-medium text-huddleroom-text-muted">{`Evidence carried over (${preview.data.retained_evidence_manifest.length})`}</h4>
+                {preview.data.retained_evidence_manifest.length === 0 ? (
+                  <p className="text-sm text-huddleroom-text-secondary">No evidence carries over.</p>
+                ) : (
+                  <ul className="flex flex-col gap-2">
+                    {preview.data.retained_evidence_manifest.map((item) => (
+                      <li key={`${item.source_gate_id}-${item.artifact_id ?? item.source_task_id}`} className="flex flex-col gap-1">
+                        <span className="flex flex-wrap items-center gap-2">
+                          <Tag>{item.revalidation_required ? 'Needs revalidation' : 'Kept, checked again by the new gate'}</Tag>
+                          {item.artifact_id ? <Tag className="font-mono">{item.artifact_id}</Tag> : null}
+                        </span>
+                        <span className="text-sm text-huddleroom-text-secondary">{item.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="text-xs text-huddleroom-text-muted">Carried-over evidence is never accepted automatically.</p>
+              </div>
+            </section>
+          ) : null}
+        </div>
+
+        {notice?.kind === 'stale' ? <Callout variant="warning">{notice.text}</Callout> : null}
+        {notice?.kind === 'error' ? <p className="text-xs text-huddleroom-status-red">{notice.text}</p> : null}
+        {inputsChanged ? <p className="text-xs text-huddleroom-text-muted">Inputs changed. Preview again before applying.</p> : null}
+
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button type="button" variant="secondary" className="min-h-11" disabled={busy} onClick={() => handleOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button ref={applyButton} type="button" className="min-h-11" disabled={!canApply} onClick={runApply}>
+            {phase === 'applying' ? 'Applying…' : 'Apply correction'}
+          </Button>
+        </div>
+      </div>
+    </Dialog>
+  )
+}
+
 function GatesPanel({
   gates,
   evidence,
@@ -832,6 +1107,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
   const reset = useResetOrchestrationGoal(projectId)
   const start = useStartOrchestrationGoal(projectId)
   const [startOpen, setStartOpen] = useState(false)
+  const [correctOpen, setCorrectOpen] = useState(false)
   const [cancelOpen, setCancelOpen] = useState(false)
   const [resetOpen, setResetOpen] = useState(false)
   const [overrideGateId, setOverrideGateId] = useState<string | null>(null)
@@ -848,6 +1124,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
   const mutationOwnerRef = useRef<MutationOwner | null>(null)
   const cancelButton = useRef<HTMLButtonElement>(null)
   const startButton = useRef<HTMLButtonElement>(null)
+  const correctButton = useRef<HTMLButtonElement>(null)
   const resetButton = useRef<HTMLButtonElement>(null)
   const lifecycleButton = useRef<HTMLButtonElement>(null)
   const lifecycleFocusIntent = useRef(false)
@@ -1309,6 +1586,21 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                 Start work
               </Button>
             )}
+            {run && detail.contract_fingerprint ? (
+              <Button
+                ref={correctButton}
+                size="sm"
+                variant="secondary"
+                className="min-h-11"
+                disabled={globalBusy}
+                onClick={() => {
+                  if (mutationOwnerRef.current !== null) return
+                  setCorrectOpen(true)
+                }}
+              >
+                Correct goal type
+              </Button>
+            ) : null}
             <Button
               ref={cancelButton}
               size="sm"
@@ -1560,6 +1852,30 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           })
         }}
       />
+
+      {run && detail.contract_fingerprint ? (
+        <CorrectGoalTypeDialog
+          projectId={projectId}
+          open={correctOpen}
+          goalId={goalId}
+          currentType={goal.goal_type}
+          runId={run.id}
+          contractFingerprint={detail.contract_fingerprint}
+          acquireMutation={acquireMutation}
+          releaseMutation={releaseMutation}
+          onOpenChange={setCorrectOpen}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault()
+            const focusTarget = correctButton.current ?? goalHeader.current
+            focusTarget?.focus()
+          }}
+          onApplied={(nextDetail) => {
+            setCorrectOpen(false)
+            setMessage(`Goal type corrected to ${goalTypeLabel(nextDetail.goal.goal_type)}.`)
+            setLastMessageOwner('correct')
+          }}
+        />
+      ) : null}
 
       <ConfirmDialog
         open={resetOpen}

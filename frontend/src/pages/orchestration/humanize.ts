@@ -406,6 +406,12 @@ export const planningModeLabel = (mode: string): string => labelFrom(PLANNING_MO
 export const itemStateLabel = (state: string): string => labelFrom(ITEM_STATE_LABELS, state)
 export const workspaceMutationLabel = (mode: string): string => labelFrom(WORKSPACE_MUTATION_LABELS, mode)
 
+const CORRECTION_AUTHORITY_LABELS: Record<string, string> = {
+  baseline_rerun: 'Baseline re-run',
+  continuous_policy: 'Recurring policy',
+}
+export const correctionAuthorityLabel = (value: string): string => labelFrom(CORRECTION_AUTHORITY_LABELS, value)
+
 // "Readiness · Preliminary"; the verdict is appended only when supplied
 // (callers usually render it as its own badge).
 export function evidenceLabel(role: string, stage: string, verdict?: string | null): string {

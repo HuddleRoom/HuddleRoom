@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { changeControl, descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
+import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import type { OrchestrationGoalDetail, Task } from '@/lib/types'
 
 const state = vi.hoisted(() => ({
@@ -21,6 +21,8 @@ const state = vi.hoisted(() => ({
   createMutation: { isPending: false, mutate: vi.fn() },
   announceError: vi.fn(),
   startMutation: { isPending: false, mutate: vi.fn() },
+  previewMutation: { isPending: false, mutate: vi.fn() },
+  applyMutation: { isPending: false, mutate: vi.fn() },
   commandMutation: { isPending: false, mutate: vi.fn() },
   healthDebugEnabled: false,
   agents: [] as Array<Record<string, unknown>>,
@@ -87,6 +89,8 @@ vi.mock('@/api/orchestration', () => ({
   useOverrideOrchestrationGate: () => ({ isPending: false, mutate: vi.fn() }),
   useResetOrchestrationGoal: () => ({ isPending: false, mutate: vi.fn() }),
   useStartOrchestrationGoal: () => state.startMutation,
+  usePreviewGoalTypeCorrection: () => state.previewMutation,
+  useApplyGoalTypeCorrection: () => state.applyMutation,
   useRecoverGoalDefinition: () => ({ isPending: false, mutate: vi.fn() }),
   useBaselineDashboard: () => ({
     memory: { data: undefined, isLoading: false, isError: false },
@@ -328,6 +332,8 @@ beforeEach(() => {
   state.startMutation.mutate.mockReset()
   state.commandMutation.isPending = false
   state.commandMutation.mutate.mockReset()
+  state.previewMutation.mutate.mockReset()
+  state.applyMutation.mutate.mockReset()
   state.healthDebugEnabled = false
   state.agents = []
   state.meetingsById = new Map()
@@ -993,5 +999,194 @@ describe('CreateGoalModal goal type selector', () => {
       const fieldset = descendants(view.document.body).find((n) => n.tagName === 'FIELDSET')!
       expect(fieldset.getAttribute('disabled')).not.toBeNull()
     } finally { view.cleanup() }
+  })
+})
+
+describe('CorrectGoalTypeDialog', () => {
+  const previewFixture = (over: Record<string, unknown> = {}) => ({
+    goal_id: 'goal-1', current_run_id: 'run-1',
+    current_goal_type: 'outcome', proposed_goal_type: 'roadmap',
+    current_planning_mode: 'delivery', proposed_planning_mode: 'roadmap',
+    source: 'user', rationale: 'Too big', blockers: [],
+    retained_evidence_manifest: [{
+      source_run_id: 'run-1', source_task_id: 't1', source_gate_id: 'g1', artifact_id: 'artifact-9',
+      source_contract_fingerprint: 'fp', revalidation_required: true, reason: 'Readiness proof from the first run',
+    }],
+    remaining_budget: { tokens: '120000' }, missing_recurring_policy: false,
+    requires_new_start: true, required_authority: ['baseline_rerun', 'start'],
+    preview_fingerprint: 'pf-1', ...over,
+  })
+  const onApplied = vi.fn()
+  const onOpenChange = vi.fn()
+
+  async function mountDialog() {
+    const { CorrectGoalTypeDialog } = await import('./OrchestrationPage')
+    return mountWithTestDom(() => (
+      <CorrectGoalTypeDialog
+        projectId="project-1" open goalId="goal-1" currentType="outcome" runId="run-1"
+        contractFingerprint="contract-fp" acquireMutation={() => true} releaseMutation={() => {}}
+        onOpenChange={onOpenChange} onApplied={onApplied}
+      />
+    ), React.act)
+  }
+  type View = Awaited<ReturnType<typeof mountDialog>>
+  const radios = (view: View) =>
+    descendants(view.document.body).filter((n) => n.tagName === 'INPUT' && n.getAttribute('name') === 'corrected-goal-type')
+  const rationale = (view: View) => getByLabel(view.container, 'Why the current type is wrong', 'textarea')
+  const press = (view: View, label: string) => React.act(async () => getButton(view.container, label).click())
+  async function fillAndPreview(view: View, text = 'Too big') {
+    await React.act(async () => {
+      changeControl(radios(view)[1], true)
+      changeControl(rationale(view), text)
+    })
+    await press(view, 'Preview change')
+  }
+
+  beforeEach(() => {
+    onApplied.mockReset()
+    onOpenChange.mockReset()
+    state.previewMutation.mutate.mockImplementation((_input: unknown, opts: { onSuccess: (d: unknown) => void }) => opts.onSuccess(previewFixture()))
+  })
+
+  it('disables the current type and gates Preview on a choice and a rationale', async () => {
+    const view = await mountDialog()
+    try {
+      expect(radios(view).map((r) => r.getAttribute('disabled') !== null)).toEqual([true, false, false])
+      expect(textOf(view.container)).toContain('Outcome (current)')
+      expect(getButton(view.container, 'Preview change').getAttribute('disabled')).not.toBeNull()
+      await React.act(async () => changeControl(radios(view)[1], true))
+      expect(getButton(view.container, 'Preview change').getAttribute('disabled')).not.toBeNull()
+      await React.act(async () => changeControl(rationale(view), '  '))
+      expect(getButton(view.container, 'Preview change').getAttribute('disabled')).not.toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('previews with the run, contract fingerprint and rationale, and shows the result', async () => {
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      expect(state.previewMutation.mutate.mock.calls[0][0]).toEqual({
+        goalId: 'goal-1', requestedGoalType: 'roadmap', expectedRunId: 'run-1',
+        expectedContractFingerprint: 'contract-fp', rationale: 'Too big',
+      })
+      const text = textOf(view.container)
+      for (const copy of [
+        'Outcome → Roadmap', 'Delivery plan → Roadmap plan', 'Baseline re-run, Start', 'tokens 120,000',
+        'No blockers.', 'Evidence carried over (1)', 'Needs revalidation', 'artifact-9',
+        'Readiness proof from the first run', 'Carried-over evidence is never accepted automatically.',
+      ]) expect(text).toContain(copy)
+      expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('shows blockers with their fix, the kept-evidence copy and disables Apply', async () => {
+    state.previewMutation.mutate.mockImplementation((_i: unknown, opts: { onSuccess: (d: unknown) => void }) => opts.onSuccess(previewFixture({
+      blockers: [{ code: 'open_work', entity_type: 'task', entity_id: 't1', message: 'A task is running.', resolution: 'Pause the goal first.' }],
+      retained_evidence_manifest: [{ source_run_id: 'r', source_task_id: 't', source_gate_id: 'g', artifact_id: null, source_contract_fingerprint: 'f', revalidation_required: false, reason: 'Kept proof' }],
+      missing_recurring_policy: true,
+    })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      const text = textOf(view.container)
+      expect(text).toContain('Resolve before applying (1)')
+      expect(text).toContain('A task is running.')
+      expect(text).toContain('How to fix: Pause the goal first.')
+      expect(text).toContain('Kept, checked again by the new gate')
+      expect(text).toContain('A recurring policy must be accepted before this goal can start.')
+      expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).not.toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('disables Apply once the inputs change after a preview', async () => {
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      await React.act(async () => changeControl(rationale(view), 'Different reason'))
+      expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).not.toBeNull()
+      expect(textOf(view.container)).toContain('Inputs changed. Preview again before applying.')
+      await React.act(async () => changeControl(radios(view)[2], true))
+      await React.act(async () => changeControl(rationale(view), 'Too big'))
+      expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).not.toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('re-previews on a stale 409 without resetting the form, then focuses Apply', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+      opts.onError(new ApiError(409, 'HTTP 409', { conflict: 'stale_preview', message: 'out of date' })))
+    state.previewMutation.mutate.mockImplementation((_i: unknown, opts: { onSuccess: (d: unknown) => void }) =>
+      opts.onSuccess(previewFixture({ preview_fingerprint: `pf-${state.previewMutation.mutate.mock.calls.length}` })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      await press(view, 'Apply correction')
+      expect(state.applyMutation.mutate.mock.calls[0][0]).toMatchObject({ previewFingerprint: 'pf-1', requestedGoalType: 'roadmap', rationale: 'Too big' })
+      expect(state.previewMutation.mutate).toHaveBeenCalledTimes(2)
+      expect(state.previewMutation.mutate.mock.calls[1][0]).toMatchObject({ requestedGoalType: 'roadmap', rationale: 'Too big' })
+      expect(radios(view)[1].checked).toBe(true)
+      expect(rationale(view).value).toBe('Too big')
+      const stale = 'The goal changed since your preview. We refreshed it. Review and apply again.'
+      expect(textOf(view.container)).toContain(stale)
+      expect(state.announceError).toHaveBeenCalledWith(stale)
+      expect(view.activeElement).toBe(getButton(view.container, 'Apply correction'))
+      // The refreshed preview carries the new fingerprint.
+      await press(view, 'Apply correction')
+      expect(state.applyMutation.mutate.mock.calls[1][0]).toMatchObject({ previewFingerprint: 'pf-2' })
+    } finally { view.cleanup() }
+  })
+
+  it('shows other apply errors inline, announces them and keeps Apply focused', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+      opts.onError(new ApiError(403, 'HTTP 403', { conflict: 'explicit_user_request_required', message: 'Only a user can correct a goal type.' })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      await press(view, 'Apply correction')
+      expect(state.previewMutation.mutate).toHaveBeenCalledTimes(1)
+      expect(textOf(view.container)).toContain('Only a user can correct a goal type.')
+      expect(state.announceError).toHaveBeenCalledWith('Only a user can correct a goal type.')
+      expect(view.activeElement).toBe(getButton(view.container, 'Apply correction'))
+    } finally { view.cleanup() }
+  })
+
+  it('reports success to the page', async () => {
+    const detail = { goal: { goal_type: 'roadmap' } }
+    state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onSuccess: (d: unknown) => void }) => opts.onSuccess(detail))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      await press(view, 'Apply correction')
+      expect(onApplied).toHaveBeenCalledWith(detail)
+    } finally { view.cleanup() }
+  })
+})
+
+describe('Correct goal type trigger', () => {
+  async function mountPage(patch: (detail: OrchestrationGoalDetail) => OrchestrationGoalDetail = (d) => d) {
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = patch({ ...richDetail, contract_fingerprint: 'contract-fp' })
+    return mountWithTestDom(() => <OrchestrationPage />, React.act)
+  }
+
+  it('shows the trigger for a live goal with a run', async () => {
+    const view = await mountPage()
+    try {
+      expect(getButton(view.container, 'Correct goal type')).toBeDefined()
+    } finally { view.cleanup() }
+  })
+
+  it('hides the trigger when the goal is terminal or has no run', async () => {
+    const terminal = await mountPage((d) => ({ ...d, goal: { ...d.goal, status: 'completed' } }))
+    try {
+      expect(() => getButton(terminal.container, 'Correct goal type')).toThrow()
+    } finally { terminal.cleanup() }
+    const noRun = await mountPage((d) => ({ ...d, run: null }))
+    try {
+      expect(() => getButton(noRun.container, 'Correct goal type')).toThrow()
+    } finally { noRun.cleanup() }
   })
 })
