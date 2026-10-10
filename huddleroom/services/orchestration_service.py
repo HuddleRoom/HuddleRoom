@@ -78,6 +78,7 @@ from huddleroom.models.orchestration_process import (
     OrchestrationWarning,
 )
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
+from huddleroom.models.orchestration_steering import OrchestrationSteeringProposal, OrchestrationSteeringRequest
 from huddleroom.services.orchestration_authority_interview import build_checkpoint, sync_deferred_questions_memory
 from huddleroom.services.orchestration_authority_service import (
     OrchestrationAuthorityDecisionService,
@@ -7554,7 +7555,7 @@ class OrchestrationService:
         """Reset a goal to fresh state, wiping all run history and orchestration progress.
 
         Status lines / timeline / logs are UI renderings of the wiped tables — no
-        separate store to clear.
+        separate store to clear. Also wipes the goal's steering requests and proposals.
         """
         transaction = db.sync_session.get_transaction()
         caller_owns_transaction = (
@@ -7615,6 +7616,10 @@ class OrchestrationService:
             ))
             await db.execute(delete(OrchestrationAgentReview).where(OrchestrationAgentReview.goal_id == goal_id))
             await db.execute(delete(OrchestrationMemorySection).where(OrchestrationMemorySection.goal_id == goal_id))
+            # Steering requests (DB-cascades transitions + result_links, which otherwise RESTRICT
+            # the run's decisions/actions) and proposals; steering state is kept.
+            await db.execute(delete(OrchestrationSteeringRequest).where(OrchestrationSteeringRequest.goal_id == goal_id))
+            await db.execute(delete(OrchestrationSteeringProposal).where(OrchestrationSteeringProposal.goal_id == goal_id))
 
             # Delete goal's run row(s) — CASCADEs run-keyed children (decisions/actions/gates/evidence/agent_suggestions)
             await db.execute(delete(OrchestrationRun).where(OrchestrationRun.goal_id == goal_id))

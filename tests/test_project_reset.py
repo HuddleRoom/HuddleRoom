@@ -1490,6 +1490,8 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
         "graph_runs": 1,
         "messages": 1,
         "channels": 1,
+        "orchestration_steering_requests": 0,
+        "orchestration_steering_proposals": 0,
         "orchestration_decisions": 1,
         "orchestration_actions": 1,
         "orchestration_gates": 1,
@@ -1524,3 +1526,42 @@ async def test_reset_purges_all_operational_state_without_touching_project_setup
     assert retained_hook is not None
     assert retained_hook.execution_count == retained_hook.error_count == 0
     assert marker.read_text() == "keep"
+
+
+@pytest.mark.asyncio
+async def test_reset_purges_steering_rows_blocking_decision_and_action_delete(db_session, test_project, test_user):
+    from huddleroom.models.orchestration_steering import (
+        OrchestrationSteeringRequest,
+        OrchestrationSteeringResultLink,
+        steering_result_link_id,
+    )
+
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="Steer me",
+        success_criteria=[{"key": "a", "description": "first"}], created_by_user_id=test_user.id,
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    await db_session.flush()
+    decision = OrchestrationDecision(run_id=run.id, decision_type="test_decision")
+    action = OrchestrationAction(run_id=run.id, idempotency_key="reset-steer", action_type="test_action")
+    steering_request = OrchestrationSteeringRequest(
+        id=uuid.uuid4(), goal_id=goal.id, actor_id=test_user.id, client_request_id=uuid.uuid4(), sequence=1,
+        directive="x", target_type="goal", target_id=str(goal.id), scope="goal", lifetime="future_runs",
+        impact_summary="x", status="applied", reason_code="submitted", contract_version="none", plan_version="none",
+    )
+    db_session.add_all([decision, action, steering_request])
+    await db_session.flush()
+    db_session.add(OrchestrationSteeringResultLink(
+        id=steering_result_link_id(steering_request.id, decision.id, action.id),
+        request_id=steering_request.id, decision_id=decision.id, action_id=action.id,
+    ))
+    await db_session.flush()
+
+    counts = await ProjectService().reset(db_session, test_project.id)
+
+    assert counts["orchestration_steering_requests"] == 1
+    assert counts["orchestration_decisions"] == 1
+    assert counts["orchestration_actions"] == 1

@@ -35,6 +35,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
 )
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
+from huddleroom.models.orchestration_steering import OrchestrationSteeringProposal, OrchestrationSteeringRequest
 from huddleroom.models.orchestration_process import (
     OrchestrationAgentReview,
     OrchestrationAuthorityDecision,
@@ -303,6 +304,17 @@ class ProjectService:
         await purge("messages", Message, Message.channel_id.in_(channel_ids))
         await purge("channels", Channel, Channel.project_id == project_id)
 
+        # Result links (RESTRICT FK to decisions/actions) cascade from requests.
+        await purge(
+            "orchestration_steering_requests",
+            OrchestrationSteeringRequest,
+            OrchestrationSteeringRequest.goal_id.in_(goal_ids),
+        )
+        await purge(
+            "orchestration_steering_proposals",
+            OrchestrationSteeringProposal,
+            OrchestrationSteeringProposal.goal_id.in_(goal_ids),
+        )
         await purge("orchestration_evidence", OrchestrationEvidence, OrchestrationEvidence.run_id.in_(run_ids))
         await purge("orchestration_actions", OrchestrationAction, OrchestrationAction.run_id.in_(run_ids))
         await purge("orchestration_decisions", OrchestrationDecision, OrchestrationDecision.run_id.in_(run_ids))

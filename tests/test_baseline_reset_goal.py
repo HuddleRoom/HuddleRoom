@@ -198,3 +198,75 @@ async def test_reset_goal_refuses_type_correction_lineage(db_session, test_proje
 
     assert exc.value.status_code == 409
     assert await _count(db_session, OrchestrationRun, goal_id=goal.id) >= 1
+
+
+@pytest.mark.asyncio
+async def test_reset_goal_wipes_steering_rows_blocking_run_delete(db_session, test_project, test_user, client):
+    from huddleroom.models.orchestration_conversation import ConversationMessage, ConversationResponse
+    from huddleroom.models.orchestration_steering import (
+        OrchestrationSteeringProposal,
+        OrchestrationSteeringRequest,
+        OrchestrationSteeringResultLink,
+        OrchestrationSteeringState,
+        OrchestrationSteeringTransition,
+        steering_result_link_id,
+    )
+
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="Steer me",
+        success_criteria=[{"key": "a", "description": "first"}], created_by_user_id=test_user.id,
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    await db_session.flush()
+    decision = OrchestrationDecision(run_id=run.id, decision_type="test_decision")
+    action = OrchestrationAction(run_id=run.id, idempotency_key="steer-action", action_type="test_action")
+    message = ConversationMessage(
+        goal_id=goal.id, actor_id=test_user.id, client_request_id=uuid.uuid4(), sequence=1, content="q",
+    )
+    db_session.add_all([decision, action, message])
+    await db_session.flush()
+    response = ConversationResponse(
+        message_id=message.id, dossier={}, context_manifest={}, context_version="v1",
+        provider_request_id="rally-chat:reset-steering",
+    )
+    db_session.add(response)
+    await db_session.flush()
+    steering_request = OrchestrationSteeringRequest(
+        id=uuid.uuid4(), goal_id=goal.id, actor_id=test_user.id, client_request_id=uuid.uuid4(), sequence=1,
+        directive="x", target_type="goal", target_id=str(goal.id), scope="goal", lifetime="future_runs",
+        impact_summary="x", status="applied", reason_code="submitted", contract_version="none", plan_version="none",
+    )
+    proposal = OrchestrationSteeringProposal(
+        id=uuid.uuid4(), response_id=response.id, goal_id=goal.id, actor_id=test_user.id,
+        status="proposed", draft={},
+    )
+    db_session.add_all([steering_request, proposal])
+    await db_session.flush()
+    db_session.add_all([
+        OrchestrationSteeringTransition(
+            id=uuid.uuid4(), request_id=steering_request.id, sequence=1, from_status=None,
+            to_status="pending", reason_code="submitted", actor="user",
+        ),
+        OrchestrationSteeringState(id=uuid.uuid4(), goal_id=goal.id),
+    ])
+    await db_session.flush()
+    db_session.add(OrchestrationSteeringResultLink(
+        id=steering_result_link_id(steering_request.id, decision.id, action.id),
+        request_id=steering_request.id, decision_id=decision.id, action_id=action.id,
+    ))
+    await db_session.flush()
+
+    resp = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/reset"
+    )
+    assert resp.status_code == 200
+
+    assert await _count(db_session, OrchestrationSteeringRequest, goal_id=goal.id) == 0
+    assert await _count(db_session, OrchestrationSteeringProposal, goal_id=goal.id) == 0
+    assert await _count(db_session, OrchestrationSteeringResultLink, request_id=steering_request.id) == 0
+    assert await _count(db_session, OrchestrationSteeringTransition, request_id=steering_request.id) == 0
+    assert await _count(db_session, OrchestrationSteeringState, goal_id=goal.id) == 1
+    assert await _count(db_session, OrchestrationDecision, run_id=run.id) == 0
