@@ -17,6 +17,31 @@ RETAINED_GATE_TYPE = "retained_evidence"
 NON_BLOCKING_GATE_TYPES = frozenset({ADHOC_GATE_TYPE, RETAINED_GATE_TYPE})
 ADHOC_GATED_WORK_FUNCTIONS = {"investigation": "discovery", "review": "readiness"}
 PLAN_IN_FLIGHT_STATUSES = frozenset({"requested", "revision_requested", "revision_required"})
+EVIDENCE_ROLES = frozenset({"discovery", "readiness", "delivery", "verification", "integration"})
+REVIEW_STAGES = frozenset({"preliminary", "final"})
+# "plan_accepted" is orchestration_service.PLAN_GATE_TYPE (not imported: that module imports this one).
+READINESS_GATE_TYPES = frozenset({"plan_accepted", "roadmap_plan_approval"})
+
+
+def evidence_semantics(
+    gate_type: str, required_evidence: Any, source_type: str | None, verdict: str, run_terminal_reason: str | None,
+) -> dict:
+    """Derived evidence metadata; declared gate values win, legacy gates get type-based defaults."""
+    declared = _obj(required_evidence)
+    role = declared.get("evidence_role")
+    if role not in EVIDENCE_ROLES:
+        role = (
+            "integration" if gate_type == "roadmap_integration"
+            else "readiness" if gate_type in READINESS_GATE_TYPES
+            else "verification" if source_type == "verification"
+            else "delivery"
+        )
+    stage = declared.get("review_stage")
+    if stage not in REVIEW_STAGES:
+        stage = "final"
+    if verdict == "candidate":
+        verdict = "superseded" if run_terminal_reason == "reclassified" else "pending"
+    return {"evidence_role": role, "review_stage": stage, "acceptance_verdict": verdict}
 
 
 def plan_in_flight(plan_state: Any) -> bool:

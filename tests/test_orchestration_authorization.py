@@ -1,3 +1,6 @@
+import json
+import uuid
+
 import pytest
 from sqlalchemy import select
 
@@ -336,3 +339,328 @@ async def test_start_continuous_goal_without_policy_conflicts(client, auth_heade
     resp = await client.post(f"{base}/{goal['id']}/start", headers=auth_headers)
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"] == {"conflict": "goal_not_runnable", "message": "Continuous policy is required"}
+
+
+# --- Task 15a: effective_authorization + evidence_semantics -------------------------------------
+
+AUTHORIZATION_RESULT_KEYS = {
+    "allowed", "reason_code", "required_decision", "authority_source", "run_id", "contract_fingerprint",
+    "model_spend_remaining", "external_write_targets", "live_send_channels", "workspace_mutation",
+    "tool_constraints",
+}
+
+
+async def _authorize(db, run):
+    db.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution",
+                               action_type="authorize_execution", status="completed"))
+    await db.flush()
+
+
+async def _started_root(db, project, **kw):
+    from tests.test_orchestration_goal_shape import _goal_run
+
+    goal, run = await _goal_run(db, project, goal_type="outcome", **kw)
+    await _authorize(db, run)
+    return goal, run
+
+
+async def _scoped_task(db, project, run, scope, context=None, assigned_to=None):
+    from huddleroom.models.task import Task
+
+    contract = {"authorization_scope": scope, **({"orchestrator_context": context} if context else {})}
+    task = Task(project_id=project.id, title="work", status="backlog", assigned_to=assigned_to,
+                metadata_={"orchestration": {"run_id": str(run.id)}, "orchestration_contract": contract})
+    db.add(task)
+    await db.flush()
+    return task
+
+
+def _denial(result):
+    return result.allowed, result.reason_code, result.required_decision
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_key_set_and_decimals_serialize_as_strings(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _started_root(db_session, test_project, budget={"caps": {"max_tokens": "1000", "max_hours": "1.5"}})
+    result = await effective_authorization(db_session, goal, run)
+
+    assert set(result.model_dump()) == AUTHORIZATION_RESULT_KEYS
+    assert (result.allowed, result.authority_source, result.run_id, result.workspace_mutation) == (
+        True, "root_start", run.id, "direct")
+    assert result.contract_fingerprint == compute_goal_contract_fingerprint(goal)
+    assert result.external_write_targets == [] and result.live_send_channels == []
+    assert result.tool_constraints == ["no_external_writes", "no_live_sends"]
+    payload = json.loads(result.model_dump_json())
+    assert payload["model_spend_remaining"] == {"max_tokens": "1000", "max_hours": "1.5"}
+    assert result.model_dump(mode="json")["model_spend_remaining"] == payload["model_spend_remaining"]
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_baseline_source(db_session, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _goal_run(db_session, test_project, started=False)
+    result = await effective_authorization(db_session, goal, run)
+    assert (result.allowed, result.authority_source, result.workspace_mutation) == (True, "baseline", "read_only")
+    run.phase = "ready"
+    assert (await effective_authorization(db_session, goal, run)).authority_source == "baseline"
+
+    run.baseline_authorized = False
+    assert _denial(await effective_authorization(db_session, goal, run)) == (
+        False, "baseline_not_authorized", "authorize_baseline")
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_root_start_contract_binding(db_session, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+    from huddleroom.services.orchestration_authority_service import (
+        effective_authorization, reauthorize_execution_key,
+    )
+
+    goal, run = await _goal_run(db_session, test_project, goal_type="outcome")
+    assert _denial(await effective_authorization(db_session, goal, run)) == (False, "start_required", "start")
+    await _authorize(db_session, run)
+    assert (await effective_authorization(db_session, goal, run)).allowed
+
+    goal.objective = "Ship it differently"
+    fp = compute_goal_contract_fingerprint(goal)
+    changed = await effective_authorization(db_session, goal, run)
+    assert _denial(changed) == (False, "contract_changed_since_start", "start")
+    assert changed.contract_fingerprint == fp != run.goal_contract_fingerprint
+
+    key = reauthorize_execution_key(run.id, fp)
+    assert key == f"run:{run.id}:kind:reauthorize_execution:{fp}"
+    db_session.add(OrchestrationAction(run_id=run.id, idempotency_key=key, action_type="reauthorize_execution",
+                                       status="completed"))
+    await db_session.flush()
+    assert (await effective_authorization(db_session, goal, run)).allowed
+    goal.objective = "Yet another contract"  # a re-Start covers only the fingerprint it named
+    assert (await effective_authorization(db_session, goal, run)).reason_code == "contract_changed_since_start"
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_legacy_null_fingerprint_grandfathered(db_session, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _goal_run(db_session, test_project, started=False)
+    run.phase = "authorized"
+    await _authorize(db_session, run)
+    goal.objective = "Edited after a legacy Start"
+    result = await effective_authorization(db_session, goal, run)
+    assert run.goal_contract_fingerprint is None
+    assert (result.allowed, result.authority_source) == (True, "root_start")
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_inactive_run(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _started_root(db_session, test_project)
+    goal.status = "paused"
+    assert _denial(await effective_authorization(db_session, goal, run)) == (False, "run_not_active", "resume")
+    run.status = "paused"  # e.g. a paused goal's correction successor: resume, not revocation
+    assert _denial(await effective_authorization(db_session, goal, run)) == (False, "run_not_active", "resume")
+    goal.status, run.status = "active", "cancelled"
+    assert _denial(await effective_authorization(db_session, goal, run)) == (False, "run_not_active", None)
+
+
+async def _released(db, project):
+    from tests.test_orchestration_roadmap_children import release
+
+    roadmap, parent, parent_run, _, row = await release(db, project)
+    child = await db.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await OrchestrationService().get_run_for_goal(db, project.id, child.id)
+    return roadmap, parent, parent_run, child, child_run
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_released_child(db_session, test_project):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from huddleroom.models.orchestration import OrchestrationBudgetReservation
+    from huddleroom.services.orchestration_authority_service import (
+        effective_authorization, reauthorize_execution_key,
+    )
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+
+    _, parent, parent_run, child, child_run = await _released(db_session, test_project)
+    result = await effective_authorization(db_session, child, child_run)
+    assert (result.allowed, result.authority_source) == (True, "parent_release")
+    assert "no_publish_before_integration" in result.tool_constraints
+    assert result.model_spend_remaining == {
+        key: Decimal(value) for key, value in child_run.budget_state["caps"].items()
+    }
+    # The roadmap fixture edits the parent contract after its Start; re-Start it before reading remaining.
+    db_session.add(OrchestrationAction(
+        run_id=parent_run.id, action_type="reauthorize_execution", status="completed",
+        idempotency_key=reauthorize_execution_key(parent_run.id, compute_goal_contract_fingerprint(parent))))
+    await db_session.flush()
+    parent_result = await effective_authorization(db_session, parent, parent_run)
+    assert parent_result.allowed
+    assert parent_result.model_spend_remaining == {
+        key: Decimal(value)
+        for key, value in (await OrchestrationBudgetService().remaining(db_session, parent))["remaining"].items()
+    }
+
+    child_run.plan_state = {"child_delta_baseline": {
+        **child_run.plan_state["child_delta_baseline"], "status": "pending_renewal"}}
+    assert _denial(await effective_authorization(db_session, child, child_run)) == (
+        False, "parent_release_pending", "parent_release")
+    child_run.plan_state = {"child_delta_baseline": {
+        **child_run.plan_state["child_delta_baseline"], "status": "accepted"}}
+
+    reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.child_goal_id == child.id))
+    reservation.status, reservation.settled_at, reservation.settlement_reason = (
+        "settled", datetime.now(timezone.utc), "completed")
+    assert _denial(await effective_authorization(db_session, child, child_run)) == (
+        False, "parent_reservation_inactive", "parent_release")
+
+
+@pytest.mark.asyncio
+async def test_predecessor_start_is_stale_after_type_correction(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+    from tests.test_orchestration_goal_type_correction import _apply, _request
+
+    goal, old = await _started_root(db_session, test_project)
+    assert (await effective_authorization(db_session, goal, old)).allowed
+    request, _ = await _request(db_session, goal, old)
+    goal, successor = await _apply(db_session, goal, request)
+
+    assert _denial(await effective_authorization(db_session, goal, old)) == (False, "run_not_active", None)
+    # The successor's baseline may run, but the predecessor's Start does not carry over.
+    assert (await effective_authorization(db_session, goal, successor)).authority_source == "baseline"
+    successor.phase = "authorized"
+    assert _denial(await effective_authorization(db_session, goal, successor)) == (False, "start_required", "start")
+
+
+@pytest.mark.asyncio
+async def test_renewed_corrected_child_is_authorized_by_parent_release(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+    from tests.test_orchestration_goal_type_correction import _apply, _request
+
+    roadmap, parent, parent_run, child, old = await _released(db_session, test_project)
+    child.goal_type_source = "parent_auto"
+    await db_session.flush()
+    request, _ = await _request(db_session, child, old, requested_goal_type="roadmap")
+    child, successor = await _apply(db_session, child, request)
+
+    assert _denial(await effective_authorization(db_session, child, old)) == (False, "run_not_active", None)
+    assert _denial(await effective_authorization(db_session, child, successor)) == (
+        False, "parent_release_pending", "parent_release")
+    assert await roadmap.renew_corrected_children(db_session, parent, parent_run) == 1
+    assert successor.plan_state["child_delta_baseline"]["approval_reference"]["kind"] == "parent_renewal"
+    result = await effective_authorization(db_session, child, successor)
+    assert (result.allowed, result.authority_source, result.run_id) == (True, "parent_release", successor.id)
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_budget_exhausted_and_measurement_error(
+    db_session, test_project, monkeypatch,
+):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+    from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
+
+    goal, run = await _started_root(db_session, test_project, budget={"caps": {"max_turns": "0", "max_tokens": "5"}})
+    exhausted = await effective_authorization(db_session, goal, run)
+    assert _denial(exhausted) == (False, "budget_exhausted", "increase_budget")
+    assert exhausted.model_spend_remaining["max_turns"] == 0
+
+    async def unmeasured(self, db, run, caps):
+        raise BudgetMeasurementError("max_tokens", uuid.uuid4())
+
+    monkeypatch.setattr(OrchestrationBudgetService, "run_remaining", unmeasured)
+    assert _denial(await effective_authorization(db_session, goal, run)) == (
+        False, "budget_measurement", "resolve_budget_measurement")
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_declared_task_scope(db_session, test_project):
+    from decimal import Decimal
+
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _started_root(db_session, test_project, budget={"caps": {"max_tokens": "1000"}})
+
+    async def check(scope, context=None):
+        task = await _scoped_task(db_session, test_project, run, scope, context)
+        return await effective_authorization(db_session, goal, run, task)
+
+    undeclared = await check(None)
+    assert (undeclared.allowed, undeclared.workspace_mutation) == (True, "direct")
+    assert undeclared.model_spend_remaining == {"max_tokens": Decimal("1000")}
+    assert _denial(await check({})) == (False, "model_spend_not_granted", "revise_task_scope")
+    assert _denial(await check({"model_spend": "yes"})) == (False, "model_spend_not_granted", "revise_task_scope")
+    spend = {"model_spend": {"allowed": True, "remaining_by_dimension": {"max_tokens": "10", "max_turns": "2"}}}
+    narrowed = await check({**spend, "tool_constraints": ["read_docs_only"]})
+    assert (narrowed.allowed, narrowed.workspace_mutation) == (True, "read_only")
+    assert narrowed.model_spend_remaining == {"max_tokens": Decimal("10"), "max_turns": Decimal("2")}
+    assert narrowed.tool_constraints == ["no_external_writes", "no_live_sends", "read_docs_only"]
+    assert _denial(await check({**spend, "external_writes": {"allowed": True, "targets": ["github"]}})) == (
+        False, "external_write_not_granted", "ask_human")
+    assert _denial(await check({**spend, "live_sends": {"allowed": True, "channels": ["slack"]}})) == (
+        False, "live_send_not_granted", "ask_human")
+    assert (await check({**spend, "workspace_mutation": "direct"})).allowed
+
+    staged = {"roadmap": {"mutates_shared_state": True, "no_publish_before_integration": True,
+                          "staging_boundary": {"type": "git_worktree", "identifier": "w", "reversible": True}}}
+    over = await check({**spend, "workspace_mutation": "direct"}, staged)
+    assert _denial(over) == (False, "workspace_mutation_exceeds_policy", "ask_human")
+    within = await check({**spend, "workspace_mutation": "staged"}, staged)
+    assert (within.allowed, within.workspace_mutation) == (True, "staged")
+    assert "no_publish_before_integration" in within.tool_constraints
+
+
+@pytest.mark.asyncio
+async def test_effective_authorization_baseline_rank_and_team(db_session, test_project, test_agent):
+    from tests.test_orchestration_goal_shape import _goal_run
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _goal_run(db_session, test_project, started=False)
+    spend = {"model_spend": {"allowed": True}}
+    staged = await _scoped_task(db_session, test_project, run, {**spend, "workspace_mutation": "staged"})
+    assert _denial(await effective_authorization(db_session, goal, run, staged)) == (
+        False, "workspace_mutation_exceeds_policy", "ask_human")
+
+    started, started_run = await _started_root(db_session, test_project)
+    context = {"roadmap": {"mutates_shared_state": False}, "team": {"agent_ids": [str(uuid.uuid4())]}}
+    outsider = await _scoped_task(db_session, test_project, started_run, None, context, assigned_to=test_agent.id)
+    assert _denial(await effective_authorization(db_session, started, started_run, outsider)) == (
+        False, "agent_outside_accepted_team", "reassign_task")
+    context["team"]["agent_ids"].append(str(test_agent.id))
+    member = await _scoped_task(db_session, test_project, started_run, None, context, assigned_to=test_agent.id)
+    assert (await effective_authorization(db_session, started, started_run, member)).allowed
+    # Outcome work without a Roadmap context gets no new team restriction.
+    plain = await _scoped_task(db_session, test_project, started_run, None, {"team": {"agent_ids": []}},
+                               assigned_to=test_agent.id)
+    assert (await effective_authorization(db_session, started, started_run, plain)).allowed
+
+
+@pytest.mark.parametrize("gate_type,required,source_type,verdict,terminal,expected", [
+    ("work_completed", {}, "task", "accepted", None, ("delivery", "final", "accepted")),
+    ("work_completed", {}, "verification", "rejected", None, ("verification", "final", "rejected")),
+    ("plan_accepted", {}, "artifact", "candidate", None, ("readiness", "final", "pending")),
+    ("roadmap_plan_approval", None, "artifact", "candidate", "reclassified", ("readiness", "final", "superseded")),
+    ("roadmap_integration", {}, "child_goal", "accepted", None, ("integration", "final", "accepted")),
+    ("adhoc_work_accepted", {"evidence_role": "discovery", "review_stage": "preliminary"}, "task", "accepted", None,
+     ("discovery", "preliminary", "accepted")),
+    ("roadmap_integration", {"evidence_role": "bogus", "review_stage": "draft"}, "task", "candidate", "cancelled",
+     ("integration", "final", "pending")),
+])
+def test_evidence_semantics_table(gate_type, required, source_type, verdict, terminal, expected):
+    from huddleroom.services.orchestration_dependencies import evidence_semantics
+
+    assert evidence_semantics(gate_type, required, source_type, verdict, terminal) == dict(
+        zip(("evidence_role", "review_stage", "acceptance_verdict"), expected))
+
+
+def test_plan_gate_type_is_a_readiness_gate():
+    from huddleroom.services.orchestration_dependencies import READINESS_GATE_TYPES
+    from huddleroom.services.orchestration_service import PLAN_GATE_TYPE
+
+    assert PLAN_GATE_TYPE in READINESS_GATE_TYPES

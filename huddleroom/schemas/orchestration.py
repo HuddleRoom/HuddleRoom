@@ -675,6 +675,23 @@ class AuthorizationScope(BaseModel):
     tool_constraints: list[str] = Field(default_factory=list)
 
 
+class AuthorizationResult(BaseModel):
+    """Effective authority for one run (and optionally one task); first failing check wins."""
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: bool
+    reason_code: str | None = None
+    required_decision: str | None = None
+    authority_source: Literal["baseline", "root_start", "parent_release"]
+    run_id: uuid.UUID
+    contract_fingerprint: str
+    model_spend_remaining: dict[str, Decimal] = Field(default_factory=dict)
+    external_write_targets: list[str] = Field(default_factory=list)
+    live_send_channels: list[str] = Field(default_factory=list)
+    workspace_mutation: Literal["read_only", "staged", "direct"]
+    tool_constraints: list[str] = Field(default_factory=list)
+
+
 # New keys are dropped from dumps while default-valued so legacy persisted
 # contracts, plan snapshots, and fingerprints stay byte-identical.
 _CONTRACT_NEW_DEFAULTS: dict[str, Any] = {

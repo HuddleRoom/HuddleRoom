@@ -4,15 +4,22 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 
+from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.base import _utcnow
-from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun, OrchestrationWait
+from huddleroom.models.orchestration import (
+    OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun, OrchestrationWait,
+    compute_goal_contract_fingerprint,
+)
 from huddleroom.models.orchestration_process import AUTHORITIES, OrchestrationAuthorityDecision
+from huddleroom.models.task import Task
 from huddleroom.models.user import User
+from huddleroom.schemas.orchestration import ROADMAP_BUDGET_DIMENSIONS, AuthorizationResult, AuthorizationScope
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_linkage import check_goal_linkage
 
@@ -536,3 +543,137 @@ class OrchestrationAuthorityDecisionService:
         )
         result = await db.execute(query)
         return list(result.scalars().all())
+
+
+_WORKSPACE_RANK = {"read_only": 0, "staged": 1, "direct": 2}
+
+
+def reauthorize_execution_key(run_id: uuid.UUID, fingerprint: str) -> str:
+    """Re-Start after a contract change; the run's frozen fingerprint is never rewritten."""
+    return f"run:{run_id}:kind:reauthorize_execution:{fingerprint}"
+
+
+async def effective_authorization(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, task: Task | None = None,
+) -> AuthorizationResult:
+    """Read-only effective authority for a run (and task); the first failing check denies.
+
+    Start is orchestration/model-spend authority only. No goal-level external-write or
+    live-send grants exist, so those stay empty; generic shell effects are not policed here.
+    Capacity is not an input (capacity_wait is owned by the scheduler).
+    """
+    # Lazy imports avoid the cycle from orchestration_service back to this service.
+    from huddleroom.services.orchestration_budget_service import (
+        BudgetMeasurementError, OrchestrationBudgetService, canonical_amounts, parent_caps,
+    )
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from huddleroom.services.session_service import SessionService
+
+    svc = OrchestrationService()
+    obj = svc._json_object_or_empty
+    fp = compute_goal_contract_fingerprint(goal)
+    if goal.parent_goal_id is not None:
+        source = "parent_release"
+    elif run.phase in ("baseline", "ready"):
+        source = "baseline"
+    else:
+        source = "root_start"
+    context = await SessionService()._immutable_roadmap_context(db, task) if task is not None else obj(
+        goal.orchestrator_context
+    )
+    roadmap = obj(context.get("roadmap"))
+    if source == "baseline":
+        workspace = "read_only"
+    elif roadmap.get("mutates_shared_state") and roadmap.get("staging_boundary"):
+        workspace = "staged"
+    else:
+        workspace = "direct"
+    raw_scope = obj(obj(task.metadata_ if task is not None else None).get("orchestration_contract")).get(
+        "authorization_scope"
+    )
+    scope = None
+    if raw_scope is not None:
+        try:
+            scope = AuthorizationScope.model_validate(raw_scope)
+        except ValidationError:
+            scope = AuthorizationScope()  # fail closed: an unreadable declaration grants nothing
+    constraints = {"no_external_writes", "no_live_sends", *(scope.tool_constraints if scope else ())}
+    if roadmap.get("no_publish_before_integration"):
+        constraints.add("no_publish_before_integration")
+    remaining: dict[str, Decimal] = {}
+
+    def result(reason: str | None = None, decision: str | None = None) -> AuthorizationResult:
+        return AuthorizationResult(
+            allowed=reason is None, reason_code=reason, required_decision=decision,
+            authority_source=source, run_id=run.id, contract_fingerprint=fp,
+            model_spend_remaining=remaining, workspace_mutation=workspace,
+            tool_constraints=sorted(constraints),
+        )
+
+    async def completed(key: str) -> bool:
+        action = await svc._existing_action_for_key(db, run.id, key)
+        return action is not None and action.status == "completed"
+
+    if goal.status not in ("active", "blocked") or run.status not in ("running", "blocked"):
+        return result("run_not_active", "resume" if "paused" in (goal.status, run.status) else None)
+    if source == "parent_release":
+        delta = obj(obj(run.plan_state).get("child_delta_baseline"))
+        if delta and delta.get("status") != "accepted":
+            return result("parent_release_pending", "parent_release")
+        if not await completed(svc._authorize_execution_key(run.id)):
+            return result("parent_release_missing", "parent_release")
+        reservation = await db.scalar(select(OrchestrationBudgetReservation.status).where(
+            OrchestrationBudgetReservation.parent_goal_id == goal.parent_goal_id,
+            OrchestrationBudgetReservation.child_goal_id == goal.id,
+        ))
+        if reservation != "active":
+            return result("parent_reservation_inactive", "parent_release")
+        if run.goal_contract_fingerprint not in (None, fp):
+            return result("contract_changed_since_release", "parent_release")
+    elif source == "baseline":
+        if not run.baseline_authorized:
+            return result("baseline_not_authorized", "authorize_baseline")
+    else:
+        # A predecessor run's Start is stale by construction: it is cancelled (check above)
+        # and the successor carries no authorize_execution action of its own.
+        if not await completed(svc._authorize_execution_key(run.id)):
+            return result("start_required", "start")
+        # NULL fingerprint = legacy run started before freezing; grandfathered.
+        if run.goal_contract_fingerprint not in (None, fp) and not await completed(
+            reauthorize_execution_key(run.id, fp)
+        ):
+            return result("contract_changed_since_start", "start")
+
+    budget = OrchestrationBudgetService()
+    try:
+        if goal.goal_type in ("roadmap", "continuous"):  # the goal is its own budget parent
+            raw = (await budget.remaining(db, goal))["remaining"]
+        else:
+            state_caps = obj(run.budget_state).get("caps")
+            caps = canonical_amounts(state_caps, allowed=ROADMAP_BUDGET_DIMENSIONS) if state_caps else parent_caps(goal)
+            raw = await budget.run_remaining(db, run, caps) if caps else {}
+    except BudgetMeasurementError:
+        return result("budget_measurement", "resolve_budget_measurement")
+    remaining = {key: Decimal(value) for key, value in raw.items()}
+    if any(value <= 0 for value in remaining.values()):
+        return result("budget_exhausted", "increase_budget")
+
+    if task is not None and roadmap and task.assigned_to is not None:
+        allowed = svc._roadmap_team_agent_ids(context.get("team"))
+        agent_id = str(task.assigned_to)
+        if (allowed is not None and agent_id not in allowed) or context.get("assigned_agent_id") not in (None, agent_id):
+            return result("agent_outside_accepted_team", "reassign_task")
+
+    if scope is not None:
+        if not scope.model_spend.allowed:
+            return result("model_spend_not_granted", "revise_task_scope")
+        for key, value in scope.model_spend.remaining_by_dimension.items():
+            remaining[key] = min(remaining[key], value) if key in remaining else value
+        if scope.external_writes.allowed:
+            return result("external_write_not_granted", "ask_human")
+        if scope.live_sends.allowed:
+            return result("live_send_not_granted", "ask_human")
+        if _WORKSPACE_RANK[scope.workspace_mutation] > _WORKSPACE_RANK[workspace]:
+            return result("workspace_mutation_exceeds_policy", "ask_human")
+        workspace = scope.workspace_mutation  # a declared scope can only narrow the goal level
+    return result()
