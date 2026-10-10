@@ -12,7 +12,7 @@ import type {
   OrchestrationProcessRunRecord,
   OrchestrationWarningRecord,
 } from '@/lib/types'
-import { errorRecord, evidenceLabel, goalTypeLabel, goalTypeSourceLabel, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
+import { acceptanceVerdictLabel, errorRecord, evidenceLabel, evidenceVerdict, goalTypeLabel, goalTypeSourceLabel, requiredDecisionLabel, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
 import { scoped } from './ProcessFocus'
 
 // Goal-wide orchestrator decision/action ledger (run-scoped, not attributable
@@ -96,6 +96,7 @@ export interface ActivityEntry {
   message: string
   processType: OrchestrationBaselineProcessType | null
   status?: string
+  statusLabel?: string
   error?: string | null
   target?: string
   decisionRef?: { id: string; label: string; reason: string }
@@ -183,7 +184,7 @@ const KIND_LABEL: Record<string, string> = {
   'work-queued': 'Work queued',
   'work-started': 'Work started',
   'evidence-recorded': 'Evidence recorded',
-  'work-accepted': 'Accepted',
+  'work-accepted': 'Work accepted',
 }
 
 function ledgerMessage(kind: string | undefined, item: TimelineItem, detail: OrchestrationGoalDetail): string {
@@ -196,7 +197,11 @@ function ledgerMessage(kind: string | undefined, item: TimelineItem, detail: Orc
   if (kind === 'work-queued') {
     const planItem = detail.plan?.items?.find((candidate) => candidate.key === request.plan_item_id)
     const fallback = typeof request.plan_item_id === 'string' ? request.plan_item_id : 'plan item'
-    return `Queued: ${planItem?.title ?? fallback}${planItem?.adopted ? ' (existing work)' : ''}`
+    const wait = detail.authorization_wait
+    const needs = wait?.required_decision && planItem?.task_id && wait.task_ids.includes(planItem.task_id)
+      ? ` · Needs: ${requiredDecisionLabel(wait.required_decision)}`
+      : ''
+    return `Queued: ${planItem?.title ?? fallback}${planItem?.adopted ? ' (existing work)' : ''}${needs}`
   }
   if (kind === 'plan-ingested') {
     const plan = detail.plan
@@ -234,18 +239,25 @@ function goalLedgerEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
   })
 }
 
+// Success criteria are shown by their description; the key is the fallback.
+function criterionText(detail: OrchestrationGoalDetail, key: string): string {
+  return detail.goal.success_criteria?.find((criterion) => criterion.key === key)?.description || key
+}
+
 // Events with no ledger row of their own, derived from the goal detail.
 // Fixtures/older payloads may omit any of these, so every read is defensive.
 function derivedGoalEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
   const entries: ActivityEntry[] = []
-  const entry = (id: string, kind: string, timestamp: string, message: string, status?: string): ActivityEntry =>
-    ({ id, kind, label: KIND_LABEL[kind], timestamp, message, processType: null, status })
+  const entry = (id: string, kind: string, timestamp: string, message: string, status?: string, statusLabel?: string): ActivityEntry =>
+    ({ id, kind, label: KIND_LABEL[kind], timestamp, message, processType: null, status, statusLabel })
   const goal = detail.goal
   if (goal && goal.goal_type && goal.goal_type_source && goal.goal_type_source !== 'legacy') {
     const type = detail.runs?.[0]?.goal_type_snapshot ?? goal.goal_type
-    const rationale = type === goal.goal_type && goal.goal_type_rationale ? ` — ${goal.goal_type_rationale}` : ''
+    // After a correction the original type no longer matches the current source/rationale.
+    const current = type === goal.goal_type
+    const rationale = current && goal.goal_type_rationale ? ` — ${goal.goal_type_rationale}` : ''
     entries.push(entry(`goal-${goal.id}:type-resolved`, 'type-resolved', goal.created_at,
-      `${goalTypeLabel(type)} · ${goalTypeSourceLabel(goal.goal_type_source)}${rationale}`))
+      `${goalTypeLabel(type)}${current ? ` · ${goalTypeSourceLabel(goal.goal_type_source)}` : ''}${rationale}`))
   }
   for (const worker of detail.supervision?.workers ?? []) {
     if (typeof worker.started_at !== 'string') continue
@@ -255,15 +267,16 @@ function derivedGoalEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
   const gates = detail.gates ?? []
   for (const evidence of detail.evidence ?? []) {
     const gate = gates.find((candidate) => candidate.id === evidence.gate_id)
+    const verdict = evidenceVerdict(evidence)
     entries.push(entry(`evidence-${evidence.id}`, 'evidence-recorded', evidence.created_at,
-      `${evidenceLabel(evidence.evidence_role ?? evidence.source_type, evidence.review_stage ?? '')} for ${gate?.success_criterion_key ?? 'a success criterion'}`,
-      evidence.verdict))
+      `${evidenceLabel(evidence.evidence_role ?? evidence.source_type, evidence.review_stage ?? '')} for ${gate ? criterionText(detail, gate.success_criterion_key) : 'a success criterion'}`,
+      verdict, acceptanceVerdictLabel(verdict)))
   }
   for (const gate of gates) {
     if (gate.status !== 'accepted' || !gate.accepted_at) continue
     const planItem = detail.plan?.items?.find((candidate) => candidate.gate_id === gate.id)
     entries.push(entry(`gate-${gate.id}:accepted`, 'work-accepted', gate.accepted_at,
-      `${planItem?.title ?? gate.success_criterion_key} accepted`))
+      `${planItem?.title ?? criterionText(detail, gate.success_criterion_key)} accepted`))
   }
   return entries
 }
@@ -420,7 +433,7 @@ export function ActivityLog({ processes, decisions, warnings, detail, selectedSt
                 )}
                 <LedgerRow
                   iso={entry.timestamp}
-                  action={<>{entry.label ?? entry.kind}{entry.status && <StatusBadge status={entry.status} />}</>}
+                  action={<>{entry.label ?? entry.kind}{entry.status && <StatusBadge status={entry.status} label={entry.statusLabel} />}</>}
                   detail={entry.message}
                 >
                   {entry.processType && <span className="text-xs text-huddleroom-text-muted">{stepDisplayLabel(entry.processType)}</span>}

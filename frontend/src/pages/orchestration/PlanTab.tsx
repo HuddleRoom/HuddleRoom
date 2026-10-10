@@ -19,6 +19,7 @@ import type {
 import {
   acceptanceVerdictLabel,
   evidenceLabel,
+  evidenceVerdict,
   goalStatusLabel,
   goalTypeLabel,
   itemStateLabel,
@@ -50,10 +51,6 @@ const VERDICT_BADGE: Record<string, string> = {
   pending: 'pending', accepted: 'accepted', rejected: 'rejected', superseded: 'cancelled',
 }
 
-function evidenceVerdict(evidence: OrchestrationEvidence): string {
-  return evidence.acceptance_verdict ?? (evidence.verdict === 'candidate' ? 'pending' : evidence.verdict)
-}
-
 // ---------------------------------------------------------------------------
 // Plan overview: runs + current plan record
 // ---------------------------------------------------------------------------
@@ -78,17 +75,19 @@ export interface PlanOverviewProps {
   agentRoles?: Names
   // A revised plan awaiting approval sits on top of an accepted plan.
   pendingReplan?: boolean
+  // Run plan-state status; drives the drafting copy while no plan record exists yet.
+  planStatus?: string | null
   pendingDecisionId?: string | null
   onViewDecision?: (decisionId: string) => void
 }
 
-export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = false, pendingDecisionId = null, onViewDecision }: PlanOverviewProps) {
+export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = false, planStatus = plan?.status ?? null, pendingDecisionId = null, onViewDecision }: PlanOverviewProps) {
   const current = runs.find((run) => run.is_current)
   const earlier = runs.filter((run) => !run.is_current).sort((a, b) => b.started_at.localeCompare(a.started_at))
   const author = plan?.author_agent_id ? (agentRoles[plan.author_agent_id] ?? 'the plan author') : 'the plan author'
   const version = plan?.planning_version ?? null
-  // ponytail: only the current plan version is projected; earlier ones are derived counts, not fetched.
-  const earlierVersions = version && version > 1 ? Array.from({ length: version - 1 }, (_, index) => version - 1 - index) : []
+  // ponytail: only the current plan version is projected; earlier ones are a count, not fetched.
+  const earlierCount = version && version > 1 ? version - 1 : 0
 
   return <div className="flex flex-col gap-3">
     <section aria-label="Runs" className="flex flex-col gap-2">
@@ -101,7 +100,7 @@ export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = fals
         </span>,
       }]} />}
       {earlier.length > 0 && <details>
-        <summary className={SUMMARY_CLASS}>Earlier runs ({earlier.length})</summary>
+        <summary className={SUMMARY_CLASS}>▸ Earlier runs ({earlier.length})</summary>
         <ul className="flex flex-col gap-1 text-sm text-huddleroom-text-secondary">
           {earlier.map((run) => <li key={run.id} className="flex flex-wrap items-baseline gap-2">
             <span>{runLabel(run.version_label)} · Historical</span>
@@ -126,13 +125,10 @@ export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = fals
           { key: 'Artifact', value: <MonoId id={plan.artifact_id} /> },
           { key: 'Status', value: plan.status ? <StatusBadge status={plan.status === 'requested' ? 'pending' : plan.status} label={planStatusLabel(plan.status)} /> : null },
         ]} />
-        {earlierVersions.length > 0 && <details>
-          <summary className={SUMMARY_CLASS}>Earlier plan versions ({earlierVersions.length})</summary>
-          <ul className="flex flex-col gap-1 text-sm text-huddleroom-text-secondary">
-            {earlierVersions.map((n) => <li key={n}>v{n} · Historical (read-only)</li>)}
-          </ul>
-        </details>}
-      </> : plan?.status === 'requested' || plan?.status === 'revision_requested'
+        {earlierCount > 0 && <p className="text-xs text-huddleroom-text-muted">
+          {earlierCount === 1 ? '1 earlier version (v1)' : `${earlierCount} earlier versions (v1–v${earlierCount})`}, not shown here.
+        </p>}
+      </> : planStatus === 'requested' || planStatus === 'revision_requested'
         ? <p className="text-sm text-huddleroom-text-secondary">Plan is being drafted by {author}.</p>
         : <p className="text-sm text-huddleroom-text-secondary">No plan yet. Items appear here once the plan author&apos;s plan is accepted.</p>}
     </section>
@@ -151,10 +147,11 @@ function asLines(value: unknown): string[] {
   return []
 }
 
-function LineList({ value }: { value: unknown }): ReactNode {
-  const lines = asLines(value)
-  if (lines.length === 0) return null
-  return <ul className="list-disc pl-4">{lines.map((line, index) => <li key={index} className="break-words">{line}</li>)}</ul>
+// Null when empty so the Record row is dropped instead of showing a bare label.
+function lines(value: unknown): ReactNode {
+  const entries = asLines(value)
+  if (entries.length === 0) return null
+  return <ul className="list-disc pl-4">{entries.map((line, index) => <li key={index} className="break-words">{line}</li>)}</ul>
 }
 
 function TitleList({ titles, empty }: { titles: string[]; empty: string }) {
@@ -203,20 +200,26 @@ export function PlanItemList({
       .filter((dep) => dep.task_id && taskReports.some((entry) => entry.task_id === dep.task_id && entry.report))
       .map((dep) => dep.title ?? dep.key)
 
+    // Unreleased queued items wait on dependencies; released ones were unblocked (possibly by preliminary evidence).
+    const runnabilityLine = item.state === 'queued' && !item.task_id && !item.child_goal_id && unmet.length > 0
+      ? `Waiting on: ${unmet.map(titleOf).join(', ')}`
+      : (item.state === 'queued' || item.state === 'started') && item.why_runnable?.trim()
+        ? `Why runnable: ${item.why_runnable}`
+        : null
+
     return <li key={item.key} className="flex flex-col gap-2 rounded-md border border-huddleroom-border p-4">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm font-medium text-huddleroom-text-primary">{item.title ?? item.key}</span>
         <StatusBadge status={ITEM_STATE_BADGE[item.state] ?? 'neutral'} label={itemStateLabel(item.state)} />
         {item.priority !== 50 && <Tag>Priority {item.priority}</Tag>}
       </div>
-      <p className="text-sm text-huddleroom-text-secondary">
-        {item.state === 'queued' && unmet.length > 0 ? `Waiting on: ${unmet.map(titleOf).join(', ')}` : `Why runnable: ${item.why_runnable}`}
-      </p>
+      {runnabilityLine && <p className="text-sm text-huddleroom-text-secondary">{runnabilityLine}</p>}
       <RecordList keyWidth={120} rows={[
         { key: 'Depends on', value: item.depends_on.length > 0 ? item.depends_on.map(titleOf).join(', ') : 'None' },
         { key: 'Artifacts', value: item.artifact_ids.length > 0 ? <span className="flex flex-wrap gap-1">{item.artifact_ids.map((id) => <Tag key={id} className="font-mono"><span title={id}>{shortId(id)}</span></Tag>)}</span> : null },
         { key: 'Reuses task', value: item.adopt_task_id ? (adoptedTitle ?? <MonoId id={item.adopt_task_id} />) : null },
         { key: 'Owner', value: owner || null },
+        { key: 'Report', value: report?.summary ?? <span className="text-huddleroom-text-muted">No report yet.</span> },
       ]} />
       {itemEvidence.length > 0 && <ul aria-label="Evidence" className="flex flex-col gap-1 text-sm">
         {itemEvidence.map((entry) => {
@@ -227,30 +230,29 @@ export function PlanItemList({
           </li>
         })}
       </ul>}
-      <p className="text-sm text-huddleroom-text-primary">{report?.summary ?? 'No report yet.'}</p>
       {fullReport && <details>
-        <summary className={SUMMARY_CLASS}>Full report and provenance</summary>
+        <summary className={SUMMARY_CLASS}>▸ Full report and provenance</summary>
         <div className="flex flex-col gap-2 pb-2">
           <RecordList keyWidth={120} rows={[
-            { key: 'Status', value: typeof fullReport.status === 'string' ? fullReport.status : null },
-            { key: 'Changes', value: <LineList value={fullReport.changes} /> },
-            { key: 'Evidence', value: <LineList value={fullReport.evidence} /> },
-            { key: 'Criterion progress', value: <LineList value={fullReport.criterion_progress} /> },
-            { key: 'Decisions', value: <LineList value={fullReport.decisions} /> },
-            { key: 'Risks', value: <LineList value={fullReport.risks} /> },
-            { key: 'Open questions', value: <LineList value={fullReport.open_questions} /> },
+            { key: 'Status', value: typeof fullReport.status === 'string' ? acceptanceVerdictLabel(fullReport.status) : null },
+            { key: 'Changes', value: lines(fullReport.changes) },
+            { key: 'Evidence', value: lines(fullReport.evidence) },
+            { key: 'Criterion progress', value: lines(fullReport.criterion_progress) },
+            { key: 'Decisions', value: lines(fullReport.decisions) },
+            { key: 'Risks', value: lines(fullReport.risks) },
+            { key: 'Open questions', value: lines(fullReport.open_questions) },
             { key: 'Next step', value: typeof fullReport.next_step === 'string' ? fullReport.next_step : null },
             { key: 'Collaboration need', value: typeof fullReport.collaboration_need === 'string' ? fullReport.collaboration_need : null },
           ]} />
-          <RecordList keyWidth={120} className="font-mono text-xs" rows={[
+          <RecordList keyWidth={120} rows={[
             { key: 'Session', value: report?.session_id ? <MonoId id={report.session_id} /> : null },
             { key: 'Run', value: runVersion ? runLabel(runVersion) : null },
-            { key: 'Contract', value: contractFingerprint ? <MonoId id={contractFingerprint} /> : null },
+            { key: 'Contract at Start', value: contractFingerprint ? <MonoId id={contractFingerprint} /> : null },
           ]} />
         </div>
       </details>}
       <details>
-        <summary className={SUMMARY_CLASS}>Context given to the agent</summary>
+        <summary className={SUMMARY_CLASS}>▸ Context given to the agent</summary>
         <div className="flex flex-col gap-2 pb-2">
           <section><h4 className={HEADING_CLASS}>Goal contract</h4>
             <TitleList empty="None" titles={[goal.objective, ...goal.success_criteria.map((criterion) => criterion.description ?? String(criterion.key ?? '')).filter(Boolean)]} />
@@ -280,9 +282,7 @@ function ChildRow({ projectId, child, nested }: { projectId: string; child: Orch
   const [open, setOpen] = useState(false)
   // Lazy: the child's own detail is fetched only after its "Next level" is opened.
   const next = useOrchestrationGoal(projectId, open ? child.id : undefined)
-  const runText = child.run_version_label
-    ? `${runLabel(child.run_version_label)} · ${child.current_run_id ? 'Current' : 'Historical'}`
-    : null
+  const runText = child.run_version_label ? runLabel(child.run_version_label) : null
   return <li className="flex flex-col gap-1 rounded-md border border-huddleroom-border p-3">
     <div className="flex flex-wrap items-center gap-2">
       <Link to={`/orchestration/${child.id}`} className="text-sm font-medium text-huddleroom-primary">{child.objective}</Link>
@@ -292,7 +292,7 @@ function ChildRow({ projectId, child, nested }: { projectId: string; child: Orch
       {child.roadmap_version !== null && <span className="text-xs text-huddleroom-text-secondary">Plan v{child.roadmap_version}</span>}
     </div>
     {!nested && child.goal_type === 'roadmap' && <details open={open}>
-      <summary className={SUMMARY_CLASS} onClick={(event) => { event.preventDefault(); setOpen((current) => !current) }}>Next level</summary>
+      <summary className={SUMMARY_CLASS} onClick={(event) => { event.preventDefault(); setOpen((current) => !current) }}>▸ Next level</summary>
       {open && (next.isLoading
         ? <div aria-busy="true" aria-label="Loading next level"><SkeletonRow /></div>
         : next.isError
@@ -341,12 +341,13 @@ export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRo
   return <section className="flex flex-col gap-4 border-t border-huddleroom-border pt-4">
     <PlanOverview
       runs={runs} plan={plan} agentRoles={agentRoles} pendingReplan={pendingReplan}
+      planStatus={plan?.status ?? run?.plan_state?.status ?? null}
       pendingDecisionId={pendingDecision?.id ?? null} onViewDecision={onViewDecision}
     />
     {plan && <PlanItemList
       plan={plan} evidence={detail.evidence} taskReports={detail.task_reports ?? []} goal={detail.goal}
       taskTitles={taskTitles} agentRoles={agentRoles}
-      runVersion={currentRun?.version_label ?? null} contractFingerprint={detail.contract_fingerprint}
+      runVersion={currentRun?.version_label ?? null} contractFingerprint={run?.goal_contract_fingerprint ?? null}
     />}
     {isRoadmap && <section aria-label="Child goals section" className="flex flex-col gap-2">
       <h3 className={HEADING_CLASS}>Child goals</h3>

@@ -500,7 +500,7 @@ async function mountPlan(detail: OrchestrationGoalDetail, props: Partial<React.C
 
 function detailsBySummary(container: Parameters<typeof descendants>[0], summary: string) {
   const found = descendants(container).find((node) => node.tagName === 'DETAILS'
-    && node.childNodes.some((c) => 'tagName' in c && (c as typeof node).tagName === 'SUMMARY' && textOf(c).startsWith(summary)))
+    && node.childNodes.some((c) => 'tagName' in c && (c as typeof node).tagName === 'SUMMARY' && textOf(c).startsWith(`▸ ${summary}`)))
   if (!found) throw new Error(`details not found: ${summary}`)
   return found
 }
@@ -523,8 +523,7 @@ describe('Plan tab', () => {
       expect(text).toContain('Run 1 · Historical')
       expect(text).toContain('Reclassified to Roadmap')
       expect(text).toContain('v3 · Current')
-      expect(text).toContain('Earlier plan versions (2)')
-      expect(text).toContain('v2 · Historical (read-only)')
+      expect(text).toContain('2 earlier versions (v1–v2), not shown here.')
       expect(text).toContain('Delivery plan')
       expect(descendants(view.container).some((n) => n.getAttribute('title') === 'artifact-abcdef123456')).toBe(true)
       expect(detailsBySummary(view.container, 'Earlier runs').getAttribute('open')).toBeNull()
@@ -551,7 +550,7 @@ describe('Plan tab', () => {
   it('renders item cards with dependencies, artifacts, adoption, owner and priority', async () => {
     const plan = { ...planBase, items: [
       item({ key: 'design', title: 'Design it', state: 'started', task_id: null, gate_id: null }),
-      item({ key: 'build', depends_on: ['design'], state: 'queued', artifact_ids: ['artifact-zzzzzzzz9999'], adopt_task_id: 'task-old', priority: 80, why_runnable: 'Design finished' }),
+      item({ key: 'build', depends_on: ['design'], state: 'queued', task_id: null, artifact_ids: ['artifact-zzzzzzzz9999'], adopt_task_id: 'task-old', priority: 80, why_runnable: 'Design finished' }),
     ] }
     const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan }), { taskTitles: { 'task-old': 'Earlier spike' }, agentRoles: { 'agent-1': 'Developer' } })
     try {
@@ -578,6 +577,51 @@ describe('Plan tab', () => {
     try { expect(textOf(view.container)).toContain('Why runnable: Design finished') } finally { view.cleanup() }
   })
 
+  it('does not claim released items wait on dependencies and hides empty runnability', async () => {
+    const plan = { ...planBase, items: [
+      item({ key: 'design', title: 'Design it', state: 'started', task_id: 'task-design', why_runnable: '' }),
+      item({ key: 'build', title: 'Build it', depends_on: ['design'], state: 'queued', task_id: 'task-build', why_runnable: 'Preliminary design evidence' }),
+      item({ key: 'ship', title: 'Ship it', depends_on: ['design'], state: 'accepted', why_runnable: 'Was runnable' }),
+    ] }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan }))
+    try {
+      const card = (title: string) => descendants(view.container).find((n) => n.tagName === 'LI' && textOf(n).startsWith(title))!
+      expect(textOf(card('Build it'))).toContain('Why runnable: Preliminary design evidence')
+      expect(textOf(card('Build it'))).not.toContain('Waiting on')
+      expect(textOf(card('Ship it'))).not.toContain('Why runnable')
+      expect(textOf(card('Ship it'))).not.toContain('Waiting on')
+      expect(textOf(card('Design it'))).not.toContain('Why runnable')
+    } finally { view.cleanup() }
+  })
+
+  it('prefixes disclosures, drops empty report rows and shows the report row', async () => {
+    const plan = { ...planBase, items: [item()] }
+    const view = await mountPlan(goalDetail({
+      runs: [run()], run: null, plan,
+      task_reports: [{ task_id: 'task-build', session_id: 's1', summary: null, report: { status: 'done', changes: [], risks: ['Slow'] } }],
+    }))
+    try {
+      const summaries = descendants(view.container).filter((n) => n.tagName === 'SUMMARY').map((n) => textOf(n))
+      expect(summaries.length).toBeGreaterThan(1)
+      expect(summaries.every((t) => t.startsWith('▸ '))).toBe(true)
+      const full = textOf(detailsBySummary(view.container, 'Full report and provenance'))
+      expect(full).toContain('StatusDone')
+      expect(full).toContain('Slow')
+      expect(full).not.toContain('Changes')
+      expect(full).not.toContain('Decisions')
+      expect(textOf(view.container)).toContain('ReportNo report yet.')
+    } finally { view.cleanup() }
+  })
+
+  it('shows one earlier version singularly and drafting copy from the run plan state', async () => {
+    const one = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, planning_version: 2, items: [] } }))
+    try { expect(textOf(one.container)).toContain('1 earlier version (v1), not shown here.') } finally { one.cleanup() }
+    const drafting = await mountPlan(goalDetail({
+      runs: [run()], plan: null, run: { plan_state: { status: 'requested' } } as unknown as OrchestrationGoalDetail['run'],
+    }))
+    try { expect(textOf(drafting.container)).toContain('Plan is being drafted by the plan author.') } finally { drafting.cleanup() }
+  })
+
   it('never shows a pending-evidence item as Accepted and keeps stage and verdict separate', async () => {
     const plan = { ...planBase, items: [item({ state: 'evidence_pending' })] }
     const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan, evidence: [evidenceRow()] }))
@@ -599,7 +643,7 @@ describe('Plan tab', () => {
       decisions: ['Use streams'], risks: ['Slow on big files'], open_questions: ['Which encoding?'], next_step: 'Review', collaboration_need: 'Needs QA',
     }
     const view = await mountPlan(goalDetail({
-      runs: [run()], run: null, plan, contract_fingerprint: 'contract-fp-123456',
+      runs: [run()], plan, run: { goal_contract_fingerprint: 'fp-at-start', plan_state: {} } as unknown as OrchestrationGoalDetail['run'], contract_fingerprint: 'current-fp-999999',
       task_reports: [{ task_id: 'task-build', session_id: 'session-abcdef12', summary: 'Implemented · next: Review', report }],
     }))
     try {
@@ -609,10 +653,12 @@ describe('Plan tab', () => {
       const card = descendants(view.container).find((n) => n.tagName === 'LI' && textOf(n).startsWith('Build the thing'))!
       expect(textOf(card)).toContain('Implemented · next: Review')
       const fullText = textOf(full)
-      for (const expected of ['Added parser', 'Test run green', 'c1: half done', 'Use streams', 'Slow on big files', 'Which encoding?', 'Review', 'Needs QA', 'Run 2']) {
+      for (const expected of ['Added parser', 'Test run green', 'c1: half done', 'Use streams', 'Slow on big files', 'Which encoding?', 'Review', 'Needs QA', 'Run 2', 'Contract at Start']) {
         expect(fullText).toContain(expected)
       }
       expect(fullText).not.toContain('{')
+      expect(descendants(full).some((n) => n.getAttribute('title') === 'fp-at-start')).toBe(true)
+      expect(descendants(full).some((n) => n.getAttribute('title') === 'current-fp-999999')).toBe(false)
       expect(descendants(full).some((n) => n.tagName === 'UL')).toBe(true)
     } finally { view.cleanup() }
   })
@@ -656,19 +702,19 @@ describe('Plan tab', () => {
       let text = textOf(view.container)
       expect(text).toContain('Child goals')
       expect(text).toContain('Deliver phase one')
-      expect(text).toContain('Run 1 · Current')
+      expect(text).toContain('Run 1')
       expect(text).toContain('Plan v3')
-      expect(text).toContain('Run 1 · Historical')
+      expect(text).not.toContain('Historical')
       expect(text).not.toContain('Deliver sub-phase')
       expect(goalDetailMock.mock.calls.every(([, goalId]) => goalId === undefined)).toBe(true)
-      expect(descendants(view.container).filter((n) => n.tagName === 'SUMMARY' && textOf(n) === 'Next level')).toHaveLength(1)
+      expect(descendants(view.container).filter((n) => n.tagName === 'SUMMARY' && textOf(n) === '▸ Next level')).toHaveLength(1)
 
       await act(async () => summaryOf(detailsBySummary(view.container, 'Next level')).click())
       expect(goalDetailMock).toHaveBeenCalledWith('project-1', 'child-1')
       text = textOf(view.container)
       expect(text).toContain('Deliver sub-phase')
       // grandchildren do not offer another level
-      expect(descendants(view.container).filter((n) => n.tagName === 'SUMMARY' && textOf(n) === 'Next level')).toHaveLength(1)
+      expect(descendants(view.container).filter((n) => n.tagName === 'SUMMARY' && textOf(n) === '▸ Next level')).toHaveLength(1)
       const links = descendants(view.container).filter((n) => n.tagName === 'A').map((n) => n.getAttribute('href'))
       expect(links).toContain('/orchestration/child-1')
     } finally { view.cleanup() }

@@ -370,13 +370,31 @@ describe('ActivityLog steering anchors', () => {
     } as unknown as Partial<OrchestrationGoalDetail>)
   }
 
+  it('humanizes evidence status, criteria, queued needs and corrected type source', () => {
+    const base = hierarchyDetail()
+    const detail = {
+      ...base,
+      goal: { ...base.goal, goal_type: 'roadmap', success_criteria: [{ key: 'api', description: 'The API is documented' }] },
+      runs: [{ goal_type_snapshot: 'outcome' }],
+      plan: { ...base.plan, items: [{ key: 'p1', title: 'Write API', gate_id: 'gate-1', adopted: false, task_id: 't-1' }] },
+      authorization_wait: { task_ids: ['t-1'], reason_code: 'start_required', required_decision: 'start' },
+      evidence: [{ id: 'ev1', gate_id: 'gate-1', source_type: 'task_report', evidence_role: 'readiness', review_stage: 'preliminary', verdict: 'candidate', acceptance_verdict: null, created_at: base.evidence[0].created_at }],
+    } as unknown as OrchestrationGoalDetail
+    const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+    const find = (kind: string) => entries.find((e) => e.kind === kind)
+    expect(find('type-resolved')?.message).toBe('Outcome')
+    expect(find('evidence-recorded')).toMatchObject({ status: 'pending', statusLabel: 'Pending' })
+    expect(find('evidence-recorded')?.message).toContain('for The API is documented')
+    expect(find('work-queued')?.message).toBe('Queued: Write API · Needs: Start again')
+  })
+
   it('derives distinct events for every hierarchy kind with copy and one chip each', async () => {
     const detail = hierarchyDetail()
     const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
     const labels: Record<string, string> = {
       'type-resolved': 'Goal type chosen', 'type-corrected': 'Goal type corrected', 'plan-ingested': 'Plan received',
       'plan-accepted': 'Plan accepted', 'work-adopted': 'Existing work adopted', 'work-queued': 'Work queued',
-      'work-started': 'Work started', 'evidence-recorded': 'Evidence recorded', 'work-accepted': 'Accepted',
+      'work-started': 'Work started', 'evidence-recorded': 'Evidence recorded', 'work-accepted': 'Work accepted',
     }
     for (const [kind, label] of Object.entries(labels)) expect(entries.find((e) => e.kind === kind)?.label).toBe(label)
     const message = (kind: string) => entries.find((e) => e.kind === kind)?.message
