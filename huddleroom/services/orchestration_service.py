@@ -79,7 +79,11 @@ from huddleroom.models.orchestration_process import (
 )
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.services.orchestration_authority_interview import build_checkpoint, sync_deferred_questions_memory
-from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService, runtime_decision_identity
+from huddleroom.services.orchestration_authority_service import (
+    OrchestrationAuthorityDecisionService,
+    reauthorize_execution_key,
+    runtime_decision_identity,
+)
 from huddleroom.services.orchestration_start_text_check import find_start_contradictions
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 from huddleroom.services.orchestration_goal_shape import OrchestrationGoalShapeService
@@ -578,6 +582,7 @@ class OrchestrationService:
             .where(
                 OrchestrationGate.run_id.in_([r.id for r in latest_runs.values()]),
                 OrchestrationGate.status == "failed",
+                OrchestrationGate.gate_type != RETAINED_GATE_TYPE,
             )
             .group_by(OrchestrationGate.run_id)
         )
@@ -1097,7 +1102,7 @@ class OrchestrationService:
                 }
                 for gate in (await db.scalars(select(OrchestrationGate).where(
                     OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
-                    OrchestrationGate.gate_type != ADHOC_GATE_TYPE,
+                    OrchestrationGate.gate_type.not_in(NON_BLOCKING_GATE_TYPES),
                 ).order_by(OrchestrationGate.created_at, OrchestrationGate.id)))
             ],
             "memory_preface": memory_preface,
@@ -5982,7 +5987,9 @@ class OrchestrationService:
             ).scalars().all()
         )
         # Ad-hoc audit gates are advisory: only an accepted one joins closeout and the summary manifest.
-        gates = [gate for gate in gates if gate.gate_type not in NON_BLOCKING_GATE_TYPES or gate.status == "accepted"]
+        # Retained (type-correction) gates never do: integration reads them via item_gate_satisfied and they carry no evidence.
+        gates = [gate for gate in gates if gate.gate_type != RETAINED_GATE_TYPE
+                 and (gate.gate_type not in NON_BLOCKING_GATE_TYPES or gate.status == "accepted")]
         run = await db.get(OrchestrationRun, run_id)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
         if goal is not None and goal.goal_type == "roadmap":
@@ -7211,6 +7218,32 @@ class OrchestrationService:
             await db.flush()
         return goal, run
 
+    async def _record_reauthorization(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        actor: str,
+        caller_owns_transaction: bool,
+    ) -> None:
+        """Re-Start after a contract change: one action per current fingerprint; the run's
+        frozen fingerprint is never rewritten. Legacy NULL fingerprints are grandfathered."""
+        fingerprint = compute_goal_contract_fingerprint(goal)
+        if run.goal_contract_fingerprint in (None, fingerprint):
+            return
+        action = await self.reserve_action(
+            db,
+            run_id=run.id,
+            idempotency_key=reauthorize_execution_key(run.id, fingerprint),
+            action_type="reauthorize_execution",
+            request={"actor": actor, "contract_fingerprint": fingerprint},
+        )
+        if action.status == "reserved":
+            await self._mark_action_completed(db, action, target_type="run", target_id=run.id)
+        await db.flush()
+        if not caller_owns_transaction:
+            await db.commit()
+
     async def start_run(
         self,
         db: AsyncSession,
@@ -7238,6 +7271,7 @@ class OrchestrationService:
                 raise self._start_conflict("goal_not_runnable", "Goal has no active run")
 
             if goal.goal_type == "continuous" and (goal.continuous_state or {}).get("started_at"):
+                await self._record_reauthorization(db, goal, run, actor, caller_owns_transaction)
                 return goal, run
 
             # Idempotent replay: already authorized -> return as-is.
@@ -7245,6 +7279,7 @@ class OrchestrationService:
                 db, run.id, self._authorize_execution_key(run.id)
             )
             if existing is not None and run.phase in {"authorized", "completed"}:
+                await self._record_reauthorization(db, goal, run, actor, caller_owns_transaction)
                 return goal, run
 
             if goal.status not in {"active", "blocked"} or run.status not in {"running", "blocked"}:
@@ -7283,6 +7318,9 @@ class OrchestrationService:
                     "baseline_version": self._json_object_or_empty(goal.orchestrator_context).get(
                         "baseline_version"
                     ),
+                    "contract_fingerprint": run.goal_contract_fingerprint,
+                    "goal_type": goal.goal_type,
+                    "planning_mode": goal.planning_mode,
                     "authorized_at": _utcnow().isoformat(),
                 },
             )
@@ -10936,6 +10974,15 @@ class OrchestrationService:
             # phase == "authorized".
             if baseline_ready and run.phase == "baseline":
                 run.phase = "ready"
+                await db.flush()
+
+            # Legacy authorized root runs (no frozen fingerprint) freeze the contract on first tick.
+            if (
+                run.phase == "authorized"
+                and goal.parent_goal_id is None
+                and run.goal_contract_fingerprint is None
+            ):
+                run.goal_contract_fingerprint = compute_goal_contract_fingerprint(goal)
                 await db.flush()
 
             new_events = await self._new_events(db, project_id, run.event_cursor)

@@ -759,22 +759,3 @@ async def test_manifest_retained_gate_carries_original_source(db_session, test_p
     assert (str(entry.source_run_id), str(entry.source_task_id), str(entry.source_gate_id)) == (
         source["source_run_id"], source["source_task_id"], source["source_gate_id"])
     assert entry.source_contract_fingerprint == FP and entry.revalidation_required is False
-
-
-async def test_pre_start_and_type_specific_lineage(db_session, test_project):
-    service = OrchestrationGoalShapeService()
-    goal, run = await _goal_run(db_session, test_project, started=False)
-    assert await service.is_pre_start(db_session, goal, run) is True
-    run.plan_state = {"planning_version": 1}
-    assert await service.has_type_specific_lineage(db_session, goal, run) is True
-    assert await service.is_pre_start(db_session, goal, run) is False
-    run.plan_state = {}
-    await _goal_run(db_session, test_project, parent=goal)
-    assert await service.has_type_specific_lineage(db_session, goal, run) is True
-
-    other, other_run = await _goal_run(db_session, test_project, started=False)
-    db_session.add(OrchestrationAction(run_id=other_run.id, idempotency_key="a", action_type="authorize_execution",
-                                       status="completed"))
-    await db_session.flush()
-    assert await service.has_type_specific_lineage(db_session, other, other_run) is False
-    assert await service.is_pre_start(db_session, other, other_run) is False

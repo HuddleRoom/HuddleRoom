@@ -295,7 +295,8 @@ class OrchestrationBudgetService:
         )
         snapshot = self.snapshot(type("BudgetGoal", (), {"budget": {"caps": caps}})())
         dimensions = set(caps)
-        parent_run = parent is not None and goal.id == parent.id
+        # Successors of a type correction inherit the goal's settled child/case reservations (pseudo-runs have none).
+        parent_run = (parent is not None and goal.id == parent.id) or getattr(run, "supersedes_run_id", None) is not None
         reservations = []
         if parent_run:
             reservations = list((await db.scalars(select(OrchestrationBudgetReservation).where(

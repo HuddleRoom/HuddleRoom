@@ -19,11 +19,9 @@ from huddleroom.models.orchestration import (
     GOAL_CONTRACT_FINGERPRINT_FIELDS,
     OrchestrationAction,
     OrchestrationBudgetReservation,
-    OrchestrationContinuousCandidate,
     OrchestrationEvidence,
     OrchestrationGate,
     OrchestrationGoal,
-    OrchestrationRoadmapVersion,
     OrchestrationRun,
     OrchestrationWait,
     compute_goal_contract_fingerprint,
@@ -275,7 +273,7 @@ class OrchestrationGoalShapeService:
         )
         async with svc._lock_goal_for_baseline_transition(db, goal.id):
             goal = await db.scalar(reload)
-            if (successor := await self._correction_replay(db, request.expected_run_id, key)) is not None:
+            if (successor := await self._correction_replay(db, goal.id, request.expected_run_id, key)) is not None:
                 return goal, successor
             preview = await self.preview_correction(db, goal, request, actor)
             if preview.preview_fingerprint != request.preview_fingerprint:
@@ -300,7 +298,7 @@ class OrchestrationGoalShapeService:
                     successor = await self._apply_locked(db, svc, goal, old, preview, actor, key)
             except IntegrityError:
                 goal = await db.scalar(reload)
-                if (successor := await self._correction_replay(db, request.expected_run_id, key)) is not None:
+                if (successor := await self._correction_replay(db, goal.id, request.expected_run_id, key)) is not None:
                     return goal, successor
                 raise HTTPException(status_code=409, detail={
                     "conflict": "stale_run", "message": "The goal's run changed concurrently; preview again.",
@@ -308,12 +306,13 @@ class OrchestrationGoalShapeService:
         return goal, successor
 
     @staticmethod
-    async def _correction_replay(db, run_id: UUID, key: str) -> OrchestrationRun | None:
+    async def _correction_replay(db, goal_id: UUID, run_id: UUID, key: str) -> OrchestrationRun | None:
         action = await db.scalar(select(OrchestrationAction).where(
             OrchestrationAction.run_id == run_id, OrchestrationAction.idempotency_key == key,
             OrchestrationAction.status == "completed",
         ))
-        return await db.get(OrchestrationRun, action.target_id) if action is not None else None
+        successor = await db.get(OrchestrationRun, action.target_id) if action is not None else None
+        return successor if successor is not None and successor.goal_id == goal_id else None
 
     async def _apply_locked(
         self, db, svc, goal: OrchestrationGoal, old: OrchestrationRun, preview: GoalTypeCorrectionPreviewResult,
@@ -326,6 +325,7 @@ class OrchestrationGoalShapeService:
         from huddleroom.services.task_service import TaskService
 
         now = _utcnow()
+        was_paused = goal.status == "paused"  # _stop_locked below sets the goal active
         requested = preview.proposed_goal_type
         cancellable = []
         for task in await svc._orchestrated_tasks_for_run(
@@ -362,6 +362,8 @@ class OrchestrationGoalShapeService:
             continuous = OrchestrationContinuousService(svc)
             await continuous._stop_locked(db, goal, old, actor=actor, reason="goal type corrected", now=now)
             await continuous.settle_terminal_children(db, goal, now)
+            # A stale started_at would turn a later finite->Continuous Start into a no-op; the stop audit keeps the record.
+            goal.continuous_state = {}
 
         if old.status in ("running", "blocked", "paused"):
             old.status, old.completed_at = "cancelled", now
@@ -372,12 +374,11 @@ class OrchestrationGoalShapeService:
         goal.goal_type_rationale = preview.rationale.strip()
         goal.planning_mode = preview.proposed_planning_mode
         goal.planning_rationale = explicit_planning_rationale(requested)
-        goal.status = "active"
+        goal.status = "paused" if was_paused else "active"
         manifest = [entry.model_dump(mode="json") for entry in preview.retained_evidence_manifest]
         plan_state: dict[str, Any] = {"retained_evidence_manifest": manifest}
         if goal.parent_goal_id is None:
-            budget_state = {**deepcopy(goal.budget or {}),
-                            "inherited_remaining": preview.model_dump(mode="json")["remaining_budget"]}
+            budget_state = deepcopy(goal.budget or {})
         else:
             budget_state = {"caps": deepcopy(_obj(old.budget_state).get("caps", _obj(goal.budget).get("caps", {})))}
             plan_state["child_delta_baseline"] = {
@@ -387,7 +388,7 @@ class OrchestrationGoalShapeService:
             }
         successor = OrchestrationRun(
             id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:type-correction-successor:{old.id}"),
-            goal_id=goal.id, supersedes_run_id=old.id, phase="baseline",
+            goal_id=goal.id, supersedes_run_id=old.id, phase="baseline", status="paused" if was_paused else "running",
             # ponytail: events before the old cursor belong to the old run; resume from it.
             event_cursor=old.event_cursor,
             baseline_authorized=old.baseline_authorized if goal.parent_goal_id is None else True,
@@ -494,30 +495,3 @@ class OrchestrationGoalShapeService:
                 else "contract unchanged since source Start; new run must validate provenance",
             ))
         return sorted(entries, key=lambda item: str(item.source_gate_id))
-
-    async def has_type_specific_lineage(self, db, goal: OrchestrationGoal, run: OrchestrationRun) -> bool:
-        """True once the goal holds plan, roadmap, Continuous, or child lineage that a correction must supersede."""
-        plan_state = _obj(run.plan_state)
-        if plan_state.get("planning_version") or plan_state.get("plan_artifact_id"):
-            return True
-        if _obj(goal.continuous_state).get("started_at"):
-            return True
-        # Roadmap items imply a version; continuous-origin children/reservations are covered by parent_goal_id.
-        for probe in (
-            select(OrchestrationRoadmapVersion.id).where(OrchestrationRoadmapVersion.goal_id == goal.id),
-            select(OrchestrationContinuousCandidate.id).where(OrchestrationContinuousCandidate.parent_goal_id == goal.id),
-            select(OrchestrationGoal.id).where(OrchestrationGoal.parent_goal_id == goal.id),
-            select(OrchestrationBudgetReservation.id).where(OrchestrationBudgetReservation.parent_goal_id == goal.id),
-        ):
-            if await db.scalar(probe.limit(1)) is not None:
-                return True
-        return False
-
-    async def is_pre_start(self, db, goal: OrchestrationGoal, run: OrchestrationRun) -> bool:
-        """Pre-Start: never authorized, still in baseline/ready, and no type-specific lineage."""
-        if run.phase not in ("baseline", "ready"):
-            return False
-        authorized = await db.scalar(select(OrchestrationAction.id).where(
-            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "authorize_execution",
-        ).limit(1))
-        return authorized is None and not await self.has_type_specific_lineage(db, goal, run)

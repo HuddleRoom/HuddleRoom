@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.orchestration import (
     OrchestrationAction,
+    OrchestrationEvidence,
     OrchestrationGate,
     OrchestrationRun,
     OrchestrationWait,
@@ -221,7 +222,7 @@ async def test_retained_gate_accepted_after_start_and_never_satisfies_criteria(d
 
     assert gate.status == "accepted"
     gates = await svc._current_run_gates(db_session, successor.id)
-    assert gate in gates and svc._criterion_evidence_manifest(gates, [], goal) == {}
+    assert gate not in gates and svc._criterion_evidence_manifest(gates, [], goal) == {}
 
 
 async def test_retained_gate_fails_when_requirements_change(db_session, test_project):
@@ -284,7 +285,7 @@ async def test_continuous_root_correction_waits_for_cases_then_stops_intake(db_s
     assert stop.status == "completed"
     assert (stop.request["reason"], stop.request["actor"], stop.request["pending_candidates"]) == (
         "goal type corrected", "human:u1", pending)
-    assert goal.continuous_state["pending_candidates"] == [] and goal.continuous_state["stopped_at"]
+    assert stop.request["stopped_at"] and goal.continuous_state == {}
     reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
         OrchestrationBudgetReservation.child_goal_id == case.id))
     assert reservation.status == "settled"
@@ -384,5 +385,132 @@ async def test_apply_stale_run_and_stale_contract_conflicts_write_nothing(db_ses
         # The request change alters the preview fingerprint, so stale_preview wins; the fresh preview names the blocker.
         assert exc.value.status_code == 409 and exc.value.detail["conflict"] in ("stale_preview", code)
         assert code in {b["code"] for b in exc.value.detail["preview"]["blockers"]}
+    assert await _counts(db_session) == before
+    assert (goal.goal_type, run.status, run.terminal_reason) == ("outcome", "running", None)
+
+
+# --- Task 14 fix round 1 ---
+
+async def test_accepted_retained_gate_does_not_block_final_summary_manifest(db_session, test_project):
+    goal, _, successor, _, _, retained = await _corrected_with_retained_gate(db_session, test_project)
+    retained.status = "accepted"  # accepted without evidence (min_count 0)
+    work = await _accepted_gate(db_session, successor)
+    db_session.add(OrchestrationEvidence(run_id=successor.id, gate_id=work.id, source_type="artifact",
+                                         source_id=uuid.uuid4(), verdict="accepted"))
+    await db_session.flush()
+    svc = OrchestrationService()
+
+    assert retained not in await svc._current_run_gates(db_session, successor.id)
+    gates, evidence = await svc._accepted_non_summary_manifest(db_session, successor.id)
+    assert gates == [work] and [item.gate_id for item in evidence] == [work.id]
+
+
+async def test_roadmap_to_outcome_successor_snapshot_counts_settled_child_spend(db_session, test_project):
+    from decimal import Decimal
+
+    from huddleroom.models.orchestration import OrchestrationBudgetReservation, OrchestrationGoal
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+
+    _, parent, parent_run, child, child_run = await _released_child(db_session, test_project)
+    child.status, child_run.status = "cancelled", "cancelled"
+    await db_session.flush()
+    request, _ = await _request(db_session, parent, parent_run, requested_goal_type="outcome")
+    parent, successor = await _apply(db_session, parent, request)
+    reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.child_goal_id == child.id))
+    reservation.status, reservation.settled_spend = "settled", {"max_tokens": "300"}
+    await db_session.flush()
+    budget = OrchestrationBudgetService()
+
+    snapshot = await budget.snapshot_for_run(db_session, parent, successor)
+    remaining = await budget.remaining(db_session, parent)
+
+    assert parent.goal_type == "outcome" and isinstance(parent, OrchestrationGoal)
+    assert Decimal(snapshot["consumed"]["max_tokens"]) == 300
+    assert {k: Decimal(v) for k, v in snapshot["remaining"].items()} == {
+        k: Decimal(v) for k, v in remaining["remaining"].items()}
+
+
+async def test_continuous_correction_clears_continuous_state_round_trip(db_session, test_project):
+    from tests.test_orchestration_continuous_service import direct_policy, started_continuous
+
+    goal, first = await started_continuous(db_session, test_project)
+    request, _ = await _request(db_session, goal, first, requested_goal_type="outcome")
+    goal, finite = await _apply(db_session, goal, request)
+    assert goal.continuous_state == {}
+    stop = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == first.id, OrchestrationAction.action_type == "stop_continuous"))
+    assert stop.request["stopped_at"]
+
+    request, _ = await _request(db_session, goal, finite, requested_goal_type="continuous")
+    goal, again = await _apply(db_session, goal, request)
+    assert goal.goal_type == "continuous" and goal.continuous_state == {}
+    # a fresh Start is not short-circuited by the old started_at / stopped_at
+    from huddleroom.schemas.orchestration import OrchestrationContinuousPolicy
+    from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
+    policy = OrchestrationContinuousPolicy.model_validate(direct_policy(adapter_filter={"adapter_type": "schedule"}))
+    await OrchestrationContinuousService(OrchestrationService()).update_policy(
+        db_session, test_project.id, goal.id, policy, actor="human:u1")
+    again.phase = "ready"
+    await db_session.flush()
+    await OrchestrationService().start_run(db_session, test_project.id, goal.id, actor="human:u1")
+    assert goal.continuous_state.get("started_at") and not goal.continuous_state.get("stopped_at")
+
+
+async def test_replay_key_from_another_goal_does_not_leak_successor(db_session, test_project):
+    goal_a, run_a = await _goal_run(db_session, test_project)
+    request, _ = await _request(db_session, goal_a, run_a)
+    _, successor_a = await _apply(db_session, goal_a, request)
+    goal_b, run_b = await _goal_run(db_session, test_project)
+    before = await _counts(db_session)
+
+    with pytest.raises(HTTPException) as exc:
+        await _apply(db_session, goal_b, request)  # same expected_run_id + fingerprint => same idempotency key
+
+    assert exc.value.status_code == 409
+    assert await _counts(db_session) == before
+    assert (goal_b.goal_type, run_b.terminal_reason) == ("outcome", None) and successor_a.goal_id == goal_a.id
+
+
+async def test_paused_goal_stays_paused_after_correction(db_session, test_project):
+    goal, old = await _goal_run(db_session, test_project)
+    goal.status = old.status = "paused"
+    await db_session.flush()
+    request, _ = await _request(db_session, goal, old)
+
+    goal, successor = await _apply(db_session, goal, request)
+
+    assert (goal.goal_type, goal.status, successor.status) == ("roadmap", "paused", "paused")
+    resumed, run = await OrchestrationService().resume_goal(db_session, test_project.id, goal.id)
+    assert (resumed.status, run.id, run.status) == ("active", successor.id, "running")
+
+
+async def test_paused_child_stays_paused_after_correction(db_session, test_project):
+    _, _, _, child, old = await _released_child(db_session, test_project)
+    child.goal_type_source = "parent_auto"
+    child.status = old.status = "paused"
+    await db_session.flush()
+    request, _ = await _request(db_session, child, old, requested_goal_type="roadmap")
+
+    child, successor = await _apply(db_session, child, request)
+
+    assert (child.status, successor.status) == ("paused", "paused")
+
+
+async def test_integrity_error_without_replay_returns_stale_run(db_session, test_project, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    goal, run = await _goal_run(db_session, test_project)
+    request, _ = await _request(db_session, goal, run)
+
+    async def boom(*_args, **_kwargs):
+        raise IntegrityError("x", {}, Exception())
+
+    monkeypatch.setattr(OrchestrationGoalShapeService, "_apply_locked", boom)
+    before = await _counts(db_session)
+    with pytest.raises(HTTPException) as exc:
+        await _apply(db_session, goal, request)
+
+    assert exc.value.status_code == 409 and exc.value.detail["conflict"] == "stale_run"
     assert await _counts(db_session) == before
     assert (goal.goal_type, run.status, run.terminal_reason) == ("outcome", "running", None)
