@@ -507,6 +507,31 @@ class SessionService:
             return task.adapter_type_override
         return agent.adapter_type
 
+    async def _orchestration_authorization(self, db: AsyncSession, task: Task | None) -> None:
+        """Refuse claims of orchestration tasks whose run lacks effective authority."""
+        if task is None:
+            return
+        from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+        from huddleroom.services.orchestration_authority_service import effective_authorization
+        from huddleroom.services.orchestration_service import OrchestrationService
+
+        orchestration = OrchestrationService._json_object_or_empty((task.metadata_ or {}).get("orchestration"))
+        run_id = OrchestrationService._optional_uuid(orchestration.get("run_id"), "run_id")
+        if run_id is None:
+            return
+        run = await db.get(OrchestrationRun, run_id)
+        goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
+        if run is None or goal is None:
+            return
+        result = await effective_authorization(db, goal, run, task)
+        if result.allowed:
+            return
+        raise SessionClaimAttention(run.id, {
+            "kind": "authorization", "scope": f"authorization:{task.id}",
+            "reason_code": result.reason_code, "required_decision": result.required_decision,
+            "reason": f"Task cannot be claimed: {result.reason_code}.",
+        }, f"authorization_denied: {result.reason_code}")
+
     async def preflight_claim(self, db: AsyncSession, task: Task, agent: Agent,
                               adapter_override: str | None = None) -> None:
         """Read-only Roadmap claim validation for callers that mutate task state."""
@@ -533,6 +558,7 @@ class SessionService:
             )
         limits = await self._orchestration_budget_limits(db, task, agent)
         await self._validate_budget_adapter(db, task, limits, context, adapter_type)
+        await self._orchestration_authorization(db, task)
 
     async def create(self, db: AsyncSession, data: SessionCreate) -> Session:
         project_service = ProjectService()
@@ -622,6 +648,7 @@ class SessionService:
         budget_approval = await self._validate_budget_adapter(
             db, task, budget_limits, roadmap_context, adapter_type,
         )
+        await self._orchestration_authorization(db, task)
         if budget_approval:
             roadmap_context = deepcopy(roadmap_context)
             roadmap_context["roadmap"] = {**roadmap_context["roadmap"], "budget_approval": budget_approval}

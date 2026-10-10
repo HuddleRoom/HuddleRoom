@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from huddleroom.models.agent import Agent
@@ -713,6 +714,63 @@ async def test_session_create(db_session: AsyncSession, runnable_project, test_a
     assert session.agent_id == test_agent.id
     assert session.project_id == runnable_project.id
     assert session.runner_task_id is not None
+
+
+async def _orchestration_task(db, project, agent, *, authorized, stale=False):
+    from huddleroom.models.orchestration import OrchestrationAction
+    from tests.test_orchestration_goal_shape import _goal_run
+
+    goal, run = await _goal_run(db, project, goal_type="outcome")
+    if authorized:
+        db.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution",
+                                   action_type="authorize_execution", status="completed"))
+    if stale:
+        goal.objective = "Edited after Start"
+    task = Task(project_id=project.id, title="work", status="backlog", assigned_to=agent.id,
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db.add(task)
+    await db.flush()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_orchestration_claim_denied_without_authority_persists_no_session(
+    db_session: AsyncSession, runnable_project, test_agent,
+):
+    from huddleroom.services.session_service import SessionClaimAttention
+
+    task = await _orchestration_task(db_session, runnable_project, test_agent, authorized=True, stale=True)
+    svc = SessionService()
+    with pytest.raises(SessionClaimAttention) as exc:
+        await svc.preflight_claim(db_session, task, test_agent)
+    assert exc.value.blocker["kind"] == "authorization"
+    assert exc.value.blocker["scope"] == f"authorization:{task.id}"
+    assert exc.value.blocker["reason_code"] == "contract_changed_since_start"
+    assert exc.value.detail == "authorization_denied: contract_changed_since_start"
+
+    with patch("huddleroom.workers.task_runner.dispatch_session", new=AsyncMock(return_value="x")):
+        with pytest.raises(SessionClaimAttention) as exc:
+            await svc.create(db_session, SessionCreate(
+                agent_id=test_agent.id, project_id=runnable_project.id, task_id=task.id))
+    assert exc.value.blocker["kind"] == "authorization"
+    assert await db_session.scalar(select(Session.id).where(Session.task_id == task.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_orchestration_claim_allowed_and_plain_task_unaffected(
+    db_session: AsyncSession, runnable_project, test_agent,
+):
+    svc = SessionService()
+    task = await _orchestration_task(db_session, runnable_project, test_agent, authorized=True)
+    plain = Task(project_id=runnable_project.id, title="plain", status="backlog", assigned_to=test_agent.id)
+    db_session.add(plain)
+    await db_session.flush()
+    with patch("huddleroom.workers.task_runner.dispatch_session", new=AsyncMock(return_value="x")):
+        await svc.preflight_claim(db_session, plain, test_agent)
+        await svc.preflight_claim(db_session, task, test_agent)
+        session = await svc.create(db_session, SessionCreate(
+            agent_id=test_agent.id, project_id=runnable_project.id, task_id=task.id))
+    assert session.task_id == task.id
 
 
 @pytest.mark.asyncio(loop_scope="session")
