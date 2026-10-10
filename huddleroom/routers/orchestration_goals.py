@@ -632,7 +632,7 @@ async def _detail(
                 "task_title": task.title, "session_status": session.status,
                 "observed_liveness": entry.get("classification", "unknown"),
                 "runner_id": entry.get("current_runner_id", entry.get("current_runner_task_id", owned.runner_task_id)),
-                "observed_at": entry.get("assessed_at"),
+                "observed_at": entry.get("assessed_at"), "started_at": session.started_at,
             })
         recovery_history = [{
             "session_id": str(session_id), "classification": entry.get("classification"),

@@ -388,7 +388,7 @@ async def test_goal_detail_projects_read_only_supervision_from_durable_sources(
     task.metadata_ = {"orchestration": {"run_id": str(run.id), "action_id": str(action.id)}}
     session = Session(
         project_id=test_project.id, task_id=task.id, agent_id=test_agent.id, adapter_type="api",
-        status="running", runner_task_id="runner-live",
+        status="running", runner_task_id="runner-live", started_at=now,
         metadata_={"orchestration": {"action_id": str(action.id)}},
     )
     gate = OrchestrationGate(
@@ -467,7 +467,7 @@ async def test_goal_detail_projects_read_only_supervision_from_durable_sources(
     assert supervision["workers"] == [{
         "session_id": str(session.id), "task_id": str(task.id), "agent_id": str(test_agent.id),
         "task_title": task.title, "session_status": "running", "observed_liveness": "live",
-        "runner_id": "runner-live", "observed_at": now.isoformat(),
+        "runner_id": "runner-live", "observed_at": now.isoformat(), "started_at": now.isoformat().replace("+00:00", "Z"),
     }]
     assert supervision["recovery_history"] == [{
         "session_id": str(session.id), "classification": "live", "disposition": "adopted",
