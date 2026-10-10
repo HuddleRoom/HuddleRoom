@@ -783,9 +783,9 @@ export interface OrchestrationEvidence {
   producer_agent_id: string | null
   verdict: 'candidate' | 'accepted' | 'rejected'
   evidence_metadata: Record<string, unknown>
-  evidence_role?: 'discovery' | 'readiness' | 'delivery' | 'verification' | 'integration' | null
-  review_stage?: 'preliminary' | 'final' | null
-  acceptance_verdict?: 'pending' | 'accepted' | 'rejected' | 'superseded' | null
+  evidence_role: 'discovery' | 'readiness' | 'delivery' | 'verification' | 'integration' | null
+  review_stage: 'preliminary' | 'final' | null
+  acceptance_verdict: 'pending' | 'accepted' | 'rejected' | 'superseded' | null
   created_at: string
   updated_at: string
 }

@@ -3,6 +3,7 @@
 // can reuse it — Playwright forbids importing one test file from another.
 import { expect, type Page } from '@playwright/test'
 import type {
+  GoalTypeCorrectionPreview,
   OrchestrationAgentReviewRecord,
   OrchestrationAuthorityDecisionRecord,
   OrchestrationMemoryOverview,
@@ -39,6 +40,12 @@ export const goal = {
   created_at: '2026-07-15T09:00:00Z',
   updated_at: '2026-07-15T10:00:00Z',
   needs_you_count: 0,
+  goal_type: 'outcome',
+  goal_type_source: 'auto',
+  goal_type_rationale: 'One deliverable with a single finish line.',
+  planning_mode: 'delivery',
+  planning_rationale: 'A single delivery plan is enough.',
+  continuous_policy: null,
 }
 
 export const run = {
@@ -81,6 +88,7 @@ export const acceptedSupervision: OrchestrationSupervision = {
     id: 'evidence-accepted', run_id: run.id, gate_id: 'gate-release', source_type: 'verification',
     source_id: 'report-accepted', observed_event_id: 'event-accepted', producer_agent_id: 'agent-reviewer',
     verdict: 'accepted', evidence_metadata: { summary: 'Independent validation accepted.', artifact_id: 'artifact-release', secret: 'must-not-render' },
+    evidence_role: 'verification', review_stage: 'final', acceptance_verdict: 'accepted',
     created_at: '2026-07-15T10:01:00Z', updated_at: '2026-07-15T10:01:00Z',
   }],
   workers: [{
@@ -180,6 +188,7 @@ export function detail(
       id: 'evidence-review', run_id: run.id, gate_id: 'gate-release', source_type: 'review',
       source_id: 'review-1', observed_event_id: null, producer_agent_id: 'agent-reviewer',
       verdict: 'candidate', evidence_metadata: { summary: 'Review is pending independent confirmation.' },
+      evidence_role: 'readiness', review_stage: 'preliminary', acceptance_verdict: 'pending',
       created_at: '2026-07-15T09:20:00Z', updated_at: '2026-07-15T09:20:00Z',
     }],
     agent_suggestions_count: 1,
@@ -192,6 +201,13 @@ export function detail(
     }],
     timeline: [],
     supervision,
+    contract_fingerprint: 'fp-contract-outcome',
+    runs: [],
+    child_goals: [],
+    task_reports: [],
+    plan: null,
+    effective_authorization: null,
+    authorization_wait: null,
   }
 }
 
@@ -841,4 +857,148 @@ export async function openOrchestrationGoal(page: Page) {
   await page.getByRole('link', { name: 'Orchestration' }).click()
   await page.getByText(goal.objective).click()
   return projectId
+}
+
+// ---------------------------------------------------------------------------
+// Planning hierarchy: an Outcome goal corrected to a Roadmap with a child level.
+// ---------------------------------------------------------------------------
+
+export const childGoalId = 'goal-phase-one'
+export const grandchildObjective = 'Fix the flaky integration suite'
+
+const runSummary = (id: string, version: string, over: Record<string, unknown>) => ({
+  id, status: 'running', phase: 'authorized', cycle_key: null, supersedes_run_id: null, terminal_reason: null,
+  goal_type_snapshot: 'outcome', planning_mode_snapshot: 'delivery', goal_contract_fingerprint: `fp-${id}`,
+  started_at: '2026-10-08T09:00:00Z', completed_at: null, version_label: version, is_current: true,
+  ...over,
+})
+
+function planningGoal(corrected: boolean) {
+  return {
+    ...goal, status: 'active', orchestrator_context: {}, continuous_policy: null, supersedes_goal_id: null, parent_goal_id: null,
+    goal_type: corrected ? 'roadmap' : 'outcome',
+    goal_type_source: corrected ? 'user' : 'auto',
+    goal_type_rationale: corrected ? 'The release spans several phases.' : 'One deliverable with a single finish line.',
+    planning_mode: corrected ? 'roadmap' : 'delivery',
+    planning_rationale: corrected ? 'Phases are planned one level at a time.' : 'A single delivery plan is enough.',
+  }
+}
+
+export function planningDetail(corrected: boolean) {
+  const runId = corrected ? 'run-roadmap-2' : 'run-outcome-1'
+  const base = detail('active', 'running', supervisionFor('working'))
+  return {
+    ...base,
+    goal: planningGoal(corrected),
+    run: {
+      ...base.run, id: runId, status: 'running', phase: 'authorized', condition: 'working', baseline_authorized: true,
+      supersedes_run_id: corrected ? 'run-outcome-1' : null,
+      plan_state: { status: 'accepted', planning_task_id: 'task-plan', expanded_items: [] },
+      active_blockers: [],
+    },
+    contract_fingerprint: corrected ? 'fp-contract-roadmap' : 'fp-contract-outcome',
+    runs: corrected
+      ? [
+        runSummary('run-roadmap-2', 'v2', { supersedes_run_id: 'run-outcome-1', goal_type_snapshot: 'roadmap', planning_mode_snapshot: 'roadmap' }),
+        runSummary('run-outcome-1', 'v1', { is_current: false, status: 'cancelled', terminal_reason: 'reclassified', completed_at: '2026-10-09T09:00:00Z' }),
+      ]
+      : [runSummary('run-outcome-1', 'v1', {})],
+    child_goals: corrected ? [{
+      id: childGoalId, objective: 'Phase one: stabilise the build', status: 'active', goal_type: 'roadmap', goal_type_source: 'parent_auto',
+      planning_mode: 'roadmap', roadmap_item_key: 'phase-one', roadmap_version: 1, current_run_id: 'run-phase-one', current_run_status: 'running',
+      run_version_label: 'v1',
+    }] : [],
+    task_reports: corrected ? [{
+      task_id: 'task-scope', session_id: 'session-scope-0001', summary: 'Scope agreed with two phases.',
+      report: {
+        status: 'completed', changes: ['Wrote the scope note'], evidence: ['scope-note.md'], criterion_progress: ['release-ready: scoped'],
+        decisions: ['Split into two phases'], risks: ['Legal sign-off pending'], open_questions: ['Who owns rollout?'],
+        next_step: 'Start phase one', collaboration_need: 'None',
+      },
+    }] : [],
+    plan: {
+      status: 'accepted', artifact_id: corrected ? 'artifact-roadmap' : 'artifact-delivery', kind: corrected ? 'roadmap' : 'delivery',
+      author_agent_id: 'agent-manager', planning_version: 1, planning_task_id: 'task-plan', summary: null, scope: null,
+      items: corrected ? [{
+        key: 'scope-release', unit_type: 'task', title: 'Scope the release', work_function: 'planning', agent_id: 'agent-manager',
+        depends_on: [], artifact_ids: [], why_runnable: 'Nothing blocks scoping.', priority: 50, adopt_task_id: null, adopted: false,
+        task_id: 'task-scope', child_goal_id: null, gate_id: 'gate-release', state: 'accepted',
+      }, {
+        key: 'phase-one', unit_type: 'goal', title: 'Phase one: stabilise the build', work_function: null, agent_id: null,
+        depends_on: ['scope-release'], artifact_ids: [], why_runnable: 'Scope is accepted.', priority: 50, adopt_task_id: null, adopted: false,
+        task_id: null, child_goal_id: childGoalId, gate_id: null, state: 'started',
+      }] : [],
+    },
+    effective_authorization: null,
+    authorization_wait: null,
+  }
+}
+
+function correctionPreview(fingerprint: string): GoalTypeCorrectionPreview {
+  return {
+    goal_id: goal.id, current_run_id: 'run-outcome-1', current_goal_type: 'outcome', proposed_goal_type: 'roadmap',
+    current_planning_mode: 'delivery', proposed_planning_mode: 'roadmap', source: 'user', rationale: 'The release spans several phases.',
+    blockers: [], remaining_budget: { max_tokens: '15000' }, missing_recurring_policy: false, requires_new_start: false,
+    required_authority: [], preview_fingerprint: fingerprint,
+    retained_evidence_manifest: [{
+      source_run_id: 'run-outcome-1', source_task_id: 'task-scope', source_gate_id: 'gate-release', artifact_id: 'artifact-scope-note',
+      source_contract_fingerprint: 'fp-contract-outcome', revalidation_required: true, reason: 'Scope note carried over from the first run.',
+    }],
+  }
+}
+
+// Mocks the goal-type correction flow on top of interceptOrchestration. The first
+// Apply answers 409 stale_preview (carrying a refreshed preview); the second succeeds.
+export async function interceptPlanningHierarchy(page: Page) {
+  const harness = await interceptOrchestration(page)
+  const previews: Array<Record<string, unknown>> = []
+  const applies: Array<Record<string, unknown>> = []
+  let corrected = false
+  const currentGoal = () => planningGoal(corrected)
+  await page.route('**/api/v1/projects/*/orchestration/goals**', async (route) => {
+    const request = route.request()
+    const suffix = new URL(request.url()).pathname.split('/orchestration/goals')[1]
+    if (request.method() === 'GET' && (suffix === '' || suffix === '/')) {
+      await route.fulfill({ json: { items: [currentGoal()], next_cursor: null } })
+      return
+    }
+    if (request.method() === 'GET' && suffix === `/${goal.id}`) {
+      await route.fulfill({ json: planningDetail(corrected) })
+      return
+    }
+    if (request.method() === 'GET' && suffix === `/${childGoalId}`) {
+      const child = planningDetail(true)
+      await route.fulfill({
+        json: {
+          ...child, goal: { ...child.goal, id: childGoalId, objective: 'Phase one: stabilise the build', parent_goal_id: goal.id },
+          child_goals: [{
+            id: 'goal-grandchild', objective: grandchildObjective, status: 'active', goal_type: 'outcome', goal_type_source: 'parent_auto',
+            planning_mode: 'delivery', roadmap_item_key: 'fix-suite', roadmap_version: 1, current_run_id: 'run-grandchild',
+            current_run_status: 'running', run_version_label: 'v1',
+          }],
+        },
+      })
+      return
+    }
+    if (request.method() === 'POST' && suffix === `/${goal.id}/type-preview`) {
+      previews.push(await request.postDataJSON() as Record<string, unknown>)
+      await route.fulfill({ json: correctionPreview(`preview-${previews.length}`) })
+      return
+    }
+    if (request.method() === 'POST' && suffix === `/${goal.id}/type`) {
+      applies.push(await request.postDataJSON() as Record<string, unknown>)
+      if (applies.length === 1) {
+        await route.fulfill({
+          status: 409,
+          json: { detail: { conflict: 'stale_preview', message: 'The preview is out of date.', preview: correctionPreview('preview-2') } },
+        })
+        return
+      }
+      corrected = true
+      await route.fulfill({ json: planningDetail(true) })
+      return
+    }
+    await route.fallback()
+  })
+  return { ...harness, previews, applies }
 }

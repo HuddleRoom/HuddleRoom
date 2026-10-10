@@ -11,7 +11,9 @@ import {
   type BaselineMutation,
   detail,
   goal,
+  grandchildObjective,
   interceptOrchestration,
+  interceptPlanningHierarchy,
   openOrchestrationGoal,
   run,
   supervisionFor,
@@ -429,7 +431,7 @@ test('operator inspects the full trail and lifecycle controls update state', asy
   // The tab is now "Plan" (Phase 5) and merges goal-plan + suggestions content
   // into one panel; its sections are no longer their own collapsibles (the tab
   // itself is the disclosure) — content is visible immediately.
-  await expect(goalPlanPanel.getByText('Accepted plan')).toBeVisible()
+  await expect(goalPlanPanel.getByText('No plan yet.', { exact: false })).toBeVisible()
   await expect(goalPlanPanel.getByText('Release is independently validated.')).toBeVisible()
   // Suggestions are merged into the Plan tab (no separate Suggestions tab).
   await expect(goalPlanPanel.getByText('No independent validator is active.')).toBeVisible()
@@ -438,7 +440,7 @@ test('operator inspects the full trail and lifecycle controls update state', asy
   await detailsTabs(page).getByRole('tab', { name: 'Gates', exact: true }).click()
   await expect(gatesPanel.getByText('Release is independently validated.')).toBeVisible()
   await expect(page.getByText('review:review-1')).toBeVisible()
-  await expect(page.getByText('candidate')).toBeVisible()
+  await expect(page.getByTestId('orchestration-evidence').getByText('candidate')).toBeVisible()
 
   await detailsTabs(page).getByRole('tab', { name: 'Delegations', exact: true }).click()
   await expect(page.locator('#details-panel-delegations').getByText('Validate the release')).toBeVisible()
@@ -1292,4 +1294,58 @@ test('renders explicit supersession and overlap clarification from the same mock
   await steeringDialog.getByLabel('Expected impact').fill('This must be clarified.')
   await steeringDialog.getByRole('button', { name: 'Submit steering' }).click()
   await expect(conversation.locator('span').filter({ hasText: 'Needs clarification' })).toBeVisible()
+})
+
+test('corrects goal type through a stale preview and inspects the progressive plan', async ({ page }) => {
+  const harness = await interceptPlanningHierarchy(page)
+  await openOrchestrationGoal(page)
+
+  const header = page.getByTestId('orchestration-goal-header')
+  await expect(header).toContainText('Outcome')
+  await expect(header).toContainText('Chosen automatically')
+  await expect(header).toContainText('Why Outcome: One deliverable with a single finish line.')
+
+  const trigger = page.getByRole('button', { name: 'Correct goal type' })
+  await trigger.click()
+  const dialog = page.getByRole('dialog', { name: 'Correct goal type' })
+  await dialog.getByRole('radio', { name: 'Roadmap' }).check()
+  const rationale = dialog.getByLabel('Why the current type is wrong')
+  await rationale.fill('The release spans several phases.')
+  await dialog.getByRole('button', { name: 'Preview change' }).click()
+  await expect(dialog.getByText('Evidence carried over (1)')).toBeVisible()
+  expect(harness.previews).toHaveLength(1)
+
+  // First Apply is stale: the dialog refreshes the preview in place and lands on Apply.
+  const apply = dialog.getByRole('button', { name: 'Apply correction' })
+  await apply.click()
+  await expect(dialog.getByText('The goal changed since your preview. We refreshed it. Review and apply again.')).toBeVisible()
+  await expect.poll(() => harness.previews.length).toBe(2)
+  await expect(apply).toBeFocused()
+  await expect(dialog.getByRole('radio', { name: 'Roadmap' })).toBeChecked()
+  await expect(rationale).toHaveValue('The release spans several phases.')
+  expect(harness.applies).toHaveLength(1)
+  expect(harness.applies[0]).toMatchObject({ preview_fingerprint: 'preview-1' })
+
+  await apply.click()
+  await expect(dialog).toHaveCount(0)
+  await expect(trigger).toBeFocused()
+  expect(harness.applies[1]).toMatchObject({ preview_fingerprint: 'preview-2', requested_goal_type: 'roadmap' })
+  await expect(header).toContainText('Roadmap')
+  await expect(header).toContainText('Chosen by you')
+
+  const tabs = detailsTabs(page)
+  await tabs.getByRole('tab', { name: 'Plan', exact: true }).click()
+  const planPanel = tabs.getByRole('tabpanel', { name: 'Plan' })
+  await expect(planPanel.getByText('Run 2 · Current')).toBeVisible()
+  await planPanel.getByText('Earlier runs (1)').click()
+  await expect(planPanel.getByText('Run 1 · Historical')).toBeVisible()
+  await expect(planPanel.getByText('Reclassified to Roadmap')).toBeVisible()
+
+  await planPanel.getByText('Next level').click()
+  await expect(planPanel.getByRole('link', { name: grandchildObjective })).toBeVisible()
+
+  await planPanel.getByText('Full report and provenance').click()
+  await expect(planPanel.getByText('Wrote the scope note')).toBeVisible()
+  await expect(planPanel.getByText('Start phase one')).toBeVisible()
+  await expect(planPanel.getByText('session-', { exact: false })).toBeVisible()
 })
