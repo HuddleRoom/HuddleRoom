@@ -130,3 +130,24 @@ async def test_dismissed_suggestion_unblocks_start_for_that_staleness(db_session
     reason = await OrchestrationService()._baseline_readiness_reason(db_session, goal.id)
 
     assert reason is None
+
+
+async def test_human_override_accepted_preliminary_gate_contributes_no_criterion_evidence(db_session, stale_hierarchy_goal):
+    from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
+
+    goal, run, _ = stale_hierarchy_goal
+    gate = OrchestrationGate(
+        run_id=run.id, success_criterion_key="plan_item:done", gate_type="work_completed",
+        required_evidence={"success_criterion_keys": ["done"], "review_stage": "preliminary"},
+        status="accepted",
+    )
+    db_session.add(gate)
+    await db_session.flush()
+    item = OrchestrationEvidence(
+        run_id=run.id, gate_id=gate.id, source_type="verification", source_id=goal.id,
+        verdict="accepted", evidence_metadata={"human_override": True},
+    )
+    db_session.add(item)
+    await db_session.flush()
+
+    assert OrchestrationService()._criterion_evidence_manifest([gate], [item]) == {}

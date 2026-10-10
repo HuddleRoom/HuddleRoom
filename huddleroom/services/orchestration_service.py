@@ -117,6 +117,7 @@ from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATED_WORK_FUNCTIONS,
     RETAINED_GATE_TYPE,
     _uuid,
+    evidence_semantics,
     first_unmet_dependency,
     task_gate_id,
     validate_dependencies,
@@ -4245,7 +4246,11 @@ class OrchestrationService:
                     "work_function": work_function,
                     "scope": (
                         "Verify the latest work for the stale orchestration gate. "
-                        "Report fresh evidence only; do not edit artifacts."
+                        "Report fresh evidence only; do not edit artifacts. "
+                        "Final evidence must fit each criterion: live observation where the criterion "
+                        "requires it; otherwise deterministic unit tests, document review, static "
+                        "analysis, or another accepted method. Preliminary readiness reports never "
+                        "satisfy a final criterion."
                     ),
                     "inputs": [
                         f"Gate: {gate.id}",
@@ -5902,9 +5907,14 @@ class OrchestrationService:
     ) -> dict[str, list[str]]:
         """Map each criterion to accepted verifier evidence from plan-item gates only."""
         manifest: dict[str, list[str]] = {}
+
+        def non_final(gate: OrchestrationGate) -> bool:
+            sem = evidence_semantics(gate.gate_type, gate.required_evidence, "verification", "accepted", None)
+            return sem["evidence_role"] in {"discovery", "readiness"} or sem["review_stage"] == "preliminary"
+
         if goal is not None and goal.goal_type == "roadmap":
             for gate in gates:
-                if (
+                if non_final(gate) or (
                     gate.gate_type != "roadmap_integration" or gate.status != "accepted"
                     or self._json_object_or_empty(gate.required_evidence).get("roadmap_version_id") != roadmap_version_id
                 ):
@@ -5919,7 +5929,7 @@ class OrchestrationService:
                     manifest.setdefault(key, []).extend(evidence_ids)
             return manifest
         for gate in gates:
-            if gate.gate_type != PLAN_ITEM_GATE_TYPE:
+            if gate.gate_type != PLAN_ITEM_GATE_TYPE or non_final(gate):
                 continue
             evidence_ids = [
                 str(item.id)

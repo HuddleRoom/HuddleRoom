@@ -1089,3 +1089,31 @@ async def test_adhoc_gate_accepts_report_repaired_on_the_clarification_task_mark
     await service.validate_open_gates(db_session, run.id)
 
     assert gate.status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_accepted_readiness_gate_unblocks_dependent_but_never_feeds_criterion_manifest(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    agent.capabilities = ["investigation", "review"]
+    first = await _delegate_adhoc(db_session, service, run, agent, "m1", work_function="review")
+    second = await _delegate_adhoc(db_session, service, run, agent, "m2", depends_on=[str(first.id)])
+    gate = await _adhoc_gate(db_session, first)
+    await _finish(db_session, test_project.id, first)
+    await service.tick(db_session, run.id)
+    await service.tick(db_session, run.id)
+    await db_session.refresh(second)
+    assert gate.status == "accepted" and second.status == "in_progress"
+
+    keys = {"success_criterion_keys": ["c1"]}
+    gate.required_evidence = {**gate.required_evidence, **keys}
+    ev = await _add_evidence(
+        db_session, run.id, gate.id, source_type="verification", producer_agent_id=agent.id,
+        verdict="accepted", event_seq=1,
+    )
+    plan_gate = await _make_gate(db_session, run.id, required_evidence={**keys, "plan_item_id": "x"})
+    final_ev = await _add_evidence(
+        db_session, run.id, plan_gate.id, source_type="verification", producer_agent_id=agent.id,
+        verdict="accepted", event_seq=2,
+    )
+    assert service._criterion_evidence_manifest([gate], [ev]) == {}
+    assert service._criterion_evidence_manifest([gate, plan_gate], [ev, final_ev]) == {"c1": [str(final_ev.id)]}

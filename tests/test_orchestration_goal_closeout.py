@@ -1142,3 +1142,31 @@ async def test_tick_swallows_commitment_409_and_progress_view_lists_it(db_sessio
     assert run.status != "completed"
     situation = await OrchestrationProgressView().build(db_session, goal, run)
     assert str(item.id) in {f["id"] for f in situation.untracked_follow_ups}
+
+
+@pytest.mark.asyncio
+async def test_preliminary_evidence_never_makes_closeout_ready_until_final_verification(db_session, test_project):
+    from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    service = OrchestrationService()
+    goal, run = await create_goal(db_session, test_project, weight="standard")
+
+    async def accepted_gate(extra):
+        gate = OrchestrationGate(
+            run_id=run.id, success_criterion_key="plan_item:done", gate_type="work_completed",
+            required_evidence={"success_criterion_keys": ["done"], **extra}, status="accepted",
+        )
+        db_session.add(gate)
+        await db_session.flush()
+        db_session.add(OrchestrationEvidence(
+            run_id=run.id, gate_id=gate.id, source_type="verification", source_id=goal.id,
+            verdict="accepted", evidence_metadata={},
+        ))
+        await db_session.flush()
+
+    await accepted_gate({"review_stage": "preliminary"})
+    assert await service._run_ready_for_final_summary_request(db_session, goal, run) is False
+
+    await accepted_gate({})
+    assert await service._run_ready_for_final_summary_request(db_session, goal, run) is True
