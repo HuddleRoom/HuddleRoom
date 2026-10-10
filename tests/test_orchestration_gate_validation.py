@@ -887,7 +887,7 @@ async def test_terminal_adopted_audit_without_verification_keeps_synthesis_queue
     assert not [t for t in tasks if (t.metadata_ or {}).get("orchestration", {}).get("plan_item_id") == "synthesis"]
 
 
-# --- ad-hoc discovery/readiness gates (T10c) --------------------------------------------
+# --- ad-hoc discovery/readiness gates ---
 
 import json  # noqa: E402
 
@@ -1068,6 +1068,88 @@ async def test_rejected_attempt_of_other_task_still_fails_gate(db_session, test_
 
     assert gate.status == "failed"
     assert gate.failure_reason == "Rejected evidence from task"
+
+
+async def _dev_gate(db_session, test_project, **gate_kwargs):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, **gate_kwargs)
+    developer = _agent("developer", "developer", ["implementation"])
+    db_session.add(developer)
+    await db_session.flush()
+    return service, run, gate, developer
+
+
+def _attempt(db_session, run, gate, developer, source_type, verdict, seq, task_id="task-a"):
+    meta = {"event_seq": seq, "source_type": source_type, **({"task_id": task_id} if task_id else {})}
+    return _add_evidence(
+        db_session, run.id, gate.id, source_type=source_type, producer_agent_id=developer.id,
+        verdict=verdict, event_seq=seq, evidence_metadata=meta,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_task_row_not_superseded_by_later_session_candidate(db_session, test_project):
+    service, run, gate, dev = await _dev_gate(
+        db_session, test_project, required_evidence={"required_source_types": ["session"], "min_count": 1})
+    await _attempt(db_session, run, gate, dev, "session", "rejected", 10)
+    await _attempt(db_session, run, gate, dev, "task", "rejected", 11)
+    await _attempt(db_session, run, gate, dev, "session", "candidate", 12)
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from task"
+
+
+@pytest.mark.asyncio
+async def test_later_rejected_task_row_after_candidate_still_fails(db_session, test_project):
+    service, run, gate, dev = await _dev_gate(db_session, test_project)
+    await _attempt(db_session, run, gate, dev, "task", "candidate", 10)
+    await _attempt(db_session, run, gate, dev, "task", "rejected", 11)
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from task"
+
+
+@pytest.mark.asyncio
+async def test_rejected_attempt_without_task_id_is_not_superseded(db_session, test_project):
+    service, run, gate, dev = await _dev_gate(db_session, test_project)
+    await _attempt(db_session, run, gate, dev, "task", "rejected", 10, task_id=None)
+    await _attempt(db_session, run, gate, dev, "task", "candidate", 11, task_id=None)
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from task"
+
+
+@pytest.mark.asyncio
+async def test_session_completed_reopens_failed_attempt_gate(db_session, test_project):
+    from huddleroom.models.session import Session
+    from huddleroom.services.event_bus import emit_event_once
+
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "s1")
+    gate = await _adhoc_gate(db_session, task)
+    failed = Session(task_id=task.id, agent_id=agent.id, project_id=test_project.id,
+                     adapter_type="api", status="failed", output="boom")
+    db_session.add(failed)
+    await db_session.flush()
+    await emit_event_once(db_session, test_project.id, "session.failed",
+                          {"session_id": str(failed.id), "task_id": str(task.id)}, dedup_key=f"failed:{failed.id}")
+    await service.tick(db_session, run.id)
+    assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from session"
+
+    task.status = "in_progress"  # recovery retry reuses the task
+    retry = Session(task_id=task.id, agent_id=agent.id, project_id=test_project.id,
+                    adapter_type="api", status="completed", output=json.dumps(VALID_REPORT))
+    db_session.add(retry)
+    await db_session.flush()
+    await _finish(db_session, test_project.id, task)
+    await emit_event_once(db_session, test_project.id, "session.completed",
+                          {"session_id": str(retry.id), "task_id": str(task.id)}, dedup_key=f"completed:{retry.id}")
+    await service.tick(db_session, run.id)
+
+    assert (gate.status, gate.failure_reason) == ("accepted", None)
 
 
 @pytest.mark.asyncio

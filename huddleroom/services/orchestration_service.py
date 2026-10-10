@@ -156,6 +156,11 @@ ATTEMPT_SOURCE_TYPES = frozenset({"task", "session"})
 ATTEMPT_REJECTION_REASONS = frozenset(
     {"Rejected evidence from task", "Rejected evidence from session"}
 )
+# Authorization denials a different agent/decision can resolve for one task; the rest are run-wide.
+TASK_SCOPED_AUTH_DENIALS = frozenset({
+    "agent_outside_accepted_team", "model_spend_not_granted", "external_write_not_granted",
+    "live_send_not_granted", "workspace_mutation_exceeds_policy",
+})
 FINAL_SUMMARY_WORK_FUNCTION = "summarization"
 FINAL_SUMMARY_REQUESTED_EVENT_TYPE = "orchestration.final_summary_requested"
 # Run work a plan can never adopt (and need not disposition): coordination, not discovery.
@@ -8920,8 +8925,14 @@ class OrchestrationService:
         unmet = await first_unmet_dependency(db, run, task)
         if unmet is not None:
             dep = await db.get(Task, unmet[0])
-            # A cancelled or missing predecessor never finishes: not a wait, so the owner is asked at once.
-            if dep is not None and dep.status != "cancelled":
+            gate_id = task_gate_id(dep, run.id) if dep is not None else None
+            gate = await db.get(OrchestrationGate, gate_id) if gate_id is not None else None
+            # A predecessor that can never satisfy its gate (cancelled, missing, or done with a final
+            # non-attempt gate failure) is not a wait, so the owner is asked at once.
+            dead = dep is None or dep.status == "cancelled" or (
+                dep.status == "done" and gate is not None and gate.status == "failed"
+                and gate.failure_reason not in ATTEMPT_REJECTION_REASONS)
+            if not dead:
                 return f"dependency task {unmet[0]} (gate {unmet[1]})", unmet[0]
         session_id = await self._first_id(db, select(Session.id).where(
             Session.task_id == task.id, Session.status.in_(["pending", "running"])))
@@ -9417,8 +9428,9 @@ class OrchestrationService:
         """_task_start_blocked, then effective authorization; a denial is parked on the task as authorization_wait.
 
         Authorization is checked last so stop/dependency/awaiting (and capacity, owned by activate_ready)
-        keep their meaning. Only activation uses this: _release_headroom keeps _task_start_blocked, so an
-        unauthorized queued task still pins its slot (no over-release while Start is stale) and headroom stays write-free.
+        keep their meaning. Only activation uses this: _release_headroom keeps _task_start_blocked, so a
+        run-wide denial (e.g. Start stale) still pins the slot; a task-scoped denial (TASK_SCOPED_AUTH_DENIALS)
+        parked by a previous activation frees it. Headroom stays write-free.
         """
         blocked = await self._task_start_blocked(db, run, task)
         if blocked:
@@ -10023,7 +10035,7 @@ class OrchestrationService:
         return "Task report is invalid", not repair_pending
 
     async def _retained_gate_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
-        """(reason, final) unless the retained source still holds (R14-3).
+        """(reason, final) unless the retained source still holds.
 
         The source gate must still be accepted on an earlier run of this run's correction lineage, its task and
         Artifact must exist in the project, and the contract must differ from the source Start by type alone.
@@ -10111,9 +10123,8 @@ class OrchestrationService:
     def _superseded_attempt(
         self, item: OrchestrationEvidence, evidence: list[OrchestrationEvidence]
     ) -> bool:
-        """Rejected attempt evidence is superseded by a later successful attempt of the same task
-        (recovery retry/reassign/resume; ruling T8-I2). Rows are never rewritten (R10/R15 verdicts
-        stay as recorded)."""
+        """Rejected attempt evidence is superseded by a later successful attempt of the same task and source
+        type (recovery retry/reassign/resume). Rows are never rewritten: recorded verdicts stay as recorded."""
         if item.verdict != "rejected" or item.source_type not in ATTEMPT_SOURCE_TYPES:
             return False
         task_id = self._json_object_or_empty(item.evidence_metadata).get("task_id")
@@ -10122,7 +10133,7 @@ class OrchestrationService:
         key = self._evidence_order_key(item)
         return any(
             o is not item
-            and o.source_type in ATTEMPT_SOURCE_TYPES
+            and o.source_type == item.source_type
             and o.verdict in {"candidate", "accepted"}
             and self._json_object_or_empty(o.evidence_metadata).get("task_id") == task_id
             and self._evidence_order_key(o) > key
@@ -10692,7 +10703,12 @@ class OrchestrationService:
         startable = 0
         for task in await queued_tasks(db, root_id):
             run = await db.get(OrchestrationRun, uuid.UUID(task.metadata_["orchestration"]["run_id"]))
-            if not await self._task_start_blocked(db, run, task):
+            if await self._task_start_blocked(db, run, task):
+                continue
+            # ponytail: uses the wait parked by the last activation; a fresh denial holds its slot for one tick.
+            meta = self._json_object_or_empty(task.metadata_.get("orchestration"))
+            wait = self._json_object_or_empty(meta.get("authorization_wait"))
+            if wait.get("reason_code") not in TASK_SCOPED_AUTH_DENIALS:
                 startable += 1
         return await available_slots(db, root_id) - startable
 

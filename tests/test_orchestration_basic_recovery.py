@@ -14,6 +14,7 @@ from huddleroom.models.orchestration import OrchestrationAction, OrchestrationEv
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+from huddleroom.services.orchestration_dependencies import task_gate_id
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
@@ -580,6 +581,36 @@ async def test_blocked_task_with_cancelled_dependency_is_not_awaiting(db_session
 
     assert await _task_waits(db_session, run.id) == []
     assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_done_dependency_and_final_failed_gate_asks_owner_at_once(db_session, test_project):
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="dep gate dead")
+    dep = await _with_dependency(db_session, test_project, run, task, agent, status="done")
+    gate = await db_session.get(OrchestrationGate, task_gate_id(dep, run.id))
+    gate.status = "failed"
+    gate.failure_reason = "Task report has no evidence"
+    await db_session.flush()
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert await _task_waits(db_session, run.id) == []
+    assert len(await _actions(db_session, run.id, "ask_human")) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_with_done_dependency_and_attempt_rejected_gate_still_waits(db_session, test_project):
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="dep retrying")
+    dep = await _with_dependency(db_session, test_project, run, task, agent, status="done")
+    gate = await db_session.get(OrchestrationGate, task_gate_id(dep, run.id))
+    gate.status = "failed"
+    gate.failure_reason = "Rejected evidence from task"
+    await db_session.flush()
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert len(await _task_waits(db_session, run.id)) == 1
+    assert await _actions(db_session, run.id, "ask_human") == []
 
 
 @pytest.mark.asyncio

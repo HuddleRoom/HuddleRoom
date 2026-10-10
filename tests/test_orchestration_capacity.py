@@ -247,6 +247,27 @@ async def test_release_headroom_subtracts_startable_queue_but_not_dependency_blo
     assert await service._release_headroom(db_session, root.id) == 0
 
 
+async def _parked_queued_task(db, project, root, run, reason_code):
+    agent = await _agent_row(db)
+    task = await _task(db, project, run, agent=agent)
+    meta = task.metadata_["orchestration"]
+    task.metadata_ = {"orchestration": {**meta, "authorization_wait": {
+        "reason_code": reason_code, "required_decision": "reassign_task", "authority_source": "root_start"}}}
+    await db.flush()
+
+
+async def test_task_scoped_authorization_denial_holds_no_slot(db_session, test_project):
+    root, run = await _root(db_session, test_project)
+    await _parked_queued_task(db_session, test_project, root, run, "agent_outside_accepted_team")
+    assert await OrchestrationService()._release_headroom(db_session, root.id) == 2
+
+
+async def test_run_wide_authorization_denial_still_holds_slot(db_session, test_project):
+    root, run = await _root(db_session, test_project)
+    await _parked_queued_task(db_session, test_project, root, run, "start_required")
+    assert await OrchestrationService()._release_headroom(db_session, root.id) == 1
+
+
 async def _stopped_sibling_setup(db, project, stop):
     agent = await _agent_row(db)
     root, _ = await _root(db, project)
