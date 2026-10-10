@@ -12,7 +12,7 @@ import type {
   OrchestrationProcessRunRecord,
   OrchestrationWarningRecord,
 } from '@/lib/types'
-import { errorRecord, goalTypeLabel, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
+import { errorRecord, evidenceLabel, goalTypeLabel, goalTypeSourceLabel, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
 import { scoped } from './ProcessFocus'
 
 // Goal-wide orchestrator decision/action ledger (run-scoped, not attributable
@@ -168,8 +168,6 @@ function perStepEvents(
 
 // Backend action_type/decision_type -> ledger kind. Only types that really
 // reach the goal ledger (orchestration actions/decisions) are mapped.
-// ponytail: type-resolved, plan-ingested, work-queued/started, evidence-recorded
-// and work-accepted have no action/decision source today; add when they do.
 const KIND_BY_TYPE: Record<string, string> = {
   correct_goal_type: 'type-corrected',
   accept_plan: 'plan-accepted',
@@ -188,26 +186,44 @@ const KIND_LABEL: Record<string, string> = {
   'work-accepted': 'Accepted',
 }
 
-function ledgerMessage(kind: string | undefined, item: TimelineItem): string {
+function ledgerMessage(kind: string | undefined, item: TimelineItem, detail: OrchestrationGoalDetail): string {
   const request = (item.detail ?? {}) as Record<string, unknown>
   if (kind === 'type-corrected' && item.kind === 'action' && typeof request.requested_goal_type === 'string') {
     const from = typeof request.previous_goal_type === 'string' ? goalTypeLabel(request.previous_goal_type) : 'Previous type'
     const rationale = typeof request.rationale === 'string' && request.rationale ? `: ${request.rationale}` : ''
     return `${from} → ${goalTypeLabel(request.requested_goal_type)}${rationale}`
   }
+  if (kind === 'work-queued') {
+    const planItem = detail.plan?.items?.find((candidate) => candidate.key === request.plan_item_id)
+    const fallback = typeof request.plan_item_id === 'string' ? request.plan_item_id : 'plan item'
+    return `Queued: ${planItem?.title ?? fallback}${planItem?.adopted ? ' (existing work)' : ''}`
+  }
+  if (kind === 'plan-ingested') {
+    const plan = detail.plan
+    return plan?.summary && plan.artifact_id === item.target?.slice('artifact:'.length)
+      ? plan.summary
+      : "The planner's plan was received."
+  }
   return item.reason
+}
+
+function ledgerKind(item: TimelineItem): string | undefined {
+  if (item.kind !== 'action') return KIND_BY_TYPE[item.label]
+  if (item.label === 'expand_plan_item' || item.label === 'release_item') return 'work-queued'
+  if (item.label === 'report_consumed') return item.target?.startsWith('artifact:') ? 'plan-ingested' : undefined
+  return KIND_BY_TYPE[item.label]
 }
 
 function goalLedgerEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
   return buildOrchestrationTimeline(detail).map((item) => {
-    const mapped = KIND_BY_TYPE[item.label]
+    const mapped = ledgerKind(item)
     return {
     id: `${item.kind}-${item.id}`,
     anchorId: item.kind === 'decision' ? `decision-${item.id}` : `action-${item.id}`,
     kind: mapped ?? item.kind,
     label: mapped ? KIND_LABEL[mapped] : item.label,
     timestamp: item.createdAt,
-    message: ledgerMessage(mapped, item),
+    message: ledgerMessage(mapped, item, detail),
     processType: null,
     status: item.status,
     error: item.error,
@@ -216,6 +232,40 @@ function goalLedgerEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
     detail: item.detail,
     }
   })
+}
+
+// Events with no ledger row of their own, derived from the goal detail.
+// Fixtures/older payloads may omit any of these, so every read is defensive.
+function derivedGoalEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
+  const entries: ActivityEntry[] = []
+  const entry = (id: string, kind: string, timestamp: string, message: string, status?: string): ActivityEntry =>
+    ({ id, kind, label: KIND_LABEL[kind], timestamp, message, processType: null, status })
+  const goal = detail.goal
+  if (goal && goal.goal_type && goal.goal_type_source && goal.goal_type_source !== 'legacy') {
+    const type = detail.runs?.[0]?.goal_type_snapshot ?? goal.goal_type
+    const rationale = type === goal.goal_type && goal.goal_type_rationale ? ` — ${goal.goal_type_rationale}` : ''
+    entries.push(entry(`goal-${goal.id}:type-resolved`, 'type-resolved', goal.created_at,
+      `${goalTypeLabel(type)} · ${goalTypeSourceLabel(goal.goal_type_source)}${rationale}`))
+  }
+  for (const worker of detail.supervision?.workers ?? []) {
+    if (typeof worker.started_at !== 'string') continue
+    entries.push(entry(`worker-${worker.session_id}:started`, 'work-started', worker.started_at,
+      `Started: ${worker.task_title ?? 'task'}`, typeof worker.session_status === 'string' ? worker.session_status : undefined))
+  }
+  const gates = detail.gates ?? []
+  for (const evidence of detail.evidence ?? []) {
+    const gate = gates.find((candidate) => candidate.id === evidence.gate_id)
+    entries.push(entry(`evidence-${evidence.id}`, 'evidence-recorded', evidence.created_at,
+      `${evidenceLabel(evidence.evidence_role ?? evidence.source_type, evidence.review_stage ?? '')} for ${gate?.success_criterion_key ?? 'a success criterion'}`,
+      evidence.verdict))
+  }
+  for (const gate of gates) {
+    if (gate.status !== 'accepted' || !gate.accepted_at) continue
+    const planItem = detail.plan?.items?.find((candidate) => candidate.gate_id === gate.id)
+    entries.push(entry(`gate-${gate.id}:accepted`, 'work-accepted', gate.accepted_at,
+      `${planItem?.title ?? gate.success_criterion_key} accepted`))
+  }
+  return entries
 }
 
 // Mirrors the old goal-wide Timeline's debug gating exactly: the raw payload
@@ -242,7 +292,7 @@ export function buildActivityEntries({
   const unscoped = decisions.flatMap((decision) => decision.source_process_run_id === null
     ? [answeredAuthorityDecisionEvent(decision, null)].filter((entry): entry is ActivityEntry => entry !== null)
     : [])
-  return [...perStep, ...unscoped, ...goalLedgerEntries(detail)].sort((left, right) =>
+  return [...perStep, ...unscoped, ...goalLedgerEntries(detail), ...derivedGoalEntries(detail)].sort((left, right) =>
     right.timestamp.localeCompare(left.timestamp) || right.id.localeCompare(left.id))
 }
 

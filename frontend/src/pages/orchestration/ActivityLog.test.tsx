@@ -351,4 +351,69 @@ describe('ActivityLog steering anchors', () => {
       view.cleanup()
     }
   })
+  function hierarchyDetail(): OrchestrationGoalDetail {
+    const at = (seconds: number) => new Date(new Date(ISO).getTime() + seconds * 1000).toISOString()
+    return goalDetail({
+      goal: { id: 'goal-1', goal_type: 'outcome', goal_type_source: 'auto', goal_type_rationale: 'Single deliverable', created_at: ISO },
+      runs: [],
+      plan: { artifact_id: 'art-1', summary: 'Build the thing', items: [{ key: 'p1', title: 'Write API', gate_id: 'gate-1', adopted: false }] },
+      actions: [
+        action(1, { action_type: 'correct_goal_type', request: { requested_goal_type: 'roadmap', previous_goal_type: 'outcome' } }),
+        action(2, { action_type: 'accept_plan' }),
+        action(3, { action_type: 'adopt_task' }),
+        action(4, { action_type: 'expand_plan_item', request: { plan_item_id: 'p1' } }),
+        action(5, { action_type: 'report_consumed', target_type: 'artifact', target_id: 'art-1' }),
+      ],
+      supervision: { workers: [{ session_id: 's1', task_id: 't1', task_title: 'Write API', session_status: 'running', started_at: at(10) }] },
+      evidence: [{ id: 'ev1', gate_id: 'gate-1', source_type: 'task_report', evidence_role: 'delivery', review_stage: 'final', verdict: 'accepted', created_at: at(11) }],
+      gates: [{ id: 'gate-1', success_criterion_key: 'api', status: 'accepted', accepted_at: at(12) }],
+    } as unknown as Partial<OrchestrationGoalDetail>)
+  }
+
+  it('derives distinct events for every hierarchy kind with copy and one chip each', async () => {
+    const detail = hierarchyDetail()
+    const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+    const labels: Record<string, string> = {
+      'type-resolved': 'Goal type chosen', 'type-corrected': 'Goal type corrected', 'plan-ingested': 'Plan received',
+      'plan-accepted': 'Plan accepted', 'work-adopted': 'Existing work adopted', 'work-queued': 'Work queued',
+      'work-started': 'Work started', 'evidence-recorded': 'Evidence recorded', 'work-accepted': 'Accepted',
+    }
+    for (const [kind, label] of Object.entries(labels)) expect(entries.find((e) => e.kind === kind)?.label).toBe(label)
+    const message = (kind: string) => entries.find((e) => e.kind === kind)?.message
+    expect(message('work-queued')).toBe('Queued: Write API')
+    expect(message('plan-ingested')).toBe('Build the thing')
+    expect(message('type-resolved')).toContain('Outcome · ')
+    expect(message('type-resolved')).toContain('Single deliverable')
+    expect(message('evidence-recorded')).toContain('for api')
+    expect(message('work-accepted')).toBe('Write API accepted')
+
+    const view = await mount({ detail })
+    try {
+      const chips = descendants(view.container).filter((n) => n.tagName.toLowerCase() === 'button')
+      for (const label of Object.values(labels)) {
+        expect(chips.filter((chip) => textOf(chip) === label)).toHaveLength(1)
+      }
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('filtering by Work queued hides derived Started rows', async () => {
+    const view = await mount({ detail: hierarchyDetail() })
+    try {
+      const chip = getButton(view.container, 'Work queued')
+      await act(async () => { chip.click() })
+      const text = textOf(view.container)
+      expect(text).toContain('Queued: Write API')
+      expect(text).not.toContain('Started: Write API')
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('keeps report_consumed on a task target as a generic action', () => {
+    const detail = goalDetail({ actions: [action(1, { action_type: 'report_consumed', target_type: 'task', target_id: 't1' })] })
+    const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+    expect(entries.find((e) => e.label === 'report_consumed')?.kind).toBe('action')
+  })
 })
