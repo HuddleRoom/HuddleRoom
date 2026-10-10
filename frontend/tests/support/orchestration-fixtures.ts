@@ -205,9 +205,23 @@ export function detail(
     runs: [],
     child_goals: [],
     task_reports: [],
-    plan: null,
-    effective_authorization: null,
+    plan: {
+      status: 'accepted', artifact_id: 'artifact-plan', kind: 'delivery', author_agent_id: 'agent-manager',
+      planning_version: 1, planning_task_id: 'task-plan', summary: null, scope: null, items: [],
+    },
+    effective_authorization: isActive(goalStatus, runStatus) ? realisticAuthorization() : null,
     authorization_wait: null,
+  }
+}
+
+const isActive = (goalStatus: string, runStatus: string) => goalStatus === 'active' && runStatus !== 'completed'
+
+function realisticAuthorization() {
+  return {
+    allowed: true, reason_code: null, required_decision: null, authority_source: 'root_start' as const,
+    run_id: run.id, contract_fingerprint: 'fp-contract-outcome', model_spend_remaining: { max_tokens: '120000' },
+    external_write_targets: [], live_send_channels: [], workspace_mutation: 'direct' as const,
+    tool_constraints: ['no_external_writes', 'no_live_sends'],
   }
 }
 
@@ -893,6 +907,7 @@ export function planningDetail(corrected: boolean) {
     run: {
       ...base.run, id: runId, status: 'running', phase: 'authorized', condition: 'working', baseline_authorized: true,
       supersedes_run_id: corrected ? 'run-outcome-1' : null,
+      goal_contract_fingerprint: corrected ? 'fp-start-roadmap' : 'fp-start-outcome',
       plan_state: { status: 'accepted', planning_task_id: 'task-plan', expanded_items: [] },
       active_blockers: [],
     },
@@ -918,7 +933,7 @@ export function planningDetail(corrected: boolean) {
     }] : [],
     plan: {
       status: 'accepted', artifact_id: corrected ? 'artifact-roadmap' : 'artifact-delivery', kind: corrected ? 'roadmap' : 'delivery',
-      author_agent_id: 'agent-manager', planning_version: 1, planning_task_id: 'task-plan', summary: null, scope: null,
+      author_agent_id: 'agent-manager', planning_version: corrected ? 2 : 1, planning_task_id: 'task-plan', summary: null, scope: null,
       items: corrected ? [{
         key: 'scope-release', unit_type: 'task', title: 'Scope the release', work_function: 'planning', agent_id: 'agent-manager',
         depends_on: [], artifact_ids: [], why_runnable: 'Nothing blocks scoping.', priority: 50, adopt_task_id: null, adopted: false,
@@ -929,7 +944,7 @@ export function planningDetail(corrected: boolean) {
         task_id: null, child_goal_id: childGoalId, gate_id: null, state: 'started',
       }] : [],
     },
-    effective_authorization: null,
+    effective_authorization: realisticAuthorization(),
     authorization_wait: null,
   }
 }

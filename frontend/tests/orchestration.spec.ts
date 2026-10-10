@@ -431,7 +431,7 @@ test('operator inspects the full trail and lifecycle controls update state', asy
   // The tab is now "Plan" (Phase 5) and merges goal-plan + suggestions content
   // into one panel; its sections are no longer their own collapsibles (the tab
   // itself is the disclosure) — content is visible immediately.
-  await expect(goalPlanPanel.getByText('No plan yet.', { exact: false })).toBeVisible()
+  await expect(goalPlanPanel.getByRole('region', { name: 'Plan' }).getByText('Accepted')).toBeVisible()
   await expect(goalPlanPanel.getByText('Release is independently validated.')).toBeVisible()
   // Suggestions are merged into the Plan tab (no separate Suggestions tab).
   await expect(goalPlanPanel.getByText('No independent validator is active.')).toBeVisible()
@@ -1337,6 +1337,7 @@ test('corrects goal type through a stale preview and inspects the progressive pl
   await tabs.getByRole('tab', { name: 'Plan', exact: true }).click()
   const planPanel = tabs.getByRole('tabpanel', { name: 'Plan' })
   await expect(planPanel.getByText('Run 2 · Current')).toBeVisible()
+  await expect(planPanel.getByText('1 earlier version (v1), not shown here.')).toBeVisible()
   await planPanel.getByText('Earlier runs (1)').click()
   await expect(planPanel.getByText('Run 1 · Historical')).toBeVisible()
   await expect(planPanel.getByText('Reclassified to Roadmap')).toBeVisible()
@@ -1348,4 +1349,5 @@ test('corrects goal type through a stale preview and inspects the progressive pl
   await expect(planPanel.getByText('Wrote the scope note')).toBeVisible()
   await expect(planPanel.getByText('Start phase one')).toBeVisible()
   await expect(planPanel.getByText('session-', { exact: false })).toBeVisible()
+  await expect(planPanel.getByText('Contract at Start')).toBeVisible()
 })
