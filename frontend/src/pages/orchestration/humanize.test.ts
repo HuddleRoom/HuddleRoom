@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest'
 import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, OrchestrationProcessRunRecord } from '@/lib/types'
 import {
   acceptanceVerdictLabel,
+  budgetLeftText,
+  evidenceVerdict,
+  requiredDecisionLabel,
+  toolConstraintLabel,
   planStatusLabel,
   runLabel,
   runTerminalReasonLabel,
@@ -392,7 +396,8 @@ describe('planning hierarchy labels', () => {
   })
 
   it('labels correction authorities with a title-cased fallback', () => {
-    expect(correctionAuthorityLabel('continuous_policy')).toBe('Recurring policy')
+    expect(correctionAuthorityLabel('baseline_rerun')).toBe('A new baseline run')
+    expect(correctionAuthorityLabel('continuous_policy')).toBe('An accepted recurring policy')
     expect(correctionAuthorityLabel('parent_release')).toBe('Parent Release')
   })
 
@@ -400,6 +405,36 @@ describe('planning hierarchy labels', () => {
     expect(authorizationReasonLabel('contract_changed_since_start')).toBe('the goal changed after you started it')
     expect(authorizationReasonLabel('budget_exhausted')).toBe('the budget is used up')
     expect(authorizationReasonLabel('some_new_reason')).toBe('some new reason')
+  })
+})
+
+describe('fix round labels', () => {
+  it('labels required decisions and tool constraints with title-case fallbacks', () => {
+    const decisions = {
+      start: 'Start again',
+      resume: 'Resume the goal',
+      increase_budget: 'A budget increase',
+      ask_human: 'Your answer to an open question',
+      revise_task_scope: 'A revised task scope',
+      parent_release: 'Release from the parent plan',
+    }
+    for (const [value, label] of Object.entries(decisions)) expect(requiredDecisionLabel(value)).toBe(label)
+    expect(requiredDecisionLabel('some_thing')).toBe('Some Thing')
+    const tools = {
+      no_external_writes: 'No external writes',
+      no_live_sends: 'No live sends',
+      no_publish_before_integration: 'No publishing before integration',
+    }
+    for (const [value, label] of Object.entries(tools)) expect(toolConstraintLabel(value)).toBe(label)
+    expect(toolConstraintLabel('no_new_thing')).toBe('No New Thing')
+  })
+
+  it('words the remaining budget, the evidence verdict and tolerates missing goal types', () => {
+    expect(budgetLeftText({})).toBe('No measured budget')
+    expect(budgetLeftText({ max_tokens: '120000' })).toBe('max tokens 120,000')
+    expect(evidenceVerdict({ acceptance_verdict: null, verdict: 'candidate' })).toBe('pending')
+    expect(evidenceVerdict({ acceptance_verdict: 'accepted', verdict: 'candidate' })).toBe('accepted')
+    expect(goalTypeLabel(undefined)).toBe('')
   })
 })
 

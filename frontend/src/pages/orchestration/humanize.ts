@@ -1,6 +1,7 @@
 import type {
   OrchestrationAuthorityDecisionRecord,
   OrchestrationBaselineProcessType,
+  OrchestrationEvidence,
   OrchestrationGoal,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
@@ -356,12 +357,12 @@ export function errorRecord(error: unknown, options?: { entity?: string }): Erro
 // Planning hierarchy labels
 // ============================================================================
 
-function titleCase(value: string): string {
-  return value.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+function titleCase(value: string | null | undefined): string {
+  return String(value ?? '').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
-function labelFrom(map: Record<string, string>, value: string): string {
-  return map[value] ?? titleCase(value)
+function labelFrom(map: Record<string, string>, value: string | null | undefined): string {
+  return value ? (map[value] ?? titleCase(value)) : ''
 }
 
 const GOAL_TYPE_LABELS: Record<string, string> = {
@@ -400,17 +401,46 @@ const WORKSPACE_MUTATION_LABELS: Record<string, string> = {
   direct: 'Direct changes',
 }
 
-export const goalTypeLabel = (type: string): string => labelFrom(GOAL_TYPE_LABELS, type)
+export const goalTypeLabel = (type: string | null | undefined): string => labelFrom(GOAL_TYPE_LABELS, type)
 export const goalTypeSourceLabel = (source: string): string => labelFrom(GOAL_TYPE_SOURCE_LABELS, source)
 export const planningModeLabel = (mode: string): string => labelFrom(PLANNING_MODE_LABELS, mode)
 export const itemStateLabel = (state: string): string => labelFrom(ITEM_STATE_LABELS, state)
 export const workspaceMutationLabel = (mode: string): string => labelFrom(WORKSPACE_MUTATION_LABELS, mode)
 
 const CORRECTION_AUTHORITY_LABELS: Record<string, string> = {
-  baseline_rerun: 'Baseline re-run',
-  continuous_policy: 'Recurring policy',
+  baseline_rerun: 'A new baseline run',
+  continuous_policy: 'An accepted recurring policy',
 }
 export const correctionAuthorityLabel = (value: string): string => labelFrom(CORRECTION_AUTHORITY_LABELS, value)
+
+const REQUIRED_DECISION_LABELS: Record<string, string> = {
+  start: 'Start again',
+  resume: 'Resume the goal',
+  increase_budget: 'A budget increase',
+  ask_human: 'Your answer to an open question',
+  revise_task_scope: 'A revised task scope',
+  parent_release: 'Release from the parent plan',
+}
+export const requiredDecisionLabel = (decision: string): string => labelFrom(REQUIRED_DECISION_LABELS, decision)
+
+const TOOL_CONSTRAINT_LABELS: Record<string, string> = {
+  no_external_writes: 'No external writes',
+  no_live_sends: 'No live sends',
+  no_publish_before_integration: 'No publishing before integration',
+}
+export const toolConstraintLabel = (constraint: string): string => labelFrom(TOOL_CONSTRAINT_LABELS, constraint)
+
+export function budgetLeftText(remaining: Record<string, string>): string {
+  const entries = Object.entries(remaining)
+  if (entries.length === 0) return 'No measured budget'
+  return entries
+    .map(([key, value]) => `${key.replace(/_/g, ' ')} ${/^\d+$/.test(value) ? Number(value).toLocaleString('en-US') : value}`)
+    .join(' · ')
+}
+
+export function evidenceVerdict(evidence: Pick<OrchestrationEvidence, 'acceptance_verdict' | 'verdict'>): string {
+  return evidence.acceptance_verdict ?? (evidence.verdict === 'candidate' ? 'pending' : evidence.verdict)
+}
 
 // "Readiness · Preliminary"; the verdict is appended only when supplied
 // (callers usually render it as its own badge).

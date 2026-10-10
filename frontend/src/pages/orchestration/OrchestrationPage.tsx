@@ -54,7 +54,7 @@ import type {
 import { useUIStore } from '@/stores/ui'
 import { BaselineDashboard, currentProcesses, type BaselineMutationOwner } from './BaselineDashboard'
 import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
-import { authorizationReasonLabel, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
+import { authorizationReasonLabel, budgetLeftText, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
@@ -677,14 +677,6 @@ function correctionConflict(error: unknown): CorrectionConflict | null {
 
 function correctionErrorText(error: unknown) {
   return correctionConflict(error)?.message ?? errorText(error)
-}
-
-function budgetLeftText(remaining: Record<string, string>) {
-  const entries = Object.entries(remaining)
-  if (entries.length === 0) return 'No measured budget'
-  return entries
-    .map(([key, value]) => `${key.replace(/_/g, ' ')} ${/^\d+$/.test(value) ? Number(value).toLocaleString('en-US') : value}`)
-    .join(' · ')
 }
 
 export function CorrectGoalTypeDialog({

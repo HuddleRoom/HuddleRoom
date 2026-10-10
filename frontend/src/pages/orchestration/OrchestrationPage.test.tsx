@@ -1071,7 +1071,7 @@ describe('CorrectGoalTypeDialog', () => {
       })
       const text = textOf(view.container)
       for (const copy of [
-        'Outcome → Roadmap', 'Delivery plan → Roadmap plan', 'Baseline re-run, Start', 'tokens 120,000',
+        'Outcome → Roadmap', 'Delivery plan → Roadmap plan', 'A new baseline run, Start', 'tokens 120,000',
         'No blockers.', 'Evidence carried over (1)', 'Needs revalidation', 'artifact-9',
         'Readiness proof from the first run', 'Carried-over evidence is never accepted automatically.',
       ]) expect(text).toContain(copy)

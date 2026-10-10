@@ -6,7 +6,7 @@ import { Callout } from '@/components/common/Callout'
 import { Record } from '@/components/common/Record'
 import { Tag } from '@/components/common/Tag'
 import type { OrchestrationAuthorization, OrchestrationGoal } from '@/lib/types'
-import { authorizationReasonLabel, goalTypeLabel, workspaceMutationLabel } from './humanize'
+import { authorizationReasonLabel, budgetLeftText, goalTypeLabel, workspaceMutationLabel } from './humanize'
 
 const CONFLICT_COPY: Record<string, string> = {
   baseline_not_ready: 'Baseline is not ready yet. Finish baseline before starting work.',
@@ -49,14 +49,6 @@ function summary(value: unknown) {
   } catch {
     return String(value)
   }
-}
-
-function spendText(remaining: Record<string, string>) {
-  const entries = Object.entries(remaining)
-  if (entries.length === 0) return 'No measured budget'
-  return entries
-    .map(([key, value]) => `${key.replace(/_/g, ' ')} ${/^\d+$/.test(value) ? Number(value).toLocaleString('en-US') : value}`)
-    .join(' · ')
 }
 
 function allowedList(items: string[]) {
@@ -139,7 +131,7 @@ export function StartWorkDialog({
           <Record
             keyWidth={120}
             rows={[
-              { key: 'Model spend left', value: spendText(authorization.model_spend_remaining) },
+              { key: 'Model spend left', value: budgetLeftText(authorization.model_spend_remaining) },
               { key: 'External writes', value: allowedList(authorization.external_write_targets) },
               { key: 'Live sends', value: allowedList(authorization.live_send_channels) },
               { key: 'Workspace', value: workspaceMutationLabel(authorization.workspace_mutation) },
