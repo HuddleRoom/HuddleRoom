@@ -1,13 +1,16 @@
 import hashlib
 import json
 import logging
+import uuid
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
@@ -22,13 +25,17 @@ from huddleroom.models.orchestration import (
     OrchestrationGoal,
     OrchestrationRoadmapVersion,
     OrchestrationRun,
+    OrchestrationWait,
     compute_goal_contract_fingerprint,
     explicit_planning_rationale,
 )
+from huddleroom.models.base import _utcnow
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import (
     GoalShapeDecision,
+    GoalTypeCorrectionApplyRequest,
     GoalTypeCorrectionBlocker,
     GoalTypeCorrectionPreviewRequest,
     GoalTypeCorrectionPreviewResult,
@@ -249,6 +256,180 @@ class OrchestrationGoalShapeService:
             json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()
         return result.model_copy(update={"preview_fingerprint": digest})
+
+    async def apply_correction(
+        self, db, goal: OrchestrationGoal, request: GoalTypeCorrectionApplyRequest, actor: str,
+    ) -> tuple[OrchestrationGoal, OrchestrationRun]:
+        """Apply a previewed correction: retire the current run as reclassified and create one successor run."""
+        from huddleroom.services.orchestration_service import OrchestrationService
+
+        if not actor.startswith("human:"):
+            raise HTTPException(status_code=403, detail={
+                "conflict": "explicit_user_request_required", "message": "Only a user can correct a goal type.",
+            })
+        svc = OrchestrationService()
+        key = (f"run:{request.expected_run_id}:kind:correct_goal_type:"
+               f"{request.requested_goal_type}:{request.preview_fingerprint}")
+        reload = select(OrchestrationGoal).where(OrchestrationGoal.id == goal.id).execution_options(
+            populate_existing=True,
+        )
+        async with svc._lock_goal_for_baseline_transition(db, goal.id):
+            goal = await db.scalar(reload)
+            if (successor := await self._correction_replay(db, request.expected_run_id, key)) is not None:
+                return goal, successor
+            preview = await self.preview_correction(db, goal, request, actor)
+            if preview.preview_fingerprint != request.preview_fingerprint:
+                raise HTTPException(status_code=409, detail={
+                    "conflict": "stale_preview", "message": "The correction preview is out of date; review it again.",
+                    "preview": preview.model_dump(mode="json"),
+                })
+            if preview.blockers:
+                codes = {blocker.code for blocker in preview.blockers}
+                raise HTTPException(status_code=409, detail={
+                    "conflict": next((code for code in ("stale_run", "stale_contract") if code in codes),
+                                     "correction_blocked"),
+                    "message": "The goal type cannot be corrected yet.",
+                    "blockers": [blocker.model_dump(mode="json") for blocker in preview.blockers],
+                    "preview": preview.model_dump(mode="json"),
+                })
+            if goal.goal_type == "continuous" and _obj(goal.continuous_state).get("started_at"):
+                # TODO(14f): stop intake via the Continuous service before retiring the run; remove this guard.
+                raise HTTPException(status_code=409, detail={
+                    "conflict": "continuous_correction_not_supported",
+                    "message": "Correcting a started Continuous goal is not supported yet.",
+                })
+            old = await db.scalar(select(OrchestrationRun).where(
+                OrchestrationRun.id == preview.current_run_id,
+            ).execution_options(populate_existing=True))
+            try:
+                async with db.begin_nested():
+                    successor = await self._apply_locked(db, svc, goal, old, preview, actor, key)
+            except IntegrityError:
+                goal = await db.scalar(reload)
+                if (successor := await self._correction_replay(db, request.expected_run_id, key)) is not None:
+                    return goal, successor
+                raise HTTPException(status_code=409, detail={
+                    "conflict": "stale_run", "message": "The goal's run changed concurrently; preview again.",
+                })
+        return goal, successor
+
+    @staticmethod
+    async def _correction_replay(db, run_id: UUID, key: str) -> OrchestrationRun | None:
+        action = await db.scalar(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.idempotency_key == key,
+            OrchestrationAction.status == "completed",
+        ))
+        return await db.get(OrchestrationRun, action.target_id) if action is not None else None
+
+    async def _apply_locked(
+        self, db, svc, goal: OrchestrationGoal, old: OrchestrationRun, preview: GoalTypeCorrectionPreviewResult,
+        actor: str, key: str,
+    ) -> OrchestrationRun:
+        from huddleroom.services.event_bus import emit_event_once
+        from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+        from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+        from huddleroom.services.task_service import TaskService
+
+        now = _utcnow()
+        requested = preview.proposed_goal_type
+        cancellable = []
+        for task in await svc._orchestrated_tasks_for_run(
+            db, old.id, statuses=["backlog", "ready", "in_progress", "blocked", "failed"],
+        ):
+            statuses = set((await db.scalars(select(Session.status).where(Session.task_id == task.id))).all())
+            if not statuses & {"pending", "running"}:  # preview blocks live sessions; never cancel one here
+                cancellable.append((task, bool(statuses)))
+        action = await svc.reserve_action(db, old.id, key, "correct_goal_type", {
+            "action_type": "correct_goal_type", "requested_goal_type": requested,
+            "previous_goal_type": goal.goal_type, "previous_planning_mode": goal.planning_mode,
+            "rationale": preview.rationale, "preview_fingerprint": preview.preview_fingerprint, "actor": actor,
+            "cancelled_tasks": [
+                {"task_id": str(task.id), "previously_activated": activated} for task, activated in cancellable
+            ],
+        })
+        for task, _ in cancellable:
+            await TaskService().cancel(db, goal.project_id, task.id)
+        decisions = OrchestrationAuthorityDecisionService()
+        # Baseline-process decisions are goal-keyed baseline work and survive the correction (R14-1).
+        for decision in (await db.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.run_id == old.id, OrchestrationAuthorityDecision.status == "pending",
+            OrchestrationAuthorityDecision.source_process_run_id.is_(None),
+        ))).all():
+            await decisions.cancel_decision(db, decision, reason="superseded by goal type correction")
+        await db.execute(update(OrchestrationWait).where(
+            OrchestrationWait.run_id == old.id, OrchestrationWait.status == "open",
+        ).values(status="cleared", cleared_at=now))
+        if goal.goal_type == "roadmap":
+            # Finished children only (active ones block the preview); their reservations stop counting.
+            await OrchestrationRoadmapService(svc).settle_finished_children(db, goal, old)
+
+        if old.status in ("running", "blocked", "paused"):
+            old.status, old.completed_at = "cancelled", now
+        old.terminal_reason = "reclassified"
+        await db.flush()  # free the one-active-run slot before the successor insert
+
+        goal.goal_type, goal.goal_type_source = requested, "user"
+        goal.goal_type_rationale = preview.rationale.strip()
+        goal.planning_mode = preview.proposed_planning_mode
+        goal.planning_rationale = explicit_planning_rationale(requested)
+        goal.status = "active"
+        manifest = [entry.model_dump(mode="json") for entry in preview.retained_evidence_manifest]
+        plan_state: dict[str, Any] = {"retained_evidence_manifest": manifest}
+        if goal.parent_goal_id is None:
+            budget_state = {**deepcopy(goal.budget or {}),
+                            "inherited_remaining": preview.model_dump(mode="json")["remaining_budget"]}
+        else:
+            budget_state = {"caps": deepcopy(_obj(old.budget_state).get("caps", _obj(goal.budget).get("caps", {})))}
+            plan_state["child_delta_baseline"] = {
+                "status": "pending_renewal", "parent_goal_id": str(goal.parent_goal_id),
+                "roadmap_version_id": str(goal.roadmap_version_id) if goal.roadmap_version_id else None,
+                "roadmap_item_key": goal.roadmap_item_key, "supersedes_run_id": str(old.id),
+            }
+        successor = OrchestrationRun(
+            id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:type-correction-successor:{old.id}"),
+            goal_id=goal.id, supersedes_run_id=old.id, phase="baseline",
+            # ponytail: events before the old cursor belong to the old run; resume from it.
+            event_cursor=old.event_cursor,
+            baseline_authorized=old.baseline_authorized if goal.parent_goal_id is None else True,
+            goal_type_snapshot=goal.goal_type, planning_mode_snapshot=goal.planning_mode,
+            budget_state=budget_state, plan_state=plan_state,
+        )
+        db.add(successor)
+        await db.flush()
+        for entry in manifest:
+            if not entry["revalidation_required"]:  # changed requirements stay reference-only
+                await svc._ensure_keyed_gate(
+                    db, successor.id, RETAINED_GATE_TYPE, entry["source_gate_id"], {**entry, "min_count": 0},
+                )
+        if goal.parent_goal_id is None:
+            await self._rerun_baseline(db, goal, successor, f"goal type corrected to {requested}")
+        await svc._mark_action_completed(db, action, target_type="run", target_id=successor.id)
+        await emit_event_once(
+            db, goal.project_id, "orchestration.goal_type_corrected", {
+                "goal_id": str(goal.id), "old_run_id": str(old.id), "successor_run_id": str(successor.id),
+                "from_type": preview.current_goal_type, "to_type": requested,
+            }, source="orchestrator", dedup_key=key,
+        )
+        return successor
+
+    @staticmethod
+    async def _rerun_baseline(db, goal: OrchestrationGoal, run: OrchestrationRun, reason: str) -> None:
+        """Restart each finished baseline process on the successor; answered decisions keep their keys."""
+        from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+        from huddleroom.services.project_service import ProjectService
+
+        processes = OrchestrationProcessService()
+        finished = []
+        for process_type in ("goal_definition", "manager_selection", "agent_definition_review", "team_hierarchy"):
+            current = await processes.get_current(db, goal.id, process_type)
+            if current is not None and current.status in ("completed", "skipped"):
+                finished.append(process_type)
+        if not finished:
+            return
+        await ProjectService().lock_workspace_boundary(db, goal.project_id)
+        await ProjectService().require_runnable_project(db, goal.project_id)
+        for process_type in finished:
+            await processes.start_process(db, goal.id, process_type=process_type, trigger_reason=reason, run_id=run.id)
 
     @staticmethod
     def contract_unchanged_since_start(goal: OrchestrationGoal, run: OrchestrationRun) -> bool:

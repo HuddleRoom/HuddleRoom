@@ -110,6 +110,8 @@ from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
     NON_BLOCKING_GATE_TYPES,
     ADHOC_GATED_WORK_FUNCTIONS,
+    RETAINED_GATE_TYPE,
+    _uuid,
     first_unmet_dependency,
     task_gate_id,
     validate_dependencies,
@@ -9796,6 +9798,17 @@ class OrchestrationService:
         return failure
 
     async def _validate_gate(self, db: AsyncSession, gate: OrchestrationGate) -> bool:
+        if gate.gate_type == RETAINED_GATE_TYPE:
+            # Provenance only: no evidence rows, and not a plan-item gate, so it never satisfies criteria.
+            if failure := await self._retained_gate_failure(db, gate):
+                reason, final = failure
+                if final:
+                    self._fail_gate(gate, reason)
+                    return True
+                gate.failure_reason = reason
+                return False
+            self._accept_gate(gate, [])
+            return True
         evidence = await self._evidence_for_gate(db, gate)
         latest_evidence = self._latest_evidence_by_source(evidence)
         rejected = next((item for item in latest_evidence if item.verdict == "rejected"), None)
@@ -9902,6 +9915,43 @@ class OrchestrationService:
             return "Task report is missing", False
         repair_pending = clarification is not None and markers[1] is None
         return "Task report is invalid", not repair_pending
+
+    async def _retained_gate_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
+        """(reason, final) unless the retained source still holds (R14-3).
+
+        The source gate must still be accepted on an earlier run of this run's correction lineage, its task and
+        Artifact must exist in the project, and the contract must differ from the source Start by type alone.
+        Acceptance waits for this run's own Start so a baseline rerun cannot rewrite the contract afterwards."""
+        from huddleroom.services.orchestration_budget_service import run_lineage
+
+        required = self._json_object_or_empty(gate.required_evidence)
+        run = await db.get(OrchestrationRun, gate.run_id)
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        source_gate_id, task_id, artifact_id = (
+            _uuid(required.get(key)) for key in ("source_gate_id", "source_task_id", "artifact_id")
+        )
+        source_gate = await db.get(OrchestrationGate, source_gate_id) if source_gate_id is not None else None
+        if source_gate is None or source_gate.status != "accepted" or str(source_gate.run_id) != required.get(
+            "source_run_id"
+        ):
+            return "Retained source gate is no longer accepted", True
+        source_run = next((item for item in (await run_lineage(db, run))[1:] if item.id == source_gate.run_id), None)
+        if source_run is None:
+            return "Retained source run is not superseded by this run", True
+        task = await db.get(Task, task_id) if task_id is not None else None
+        if task is None or task.project_id != goal.project_id:
+            return "Retained source task is missing", True
+        artifact = await db.get(Artifact, artifact_id) if artifact_id is not None else None
+        if artifact_id is not None and (artifact is None or artifact.project_id != goal.project_id):
+            return "Retained artifact is missing", True
+        if (
+            required.get("source_contract_fingerprint") != source_run.goal_contract_fingerprint
+            or not OrchestrationGoalShapeService.contract_unchanged_since_start(goal, source_run)
+        ):
+            return "Goal requirements changed since the retained source Start", True
+        if run.goal_contract_fingerprint is None:
+            return "Waiting for Start to freeze the goal contract", False
+        return None
 
     def _select_required_evidence(
         self,
