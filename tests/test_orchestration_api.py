@@ -5,6 +5,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import func, inspect as sa_inspect, select
 
+from huddleroom.models.artifact import Artifact
 from huddleroom.models.orchestration import (
     OrchestrationAction,
     OrchestrationEvidence,
@@ -13,6 +14,8 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
     compute_goal_contract_fingerprint,
 )
+from huddleroom.models.session import Session
+from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import AuthorizationResult
 from huddleroom.services.orchestration_service import OrchestrationService
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
@@ -118,6 +121,7 @@ DETAIL_RESPONSE_KEYS = {
     "decisions_count", "actions_count", "gates_count", "evidence_count", "agent_suggestions_count",
     "roadmap_version", "roadmap_items", "children", "budget_summary", "supervision",
     "contract_fingerprint", "runs", "child_goals", "effective_authorization",
+    "task_reports", "plan", "authorization_wait",
 }
 
 
@@ -814,3 +818,218 @@ async def test_detail_lists_released_roadmap_child_with_private_key_set(client, 
     child_detail = (await client.get(
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{child['id']}")).json()
     assert child_detail["child_goals"] == []
+
+
+PLAN_ITEM_KEYS = {
+    "key", "unit_type", "title", "work_function", "agent_id", "depends_on", "artifact_ids", "why_runnable",
+    "priority", "adopt_task_id", "adopted", "task_id", "child_goal_id", "gate_id", "state",
+}
+PLAN_KEYS = {
+    "status", "artifact_id", "kind", "author_agent_id", "planning_version", "planning_task_id", "summary",
+    "scope", "items",
+}
+
+
+@pytest.mark.asyncio
+async def test_detail_outcome_plan_projects_every_item_state(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    run = await db_session.get(OrchestrationRun, uuid.UUID(body["run"]["id"]))
+    author, adopted_task = uuid.uuid4(), uuid.uuid4()
+    planning_task = Task(project_id=test_project.id, title="plan", status="done",
+                         metadata_={"orchestration_contract": {"scope": "Plan the work"}})
+    db_session.add(planning_task)
+    await db_session.flush()
+
+    # (item id, task status or None for unreleased, gate status): one row per plan_item_state outcome.
+    seeds = [("queued", None, None), ("backlog", "backlog", "open"), ("started", "in_progress", "open"),
+             ("pending", "done", "open"), ("accepted", "done", "accepted"), ("failed", "failed", "failed"),
+             ("cancelled", "cancelled", "open")]
+    expanded = []
+    for item_id, task_status, gate_status in seeds:
+        if task_status is None:
+            continue
+        task = Task(project_id=test_project.id, title=item_id, status=task_status)
+        gate = OrchestrationGate(run_id=run.id, success_criterion_key=item_id, gate_type="work_completed",
+                                 required_evidence={}, status=gate_status)
+        db_session.add_all([task, gate])
+        await db_session.flush()
+        expanded.append({"plan_item_id": item_id, "task_id": str(task.id), "gate_id": str(gate.id),
+                         **({"adopted": True} if item_id == "started" else {})})
+    snapshot_items = [{"id": item_id, "work_function": "implementation", "scope": "s", "deliverable": "d"}
+                      for item_id, _, _ in seeds]
+    snapshot_items[1]["depends_on"] = ["plan_item:queued"]
+    snapshot_items[2].update({"priority": 80, "why_runnable": "ready now", "adopt_task_id": str(adopted_task),
+                              "artifact_ids": [str(adopted_task)], "title": "Started item"})
+    artifact = Artifact(
+        project_id=test_project.id, name="plan", artifact_type="plan", linked_task_id=planning_task.id,
+        metadata_={"plan_kind": "implementation", "summary": "The plan", "planning_version": 2,
+                   "plan_author_agent_id": str(author), "plan_items": []},
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    run.plan_state = {"status": "accepted", "accepted_artifact_id": str(artifact.id),
+                      "accepted_plan_snapshot": {"items": snapshot_items}, "expanded_items": expanded}
+    await db_session.flush()
+
+    plan = (await client.get(url)).json()["plan"]
+
+    assert set(plan) == PLAN_KEYS
+    assert (plan["status"], plan["kind"], plan["author_agent_id"], plan["planning_version"], plan["summary"]) == (
+        "accepted", "implementation", str(author), 2, "The plan")
+    assert (plan["artifact_id"], plan["planning_task_id"], plan["scope"]) == (
+        str(artifact.id), str(planning_task.id), "Plan the work")
+    items = {i["key"]: i for i in plan["items"]}
+    assert [i["key"] for i in plan["items"]] == [s[0] for s in seeds]
+    assert all(set(i) == PLAN_ITEM_KEYS for i in items.values())
+    assert {k: i["state"] for k, i in items.items()} == {
+        "queued": "queued", "backlog": "queued", "started": "started", "pending": "evidence_pending",
+        "accepted": "accepted", "failed": "failed", "cancelled": "cancelled"}
+    assert items["backlog"]["depends_on"] == ["queued"]
+    started = items["started"]
+    assert (started["priority"], started["why_runnable"], started["adopt_task_id"], started["adopted"],
+            started["artifact_ids"], started["title"]) == (
+        80, "ready now", str(adopted_task), True, [str(adopted_task)], "Started item")
+    assert items["queued"]["task_id"] is None and items["queued"]["priority"] == 50
+    assert items["queued"]["why_runnable"] == "" and items["queued"]["adopted"] is False
+    assert items["accepted"]["gate_id"] and items["accepted"]["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_detail_plan_is_lenient_and_absent_without_artifact(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    assert (await client.get(url)).json()["plan"] is None
+
+    run = await db_session.get(OrchestrationRun, uuid.UUID(body["run"]["id"]))
+    artifact = Artifact(project_id=test_project.id, name="plan", artifact_type="plan",
+                        metadata_={"plan_kind": "bogus", "plan_items": [
+                            {"id": "a", "priority": "high", "depends_on": "nope"}, "junk", {"title": "no key"}]})
+    db_session.add(artifact)
+    await db_session.flush()
+    # Never accepted and malformed state: the 409-raising accepted-plan path is not used.
+    run.plan_state = {"status": "proposed", "plan_artifact_id": str(artifact.id), "planning_version": "x"}
+    await db_session.flush()
+
+    plan = (await client.get(url)).json()["plan"]
+    assert (plan["status"], plan["kind"], plan["planning_version"], plan["author_agent_id"]) == (
+        "proposed", None, None, None)
+    assert [(i["key"], i["state"], i["priority"], i["depends_on"]) for i in plan["items"]] == [
+        ("a", "queued", 50, [])]
+
+
+@pytest.mark.asyncio
+async def test_detail_roadmap_plan_joins_released_items_and_hides_private_snapshot(client, db_session, test_project):
+    from tests.test_orchestration_roadmap_children import goal_item, release
+
+    _, parent, _, _, _ = await release(db_session, test_project, goal_item("alpha"))
+    detail = (await client.get(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{parent.id}")).json()
+    plan = detail["plan"]
+
+    assert set(plan) == PLAN_KEYS and plan["artifact_id"]
+    assert len(plan["items"]) == 1
+    item = plan["items"][0]
+    assert set(item) == PLAN_ITEM_KEYS
+    assert (item["key"], item["unit_type"], item["state"]) == ("alpha", "goal", "started")
+    assert item["child_goal_id"] == detail["children"][0] and item["gate_id"] and item["task_id"] is None
+    dumped = json.dumps(plan)
+    assert "parent_contract_snapshot" not in dumped and "workspace_policy" not in dumped
+    assert "allocation" not in dumped and "objective" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_detail_roadmap_plan_unreleased_item_is_queued(client, db_session, test_project):
+    from tests.test_orchestration_roadmap_children import accepted_goal_roadmap, goal_item
+
+    _, parent, _, _ = await accepted_goal_roadmap(db_session, test_project, goal_item("beta"))
+    plan = (await client.get(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{parent.id}")).json()["plan"]
+
+    assert [(i["key"], i["state"], i["child_goal_id"], i["gate_id"]) for i in plan["items"]] == [
+        ("beta", "queued", None, None)]
+
+
+def _report(status="done", next_step="verify"):
+    return {"status": status, "changes": ["c"], "evidence": ["e"], "criterion_progress": {"done": "claimed"},
+            "decisions": [], "risks": [], "open_questions": [], "next_step": next_step, "collaboration_need": None}
+
+
+@pytest.mark.asyncio
+async def test_detail_task_reports_project_only_validated_payloads(client, db_session, test_project):
+    url, body = await _create_detail(client, test_project)
+    run_id = uuid.UUID(body["run"]["id"])
+    valid_task, bad_task, planning_task = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    valid_session = uuid.uuid4()
+    for task_id, request in (
+        (valid_task, {"task_id": str(valid_task), "session_id": str(valid_session), "report": _report()}),
+        (bad_task, {"task_id": str(bad_task), "session_id": None, "report": {"status": "done"}}),
+        (planning_task, {"task_id": str(planning_task), "session_id": str(uuid.uuid4())}),
+    ):
+        db_session.add(OrchestrationAction(
+            run_id=run_id, idempotency_key=f"run:{run_id}:kind:report_consumed:task:{task_id}",
+            action_type="report_consumed", request=request, target_type="task", target_id=task_id,
+            status="completed",
+        ))
+    await db_session.flush()
+
+    reports = (await client.get(url)).json()["task_reports"]
+
+    by_task = {r["task_id"]: r for r in reports}
+    assert set(by_task) == {str(valid_task), str(bad_task)}  # planning marker has no report key
+    assert set(by_task[str(valid_task)]) == {"task_id", "session_id", "summary", "report"}
+    assert by_task[str(valid_task)]["summary"] == "done · next: verify"
+    assert by_task[str(valid_task)]["session_id"] == str(valid_session)
+    assert by_task[str(valid_task)]["report"]["next_step"] == "verify"
+    assert by_task[str(bad_task)]["report"] is None and by_task[str(bad_task)]["summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_detail_task_reports_never_expose_raw_session_output(client, db_session, test_project):
+    from tests.test_orchestration_runtime_e2e import _agent
+
+    url, body = await _create_detail(client, test_project)
+    run_id = uuid.UUID(body["run"]["id"])
+    agent = _agent("reporter", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    task = Task(project_id=test_project.id, title="t", status="done", assigned_to=agent.id)
+    db_session.add(task)
+    await db_session.flush()
+    secret = "RAW-SESSION-OUTPUT-SECRET"
+    session = Session(project_id=test_project.id, task_id=task.id, agent_id=agent.id, adapter_type="claude_code", status="completed",
+                      output=json.dumps({**_report(), "scratch": secret}))
+    db_session.add(session)
+    await db_session.flush()
+    db_session.add(OrchestrationAction(
+        run_id=run_id, idempotency_key=f"run:{run_id}:kind:report_consumed:task:{task.id}",
+        action_type="report_consumed", target_type="task", target_id=task.id, status="completed",
+        request={"task_id": str(task.id), "session_id": str(session.id), "report": None,
+                 "report_validation_errors": ["report contains unexpected fields: scratch"]},
+    ))
+    await db_session.flush()
+
+    response = await client.get(url)
+
+    assert secret not in response.text
+    report = response.json()["task_reports"][0]
+    assert report["report"] is None and report["session_id"] == str(session.id)
+
+
+@pytest.mark.asyncio
+async def test_detail_exposes_authorization_wait_for_stale_start_queued_task(client, db_session, test_project):
+    from tests.test_orchestration_authorization import _started_with_backlog_task
+
+    svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}"
+    assert (await client.get(url)).json()["authorization_wait"] is None
+
+    goal.objective = "Changed after Start"
+    await db_session.flush()
+    assert await svc._start_released_tasks(db_session, goal, run) == 0
+
+    wait = (await client.get(url)).json()["authorization_wait"]
+    assert wait == {"task_ids": [str(task.id)], "reason_code": "contract_changed_since_start",
+                    "required_decision": "start"}
+
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")  # re-Start
+    assert await svc._start_released_tasks(db_session, goal, run) == 1
+    assert (await client.get(url)).json()["authorization_wait"] is None

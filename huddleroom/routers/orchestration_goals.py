@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from huddleroom.config import settings
 from huddleroom.database import get_db
 from huddleroom.dependencies import ensure_project_exists, get_current_user
+from huddleroom.models.artifact import Artifact
 from huddleroom.models.orchestration import (
     OrchestrationAction,
     OrchestrationAgentSuggestion,
@@ -31,6 +32,7 @@ from huddleroom.schemas.common import CursorPage
 from huddleroom.schemas.orchestration import (
     OrchestrationActionResponse,
     OrchestrationAgentSuggestionResponse,
+    OrchestrationAuthorizationWaitResponse,
     OrchestrationAuthorityDecisionResponse,
     OrchestrationChildGoalResponse,
     OrchestrationDebugActionResponse,
@@ -46,6 +48,9 @@ from huddleroom.schemas.orchestration import (
     OrchestrationGoalDefinitionRecoverRequest,
     OrchestrationGoalDetailResponse,
     OrchestrationGoalResponse,
+    OrchestrationPlanItemView,
+    OrchestrationPlanView,
+    OrchestrationTaskReportResponse,
     OrchestrationSupersedeRequest,
     GoalTypeCorrectionApplyRequest,
     GoalTypeCorrectionPreviewRequest,
@@ -75,6 +80,8 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.services.orchestration_authority_service import effective_authorization
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_dependencies import evidence_semantics
+from huddleroom.services.orchestration_progress_view import plan_item_state, queued_authorization_wait
+from huddleroom.services.orchestration_work_report import persisted_report_validation, report_summary, work_report_payload
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
 from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
@@ -380,6 +387,128 @@ async def _child_goals(db: AsyncSession, goal: OrchestrationGoal) -> list[Orches
     return result
 
 
+def _uuid_or_none(value) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _text(value) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _texts(value) -> list[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _plan_item_view(raw: dict, key: str, links: dict, state: str) -> OrchestrationPlanItemView:
+    priority = raw.get("priority")
+    adopt_task_id = _uuid_or_none(raw.get("adopt_task_id"))
+    return OrchestrationPlanItemView(
+        key=key, unit_type="goal" if raw.get("unit_type") == "goal" else "task",
+        title=_text(raw.get("title")), work_function=_text(raw.get("work_function")),
+        agent_id=_uuid_or_none(raw.get("agent_id")),
+        depends_on=[dep.removeprefix("plan_item:") for dep in _texts(raw.get("depends_on"))],
+        artifact_ids=[u for u in map(_uuid_or_none, raw.get("artifact_ids") or []) if u]
+        if isinstance(raw.get("artifact_ids"), list) else [],
+        why_runnable=_text(raw.get("why_runnable")) or "",
+        priority=priority if isinstance(priority, int) and not isinstance(priority, bool) else 50,
+        adopt_task_id=adopt_task_id, adopted=links.get("adopted", False),
+        task_id=links.get("task_id"), child_goal_id=links.get("child_goal_id"), gate_id=links.get("gate_id"),
+        state=state,
+    )
+
+
+async def _plan_view(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, version: OrchestrationRoadmapVersion | None,
+) -> OrchestrationPlanView | None:
+    """Read-only, lenient projection of the run's plan; never raises on malformed plan state."""
+    state = run.plan_state if isinstance(run.plan_state, dict) else {}
+    artifact_id = next((u for u in (
+        version.plan_artifact_id if version else None,
+        _uuid_or_none(state.get("accepted_artifact_id")), _uuid_or_none(state.get("plan_artifact_id")),
+    ) if u), None)
+    artifact = await db.get(Artifact, artifact_id) if artifact_id else None
+    if artifact is None or artifact.project_id != goal.project_id:
+        return None
+    metadata = artifact.metadata_ if isinstance(artifact.metadata_, dict) else {}
+    planning_task = await db.get(Task, artifact.linked_task_id) if artifact.linked_task_id else None
+    contract = (planning_task.metadata_ or {}).get("orchestration_contract") if planning_task else None
+    planning_version = metadata.get("planning_version") or state.get("planning_version")
+
+    links: dict[str, dict] = {}
+    if version is not None:
+        raws = version.snapshot.get("items") if isinstance(version.snapshot, dict) else None
+        key_field = "item_key"
+        for row in await db.scalars(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id)):
+            links[row.item_key] = {"task_id": row.task_id, "child_goal_id": row.child_goal_id, "gate_id": row.gate_id}
+    else:
+        snapshot = state.get("accepted_plan_snapshot")
+        accepted = state.get("status") == "accepted" and isinstance(snapshot, dict)
+        raws = snapshot.get("items") if accepted else metadata.get("plan_items")
+        key_field = "id"
+        for entry in state.get("expanded_items") if isinstance(state.get("expanded_items"), list) else []:
+            if isinstance(entry, dict) and isinstance(entry.get("plan_item_id"), str):
+                links[entry["plan_item_id"]] = {
+                    "task_id": _uuid_or_none(entry.get("task_id")), "gate_id": _uuid_or_none(entry.get("gate_id")),
+                    "adopted": entry.get("adopted") is True,
+                }
+    raws = [raw for raw in raws if isinstance(raw, dict)] if isinstance(raws, list) else []
+
+    task_ids = {v["task_id"] for v in links.values() if v.get("task_id")}
+    gate_ids = {v["gate_id"] for v in links.values() if v.get("gate_id")}
+    child_ids = {v["child_goal_id"] for v in links.values() if v.get("child_goal_id")}
+    task_status = dict((await db.execute(select(Task.id, Task.status).where(Task.id.in_(task_ids)))).all()) if task_ids else {}
+    # Gates may belong to an older run after a correction, so look them up by id, not by run.
+    gate_status = dict((await db.execute(
+        select(OrchestrationGate.id, OrchestrationGate.status).where(OrchestrationGate.id.in_(gate_ids))
+    )).all()) if gate_ids else {}
+    child_status = dict((await db.execute(
+        select(OrchestrationGoal.id, OrchestrationGoal.status).where(OrchestrationGoal.id.in_(child_ids))
+    )).all()) if child_ids else {}
+
+    items = []
+    for raw in raws:
+        key = _text(raw.get(key_field))
+        if key is None:
+            continue
+        link = dict(links.get(key) or {})
+        if version is not None and link:
+            adopt = _uuid_or_none(raw.get("adopt_task_id"))
+            link["adopted"] = adopt is not None and adopt == link.get("task_id")
+        unit_status = (
+            {"completed": "done", "cancelled": "cancelled"}.get(child_status.get(link.get("child_goal_id")))
+            if link.get("child_goal_id") else task_status.get(link.get("task_id"))
+        )
+        items.append(_plan_item_view(
+            raw, key, link, plan_item_state(bool(link), unit_status, gate_status.get(link.get("gate_id")))))
+    scope = contract.get("scope") if isinstance(contract, dict) else None
+    return OrchestrationPlanView(
+        status=_text(state.get("status")), artifact_id=artifact.id,
+        kind=metadata.get("plan_kind") if metadata.get("plan_kind") in ("roadmap", "delivery", "implementation") else None,
+        author_agent_id=_uuid_or_none(metadata.get("plan_author_agent_id")) or artifact.created_by_agent,
+        planning_version=planning_version if isinstance(planning_version, int) else None,
+        planning_task_id=artifact.linked_task_id, summary=_text(metadata.get("summary")),
+        scope=scope if isinstance(scope, str) else None, items=items,
+    )
+
+
+def _task_reports(actions: list[OrchestrationActionResponse]) -> list[OrchestrationTaskReportResponse]:
+    """Validated work reports only; the raw session output stays private. Planning markers carry no report."""
+    reports = []
+    for action in actions:
+        task_id = _uuid_or_none(action.request.get("task_id"))
+        if action.action_type != "report_consumed" or "report" not in action.request or task_id is None:
+            continue
+        payload = work_report_payload(persisted_report_validation(action.request["report"], ()).report)
+        reports.append(OrchestrationTaskReportResponse(
+            task_id=task_id, session_id=_uuid_or_none(action.request.get("session_id")),
+            summary=report_summary(payload), report=payload,
+        ))
+    return reports
+
+
 async def _detail(
     db: AsyncSession,
     goal: OrchestrationGoal,
@@ -621,6 +750,7 @@ async def _detail(
         )
 
     roadmap_version = None
+    version = None
     roadmap_items = None
     children = None
     budget_summary = None
@@ -667,9 +797,15 @@ async def _detail(
         contract_fingerprint=compute_goal_contract_fingerprint(goal),
         runs=await _run_history(db, goal, run) if run is not None else [],
         child_goals=await _child_goals(db, goal),
+        task_reports=_task_reports(actions),
+        plan=await _plan_view(db, goal, run, version) if run is not None else None,
         effective_authorization=(
             await effective_authorization(db, goal, run)
             if run is not None and goal.status not in ("completed", "cancelled") else None
+        ),
+        authorization_wait=(
+            OrchestrationAuthorizationWaitResponse(**wait)
+            if run is not None and (wait := await queued_authorization_wait(db, goal, run)) else None
         ),
     )
 

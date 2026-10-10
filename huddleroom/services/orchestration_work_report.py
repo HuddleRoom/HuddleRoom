@@ -133,6 +133,19 @@ def work_report_payload(report: WorkReport | None) -> dict[str, Any] | None:
     }
 
 
+REPORT_SUMMARY_MAX = 200
+
+
+def report_summary(payload: dict[str, Any] | None) -> str | None:
+    """One-line digest of a work report payload: status, then the next step when present."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+        return None
+    text = payload["status"]
+    if isinstance(payload.get("next_step"), str) and payload["next_step"]:
+        text += f" · next: {payload['next_step']}"
+    return text if len(text) <= REPORT_SUMMARY_MAX else text[:REPORT_SUMMARY_MAX - 1] + "…"
+
+
 def persisted_report_validation(report: Any, errors: Any) -> ReportValidation:
     if report is None:
         return ReportValidation(None, tuple(error for error in errors if isinstance(error, str)))

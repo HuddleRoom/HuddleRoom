@@ -17,9 +17,18 @@ from huddleroom.services.orchestration_work_report import (
     WorkReport,
     curate_report_memory,
     parse_work_report,
+    report_summary,
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_report_summary_status_next_step_and_cap():
+    assert report_summary({"status": "done", "next_step": "verify c1"}) == "done · next: verify c1"
+    assert report_summary({"status": "done", "next_step": ""}) == "done"
+    capped = report_summary({"status": "x" * 300, "next_step": "y"})
+    assert len(capped) == 200 and capped.endswith("…")
+    assert report_summary(None) is None and report_summary({"status": 3}) is None
 
 
 def test_parse_valid_report():

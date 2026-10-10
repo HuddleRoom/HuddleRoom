@@ -431,16 +431,52 @@ async def _follow_up_rows(
     return rows
 
 
+async def _run_tasks(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> list[Task]:
+    return list((await db.execute(
+        select(Task)
+        .where(
+            Task.project_id == goal.project_id,
+            Task.metadata_["orchestration"]["run_id"].as_string() == str(run.id),
+        )
+        .order_by(Task.created_at.asc(), Task.id.asc())
+    )).scalars().all())
+
+
+async def _unstarted_queued_ids(db: AsyncSession, run: OrchestrationRun, tasks: list[Task]) -> list[uuid.UUID]:
+    """Assigned backlog tasks with no session yet, while the run is active."""
+    queued_ids = [t.id for t in tasks if t.status == "backlog" and t.assigned_to]
+    if not queued_ids or run.status not in ACTIVE_RUN_STATUSES:
+        return []
+    started = set(await db.scalars(select(Session.task_id).where(Session.task_id.in_(queued_ids))))
+    return [i for i in queued_ids if i not in started]
+
+
+def _authorization_wait(tasks: list[Task], queued_ids: list[uuid.UUID]) -> dict | None:
+    waiting = [
+        (t, ((t.metadata_ or {}).get("orchestration") or {}).get("authorization_wait"))
+        for t in tasks if t.id in queued_ids
+    ]
+    waiting = [(t, wait) for t, wait in waiting if wait]
+    if not waiting:
+        return None
+    # ponytail: reason and decision of the first waiting task; per-reason groups if they diverge in practice
+    first = waiting[0][1]
+    return {
+        "task_ids": [str(t.id) for t, _ in waiting],
+        "reason_code": first.get("reason_code"),
+        "required_decision": first.get("required_decision"),
+    }
+
+
+async def queued_authorization_wait(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> dict | None:
+    """Queued tasks the run's effective authorization is holding back, as the progress view reports them."""
+    tasks = await _run_tasks(db, goal, run)
+    return _authorization_wait(tasks, await _unstarted_queued_ids(db, run, tasks))
+
+
 class OrchestrationProgressView:
     async def build(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> ProgressSituation:
-        tasks = list((await db.execute(
-            select(Task)
-            .where(
-                Task.project_id == goal.project_id,
-                Task.metadata_["orchestration"]["run_id"].as_string() == str(run.id),
-            )
-            .order_by(Task.created_at.asc(), Task.id.asc())
-        )).scalars().all())
+        tasks = await _run_tasks(db, goal, run)
         gates = list((await db.execute(
             select(OrchestrationGate)
             .where(OrchestrationGate.run_id == run.id)
@@ -508,28 +544,14 @@ class OrchestrationProgressView:
         }
         untracked = [row for row in follow_up_rows if row[2] not in tracked_ids]
         capacity_wait = authorization_wait = None
-        queued_ids = [t.id for t in tasks if t.status == "backlog" and t.assigned_to]
-        if queued_ids and run.status in ACTIVE_RUN_STATUSES:
-            started = set(await db.scalars(select(Session.task_id).where(Session.task_id.in_(queued_ids))))
-            queued_ids = [i for i in queued_ids if i not in started]
-            root = await root_goal_id(db, goal.id) if queued_ids else None
-            if queued_ids and await available_slots(db, root) == 0:
+        queued_ids = await _unstarted_queued_ids(db, run, tasks)
+        if queued_ids:
+            root = await root_goal_id(db, goal.id)
+            if await available_slots(db, root) == 0:
                 capacity_wait = {
                     "root_goal_id": str(root), "available_slots": 0, "queued_task_ids": [str(i) for i in queued_ids],
                 }
-            waiting = [
-                (t, ((t.metadata_ or {}).get("orchestration") or {}).get("authorization_wait"))
-                for t in tasks if t.id in queued_ids
-            ]
-            waiting = [(t, wait) for t, wait in waiting if wait]
-            if waiting:
-                # ponytail: reason and decision of the first waiting task; per-reason groups if they diverge in practice
-                first = waiting[0][1]
-                authorization_wait = {
-                    "task_ids": [str(t.id) for t, _ in waiting],
-                    "reason_code": first.get("reason_code"),
-                    "required_decision": first.get("required_decision"),
-                }
+            authorization_wait = _authorization_wait(tasks, queued_ids)
         return ProgressSituation(
             capacity_wait=capacity_wait,
             authorization_wait=authorization_wait,

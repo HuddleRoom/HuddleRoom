@@ -1186,6 +1186,52 @@ class OrchestrationSupervisionResponse(BaseModel):
     transition: dict | None = None
 
 
+PlanItemState = Literal["queued", "started", "evidence_pending", "accepted", "failed", "cancelled"]
+
+
+class OrchestrationPlanItemView(BaseModel):
+    key: str
+    unit_type: Literal["task", "goal"]
+    title: str | None
+    work_function: str | None
+    agent_id: uuid.UUID | None
+    depends_on: list[str]
+    artifact_ids: list[uuid.UUID]
+    why_runnable: str
+    priority: int
+    adopt_task_id: uuid.UUID | None
+    adopted: bool
+    task_id: uuid.UUID | None
+    child_goal_id: uuid.UUID | None
+    gate_id: uuid.UUID | None
+    state: PlanItemState
+
+
+class OrchestrationPlanView(BaseModel):
+    status: str | None
+    artifact_id: uuid.UUID | None
+    kind: Literal["roadmap", "delivery", "implementation"] | None
+    author_agent_id: uuid.UUID | None
+    planning_version: int | None
+    planning_task_id: uuid.UUID | None
+    summary: str | None
+    scope: str | None
+    items: list[OrchestrationPlanItemView]
+
+
+class OrchestrationTaskReportResponse(BaseModel):
+    task_id: uuid.UUID
+    session_id: uuid.UUID | None
+    summary: str | None
+    report: dict | None
+
+
+class OrchestrationAuthorizationWaitResponse(BaseModel):
+    task_ids: list[uuid.UUID]
+    reason_code: str
+    required_decision: str | None = None
+
+
 class OrchestrationGoalDetailResponse(BaseModel):
     goal: OrchestrationGoalResponse
     run: OrchestrationRunResponse | None = None
@@ -1209,7 +1255,10 @@ class OrchestrationGoalDetailResponse(BaseModel):
     contract_fingerprint: str | None = None
     runs: list[OrchestrationRunSummaryResponse] = Field(default_factory=list)
     child_goals: list[OrchestrationChildGoalResponse] = Field(default_factory=list)
+    task_reports: list[OrchestrationTaskReportResponse] = Field(default_factory=list)
+    plan: OrchestrationPlanView | None = None
     effective_authorization: AuthorizationResult | None = None
+    authorization_wait: OrchestrationAuthorizationWaitResponse | None = None
 
 
 class OrchestrationProcessRunResponse(BaseModel):
