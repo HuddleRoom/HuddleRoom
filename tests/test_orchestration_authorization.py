@@ -724,3 +724,84 @@ async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_
     await svc.tick(db_session, child_run.id)
     await db_session.refresh(child_run)
     assert child_run.goal_contract_fingerprint is None
+
+
+# --- 15b: activation hook (T13 activate_ready is_blocked) ---
+
+async def _started_with_backlog_task(db, project):
+    from huddleroom.models.task import Task
+    from tests.test_orchestration_runtime_e2e import _agent
+
+    svc = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db, project)
+    await svc.tick(db, run.id)
+    await svc.start_run(db, project.id, goal.id, actor="human:a")
+    agent = _agent("activation", ["implementation"])
+    db.add(agent)
+    await db.flush()
+    task = Task(project_id=project.id, title="t", status="backlog", assigned_to=agent.id,
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db.add(task)
+    await db.flush()
+    return svc, goal, run, task
+
+
+async def _session_count(db, task):
+    from sqlalchemy import func
+
+    from huddleroom.models.session import Session
+
+    return await db.scalar(select(func.count()).select_from(Session).where(Session.task_id == task.id))
+
+
+@pytest.mark.asyncio
+async def test_stale_start_keeps_task_queued_with_authorization_wait_until_restart(db_session, test_project):
+    svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    goal.objective = "Changed after Start"
+    scope = f"authorization:{task.id}"
+    run.active_blockers = [{"kind": "authorization", "scope": scope, "reason_code": "contract_changed_since_start"}]
+    await db_session.flush()
+
+    assert await svc._start_released_tasks(db_session, goal, run) == 0
+    assert task.status == "backlog" and await _session_count(db_session, task) == 0
+    assert task.metadata_["orchestration"]["authorization_wait"] == {
+        "reason_code": "contract_changed_since_start", "required_decision": "start", "authority_source": "root_start",
+    }
+    assert task.metadata_["orchestration"]["run_id"] == str(run.id)
+    assert await svc._start_released_tasks(db_session, goal, run) == 0  # unchanged denial is stable
+    assert run.active_blockers  # only an allowed activation clears the claim blocker
+
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")  # re-Start
+    assert await svc._start_released_tasks(db_session, goal, run) == 1
+    assert task.status == "in_progress" and await _session_count(db_session, task) == 1
+    assert "authorization_wait" not in task.metadata_["orchestration"]
+    assert not [b for b in run.active_blockers if b.get("scope") == scope]
+
+
+@pytest.mark.asyncio
+async def test_authorization_is_checked_after_stop_and_dependency_checks(db_session, test_project):
+    svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    goal.objective = "Changed after Start"
+    run.active_blockers = [{"kind": "repeated_failure", "reason": "stopped"}]
+    await db_session.flush()
+    assert await svc._activation_blocker(db_session, run, task) == "repeated_failure"
+    assert "authorization_wait" not in task.metadata_["orchestration"]  # stop semantics unchanged, authority not probed
+
+
+@pytest.mark.asyncio
+async def test_corrupt_lineage_is_an_authorization_denial_not_a_tick_crash(db_session, test_project, monkeypatch):
+    from fastapi import HTTPException
+
+    from huddleroom.services.session_service import SessionService
+
+    async def corrupt(self, db, task):  # a corrupt roadmap row cannot be built under the FKs
+        raise HTTPException(status_code=409, detail="Roadmap task lineage is invalid")
+
+    svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    monkeypatch.setattr(SessionService, "_immutable_roadmap_context", corrupt)
+
+    assert await svc._start_released_tasks(db_session, goal, run) == 0
+    assert task.status == "backlog" and await _session_count(db_session, task) == 0
+    assert task.metadata_["orchestration"]["authorization_wait"] == {
+        "reason_code": "lineage_invalid", "required_decision": "ask_human", "authority_source": "root_start",
+    }

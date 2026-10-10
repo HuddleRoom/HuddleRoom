@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from huddleroom.models.orchestration import (
-    OrchestrationBudgetReservation, OrchestrationDecision, OrchestrationGoal, OrchestrationRoadmapItem,
+    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationDecision, OrchestrationGoal, OrchestrationRoadmapItem,
     OrchestrationRun,
 )
 from huddleroom.models.session import Session
@@ -40,8 +40,15 @@ async def _root(db, project, goal_type="outcome"):
     goal.goal_type, goal.status, run.status, run.phase = goal_type, "active", "running", "authorized"
     if goal_type == "continuous":
         goal.planning_mode = "continuous_policy"
-    await db.flush()
+    await _authorize(db, run)
     return goal, run
+
+
+async def _authorize(db, run):
+    # Effective authorization gates activation and claims; a NULL fingerprint is a grandfathered legacy Start.
+    db.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution",
+                               action_type="authorize_execution", status="completed"))
+    await db.flush()
 
 
 async def _child(db, project, parent, goal_type="outcome", phase="authorized"):
@@ -54,7 +61,12 @@ async def _child(db, project, parent, goal_type="outcome", phase="authorized"):
     await db.flush()
     run = OrchestrationRun(goal_id=goal.id, status="running", phase=phase)
     db.add(run)
+    db.add(OrchestrationBudgetReservation(  # the parent release this child runs under
+        parent_goal_id=parent.id, continuous_origin_key=goal.continuous_origin_key, child_goal_id=goal.id,
+        allocation={},
+    ))
     await db.flush()
+    await _authorize(db, run)
     return goal, run
 
 
@@ -341,6 +353,8 @@ async def test_tick_fills_root_slots_by_rank_queues_the_rest_and_starts_it_when_
     situation = await OrchestrationProgressView().build(db_session, root, run)
     assert situation.capacity_wait["available_slots"] == 0
     assert situation.capacity_wait["queued_task_ids"] == [str(low.id)]
+    assert situation.authorization_wait is None and "authorization_wait" not in situation.as_context()
+    assert "authorization_wait" not in (await db_session.get(Task, low.id)).metadata_["orchestration"]
     assert not [b for b in run.active_blockers if isinstance(b, dict)]
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id)) == 0

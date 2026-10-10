@@ -81,6 +81,7 @@ from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.services.orchestration_authority_interview import build_checkpoint, sync_deferred_questions_memory
 from huddleroom.services.orchestration_authority_service import (
     OrchestrationAuthorityDecisionService,
+    effective_authorization,
     reauthorize_execution_key,
     runtime_decision_identity,
 )
@@ -9389,6 +9390,42 @@ class OrchestrationService:
             or await self._blocked_task_awaiting(db, run, task)
         )
 
+    async def _activation_blocker(self, db: AsyncSession, run: OrchestrationRun, task: Task):
+        """_task_start_blocked, then effective authorization; a denial is parked on the task as authorization_wait.
+
+        Authorization is checked last so stop/dependency/awaiting (and capacity, owned by activate_ready)
+        keep their meaning. Only activation uses this: _release_headroom keeps _task_start_blocked, so an
+        unauthorized queued task still pins its slot (no over-release while Start is stale) and headroom stays write-free.
+        """
+        blocked = await self._task_start_blocked(db, run, task)
+        if blocked:
+            return blocked
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        try:
+            auth = await effective_authorization(db, goal, run, task)
+            wait = None if auth.allowed else {
+                "reason_code": auth.reason_code, "required_decision": auth.required_decision,
+                "authority_source": auth.authority_source,
+            }
+        except HTTPException:
+            # Corrupt roadmap lineage (409) is a denial, not a tick crash.
+            wait = {
+                "reason_code": "lineage_invalid", "required_decision": "ask_human",
+                "authority_source": "parent_release" if goal.parent_goal_id else "root_start",
+            }
+        meta = self._json_object_or_empty(task.metadata_.get("orchestration"))
+        if meta.get("authorization_wait") != wait:
+            meta = {key: value for key, value in meta.items() if key != "authorization_wait"}
+            task.metadata_ = {**task.metadata_, "orchestration": {**meta, **({"authorization_wait": wait} if wait else {})}}
+        if wait is not None:
+            return f"authorization:{wait['reason_code']}", run.id
+        scope = f"authorization:{task.id}"  # the claim boundary's blocker; the next allowed activation clears it
+        if any(isinstance(b, Mapping) and b.get("scope") == scope for b in run.active_blockers or []):
+            run.active_blockers = [
+                b for b in run.active_blockers if not (isinstance(b, Mapping) and b.get("scope") == scope)
+            ]
+        return None
+
     async def _run_activation_stopped(self, db: AsyncSession, run: OrchestrationRun) -> str | None:
         """Why this run's own tick would refuse to spend; None when it may start work."""
         if await self._hard_stop_active(db, run.goal_id):
@@ -9409,7 +9446,7 @@ class OrchestrationService:
             return 0
         if run.phase == "authorized":
             # Best-ranked startable tasks of the whole root tree, into the root's free slots.
-            result = await activate_ready(db, await root_goal_id(db, goal.id), is_blocked=self._task_start_blocked)
+            result = await activate_ready(db, await root_goal_id(db, goal.id), is_blocked=self._activation_blocker)
             await db.flush()
             await db.refresh(run)  # a refused start rolled back a savepoint, which expires run/goal
             await db.refresh(goal)

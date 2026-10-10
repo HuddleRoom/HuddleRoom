@@ -54,6 +54,7 @@ class ProgressSituation:
     plan_items: list[dict] = field(default_factory=list)
     error: bool = False
     capacity_wait: dict | None = None
+    authorization_wait: dict | None = None
 
     def as_context(self) -> dict[str, Any]:
         context: dict[str, Any] = {
@@ -69,6 +70,8 @@ class ProgressSituation:
             context["plan_items_total"] = len(self.plan_items)
         if self.capacity_wait:
             context["capacity_wait"] = self.capacity_wait
+        if self.authorization_wait:
+            context["authorization_wait"] = self.authorization_wait
         if self.error:
             context["progress_view_error"] = True
         return context
@@ -504,7 +507,7 @@ class OrchestrationProgressView:
             for value in ((wait.awaited_event or {}).get("matcher") or {}).values()
         }
         untracked = [row for row in follow_up_rows if row[2] not in tracked_ids]
-        capacity_wait = None
+        capacity_wait = authorization_wait = None
         queued_ids = [t.id for t in tasks if t.status == "backlog" and t.assigned_to]
         if queued_ids and run.status in ACTIVE_RUN_STATUSES:
             started = set(await db.scalars(select(Session.task_id).where(Session.task_id.in_(queued_ids))))
@@ -514,8 +517,22 @@ class OrchestrationProgressView:
                 capacity_wait = {
                     "root_goal_id": str(root), "available_slots": 0, "queued_task_ids": [str(i) for i in queued_ids],
                 }
+            waiting = [
+                (t, ((t.metadata_ or {}).get("orchestration") or {}).get("authorization_wait"))
+                for t in tasks if t.id in queued_ids
+            ]
+            waiting = [(t, wait) for t, wait in waiting if wait]
+            if waiting:
+                # ponytail: reason and decision of the first waiting task; per-reason groups if they diverge in practice
+                first = waiting[0][1]
+                authorization_wait = {
+                    "task_ids": [str(t.id) for t, _ in waiting],
+                    "reason_code": first.get("reason_code"),
+                    "required_decision": first.get("required_decision"),
+                }
         return ProgressSituation(
             capacity_wait=capacity_wait,
+            authorization_wait=authorization_wait,
             progress_view=entries,
             untracked_follow_ups=[item for *_, item in _select_follow_ups(untracked)],
             untracked_follow_ups_total=len(untracked),

@@ -1069,3 +1069,28 @@ async def test_capacity_wait_set_only_when_queued_work_has_no_free_slot(db_sessi
         "root_goal_id": str(goal.id), "available_slots": 0, "queued_task_ids": [str(queued.id)],
     }
     assert situation.as_context()["capacity_wait"] == situation.capacity_wait
+
+
+async def test_authorization_wait_lists_queued_tasks_parked_by_activation(db_session, test_project):
+    from tests.test_orchestration_runtime_e2e import _agent
+
+    goal, run = await _run_with_criteria(db_session, test_project, [])
+    agent = _agent("auth-wait", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    parked = await _task(db_session, test_project, run, status="backlog")
+    plain = await _task(db_session, test_project, run, status="backlog")
+    parked.assigned_to = plain.assigned_to = agent.id
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.authorization_wait is None and "authorization_wait" not in situation.as_context()
+
+    parked.metadata_ = {**parked.metadata_, "orchestration": {**parked.metadata_["orchestration"], "authorization_wait": {
+        "reason_code": "contract_changed_since_start", "required_decision": "start", "authority_source": "root_start",
+    }}}
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert situation.authorization_wait == {
+        "task_ids": [str(parked.id)], "reason_code": "contract_changed_since_start", "required_decision": "start",
+    }
+    assert situation.as_context()["authorization_wait"] == situation.authorization_wait
