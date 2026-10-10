@@ -621,7 +621,7 @@ async def test_roadmap_dependency_uses_predecessor_lineage_version(db_session, a
     successor_version = SimpleNamespace(id=uuid.uuid4())
     from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
     assert await OrchestrationRoadmapService(service)._dependencies_accepted(
-        db_session, goal.id, run.id, successor_version, ["build"]
+        db_session, goal.id, run, successor_version, ["build"]
     )
 
 

@@ -10391,7 +10391,7 @@ class OrchestrationService:
                     return {"step": "plan_revision_required", "reason": str(exc.detail)}
                 wait_state = {
                     "artifact_id": str(artifact.id),
-                    "fingerprint": self._accepted_plan_fingerprint([
+                    "fingerprint": await roadmap.plan_fingerprint(db, run, [
                         item.model_dump(mode="json") for item in roadmap.parse_items(artifact, goal)
                     ]),
                     "approval_id": str(approval.id),

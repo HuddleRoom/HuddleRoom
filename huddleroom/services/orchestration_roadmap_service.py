@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
@@ -5,7 +6,7 @@ from graphlib import CycleError, TopologicalSorter
 
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import object_session
@@ -42,8 +43,14 @@ from huddleroom.services.orchestration_budget_service import (
     BudgetMeasurementError, OrchestrationBudgetService, canonical_amounts, parent_caps, validate_declared_allocations,
 )
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_dependencies import RETAINED_GATE_TYPE
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+def retained_gate_id(run_id, source_gate_id) -> uuid.UUID:
+    """Successor gate retaining source_gate_id; equals _ensure_keyed_gate(run_id, RETAINED_GATE_TYPE, str(source_gate_id))."""
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"rally:orchestration:gate:{run_id}:{RETAINED_GATE_TYPE}:{source_gate_id}")
+
 
 class ChildShapeRejected(Exception):
     """A child item resolved to a shape a finite Roadmap may not create."""
@@ -203,9 +210,55 @@ class OrchestrationRoadmapService:
         return context
 
     async def current_version(self, db: AsyncSession, goal_id: uuid.UUID) -> OrchestrationRoadmapVersion | None:
+        # Same ordering as get_run_for_goal: a corrected successor never inherits its predecessor's versions.
+        latest_run = select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id).order_by(
+            OrchestrationRun.started_at.desc(), OrchestrationRun.id.desc()
+        ).limit(1).scalar_subquery()
         return await db.scalar(select(OrchestrationRoadmapVersion).where(
-            OrchestrationRoadmapVersion.goal_id == goal_id
+            OrchestrationRoadmapVersion.goal_id == goal_id,
+            OrchestrationRoadmapVersion.run_id == latest_run,
         ).order_by(OrchestrationRoadmapVersion.version.desc()).limit(1))
+
+    async def plan_fingerprint(self, db, run, items: list[dict]) -> str:
+        """Successor runs salt the plan hash so versions and approvals never alias their predecessor's."""
+        fingerprint = self.orchestration._accepted_plan_fingerprint(items)
+        if sa_inspect(run).expired:
+            await db.refresh(run)  # a rolled-back savepoint expired it; never lazy-load in async
+        if run.supersedes_run_id is None:
+            return fingerprint
+        return hashlib.sha256(f"{run.id}:{fingerprint}".encode()).hexdigest()
+
+    async def item_gate_satisfied(self, db, run, row) -> bool:
+        """Released item accepted in this run, or a predecessor's item retained by an accepted successor gate."""
+        gate = await db.get(OrchestrationGate, row.gate_id)
+        if gate is not None and gate.run_id == run.id:
+            metadata = self.orchestration._json_object_or_empty(gate.required_evidence)
+            return (
+                gate.status == "accepted"
+                and gate.gate_type == ("work_completed" if row.unit_type == "task" else "child_goal_completed")
+                and gate.success_criterion_key == f"roadmap_item:{row.item_key}"
+                and metadata.get("roadmap_item_key") == row.item_key
+                and metadata.get("roadmap_version_id") == str(row.first_version_id)
+            )
+        retained = await db.get(OrchestrationGate, retained_gate_id(run.id, row.gate_id))
+        return retained is not None and retained.run_id == run.id and retained.status == "accepted"
+
+    async def _require_historical_keys(self, db, goal, run, items) -> None:
+        """A successor may reuse a predecessor's item key only unchanged and with accepted retained evidence."""
+        candidate = {item.item_key: item.model_dump(mode="json") for item in items}
+        rows = (await db.scalars(select(OrchestrationRoadmapItem).join(
+            OrchestrationGate, OrchestrationRoadmapItem.gate_id == OrchestrationGate.id,
+        ).where(
+            OrchestrationRoadmapItem.goal_id == goal.id,
+            OrchestrationRoadmapItem.item_key.in_(list(candidate)),
+            OrchestrationGate.run_id != run.id,
+        ))).all()
+        for row in rows:
+            if candidate[row.item_key] != row.item_snapshot or not await self.item_gate_satisfied(db, run, row):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Historical roadmap item '{row.item_key}' needs an unchanged snapshot and accepted retained evidence",
+                )
 
     async def reconcile_claim_blockers(self, db, goal, run) -> None:
         """Clear only this run's recovered claim refusal, independent of its parent."""
@@ -304,16 +357,9 @@ class OrchestrationRoadmapService:
         ))).all())
         if len(lineage) != len(items):
             return None
-        gates = [await db.get(OrchestrationGate, row.gate_id) for row in lineage]
-        if any(
-            gate is None or gate.run_id != run.id or gate.status != "accepted"
-            or gate.success_criterion_key != f"roadmap_item:{row.item_key}"
-            or gate.gate_type != ("work_completed" if row.unit_type == "task" else "child_goal_completed")
-            or self.orchestration._json_object_or_empty(gate.required_evidence).get("roadmap_item_key") != row.item_key
-            or self.orchestration._json_object_or_empty(gate.required_evidence).get("roadmap_version_id") != str(row.first_version_id)
-            for row, gate in zip(lineage, gates)
-        ):
-            return None
+        for row in lineage:
+            if not await self.item_gate_satisfied(db, run, row):
+                return None
         gate_id = uuid.uuid5(uuid.NAMESPACE_URL, f"rally:roadmap-integration:{run.id}:{version.id}")
         gate = await db.get(OrchestrationGate, gate_id)
         if gate is not None:
@@ -352,9 +398,8 @@ class OrchestrationRoadmapService:
     async def ensure_plan_approval(self, db, goal, run, artifact):
         items = self.parse_items(artifact, goal)
         await self._require_expansion_limits(db, goal, items)
-        fingerprint = self.orchestration._accepted_plan_fingerprint(
-            [item.model_dump(mode="json") for item in items]
-        )
+        await self._require_historical_keys(db, goal, run, items)
+        fingerprint = await self.plan_fingerprint(db, run, [item.model_dump(mode="json") for item in items])
         key = f"roadmap_plan:{fingerprint}"
         if goal.authority_model == "no_manager":
             gate = await db.scalar(select(OrchestrationGate).where(
@@ -417,7 +462,7 @@ class OrchestrationRoadmapService:
             or task.assigned_to != artifact.created_by_agent
         ):
             raise HTTPException(status_code=409, detail="Pending Roadmap replan binding is stale")
-        fingerprint = self.orchestration._accepted_plan_fingerprint([
+        fingerprint = await self.plan_fingerprint(db, run, [
             item.model_dump(mode="json") for item in self.parse_items(artifact, goal)
         ])
         required = self.orchestration._json_object_or_empty(
@@ -472,7 +517,7 @@ class OrchestrationRoadmapService:
         if previous is None:
             validate_declared_allocations(goal, items)
         normalized = [item.model_dump(mode="json") for item in items]
-        fingerprint = self.orchestration._accepted_plan_fingerprint(normalized)
+        fingerprint = await self.plan_fingerprint(db, run, normalized)
         existing = await db.scalar(select(OrchestrationRoadmapVersion).where(
             OrchestrationRoadmapVersion.goal_id == goal.id,
             OrchestrationRoadmapVersion.fingerprint == fingerprint,
@@ -481,6 +526,7 @@ class OrchestrationRoadmapService:
             if previous is not None and existing.id != previous.id:
                 raise HTTPException(status_code=409, detail="Historical Roadmap fingerprint cannot replace the current version")
             return existing
+        await self._require_historical_keys(db, goal, run, items)
         if previous is not None:
             await self._validate_replan(db, goal, run, previous, items)
             await self._require_expansion_approval(db, goal, run, previous, items, fingerprint)
@@ -530,7 +576,9 @@ class OrchestrationRoadmapService:
                     "boundary": deepcopy(item.staging_boundary), "path": str(path),
                 }
         version = OrchestrationRoadmapVersion(
-            goal_id=goal.id, run_id=run.id, version=1 if previous is None else previous.version + 1,
+            goal_id=goal.id, run_id=run.id, version=1 + (await db.scalar(select(func.max(
+                OrchestrationRoadmapVersion.version
+            )).where(OrchestrationRoadmapVersion.goal_id == goal.id)) or 0),
             plan_artifact_id=artifact.id, snapshot={
                 "schema_version": 1, "items": normalized, "team": team,
                 "workspace_policy": deepcopy(previous.snapshot.get("workspace_policy", {})) if previous else (
@@ -547,10 +595,13 @@ class OrchestrationRoadmapService:
         return version
 
     async def _validate_replan(self, db, goal, run, previous, candidate_items):
+        # Released keys always stay in later versions, so previous's keys are this run's releases plus
+        # reused history; a successor never has to carry predecessor items it did not reuse.
         released = {
             row.item_key: row
             for row in (await db.scalars(select(OrchestrationRoadmapItem).where(
-                OrchestrationRoadmapItem.goal_id == goal.id
+                OrchestrationRoadmapItem.goal_id == goal.id,
+                OrchestrationRoadmapItem.item_key.in_([item["item_key"] for item in previous.snapshot["items"]]),
             ))).all()
         }
         candidate = {item.item_key: item.model_dump(mode="json") for item in candidate_items}
@@ -611,9 +662,7 @@ class OrchestrationRoadmapService:
         items = self.parse_items(artifact, goal)
         if previous is None:
             return None
-        fingerprint = self.orchestration._accepted_plan_fingerprint([
-            item.model_dump(mode="json") for item in items
-        ])
+        fingerprint = await self.plan_fingerprint(db, run, [item.model_dump(mode="json") for item in items])
         await self._validate_replan(db, goal, run, previous, items)
         try:
             await self._require_expansion_approval(db, goal, run, previous, items, fingerprint)
@@ -669,29 +718,22 @@ class OrchestrationRoadmapService:
             raise HTTPException(status_code=409, detail="Roadmap plan approval authority is invalid")
         return {"kind": "authority_decision", "id": str(decision.id)}
 
-    async def _dependencies_accepted(self, db, goal_id, run_id, version, dependencies) -> bool:
+    async def _dependencies_accepted(self, db, goal_id, run, version, dependencies) -> bool:
         for key in dependencies:
             lineage = await db.scalar(select(OrchestrationRoadmapItem).where(
                 OrchestrationRoadmapItem.goal_id == goal_id,
                 OrchestrationRoadmapItem.item_key == key,
             ))
-            gate = await db.get(OrchestrationGate, lineage.gate_id) if lineage is not None else None
-            metadata = self.orchestration._json_object_or_empty(gate.required_evidence) if gate else {}
-            if (
-                gate is None or gate.run_id != run_id
-                or gate.gate_type != ("work_completed" if lineage.unit_type == "task" else "child_goal_completed")
-                or gate.success_criterion_key != f"roadmap_item:{key}" or gate.status != "accepted"
-                or metadata.get("roadmap_item_key") != key
-                or metadata.get("roadmap_version_id") != str(lineage.first_version_id)
-            ):
+            if lineage is None or not await self.item_gate_satisfied(db, run, lineage):
                 return False
         return True
 
-    async def _mutable_item_active(self, db, goal_id) -> bool:
+    async def _mutable_item_active(self, db, goal_id, run) -> bool:
         return await db.scalar(select(OrchestrationRoadmapItem.id).join(
             OrchestrationGate, OrchestrationRoadmapItem.gate_id == OrchestrationGate.id,
         ).where(
             OrchestrationRoadmapItem.goal_id == goal_id,
+            OrchestrationGate.run_id == run.id,
             OrchestrationRoadmapItem.item_snapshot["mutates_shared_state"].as_boolean().is_(True),
             OrchestrationGate.status != "accepted",
         ).limit(1)) is not None
@@ -765,12 +807,12 @@ class OrchestrationRoadmapService:
         headroom = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id))
         for item in rank_queued(items, {item.item_key: index for index, item in enumerate(items)}, dependency_counts(items)):
             if item.item_key in released or not await self._dependencies_accepted(
-                db, goal.id, run.id, version, item.depends_on
+                db, goal.id, run, version, item.depends_on
             ):
                 continue
             if item.unit_type == "task" and headroom <= 0:
                 continue
-            if item.mutates_shared_state and await self._mutable_item_active(db, goal.id):
+            if item.mutates_shared_state and await self._mutable_item_active(db, goal.id, run):
                 continue
             if item.mutates_shared_state and await self._requires_mutation_authority(db, goal, version, item):
                 if item.unit_type == "goal" and await self._expansion_limit_error(db, goal, 1):
@@ -839,11 +881,11 @@ class OrchestrationRoadmapService:
         for item in rank_queued(items, {item.item_key: index for index, item in enumerate(items)}, dependency_counts(items)):
             if item.item_key in released:
                 continue
-            if not await self._dependencies_accepted(db, goal.id, run.id, version, item.depends_on):
+            if not await self._dependencies_accepted(db, goal.id, run, version, item.depends_on):
                 continue
             if item.unit_type == "task" and headroom <= 0:
                 return CAPACITY_WAIT
-            if item.mutates_shared_state and await self._mutable_item_active(db, goal.id):
+            if item.mutates_shared_state and await self._mutable_item_active(db, goal.id, run):
                 return "waiting_shared_workspace"
             if item.mutates_shared_state and await self._requires_mutation_authority(db, goal, version, item):
                 authority = await self._mutation_authority(db, goal, run, version, item)
@@ -1290,6 +1332,7 @@ class OrchestrationRoadmapService:
                 OrchestrationRoadmapItem.goal_id == goal.id,
                 OrchestrationRoadmapItem.unit_type == "task",
                 Task.status.in_(("done", "failed", "cancelled")),
+                OrchestrationGate.run_id == run.id,
                 OrchestrationGate.status == "open",
             ).limit(1))
             if terminal_task_gate is not None:

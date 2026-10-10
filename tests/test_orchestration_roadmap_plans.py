@@ -1742,3 +1742,127 @@ async def test_unreleased_child_goal_type_change_needs_a_new_plan_approval(db_se
     outcome = [{**_roadmap_goal("a", allocation=_SMALL), "goal_type": "outcome"}]
     roadmap = [{**_roadmap_goal("a", allocation=_SMALL), "goal_type": "roadmap"}]
     assert _roadmap_fingerprint(service, goal, outcome) != _roadmap_fingerprint(service, goal, roadmap)
+
+
+# --- Type-correction successor run scoping (Task 14b) ---------------------------------------------------------
+
+async def _successor_run(db_session, run):
+    """Retire run as reclassified and add its successor (apply_correction's shape, built directly)."""
+    run.status, run.terminal_reason = "cancelled", "reclassified"
+    await db_session.flush()
+    successor = OrchestrationRun(
+        goal_id=run.goal_id, status="running", phase="authorized", supersedes_run_id=run.id,
+        started_at=run.started_at + timedelta(seconds=1), budget_state=deepcopy(run.budget_state),
+    )
+    db_session.add(successor)
+    await db_session.flush()
+    return successor
+
+
+async def _approved_successor_version(db_session, service, goal, successor, artifact):
+    roadmap = OrchestrationRoadmapService(service)
+    decision = await roadmap.ensure_plan_approval(db_session, goal, successor, artifact)
+    await _approve(db_session, goal, decision)
+    return await roadmap.accept_version(db_session, goal, successor, artifact, None)
+
+
+async def _accepted_retained_gate(db_session, service, successor, row):
+    from huddleroom.services.orchestration_dependencies import RETAINED_GATE_TYPE
+    from huddleroom.services.orchestration_roadmap_service import retained_gate_id
+
+    gate = await service._ensure_keyed_gate(
+        db_session, successor.id, RETAINED_GATE_TYPE, str(row.gate_id), {"source_gate_id": str(row.gate_id), "min_count": 0},
+    )
+    assert gate.id == retained_gate_id(successor.id, row.gate_id)
+    gate.status = "accepted"
+    await db_session.flush()
+    return gate
+
+
+async def test_successor_accepts_version_two_with_run_salted_fingerprint(db_session, test_project, test_user):
+    import hashlib
+
+    service, goal, run, artifact = await _accept_version_one(db_session, test_project, test_user, items=[_roadmap_task()])
+    roadmap = OrchestrationRoadmapService(service)
+    v1 = await roadmap.current_version(db_session, goal.id)
+    successor = await _successor_run(db_session, run)
+    assert await roadmap.current_version(db_session, goal.id) is None
+
+    v2 = await _approved_successor_version(db_session, service, goal, successor, artifact)
+
+    assert (v2.version, v2.run_id) == (2, successor.id)
+    assert v2.fingerprint == hashlib.sha256(f"{successor.id}:{v1.fingerprint}".encode()).hexdigest()
+    assert (await roadmap.current_version(db_session, goal.id)).id == v2.id
+    assert await roadmap.plan_fingerprint(db_session, run, v1.snapshot["items"]) == v1.fingerprint
+
+
+async def test_successor_never_releases_historical_items(db_session, test_project, test_user):
+    service, goal, run, _ = await _accept_version_one(
+        db_session, test_project, test_user, items=[_roadmap_task("a"), _roadmap_task("b", depends_on=["a"])],
+    )
+    roadmap = OrchestrationRoadmapService(service)
+    v1 = await roadmap.current_version(db_session, goal.id)
+    row = await _release_roadmap_item(db_session, service, goal, run, "a")
+    (await db_session.get(Task, row.task_id)).status = "done"
+    (await db_session.get(OrchestrationGate, row.gate_id)).status = "accepted"
+    await db_session.flush()
+    assert (await roadmap.first_releasable_item(db_session, goal, run, v1)).item_key == "b"
+
+    successor = await _successor_run(db_session, run)
+
+    assert await roadmap.current_version(db_session, goal.id) is None
+    assert not await roadmap._dependencies_accepted(db_session, goal.id, successor, v1, ["a"])
+    assert await roadmap.first_releasable_item(db_session, goal, successor, v1) is None
+
+
+async def test_successor_reusing_historical_key_without_retained_gate_is_409(db_session, test_project, test_user):
+    service, goal, run, artifact = await _accept_version_one(db_session, test_project, test_user, items=[_roadmap_task("a")])
+    row = await _release_roadmap_item(db_session, service, goal, run, "a")
+    (await db_session.get(OrchestrationGate, row.gate_id)).status = "accepted"
+    successor = await _successor_run(db_session, run)
+    roadmap = OrchestrationRoadmapService(service)
+
+    with pytest.raises(HTTPException, match="Historical roadmap item 'a'") as excinfo:
+        await roadmap.ensure_plan_approval(db_session, goal, successor, artifact)
+    assert excinfo.value.status_code == 409
+    with pytest.raises(HTTPException, match="Historical roadmap item 'a'"):
+        await roadmap.accept_version(db_session, goal, successor, artifact, None)
+
+    # A retained gate does not license a changed snapshot either.
+    await _accepted_retained_gate(db_session, service, successor, row)
+    changed = Artifact(
+        project_id=test_project.id, name="changed", artifact_type="plan", status="draft",
+        linked_task_id=artifact.linked_task_id, created_by_agent=artifact.created_by_agent,
+        metadata_={"plan_items": [{**_roadmap_task("a"), "scope": "Something else"}]},
+    )
+    db_session.add(changed)
+    await db_session.flush()
+    with pytest.raises(HTTPException, match="Historical roadmap item 'a'"):
+        await roadmap.accept_version(db_session, goal, successor, changed, None)
+
+
+async def test_successor_dependency_on_accepted_retained_gate_releases(db_session, test_project, test_user):
+    service, goal, run, artifact = await _accept_version_one(
+        db_session, test_project, test_user, items=[_roadmap_task("a"), _roadmap_task("b", depends_on=["a"])],
+    )
+    row = await _release_roadmap_item(db_session, service, goal, run, "a")
+    successor = await _successor_run(db_session, run)
+    roadmap = OrchestrationRoadmapService(service)
+    await _accepted_retained_gate(db_session, service, successor, row)
+
+    v2 = await _approved_successor_version(db_session, service, goal, successor, artifact)
+
+    assert await roadmap._dependencies_accepted(db_session, goal.id, successor, v2, ["a"])
+    assert (await roadmap.first_releasable_item(db_session, goal, successor, v2)).item_key == "b"
+
+
+async def test_successor_does_not_reuse_old_run_pending_plan_approval(db_session, test_project, test_user):
+    service, goal, run, artifact, old_decision, _ = await _roadmap_acceptance(db_session, test_project, test_user)
+    assert old_decision.status == "pending"
+    successor = await _successor_run(db_session, run)
+
+    decision = await OrchestrationRoadmapService(service).ensure_plan_approval(db_session, goal, successor, artifact)
+
+    assert decision.id != old_decision.id
+    assert decision.run_id == successor.id and decision.status == "pending"
+    assert decision.decision_key != old_decision.decision_key
