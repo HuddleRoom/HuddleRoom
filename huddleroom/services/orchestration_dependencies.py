@@ -13,6 +13,8 @@ from huddleroom.models.task import Task
 
 
 ADHOC_GATE_TYPE = "adhoc_work_accepted"
+RETAINED_GATE_TYPE = "retained_evidence"
+NON_BLOCKING_GATE_TYPES = frozenset({ADHOC_GATE_TYPE, RETAINED_GATE_TYPE})
 ADHOC_GATED_WORK_FUNCTIONS = {"investigation": "discovery", "review": "readiness"}
 PLAN_IN_FLIGHT_STATUSES = frozenset({"requested", "revision_requested", "revision_required"})
 

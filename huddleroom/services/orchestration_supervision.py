@@ -16,7 +16,7 @@ from huddleroom.models.session import Session
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.graph import GraphRun
 from huddleroom.config import settings
-from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, first_unmet_dependency, plan_in_flight
+from huddleroom.services.orchestration_dependencies import NON_BLOCKING_GATE_TYPES, first_unmet_dependency, plan_in_flight
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE as _ORCH_OWNER
 
 from huddleroom.services.orchestration_decision_validator import (
@@ -658,7 +658,7 @@ class OrchestrationSupervisionService:
             return {"outcome": "continue"}
         has_open_gate = await db.scalar(select(OrchestrationGate.id).where(
             OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
-            OrchestrationGate.gate_type != ADHOC_GATE_TYPE,  # ad-hoc audit gates never block closeout
+            OrchestrationGate.gate_type.not_in(NON_BLOCKING_GATE_TYPES),  # ad-hoc/retained gates never block closeout
         ).limit(1)) is not None
         from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
         # Closeout rejects unfulfilled meeting commitments; let the orchestrator see them instead of idling.

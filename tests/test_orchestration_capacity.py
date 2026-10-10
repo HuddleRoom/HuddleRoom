@@ -11,7 +11,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from huddleroom.models.orchestration import (
-    OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRoadmapItem, OrchestrationRun,
+    OrchestrationBudgetReservation, OrchestrationDecision, OrchestrationGoal, OrchestrationRoadmapItem,
+    OrchestrationRun,
 )
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -555,3 +556,19 @@ async def test_racing_ticks_of_a_child_roadmap_reserve_its_budget_once(
         assert len(reservations) == 1
         assert await reader.scalar(select(func.count()).select_from(OrchestrationGoal).where(
             OrchestrationGoal.parent_goal_id == child_id)) == 1
+
+
+async def test_pending_renewal_child_tick_is_noop(db_session, test_project):
+    agent = await _agent_row(db_session)
+    root, _ = await _root(db_session, test_project)
+    _, run = await _child(db_session, test_project, root)
+    run.plan_state = {"child_delta_baseline": {"status": "pending_renewal"}}
+    task = await _task(db_session, test_project, run, agent=agent)
+    await db_session.flush()
+    await OrchestrationService().tick(db_session, run.id)
+    await db_session.refresh(task)
+    assert task.status == "backlog"
+    assert await db_session.scalar(select(func.count()).select_from(Session).where(Session.task_id == task.id)) == 0
+    assert await db_session.scalar(
+        select(func.count()).select_from(OrchestrationDecision).where(OrchestrationDecision.run_id == run.id)
+    ) == 0

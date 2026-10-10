@@ -658,6 +658,41 @@ def test_planning_contract_lists_eligible_parent_evidence_only_when_present():
     assert root.artifact_ids == [] and not any("Eligible parent evidence" in i for i in root.inputs)
 
 
+def test_planning_contract_lists_retained_evidence_manifest_only_when_present():
+    from types import SimpleNamespace
+
+    gate, task, art, art2 = (uuid.uuid4() for _ in range(4))
+    eligible = uuid.uuid4()
+
+    def contract(manifest):
+        goal = SimpleNamespace(
+            id=uuid.uuid4(), planning_mode="roadmap", objective="Ship it",
+            orchestrator_context={"eligible_evidence": {"artifact_ids": [str(art)]}},
+            success_criteria=[], constraints={}, budget={}, goal_type="roadmap",
+        )
+        run = SimpleNamespace(
+            id=uuid.uuid4(), planning_mode_snapshot=None,
+            plan_state={"retained_evidence_manifest": manifest} if manifest else {},
+        )
+        return OrchestrationService()._planning_contract(
+            goal, run, SimpleNamespace(id=uuid.uuid4()), {"agent_id": str(uuid.uuid4()), "scope": "plan it"}
+        )
+
+    with_manifest = contract([
+        {"source_gate_id": str(gate), "source_task_id": str(task), "artifact_id": str(art), "revalidation_required": True},
+        {"source_gate_id": str(eligible), "source_task_id": str(task), "artifact_id": str(art2), "revalidation_required": False},
+        {"source_gate_id": str(eligible), "source_task_id": str(task), "artifact_id": None, "revalidation_required": False},
+    ])
+    assert with_manifest.artifact_ids == [art, art2]
+    line = next(i for i in with_manifest.inputs if i.startswith("Retained evidence from superseded run"))
+    assert line.startswith("Retained evidence from superseded run (re-verify; reuse only via retained gates):")
+    assert f"{gate} | task {task} | artifact {art} | re-verify" in line
+    assert f"{eligible} | task {task} | artifact {art2} | contract unchanged" in line
+    assert f"artifact none | contract unchanged" in line
+    plain = contract(None)
+    assert plain.artifact_ids == [art] and not any("Retained evidence" in i for i in plain.inputs)
+
+
 # --- orchestration_dependencies ---------------------------------------------
 
 async def _dep_task(db_session, project_id, run, *, gate=None, status="done", run_id="same", meta_key="gate_id"):

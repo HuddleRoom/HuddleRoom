@@ -36,7 +36,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationContinuousPolicy,
     OrchestrationGoalCreate,
 )
-from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, _obj, _uuid, task_gate_id
+from huddleroom.services.orchestration_dependencies import ADHOC_GATE_TYPE, RETAINED_GATE_TYPE, _obj, _uuid, task_gate_id
 from huddleroom.services.orchestration_goal_definition import _redacted_json
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_completion import (
@@ -50,8 +50,6 @@ from huddleroom.services.orchestration_llm_decision_adapter import (
 
 logger = logging.getLogger(__name__)
 
-# ponytail: local until 14e moves it into orchestration_dependencies.py next to ADHOC_GATE_TYPE.
-RETAINED_GATE_TYPE = "retained_evidence"
 _TERMINAL_GOAL_STATUSES = ("completed", "cancelled")
 
 _SHAPE_KEYS = frozenset({"goal_type", "goal_type_rationale", "planning_mode", "planning_rationale"})

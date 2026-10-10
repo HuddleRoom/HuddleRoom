@@ -108,6 +108,7 @@ from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_decision_validator import SELF_GRANT_ERROR, independent_work_rejection
 from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
+    NON_BLOCKING_GATE_TYPES,
     ADHOC_GATED_WORK_FUNCTIONS,
     first_unmet_dependency,
     task_gate_id,
@@ -5785,6 +5786,19 @@ class OrchestrationService:
                 "Eligible parent evidence (references only; re-verify before relying on them for any final "
                 f"criterion): artifacts {', '.join(artifact_ids) or 'none'}; evidence {', '.join(evidence_ids) or 'none'}."
             )
+        retained = [e for e in plan_state.get("retained_evidence_manifest") or [] if isinstance(e, Mapping)]
+        if retained:
+            extra_inputs.append(
+                "Retained evidence from superseded run (re-verify; reuse only via retained gates):\n"
+                + "\n".join(
+                    f"{e.get('source_gate_id')} | task {e.get('source_task_id')} | "
+                    f"artifact {e.get('artifact_id') or 'none'} | "
+                    f"{'re-verify' if e.get('revalidation_required') else 'contract unchanged'}"
+                    for e in retained
+                )
+            )
+            artifact_ids += [str(e["artifact_id"]) for e in retained if e.get("artifact_id")]
+            artifact_ids = list(dict.fromkeys(artifact_ids))
         return OrchestrationDelegationContract(
             goal_id=goal.id,
             run_id=run.id,
@@ -5966,7 +5980,7 @@ class OrchestrationService:
             ).scalars().all()
         )
         # Ad-hoc audit gates are advisory: only an accepted one joins closeout and the summary manifest.
-        gates = [gate for gate in gates if gate.gate_type != ADHOC_GATE_TYPE or gate.status == "accepted"]
+        gates = [gate for gate in gates if gate.gate_type not in NON_BLOCKING_GATE_TYPES or gate.status == "accepted"]
         run = await db.get(OrchestrationRun, run_id)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
         if goal is not None and goal.goal_type == "roadmap":
@@ -10698,6 +10712,13 @@ class OrchestrationService:
                 )
 
             if await self._hard_stop_active(db, goal.id):
+                return self._tick_noop_result(run)
+
+            if goal.parent_goal_id is not None and self._json_object_or_empty(
+                self._json_object_or_empty(run.plan_state).get("child_delta_baseline")
+            ).get("status") == "pending_renewal":
+                if not caller_owns_transaction:
+                    await db.commit()
                 return self._tick_noop_result(run)
 
             if goal.goal_type == "continuous" and run.phase in {"waiting_activation", "authorized"}:

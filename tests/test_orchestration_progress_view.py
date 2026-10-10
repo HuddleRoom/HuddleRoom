@@ -704,6 +704,15 @@ async def test_open_gate_without_verification_request_is_unverified(db_session, 
     }]
 
 
+async def test_open_retained_evidence_gate_is_not_unverified(db_session, test_project):
+    goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
+    gate = await _gate(db_session, run, "done", status="open")
+    gate.gate_type = "retained_evidence"
+    await db_session.flush()
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    assert [f for f in situation.untracked_follow_ups if f["kind"] == "unverified_gate"] == []
+
+
 async def test_gate_excluded_when_request_verification_names_it(db_session, test_project):
     goal, run = await _run_with_criteria(db_session, test_project, [{"key": "done", "description": "Done."}])
     gate = await _gate(db_session, run, "done", status="open")
