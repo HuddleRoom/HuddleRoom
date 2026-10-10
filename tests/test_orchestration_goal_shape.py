@@ -469,3 +469,312 @@ def test_planning_contract_excludes_expansion_policy():
         goal, SimpleNamespace(id=uuid.uuid4(), planning_mode_snapshot=None, plan_state={}), SimpleNamespace(id=uuid.uuid4()), request,
     )
     assert contract.orchestrator_context == {"team": {"agent_ids": ["x"]}}
+
+
+# --- Task 14c: correction preview, retained manifest, preview fingerprint ---
+
+from datetime import datetime, timezone
+import hashlib
+
+from sqlalchemy import event as sa_event, func
+
+from huddleroom.models.artifact import Artifact
+from huddleroom.models.event_log import EventLog
+from huddleroom.models.orchestration import (
+    OrchestrationAction,
+    OrchestrationBudgetReservation,
+    OrchestrationDecision,
+    OrchestrationEvidence,
+    OrchestrationGate,
+    OrchestrationWait,
+    compute_goal_contract_fingerprint,
+)
+from huddleroom.models.session import Session
+from huddleroom.models.task import Task
+from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
+from tests.test_orchestration_continuous_service import direct_policy
+
+
+async def _goal_run(db, project, *, started=True, parent=None, **kw):
+    lineage = {} if parent is None else dict(
+        parent_goal_id=parent.id, continuous_origin_key=f"case-{uuid.uuid4()}", parent_contract_snapshot={},
+        goal_delta={},
+    )
+    goal = OrchestrationGoal(**{
+        "project_id": project.id, "objective": "Ship it", "original_request": "Ship it", "success_criteria": [],
+        "constraints": {}, "budget": {}, "goal_type_source": "user", **lineage, **kw,
+    })
+    db.add(goal)
+    await db.flush()
+    run = OrchestrationRun(
+        goal_id=goal.id, plan_state={}, active_blockers=[], budget_state={}, retry_state={},
+        goal_type_snapshot=goal.goal_type, planning_mode_snapshot=goal.planning_mode,
+        goal_contract_fingerprint=compute_goal_contract_fingerprint(goal) if started else None,
+        phase="authorized" if started else "baseline",
+    )
+    db.add(run)
+    await db.flush()
+    return goal, run
+
+
+async def _preview(db, goal, run, actor="human:u1", **kw):
+    request = GoalTypeCorrectionPreviewRequest(**{
+        "requested_goal_type": "roadmap", "expected_run_id": run.id,
+        "expected_contract_fingerprint": compute_goal_contract_fingerprint(goal), "rationale": "fits better", **kw,
+    })
+    return await OrchestrationGoalShapeService().preview_correction(db, goal, request, actor)
+
+
+def _codes(result):
+    return [blocker.code for blocker in result.blockers]
+
+
+async def _run_task(db, project, run, status="done", **orchestration):
+    task = Task(project_id=project.id, title="work", status=status,
+                metadata_={"orchestration": {"run_id": str(run.id), **orchestration}})
+    db.add(task)
+    await db.flush()
+    return task
+
+
+async def _accepted_gate(db, run, gate_type="work_completed", **kw):
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="done", gate_type=gate_type,
+                             required_evidence=kw.pop("required_evidence", {}), status=kw.pop("status", "accepted"))
+    db.add(gate)
+    await db.flush()
+    return gate
+
+
+async def test_preview_clean_root(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project, goal_type="outcome", budget={"caps": {"max_tokens": "1000"}})
+    result = await _preview(db_session, goal, run)
+    assert result.blockers == [] and result.retained_evidence_manifest == []
+    assert (result.goal_id, result.current_run_id) == (goal.id, run.id)
+    assert (result.current_goal_type, result.current_planning_mode) == ("outcome", goal.planning_mode)
+    assert (result.proposed_goal_type, result.proposed_planning_mode, result.source) == ("roadmap", "roadmap", "user")
+    assert result.remaining_budget == {"max_tokens": Decimal("1000")}
+    assert result.requires_new_start is True and result.missing_recurring_policy is False
+    assert result.required_authority == ["baseline_rerun", "start"]
+
+
+async def test_preview_stale_terminal_same_type_blockers_sorted(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project, goal_type="outcome")
+    goal.status = "completed"
+    result = await _preview(db_session, goal, run, requested_goal_type="outcome",
+                            expected_run_id=uuid.uuid4(), expected_contract_fingerprint=FP)
+    assert _codes(result) == ["goal_terminal", "same_goal_type", "stale_contract", "stale_run"]
+    assert result.blockers[-1].entity_id == run.id
+
+
+async def test_auto_recommendation_for_user_goal_requires_user(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    assert _codes(await _preview(db_session, goal, run, actor="orchestrator")) == ["explicit_choice_requires_user"]
+    assert _codes(await _preview(db_session, goal, run, actor="human:u1")) == []
+    goal.goal_type_source = "auto"
+    assert _codes(await _preview(db_session, goal, run, actor="orchestrator")) == []
+
+
+async def test_preview_child_blockers_and_authority(db_session, test_project):
+    parent, _ = await _goal_run(db_session, test_project)
+    child, child_run = await _goal_run(db_session, test_project, parent=parent)
+    child.goal_type_source = "parent_explicit"
+    result = await _preview(db_session, child, child_run, requested_goal_type="continuous")
+    assert _codes(result) == [
+        "continuous_child_requires_continuous_root", "parent_explicit_requires_parent_plan",
+        "parent_reservation_inactive",
+    ]
+    assert result.blockers[-1].entity_id is None
+    assert result.requires_new_start is False and result.required_authority == ["parent_plan", "authority_review"]
+    assert result.missing_recurring_policy is True
+
+    child.goal_type_source = "parent_auto"
+    reservation = OrchestrationBudgetReservation(
+        parent_goal_id=parent.id, child_goal_id=child.id, continuous_origin_key="case-1", allocation={},
+    )
+    db_session.add(reservation)
+    await db_session.flush()
+    result = await _preview(db_session, child, child_run)
+    assert result.blockers == [] and result.required_authority == ["parent_release"]
+
+    reservation.status, reservation.settled_at, reservation.settlement_reason = "settled", datetime.now(timezone.utc), "completed"
+    await db_session.flush()
+    result = await _preview(db_session, child, child_run)
+    assert [(b.code, b.entity_id) for b in result.blockers] == [("parent_reservation_inactive", reservation.id)]
+
+    parent_run = await OrchestrationService().get_run_for_goal(db_session, test_project.id, parent.id)
+    assert [(b.code, b.entity_id) for b in (await _preview(db_session, parent, parent_run)).blockers] == [
+        ("active_child_goal", child.id),
+    ]
+
+
+async def test_preview_active_work_blockers(db_session, test_project, test_agent):
+    goal, run = await _goal_run(db_session, test_project)
+    running = await _run_task(db_session, test_project, run, status="in_progress")
+    ready = await _run_task(db_session, test_project, run, status="ready")
+    await _run_task(db_session, test_project, run, status="backlog")
+    session = Session(project_id=test_project.id, task_id=running.id, agent_id=test_agent.id,
+                      adapter_type="api", status="running")
+    action = OrchestrationAction(run_id=run.id, idempotency_key="k", action_type="delegate_task", status="reserved")
+    db_session.add_all([session, action])
+    await db_session.flush()
+    result = await _preview(db_session, goal, run)
+    assert {(b.code, b.entity_id) for b in result.blockers} == {
+        ("active_session", session.id), ("active_task", running.id), ("active_task", ready.id),
+        ("reserved_action", action.id),
+    }
+    assert result.blockers == sorted(result.blockers, key=lambda b: (b.code, str(b.entity_id)))
+
+
+async def test_preview_budget_measurement_blocker(db_session, test_project, monkeypatch):
+    goal, run = await _goal_run(db_session, test_project)
+    session_id = uuid.uuid4()
+
+    async def unmeasured(self, db, parent):
+        raise BudgetMeasurementError("max_tokens", session_id)
+
+    monkeypatch.setattr(OrchestrationBudgetService, "remaining", unmeasured)
+    result = await _preview(db_session, goal, run)
+    assert [(b.code, b.entity_id) for b in result.blockers] == [("budget_measurement", session_id)]
+    assert result.remaining_budget == {}
+
+
+async def test_preview_recurring_policy_flag(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    result = await _preview(db_session, goal, run, requested_goal_type="continuous")
+    assert result.missing_recurring_policy is True and result.blockers == []
+    assert result.required_authority == ["baseline_rerun", "start", "continuous_policy"]
+    goal.continuous_policy = {"version": 1, **direct_policy()}
+    result = await _preview(db_session, goal, run, requested_goal_type="continuous")
+    assert result.missing_recurring_policy is False and result.required_authority == ["baseline_rerun", "start"]
+
+
+async def _counts(db):
+    tables = (OrchestrationGoal, OrchestrationRun, OrchestrationGate, OrchestrationEvidence, OrchestrationAction,
+              OrchestrationDecision, OrchestrationWait, OrchestrationBudgetReservation, Task, Session, EventLog, Artifact)
+    return {table.__name__: await db.scalar(select(func.count()).select_from(table)) for table in tables}
+
+
+async def test_preview_writes_nothing(db_session, test_project, test_agent):
+    goal, run = await _goal_run(db_session, test_project, budget={"caps": {"max_tokens": "1000"}})
+    gate = await _accepted_gate(db_session, run)
+    task = await _run_task(db_session, test_project, run, status="in_progress", gate_id=str(gate.id))
+    db_session.add(Session(project_id=test_project.id, task_id=task.id, agent_id=test_agent.id,
+                           adapter_type="api", status="running"))
+    await db_session.flush()
+    before = await _counts(db_session)
+    statements = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    engine = db_session.bind.sync_engine
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        result = await _preview(db_session, goal, run, requested_goal_type="continuous")
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+    assert result.blockers and result.retained_evidence_manifest
+    assert statements and all(sql.lstrip().upper().startswith("SELECT") for sql in statements)
+    assert not db_session.new and not db_session.dirty and not db_session.deleted
+    assert await _counts(db_session) == before
+
+
+async def test_preview_fingerprint_deterministic_and_sensitive(db_session, test_project, monkeypatch):
+    goal, run = await _goal_run(db_session, test_project)
+    first = await _preview(db_session, goal, run)
+    assert (await _preview(db_session, goal, run)).preview_fingerprint == first.preview_fingerprint
+    payload = {**first.model_dump(mode="json", exclude={"preview_fingerprint"}),
+               "contract_fingerprint": compute_goal_contract_fingerprint(goal)}
+    assert first.preview_fingerprint == hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+    assert (await _preview(db_session, goal, run, rationale="other")).preview_fingerprint != first.preview_fingerprint
+
+    async def richer(self, db, parent):
+        return {"remaining": {"max_tokens": "5"}}
+
+    with monkeypatch.context() as patched:
+        patched.setattr(OrchestrationBudgetService, "remaining", richer)
+        assert (await _preview(db_session, goal, run)).preview_fingerprint != first.preview_fingerprint
+
+    db_session.add(OrchestrationAction(run_id=run.id, idempotency_key="k", action_type="x", status="reserved"))
+    await db_session.flush()
+    assert (await _preview(db_session, goal, run)).preview_fingerprint != first.preview_fingerprint
+
+
+async def test_manifest_contract_unchanged_retains_without_revalidation(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    gate = await _accepted_gate(db_session, run)
+    task = await _run_task(db_session, test_project, run, gate_id=str(gate.id))
+    adhoc = await _accepted_gate(db_session, run, gate_type="adhoc_work_accepted")
+    adopted = await _run_task(db_session, test_project, run, adhoc_gate_id=str(adhoc.id))
+    open_gate = await _accepted_gate(db_session, run, status="open")
+    await _run_task(db_session, test_project, run, gate_id=str(open_gate.id))
+    artifact = Artifact(project_id=test_project.id, name="spec", artifact_type="document")
+    db_session.add(artifact)
+    await db_session.flush()
+    db_session.add(OrchestrationEvidence(run_id=run.id, gate_id=gate.id, source_type="artifact",
+                                         source_id=artifact.id, verdict="accepted"))
+    await db_session.flush()
+
+    manifest = (await _preview(db_session, goal, run)).retained_evidence_manifest
+    assert [(e.source_gate_id, e.source_task_id) for e in manifest] == sorted(
+        [(gate.id, task.id), (adhoc.id, adopted.id)], key=lambda pair: str(pair[0]))
+    by_gate = {e.source_gate_id: e for e in manifest}
+    assert by_gate[gate.id].artifact_id == artifact.id and by_gate[adhoc.id].artifact_id is None
+    assert all(e.source_run_id == run.id and e.source_contract_fingerprint == run.goal_contract_fingerprint
+               and e.revalidation_required is False and e.reason.startswith("contract unchanged") for e in manifest)
+
+    goal.objective = "Ship something else"
+    manifest = (await _preview(db_session, goal, run)).retained_evidence_manifest
+    assert len(manifest) == 2 and all(e.revalidation_required for e in manifest)
+
+
+async def test_manifest_legacy_null_fingerprint_and_missing_artifact_require_revalidation(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project, started=False)
+    gate = await _accepted_gate(db_session, run)
+    await _run_task(db_session, test_project, run, gate_id=str(gate.id))
+    [entry] = (await _preview(db_session, goal, run)).retained_evidence_manifest
+    assert entry.revalidation_required is True and entry.reason.startswith("requirements changed")
+    assert entry.source_contract_fingerprint == compute_goal_contract_fingerprint(goal)
+
+    goal2, run2 = await _goal_run(db_session, test_project)
+    gate2 = await _accepted_gate(db_session, run2)
+    await _run_task(db_session, test_project, run2, gate_id=str(gate2.id))
+    db_session.add(OrchestrationEvidence(run_id=run2.id, gate_id=gate2.id, source_type="artifact",
+                                         source_id=uuid.uuid4(), verdict="accepted"))
+    await db_session.flush()
+    [entry] = (await _preview(db_session, goal2, run2)).retained_evidence_manifest
+    assert entry.revalidation_required is True
+
+
+async def test_manifest_retained_gate_carries_original_source(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    source = {
+        "source_run_id": str(uuid.uuid4()), "source_task_id": str(uuid.uuid4()), "source_gate_id": str(uuid.uuid4()),
+        "artifact_id": None, "source_contract_fingerprint": FP, "revalidation_required": False, "reason": "r",
+    }
+    await _accepted_gate(db_session, run, gate_type="retained_evidence", required_evidence={**source, "min_count": 0})
+    [entry] = (await _preview(db_session, goal, run)).retained_evidence_manifest
+    assert (str(entry.source_run_id), str(entry.source_task_id), str(entry.source_gate_id)) == (
+        source["source_run_id"], source["source_task_id"], source["source_gate_id"])
+    assert entry.source_contract_fingerprint == FP and entry.revalidation_required is False
+
+
+async def test_pre_start_and_type_specific_lineage(db_session, test_project):
+    service = OrchestrationGoalShapeService()
+    goal, run = await _goal_run(db_session, test_project, started=False)
+    assert await service.is_pre_start(db_session, goal, run) is True
+    run.plan_state = {"planning_version": 1}
+    assert await service.has_type_specific_lineage(db_session, goal, run) is True
+    assert await service.is_pre_start(db_session, goal, run) is False
+    run.plan_state = {}
+    await _goal_run(db_session, test_project, parent=goal)
+    assert await service.has_type_specific_lineage(db_session, goal, run) is True
+
+    other, other_run = await _goal_run(db_session, test_project, started=False)
+    db_session.add(OrchestrationAction(run_id=other_run.id, idempotency_key="a", action_type="authorize_execution",
+                                       status="completed"))
+    await db_session.flush()
+    assert await service.has_type_specific_lineage(db_session, other, other_run) is False
+    assert await service.is_pre_start(db_session, other, other_run) is False
