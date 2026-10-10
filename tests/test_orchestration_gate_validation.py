@@ -1017,6 +1017,146 @@ async def test_adhoc_gate_fails_when_task_fails(db_session, test_project):
     assert gate.status == "failed"
 
 
+async def _attempt_rows(db_session, run, gate, developer, *, task_id, second_task_verdict="candidate"):
+    s1, s2, t = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rows = []
+    for st, sid, verdict, seq in (
+        ("session", s1, "rejected", 10), ("task", t, "rejected", 11),
+        ("session", s2, "candidate", 12), ("task", t, second_task_verdict, 13),
+    ):
+        rows.append(await _add_evidence(
+            db_session, run.id, gate.id, source_type=st, source_id=sid, producer_agent_id=developer.id,
+            verdict=verdict, event_seq=seq,
+            evidence_metadata={"event_seq": seq, "source_type": st, "task_id": task_id},
+        ))
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_rejected_attempt_superseded_by_later_successful_attempt_of_same_task(db_session, test_project):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    developer = _agent("developer", "developer", ["implementation"])
+    db_session.add(developer)
+    await db_session.flush()
+    s1, _t_rej, _s2, t_ok = await _attempt_rows(db_session, run, gate, developer, task_id="task-a")
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "accepted"
+    assert s1.verdict == "rejected"
+    assert t_ok.verdict == "accepted"  # only required source types are promoted
+
+
+@pytest.mark.asyncio
+async def test_rejected_attempt_of_other_task_still_fails_gate(db_session, test_project):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    developer = _agent("developer", "developer", ["implementation"])
+    db_session.add(developer)
+    await db_session.flush()
+    await _add_evidence(
+        db_session, run.id, gate.id, source_type="task", producer_agent_id=developer.id, verdict="rejected",
+        event_seq=10, evidence_metadata={"event_seq": 10, "source_type": "task", "task_id": "task-a"},
+    )
+    await _add_evidence(
+        db_session, run.id, gate.id, source_type="task", producer_agent_id=developer.id, verdict="candidate",
+        event_seq=11, evidence_metadata={"event_seq": 11, "source_type": "task", "task_id": "task-b"},
+    )
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "failed"
+    assert gate.failure_reason == "Rejected evidence from task"
+
+
+@pytest.mark.asyncio
+async def test_rejected_verification_is_never_superseded(db_session, test_project):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    developer = _agent("developer", "developer", ["implementation"])
+    db_session.add(developer)
+    await db_session.flush()
+    await _add_evidence(
+        db_session, run.id, gate.id, source_type="verification", producer_agent_id=developer.id,
+        verdict="rejected", event_seq=10,
+        evidence_metadata={"event_seq": 10, "source_type": "verification", "task_id": "task-a"},
+    )
+    await _add_evidence(
+        db_session, run.id, gate.id, source_type="task", producer_agent_id=developer.id, verdict="candidate",
+        event_seq=11, evidence_metadata={"event_seq": 11, "source_type": "task", "task_id": "task-a"},
+    )
+
+    await service.validate_open_gates(db_session, run.id)
+
+    assert gate.status == "failed"
+    assert gate.failure_reason == "Rejected evidence from verification"
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gate_reopens_and_accepts_after_successful_retry(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "r1")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task, status="failed")
+    await service.tick(db_session, run.id)
+    assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from task"
+
+    task.status = "in_progress"  # recovery retry reuses the task
+    await _finish(db_session, test_project.id, task)
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "accepted" and gate.failure_reason is None and gate.failed_at is None
+    count, accepted_at = len(await _evidence_rows(db_session, gate.id)), gate.accepted_at
+    await service.tick(db_session, run.id)
+    assert len(await _evidence_rows(db_session, gate.id)) == count
+    assert gate.status == "accepted" and gate.accepted_at == accepted_at
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gate_failed_without_retry_stays_failed(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "r2")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task, status="failed")
+    await service.tick(db_session, run.id)
+    failed_at = gate.failed_at
+
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "failed" and gate.failed_at == failed_at
+
+
+@pytest.mark.asyncio
+async def test_adhoc_gate_not_reopened_when_task_cancelled(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "r3")
+    gate = await _adhoc_gate(db_session, task)
+    await _finish(db_session, test_project.id, task, status="failed")
+    await service.tick(db_session, run.id)
+    task.status = "in_progress"
+    await _finish(db_session, test_project.id, task, status="cancelled")
+
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_gate_failed_for_review_rejection_not_reopened_by_task_done(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "r4")
+    gate = await _adhoc_gate(db_session, task)
+    service._fail_gate(gate, "Rejected evidence from verification")
+    await db_session.flush()
+    await _finish(db_session, test_project.id, task)
+
+    await service.tick(db_session, run.id)
+
+    assert gate.status == "failed"
+    assert gate.failure_reason == "Rejected evidence from verification"
+
+
 @pytest.mark.asyncio
 async def test_adhoc_gates_block_neither_closeout_manifest_nor_unverified_gate_follow_ups(db_session, test_project):
     from huddleroom.services.orchestration_progress_view import OrchestrationProgressView

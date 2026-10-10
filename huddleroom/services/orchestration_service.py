@@ -152,6 +152,10 @@ def plan_kind_for(goal, run=None) -> str:
     return "roadmap" if getattr(goal, "goal_type", None) == "roadmap" else "implementation"
 FINAL_SUMMARY_GATE_KEY = "final_summary"
 FINAL_SUMMARY_GATE_TYPE = "final_summary_accepted"
+ATTEMPT_SOURCE_TYPES = frozenset({"task", "session"})
+ATTEMPT_REJECTION_REASONS = frozenset(
+    {"Rejected evidence from task", "Rejected evidence from session"}
+)
 FINAL_SUMMARY_WORK_FUNCTION = "summarization"
 FINAL_SUMMARY_REQUESTED_EVENT_TYPE = "orchestration.final_summary_requested"
 # Run work a plan can never adopt (and need not disposition): coordination, not discovery.
@@ -8086,6 +8090,13 @@ class OrchestrationService:
             verdict="candidate" if status == "done" else "rejected",
             evidence_metadata=metadata,
         )
+        if (
+            created
+            and status == "done"
+            and gate.status == "failed"
+            and gate.failure_reason in ATTEMPT_REJECTION_REASONS
+        ):
+            self._reopen_gate(gate)
         if created and status == "done":
             sessions = list(await db.scalars(select(Session).where(
                 Session.task_id == task.id, Session.status == "completed",
@@ -8146,13 +8157,13 @@ class OrchestrationService:
         if (
             created
             and event.event_type == "session.completed"
-            and gate.gate_type == FINAL_SUMMARY_GATE_TYPE
             and gate.status == "failed"
+            and (
+                gate.gate_type == FINAL_SUMMARY_GATE_TYPE
+                or gate.failure_reason in ATTEMPT_REJECTION_REASONS
+            )
         ):
-            gate.status = "open"
-            gate.failure_reason = None
-            gate.failed_at = None
-            gate.accepted_at = None
+            self._reopen_gate(gate)
 
         # INVARIANT: this keys off task.status == "done" being already committed
         # by the time this event is processed, which relies on every
@@ -9903,7 +9914,10 @@ class OrchestrationService:
             return True
         evidence = await self._evidence_for_gate(db, gate)
         latest_evidence = self._latest_evidence_by_source(evidence)
-        rejected = next((item for item in latest_evidence if item.verdict == "rejected"), None)
+        rejected = next(
+            (item for item in latest_evidence if item.verdict == "rejected" and not self._superseded_attempt(item, evidence)),
+            None,
+        )
         if rejected is not None:
             self._fail_gate(gate, f"Rejected evidence from {rejected.source_type}")
             return True
@@ -10094,6 +10108,27 @@ class OrchestrationService:
             latest_by_source[(item.source_type, item.source_id)] = item
         return sorted(latest_by_source.values(), key=self._evidence_order_key)
 
+    def _superseded_attempt(
+        self, item: OrchestrationEvidence, evidence: list[OrchestrationEvidence]
+    ) -> bool:
+        """Rejected attempt evidence is superseded by a later successful attempt of the same task
+        (recovery retry/reassign/resume; ruling T8-I2). Rows are never rewritten (R10/R15 verdicts
+        stay as recorded)."""
+        if item.verdict != "rejected" or item.source_type not in ATTEMPT_SOURCE_TYPES:
+            return False
+        task_id = self._json_object_or_empty(item.evidence_metadata).get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return False
+        key = self._evidence_order_key(item)
+        return any(
+            o is not item
+            and o.source_type in ATTEMPT_SOURCE_TYPES
+            and o.verdict in {"candidate", "accepted"}
+            and self._json_object_or_empty(o.evidence_metadata).get("task_id") == task_id
+            and self._evidence_order_key(o) > key
+            for o in evidence
+        )
+
     def _evidence_order_key(self, evidence: OrchestrationEvidence) -> tuple[bool, int, datetime, str]:
         seq = self._evidence_event_seq(evidence)
         return (seq is None, seq or 0, evidence.created_at, str(evidence.id))
@@ -10215,6 +10250,13 @@ class OrchestrationService:
         for item in evidence:
             if item.verdict == "candidate":
                 item.verdict = "accepted"
+
+    @staticmethod
+    def _reopen_gate(gate: OrchestrationGate) -> None:
+        gate.status = "open"
+        gate.failure_reason = None
+        gate.failed_at = None
+        gate.accepted_at = None
 
     @staticmethod
     def _fail_gate(gate: OrchestrationGate, reason: str) -> None:

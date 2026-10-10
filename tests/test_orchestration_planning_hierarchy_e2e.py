@@ -5,8 +5,7 @@ Scenario 1: Auto root Roadmap P (stubbed classifier) -> nested Roadmap C (parent
 attempt fails and is retried before the plan adopts both audits and joins them in a synthesis item; C replans
 safely (v2) while a probe task runs, preserving g1's accepted evidence; g2 releases from v2; C then P close
 only through independent integration. Scenario 2: explicit types are never classified, and an Auto root
-corrected after Start needs its own baseline and fresh Start. Scenario 3 (xfail): a failed predecessor
-attempt on a released plan item latches its gate failed even after a successful retry.
+corrected after Start needs its own baseline and fresh Start. Scenario 3: a failed predecessor attempt is retried; its gate reopens on the successful attempt and the dependent releases.
 
 Shortcuts (documented): LLM decisions are scripted per run through the real dispatcher; agent sessions are
 finished by writing the terminal Session row + events the adapters would write (the local runner hand-off
@@ -665,13 +664,6 @@ async def test_explicit_type_is_preserved_and_corrected_auto_root_needs_fresh_st
 
 # --- scenario 3: one failed predecessor attempt, retried, then its dependent releases --------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Task 18 tester: a failed attempt records 'rejected' task evidence and _validate_gate fails the plan-item "
-    "gate permanently ('Rejected evidence from task'); the recovery retry succeeds but the gate is never "
-    "reopened (only final_summary gates reopen), so independent verification cannot accept it, the dependent "
-    "item never releases, and supervision reports closeout_ready. Contradicts ruling T8-I2 (failed predecessor "
-    "with recovery retry remains a wait). Same latch fails ad-hoc discovery/readiness gates."
-))
 async def test_failed_predecessor_attempt_retries_then_its_accepted_gate_releases_the_dependent(
     db_session, test_project, monkeypatch, external_calls, safe_effectiveness_review_continue,
 ):
@@ -702,10 +694,11 @@ async def test_failed_predecessor_attempt_retries_then_its_accepted_gate_release
     assert released("second") == []  # a failed predecessor is a wait, never a release
     await _finish(db, project, run, first, _report("first delivered on retry"))
     await service.tick(db, run.id)
-    await _verify(db, project, service, run, await _item_gate(db, run, "first"), verifier)  # xfail: gate stays failed
+    await _verify(db, project, service, run, await _item_gate(db, run, "first"), verifier)
     for _ in range(3):
         await service.tick(db, run.id)
     tasks = await _tasks_for_run(db, run.id)
+    assert (await _item_gate(db, run, "first")).status == "accepted"
     assert len(released("second")) == 1
     assert external_calls == []
 
