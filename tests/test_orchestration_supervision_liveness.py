@@ -852,3 +852,34 @@ async def test_only_non_adhoc_open_gates_block_closeout_readiness(db_session, te
     result = await service.supervision.reconcile_local(db_session, goal, run)
 
     assert result["outcome"] == outcome
+
+
+async def test_reconcile_local_capacity_wait_is_typed_wait_without_provider_call(db_session, test_project, monkeypatch):
+    from tests.test_orchestration_runtime_e2e import _agent
+    from huddleroom.models.orchestration import OrchestrationDecision
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted", "version": 1}
+    agent = _agent("capacity", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    for status in ("ready", "ready", "backlog"):
+        task = Task(project_id=test_project.id, title="t", status=status, assigned_to=agent.id,
+                    metadata_={"orchestration": {"run_id": str(run.id)}})
+        db_session.add(task)
+        await db_session.flush()
+    await db_session.flush()
+    blockers_before = list(run.active_blockers or [])
+    service = OrchestrationService()
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("provider decision must not be requested")
+
+    monkeypatch.setattr(service, "request_llm_decision", forbidden)
+
+    result = await service.tick(db_session, run.id, local_only=True)
+
+    assert result["local_liveness"] == {"outcome": "waiting", "reason": "capacity_wait", "root_goal_id": str(goal.id)}
+    await db_session.refresh(run)
+    assert run.supervision_state["needs_judgment"] is False
+    assert list(run.active_blockers or []) == blockers_before
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationDecision)) == 0
