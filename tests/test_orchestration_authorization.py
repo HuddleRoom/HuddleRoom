@@ -805,3 +805,33 @@ async def test_corrupt_lineage_is_an_authorization_denial_not_a_tick_crash(db_se
     assert task.metadata_["orchestration"]["authorization_wait"] == {
         "reason_code": "lineage_invalid", "required_decision": "ask_human", "authority_source": "root_start",
     }
+
+
+# --- 15f: fingerprint covers only the human-authored contract ---
+
+@pytest.mark.asyncio
+async def test_manager_selection_rewrites_do_not_change_contract(db_session, test_project):
+    from tests.test_orchestration_runtime_e2e import _agent
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    goal, run = await _started_root(db_session, test_project)
+    agent = _agent("manager", ["management"])
+    db_session.add(agent)
+    await db_session.flush()
+    goal.manager_agent_id = agent.id          # what a post-Start manager-selection rerun writes
+    goal.authority_model = "agent_manager"
+    assert (await effective_authorization(db_session, goal, run)).allowed
+
+    goal.success_criteria = [{"id": "c1", "text": "new criterion"}]
+    result = await effective_authorization(db_session, goal, run)
+    assert (result.allowed, result.reason_code) == (False, "contract_changed_since_start")
+
+
+@pytest.mark.asyncio
+async def test_post_start_manager_rewrite_does_not_block_activation(db_session, test_project):
+    svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    goal.manager_user_id = None
+    goal.authority_model = "agent_manager"
+    await db_session.flush()
+    assert not await svc._activation_blocker(db_session, run, task)
+    assert "authorization_wait" not in task.metadata_["orchestration"]

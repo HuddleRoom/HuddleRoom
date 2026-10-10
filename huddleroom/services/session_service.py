@@ -820,6 +820,7 @@ class SessionService:
         await self._validate_budget_adapter(
             db, task, budget_limits, roadmap_context, session.adapter_type,
         )
+        await self._orchestration_authorization(db, task)
         prior_usage = None
         if budget_limits:
             old_config = (session.metadata_ or {}).get("_run_config", {})

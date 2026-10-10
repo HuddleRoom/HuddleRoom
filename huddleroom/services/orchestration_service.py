@@ -3844,11 +3844,13 @@ class OrchestrationService:
                 return action
             task_metadata_before = task.metadata_
             self._set_task_budget_action(task, action.id)
-            from huddleroom.services.session_service import SessionService
+            from huddleroom.services.session_service import SessionClaimAttention, SessionService
             try:
                 source_runner_task_id = session.runner_task_id
                 resumed = await SessionService().resume(db, session.id)
             except HTTPException as exc:
+                if isinstance(exc, SessionClaimAttention):
+                    await SessionService.persist_claim_attention(db, exc)
                 task.metadata_ = task_metadata_before
                 await self._release_recovery_action_budget(db, goal, run, action, "resume_refused")
                 await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))

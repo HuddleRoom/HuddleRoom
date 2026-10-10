@@ -96,9 +96,8 @@ RUN_TERMINAL_REASON_CHECK = (
     + " AND status IN ('completed', 'cancelled'))"
 )
 GOAL_CONTRACT_FINGERPRINT_FIELDS = (
-    "objective", "original_request", "success_criteria", "constraints", "budget",
-    "authority_model", "manager_agent_id", "manager_user_id", "goal_type", "planning_mode",
-)
+    "objective", "original_request", "success_criteria", "constraints", "budget", "goal_type", "planning_mode",
+)  # human-authored contract only; manager selection rewrites manager_*/authority_model after Start
 
 ROADMAP_UNIT_TYPE_VALUES = ("task", "goal")
 ROADMAP_UNIT_TYPE_CHECK = _column_check("unit_type", ROADMAP_UNIT_TYPE_VALUES)

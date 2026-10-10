@@ -2013,3 +2013,24 @@ async def test_task_create_depends_on_rejects_invalid(db_session: AsyncSession, 
         with pytest.raises(HTTPException) as exc_info:
             await svc.create(db_session, test_project.id, data, task_id=task_id)
         assert exc_info.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_resume_refused_when_orchestration_start_is_stale(db_session: AsyncSession, test_project):
+    from huddleroom.services.session_service import SessionClaimAttention, SessionService
+    from tests.test_orchestration_authorization import _started_with_backlog_task
+
+    _, goal, run, task = await _started_with_backlog_task(db_session, test_project)
+    session = Session(
+        project_id=test_project.id, task_id=task.id, agent_id=task.assigned_to, adapter_type="api",
+        status="failed", resumable=True, metadata_={"_run_config": {}},
+    )
+    db_session.add(session)
+    goal.objective = "Changed after Start"
+    await db_session.flush()
+
+    with pytest.raises(SessionClaimAttention) as exc_info:
+        await SessionService().resume(db_session, session.id)
+    assert exc_info.value.blocker["kind"] == "authorization"
+    assert exc_info.value.blocker["reason_code"] == "contract_changed_since_start"
+    assert session.status == "failed" and session.resumable is True
