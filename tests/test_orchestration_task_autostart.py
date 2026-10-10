@@ -4,6 +4,7 @@ from sqlalchemy import select
 
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.models.orchestration import OrchestrationAction
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.orchestration_service import OrchestrationService
 from tests.test_orchestration_runtime_e2e import _agent
@@ -21,6 +22,10 @@ async def _setup(db, project, phase, **task_kwargs):
     db.add(agent)
     await db.flush()
     goal.status, run.status, run.phase = "active", "running", phase
+    if phase == "authorized":
+        db.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution", action_type="authorize_execution", status="completed")); await db.flush()
+    if phase == "baseline":
+        run.baseline_authorized = True
     task = Task(project_id=project.id, title="delegated", status="backlog", assigned_to=agent.id,
                 metadata_={"orchestration": {"run_id": str(run.id)}}, **task_kwargs)
     db.add(task)

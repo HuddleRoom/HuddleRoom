@@ -93,6 +93,9 @@ async def accepted_roadmap(db_session, test_project):
         goal.planning_mode = "roadmap"
         if setup is not None:
             await setup(planner, goal, run)
+        from sqlalchemy import update
+        from huddleroom.models.orchestration import OrchestrationRun, compute_goal_contract_fingerprint
+        await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == run.id).values(goal_contract_fingerprint=compute_goal_contract_fingerprint(goal))); await db_session.refresh(run)
         goal.orchestrator_context = {"team": {"agent_ids": [str(agent_id) for agent_id in await db_session.scalars(
             select(Agent.id).where(Agent.is_active.is_(True))
         )]}}

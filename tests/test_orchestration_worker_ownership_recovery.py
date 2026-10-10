@@ -33,6 +33,7 @@ async def _owned(db, project, agent, *, session_status="running", task_status="i
     db.add(goal); await db.flush()
     run = OrchestrationRun(goal_id=goal.id, status="paused" if goal_status == "paused" else "running", phase="baseline")
     db.add(run); await db.flush()
+    db.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution", action_type="authorize_execution", status="completed")); await db.flush()
     action = OrchestrationAction(run_id=run.id, idempotency_key=f"seed:{uuid.uuid4()}", action_type="retry_task", request={}, status="completed",
         dispatch_contract={"owner": "orchestration_recovery"})
     db.add(action); await db.flush()

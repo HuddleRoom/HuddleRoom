@@ -71,6 +71,9 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, authority_model="hu
     parent.budget = {"caps": budget_caps or {"max_tokens": cap, "max_turns": 10, "max_hours": 10}}
     parent.constraints = {"region": "EU"}
     parent.success_criteria = [{"key": "parent"}]
+    from sqlalchemy import update
+    from huddleroom.models.orchestration import OrchestrationRun, compute_goal_contract_fingerprint
+    await db.execute(update(OrchestrationRun).where(OrchestrationRun.id == run.id).values(goal_contract_fingerprint=compute_goal_contract_fingerprint(parent))); await db.refresh(run)
     project.config = {"workspace_policy": {"mode": "isolated"}}
     hierarchy = await db.scalar(select(OrchestrationProcessRun).where(
         OrchestrationProcessRun.goal_id == parent.id,
@@ -1633,6 +1636,9 @@ async def test_nested_roadmap_own_cli_task_item_claim_keys_on_its_own_lineage(db
     roadmap, parent, child, child_run, agent = await _released_nested_roadmap_with_cli_planner(db_session, test_project)
     service = roadmap.orchestration
     child.budget = {"caps": {"max_tokens": 800, "max_turns": 5, "max_hours": 5}}
+    from sqlalchemy import update
+    from huddleroom.models.orchestration import OrchestrationRun, compute_goal_contract_fingerprint
+    await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == child_run.id).values(goal_contract_fingerprint=compute_goal_contract_fingerprint(child))); await db_session.refresh(child_run)
     items = [{**roadmap_task("own-task"), "agent_id": str(agent.id)}]
     artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
                         created_by_agent=agent.id, metadata_={"plan_items": items})

@@ -902,6 +902,8 @@ VALID_REPORT = {
 async def _adhoc_run(db_session, project_id):
     service, goal, run = await _make_run(db_session, project_id)
     goal.status, run.status, run.phase = "active", "running", "authorized"
+    from huddleroom.models.orchestration import OrchestrationAction
+    db_session.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution", action_type="authorize_execution", status="completed")); await db_session.flush()
     agent = _agent("auditor", "developer", ["investigation"])
     db_session.add(agent)
     await db_session.flush()
