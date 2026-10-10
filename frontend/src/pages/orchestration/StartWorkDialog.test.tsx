@@ -104,7 +104,7 @@ describe('StartWorkDialog', () => {
   it('keeps its controls disabled while starting', async () => {
     const view = await mountWithTestDom(() => renderDialog({ isPending: true }), act)
     try {
-      expect(getButton(view.document.body, 'Working…').getAttribute('disabled')).not.toBeNull()
+      expect(getButton(view.document.body, 'Starting…').getAttribute('disabled')).not.toBeNull()
       expect(getButton(view.document.body, 'Cancel').getAttribute('disabled')).not.toBeNull()
     } finally {
       view.cleanup()
@@ -129,7 +129,8 @@ describe('StartWorkDialog', () => {
       expect(text).toContain('Allowed: github:main')
       expect(text).toContain('Allowed: slack')
       expect(text).toContain('Staged (reviewed before it lands)')
-      expect(text).toContain('no_live_sends, no_external_writes')
+      expect(text).toContain('No live sends, No external writes')
+      expect(text).not.toContain('no_live_sends')
       expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).toBeNull()
     } finally {
       view.cleanup()
@@ -163,7 +164,7 @@ describe('StartWorkDialog', () => {
       authorization: { ...allowed, allowed: false, reason_code: 'budget_exhausted', required_decision: 'increase_budget' },
     }), act)
     try {
-      expect(textOf(view.document.body)).toContain("Start isn't available: the budget is used up. Needed: increase budget.")
+      expect(textOf(view.document.body)).toContain("Start isn't available: the budget is used up. Needed: A budget increase.")
       expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).not.toBeNull()
     } finally {
       view.cleanup()
@@ -177,6 +178,19 @@ describe('StartWorkDialog', () => {
     try {
       expect(textOf(view.document.body)).not.toContain("Start isn't available")
       expect(getButton(view.document.body, 'Start work').getAttribute('disabled')).toBeNull()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('words a re-Start with the reason and a Start again action', async () => {
+    const view = await mountWithTestDom(() => renderDialog({ restartReason: 'the goal changed after you started it' }), act)
+    try {
+      const text = textOf(view.document.body)
+      expect(text).toContain('Start work again?')
+      expect(text).toContain('The goal changed after you started it. Starting again re-authorizes the orchestrator with the limits below.')
+      expect(getButton(view.document.body, 'Start again').getAttribute('disabled')).toBeNull()
+      expect(text).not.toContain('Start work on this goal?')
     } finally {
       view.cleanup()
     }

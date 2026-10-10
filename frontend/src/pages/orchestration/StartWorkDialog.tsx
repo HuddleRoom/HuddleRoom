@@ -6,7 +6,7 @@ import { Callout } from '@/components/common/Callout'
 import { Record } from '@/components/common/Record'
 import { Tag } from '@/components/common/Tag'
 import type { OrchestrationAuthorization, OrchestrationGoal } from '@/lib/types'
-import { authorizationReasonLabel, budgetLeftText, goalTypeLabel, workspaceMutationLabel } from './humanize'
+import { authorizationReasonLabel, budgetLeftText, goalTypeLabel, requiredDecisionLabel, toolConstraintLabel, workspaceMutationLabel } from './humanize'
 
 const CONFLICT_COPY: Record<string, string> = {
   baseline_not_ready: 'Baseline is not ready yet. Finish baseline before starting work.',
@@ -54,7 +54,7 @@ function summary(value: unknown) {
 function allowedList(items: string[]) {
   return items.length === 0
     ? 'Not allowed'
-    : <>Allowed: {items.map((item) => <Tag key={item} className="mr-1 font-mono">{item}</Tag>)}</>
+    : <>Allowed: <span className="flex flex-wrap gap-1">{items.map((item) => <Tag key={item} className="font-mono">{item}</Tag>)}</span></>
 }
 
 // Start itself resolves a "start" decision (first Start or re-Start), so only
@@ -66,7 +66,7 @@ function blockedText(authorization: OrchestrationAuthorization | null, missingRe
   if (!authorization) return 'Authorization details are unavailable. Refresh and try again.'
   if (authorization.allowed || authorization.required_decision === 'start') return null
   const reason = authorization.reason_code ? authorizationReasonLabel(authorization.reason_code) : 'it is not allowed right now'
-  const needed = authorization.required_decision ? ` Needed: ${authorization.required_decision.replace(/_/g, ' ')}.` : ''
+  const needed = authorization.required_decision ? ` Needed: ${requiredDecisionLabel(authorization.required_decision)}.` : ''
   return `Start isn't available: ${reason}.${needed}`
 }
 
@@ -79,52 +79,55 @@ interface StartWorkDialogProps {
   error: unknown
   onOpenChange: (open: boolean) => void
   onConfirm: () => void
+  // Why the goal needs a fresh Start (re-Start); null/undefined for a first Start.
+  restartReason?: string | null
   onCloseAutoFocus?: React.ComponentPropsWithoutRef<typeof RadixDialog.Content>['onCloseAutoFocus']
 }
 
 export function StartWorkDialog({
-  open, goal, authorization, missingRecurringPolicy, isPending, error, onOpenChange, onConfirm, onCloseAutoFocus,
+  open, goal, authorization, missingRecurringPolicy, isPending, error, onOpenChange, onConfirm, restartReason, onCloseAutoFocus,
 }: StartWorkDialogProps) {
   const confirmFocusIntent = useRef(false)
-  const contentRef = useRef<HTMLDivElement>(null)
+  const primaryRef = useRef<HTMLButtonElement>(null)
   const message = error ? conflictText(error) : null
   const blocked = blockedText(authorization, missingRecurringPolicy)
 
   useEffect(() => {
     if (isPending || !message || !confirmFocusIntent.current) return
     confirmFocusIntent.current = false
-    // ponytail: scoped to this dialog's own content via contentRef, so we
-    // focus the primary footer button by DOM position rather than by ref.
-    // Ceiling: relies on the primary button being the last button in the footer.
-    const buttons = contentRef.current?.querySelectorAll('button')
-    const primary = buttons?.[buttons.length - 1] as HTMLButtonElement | undefined
-    primary?.focus()
+    primaryRef.current?.focus()
   }, [isPending, message])
 
   return (
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => { if (!isPending) onOpenChange(nextOpen) }}
-      title="Start work on this goal?"
-      description="The baseline is complete. Starting authorizes the orchestrator to release work for this goal."
+      title={restartReason ? 'Start work again?' : 'Start work on this goal?'}
+      description={restartReason
+        ? `${restartReason.charAt(0).toUpperCase()}${restartReason.slice(1).replace(/\.$/, '')}. Starting again re-authorizes the orchestrator with the limits below.`
+        : 'The baseline is complete. Starting authorizes the orchestrator to release work for this goal.'}
       size="md"
       role="alertdialog"
       onCloseAutoFocus={onCloseAutoFocus}
-      contentRef={contentRef}
       footer={{
-        primaryLabel: isPending ? 'Starting…' : 'Start work',
+        primaryLabel: restartReason ? 'Start again' : 'Start work',
+        pendingLabel: 'Starting…',
+        primaryRef,
         onPrimary: () => { confirmFocusIntent.current = true; onConfirm() },
         isPending,
         primaryDisabled: blocked !== null,
       }}
     >
       {blocked && <Callout variant="warning" className="mb-4">{blocked}</Callout>}
-      <dl className="space-y-2 text-sm">
-        <div><dt className="text-huddleroom-text-muted">Goal type</dt><dd className="text-huddleroom-text-primary">{goalTypeLabel(goal.goal_type)}</dd></div>
-        <div><dt className="text-huddleroom-text-muted">Authority</dt><dd className="break-words text-huddleroom-text-primary">{authority(goal)}</dd></div>
-        <div><dt className="text-huddleroom-text-muted">Scope</dt><dd className="break-words text-huddleroom-text-primary">{scope(goal)}</dd></div>
-        <div><dt className="text-huddleroom-text-muted">Budget</dt><dd className="break-words text-huddleroom-text-primary">{budget(goal)}</dd></div>
-      </dl>
+      <Record
+        keyWidth={120}
+        rows={[
+          { key: 'Goal type', value: goalTypeLabel(goal.goal_type) },
+          { key: 'Authority', value: authority(goal) },
+          { key: 'Scope', value: <span className="break-words">{scope(goal)}</span> },
+          { key: 'Budget', value: <span className="break-words">{budget(goal)}</span> },
+        ]}
+      />
       {authorization && (
         <section className="mt-4" aria-label="What Start allows">
           <h3 className="mb-2 text-xs font-medium text-huddleroom-text-muted">What Start allows</h3>
@@ -135,7 +138,7 @@ export function StartWorkDialog({
               { key: 'External writes', value: allowedList(authorization.external_write_targets) },
               { key: 'Live sends', value: allowedList(authorization.live_send_channels) },
               { key: 'Workspace', value: workspaceMutationLabel(authorization.workspace_mutation) },
-              { key: 'Tool limits', value: authorization.tool_constraints.length ? authorization.tool_constraints.join(', ') : 'None' },
+              { key: 'Tool limits', value: authorization.tool_constraints.length ? authorization.tool_constraints.map(toolConstraintLabel).join(', ') : 'None' },
             ]}
           />
         </section>

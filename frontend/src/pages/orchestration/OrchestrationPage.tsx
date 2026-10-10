@@ -54,7 +54,7 @@ import type {
 import { useUIStore } from '@/stores/ui'
 import { BaselineDashboard, currentProcesses, type BaselineMutationOwner } from './BaselineDashboard'
 import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
-import { authorizationReasonLabel, budgetLeftText, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planningModeLabel, runStatusLabel } from './humanize'
+import { authorizationReasonLabel, budgetLeftText, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planStatusLabel, planningModeLabel, requiredDecisionLabel, runStatusLabel } from './humanize'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
@@ -667,6 +667,11 @@ export function CreateGoalModal({
 const CORRECTABLE_TYPES: OrchestrationGoalType[] = ['outcome', 'roadmap', 'continuous']
 const STALE_CONFLICTS = new Set(['stale_preview', 'stale_run', 'stale_contract'])
 const STALE_PREVIEW_COPY = 'The goal changed since your preview. We refreshed it. Review and apply again.'
+const GOAL_GONE_COPY = 'This goal changed and can no longer be corrected here. Close and reopen the dialog.'
+const BUSY_COPY = 'Another action is in progress. Try again in a moment.'
+
+// The run and contract a preview/apply request is conditioned on.
+type CorrectionExpected = { runId: string; fingerprint: string }
 
 type CorrectionConflict = { conflict?: string; message?: string; preview?: GoalTypeCorrectionPreview }
 
@@ -688,6 +693,7 @@ export function CorrectGoalTypeDialog({
   contractFingerprint,
   acquireMutation,
   releaseMutation,
+  refreshDetail,
   onOpenChange,
   onCloseAutoFocus,
   onApplied,
@@ -700,6 +706,8 @@ export function CorrectGoalTypeDialog({
   contractFingerprint: string
   acquireMutation: (owner: 'correct') => boolean
   releaseMutation: (owner: 'correct') => void
+  // Refetches the goal detail so a stale 409 can re-preview against the current run/contract.
+  refreshDetail: () => Promise<OrchestrationGoalDetail | undefined>
   onOpenChange: (open: boolean) => void
   onCloseAutoFocus?: (event: Event) => void
   onApplied: (detail: OrchestrationGoalDetail) => void
@@ -711,16 +719,27 @@ export function CorrectGoalTypeDialog({
   const [selection, setSelection] = useState<OrchestrationGoalType | null>(null)
   const [rationale, setRationale] = useState('')
   // The inputs a preview was produced for; Apply requires the form to still match.
-  const [preview, setPreview] = useState<{ data: GoalTypeCorrectionPreview; selection: OrchestrationGoalType; rationale: string } | null>(null)
+  const [preview, setPreview] = useState<{ data: GoalTypeCorrectionPreview; selection: OrchestrationGoalType; rationale: string; expected: CorrectionExpected } | null>(null)
   const [phase, setPhase] = useState<'idle' | 'previewing' | 'applying'>('idle')
   const [notice, setNotice] = useState<{ kind: 'stale' | 'error'; text: string } | null>(null)
   const applyButton = useRef<HTMLButtonElement>(null)
+  const previewButton = useRef<HTMLButtonElement>(null)
   const previewHeading = useRef<HTMLHeadingElement>(null)
   const applyFocusIntent = useRef(false)
+  // The fieldset is disabled while previewing, which drops focus to the body; a manual
+  // Preview lands on the result (heading) or, on failure, back on the Preview button.
+  const previewFocusIntent = useRef<'heading' | 'button' | null>(null)
 
   useEffect(() => { if (notice) announceError(notice.text) }, [notice, announceError])
   useEffect(() => {
-    if (phase !== 'idle' || !applyFocusIntent.current) return
+    if (phase !== 'idle') return
+    if (previewFocusIntent.current) {
+      const target = previewFocusIntent.current === 'heading' ? previewHeading.current : previewButton.current
+      previewFocusIntent.current = null
+      target?.focus()
+      return
+    }
+    if (!applyFocusIntent.current) return
     applyFocusIntent.current = false
     // A refreshed preview that now has blockers leaves Apply disabled; land on the preview instead.
     const target = applyButton.current && !applyButton.current.disabled ? applyButton.current : previewHeading.current
@@ -739,6 +758,7 @@ export function CorrectGoalTypeDialog({
     setNotice(null)
     setPhase('idle')
     applyFocusIntent.current = false
+    previewFocusIntent.current = null
   }
 
   function handleOpenChange(next: boolean) {
@@ -747,19 +767,21 @@ export function CorrectGoalTypeDialog({
     onOpenChange(next)
   }
 
-  function runPreview(type: OrchestrationGoalType, text: string) {
-    if (!acquireMutation('correct')) return
+  // Sends a preview request; the caller already holds the 'correct' mutation.
+  function sendPreview(type: OrchestrationGoalType, text: string, expected: CorrectionExpected, manual: boolean) {
     setPhase('previewing')
     previewMutation.mutate(
-      { goalId, requestedGoalType: type, expectedRunId: runId, expectedContractFingerprint: contractFingerprint, rationale: text },
+      { goalId, requestedGoalType: type, expectedRunId: expected.runId, expectedContractFingerprint: expected.fingerprint, rationale: text },
       {
         onSuccess: (data) => {
           releaseMutation('correct')
-          setPreview({ data, selection: type, rationale: text })
+          if (manual) previewFocusIntent.current = 'heading'
+          setPreview({ data, selection: type, rationale: text, expected })
           setPhase('idle')
         },
         onError: (error) => {
           releaseMutation('correct')
+          if (manual) previewFocusIntent.current = 'button'
           setPreview(null)
           setNotice({ kind: 'error', text: correctionErrorText(error) })
           setPhase('idle')
@@ -768,9 +790,42 @@ export function CorrectGoalTypeDialog({
     )
   }
 
+  function runPreview(type: OrchestrationGoalType, text: string) {
+    if (!acquireMutation('correct')) {
+      setNotice({ kind: 'error', text: BUSY_COPY })
+      return
+    }
+    sendPreview(type, text, { runId, fingerprint: contractFingerprint }, true)
+  }
+
+  // Stale 409: refetch the goal and preview against its current run/contract (the props
+  // would still be the stale ones). The 'correct' mutation stays held throughout.
+  async function refreshAndPreview(type: OrchestrationGoalType, text: string) {
+    let fresh: OrchestrationGoalDetail | undefined
+    try {
+      fresh = await refreshDetail()
+    } catch {
+      fresh = undefined
+    }
+    if (fresh?.run && fresh.contract_fingerprint) {
+      sendPreview(type, text, { runId: fresh.run.id, fingerprint: fresh.contract_fingerprint }, false)
+      return
+    }
+    releaseMutation('correct')
+    applyFocusIntent.current = false
+    previewFocusIntent.current = 'button'
+    setPreview(null)
+    setNotice({ kind: 'error', text: GOAL_GONE_COPY })
+    setPhase('idle')
+  }
+
   function runApply() {
-    if (!preview || !canApply || !acquireMutation('correct')) return
-    const { data, selection: type, rationale: text } = preview
+    if (!preview || !canApply) return
+    if (!acquireMutation('correct')) {
+      setNotice({ kind: 'error', text: BUSY_COPY })
+      return
+    }
+    const { data, selection: type, rationale: text, expected } = preview
     setNotice(null)
     setPhase('applying')
     applyFocusIntent.current = true
@@ -778,8 +833,8 @@ export function CorrectGoalTypeDialog({
       {
         goalId,
         requestedGoalType: type,
-        expectedRunId: runId,
-        expectedContractFingerprint: contractFingerprint,
+        expectedRunId: expected.runId,
+        expectedContractFingerprint: expected.fingerprint,
         rationale: text,
         previewFingerprint: data.preview_fingerprint,
       },
@@ -790,17 +845,17 @@ export function CorrectGoalTypeDialog({
           onApplied(detail)
         },
         onError: (error) => {
-          releaseMutation('correct')
           const conflict = correctionConflict(error)
           if (conflict?.conflict && STALE_CONFLICTS.has(conflict.conflict)) {
             // Refresh in place: same selection and rationale, never reset the form.
             setNotice({ kind: 'stale', text: STALE_PREVIEW_COPY })
-            setPhase('idle')
-            runPreview(type, text)
+            setPhase('previewing')
+            void refreshAndPreview(type, text)
             return
           }
+          releaseMutation('correct')
           if (conflict?.conflict === 'correction_blocked' && conflict.preview) {
-            setPreview({ data: conflict.preview, selection: type, rationale: text })
+            setPreview({ data: conflict.preview, selection: type, rationale: text, expected })
           }
           setNotice({ kind: 'error', text: correctionErrorText(error) })
           setPhase('idle')
@@ -817,13 +872,21 @@ export function CorrectGoalTypeDialog({
       description="Preview what changes before applying. Nothing changes until you apply."
       size="md"
       onCloseAutoFocus={onCloseAutoFocus}
+      footer={{
+        primaryLabel: 'Apply correction',
+        pendingLabel: 'Applying…',
+        isPending: phase === 'applying',
+        primaryDisabled: !canApply,
+        onPrimary: runApply,
+        primaryRef: applyButton,
+      }}
     >
       <div className="flex flex-col gap-3">
-        <fieldset disabled={busy} className="min-w-0">
+        <fieldset disabled={busy} className="flex min-w-0 flex-col gap-3">
           <legend className="mb-2 text-sm font-medium text-huddleroom-text-primary">New type</legend>
           <div className="flex flex-wrap gap-4">
             {CORRECTABLE_TYPES.map((type) => (
-              <label key={type} className="flex min-h-11 items-center gap-2 text-sm text-huddleroom-text-primary">
+              <label key={type} className={`flex min-h-11 items-center gap-2 text-sm ${type === currentType ? 'text-huddleroom-text-muted' : 'text-huddleroom-text-primary'}`}>
                 <input
                   type="radio"
                   name="corrected-goal-type"
@@ -844,9 +907,10 @@ export function CorrectGoalTypeDialog({
             required
           />
           <Button
+            ref={previewButton}
             type="button"
             variant="secondary"
-            className="min-h-11"
+            className="min-h-11 self-start"
             disabled={!selection || !trimmedRationale}
             onClick={() => {
               setNotice(null)
@@ -867,7 +931,7 @@ export function CorrectGoalTypeDialog({
                   { key: 'Type', value: `${goalTypeLabel(preview.data.current_goal_type)} → ${goalTypeLabel(preview.data.proposed_goal_type)}` },
                   { key: 'Planning', value: `${planningModeLabel(preview.data.current_planning_mode)} → ${planningModeLabel(preview.data.proposed_planning_mode)}` },
                   { key: 'Needs a new Start', value: preview.data.requires_new_start ? 'Yes' : 'No' },
-                  { key: 'Needs approval from', value: preview.data.required_authority.map(correctionAuthorityLabel).join(', ') },
+                  { key: 'Also requires', value: preview.data.required_authority.map(correctionAuthorityLabel).join(', ') || 'Nothing extra' },
                   { key: 'Budget left', value: budgetLeftText(preview.data.remaining_budget) },
                 ]}
               />
@@ -895,7 +959,7 @@ export function CorrectGoalTypeDialog({
                       <li key={`${item.source_gate_id}-${item.artifact_id ?? item.source_task_id}`} className="flex flex-col gap-1">
                         <span className="flex flex-wrap items-center gap-2">
                           <Tag>{item.revalidation_required ? 'Needs revalidation' : 'Kept, checked again by the new gate'}</Tag>
-                          {item.artifact_id ? <Tag className="font-mono">{item.artifact_id}</Tag> : null}
+                          {item.artifact_id ? <Tag className="font-mono"><span title={item.artifact_id}>{item.artifact_id.slice(0, 8)}</span></Tag> : null}
                         </span>
                         <span className="text-sm text-huddleroom-text-secondary">{item.reason}</span>
                       </li>
@@ -911,15 +975,6 @@ export function CorrectGoalTypeDialog({
         {notice?.kind === 'stale' ? <Callout variant="warning">{notice.text}</Callout> : null}
         {notice?.kind === 'error' ? <p className="text-xs text-huddleroom-status-red">{notice.text}</p> : null}
         {inputsChanged ? <p className="text-xs text-huddleroom-text-muted">Inputs changed. Preview again before applying.</p> : null}
-
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button type="button" variant="secondary" className="min-h-11" disabled={busy} onClick={() => handleOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button ref={applyButton} type="button" className="min-h-11" disabled={!canApply} onClick={runApply}>
-            {phase === 'applying' ? 'Applying…' : 'Apply correction'}
-          </Button>
-        </div>
       </div>
     </Dialog>
   )
@@ -1234,6 +1289,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
       ? effectiveAuth
       : detail.authorization_wait)
     : null
+  const planStatus = String(run?.plan_state.status ?? 'pending')
   const pausedReason = pausedOn?.reason_code ? authorizationReasonLabel(pausedOn.reason_code) : null
   const needsRestart = pausedOn?.required_decision === 'start' && startable
   const canStart = (run?.phase === 'ready' && startable) || needsRestart
@@ -1460,15 +1516,12 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                 <span className="text-xs text-huddleroom-text-secondary">{goalTypeSourceLabel(goal.goal_type_source)}</span>
               ) : null}
             </div>
-            {goal.planning_mode ? (
-              <div className="flex flex-col gap-1">
-                <span className="text-huddleroom-text-muted">Planning</span>
-                <span className="text-huddleroom-text-primary">{planningModeLabel(goal.planning_mode)}</span>
-              </div>
-            ) : null}
             <div className="flex flex-col gap-1">
               <span className="text-huddleroom-text-muted">Plan</span>
-              <StatusBadge status={String(run?.plan_state.status ?? 'pending')} label={runStatusLabel(String(run?.plan_state.status ?? 'pending'))} />
+              {goal.planning_mode ? (
+                <span className="text-huddleroom-text-primary">{planningModeLabel(goal.planning_mode)}</span>
+              ) : null}
+              <StatusBadge status={planStatus} label={planStatusLabel(planStatus)} />
             </div>
             <div className="flex flex-col gap-1">
               <span className="text-huddleroom-text-muted">Gates</span>
@@ -1495,7 +1548,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           ) : null}
           {goal.planning_rationale ? (
             <details className="mt-2 text-sm text-huddleroom-text-secondary">
-              <summary className="cursor-pointer">Why this plan depth</summary>
+              <summary className="flex min-h-11 cursor-pointer items-center">▸ Why this plan depth</summary>
               <p className="mt-1">{goal.planning_rationale}</p>
             </details>
           ) : null}
@@ -1509,7 +1562,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
             <Callout variant="warning" className="mt-2">
               {pausedOn.required_decision === 'start'
                 ? `Work is paused until you start again: ${pausedReason}.`
-                : `Work is paused: ${pausedReason}. Needed: ${pausedOn.required_decision.replace(/_/g, ' ')}.`}
+                : `Work is paused: ${pausedReason}. Needed: ${requiredDecisionLabel(pausedOn.required_decision)}.`}
             </Callout>
           ) : null}
 
@@ -1802,6 +1855,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         goal={goal}
         authorization={effectiveAuth}
         missingRecurringPolicy={missingRecurringPolicy}
+        restartReason={needsRestart ? pausedReason : null}
         isPending={mutationOwner === 'start' || start.isPending}
         error={startError}
         onOpenChange={setStartDialogOpen}
@@ -1836,6 +1890,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           contractFingerprint={detail.contract_fingerprint}
           acquireMutation={acquireMutation}
           releaseMutation={releaseMutation}
+          refreshDetail={async () => (await query.refetch()).data}
           onOpenChange={setCorrectOpen}
           onCloseAutoFocus={(event) => {
             event.preventDefault()

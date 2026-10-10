@@ -125,6 +125,34 @@ describe('Dialog', () => {
     } finally { view.cleanup() }
   })
 
+  it('renders footer.pendingLabel while pending', async () => {
+    const view = await mountWithTestDom(() => (
+      <Dialog
+        open
+        onOpenChange={vi.fn()}
+        title="Form"
+        footer={{ primaryLabel: 'Save', pendingLabel: 'Saving…', onPrimary: vi.fn(), isPending: true }}
+      >
+        <p>Body</p>
+      </Dialog>
+    ), act)
+    try {
+      expect(getButton(view.container, 'Saving…').getAttribute('disabled')).not.toBeNull()
+    } finally { view.cleanup() }
+  })
+
+  it('points footer.primaryRef at the primary button', async () => {
+    const ref = React.createRef<HTMLButtonElement>()
+    const view = await mountWithTestDom(() => (
+      <Dialog open onOpenChange={vi.fn()} title="Form" footer={{ primaryLabel: 'Save', onPrimary: vi.fn(), primaryRef: ref }}>
+        <p>Body</p>
+      </Dialog>
+    ), act)
+    try {
+      expect(ref.current).toBe(getButton(view.container, 'Save'))
+    } finally { view.cleanup() }
+  })
+
   it('blocks onOpenChange(false) while a footer mutation is pending', async () => {
     const onOpenChange = vi.fn()
     const view = await mountWithTestDom(() => (

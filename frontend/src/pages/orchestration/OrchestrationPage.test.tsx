@@ -168,13 +168,17 @@ vi.mock('./BaselineDashboard', () => ({
 }))
 
 vi.mock('./StartWorkDialog', () => ({
-  StartWorkDialog: ({ open, isPending, error, onConfirm }: {
+  StartWorkDialog: ({ open, isPending, error, onConfirm, authorization, restartReason }: {
     open: boolean
     isPending: boolean
     error: Error | null
     onConfirm: () => void
+    authorization?: { model_spend_remaining: Record<string, string>; workspace_mutation: string } | null
+    restartReason?: string | null
   }) => open ? (
     <div data-testid="start-work-dialog">
+      <p data-testid="start-authorization">{authorization ? `${JSON.stringify(authorization.model_spend_remaining)} ${authorization.workspace_mutation}` : 'no authorization'}</p>
+      <p data-testid="start-restart-reason">{restartReason ?? 'first start'}</p>
       {error && <p role="alert">{error.message}</p>}
       <button type="button" disabled={isPending} onClick={onConfirm}>Confirm start</button>
     </div>
@@ -618,13 +622,41 @@ describe('OrchestrationPage', () => {
       expect(html).toContain('Start work')
     })
 
+    it('passes the effective authorization and the restart reason into the Start dialog', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      state.detail = authorized({
+        reason_code: 'contract_changed_since_start', required_decision: 'start',
+        model_spend_remaining: { max_tokens: '7000' }, workspace_mutation: 'staged',
+      })
+      const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+      try {
+        await React.act(async () => getButton(view.container, 'Start work').click())
+        expect(textOf(view.container)).toContain('{"max_tokens":"7000"} staged')
+        expect(textOf(view.container)).toContain('the goal changed after you started it')
+      } finally { view.cleanup() }
+    })
+
+    it('passes no restart reason for a first Start', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      state.detail = richDetail
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+      try {
+        await React.act(async () => getButton(view.container, 'Start work').click())
+        expect(textOf(view.container)).toContain('first start')
+      } finally { view.cleanup() }
+    })
+
     it('falls back to authorization_wait and shows the reason without Start for other decisions', async () => {
       state.activeProjectId = 'project-1'
       state.goalId = 'goal-1'
       const { OrchestrationPage } = await import('./OrchestrationPage')
       state.detail = authorized(null, { task_ids: ['task-1'], reason_code: 'budget_exhausted', required_decision: 'increase_budget' })
       const html = renderToStaticMarkup(<OrchestrationPage />)
-      expect(html).toContain('Work is paused: the budget is used up. Needed: increase budget.')
+      expect(html).toContain('Work is paused: the budget is used up. Needed: A budget increase.')
       expect(html).not.toContain('Start work')
     })
 
@@ -904,7 +936,10 @@ describe('goal header shape provenance', () => {
     expect(html).toContain('Existing goal (set before automatic selection)')
     expect(html).toContain('Delivery plan')
     expect(html).toContain('Why Outcome: One bounded result.')
-    expect(html).toContain('Why this plan depth')
+    expect(html).toContain('▸ Why this plan depth')
+    // Planning mode and plan status share one "Plan" column.
+    expect(html).not.toContain('>Planning<')
+    expect(html).toMatch(/>Plan<\/span><span[^>]*>Delivery plan<\/span>.*Accepted/)
     expect(html).toContain('Small enough for one plan level.')
     expect(html).not.toContain('replaces an earlier run')
     expect(html).not.toContain('{&quot;')
@@ -1009,7 +1044,7 @@ describe('CorrectGoalTypeDialog', () => {
     current_planning_mode: 'delivery', proposed_planning_mode: 'roadmap',
     source: 'user', rationale: 'Too big', blockers: [],
     retained_evidence_manifest: [{
-      source_run_id: 'run-1', source_task_id: 't1', source_gate_id: 'g1', artifact_id: 'artifact-9',
+      source_run_id: 'run-1', source_task_id: 't1', source_gate_id: 'g1', artifact_id: 'a1b2c3d4-9999',
       source_contract_fingerprint: 'fp', revalidation_required: true, reason: 'Readiness proof from the first run',
     }],
     remaining_budget: { tokens: '120000' }, missing_recurring_policy: false,
@@ -1018,14 +1053,17 @@ describe('CorrectGoalTypeDialog', () => {
   })
   const onApplied = vi.fn()
   const onOpenChange = vi.fn()
+  const acquireMutation = vi.fn(() => true)
+  const refreshDetail = vi.fn()
+  const freshDetail = { run: { id: 'run-2' }, contract_fingerprint: 'fp-2' } as unknown as OrchestrationGoalDetail
 
   async function mountDialog() {
     const { CorrectGoalTypeDialog } = await import('./OrchestrationPage')
     return mountWithTestDom(() => (
       <CorrectGoalTypeDialog
         projectId="project-1" open goalId="goal-1" currentType="outcome" runId="run-1"
-        contractFingerprint="contract-fp" acquireMutation={() => true} releaseMutation={() => {}}
-        onOpenChange={onOpenChange} onApplied={onApplied}
+        contractFingerprint="contract-fp" acquireMutation={acquireMutation} releaseMutation={() => {}}
+        refreshDetail={refreshDetail} onOpenChange={onOpenChange} onApplied={onApplied}
       />
     ), React.act)
   }
@@ -1045,6 +1083,10 @@ describe('CorrectGoalTypeDialog', () => {
   beforeEach(() => {
     onApplied.mockReset()
     onOpenChange.mockReset()
+    acquireMutation.mockReset()
+    acquireMutation.mockReturnValue(true)
+    refreshDetail.mockReset()
+    refreshDetail.mockResolvedValue(freshDetail)
     state.previewMutation.mutate.mockImplementation((_input: unknown, opts: { onSuccess: (d: unknown) => void }) => opts.onSuccess(previewFixture()))
   })
 
@@ -1072,7 +1114,7 @@ describe('CorrectGoalTypeDialog', () => {
       const text = textOf(view.container)
       for (const copy of [
         'Outcome → Roadmap', 'Delivery plan → Roadmap plan', 'A new baseline run, Start', 'tokens 120,000',
-        'No blockers.', 'Evidence carried over (1)', 'Needs revalidation', 'artifact-9',
+        'No blockers.', 'Evidence carried over (1)', 'Needs revalidation', 'a1b2c3d4', 'Also requires',
         'Readiness proof from the first run', 'Carried-over evidence is never accepted automatically.',
       ]) expect(text).toContain(copy)
       expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).toBeNull()
@@ -1111,28 +1153,119 @@ describe('CorrectGoalTypeDialog', () => {
     } finally { view.cleanup() }
   })
 
-  it('re-previews on a stale 409 without resetting the form, then focuses Apply', async () => {
+  it('refreshes the goal on a stale 409, re-previews with the fresh run and contract, then focuses Apply', async () => {
     const { ApiError } = await import('@/lib/api-client')
     state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onError: (e: unknown) => void }) =>
-      opts.onError(new ApiError(409, 'HTTP 409', { conflict: 'stale_preview', message: 'out of date' })))
+      opts.onError(new ApiError(409, 'HTTP 409', { conflict: 'stale_contract', message: 'out of date' })))
     state.previewMutation.mutate.mockImplementation((_i: unknown, opts: { onSuccess: (d: unknown) => void }) =>
       opts.onSuccess(previewFixture({ preview_fingerprint: `pf-${state.previewMutation.mutate.mock.calls.length}` })))
     const view = await mountDialog()
     try {
       await fillAndPreview(view)
       await press(view, 'Apply correction')
-      expect(state.applyMutation.mutate.mock.calls[0][0]).toMatchObject({ previewFingerprint: 'pf-1', requestedGoalType: 'roadmap', rationale: 'Too big' })
+      expect(state.applyMutation.mutate.mock.calls[0][0]).toMatchObject({
+        previewFingerprint: 'pf-1', requestedGoalType: 'roadmap', rationale: 'Too big',
+        expectedRunId: 'run-1', expectedContractFingerprint: 'contract-fp',
+      })
+      expect(refreshDetail).toHaveBeenCalledTimes(1)
       expect(state.previewMutation.mutate).toHaveBeenCalledTimes(2)
-      expect(state.previewMutation.mutate.mock.calls[1][0]).toMatchObject({ requestedGoalType: 'roadmap', rationale: 'Too big' })
+      expect(state.previewMutation.mutate.mock.calls[1][0]).toMatchObject({
+        requestedGoalType: 'roadmap', rationale: 'Too big', expectedRunId: 'run-2', expectedContractFingerprint: 'fp-2',
+      })
       expect(radios(view)[1].checked).toBe(true)
       expect(rationale(view).value).toBe('Too big')
       const stale = 'The goal changed since your preview. We refreshed it. Review and apply again.'
       expect(textOf(view.container)).toContain(stale)
       expect(state.announceError).toHaveBeenCalledWith(stale)
       expect(view.activeElement).toBe(getButton(view.container, 'Apply correction'))
-      // The refreshed preview carries the new fingerprint.
+      // The refreshed preview carries the new fingerprint and the refreshed run/contract.
       await press(view, 'Apply correction')
-      expect(state.applyMutation.mutate.mock.calls[1][0]).toMatchObject({ previewFingerprint: 'pf-2' })
+      expect(state.applyMutation.mutate.mock.calls[1][0]).toMatchObject({
+        previewFingerprint: 'pf-2', expectedRunId: 'run-2', expectedContractFingerprint: 'fp-2',
+      })
+    } finally { view.cleanup() }
+  })
+
+  it('explains when the goal can no longer be corrected after a stale 409', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    const expectedCopy = 'This goal changed and can no longer be corrected here. Close and reopen the dialog.'
+    for (const failure of [() => refreshDetail.mockResolvedValue(undefined), () => refreshDetail.mockRejectedValue(new Error('offline'))]) {
+      state.applyMutation.mutate.mockReset()
+      state.previewMutation.mutate.mockClear()
+      state.announceError.mockReset()
+      failure()
+      state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+        opts.onError(new ApiError(409, 'HTTP 409', { conflict: 'stale_run', message: 'out of date' })))
+      const view = await mountDialog()
+      try {
+        await fillAndPreview(view)
+        await press(view, 'Apply correction')
+        expect(state.previewMutation.mutate).toHaveBeenCalledTimes(1)
+        expect(textOf(view.container)).toContain(expectedCopy)
+        expect(state.announceError).toHaveBeenCalledWith(expectedCopy)
+        expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).not.toBeNull()
+      } finally { view.cleanup() }
+    }
+  })
+
+  it('tells the user when another action holds the mutation lock', async () => {
+    acquireMutation.mockReturnValue(false)
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      expect(state.previewMutation.mutate).not.toHaveBeenCalled()
+      expect(textOf(view.container)).toContain('Another action is in progress. Try again in a moment.')
+    } finally { view.cleanup() }
+  })
+
+  it('moves focus to the Preview heading after a manual preview', async () => {
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      expect(view.activeElement?.textContent).toBe('Preview')
+      expect(view.activeElement?.tagName).toBe('H3')
+    } finally { view.cleanup() }
+  })
+
+  it('shows a preview error and returns focus to the Preview button', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    state.previewMutation.mutate.mockImplementation((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+      opts.onError(new ApiError(422, 'HTTP 422', { message: 'Cannot preview this change.' })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      expect(textOf(view.container)).toContain('Cannot preview this change.')
+      expect(view.activeElement).toBe(getButton(view.container, 'Preview change'))
+    } finally { view.cleanup() }
+  })
+
+  it('keeps the blockers from a correction_blocked 409 and disables Apply', async () => {
+    const { ApiError } = await import('@/lib/api-client')
+    const blocked = previewFixture({
+      blockers: [{ code: 'open_work', entity_type: 'task', entity_id: 't1', message: 'A task started meanwhile.', resolution: 'Pause the goal first.' }],
+    })
+    state.applyMutation.mutate.mockImplementationOnce((_i: unknown, opts: { onError: (e: unknown) => void }) =>
+      opts.onError(new ApiError(409, 'HTTP 409', { conflict: 'correction_blocked', message: 'Resolve the blockers first.', preview: blocked })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      await press(view, 'Apply correction')
+      const text = textOf(view.container)
+      expect(text).toContain('Resolve before applying (1)')
+      expect(text).toContain('A task started meanwhile.')
+      expect(text).toContain('Resolve the blockers first.')
+      expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).not.toBeNull()
+      expect(refreshDetail).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it("says 'Nothing extra' when no further authority is required", async () => {
+    state.previewMutation.mutate.mockImplementation((_i: unknown, opts: { onSuccess: (d: unknown) => void }) =>
+      opts.onSuccess(previewFixture({ required_authority: [] })))
+    const view = await mountDialog()
+    try {
+      await fillAndPreview(view)
+      expect(textOf(view.container)).toContain('Nothing extra')
     } finally { view.cleanup() }
   })
 
@@ -1176,6 +1309,15 @@ describe('Correct goal type trigger', () => {
     const view = await mountPage()
     try {
       expect(getButton(view.container, 'Correct goal type')).toBeDefined()
+    } finally { view.cleanup() }
+  })
+
+  it('disables the Correct and Start triggers while another mutation is pending', async () => {
+    state.commandMutation.isPending = true
+    const view = await mountPage()
+    try {
+      expect(getButton(view.container, 'Correct goal type').getAttribute('disabled')).not.toBeNull()
+      expect(getButton(view.container, 'Start work').getAttribute('disabled')).not.toBeNull()
     } finally { view.cleanup() }
   })
 

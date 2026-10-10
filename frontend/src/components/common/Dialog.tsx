@@ -31,6 +31,8 @@ export interface DialogProps<T extends HTMLElement = HTMLElement> {
     primaryVariant?: 'primary' | 'danger'
     isPending?: boolean
     primaryDisabled?: boolean
+    primaryRef?: React.Ref<HTMLButtonElement>
+    pendingLabel?: string
     primaryType?: 'button' | 'submit'
     formId?: string
   }
@@ -156,6 +158,7 @@ export function Dialog<T extends HTMLElement = HTMLElement>({
                 </Button>
               </RadixDialog.Close>
               <Button
+                ref={footer.primaryRef}
                 type={footer.primaryType === 'submit' ? 'submit' : 'button'}
                 form={footer.primaryType === 'submit' ? footer.formId : undefined}
                 variant={footer.primaryVariant ?? 'primary'}
@@ -164,7 +167,7 @@ export function Dialog<T extends HTMLElement = HTMLElement>({
                 disabled={footer.isPending || footer.primaryDisabled}
                 onClick={footer.primaryType === 'submit' ? undefined : footer.onPrimary}
               >
-                {footer.isPending ? 'Working…' : footer.primaryLabel}
+                {footer.isPending ? (footer.pendingLabel ?? 'Working…') : footer.primaryLabel}
               </Button>
             </div>
           )}
