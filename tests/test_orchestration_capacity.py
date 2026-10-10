@@ -586,3 +586,29 @@ async def test_pending_renewal_child_tick_is_noop(db_session, test_project):
     assert await db_session.scalar(
         select(func.count()).select_from(OrchestrationDecision).where(OrchestrationDecision.run_id == run.id)
     ) == 0
+
+
+async def test_activation_blocker_clears_stale_authorization_wait_when_stopped(db_session, test_project):
+    agent = await _agent_row(db_session)
+    _, run = await _root(db_session, test_project)
+    task = await _task(db_session, test_project, run, agent=agent)
+    task.metadata_ = {"orchestration": {"run_id": str(run.id), "authorization_wait": {"reason_code": "start_required"}}}
+    _exhaust_budget(run)
+    blocked = await OrchestrationService()._activation_blocker(db_session, run, task)
+    assert blocked == "budget_exhausted"
+    assert "authorization_wait" not in task.metadata_["orchestration"]
+
+
+async def test_activation_blocker_lineage_error_carries_detail(db_session, test_project, monkeypatch):
+    agent = await _agent_row(db_session)
+    _, run = await _root(db_session, test_project)
+    task = await _task(db_session, test_project, run, agent=agent)
+
+    async def boom(*_args, **_kwargs):
+        raise HTTPException(409, "boom")
+
+    monkeypatch.setattr("huddleroom.services.orchestration_service.effective_authorization", boom)
+    blocked = await OrchestrationService()._activation_blocker(db_session, run, task)
+    assert blocked[0] == "authorization:lineage_invalid"
+    wait = task.metadata_["orchestration"]["authorization_wait"]
+    assert wait["reason_code"] == "lineage_invalid" and wait["detail"] == "boom"

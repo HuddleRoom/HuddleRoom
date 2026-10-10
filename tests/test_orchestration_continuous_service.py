@@ -24,6 +24,7 @@ from huddleroom.models.orchestration_process import OrchestrationProcessRun
 from huddleroom.schemas.orchestration import OrchestrationContinuousPolicy, parse_discovery_batch
 from huddleroom.schemas.session import SessionCreate
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
+from huddleroom.services.orchestration_authority_service import reauthorize_execution_key
 from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionClaimAttention, SessionService
@@ -1964,3 +1965,23 @@ async def test_pause_stops_claims_without_cancelling_existing_child(db_session, 
     assert await continuous.claim_due_cycle(db_session, goal.id, next_due) is None
     assert child.status == "active"
     assert successor.status == "paused"
+
+
+@pytest.mark.parametrize("reauthorized", [False, True])
+async def test_continuous_successor_keeps_authorized_fingerprint(db_session, test_project, reauthorized):
+    goal, run = await started_continuous(db_session, test_project)
+    old = run.goal_contract_fingerprint
+    assert old == compute_goal_contract_fingerprint(goal)
+    goal.objective = "changed objective"
+    new = compute_goal_contract_fingerprint(goal)
+    assert new != old
+    if reauthorized:
+        db_session.add(OrchestrationAction(
+            run_id=run.id, idempotency_key=reauthorize_execution_key(run.id, new),
+            action_type="reauthorize_execution", status="completed",
+        ))
+        await db_session.flush()
+    continuous = OrchestrationContinuousService(OrchestrationService())
+    await continuous._complete_cycle(db_session, goal, run, "no_action", datetime.now(timezone.utc))
+    successor = await db_session.get(OrchestrationRun, uuid.uuid5(uuid.NAMESPACE_URL, f"rally:continuous-successor:{run.id}"))
+    assert successor.goal_contract_fingerprint == (new if reauthorized else old)

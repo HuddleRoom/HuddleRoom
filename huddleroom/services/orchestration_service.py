@@ -9411,6 +9411,10 @@ class OrchestrationService:
         """
         blocked = await self._task_start_blocked(db, run, task)
         if blocked:
+            stale = self._json_object_or_empty(task.metadata_.get("orchestration"))
+            if "authorization_wait" in stale:  # a stop/dependency block supersedes a parked authorization wait
+                task.metadata_ = {**task.metadata_, "orchestration": {
+                    k: v for k, v in stale.items() if k != "authorization_wait"}}
             return blocked
         goal = await db.get(OrchestrationGoal, run.goal_id)
         try:
@@ -9419,11 +9423,12 @@ class OrchestrationService:
                 "reason_code": auth.reason_code, "required_decision": auth.required_decision,
                 "authority_source": auth.authority_source,
             }
-        except HTTPException:
+        except HTTPException as exc:
             # Corrupt roadmap lineage (409) is a denial, not a tick crash.
             wait = {
                 "reason_code": "lineage_invalid", "required_decision": "ask_human",
                 "authority_source": "parent_release" if goal.parent_goal_id else "root_start",
+                "detail": exc.detail,
             }
         meta = self._json_object_or_empty(task.metadata_.get("orchestration"))
         if meta.get("authorization_wait") != wait:

@@ -22,6 +22,7 @@ from huddleroom.models.session import Session
 from huddleroom.models.agent import Agent
 from huddleroom.schemas.orchestration import OrchestrationContinuousPolicy, parse_discovery_batch
 from huddleroom.services.event_bus import emit_event_once
+from huddleroom.services.orchestration_authority_service import reauthorize_execution_key
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService, parent_caps
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, available_slots
@@ -948,13 +949,18 @@ class OrchestrationContinuousService:
             {"goal_id": str(goal.id), "run_id": str(run.id), "cycle_key": run.cycle_key, "outcome": outcome},
             source="orchestrator", dedup_key=f"orchestration.continuous_cycle_completed:{goal.id}:{run.cycle_key}")
         if not state.get("stopped_at"):
+            fp, prev = compute_goal_contract_fingerprint(goal), run.goal_contract_fingerprint
+            action = None if prev in (None, fp) else await self.orchestration._existing_action_for_key(
+                db, run.id, reauthorize_execution_key(run.id, fp))
+            # an unauthorized contract change must not be silently re-authorized by the successor
+            successor_fp = fp if prev in (None, fp) or (action and action.status == "completed") else prev
             successor_id = uuid.uuid5(uuid.NAMESPACE_URL, f"rally:continuous-successor:{run.id}")
             successor = await db.get(OrchestrationRun, successor_id)
             if successor is None:
                 successor = OrchestrationRun(
                     id=successor_id, goal_id=goal.id, phase="waiting_activation",
                     goal_type_snapshot=goal.goal_type, planning_mode_snapshot=goal.planning_mode,
-                    goal_contract_fingerprint=compute_goal_contract_fingerprint(goal),
+                    goal_contract_fingerprint=successor_fp,
                 )
                 db.add(successor)
                 await db.flush()
