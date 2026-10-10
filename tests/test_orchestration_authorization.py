@@ -589,6 +589,31 @@ async def test_effective_authorization_budget_parity_with_outcome_stop(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_effective_authorization_reports_measured_budget_on_start_denials(db_session, test_project):
+    from tests.test_orchestration_goal_shape import _goal_run
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    from decimal import Decimal
+
+    caps = {"max_turns": "7", "max_tokens": "5"}
+    goal, run = await _goal_run(db_session, test_project, goal_type="outcome", budget={"caps": caps})
+    before_start = await effective_authorization(db_session, goal, run)
+    assert before_start.reason_code == "start_required"
+    expected = {key: Decimal(value) for key, value in caps.items()}
+    assert before_start.model_spend_remaining == expected
+
+    await _authorize(db_session, run)
+    goal.objective = "Ship it differently"
+    changed = await effective_authorization(db_session, goal, run)
+    assert changed.reason_code == "contract_changed_since_start"
+    assert changed.model_spend_remaining == expected
+
+    goal.status = "paused"  # run_not_active returns before any measurement
+    inactive = await effective_authorization(db_session, goal, run)
+    assert inactive.reason_code == "run_not_active" and inactive.model_spend_remaining == {}
+
+
+@pytest.mark.asyncio
 async def test_effective_authorization_roadmap_fully_reserved_is_not_denied(db_session, test_project, monkeypatch):
     from huddleroom.services.orchestration_authority_service import effective_authorization
     from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService

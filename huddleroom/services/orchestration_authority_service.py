@@ -616,6 +616,17 @@ async def effective_authorization(
 
     if goal.status not in ("active", "blocked") or run.status not in ("running", "blocked"):
         return result("run_not_active", "resume" if "paused" in (goal.status, run.status) else None)
+    budget = OrchestrationBudgetService()
+    try:
+        if goal.goal_type in ("roadmap", "continuous"):  # the goal is its own budget parent
+            raw = (await budget.remaining(db, goal))["remaining"]
+        else:
+            state_caps = obj(run.budget_state).get("caps")
+            caps = canonical_amounts(state_caps, allowed=ROADMAP_BUDGET_DIMENSIONS) if state_caps else parent_caps(goal)
+            raw = await budget.run_remaining(db, run, caps) if caps else {}
+    except BudgetMeasurementError:
+        raw = {}  # ponytail: parity with the Outcome stop: measurement error is an attention blocker, not a denial
+    remaining = {key: Decimal(value) for key, value in raw.items()}
     if source == "parent_release":
         delta = obj(obj(run.plan_state).get("child_delta_baseline"))
         if delta and delta.get("status") != "accepted":
@@ -644,17 +655,6 @@ async def effective_authorization(
         ):
             return result("contract_changed_since_start", "start")
 
-    budget = OrchestrationBudgetService()
-    try:
-        if goal.goal_type in ("roadmap", "continuous"):  # the goal is its own budget parent
-            raw = (await budget.remaining(db, goal))["remaining"]
-        else:
-            state_caps = obj(run.budget_state).get("caps")
-            caps = canonical_amounts(state_caps, allowed=ROADMAP_BUDGET_DIMENSIONS) if state_caps else parent_caps(goal)
-            raw = await budget.run_remaining(db, run, caps) if caps else {}
-    except BudgetMeasurementError:
-        raw = {}  # ponytail: parity with the Outcome stop: measurement error is an attention blocker, not a denial
-    remaining = {key: Decimal(value) for key, value in raw.items()}
     if svc._budget_is_exhausted(run):  # per-claim headroom is enforced in _orchestration_budget_limits
         return result("budget_exhausted", "increase_budget")
 
