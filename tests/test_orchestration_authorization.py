@@ -2,7 +2,7 @@ import json
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from huddleroom.models.orchestration import (
     GOAL_TYPE_VALUES,
@@ -664,3 +664,63 @@ def test_plan_gate_type_is_a_readiness_gate():
     from huddleroom.services.orchestration_service import PLAN_GATE_TYPE
 
     assert PLAN_GATE_TYPE in READINESS_GATE_TYPES
+
+
+async def _actions(db, run, action_type):
+    return (await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == action_type))).all()
+
+
+@pytest.mark.asyncio
+async def test_restart_records_one_action_per_fingerprint_and_authorizes(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    svc = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await svc.tick(db_session, run.id)
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")
+    frozen = run.goal_contract_fingerprint
+    (start,) = await _actions(db_session, run, "authorize_execution")
+    assert start.request["contract_fingerprint"] == frozen
+    assert (start.request["goal_type"], start.request["planning_mode"]) == (goal.goal_type, goal.planning_mode)
+
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")  # unchanged contract
+    assert await _actions(db_session, run, "reauthorize_execution") == []
+
+    goal.objective = "Changed after Start"
+    assert (await effective_authorization(db_session, goal, run)).reason_code == "contract_changed_since_start"
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:b")
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:c")  # same fingerprint
+    (re1,) = await _actions(db_session, run, "reauthorize_execution")
+    fp1 = compute_goal_contract_fingerprint(goal)
+    assert re1.status == "completed"
+    assert re1.request == {"actor": "human:b", "contract_fingerprint": fp1}
+    assert (await effective_authorization(db_session, goal, run)).allowed
+
+    goal.objective = "Changed again"
+    await svc.start_run(db_session, test_project.id, goal.id, actor="human:b")
+    assert len(await _actions(db_session, run, "reauthorize_execution")) == 2
+    assert len(await _actions(db_session, run, "authorize_execution")) == 1
+    assert run.goal_contract_fingerprint == frozen  # run column is never rewritten
+
+
+@pytest.mark.asyncio
+async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_session, test_project):
+    svc = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await svc.tick(db_session, run.id)
+    run.phase = "authorized"  # legacy Start: authorized without a frozen fingerprint
+    assert run.goal_contract_fingerprint is None
+    await svc.tick(db_session, run.id)
+    await db_session.refresh(run)
+    assert run.goal_contract_fingerprint == compute_goal_contract_fingerprint(goal)
+
+    _, _, _, child, child_run = await _released(db_session, test_project)
+    assert child.parent_goal_id is not None
+    await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == child_run.id).values(
+        phase="authorized", goal_contract_fingerprint=None))  # column validator forbids ORM writes
+    await db_session.refresh(child_run)
+    assert child_run.goal_contract_fingerprint is None
+    await svc.tick(db_session, child_run.id)
+    await db_session.refresh(child_run)
+    assert child_run.goal_contract_fingerprint is None
