@@ -1230,6 +1230,7 @@ class OrchestrationRoadmapService:
         )
 
     async def _advance_once(self, db, goal, run) -> dict:
+        await self.renew_corrected_children(db, goal, run)
         version = await self.current_version(db, goal.id)
         if version is None:
             return await self.orchestration._advance_authorized_execution(db, goal, run)
@@ -1402,6 +1403,47 @@ class OrchestrationRoadmapService:
             raise HTTPException(status_code=409, detail="Roadmap child completion evidence is invalid")
         await self.orchestration._validate_gate(db, gate)
         return evidence
+
+    async def renew_corrected_children(self, db, goal, run) -> int:
+        """Re-release type-corrected children (pending_renewal successor) that still hold an active reservation."""
+        children = list((await db.scalars(select(OrchestrationGoal).join(
+            OrchestrationRoadmapItem, OrchestrationRoadmapItem.child_goal_id == OrchestrationGoal.id,
+        ).join(
+            OrchestrationBudgetReservation, OrchestrationBudgetReservation.roadmap_item_id == OrchestrationRoadmapItem.id,
+        ).where(
+            OrchestrationRoadmapItem.goal_id == goal.id,
+            OrchestrationGoal.parent_goal_id == goal.id,
+            OrchestrationGoal.status.not_in(("completed", "cancelled")),
+            OrchestrationBudgetReservation.status == "active",
+        ).order_by(OrchestrationRoadmapItem.item_key))).all())
+        renewed = 0
+        for child in children:
+            child_run = await self.orchestration.get_run_for_goal(db, child.project_id, child.id)
+            plan_state = self.orchestration._json_object_or_empty(child_run.plan_state) if child_run else {}
+            delta = self.orchestration._json_object_or_empty(plan_state.get("child_delta_baseline"))
+            if delta.get("status") != "pending_renewal":
+                continue
+            child_run.plan_state = {**plan_state, "child_delta_baseline": {
+                **delta, "status": "accepted",
+                "approval_reference": {"kind": "parent_renewal", "parent_run_id": str(run.id)},
+            }}
+            child_run.phase = "authorized"
+            if child_run.goal_contract_fingerprint is None:
+                child_run.goal_contract_fingerprint = compute_goal_contract_fingerprint(child)
+            if await db.get(OrchestrationAction, action_id := uuid.uuid5(
+                uuid.NAMESPACE_URL, f"rally:authorize-child:{child_run.id}",
+            )) is None:
+                db.add(OrchestrationAction(
+                    id=action_id, run_id=child_run.id,
+                    idempotency_key=f"run:{child_run.id}:kind:authorize_execution",
+                    action_type="authorize_execution", status="completed",
+                    request={"action_type": "authorize_execution", "actor": f"roadmap_parent:{goal.id}"},
+                    target_type="run", target_id=child_run.id,
+                ))
+            renewed += 1
+        if renewed:
+            await db.flush()
+        return renewed
 
     async def settle_finished_children(self, db, goal, run):
         rows = list((await db.scalars(select(OrchestrationRoadmapItem).join(

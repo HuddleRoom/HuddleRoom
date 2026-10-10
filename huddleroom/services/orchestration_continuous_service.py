@@ -382,26 +382,30 @@ class OrchestrationContinuousService:
                 raise HTTPException(status_code=409, detail="Continuous work has not started")
             if goal.status in {"completed", "cancelled"}:
                 raise HTTPException(status_code=409, detail=f"Cannot stop goal in status '{goal.status}'")
-            state = self._state(goal)
-            if state.get("stopped_at"):
-                return await self._finish_locked(db, caller_owns_transaction, (goal, run))
-            action = await self.orchestration.reserve_action(
-                db, run.id, f"goal:{goal.id}:kind:stop_continuous", "stop_continuous",
-                {"actor": actor, "reason": reason, "stopped_at": _iso(now),
-                 "pending_candidates": deepcopy(state.get("pending_candidates", []))},
-            )
-            await self._cancel_discovery_work(db, goal, reason="cancelled")
-            state["pending_candidates"] = []
-            goal.continuous_state = state
-            if run.phase == "authorized" and run.cycle_key:
-                await self._complete_stopped_claimed_cycle(db, goal, run, now)
-            else:
-                await self._terminalize_waiting_run(db, goal, run, now)
-            goal.status = "active"
-            if action.status == "reserved":
-                await self.orchestration._mark_action_completed(db, action, target_type="goal", target_id=goal.id)
-            await db.flush()
+            await self._stop_locked(db, goal, run, actor=actor, reason=reason, now=now)
             return await self._finish_locked(db, caller_owns_transaction, (goal, run))
+
+    async def _stop_locked(self, db, goal, run, *, actor: str, reason: str, now: datetime) -> None:
+        """Stop intake under the caller's goal lock: audit pending candidates, cancel discovery, end the run."""
+        state = self._state(goal)
+        if state.get("stopped_at"):
+            return
+        action = await self.orchestration.reserve_action(
+            db, run.id, f"goal:{goal.id}:kind:stop_continuous", "stop_continuous",
+            {"actor": actor, "reason": reason, "stopped_at": _iso(now),
+             "pending_candidates": deepcopy(state.get("pending_candidates", []))},
+        )
+        await self._cancel_discovery_work(db, goal, reason="cancelled")
+        state["pending_candidates"] = []
+        goal.continuous_state = state
+        if run.phase == "authorized" and run.cycle_key:
+            await self._complete_stopped_claimed_cycle(db, goal, run, now)
+        else:
+            await self._terminalize_waiting_run(db, goal, run, now)
+        goal.status = "active"
+        if action.status == "reserved":
+            await self.orchestration._mark_action_completed(db, action, target_type="goal", target_id=goal.id)
+        await db.flush()
 
     async def cancel_children(self, db, goal, *, cancelled_by: str) -> None:
         run = await self.orchestration.get_active_run_for_goal(db, goal.project_id, goal.id)

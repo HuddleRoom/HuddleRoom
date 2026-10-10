@@ -242,3 +242,130 @@ async def test_changed_requirements_create_no_retained_gate(db_session, test_pro
     [entry] = successor.plan_state["retained_evidence_manifest"]
     assert entry["revalidation_required"] is True
     assert await db_session.get(OrchestrationGate, retained_gate_id(successor.id, source.id)) is None
+
+
+# --- Task 14f: Continuous root → finite drain, child correction + parent renewal ---
+
+async def test_continuous_root_correction_waits_for_cases_then_stops_intake(db_session, test_project):
+    from datetime import datetime
+
+    from huddleroom.models.orchestration import OrchestrationBudgetReservation, OrchestrationGoal
+    from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
+    from tests.test_orchestration_continuous_service import started_continuous
+
+    goal, first = await started_continuous(db_session, test_project)
+    svc = OrchestrationService()
+    continuous = OrchestrationContinuousService(svc)
+    due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
+    await continuous.claim_due_cycle(db_session, goal.id, due)
+    await continuous.advance(db_session, goal, first, due)
+    case = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == goal.id))
+    pending = [{"origin_key": "case:queued", "objective": "Queued case"}]
+    goal.continuous_state = {**goal.continuous_state, "pending_candidates": pending}
+    old = await svc.get_run_for_goal(db_session, test_project.id, goal.id)
+    assert old.phase == "waiting_activation"
+
+    request, _ = await _request(db_session, goal, old, requested_goal_type="outcome")
+    with pytest.raises(HTTPException) as exc:
+        await _apply(db_session, goal, request)
+    assert exc.value.detail["conflict"] == "correction_blocked"
+    assert [(b["code"], b["entity_id"]) for b in exc.value.detail["blockers"]] == [("active_child_goal", str(case.id))]
+    assert goal.goal_type == "continuous" and not goal.continuous_state.get("stopped_at")
+
+    case.status = "completed"
+    case_run = await svc.get_run_for_goal(db_session, test_project.id, case.id)
+    case_run.status = case_run.phase = "completed"
+    await db_session.flush()
+    request, _ = await _request(db_session, goal, old, requested_goal_type="outcome")
+    goal, successor = await _apply(db_session, goal, request)
+
+    stop = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == old.id, OrchestrationAction.action_type == "stop_continuous"))
+    assert stop.status == "completed"
+    assert (stop.request["reason"], stop.request["actor"], stop.request["pending_candidates"]) == (
+        "goal type corrected", "human:u1", pending)
+    assert goal.continuous_state["pending_candidates"] == [] and goal.continuous_state["stopped_at"]
+    reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.child_goal_id == case.id))
+    assert reservation.status == "settled"
+    assert (old.status, old.terminal_reason) == ("completed", "reclassified")
+    assert (goal.goal_type, goal.planning_mode, goal.status) == ("outcome", "delivery", "active")
+    assert (successor.supersedes_run_id, successor.phase, successor.goal_type_snapshot) == (old.id, "baseline", "outcome")
+    # Intake stays stopped: no Continuous successor cycle appears for the old run.
+    assert await db_session.get(
+        OrchestrationRun, uuid.uuid5(uuid.NAMESPACE_URL, f"rally:continuous-successor:{old.id}")) is None
+    active = await svc.get_active_run_for_goal(db_session, test_project.id, goal.id)
+    assert active.id == successor.id
+
+
+async def _released_child(db, project):
+    from huddleroom.models.orchestration import OrchestrationGoal
+    from tests.test_orchestration_roadmap_children import release
+
+    roadmap, parent, parent_run, _, row = await release(db, project)
+    child = await db.get(OrchestrationGoal, row.child_goal_id)
+    child_run = await OrchestrationService().get_run_for_goal(db, project.id, child.id)
+    return roadmap, parent, parent_run, child, child_run
+
+
+async def test_child_correction_rejects_continuous_and_parent_explicit(db_session, test_project):
+    _, _, _, child, child_run = await _released_child(db_session, test_project)
+    assert child.goal_type_source == "parent_explicit"
+    for requested, code in (("roadmap", "parent_explicit_requires_parent_plan"),
+                            ("continuous", "continuous_child_requires_continuous_root")):
+        request, _ = await _request(db_session, child, child_run, requested_goal_type=requested)
+        with pytest.raises(HTTPException) as exc:
+            await _apply(db_session, child, request)
+        assert code in {b["code"] for b in exc.value.detail["blockers"]}
+    child.goal_type_source = "parent_auto"
+    request, _ = await _request(db_session, child, child_run, requested_goal_type="continuous")
+    with pytest.raises(HTTPException) as exc:
+        await _apply(db_session, child, request)
+    assert [b["code"] for b in exc.value.detail["blockers"]] == ["continuous_child_requires_continuous_root"]
+    assert (child.goal_type, child_run.status) == ("outcome", "running")
+
+
+async def test_parent_auto_child_waits_for_parent_renewal_then_runs_without_start(
+    db_session, test_project, monkeypatch,
+):
+    from huddleroom.models.orchestration import OrchestrationBudgetReservation
+
+    roadmap, parent, parent_run, child, old = await _released_child(db_session, test_project)
+    child.goal_type_source = "parent_auto"
+    await db_session.flush()
+    request, preview = await _request(db_session, child, old, requested_goal_type="roadmap")
+    assert preview.required_authority == ["parent_release"] and preview.requires_new_start is False
+
+    child, successor = await _apply(db_session, child, request)
+
+    reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.child_goal_id == child.id))
+    assert reservation.status == "active"
+    assert (old.status, old.terminal_reason) == ("cancelled", "reclassified")
+    assert successor.plan_state["child_delta_baseline"]["status"] == "pending_renewal"
+    svc = roadmap.orchestration
+    idle = await svc.tick(db_session, successor.id)
+    assert "authorized_execution" not in idle and successor.phase == "baseline"
+
+    await svc.tick(db_session, parent_run.id)
+    await roadmap.advance(db_session, parent, parent_run)  # idempotent
+
+    assert successor.phase == "authorized"
+    assert successor.plan_state["child_delta_baseline"] == {
+        **successor.plan_state["child_delta_baseline"], "status": "accepted",
+        "approval_reference": {"kind": "parent_renewal", "parent_run_id": str(parent_run.id)},
+    }
+    assert successor.goal_contract_fingerprint == compute_goal_contract_fingerprint(child)
+    [authorize] = (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == successor.id, OrchestrationAction.action_type == "authorize_execution"))).all()
+    assert authorize.id == uuid.uuid5(uuid.NAMESPACE_URL, f"rally:authorize-child:{successor.id}")
+    assert (authorize.status, authorize.request["actor"]) == ("completed", f"roadmap_parent:{parent.id}")
+    assert authorize.idempotency_key == f"run:{successor.id}:kind:authorize_execution"
+    assert reservation.status == "active"
+
+    async def probe(db, goal, run):
+        return {"step": "probe", "run_id": str(run.id)}
+
+    monkeypatch.setattr(svc, "_advance_authorized_execution", probe)
+    ran = await svc.tick(db_session, successor.id)  # no human Start
+    assert ran["authorized_execution"] == {"step": "probe", "run_id": str(successor.id)}

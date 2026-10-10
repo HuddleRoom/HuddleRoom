@@ -292,12 +292,6 @@ class OrchestrationGoalShapeService:
                     "blockers": [blocker.model_dump(mode="json") for blocker in preview.blockers],
                     "preview": preview.model_dump(mode="json"),
                 })
-            if goal.goal_type == "continuous" and _obj(goal.continuous_state).get("started_at"):
-                # TODO(14f): stop intake via the Continuous service before retiring the run; remove this guard.
-                raise HTTPException(status_code=409, detail={
-                    "conflict": "continuous_correction_not_supported",
-                    "message": "Correcting a started Continuous goal is not supported yet.",
-                })
             old = await db.scalar(select(OrchestrationRun).where(
                 OrchestrationRun.id == preview.current_run_id,
             ).execution_options(populate_existing=True))
@@ -327,6 +321,7 @@ class OrchestrationGoalShapeService:
     ) -> OrchestrationRun:
         from huddleroom.services.event_bus import emit_event_once
         from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+        from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
         from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
         from huddleroom.services.task_service import TaskService
 
@@ -362,6 +357,11 @@ class OrchestrationGoalShapeService:
         if goal.goal_type == "roadmap":
             # Finished children only (active ones block the preview); their reservations stop counting.
             await OrchestrationRoadmapService(svc).settle_finished_children(db, goal, old)
+        elif goal.goal_type == "continuous" and _obj(goal.continuous_state).get("started_at"):
+            # After the task loop: stop's discovery cleanup skips the tasks cancelled above (no double cancel).
+            continuous = OrchestrationContinuousService(svc)
+            await continuous._stop_locked(db, goal, old, actor=actor, reason="goal type corrected", now=now)
+            await continuous.settle_terminal_children(db, goal, now)
 
         if old.status in ("running", "blocked", "paused"):
             old.status, old.completed_at = "cancelled", now
