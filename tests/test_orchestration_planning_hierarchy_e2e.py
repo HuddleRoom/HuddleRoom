@@ -1,4 +1,4 @@
-"""Task 18: integrated three-level planning hierarchy, no network.
+"""Integrated three-level planning hierarchy, no network.
 
 Scenario 1: Auto root Roadmap P (stubbed classifier) -> nested Roadmap C (parent_explicit) -> leaf Outcome g1
 (parent_auto). The leaf planner and two independent audits share the root's two slots; audit-1's first

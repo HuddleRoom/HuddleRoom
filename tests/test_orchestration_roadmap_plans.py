@@ -1744,7 +1744,7 @@ async def test_unreleased_child_goal_type_change_needs_a_new_plan_approval(db_se
     assert _roadmap_fingerprint(service, goal, outcome) != _roadmap_fingerprint(service, goal, roadmap)
 
 
-# --- Type-correction successor run scoping (Task 14b) ---------------------------------------------------------
+# --- Type-correction successor run scoping ---
 
 async def _successor_run(db_session, run):
     """Retire run as reclassified and add its successor (apply_correction's shape, built directly)."""

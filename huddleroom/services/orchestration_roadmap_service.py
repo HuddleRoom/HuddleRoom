@@ -1075,7 +1075,7 @@ class OrchestrationRoadmapService:
             if reservation is None:
                 raise HTTPException(status_code=409, detail="Roadmap child reservation is missing")
             return {"step": "release_item", "item_key": item.item_key, "unit_type": "goal"}
-        # ponytail: backstop for cousin races and legacy versions, mirrors child_contract; T13 root lock removes the race
+        # ponytail: backstop for cousin races and legacy versions; mirrors child_contract
         root, depth, limits = await expansion_scope(db, goal)
         existing_descendants = await descendant_count(db, root.id)
         reason = expansion_limit_error(depth, existing_descendants, 1, limits)

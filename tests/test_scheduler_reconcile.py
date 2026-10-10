@@ -295,7 +295,7 @@ async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_pro
     await assert_one_lineage_per_key()
 
 
-# --- Task 14g: goal-type correction successors and Continuous rollover (R14-7: no scheduler change) ---
+# --- goal-type correction successors and Continuous rollover (no scheduler change) ---
 
 @pytest.mark.asyncio
 async def test_sweep_ticks_correction_successor_never_the_reclassified_run(db_session, test_project, monkeypatch):

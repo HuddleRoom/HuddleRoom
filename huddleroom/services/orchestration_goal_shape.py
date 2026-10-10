@@ -143,7 +143,7 @@ class OrchestrationGoalShapeService:
             logger.warning("Goal shape classifier call failed: %s", _safe_completion_error(exc))
             raise GoalShapeResolutionError("provider_error", _safe_completion_error(exc)) from exc
 
-    # --- Typed correction (Task 14) ---
+    # --- Typed correction ---
 
     async def preview_correction(
         self, db, goal: OrchestrationGoal, request: GoalTypeCorrectionPreviewRequest, actor: str,
@@ -175,6 +175,7 @@ class OrchestrationGoalShapeService:
             block("goal_terminal", "goal", goal.id, f"The goal is {goal.status}.", "Create a new goal instead.")
         if requested == goal.goal_type:
             block("same_goal_type", "goal", goal.id, f"The goal is already {requested}.", "Choose a different type.")
+        # Defense in depth: every current caller passes a human: actor; an agent-initiated correction path must not bypass an explicit choice.
         if not actor.startswith("human:") and goal.goal_type_source not in ("auto", "parent_auto"):
             block("explicit_choice_requires_user", "goal", goal.id,
                   f"The goal type was chosen explicitly ({goal.goal_type_source}); only a user may change it.",
@@ -345,7 +346,7 @@ class OrchestrationGoalShapeService:
         for task, _ in cancellable:
             await TaskService().cancel(db, goal.project_id, task.id)
         decisions = OrchestrationAuthorityDecisionService()
-        # Baseline-process decisions are goal-keyed baseline work and survive the correction (R14-1).
+        # Baseline-process decisions are goal-keyed baseline work and survive the correction.
         for decision in (await db.scalars(select(OrchestrationAuthorityDecision).where(
             OrchestrationAuthorityDecision.run_id == old.id, OrchestrationAuthorityDecision.status == "pending",
             OrchestrationAuthorityDecision.source_process_run_id.is_(None),
@@ -434,7 +435,7 @@ class OrchestrationGoalShapeService:
 
     @staticmethod
     def contract_unchanged_since_start(goal: OrchestrationGoal, run: OrchestrationRun) -> bool:
-        """True only when the goal contract differs from the run's Start freeze by type/mode alone (R14-3)."""
+        """True only when the goal contract differs from the run's Start freeze by type/mode alone."""
         if None in (run.goal_contract_fingerprint, run.goal_type_snapshot, run.planning_mode_snapshot):
             return False
         as_started = SimpleNamespace(**{key: getattr(goal, key) for key in GOAL_CONTRACT_FINGERPRINT_FIELDS})

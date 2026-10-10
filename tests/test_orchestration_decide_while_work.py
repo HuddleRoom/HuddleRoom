@@ -301,7 +301,7 @@ async def test_new_follow_up_after_post_action_wait_continues(db_session, test_p
 
 
 
-# --- independent work while planning is in flight (T10b) --------------------------------
+# --- independent work while planning is in flight --------------------------------
 
 from huddleroom.services.orchestration_decision_validator import independent_work_rejection  # noqa: E402
 
@@ -420,7 +420,7 @@ async def test_dispatcher_creates_two_independent_audits(db_session, test_projec
     assert len(tasks) == 2 and all(not t.depends_on for t in tasks)
 
 
-# --- decision opportunity while planning (T10e) -----------------------------------------
+# --- decision opportunity while planning -----------------------------------------
 
 async def _planning_setup(db, project, agent, status="requested", tasks=1):
     goal, run = await _setup(db, project, agent, tasks=tasks, accepted=False)
@@ -474,7 +474,7 @@ async def test_progress_contract_allows_independent_work_while_planning():
 
 
 async def test_repeated_ticks_while_planning_after_noop_wake_when_do_not_ask_again(db_session, test_project, test_agent, monkeypatch):
-    """T10 tester: a noop with wake_when while the plan is in flight bounds the decision count (no repeated LLM calls)."""
+    """A noop with wake_when while the plan is in flight bounds the decision count (no repeated LLM calls)."""
     goal, run = await _planning_setup(db_session, test_project, test_agent)
     await _session_wait(db_session, test_project, run)
     _situation(monkeypatch, progress_view=NO_WORK)

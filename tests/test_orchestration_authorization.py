@@ -341,7 +341,7 @@ async def test_start_continuous_goal_without_policy_conflicts(client, auth_heade
     assert resp.json()["detail"] == {"conflict": "goal_not_runnable", "message": "Continuous policy is required"}
 
 
-# --- Task 15a: effective_authorization + evidence_semantics -------------------------------------
+# --- effective_authorization + evidence_semantics ---
 
 AUTHORIZATION_RESULT_KEYS = {
     "allowed", "reason_code", "required_decision", "authority_source", "run_id", "contract_fingerprint",
@@ -789,7 +789,7 @@ async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_
     assert child_run.goal_contract_fingerprint is None
 
 
-# --- 15b: activation hook (T13 activate_ready is_blocked) ---
+# --- activation hook (activate_ready is_blocked) ---
 
 async def _started_with_backlog_task(db, project):
     from huddleroom.models.task import Task

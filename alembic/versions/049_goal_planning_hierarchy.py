@@ -110,7 +110,9 @@ def downgrade() -> None:
     if lineage is not None:
         raise RuntimeError(
             "049 downgrade refused: successor/recursive lineage exists; "
-            "restore a verified pre-049 snapshot or forward-fix"
+            "restore a verified pre-049 snapshot or forward-fix. Even when this check passes, "
+            "a pre-049 binary misreads adhoc_work_accepted gates, plan_state.planning_version "
+            "and adopted plan items: downgrade only a database that never ran this branch."
         )
     with op.batch_alter_table("orchestration_runs") as batch:
         for name in RUN_CHECKS:

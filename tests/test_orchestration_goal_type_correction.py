@@ -1,4 +1,4 @@
-"""Task 14d: applying a goal-type correction to finite roots, retained gates, and their validation."""
+"""Applying a goal-type correction to finite roots, retained gates, and their validation."""
 import uuid
 
 import pytest
@@ -245,7 +245,7 @@ async def test_changed_requirements_create_no_retained_gate(db_session, test_pro
     assert await db_session.get(OrchestrationGate, retained_gate_id(successor.id, source.id)) is None
 
 
-# --- Task 14f: Continuous root → finite drain, child correction + parent renewal ---
+# --- Continuous root → finite drain, child correction + parent renewal ---
 
 async def test_continuous_root_correction_waits_for_cases_then_stops_intake(db_session, test_project):
     from datetime import datetime
@@ -389,7 +389,7 @@ async def test_apply_stale_run_and_stale_contract_conflicts_write_nothing(db_ses
     assert (goal.goal_type, run.status, run.terminal_reason) == ("outcome", "running", None)
 
 
-# --- Task 14 fix round 1 ---
+# --- Correction edge cases ---
 
 async def test_accepted_retained_gate_does_not_block_final_summary_manifest(db_session, test_project):
     goal, _, successor, _, _, retained = await _corrected_with_retained_gate(db_session, test_project)

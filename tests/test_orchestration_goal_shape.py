@@ -189,7 +189,7 @@ def test_no_response_or_decision_model_accepts_auto_goal_type():
         assert "auto" not in get_args(model.model_fields[field].annotation)
 
 
-# --- Task 4a: shape resolution service (unit, injected completion_fn) ---
+# --- shape resolution service (unit, injected completion_fn) ---
 
 # Unit tests of _classify/resolve_creation_shape must carry real_shape, or the autouse conftest stub replaces _classify.
 real_shape = pytest.mark.real_goal_shape
@@ -396,7 +396,7 @@ async def test_reset_preserves_expansion_policy(client, test_project):
     assert resp.json()["goal"]["orchestrator_context"] == {"expansion_policy": {**_DEFAULT_POLICY, "max_concurrent_tasks": 4}}
 
 
-# --- Task 4 tester additions ---
+# --- shape edge cases ---
 
 @real_shape
 def test_conftest_stub_skipped_for_real_goal_shape_marker():
@@ -471,7 +471,7 @@ def test_planning_contract_excludes_expansion_policy():
     assert contract.orchestrator_context == {"team": {"agent_ids": ["x"]}}
 
 
-# --- Task 14c: correction preview, retained manifest, preview fingerprint ---
+# --- correction preview, retained manifest, preview fingerprint ---
 
 from datetime import datetime, timezone
 import hashlib
