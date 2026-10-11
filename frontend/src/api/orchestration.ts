@@ -314,6 +314,7 @@ export function answerOrchestrationDecision(
   selectedOption: string,
   reason: string,
   editedAgent?: AgentCreatePayload,
+  contractVersion?: string | null,
 ) {
   return apiFetch<OrchestrationDecisionAnswerResult>(
     `${root(projectId)}/${goalId}/decisions/${decisionId}/answer`,
@@ -323,6 +324,7 @@ export function answerOrchestrationDecision(
         selected_option: selectedOption,
         reason: reason.trim() || null,
         ...(editedAgent ? { edited_agent: editedAgent } : {}),
+        ...(contractVersion ? { contract_version: contractVersion } : {}),
       }),
     },
   )
@@ -506,7 +508,9 @@ export function useSubmitProjectAdvisorTurn(projectId: string | null) {
   })
 }
 
-export function useBaselineDashboard(projectId: string | null, goalId: string | undefined) {
+export function useBaselineDashboard(projectId: string | null, goalId: string | undefined, activeMutation = false) {
+  const queryClient = useQueryClient()
+  const interval = () => activeMutation || queryClient.getQueryData<OrchestrationProcessRunRecord[]>([...orchestrationBaselineKey(projectId, goalId), 'processes'])?.some((process) => process.superseded_by_id === null && process.status === 'running') ? 2000 : false
   const enabled = !!projectId && !!goalId
   const [memory, processes, agentReviews, warnings, decisions, checkpoint] = useQueries({
     queries: [
@@ -514,31 +518,37 @@ export function useBaselineDashboard(projectId: string | null, goalId: string | 
         queryKey: [...orchestrationBaselineKey(projectId, goalId), 'memory'],
         queryFn: () => fetchOrchestrationMemoryOverview(projectId!, goalId!),
         enabled,
+        refetchInterval: interval,
       },
       {
         queryKey: [...orchestrationBaselineKey(projectId, goalId), 'processes'],
         queryFn: () => fetchOrchestrationProcesses(projectId!, goalId!),
         enabled,
+        refetchInterval: (query: { state: { data: OrchestrationProcessRunRecord[] | undefined } }) => activeMutation || query.state.data?.some((process) => process.superseded_by_id === null && process.status === 'running') ? 2000 : false,
       },
       {
         queryKey: [...orchestrationBaselineKey(projectId, goalId), 'agent-reviews'],
         queryFn: () => fetchOrchestrationAgentReviews(projectId!, goalId!),
         enabled,
+        refetchInterval: interval,
       },
       {
         queryKey: [...orchestrationBaselineKey(projectId, goalId), 'warnings'],
         queryFn: () => fetchOrchestrationWarnings(projectId!, goalId!),
         enabled,
+        refetchInterval: interval,
       },
       {
         queryKey: [...orchestrationBaselineKey(projectId, goalId), 'decisions'],
         queryFn: () => fetchOrchestrationDecisions(projectId!, goalId!),
         enabled,
+        refetchInterval: interval,
       },
       {
         queryKey: [...orchestrationBaselineKey(projectId, goalId), 'checkpoint'],
         queryFn: () => fetchOrchestrationCheckpoint(projectId!, goalId!),
         enabled,
+        refetchInterval: interval,
       },
     ],
   })
@@ -566,13 +576,15 @@ export function useOrchestrationMemorySection(
 }
 
 async function invalidateGoalAndBaseline(queryClient: QueryClient, projectId: string | null, goalId: string) {
-  await queryClient.invalidateQueries({
-    queryKey: ['orchestration-goal', projectId, goalId],
-    exact: true,
-  })
-  await queryClient.invalidateQueries({
-    queryKey: orchestrationBaselineKey(projectId, goalId),
-  })
+  await Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: ['orchestration-goal', projectId, goalId],
+      exact: true,
+    }),
+    queryClient.invalidateQueries({
+      queryKey: orchestrationBaselineKey(projectId, goalId),
+    }),
+  ])
 }
 
 function syncAnsweredDecisionCache(
@@ -639,14 +651,15 @@ export function useResolveOrchestrationWarning(projectId: string | null) {
 export function useAnswerOrchestrationDecision(projectId: string | null) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ goalId, decisionId, selectedOption, reason, editedAgent }: {
+    mutationFn: ({ goalId, decisionId, selectedOption, reason, editedAgent, contractVersion }: {
       goalId: string
       decisionId: string
       selectedOption: string
       reason: string
       editedAgent?: AgentCreatePayload
+      contractVersion?: string | null
     }) => answerOrchestrationDecision(
-      projectId!, goalId, decisionId, selectedOption, reason, editedAgent,
+      projectId!, goalId, decisionId, selectedOption, reason, editedAgent, contractVersion,
     ),
     onSuccess: (data, { goalId }) => {
       syncAnsweredDecisionCache(queryClient, projectId, goalId, data)
@@ -684,7 +697,8 @@ export function useRunOrchestrationBaselineStep(projectId: string | null) {
       goalId: string
       processType: OrchestrationBaselineProcessType
     }) => runOrchestrationBaselineStep(projectId!, goalId, processType),
-    onSuccess: (_data, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
+    onMutate: ({ goalId }) => { void invalidateGoalAndBaseline(queryClient, projectId, goalId) },
+    onSettled: (_data, _error, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
   })
 }
 
@@ -695,7 +709,8 @@ export function useRerunOrchestrationBaselineStep(projectId: string | null) {
       goalId: string
       processType: OrchestrationBaselineProcessType
     }) => rerunOrchestrationBaselineStep(projectId!, goalId, processType),
-    onSuccess: (_data, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
+    onMutate: ({ goalId }) => { void invalidateGoalAndBaseline(queryClient, projectId, goalId) },
+    onSettled: (_data, _error, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
   })
 }
 
@@ -703,7 +718,8 @@ export function useAuthorizeOrchestrationBaseline(projectId: string | null) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ goalId }: { goalId: string }) => authorizeOrchestrationBaseline(projectId!, goalId),
-    onSuccess: (_data, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
+    onMutate: ({ goalId }) => { void invalidateGoalAndBaseline(queryClient, projectId, goalId) },
+    onSettled: (_data, _error, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
   })
 }
 
@@ -714,7 +730,8 @@ export function useRetryOrchestrationBaselineStep(projectId: string | null) {
       goalId: string
       processType: OrchestrationBaselineProcessType
     }) => retryOrchestrationBaselineStep(projectId!, goalId, processType),
-    onSuccess: (_data, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
+    onMutate: ({ goalId }) => { void invalidateGoalAndBaseline(queryClient, projectId, goalId) },
+    onSettled: (_data, _error, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
   })
 }
 

@@ -903,6 +903,8 @@ export interface OrchestrationAuthorityDecisionRecord {
   goal_id: string
   run_id: string | null
   decision_key: string
+  runtime_identity?: string | null
+  contract_version?: string | null
   title: string
   status: OrchestrationAuthorityDecisionStatus
   authority: OrchestrationAuthority

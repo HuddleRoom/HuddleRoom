@@ -109,11 +109,12 @@ export interface ProcessChainProps {
   // Optional so callers/tests that don't exercise the gate keep working.
   run?: OrchestrationRun | null
   onAuthorize?: (trigger: HTMLButtonElement | null) => void
+  chainPending?: boolean
   authorizePending?: boolean
   authorizeError?: string | null
 }
 
-export function ProcessChain({ processes, processState, selectedProcessType, onSelect, goal, checkpointItems = [], run, onAuthorize, authorizePending = false, authorizeError = null }: ProcessChainProps) {
+export function ProcessChain({ processes, processState, selectedProcessType, onSelect, goal, checkpointItems = [], run, onAuthorize, chainPending = false, authorizePending = false, authorizeError = null }: ProcessChainProps) {
   const [focusedType, setFocusedType] = useState(selectedProcessType)
   const selectButtonRefs = useRef<Partial<Record<OrchestrationBaselineProcessType, HTMLButtonElement | null>>>({})
   const authorizeButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -160,13 +161,15 @@ export function ProcessChain({ processes, processState, selectedProcessType, onS
             type="button"
             size="sm"
             className="min-h-11"
-            disabled={authorizePending}
+            disabled={authorizePending || chainPending || goal?.status === 'paused'}
+            aria-describedby={goal?.status === 'paused' ? 'baseline-paused-hint' : undefined}
             onClick={() => onAuthorize?.(authorizeButtonRef.current)}
           >
             {authorizePending ? 'Starting…' : authorizeLabel}
           </Button>
         )}
       </div>
+      {showAuthorize && goal?.status === 'paused' && <p id="baseline-paused-hint" className="mt-1 text-sm text-huddleroom-text-secondary">Resume the goal to start the baseline</p>}
       {showAuthorize && authorizeError && <p className="mt-1 text-xs text-huddleroom-status-red">{authorizeError}</p>}
       {processState === 'loading' ? (
         <div aria-busy="true" aria-label="Loading orchestrator steps" className="mt-3 flex gap-2 overflow-x-auto">

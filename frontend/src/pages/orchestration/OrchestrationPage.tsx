@@ -1181,6 +1181,23 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
   const [overrideError, setOverrideError] = useState<string | null>(null)
   const [mutationOwner, setMutationOwner] = useState<MutationOwner | null>(null)
   const mutationOwnerRef = useRef<MutationOwner | null>(null)
+  const mutationGeneration = useRef(0)
+  const observedRunId = useRef(query.data?.run?.id ?? null)
+  useEffect(() => {
+    const runId = query.data?.run?.id ?? null
+    if (query.data === undefined || observedRunId.current === runId) return
+    observedRunId.current = runId
+    // A replaced run unmounts its dashboard, so per-call mutation callbacks
+    // may never settle. Fence and release that run's baseline owner here.
+    // Reset itself retains ownership until its own request settles.
+    if (mutationOwnerRef.current?.startsWith('baseline:')) {
+      mutationGeneration.current++
+      mutationOwnerRef.current = null
+      setMutationOwner(null)
+    }
+  }, [query.data, query.data?.run?.id])
+  const getMutationGeneration = () => mutationGeneration.current
+  const resetInterrupts = (owner: MutationOwner | null) => owner !== null && /^baseline:(run|rerun|retry|authorize):/.test(owner)
   const cancelButton = useRef<HTMLButtonElement>(null)
   const startButton = useRef<HTMLButtonElement>(null)
   const correctButton = useRef<HTMLButtonElement>(null)
@@ -1330,7 +1347,8 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
     : null
 
   function acquireMutation(owner: MutationOwner) {
-    if (mutationOwnerRef.current !== null) return false
+    if (mutationOwnerRef.current !== null && !(owner === 'reset' && resetInterrupts(mutationOwnerRef.current))) return false
+    mutationGeneration.current++
     mutationOwnerRef.current = owner
     setMutationOwner(owner)
     return true
@@ -1476,9 +1494,9 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
       {!terminal && (
         <DangerZoneSection
           resetButton={resetButton}
-          globalBusy={globalBusy}
+          globalBusy={globalBusy && !resetInterrupts(mutationOwner)}
           onReset={() => {
-            if (mutationOwnerRef.current !== null) return
+            if (mutationOwnerRef.current !== null && !resetInterrupts(mutationOwnerRef.current)) return
             setResetError(null)
             setResetOpen(true)
           }}
@@ -1686,6 +1704,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
       )}
 
       <BaselineDashboard
+        key={`${goalId}:${run?.id ?? "none"}`}
         projectId={projectId}
         goalId={goalId}
         goal={goal}
@@ -1694,6 +1713,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         mutationBusy={baselineBusy}
         acquireMutation={acquireMutation}
         releaseMutation={releaseMutation}
+        getMutationGeneration={getMutationGeneration}
         onMessage={(msg) => { setMessage(msg); setLastMessageOwner(null) }}
         onSelectedProcessTypeChange={setActivityStepType}
         onViewActivity={() => detailsTabsRef.current?.showStepActivity()}
@@ -1921,7 +1941,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         open={resetOpen}
         onOpenChange={setResetOpen}
         title="Reset this goal?"
-        consequence="This permanently deletes all decisions, assumptions, warnings, agent reviews, and process history for this goal. The goal returns to its freshly-created state."
+        consequence="This permanently deletes all decisions, assumptions, warnings, agent reviews, and process history for this goal. The goal returns to its freshly-created state. In-flight baseline results will be discarded; the provider request may finish in the background."
         confirmLabel="Confirm reset"
         isPending={mutationOwner === 'reset' || reset.isPending}
         error={resetError}

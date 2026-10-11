@@ -161,7 +161,7 @@ export function buildQueueRows({
       key: `warning:${warning.id}`,
       warning,
       process: warning.source_process_run_id ? processesById.get(warning.source_process_run_id) : undefined,
-      canAcknowledge: warning.acknowledged_at === null && (warning.severity === 'recommendation' || warning.severity === 'warning'),
+      canAcknowledge: warning.severity === 'recommendation' || warning.severity === 'warning',
     })
   }
 
@@ -253,6 +253,7 @@ export interface NeedsYouQueueProps {
   // then resolves the warning; Dismiss just resolves it. Both reuse the
   // existing rerun/resolve mutations (see BaselineDashboard).
   onApproveStaleInputs: (warning: OrchestrationWarningRecord, processType: OrchestrationBaselineProcessType, onSuccessFocus?: () => void) => void
+  onAcknowledgeWarning: (warning: OrchestrationWarningRecord, onSuccessFocus?: () => void) => void
   onDismissStaleInputs: (warning: OrchestrationWarningRecord, onSuccessFocus?: () => void) => void
   // Renders the goal_definition_clarification_limit recovery action
   // (Proceed / Ask another round) as this blocker row's primary action.
@@ -376,7 +377,7 @@ export function NeedsYouQueue({
   goal, run, processes, warnings, gates, checkpointItems, checkpointLoaded, queriesErrored, queriesUnready, deferredCount, isWorking, mutationBusy,
   onSelectProcess, openAction, onOpenAction, onActionTrigger, renderActionForm, renderAgentDefinitionReviewBatch, renderTeamHierarchyProposal,
   onAcceptDecision, onAnswerGoalDefinitionQuestion,
-  retryPending, retryError, onRetryProcess, onApproveStaleInputs, onDismissStaleInputs,
+  retryPending, retryError, onRetryProcess, onApproveStaleInputs, onDismissStaleInputs, onAcknowledgeWarning,
   renderBlockerRecovery, suppressAnnouncement = false,
 }: NeedsYouQueueProps) {
   const [justResolvedIds, setJustResolvedIds] = useState<Set<string>>(new Set())
@@ -451,10 +452,6 @@ export function NeedsYouQueue({
     })
   }
 
-  function focusSameRow(key: string) {
-    queueMicrotask(() => rowRefs.current[key]?.focus())
-  }
-
   // Retry has no BaselineFocusAction (it doesn't go through openAction/
   // renderActionForm), so it registers directly instead of via onActionTrigger.
   function registerRowRef(key: string, element: HTMLButtonElement | null) {
@@ -527,7 +524,13 @@ export function NeedsYouQueue({
           below = renderTeamHierarchyProposal(row.decision, () => { markResolved(row.key); successToast('Proposal decision received.'); focusNextRow(row.key) }, (element) => registerRowRef(row.key, element))
         } else if (row.kind === 'answer') {
           const focusAction: BaselineFocusAction = { kind: 'answer', id: row.decision.id }
-          message = row.decision.title || row.decision.question
+          const title = row.decision.title.startsWith('Runtime decision: run:')
+            ? row.decision.question
+            : row.decision.title || row.decision.question
+          message = <>
+            {title}
+            {row.decision.title && title !== row.decision.question && <span className="mt-1 block text-sm text-huddleroom-text-secondary">{row.decision.question}</span>}
+          </>
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
           // Accept-recommendation fast path (spec C): a non-null recommendation
           // gets a primary Accept button (submits immediately, no form, no
@@ -580,9 +583,7 @@ export function NeedsYouQueue({
         } else {
           const focusAction: BaselineFocusAction = row.canAcknowledge ? { kind: 'acknowledge', id: row.warning.id } : { kind: 'resolve', id: row.warning.id }
           const label = row.canAcknowledge ? 'Acknowledge' : 'Resolve'
-          const successFocus = row.canAcknowledge
-            ? () => { successToast('Risk acknowledged.'); focusSameRow(row.key) }
-            : () => { markResolved(row.key); successToast('Risk resolved.'); focusNextRow(row.key) }
+          const successFocus = () => { markResolved(row.key); successToast(row.canAcknowledge ? 'Risk acknowledged.' : 'Risk resolved.'); focusNextRow(row.key) }
           message = <>
             <span className="mr-1.5 text-xs text-huddleroom-text-muted">{warningTypeLabel(row.warning.warning_type)} · {warningSeverityLabel(row.warning.severity)}</span>
             {warningMessage(row.warning.message)}
@@ -590,8 +591,8 @@ export function NeedsYouQueue({
           tag = row.warning.warning_type === 'start_text_conflict'
             ? <Link to={{ pathname: '/settings', hash: '#project-details' }} className="inline-flex min-h-11 items-center text-xs font-medium text-huddleroom-primary underline-offset-2 hover:underline">Edit project description</Link>
             : <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
-          action = <Button ref={(element) => registerRow(focusAction, row.key, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy} onClick={() => onOpenAction(focusAction)}>{label}</Button>
-          if (openAction?.kind === focusAction.kind && openAction.id === row.warning.id) {
+          action = <Button ref={(element) => registerRow(focusAction, row.key, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy} onClick={() => row.canAcknowledge ? onAcknowledgeWarning(row.warning, successFocus) : onOpenAction(focusAction)}>{label}</Button>
+          if (!row.canAcknowledge && openAction?.kind === focusAction.kind && openAction.id === row.warning.id) {
             below = <div className="mt-1">{renderActionForm(focusAction, row.warning, successFocus)}</div>
           }
         }

@@ -24,6 +24,7 @@ const state = vi.hoisted(() => ({
   previewMutation: { isPending: false, mutate: vi.fn() },
   applyMutation: { isPending: false, mutate: vi.fn() },
   commandMutation: { isPending: false, mutate: vi.fn() },
+  resetMutation: { isPending: false, mutate: vi.fn() },
   healthDebugEnabled: false,
   agents: [] as Array<Record<string, unknown>>,
   // Keyed by meeting id (matches meetingKeys.detail's third element).
@@ -93,7 +94,7 @@ vi.mock('@/api/orchestration', () => ({
   }),
   useOrchestrationGoalCommand: () => state.commandMutation,
   useOverrideOrchestrationGate: () => ({ isPending: false, mutate: vi.fn() }),
-  useResetOrchestrationGoal: () => ({ isPending: false, mutate: vi.fn() }),
+  useResetOrchestrationGoal: () => state.resetMutation,
   useStartOrchestrationGoal: () => state.startMutation,
   usePreviewGoalTypeCorrection: () => state.previewMutation,
   useApplyGoalTypeCorrection: () => state.applyMutation,
@@ -167,8 +168,8 @@ vi.mock('@tanstack/react-query', () => ({
 // Gates, Delegations, Suggestions) is owned by GoalDetailView itself and is
 // exercised directly by these tests, same as before this phase's restructure.
 vi.mock('./BaselineDashboard', () => ({
-  BaselineDashboard: ({ goalId, run }: { goalId: string; run: { id: string } | null }) => (
-    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'} />
+  BaselineDashboard: ({ goalId, run, acquireMutation }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean }) => (
+    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => acquireMutation("baseline:run:goal_definition")}>Mock run</button><button onClick={() => acquireMutation("baseline:answer:decision-1")}>Mock answer</button></div>
   ),
   currentProcesses: (processes: unknown[] | null | undefined) => (processes ?? []).filter((process) => (process as { superseded_by_id: string | null }).superseded_by_id === null),
 }))
@@ -340,6 +341,8 @@ beforeEach(() => {
   state.announceError.mockReset()
   state.startMutation.isPending = false
   state.startMutation.mutate.mockReset()
+  state.resetMutation.isPending = false
+  state.resetMutation.mutate.mockReset()
   state.commandMutation.isPending = false
   state.commandMutation.mutate.mockReset()
   state.previewMutation.mutate.mockReset()
@@ -1368,5 +1371,48 @@ describe('Correct goal type trigger', () => {
     try {
       expect(() => getButton(noRun.container, 'Correct goal type')).toThrow()
     } finally { noRun.cleanup() }
+  })
+})
+
+describe('baseline reset interruption', () => {
+  it.each([['Mock run', false], ['Mock answer', true]])('Reset availability while %s owns the action', async (label, disabled) => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = richDetail
+    state.healthDebugEnabled = true
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, label).click())
+      const reset = getButton(view.container, 'Reset goal — deletes all history')
+      expect(reset.getAttribute('disabled') !== null).toBe(disabled)
+      if (!disabled) {
+        await React.act(async () => reset.click())
+        expect(textOf(view.container)).toContain('In-flight baseline results will be discarded')
+        const confirm = getButton(view.container, 'Confirm reset')
+        await React.act(async () => { confirm.click(); confirm.click() })
+        expect(state.resetMutation.mutate).toHaveBeenCalledOnce()
+      }
+    } finally { view.cleanup() }
+  })
+})
+
+describe('authoritative baseline run replacement', () => {
+  it.each([['Mock run', false], ['Mock answer', false], ['reset', true]])('releases replaced %s ownership while preserving reset', async (owner, stillBusy) => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = richDetail
+    state.healthDebugEnabled = true
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      if (owner === 'reset') {
+        await React.act(async () => getButton(view.container, 'Reset goal — deletes all history').click())
+        await React.act(async () => getButton(view.container, 'Confirm reset').click())
+      } else await React.act(async () => getButton(view.container, owner).click())
+      state.detail = { ...richDetail, run: { ...richDetail.run!, id: 'replacement-run' } }
+      await view.rerender(() => <OrchestrationPage />)
+      expect(getButton(view.container, 'Pause goal').getAttribute('disabled') !== null).toBe(stillBusy)
+    } finally { view.cleanup() }
   })
 })

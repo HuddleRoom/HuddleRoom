@@ -14,6 +14,7 @@ const HierarchyGraph = lazy(() => import('./HierarchyGraph').then((m) => ({ defa
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import type { BaselineFocusAction } from './BaselineDashboard'
 import { useGoalAnnouncer } from './goalAnnouncer'
+import { hierarchyAgentResolver } from './hierarchyAgentNames'
 
 // Shared retry button + pending/error UI. Reused by the queue in Phase C.
 export function RetryControl({
@@ -96,10 +97,6 @@ function displayValue(value: unknown, fallback = '—') {
   return typeof value === 'string' && value.trim() ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : fallback
 }
 
-function looksLikeUuid(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
-}
-
 function processError(process: OrchestrationProcessRunRecord | undefined) {
   if (!process) return null
   const outputs = isRecord(process.outputs) ? process.outputs : null
@@ -124,17 +121,7 @@ function parseHierarchy(process: OrchestrationProcessRunRecord, reviews: readonl
   const outputs = isRecord(process.outputs) ? process.outputs : {}
   const snapshot = process.status === 'waiting_decision' && isRecord(outputs.proposal) ? outputs.proposal : outputs
   const hierarchy = isRecord(snapshot.hierarchy) ? snapshot.hierarchy : snapshot
-  const agentNames = new Map(reviews.flatMap((review) => {
-    if (!review.agent_id) return []
-    const name = typeof review.definition_snapshot.name === 'string' && review.definition_snapshot.name.trim()
-      ? review.definition_snapshot.name
-      : stringItems(review.approved_for_work_functions)[0]
-    return name ? [[review.agent_id, name] as const] : []
-  }))
-  const resolveAgent = (value: unknown) => {
-    if (typeof value !== 'string' || !value.trim()) return null
-    return agentNames.get(value) ?? (looksLikeUuid(value) ? null : value)
-  }
+  const resolveAgent = hierarchyAgentResolver(reviews)
   const manager = isRecord(hierarchy.manager)
     ? displayValue(hierarchy.manager.name, resolveAgent(hierarchy.manager.id) ?? displayValue(hierarchy.manager.kind))
     : resolveAgent(snapshot.manager) ?? resolveAgent(hierarchy.manager) ?? 'Not recorded'
@@ -172,17 +159,7 @@ function HierarchyCard({ process, reviews }: { process: OrchestrationProcessRunR
 
 function ManagerCard({ process, reviews }: { process: OrchestrationProcessRunRecord; reviews: readonly OrchestrationAgentReviewRecord[] }) {
   const outputs = isRecord(process.outputs) ? process.outputs : {}
-  const agentNames = new Map(reviews.flatMap((review) => {
-    if (!review.agent_id) return []
-    const name = typeof review.definition_snapshot.name === 'string' && review.definition_snapshot.name.trim()
-      ? review.definition_snapshot.name
-      : stringItems(review.approved_for_work_functions)[0]
-    return name ? [[review.agent_id, name] as const] : []
-  }))
-  const resolveAgent = (value: unknown) => {
-    if (typeof value !== 'string' || !value.trim()) return null
-    return agentNames.get(value) ?? (looksLikeUuid(value) ? null : value)
-  }
+  const resolveAgent = hierarchyAgentResolver(reviews)
   // Backend stores selected_manager as "agent:<uuid>", "human:<uuid>", "human", or null (spec 8).
   const rawManager = typeof outputs.selected_manager === 'string' ? outputs.selected_manager : ''
   const [managerKind, managerId] = rawManager.includes(':') ? [rawManager.slice(0, rawManager.indexOf(':')), rawManager.slice(rawManager.indexOf(':') + 1)] : [rawManager, '']

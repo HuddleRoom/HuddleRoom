@@ -1,4 +1,4 @@
-import { QueryClient, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { QueryClient, useQueries, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearToken } from '@/lib/api-client'
 import type { OrchestrationGoalDetail } from '@/lib/types'
@@ -61,12 +61,14 @@ import {
   useDismissOrchestrationSteeringProposal,
   useStepOrchestrationBaseline,
   useOrchestrationGoal,
+  useBaselineDashboard,
 } from './orchestration'
 
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
   useMutation: vi.fn((options) => options),
   useQuery: vi.fn((options) => options),
+  useQueries: vi.fn(({ queries }) => queries),
   useQueryClient: vi.fn(),
 }))
 
@@ -578,6 +580,23 @@ describe('orchestration API', () => {
     }))
   })
 
+  it('sends the runtime contract version through the answer mutation', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({}))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.mocked(useQueryClient).mockReturnValue({} as never)
+    const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
+      mutationFn: (variables: {
+        goalId: string; decisionId: string; selectedOption: string; reason: string; contractVersion: string
+      }) => Promise<unknown>
+    }
+    await mutation.mutationFn({
+      goalId: 'goal-1', decisionId: 'decision-1', selectedOption: 'approve', reason: '', contractVersion: 'plan:1',
+    })
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      selected_option: 'approve', reason: null, contract_version: 'plan:1',
+    })
+  })
+
   it('sends null for a blank optional decision-answer reason', async () => {
     const fetchMock = vi.fn().mockResolvedValue(okJson({}))
     vi.stubGlobal('fetch', fetchMock)
@@ -675,9 +694,11 @@ describe('orchestration API', () => {
     vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries } as never)
 
     const mutation = useAction('project-1') as unknown as {
-      onSuccess: (data: unknown, variables: typeof variables) => Promise<void>
+      onSuccess?: (data: unknown, variables: typeof variables) => Promise<void>
+      onSettled?: (data: unknown, error: unknown, variables: typeof variables) => Promise<void>
     }
-    await mutation.onSuccess({}, variables)
+    if (mutation.onSettled) await mutation.onSettled({}, null, variables)
+    else await mutation.onSuccess!({}, variables)
 
     expect(invalidateQueries).toHaveBeenNthCalledWith(1, {
       queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
@@ -771,4 +792,51 @@ describe('orchestration API', () => {
       queryKey: ['orchestration-goals', 'project-1'],
     })
   })
+})
+
+describe('baseline progress polling', () => {
+  it('polls all dashboard data every two seconds during a pending action even with connected websocket', () => {
+    vi.mocked(useWSStore.getState).mockReturnValue({ connected: true } as never)
+    vi.mocked(useQueryClient).mockReturnValue(new QueryClient())
+    const dashboard = useBaselineDashboard('project-1', 'goal-1', true)
+    for (const query of Object.values(dashboard)) {
+      const options = query as unknown as { refetchInterval: (query: unknown) => number | false }
+      expect(options.refetchInterval({ state: { data: [] } })).toBe(2000)
+    }
+  })
+  it('polls persisted current running processes but stops for superseded and completed ones', () => {
+    const client = new QueryClient()
+    vi.mocked(useQueryClient).mockReturnValue(client)
+    const dashboard = useBaselineDashboard('project-1', 'goal-1')
+    const interval = (dashboard.processes as unknown as { refetchInterval: (query: unknown) => number | false }).refetchInterval
+    expect(interval({ state: { data: [{ status: 'running', superseded_by_id: null }] } })).toBe(2000)
+    expect(interval({ state: { data: [{ status: 'running', superseded_by_id: 'new' }] } })).toBe(false)
+    expect(interval({ state: { data: [{ status: 'complete', superseded_by_id: null }] } })).toBe(false)
+    client.setQueryData([...orchestrationBaselineKey('project-1', 'goal-1'), 'processes'], [{ status: 'running', superseded_by_id: null }])
+    expect((dashboard.memory as unknown as { refetchInterval: () => number | false }).refetchInterval()).toBe(2000)
+  })
+})
+
+describe('baseline mutation progress refresh', () => {
+  it.each([useRunOrchestrationBaselineStep, useRerunOrchestrationBaselineStep, useRetryOrchestrationBaselineStep, useAuthorizeOrchestrationBaseline])('refreshes on submission and every settlement for %s', async (hook) => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries } as never)
+    const mutation = hook('project-1') as unknown as { onMutate: (variables: { goalId: string }) => Promise<void>; onSettled: (data: unknown, error: unknown, variables: { goalId: string }) => Promise<void> }
+    await mutation.onMutate({ goalId: 'goal-1' })
+    expect(invalidateQueries).toHaveBeenCalledTimes(2)
+    invalidateQueries.mockClear()
+    await mutation.onSettled(undefined, new Error('cancelled'), { goalId: 'goal-1' })
+    expect(invalidateQueries).toHaveBeenCalledTimes(2)
+    invalidateQueries.mockClear()
+    await mutation.onSettled({}, null, { goalId: 'goal-1' })
+    expect(invalidateQueries).toHaveBeenCalledTimes(2)
+  })
+})
+
+it('launches both submission refreshes without waiting for network requests', () => {
+  const invalidateQueries = vi.fn().mockReturnValue(new Promise(() => undefined))
+  vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries } as never)
+  const mutation = useRunOrchestrationBaselineStep('project-1') as unknown as { onMutate: (variables: { goalId: string }) => unknown }
+  expect(mutation.onMutate({ goalId: 'goal-1' })).toBeUndefined()
+  expect(invalidateQueries).toHaveBeenCalledTimes(2)
 })

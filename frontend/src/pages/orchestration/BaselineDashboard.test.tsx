@@ -202,13 +202,47 @@ function controlElement(root: Parameters<typeof descendants>[0], label: string) 
 beforeEach(() => {
   api.dashboard = dashboardData()
   api.health = { data: { debug_enabled: false } }
-  for (const mutation of [api.answer, api.answerAgentDefinitionBatch, api.skip, api.acknowledge, api.resolve, api.run, api.rerun, api.retry, api.debugStep, api.debugRerun]) {
+  for (const mutation of [api.answer, api.answerAgentDefinitionBatch, api.skip, api.acknowledge, api.resolve, api.run, api.rerun, api.retry, api.authorize, api.debugStep, api.debugRerun]) {
     mutation.isPending = false
     mutation.mutate.mockReset()
   }
 })
 
 describe('Baseline dashboard D3 composition', () => {
+  it.each(['recommendation', 'warning'] as const)('resolves %s warnings in one click and removes the row', async (severity) => {
+    api.dashboard = dashboardData({ warnings: query([warning({ severity, message: 'Review this risk.' })]) })
+    api.resolve.mutate.mockImplementation((_variables, options) => { options.onSuccess?.({}); options.onSettled?.() })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(view.container, 'Acknowledge').click())
+      expect(api.resolve.mutate).toHaveBeenCalledWith(expect.objectContaining({ reason: 'Acknowledged by operator' }), expect.any(Object))
+      expect(api.acknowledge.mutate).not.toHaveBeenCalled()
+      expect(textOf(view.container)).not.toContain('Review this risk.')
+    } finally { view.cleanup() }
+  })
+
+  it.each(['blocker', 'hard_stop'] as const)('confirms %s resolution with an optional default reason', async (severity) => {
+    api.dashboard = dashboardData({ warnings: query([warning({ severity })]) })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(view.container, 'Resolve').click())
+      expect(api.resolve.mutate).not.toHaveBeenCalled()
+      expect(getByLabel(view.container, 'Reason (optional)', 'textarea')).toBeDefined()
+      await act(async () => getButton(view.container, 'Resolve risk').click())
+      expect(api.resolve.mutate).toHaveBeenCalledWith(expect.objectContaining({ reason: 'Acknowledged by operator' }), expect.any(Object))
+    } finally { view.cleanup() }
+  })
+
+  it('keeps a warning visible when acknowledgement resolution fails', async () => {
+    api.dashboard = dashboardData({ warnings: query([warning({ message: 'Retry this risk.' })]) })
+    api.resolve.mutate.mockImplementation((_variables, options) => { options.onError?.(new Error('Failed')); options.onSettled?.() })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(view.container, 'Acknowledge').click())
+      expect(textOf(view.container)).toContain('Retry this risk.')
+    } finally { view.cleanup() }
+  })
+
   it.each([
     ['goal_definition', 'Goal definition'], ['manager_selection', 'Manager selection'],
     ['agent_definition_review', 'Agent definition review'], ['team_hierarchy', 'Team hierarchy'],
@@ -565,7 +599,7 @@ describe('Baseline dashboard D3 composition', () => {
 
   it('keeps the process focus panel on the run step once the Run mutation succeeds', async () => {
     api.dashboard = dashboardData({ processes: query([process({ status: 'completed', completed_at: ISO.completed })]) })
-    api.run.mutate.mockImplementation((_variables, options) => { options.onSuccess?.(); options.onSettled?.() })
+    api.run.mutate.mockImplementation((_variables, options) => { options.onSuccess?.({ process: { status: 'running' } }); options.onSettled?.() })
     const view = await mountDashboard()
     try {
       expect(controlElement(view.container, 'Select Goal definition').getAttribute('aria-pressed')).toBe('true')
@@ -651,6 +685,55 @@ describe('Baseline dashboard D3 composition', () => {
       view.cleanup()
       mutation.isPending = false
     }
+  })
+
+  it.each([
+    ['idle', 'Nothing to run: no new evidence'],
+    ['not_started', 'Nothing to run: no new evidence'],
+    ['running', 'Running Goal definition.'],
+    ['completed', 'Goal definition: Done.'],
+    ['waiting_decision', 'Goal definition: Needs you.'],
+    ['blocked', 'Goal definition: blocked.'],
+    ['failed', 'Goal definition: failed.'],
+  ])('announces the returned %s process status', async (status, message) => {
+    const onMessage = vi.fn()
+    api.run.mutate.mockImplementation((_variables, callbacks) => {
+      callbacks.onSuccess?.({ process: { status, reason: 'no new evidence' } })
+      callbacks.onSettled?.()
+    })
+    const view = await mountDashboard({ onMessage })
+    try {
+      await act(async () => controlElement(view.container, 'Run Goal definition').click())
+      expect(onMessage).toHaveBeenCalledWith(message)
+    } finally { view.cleanup() }
+  })
+
+  it('announces baseline authorization without claiming a process started', async () => {
+    const onMessage = vi.fn()
+    api.authorize.mutate.mockImplementation((_variables, callbacks) => {
+      callbacks.onSuccess?.({ goal: goal(), run: run({ baseline_authorized: true }) })
+      callbacks.onSettled?.()
+    })
+    const view = await mountDashboard({ onMessage, run: run({ phase: 'baseline', baseline_authorized: false }) })
+    try {
+      await act(async () => getButton(view.container, 'Start baseline').click())
+      expect(onMessage).toHaveBeenCalledWith('Baseline authorized.')
+      expect(onMessage).not.toHaveBeenCalledWith('Baseline started.')
+    } finally { view.cleanup() }
+  })
+
+  it('surfaces structured authorization conflict details', async () => {
+    const onMessage = vi.fn()
+    api.authorize.mutate.mockImplementation((_variables, callbacks) => {
+      callbacks.onError?.(new ApiError(409, 'Request failed', { conflict: 'goal_not_runnable', message: 'Goal is paused' }))
+      callbacks.onSettled?.()
+    })
+    const view = await mountDashboard({ onMessage, run: run({ phase: 'baseline', baseline_authorized: false }) })
+    try {
+      await act(async () => getButton(view.container, 'Start baseline').click())
+      expect(onMessage).toHaveBeenCalledWith('Goal is paused')
+      expect(textOf(view.container)).toContain('Goal is paused')
+    } finally { view.cleanup() }
   })
 
   it('auto-selects delayed running data once, then preserves a manual selection through refetch', async () => {
@@ -1197,6 +1280,36 @@ describe('Baseline dashboard D3 composition', () => {
     } finally { view.cleanup() }
   })
 
+  it('shows agent names in proposed hierarchy assignments, reporting and unused agents without raw JSON', () => {
+    const implementerId = '11111111-1111-4111-8111-111111111111'
+    const managerId = '22222222-2222-4222-8222-222222222222'
+    const unusedId = '33333333-3333-4333-8333-333333333333'
+    const unknownId = '44444444-4444-4444-8444-444444444444'
+    const hierarchy = process({ id: 'hierarchy-process', process_type: 'team_hierarchy', status: 'waiting_decision' })
+    const proposal = {
+      assignments: [{ work_function: 'build', agent_ref: implementerId }],
+      reporting_lines: [{ agent_ref: implementerId, reports_to: managerId }],
+      approved_but_unused_agent_ids: [unusedId, unknownId],
+      documented_gaps: [], rationale: 'Coverage checked.', self_review: 'Ready.',
+    }
+    const approval = decision({ decision_key: 'team_hierarchy:approval', source_process_run_id: hierarchy.id, options: [{ key: 'approve', proposal }] })
+    api.dashboard = dashboardData({
+      processes: query([hierarchy]), decisions: query([approval]),
+      checkpoint: query({ goal_id: goal().id, items: [approval], deferred_count: 0, max_questions: 5 }),
+      agentReviews: query([
+        review({ agent_id: implementerId, definition_snapshot: { name: 'Ada Builder' } }),
+        review({ agent_id: managerId, definition_snapshot: { name: 'Grace Manager' } }),
+        review({ agent_id: unusedId, definition_snapshot: { name: 'Linus Reviewer' } }),
+      ]),
+    })
+    const markup = renderDashboard()
+    expect(markup).toContain('build: Ada Builder')
+    expect(markup).toContain('Ada Builder reports to Grace Manager')
+    expect(markup).toContain('Linus Reviewer, Unknown agent')
+    for (const id of [implementerId, managerId, unusedId, unknownId]) expect(markup).not.toContain(id)
+    expect(markup).not.toContain('{')
+  })
+
   it('shows manager comparison in the collapsed queue row without a second action', async () => {
     const manager = process({ id: 'manager-process', process_type: 'manager_selection', status: 'waiting_decision' })
     const review = decision({ id: 'manager-review', decision_key: 'manager_selection:review_override', source_process_run_id: manager.id, recommendation: 'approve', options: ['approve', 'reject'], context: 'Deterministic: agent:a\nLLM: agent:b\nRationale: Better leadership fit.' })
@@ -1257,7 +1370,7 @@ describe('Baseline dashboard D3 composition', () => {
   })
 
   it('submits the accept-recommendation fast path through the answer mutation with no form and no reason', async () => {
-    const recommended = decision({ id: 'decision-1', recommendation: 'approve', options: ['approve', { key: 'revise', label: 'Revise scope' }] })
+    const recommended = decision({ id: 'decision-1', recommendation: 'approve', options: ['approve', { key: 'revise', label: 'Revise scope' }], runtime_identity: 'runtime-1', contract_version: 'plan:1' })
     api.dashboard = dashboardData({
       checkpoint: query({ goal_id: 'goal-00000000-0000-4000-8000-000000000001', items: [recommended], deferred_count: 0, max_questions: 5 }),
     })
@@ -1266,7 +1379,7 @@ describe('Baseline dashboard D3 composition', () => {
       expect(() => getButton(view.container, 'Submit answer')).toThrow()
       await act(async () => getButton(view.container, 'Accept: approve').click())
       expect(api.answer.mutate).toHaveBeenCalledWith(
-        { goalId: 'goal-00000000-0000-4000-8000-000000000001', decisionId: 'decision-1', selectedOption: 'approve', reason: '' },
+        { goalId: 'goal-00000000-0000-4000-8000-000000000001', decisionId: 'decision-1', selectedOption: 'approve', reason: '', contractVersion: 'plan:1' },
         expect.any(Object),
       )
       expect(() => getButton(view.container, 'Submit answer')).toThrow()
@@ -1614,5 +1727,50 @@ describe('Baseline action form regressions', () => {
     const markup = formWithContext(JSON.stringify({ some_other_field: 'value' }))
     expect(markup).not.toContain('Original:')
     expect(markup).not.toContain('Proposed:')
+  })
+})
+
+ describe('baseline operation generations', () => {
+  it('announces progress before the provider responds and ignores callbacks after reset', async () => {
+    api.dashboard = dashboardData({ processes: query([]) })
+    let generation = 1
+    const onMessage = vi.fn()
+    const releaseMutation = vi.fn()
+    const view = await mountDashboard({ onMessage, releaseMutation, getMutationGeneration: () => generation })
+    try {
+      await act(async () => controlElement(view.container, 'Run Goal definition').click())
+      expect(onMessage).toHaveBeenCalledWith('Running Goal definition.')
+      const callbacks = api.run.mutate.mock.calls[0][1]
+      onMessage.mockClear()
+      generation++
+      await act(async () => {
+        callbacks.onSuccess({ process: process({ status: 'complete' }) })
+        callbacks.onError(new Error('late failure'))
+        callbacks.onSettled()
+      })
+      expect(onMessage).not.toHaveBeenCalled()
+      expect(releaseMutation).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+})
+
+describe('same baseline owner replacement', () => {
+  it('old settled callback cannot release a newer run with the same owner', async () => {
+    api.dashboard = dashboardData({ processes: query([]) })
+    const onMessage = vi.fn()
+    const releaseMutation = vi.fn()
+    const view = await mountDashboard({ onMessage, releaseMutation })
+    try {
+      await act(async () => controlElement(view.container, 'Run Goal definition').click())
+      const oldCallbacks = api.run.mutate.mock.calls[0][1]
+      await act(async () => controlElement(view.container, 'Run Goal definition').click())
+      const newCallbacks = api.run.mutate.mock.calls[1][1]
+      onMessage.mockClear()
+      await act(async () => { oldCallbacks.onError(new Error('old failure')); oldCallbacks.onSettled() })
+      expect(onMessage).not.toHaveBeenCalled()
+      expect(releaseMutation).not.toHaveBeenCalled()
+      await act(async () => newCallbacks.onSettled())
+      expect(releaseMutation).toHaveBeenCalledOnce()
+    } finally { view.cleanup() }
   })
 })

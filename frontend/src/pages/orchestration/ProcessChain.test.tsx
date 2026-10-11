@@ -114,6 +114,25 @@ describe('ProcessChain baseline authorization button', () => {
     }
   })
 
+  it('disables baseline authorization on a paused goal with a resume hint', async () => {
+    const onAuthorize = vi.fn()
+    const view = await mountChain({ goal: goal({ status: 'paused' }), run: run(), onAuthorize })
+    try {
+      const button = getButton(view.container, 'Start baseline')
+      expect(button.getAttribute('disabled')).not.toBeNull()
+      expect(button.getAttribute('aria-describedby')).toBe('baseline-paused-hint')
+      expect(textOf(view.container)).toContain('Resume the goal to start the baseline')
+      await act(async () => button.click())
+      expect(onAuthorize).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('disables baseline authorization while another chain action is pending', async () => {
+    const view = await mountChain({ goal: goal(), run: run(), onAuthorize: vi.fn(), chainPending: true })
+    try { expect(getButton(view.container, 'Start baseline').getAttribute('disabled')).not.toBeNull() }
+    finally { view.cleanup() }
+  })
+
   it('surfaces an authorize error under the header', async () => {
     const view = await mountChain({ goal: goal(), run: run({ baseline_authorized: false }), onAuthorize: vi.fn(), authorizeError: 'The baseline could not be started.', processes: [] })
     try {

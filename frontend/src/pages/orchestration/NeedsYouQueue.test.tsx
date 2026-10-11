@@ -205,6 +205,7 @@ function QueueHarness(props: Partial<NeedsYouQueueProps> & { onSelectProcess?: (
     retryPending: false, retryError: null,
     onRetryProcess: (_type, _trigger, onSuccessFocus) => onSuccessFocus?.(),
     onApproveStaleInputs: (_warning, _processType, onSuccessFocus) => onSuccessFocus?.(),
+    onAcknowledgeWarning: (_warning, onSuccessFocus) => onSuccessFocus?.(),
     onDismissStaleInputs: (_warning, onSuccessFocus) => onSuccessFocus?.(),
   }
   return <NeedsYouQueue {...defaults} {...props} openAction={openAction} onOpenAction={setOpenAction} />
@@ -426,29 +427,27 @@ describe('NeedsYouQueue', () => {
     }
   })
 
-  it('keeps a warning row visible after Acknowledge (it does not clear the warning) and returns focus to it', async () => {
+  it('removes a warning row after one-click Acknowledge and focuses the heading', async () => {
     const warn = warning({ id: 'warn-1', message: 'Needs a second look.' })
     const view = await mountQueue({ warnings: [warn] })
     try {
       await act(async () => getButton(view.container, 'Acknowledge').click())
-      await act(async () => getButton(view.container, 'Submit acknowledge').click())
 
-      expect(textOf(view.container)).toContain('Needs a second look.')
+      expect(textOf(view.container)).not.toContain('Needs a second look.')
       const active = view.container.ownerDocument.activeElement
-      expect(active && textOf(active)).toBe('Acknowledge')
+      expect(active?.id).toBe('needs-you-queue-heading')
       expect(toastMock.success).toHaveBeenCalled()
     } finally {
       view.cleanup()
     }
   })
 
-  it('offers Resolve instead of Acknowledge once a warning is already acknowledged, and removes it on resolve', async () => {
+  it('offers one-click Acknowledge for an already acknowledged active warning', async () => {
     const warn = warning({ id: 'warn-1', message: 'Already acknowledged.', acknowledged_at: ISO.started })
     const view = await mountQueue({ warnings: [warn] })
     try {
-      expect(() => getButton(view.container, 'Acknowledge')).toThrow()
-      await act(async () => getButton(view.container, 'Resolve').click())
-      await act(async () => getButton(view.container, 'Submit resolve').click())
+      expect(() => getButton(view.container, 'Resolve')).toThrow()
+      await act(async () => getButton(view.container, 'Acknowledge').click())
       expect(textOf(view.container)).not.toContain('Already acknowledged.')
     } finally {
       view.cleanup()
@@ -621,6 +620,27 @@ describe('NeedsYouQueue', () => {
     } finally {
       view.cleanup()
     }
+  })
+
+  it('uses the question as the title for legacy runtime decisions', async () => {
+    const view = await mountQueue({ checkpointItems: [decision({
+      title: 'Runtime decision: run:raw-run-id:kind:ask_human:deployment',
+      question: 'Approve deployment?', context: 'Production rollout needs approval.',
+    })] })
+    try {
+      expect(textOf(view.container)).toContain('Approve deployment?')
+      expect(textOf(view.container)).not.toContain('run:raw-run-id')
+    } finally { view.cleanup() }
+  })
+
+  it('renders the question beneath a distinct decision title', async () => {
+    const view = await mountQueue({ checkpointItems: [decision({
+      title: 'Deployment approval', question: 'Deploy the new release now?',
+    })] })
+    try {
+      expect(textOf(view.container)).toContain('Deployment approval')
+      expect(textOf(view.container)).toContain('Deploy the new release now?')
+    } finally { view.cleanup() }
   })
 
   it('renders a failed gate as a plain reference row with no inline action', async () => {

@@ -23,6 +23,7 @@ import type {
   OrchestrationBaselineProcessType,
   OrchestrationBlocker,
   OrchestrationDecisionAnswerResult,
+  OrchestrationAgentReviewRecord,
   OrchestrationDecisionOption,
   OrchestrationGate,
   OrchestrationGoal,
@@ -30,11 +31,12 @@ import type {
   OrchestrationRun,
   OrchestrationWarningRecord,
 } from '@/lib/types'
-import { BASELINE_PROCESS_TYPES, processLabel } from './humanize'
+import { BASELINE_PROCESS_TYPES, processLabel, statusPhrase } from './humanize'
 import { frontierProcessType, isTerminalProcess, ProcessChain } from './ProcessChain'
 import { ProcessFocus } from './ProcessFocus'
 import { NeedsYouQueue } from './NeedsYouQueue'
 import { useGoalAnnouncer } from './goalAnnouncer'
+import { hierarchyAgentResolver } from './hierarchyAgentNames'
 
 export type BaselineMutationOwner =
   `baseline:${'answer' | 'skip' | 'acknowledge' | 'resolve' | 'run' | 'rerun' | 'retry' | 'authorize'}:${string}`
@@ -61,6 +63,7 @@ export interface BaselineDashboardProps {
   mutationBusy: boolean
   acquireMutation: (owner: BaselineMutationOwner) => boolean
   releaseMutation: (owner: BaselineMutationOwner) => void
+  getMutationGeneration?: () => number
   onMessage: (message: string) => void
   // Reports the currently-effective selected step whenever it changes, so the
   // page can keep the Details tabs' Activity "This step" scope synced to the
@@ -113,6 +116,7 @@ export function canSubmitDecision(selectedOption: string | null, recommendation:
 }
 
 function actionError(error: unknown) {
+  if (error instanceof ApiError && error.detail && typeof error.detail === 'object' && 'message' in error.detail && typeof error.detail.message === 'string') return error.detail.message
   return error instanceof Error ? error.message : 'The request failed. Check your connection and try again.'
 }
 
@@ -184,10 +188,10 @@ export function BaselineActionForm({
   const managerComparison = target.kind === 'answer' && isManagerSelectionDecision(target.decision.decision_key) ? parseManagerComparison(target.decision.context) : null
   const answerRef = useRef<HTMLTextAreaElement>(null)
   const firstAnswerOption = options.findIndex((option) => option.key !== null)
-  const requiresReason = target.kind !== 'answer' || decisionRequiresReason(selectedOption, target.decision.recommendation)
+  const requiresReason = target.kind === 'skip' || target.kind === 'answer' && decisionRequiresReason(selectedOption, target.decision.recommendation)
   const canSubmit = target.kind === 'answer'
     ? canSubmitDecision(selectedOption, target.decision.recommendation, reason)
-    : canSubmitReason(reason)
+    : target.kind === 'skip' ? canSubmitReason(reason) : true
   const label = target.kind === 'answer' ? 'Submit answer' : target.kind === 'skip' ? 'Skip process' : target.kind === 'acknowledge' ? 'Acknowledge risk' : 'Resolve risk'
   const { announceError } = useGoalAnnouncer()
 
@@ -204,10 +208,11 @@ export function BaselineActionForm({
       if (canSubmit) onAnswer(target.decision, selectedOption!, reason)
       return
     }
-    if (!canSubmitReason(reason)) return
+    if (target.kind === 'skip' && !canSubmitReason(reason)) return
+    const warningReason = reason.trim() || 'Acknowledged by operator'
     if (target.kind === 'skip') onSkip(target.process, reason)
-    else if (target.kind === 'acknowledge') onAcknowledge(target.warning, reason)
-    else onResolve(target.warning, reason)
+    else if (target.kind === 'acknowledge') onAcknowledge(target.warning, warningReason)
+    else onResolve(target.warning, warningReason)
   }
 
   return (
@@ -259,7 +264,7 @@ export function BaselineActionForm({
           )}
         </>}
         {target.kind === 'answer' && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
-        {target.kind !== 'answer' && <Textarea ref={reasonRef} label="Reason (required)" value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
+        {target.kind !== 'answer' && <Textarea ref={reasonRef} label={target.kind === 'skip' ? 'Reason (required)' : 'Reason (optional)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
         {error && <p className="mt-2 text-xs text-huddleroom-status-red">{error}</p>}
         <div className="mt-3 flex flex-wrap justify-end gap-2">
           <Button type="button" variant="secondary" className="min-h-11" disabled={disabled} onClick={onCancel}>Cancel</Button>
@@ -522,7 +527,7 @@ function TeamHierarchyProposalForm({ decision, disabled, submitting, error, onSu
   </div>
 }
 
-function TeamHierarchyStatus({ decisions, processId }: { decisions: readonly OrchestrationAuthorityDecisionRecord[]; processId: string | null }) {
+function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: readonly OrchestrationAuthorityDecisionRecord[]; processId: string | null; reviews: readonly OrchestrationAgentReviewRecord[] }) {
   const current = processId ? decisions.filter((item) => item.source_process_run_id === processId) : []
   const pending = current.filter((item) => item.status === 'pending' && item.decision_key.startsWith('team_hierarchy:agent:'))
   const approval = current.find((item) => item.status === 'pending' && item.decision_key === 'team_hierarchy:approval')
@@ -535,16 +540,20 @@ function TeamHierarchyStatus({ decisions, processId }: { decisions: readonly Orc
   const proposal = option?.proposal
   if (!proposal) return null
   const list = (key: string) => Array.isArray(proposal[key]) ? proposal[key] as unknown[] : []
+  const resolveAgent = hierarchyAgentResolver(reviews)
+  const agentName = (value: unknown) => resolveAgent(value) ?? 'Unknown agent'
+  const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+  const assignments = list('assignments').filter(isRecord)
+  const reporting = list('reporting_lines').filter(isRecord)
   return <section className="rounded border border-huddleroom-border p-3"><h3 className="text-sm font-medium text-huddleroom-text-primary">Proposed hierarchy</h3>
-    <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Assignments</p><pre className="max-w-full overflow-hidden whitespace-pre-wrap break-words text-xs text-huddleroom-text-secondary">{JSON.stringify(list('assignments'), null, 2)}</pre>
-    <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Reporting</p><pre className="max-w-full overflow-hidden whitespace-pre-wrap break-words text-xs text-huddleroom-text-secondary">{JSON.stringify(list('reporting_lines'), null, 2)}</pre>
+    <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Assignments</p><ul className="text-sm text-huddleroom-text-secondary">{assignments.map((assignment, index) => <li key={index}>{typeof assignment.work_function === 'string' ? assignment.work_function : 'Work function'}: {agentName(assignment.agent_ref)}</li>)}</ul>
+    <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Reporting</p><ul className="text-sm text-huddleroom-text-secondary">{reporting.map((line, index) => <li key={index}>{agentName(line.agent_ref)} reports to {agentName(line.reports_to)}</li>)}</ul>
     <p className="mt-2 text-xs"><span className="font-medium text-huddleroom-text-muted">Rationale:</span> {String(proposal.rationale ?? 'None')}</p><p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Self-review:</span> {String(proposal.self_review ?? 'None')}</p>
-    <p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Documented gaps:</span> {list('documented_gaps').length ? list('documented_gaps').join(', ') : 'None'}</p><p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Approved but unused:</span> {list('approved_but_unused_agent_ids').length ? list('approved_but_unused_agent_ids').join(', ') : 'None'}</p>
+    <p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Documented gaps:</span> {list('documented_gaps').length ? list('documented_gaps').join(', ') : 'None'}</p><p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Approved but unused:</span> {list('approved_but_unused_agent_ids').length ? list('approved_but_unused_agent_ids').map(agentName).join(', ') : 'None'}</p>
   </section>
 }
 
-export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, renderBlockerRecovery, suppressQueueAnnouncement }: BaselineDashboardProps) {
-  const dashboard = useBaselineDashboard(projectId, goalId)
+export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, renderBlockerRecovery, suppressQueueAnnouncement, getMutationGeneration }: BaselineDashboardProps) {
   const health = useOrchestrationHealth()
   const answer = useAnswerOrchestrationDecision(projectId)
   const answerAgentDefinitionBatch = useAnswerAgentDefinitionReviewBatch(projectId)
@@ -555,6 +564,19 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
   const rerun = useRerunOrchestrationBaselineStep(projectId)
   const retry = useRetryOrchestrationBaselineStep(projectId)
   const authorize = useAuthorizeOrchestrationBaseline(projectId)
+  const dashboard = useBaselineDashboard(projectId, goalId, runStep.isPending || rerun.isPending || retry.isPending || authorize.isPending)
+  const localGeneration = useRef(0)
+  const generation = () => getMutationGeneration?.() ?? localGeneration.current
+  function beginMutation(owner: BaselineMutationOwner) {
+    if (!acquireMutation(owner)) return null
+    localGeneration.current++
+    const started = generation()
+    return () => generation() === started
+  }
+  function guardedMicrotask(callback: () => void) {
+    const started = generation()
+    queueMicrotask(() => { if (generation() === started) callback() })
+  }
   const [selectedProcessType, setSelectedProcessType] = useState<OrchestrationBaselineProcessType | null>(null)
   const [openAction, setOpenAction] = useState<BaselineFocusAction | null>(null)
   const [selectedOption, setSelectedOption] = useState<string | null>(null)
@@ -625,11 +647,11 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
 
   function closeForm(action: BaselineFocusAction) {
     setOpenAction(null)
-    queueMicrotask(() => actionTriggers.current[`${action.kind}:${action.id}`]?.focus())
+    guardedMicrotask(() => actionTriggers.current[`${action.kind}:${action.id}`]?.focus())
   }
 
   function restoreSuccessFocus(action: BaselineFocusAction) {
-    queueMicrotask(() => {
+    guardedMicrotask(() => {
       const trigger = actionTriggers.current[`${action.kind}:${action.id}`]
       // A skipped process leaves the frontier, so the refetch that follows
       // success unmounts its Skip trigger. The trigger is still connected in
@@ -643,7 +665,8 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
 
   function runMutation<T>(action: BaselineFocusAction, mutate: (callbacks: { onSuccess: (data: T) => void; onError: (error: unknown) => void; onSettled: () => void }) => void, success: string, onSuccessFocus?: () => void) {
     const owner = actionOwner(action)
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     // Snapshot whether `action` is the form currently open — runMutation is
     // now also called for actions with no open form at all (the accept-
     // recommendation fast path). Closing/clearing openAction+formError must
@@ -653,6 +676,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
     if (targetsOpenForm) { setFormError(null); setFormErrorSource(null) }
     mutate({
       onSuccess: () => {
+        if (!isCurrent()) return
         if (targetsOpenForm) setOpenAction(null)
         onMessage(success)
         ;(onSuccessFocus ?? (() => restoreSuccessFocus(action)))()
@@ -663,10 +687,11 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
       // button just re-enabled (review round 2, finding I1). onMessage flows
       // through the shared goal announcer's queue region.
       onError: (error) => {
+        if (!isCurrent()) return
         if (targetsOpenForm) { setFormError(actionError(error)); setFormErrorSource('action'); submitRef.current?.focus() }
         else onMessage(actionError(error))
       },
-      onSettled: () => releaseMutation(owner),
+      onSettled: () => { if (isCurrent()) { releaseMutation(owner) } },
     })
   }
 
@@ -688,6 +713,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
       onAnswer={(decision, option, submitReason) => runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
         goalId,
         decisionId: decision.id,
+        contractVersion: decision.contract_version,
         selectedOption: option,
         reason: submitReason,
       }, callbacks), 'Answer received.', onSuccessFocus)}
@@ -708,6 +734,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
     runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
       goalId,
       decisionId: decision.id,
+      contractVersion: decision.contract_version,
       selectedOption: decision.recommendation!,
       reason: '',
     }, callbacks), 'Answer received.', onSuccessFocus)
@@ -724,59 +751,90 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
     callbacks: { onSuccess: () => void; onError: (error: unknown) => void; onSettled: () => void },
   ) {
     const owner: BaselineMutationOwner = `baseline:answer:${decision.id}`
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     setFormError(null)
     setFormErrorSource(null)
-    answer.mutate({ goalId, decisionId: decision.id, selectedOption: answerText, reason: '' }, {
-      onSuccess: () => { onMessage('Answer received.'); callbacks.onSuccess() },
-      onError: (error) => { setFormError(actionError(error)); setFormErrorSource('action'); callbacks.onError(error) },
-      onSettled: () => { releaseMutation(owner); callbacks.onSettled() },
+    answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, selectedOption: answerText, reason: '' }, {
+      onSuccess: () => {
+        if (!isCurrent()) return
+        onMessage('Answer received.')
+        callbacks.onSuccess()
+      },
+      onError: (error) => {
+        if (!isCurrent()) return
+        setFormError(actionError(error))
+        setFormErrorSource('action')
+        callbacks.onError(error)
+      },
+      onSettled: () => {
+        if (!isCurrent()) return
+        releaseMutation(owner)
+        callbacks.onSettled()
+      },
     })
   }
 
   function submitAgentDefinitionReviewBatch(answers: AgentDefinitionReviewBatchAnswerInput[], onSuccessFocus?: () => void) {
     const owner: BaselineMutationOwner = 'baseline:answer:agent-definition-review-batch'
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     setFormError(null)
     setFormErrorSource(null)
     answerAgentDefinitionBatch.mutate({ goalId, answers }, {
       onSuccess: () => {
+        if (!isCurrent()) return
         setOpenAction(null)
         onMessage('Agent-definition review completed.')
-        queueMicrotask(onSuccessFocus ?? (() => focusHeadingRef.current?.focus()))
+        guardedMicrotask(onSuccessFocus ?? (() => focusHeadingRef.current?.focus()))
       },
       onError: (error) => {
+        if (!isCurrent()) return
         if (error instanceof ApiError && error.status === 409) {
           void Promise.all([dashboard.decisions.refetch(), dashboard.processes.refetch(), dashboard.warnings.refetch()])
           onMessage('The proposals changed and were reloaded — please review the updated agent-definition proposals.')
-          queueMicrotask(() => focusHeadingRef.current?.focus())
+          guardedMicrotask(() => focusHeadingRef.current?.focus())
         } else {
           setFormError(actionError(error))
           setFormErrorSource('batch')
         }
       },
-      onSettled: () => releaseMutation(owner),
+      onSettled: () => { if (isCurrent()) { releaseMutation(owner) } },
     })
   }
 
   function answerTeamProposal(decision: OrchestrationAuthorityDecisionRecord, selectedOption: string, editedAgent: AgentCreatePayload | undefined, onSuccess?: () => void) {
     const action: BaselineFocusAction = { kind: 'answer', id: decision.id }
-    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({ goalId, decisionId: decision.id, selectedOption, reason: '', editedAgent }, callbacks), 'Proposal decision received.', onSuccess)
+    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, selectedOption, reason: '', editedAgent }, callbacks), 'Proposal decision received.', onSuccess)
   }
 
   function mutateChain(processType: OrchestrationBaselineProcessType, action: 'run' | 'rerun', trigger: HTMLButtonElement | null) {
     const owner: BaselineMutationOwner = `baseline:${action}:${processType}`
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     setRunRerunError(null)
+    onMessage(`${action === 'run' ? 'Running' : 'Re-running'} ${processLabel(processType)}.`)
     const mutation = action === 'run' ? runStep : rerun
     mutation.mutate({ goalId, processType }, {
-      onSuccess: () => { onMessage(`${action === 'run' ? 'Running' : 'Re-running'} ${processLabel(processType)}.`); setSelectedProcessType(processType) },
+      onSuccess: (result) => {
+        if (!isCurrent()) return
+        const status = result.process.status
+        const reason = typeof result.process.reason === 'string' ? result.process.reason : 'The process did not start.'
+        onMessage(status === 'running'
+          ? `${action === 'run' ? 'Running' : 'Re-running'} ${processLabel(processType)}.`
+          : status === 'idle' || status === 'not_started' || status === 'not-started' || !status
+            ? `Nothing to run: ${reason}`
+            : `${processLabel(processType)}: ${statusPhrase(String(status)).label}.`)
+        setSelectedProcessType(processType)
+      },
       onError: (mutationError) => {
+        if (!isCurrent()) return
         const message = actionError(mutationError)
         setRunRerunError(message)
         onMessage(message)
       },
       onSettled: () => {
+        if (!isCurrent()) return
         releaseMutation(owner)
         trigger?.focus()
       },
@@ -788,16 +846,25 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
   // mutation the same way mutateChain/retryProcess do.
   function authorizeBaseline(trigger: HTMLButtonElement | null) {
     const owner: BaselineMutationOwner = `baseline:authorize:${goalId}`
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     setAuthorizeError(null)
+    onMessage('Authorizing baseline.')
     authorize.mutate({ goalId }, {
-      onSuccess: () => onMessage('Baseline started.'),
+      onSuccess: (result) => {
+        if (!isCurrent()) return
+        onMessage(result.run?.baseline_authorized
+        ? 'Baseline authorized.'
+        : `Baseline: ${result.goal.status === 'paused' ? 'paused' : result.run?.status ?? 'not started'}.`)
+      },
       onError: (mutationError) => {
+        if (!isCurrent()) return
         const message = actionError(mutationError)
         setAuthorizeError(message)
         onMessage(message)
       },
       onSettled: () => {
+        if (!isCurrent()) return
         releaseMutation(owner)
         trigger?.focus()
       },
@@ -811,16 +878,24 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
   // endpoints.
   function approveStaleInputs(warningRecord: OrchestrationWarningRecord, processType: OrchestrationBaselineProcessType, onSuccessFocus?: () => void) {
     const owner: BaselineMutationOwner = `baseline:rerun:${processType}`
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
+    onMessage(`Re-running ${processLabel(processType)}.`)
     rerun.mutate({ goalId, processType }, {
       onSuccess: () => {
+        if (!isCurrent()) return
         resolve.mutate({ goalId, warningId: warningRecord.id, reason: 'approved rerun' }, {
-          onSuccess: () => { onMessage(`Re-running ${processLabel(processType)}.`); onSuccessFocus?.() },
-          onError: (error) => onMessage(actionError(error)),
-          onSettled: () => releaseMutation(owner),
+          onSuccess: () => {
+            if (!isCurrent()) return
+            onMessage(`Re-running ${processLabel(processType)}.`)
+            onSuccessFocus?.()
+          },
+          onError: (error) => { if (isCurrent()) { onMessage(actionError(error)) } },
+          onSettled: () => { if (isCurrent()) { releaseMutation(owner) } },
         })
       },
       onError: (error) => {
+        if (!isCurrent()) return
         onMessage(actionError(error))
         releaseMutation(owner)
       },
@@ -829,49 +904,56 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
 
   function dismissStaleInputs(warningRecord: OrchestrationWarningRecord, onSuccessFocus?: () => void) {
     const owner: BaselineMutationOwner = `baseline:resolve:${warningRecord.id}`
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     resolve.mutate({ goalId, warningId: warningRecord.id, reason: 'dismissed by human' }, {
-      onSuccess: () => { onMessage('Suggestion dismissed.'); onSuccessFocus?.() },
-      onError: (error) => onMessage(actionError(error)),
-      onSettled: () => releaseMutation(owner),
+      onSuccess: () => {
+        if (!isCurrent()) return
+        onMessage('Suggestion dismissed.'); onSuccessFocus?.() },
+      onError: (error) => { if (isCurrent()) { onMessage(actionError(error)) } },
+      onSettled: () => { if (isCurrent()) { releaseMutation(owner) } },
     })
   }
 
   function retryProcess(processType: OrchestrationBaselineProcessType, trigger: HTMLButtonElement | null, onSuccessFocus?: () => void) {
     const owner: BaselineMutationOwner = `baseline:retry:${processType}`
-    if (!acquireMutation(owner)) return
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
     setRetryError(null)
+    onMessage(`Retrying ${processLabel(processType)}.`)
     retry.mutate({ goalId, processType }, {
       onSuccess: (result) => {
+        if (!isCurrent()) return
         if (result?.process?.['retry_failed'] === true) {
           const message = typeof result.process['error'] === 'string' ? result.process['error'] : 'Language model request failed.'
           setRetryError(message)
           onMessage(message)
-          queueMicrotask(() => trigger?.focus())
+          guardedMicrotask(() => trigger?.focus())
           return
         }
         onMessage(`Request succeeded. Continuing ${processLabel(processType)}.`)
-        queueMicrotask(onSuccessFocus ?? (() => focusHeadingRef.current?.focus()))
+        guardedMicrotask(onSuccessFocus ?? (() => focusHeadingRef.current?.focus()))
       },
       onError: (error) => {
+        if (!isCurrent()) return
         if (error instanceof ApiError && error.status === 409) {
           void Promise.all([dashboard.processes.refetch(), dashboard.warnings.refetch()])
           onMessage('This retry is no longer available. Refreshing process state.')
-          queueMicrotask(() => focusHeadingRef.current?.focus())
+          guardedMicrotask(() => focusHeadingRef.current?.focus())
         } else {
           const message = actionError(error)
           setRetryError(message)
           onMessage(message)
-          queueMicrotask(() => trigger?.focus())
+          guardedMicrotask(() => trigger?.focus())
         }
       },
-      onSettled: () => releaseMutation(owner),
+      onSettled: () => { if (isCurrent()) { releaseMutation(owner) } },
     })
   }
 
   return <div data-testid="baseline-dashboard" className="flex min-w-0 flex-col gap-4">
-    <TeamHierarchyStatus decisions={decisions} processId={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)?.id ?? null} />
-    <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} authorizePending={authorize.isPending} authorizeError={authorizeError} />
+    <TeamHierarchyStatus decisions={decisions} reviews={dashboard.agentReviews.data ?? []} processId={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)?.id ?? null} />
+    <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
     {processState === 'ready' && <>
       <NeedsYouQueue
         goal={goal} run={run} processes={processes} warnings={warnings} gates={gates}
@@ -889,6 +971,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
         onAcceptDecision={acceptRecommendation} onAnswerGoalDefinitionQuestion={answerGoalDefinitionQuestion}
         retryPending={retry.isPending} retryError={retryError} onRetryProcess={retryProcess}
         onApproveStaleInputs={approveStaleInputs} onDismissStaleInputs={dismissStaleInputs}
+        onAcknowledgeWarning={(warningRecord, onSuccessFocus) => runMutation({ kind: 'acknowledge', id: warningRecord.id }, (callbacks) => resolve.mutate({ goalId, warningId: warningRecord.id, reason: 'Acknowledged by operator' }, callbacks), 'Risk acknowledged.', onSuccessFocus)}
         renderBlockerRecovery={renderBlockerRecovery} suppressAnnouncement={suppressQueueAnnouncement}
       />
       <ProcessFocus selectedProcessType={effectiveProcessType} process={selectedProcess} goal={goal} decisions={decisions} decisionsUnready={dashboard.decisions.isLoading || dashboard.decisions.isError} warnings={warnings} reviews={dashboard.agentReviews.data ?? []} debug={debug} canSkip={!!selectedProcess && goal.status !== 'completed' && goal.status !== 'cancelled' && (selectedProcess.status === 'running' || selectedProcess.status === 'waiting_decision')} mutationBusy={mutationBusy} canRun={canRunSelected} canRerun={canRerunSelected} runPending={runStep.isPending} rerunPending={rerun.isPending} runRerunError={runRerunError} onRun={(trigger) => mutateChain(effectiveProcessType, 'run', trigger)} onRerun={(trigger) => mutateChain(effectiveProcessType, 'rerun', trigger)} retryPending={retry.isPending} retryError={retryError} onRetry={(trigger) => retryProcess(effectiveProcessType, trigger)} openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }} headingRef={focusHeadingRef} renderActionForm={renderActionForm} onViewActivity={onViewActivity} />
