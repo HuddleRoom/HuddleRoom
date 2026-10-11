@@ -815,6 +815,103 @@ async def test_discovery_failed_source_retries_once_with_original_limits(
     assert (await db_session.get(Session, retry.target_id)).task_id == task.id
 
 
+@pytest.mark.parametrize("legacy_settled", [False, True])
+async def test_discovery_retry_recovers_after_agent_reactivated(
+    db_session, test_project, test_agent, monkeypatch, legacy_settled,
+):
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    task.status = session.status = "failed"
+    session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
+                         "attempt": {"effect_state": "started"}}
+    from huddleroom.services.task_service import TaskService
+    original_run = TaskService.run
+
+    async def refuse_inactive_agent(self, *args, **kwargs):
+        if not test_agent.is_active:
+            raise HTTPException(status_code=409, detail="Discovery agent is inactive")
+        return await original_run(self, *args, **kwargs)
+
+    # Model a refused dispatch while preserving the real action reservation and replay path.
+    monkeypatch.setattr(TaskService, "run", refuse_inactive_agent)
+    test_agent.is_active = False
+    await db_session.flush()
+    async with db_session.begin_nested():
+        assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    failed_retry = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "retry_task",
+    ))
+    assert failed_retry is not None and failed_retry.status == "failed"
+    assert any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
+    if legacy_settled:
+        reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+            OrchestrationBudgetReservation.discovery_run_id == run.id,
+        ))
+        await OrchestrationBudgetService().settle_discovery_source(
+            db_session, reservation, run, reason="needs_attention",
+        )
+        assert reservation.status == "settled"
+
+    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    test_agent.is_active = True
+    await db_session.flush()
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_retry", run.active_blockers
+    retries = (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "retry_task",
+    ))).all()
+    assert len(retries) == 2
+    recovered_retry = next(action for action in retries if action.id != failed_retry.id)
+    assert recovered_retry.idempotency_key != failed_retry.idempotency_key
+    assert recovered_retry.target_id is not None
+    assert (await db_session.get(Session, recovered_retry.target_id)).task_id == task.id
+    assert run.plan_state["discovery"]["retry_generation"] == 1
+    assert not any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
+    task.status = "failed"
+    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    assert run.plan_state["discovery"]["retry_generation"] == 1
+
+
+@pytest.mark.parametrize(("limiting_budget", "expired", "can_reactivate"), [
+    ("rolling", False, True), ("rolling", True, True),
+    ("rolling", False, False), ("rolling", True, False), ("total", False, False),
+])
+async def test_legacy_discovery_reservation_reactivation_respects_budget_headroom(
+    db_session, test_project, test_agent, monkeypatch, limiting_budget, expired, can_reactivate,
+):
+    goal, run, task, session, _continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    task.status = session.status = "failed"
+    session.metadata_ = {**session.metadata_, "token_count_in": 20, "token_count_out": 0,
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0}
+    budget = OrchestrationBudgetService()
+    reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
+        OrchestrationBudgetReservation.discovery_run_id == run.id,
+    ))
+    await budget.settle_discovery_source(db_session, reservation, run, reason="needs_attention")
+    now = datetime.now(timezone.utc)
+    if expired:
+        reservation.settled_at = now - timedelta(hours=2)
+    source = deepcopy(run.plan_state["continuous_policy"]["discovery_source"])
+    if limiting_budget == "rolling":
+        source["budget"]["rolling"]["limits"]["max_tokens"] = "100" if can_reactivate else "80"
+    else:
+        goal.budget = {"caps": {**goal.budget["caps"], "max_tokens": "80"}}
+    await db_session.flush()
+
+    if can_reactivate:
+        assert await budget.reactivate_discovery_source(db_session, goal, run, source, now) is reservation
+        assert reservation.status == "active" and reservation.settled_spend == {}
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await budget.reactivate_discovery_source(db_session, goal, run, source, now)
+        assert exc.value.detail == "continuous_discovery_budget_wait"
+        assert reservation.status == "settled" and reservation.settled_spend["max_tokens"] == "20"
+
+
 async def test_discovery_second_invalid_output_needs_attention_without_reassignment(
     db_session, test_project, test_agent, monkeypatch,
 ):

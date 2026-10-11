@@ -48,7 +48,9 @@ class OrchestrationMemoryService:
         for section in sections:
             provenance = section.provenance if isinstance(section.provenance, dict) else {}
             sources = [(kind, provenance.get(f"{kind}_id")) for kind in ("decision", "evidence") if f"{kind}_id" in provenance]
-            if len(sources) != 1:
+            if not sources:
+                continue
+            if len(sources) > 1:
                 unresolved += 1; continue
             kind, source_id = sources[0]
             try:

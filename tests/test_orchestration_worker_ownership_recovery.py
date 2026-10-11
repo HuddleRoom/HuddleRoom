@@ -246,7 +246,8 @@ async def test_snapshot_sessions_are_deterministically_ordered(db_session, test_
 async def test_unresolved_memory_remains_visible_while_owned_session_is_assessed(db_session, test_project, test_agent):
     goal, run, _, _, session = await _owned(db_session, test_project, test_agent)
     section = OrchestrationMemorySection(project_id=goal.project_id, goal_id=goal.id, run_id=run.id,
-        section_key="ambiguous-memory", title="memory", body="fact", created_by="test", provenance={})
+        section_key="ambiguous-memory", title="memory", body="fact", created_by="test",
+        provenance={"decision_id": str(uuid.uuid4())})
     db_session.add(section)
     await db_session.flush()
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
@@ -262,6 +263,29 @@ async def test_unresolved_memory_remains_visible_while_owned_session_is_assessed
     marker = run.supervision_state["memory_upgrade_reconciled"]
     assert replay.disposition == "live" and len(waits) == 2
     assert marker["outcome"] == "unresolved" and marker["wait_id"] in {str(wait.id) for wait in waits}
+
+
+@pytest.mark.asyncio
+async def test_owned_session_recovery_recomputes_unresolved_source_free_memory(db_session, test_project, test_agent):
+    goal, run, _, _, session = await _owned(db_session, test_project, test_agent)
+    section = OrchestrationMemorySection(project_id=goal.project_id, goal_id=goal.id, run_id=run.id,
+        section_key="goal_definition", title="goal", body="context", created_by="orchestrator:goal_definition",
+        provenance={"created_by": "orchestrator:goal_definition"})
+    db_session.add(section)
+    recovery = OrchestrationRecoveryService()
+    wait = await recovery._wait(db_session, run, None, "upgrade_reconciliation")
+    run.supervision_state = {"memory_upgrade_reconciled": {
+        "outcome": "unresolved", "unresolved": 1, "wait_id": str(wait.id),
+    }}
+    await db_session.flush()
+    snapshot = await recovery.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
+    result = await recovery.apply_goal_recovery(db_session, snapshot, {
+        session.id: RunnerObservation(session.runner_task_id, "active", datetime.now(timezone.utc)),
+    })
+    assert result.disposition == "live" and wait.status == "cleared"
+    assert run.supervision_state["memory_upgrade_reconciled"]["outcome"] == "promoted"
+    assert run.supervision_state["memory_upgrade_reconciled"]["unresolved"] == 0
+    assert section.fact_status == "unverified"
 
 
 @pytest.mark.asyncio

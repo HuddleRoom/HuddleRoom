@@ -1,5 +1,6 @@
 """Task 9 acceptance tests for goal-scoped memory provenance recovery."""
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
@@ -7,6 +8,7 @@ from sqlalchemy import select
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationEvidence, OrchestrationGate, OrchestrationGoal, OrchestrationRun, OrchestrationWait
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.models.event_log import EventLog
+from huddleroom.models.orchestration_process import OrchestrationWarning
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
 from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService
 
@@ -91,7 +93,7 @@ async def test_ambiguous_missing_candidate_and_rejected_provenance_stays_unverif
     sections = [await _section(db_session, goal, run, {}), await _section(db_session, goal, run, {"decision_id": str(rejected.id)}),
                 await _section(db_session, goal, run, {"decision_id": str(candidate.id)}),
                 await _section(db_session, goal, run, {"decision_id": str(rejected.id), "evidence_id": str(candidate.id)})]
-    assert await OrchestrationMemoryService().reconcile_accepted_sources(db_session, goal.id, run.id) == 4
+    assert await OrchestrationMemoryService().reconcile_accepted_sources(db_session, goal.id, run.id) == 3
     assert {section.fact_status for section in sections} == {"unverified"}
 
 
@@ -109,7 +111,7 @@ async def test_upgrade_with_no_owned_session_runs_from_goal_recovery(db_session,
 @pytest.mark.asyncio
 async def test_upgrade_uncertainty_creates_one_valid_run_wait(db_session, test_project):
     goal, run = await _goal_run(db_session, test_project)
-    await _section(db_session, goal, run, {})
+    await _section(db_session, goal, run, {"decision_id": str(uuid.uuid4())})
     service = OrchestrationRecoveryService()
     for _ in range(2):
         snapshot = await service.build_goal_snapshot(db_session, goal.id, __import__("datetime").datetime.now(__import__("datetime").timezone.utc))
@@ -118,6 +120,52 @@ async def test_upgrade_uncertainty_creates_one_valid_run_wait(db_session, test_p
     assert len(waits) == 1 and waits[0].owner == {"type": "run", "id": str(run.id)} and waits[0].awaited_event["event_type"]
     marker = run.supervision_state["memory_upgrade_reconciled"]
     assert marker["outcome"] == "unresolved" and marker["wait_id"] == str(waits[0].id)
+
+
+async def _orchestrator_sections(db, goal, run):
+    return [await OrchestrationMemoryService().upsert_section(
+        db, goal.project_id, goal.id, section_key=key, title=key, body="context",
+        run_id=run.id, created_by=f"orchestrator:{key}",
+    ) for key in ("goal_definition", "work_report")]
+
+
+@pytest.mark.asyncio
+async def test_source_free_orchestrator_sections_do_not_open_upgrade_wait(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    sections = await _orchestrator_sections(db_session, goal, run)
+    assert await OrchestrationMemoryService().reconcile_accepted_sources(db_session, goal.id, run.id) == 0
+    recovery = OrchestrationRecoveryService()
+    snapshot = await recovery.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
+    result = await recovery.apply_goal_recovery(db_session, snapshot, {})
+    assert result.wait_id is None
+    assert not list(await db_session.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id)))
+    assert {section.fact_status for section in sections} == {"unverified"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_status", ["open", "cleared"])
+async def test_persisted_unresolved_memory_self_heals_and_resolves_attention(db_session, test_project, wait_status):
+    goal, run = await _goal_run(db_session, test_project)
+    sections = await _orchestrator_sections(db_session, goal, run)
+    recovery = OrchestrationRecoveryService()
+    wait = await recovery._wait(db_session, run, None, "upgrade_reconciliation")
+    wait.status = wait_status
+    warning = OrchestrationWarning(goal_id=goal.id, run_id=run.id, warning_type="supervision_attention",
+        severity="warning", message="upgrade_reconciliation")
+    unrelated = OrchestrationWarning(goal_id=goal.id, run_id=run.id, warning_type="supervision_attention",
+        severity="warning", message="unknown_external_effect")
+    db_session.add_all([warning, unrelated])
+    run.supervision_state = {"memory_upgrade_reconciled": {
+        "run_id": str(run.id), "outcome": "unresolved", "unresolved": 2, "wait_id": str(wait.id),
+    }}
+    await db_session.flush()
+    snapshot = await recovery.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
+    result = await recovery.apply_goal_recovery(db_session, snapshot, {})
+    assert result.wait_id is None and wait.status == "cleared"
+    assert run.supervision_state["memory_upgrade_reconciled"]["outcome"] == "promoted"
+    assert run.supervision_state["memory_upgrade_reconciled"]["unresolved"] == 0
+    assert warning.active is False and warning.resolved_by == "system" and unrelated.active is True
+    assert {section.fact_status for section in sections} == {"unverified"}
 
 
 @pytest.mark.asyncio

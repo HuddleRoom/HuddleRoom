@@ -713,6 +713,59 @@ async def test_clean_pre_completion_starts_and_completes_in_one_advance(
 
 
 @pytest.mark.asyncio
+async def test_manual_step_starts_review_without_automatic_triggers(db_session, test_project, monkeypatch):
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+
+    goal, run = await _goal_run(db_session, test_project)
+    stub = _EffectivenessAnalyzerStub("continue")
+    process = orchestration_effectiveness_review.EffectivenessReviewProcess(stub)
+    automatic = await process.advance(db_session, goal, run)
+    assert automatic["status"] == "idle"
+    assert stub.calls == 0
+    assert await OrchestrationProcessService().get_current(db_session, goal.id, "effectiveness_review") is None
+
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_debug_service.EffectivenessReviewProcess", lambda: process,
+    )
+    manual = await OrchestrationDebugService().advance_process(db_session, goal, run, "effectiveness_review")
+    current = await OrchestrationProcessService().get_current(db_session, goal.id, "effectiveness_review")
+    assert manual["status"] == "waiting_decision"
+    assert current is not None
+    assert current.outputs["triggers"][0]["name"] == "manual"
+    assert stub.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_step_starts_successor_without_new_trigger_evidence(db_session, test_project):
+    goal, run = await _goal_run(db_session, test_project)
+    run.started_at = _utcnow() - timedelta(hours=25)
+    await db_session.flush()
+    process_service = OrchestrationProcessService()
+    triggers = await orchestration_effectiveness_review.detect_triggers(db_session, goal, run)
+    previous = await process_service.start_process(
+        db_session, goal.id, process_type="effectiveness_review",
+        trigger_reason="automatic: inactivity", run_id=run.id,
+        input_snapshot={"triggers": orchestration_effectiveness_review.serialize_triggers(triggers)},
+    )
+    await process_service.complete_process(
+        db_session, previous,
+        outputs={"triggers": orchestration_effectiveness_review.serialize_triggers(triggers)},
+    )
+    stub = _EffectivenessAnalyzerStub("continue")
+    process = orchestration_effectiveness_review.EffectivenessReviewProcess(stub)
+    assert (await process.advance(db_session, goal, run))["status"] == "completed"
+    assert stub.calls == 0
+
+    result = await process.advance(db_session, goal, run, manual=True)
+    current = await process_service.get_current(db_session, goal.id, "effectiveness_review")
+    assert result["status"] == "waiting_decision"
+    assert current.id != previous.id
+    assert current.input_snapshot["triggers"][0]["name"] == "manual"
+    assert current.trigger_reason == "manual: human requested effectiveness review"
+    assert stub.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_manual_running_review_adds_current_automatic_evidence_and_completes(
     db_session, test_project
 ):

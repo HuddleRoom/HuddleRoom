@@ -1,7 +1,7 @@
 # pylint: disable=too-many-public-methods,too-many-locals,protected-access
 
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from fastapi import HTTPException
@@ -942,6 +942,37 @@ class OrchestrationBudgetService:
                 for key in dimensions
             },
         }
+
+    async def reactivate_discovery_source(self, db, parent, run, source, now):
+        """Replace a recoverable settlement with its original, budget-checked reservation."""
+        reservation = await db.scalar(select(OrchestrationBudgetReservation).where(
+            OrchestrationBudgetReservation.discovery_run_id == run.id,
+        ))
+        if reservation is None or reservation.status == "active":
+            return reservation
+        if reservation.settlement_reason != "needs_attention":
+            raise HTTPException(status_code=409, detail="continuous_discovery_budget_wait")
+        actual, complete = await self.known_task_spend(db, self._discovery_task_ids(run), set(reservation.allocation))
+        if not complete or any(Decimal(actual[key]) > Decimal(amount) for key, amount in reservation.allocation.items()):
+            raise HTTPException(status_code=409, detail="continuous_discovery_budget_wait")
+        available = await self.discovery_available(db, parent, source, now)
+        cutoff = now - timedelta(seconds=source["budget"]["rolling"]["window_seconds"])
+        settled_at = reservation.settled_at
+        if settled_at is not None and settled_at.tzinfo is None:
+            settled_at = settled_at.replace(tzinfo=timezone.utc)
+        for key, amount in reservation.allocation.items():
+            own_spend = Decimal(reservation.settled_spend.get(key, "0"))
+            total = Decimal(available["total"][key]) + own_spend
+            rolling = Decimal(available["rolling"][key]) + (own_spend if settled_at and settled_at >= cutoff else 0)
+            if Decimal(amount) > min(total, rolling):
+                raise HTTPException(status_code=409, detail="continuous_discovery_budget_wait")
+        reservation.status = "active"
+        reservation.settled_spend = {}
+        reservation.settled_at = None
+        reservation.settlement_reason = None
+        reservation.measurement_complete = True
+        await db.flush()
+        return reservation
 
     async def reserve_discovery_source(self, db, parent, run, source, now):
         existing = await db.scalar(select(OrchestrationBudgetReservation).where(

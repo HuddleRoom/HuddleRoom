@@ -137,6 +137,11 @@ def _criteria(goal: OrchestrationGoal) -> list[tuple[str, str]]:
     return list(seen.items())
 
 
+def unreleased_plan_item_ids(run: OrchestrationRun) -> list[str]:
+    """Accepted plan items that have not been expanded into producer tasks."""
+    return [item["item_id"] for item in _plan_items(run, [], []) if item["task_id"] is None]
+
+
 def _orchestration_meta(task: Task) -> dict:
     meta = task.metadata_ or {}
     orchestration = meta.get("orchestration") if isinstance(meta, dict) else None
@@ -213,6 +218,22 @@ async def _follow_up_rows(
 ) -> list[tuple[int, datetime, str, dict]]:
     """(rank, created_at, id, item) per untracked follow-up, in source order."""
     rows: list[tuple[int, datetime, str, dict]] = []
+
+    from huddleroom.services.orchestration_service import TASK_SCOPED_AUTH_DENIALS
+    queued_ids = set(await _unstarted_queued_ids(db, run, tasks))
+    for task in tasks:
+        wait = _orchestration_meta(task).get("authorization_wait")
+        if task.id not in queued_ids or not isinstance(wait, dict):
+            continue
+        reason = wait.get("reason_code")
+        if reason not in TASK_SCOPED_AUTH_DENIALS:
+            continue
+        rows.append((RANK_STALLED_TASK, _naive_utc(task.created_at), str(task.id), {
+            "kind": "authorization_wait",
+            "id": str(task.id),
+            "summary": f"{task.title}: authorization denied ({reason})"[:FOLLOW_UP_SUMMARY_MAX],
+            "suggested_actions": ["reassign_task", "ask_human"],
+        }))
 
     meeting_ids = list((await db.execute(
         select(Meeting.id).where(Meeting.source_task_id.in_([task.id for task in tasks]))

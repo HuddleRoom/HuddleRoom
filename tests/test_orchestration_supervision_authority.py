@@ -104,6 +104,64 @@ async def test_runtime_answer_applies_exactly_once_and_rejects_conflict(db_sessi
         )
 
 
+@pytest.mark.parametrize("question", ["Approve deployment?", "Approve " + "deployment " * 30 + "?"])
+async def test_ask_human_decision_can_be_fetched_and_answered_with_contract_version(
+    db_session, test_project, client, auth_headers, question
+):
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="Approve deployment", status="active",
+        success_criteria=[{"key": "done", "description": "Done"}],
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id, status="running")
+    db_session.add(run)
+    await db_session.flush()
+    reason = "The production rollout needs operator approval."
+    action = await OrchestrationService().execute_ask_human_action(
+        db_session, run.id,
+        {"action_type": "ask_human", "question": question, "reason": reason,
+         "contract_version": "plan:1", "options": [{"key": "approve"}],
+         "continuation": {"action_type": "continue"}},
+        f"run:{run.id}:kind:ask_human:deployment",
+    )
+    base = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/decisions"
+    response = await client.get(base, headers=auth_headers)
+    assert response.status_code == 200
+    decision = next(row for row in response.json() if row["id"] == str(action.target_id))
+    assert decision["runtime_identity"]
+    assert decision["contract_version"] == "plan:1"
+    assert decision["title"] == question[:255]
+    assert "run:" not in decision["title"]
+    assert decision["question"] == question
+    assert decision["context"] == reason
+    missing_version = await client.post(
+        f"{base}/{decision['id']}/answer", headers=auth_headers,
+        json={"selected_option": "approve"},
+    )
+    assert missing_version.status_code == 400
+    assert missing_version.json()["detail"] == "contract_version is required for runtime decisions"
+    stale_version = await client.post(
+        f"{base}/{decision['id']}/answer", headers=auth_headers,
+        json={"selected_option": "approve", "contract_version": "plan:stale"},
+    )
+    assert stale_version.status_code == 200
+    assert stale_version.json()["continuation_applied"] is False
+    assert stale_version.json()["decision"]["status"] == "pending"
+    answer = await client.post(
+        f"{base}/{decision['id']}/answer", headers=auth_headers,
+        json={"selected_option": "approve", "contract_version": decision["contract_version"]},
+    )
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["continuation_applied"] is True
+    assert answer.json()["decision"]["status"] == "answered"
+    continuation = await db_session.get(
+        OrchestrationAction, uuid.UUID(answer.json()["decision"]["continuation_action_id"])
+    )
+    assert continuation.run_id == run.id
+    assert continuation.status == "completed"
+
+
 async def test_runtime_answer_rejects_unauthorized_actor_and_stale_contract(db_session, test_project, test_user):
     service, _, run, decision = await _runtime_decision(db_session, test_project)
     with pytest.raises(ValueError, match="human"):

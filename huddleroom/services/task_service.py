@@ -132,7 +132,11 @@ class TaskService:
         if data.trigger is not None:
             task.trigger = data.trigger
         if data.metadata is not None:
-            task.metadata_ = data.metadata
+            metadata = dict(data.metadata)
+            for key in ("orchestration", "orchestration_contract"):
+                if key in (task.metadata_ or {}):
+                    metadata[key] = task.metadata_[key]
+            task.metadata_ = metadata
         if data.due_at is not None:
             task.due_at = data.due_at
         await db.flush()

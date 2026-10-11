@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 import sqlalchemy as sa
+from fastapi import HTTPException
 
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
@@ -113,6 +114,30 @@ async def test_create_goal_starts_gated_and_authorize_unlocks_tick(
     # Idempotent: calling again is a no-op, not an error.
     goal, run = await service.authorize_baseline(db_session, test_project.id, goal.id, actor="human:test")
     assert run.baseline_authorized is True
+
+
+@pytest.mark.asyncio
+async def test_authorize_baseline_rejects_paused_goal(db_session, test_project):
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="Ship X", original_request="Ship X",
+        success_criteria=[], constraints={}, budget={}, status="paused",
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(
+        goal_id=goal.id, status="paused", phase="baseline", baseline_authorized=False,
+    )
+    db_session.add(run)
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await OrchestrationService().authorize_baseline(
+            db_session, test_project.id, goal.id, actor="human:test",
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["conflict"] == "goal_not_runnable"
+    await db_session.refresh(run)
+    assert run.baseline_authorized is False
 
 
 @pytest.mark.asyncio

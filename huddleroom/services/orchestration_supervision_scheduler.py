@@ -230,7 +230,7 @@ class OrchestrationSupervisionScheduler:
         from huddleroom.services.orchestration_service import OrchestrationService
         from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 
-        reason = f"Supervision judgment is failing repeatedly; retrying at {retry_at.isoformat()}"
+        reason = "Supervision judgment is failing repeatedly"
         warning = await OrchestrationWarningService().create_warning(
             db, goal.id, warning_type="supervision_judgment_failures", severity="warning",
             message=reason, run_id=run.id,

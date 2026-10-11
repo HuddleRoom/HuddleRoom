@@ -212,6 +212,7 @@ class OrchestrationAuthorityDecisionService:
         continuation: dict,
         question: str,
         options: list[dict],
+        context: str | None = None,
     ) -> OrchestrationAuthorityDecision:
         if authority != "human":
             raise ValueError("runtime questions require human authority")
@@ -237,13 +238,13 @@ class OrchestrationAuthorityDecisionService:
             goal_id=goal_id,
             run_id=run_id,
             decision_key=f"runtime:{identity}",
-            title=f"Runtime decision: {subject}",
+            title=question[:255],
             authority=authority,
             runtime_identity=identity,
             contract_version=contract_version,
             continuation=continuation,
             question=question,
-            context=f"Blocked action: {subject}",
+            context=context,
             options=options,
         )
         try:

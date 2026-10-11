@@ -78,6 +78,7 @@ from huddleroom.models.orchestration_process import (
     OrchestrationWarning,
 )
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
+from huddleroom.models.orchestration_conversation import ConversationMessage
 from huddleroom.models.orchestration_steering import OrchestrationSteeringProposal, OrchestrationSteeringRequest
 from huddleroom.services.orchestration_authority_interview import build_checkpoint, sync_deferred_questions_memory
 from huddleroom.services.orchestration_authority_service import (
@@ -2921,6 +2922,7 @@ class OrchestrationService:
                 continuation=self._json_object_or_empty(stored_request.get("continuation")) or {"action_type": "continue"},
                 question=question,
                 options=stored_request.get("options") or [{"key": "acknowledge"}],
+                context=self._optional_string(stored_request.get("reason")),
             )
         except ValueError as exc:
             await self._fail_reserved_action_for_current_flow(db, action, str(exc))
@@ -3925,9 +3927,8 @@ class OrchestrationService:
                 max_tokens=action.request.get("max_tokens"),
             )
         except HTTPException as exc:
-            from huddleroom.services.session_service import SessionClaimAttention, SessionService
-            if isinstance(exc, SessionClaimAttention):
-                await SessionService.persist_claim_attention(db, exc)
+            from huddleroom.services.session_service import SessionService
+            if await SessionService.handle_claim_refusal(db, exc):
                 await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
                 return action
             await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
@@ -4023,11 +4024,10 @@ class OrchestrationService:
             task.status = previous_status
             await db.flush()
             error = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
-            from huddleroom.services.session_service import SessionClaimAttention, SessionService
-            if isinstance(exc, SessionClaimAttention):
-                await SessionService.persist_claim_attention(db, exc)
+            from huddleroom.services.session_service import SessionService
+            claim_refused = await SessionService.handle_claim_refusal(db, exc)
             await self._fail_reserved_action_for_current_flow(db, action, error)
-            if isinstance(exc, SessionClaimAttention):
+            if claim_refused:
                 return action
             raise
         run = await db.get(OrchestrationRun, run_id)
@@ -6073,6 +6073,10 @@ class OrchestrationService:
         goal: OrchestrationGoal,
         run: OrchestrationRun,
     ) -> dict[str, Any]:
+        from huddleroom.services.orchestration_progress_view import unreleased_plan_item_ids
+        unreleased_items = unreleased_plan_item_ids(run)
+        if unreleased_items:
+            raise HTTPException(status_code=409, detail="Accepted plan items are unreleased: " + ", ".join(unreleased_items))
         active_warnings = await OrchestrationWarningService().list_warnings(
             db, goal.id, active_only=True
         )
@@ -7235,18 +7239,23 @@ class OrchestrationService:
         Idempotent (no-op once already authorized). Requires the goal's active
         run to still be in the 'baseline' phase.
         """
-        goal = await self.get_goal(db, project_id, goal_id)
-        if goal is None:
-            raise HTTPException(status_code=404, detail="Orchestration goal not found")
-        run = await self.get_active_run_for_goal(db, project_id, goal_id)
-        if run is None:
-            raise self._start_conflict("goal_not_runnable", "Goal has no active run")
-        if run.phase != "baseline":
-            raise self._start_conflict("baseline_complete", f"Run phase is {run.phase}")
-        if not run.baseline_authorized:
-            run.baseline_authorized = True
-            await db.flush()
-        return goal, run
+        async with self._lock_goal_for_baseline_transition(db, goal_id):
+            goal = await self.get_goal(db, project_id, goal_id)
+            if goal is None:
+                raise HTTPException(status_code=404, detail="Orchestration goal not found")
+            if goal.status not in ("active", "blocked"):
+                raise self._start_conflict(
+                    "goal_not_runnable", f"Cannot start baseline for goal in status '{goal.status}'",
+                )
+            run = await self.get_active_run_for_goal(db, project_id, goal_id)
+            if run is None:
+                raise self._start_conflict("goal_not_runnable", "Goal has no active run")
+            if run.phase != "baseline":
+                raise self._start_conflict("baseline_complete", f"Run phase is {run.phase}")
+            if not run.baseline_authorized:
+                run.baseline_authorized = True
+                await db.flush()
+            return goal, run
 
     async def _record_reauthorization(
         self,
@@ -7546,6 +7555,55 @@ class OrchestrationService:
             or_(OrchestrationRun.supersedes_run_id.is_not(None), OrchestrationRun.terminal_reason.is_not(None)),
         ).limit(1)) is not None
 
+    async def _require_resettable_goal(self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID):
+        # Fetch goal fresh and verify it belongs to project_id
+        goal = await db.scalar(
+            select(OrchestrationGoal)
+            .where(
+                OrchestrationGoal.id == goal_id,
+                OrchestrationGoal.project_id == project_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        if goal is None:
+            raise HTTPException(status_code=404, detail="Orchestration goal not found")
+        if goal.status in ("completed", "cancelled"):
+            raise HTTPException(status_code=409, detail=f"Cannot reset goal in status '{goal.status}'")
+        child_lineage = (
+            goal.parent_goal_id is not None
+            or await db.scalar(select(OrchestrationRoadmapItem.id).where(
+                OrchestrationRoadmapItem.child_goal_id == goal.id
+            )) is not None
+            or await db.scalar(select(OrchestrationBudgetReservation.id).where(
+                OrchestrationBudgetReservation.child_goal_id == goal.id,
+                OrchestrationBudgetReservation.status == "active",
+            )) is not None
+        )
+        owned_roadmap_lineage = goal.goal_type == "roadmap" and (
+            await db.scalar(select(OrchestrationRoadmapVersion.id).where(
+                OrchestrationRoadmapVersion.goal_id == goal.id
+            )) is not None
+            or await db.scalar(select(OrchestrationRoadmapItem.id).where(
+                OrchestrationRoadmapItem.goal_id == goal.id
+            )) is not None
+        )
+        owned_continuous_lineage = goal.goal_type == "continuous" and (
+            bool((goal.continuous_state or {}).get("started_at"))
+            or await db.scalar(select(OrchestrationGoal.id).where(
+                OrchestrationGoal.parent_goal_id == goal.id,
+                OrchestrationGoal.continuous_origin_key.is_not(None),
+            ).limit(1)) is not None
+            or await db.scalar(select(OrchestrationBudgetReservation.id).where(
+                OrchestrationBudgetReservation.parent_goal_id == goal.id,
+                OrchestrationBudgetReservation.continuous_origin_key.is_not(None),
+            ).limit(1)) is not None
+        )
+        if (child_lineage or owned_roadmap_lineage or owned_continuous_lineage
+                or await self.has_type_correction_lineage(db, goal.id)):
+            raise HTTPException(status_code=409, detail="Cannot reset goal with immutable execution lineage")
+
+        return goal
+
     async def reset_goal(
         self,
         db: AsyncSession,
@@ -7561,52 +7619,12 @@ class OrchestrationService:
         caller_owns_transaction = (
             transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
         )
-        async with self._lock_goal_for_baseline_transition(db, goal_id):
-            # Fetch goal fresh and verify it belongs to project_id
-            goal = await db.scalar(
-                select(OrchestrationGoal)
-                .where(
-                    OrchestrationGoal.id == goal_id,
-                    OrchestrationGoal.project_id == project_id,
-                )
-                .execution_options(populate_existing=True)
-            )
-            if goal is None:
-                raise HTTPException(status_code=404, detail="Orchestration goal not found")
-            if goal.status in ("completed", "cancelled"):
-                raise HTTPException(status_code=409, detail=f"Cannot reset goal in status '{goal.status}'")
-            child_lineage = (
-                goal.parent_goal_id is not None
-                or await db.scalar(select(OrchestrationRoadmapItem.id).where(
-                    OrchestrationRoadmapItem.child_goal_id == goal.id
-                )) is not None
-                or await db.scalar(select(OrchestrationBudgetReservation.id).where(
-                    OrchestrationBudgetReservation.child_goal_id == goal.id,
-                    OrchestrationBudgetReservation.status == "active",
-                )) is not None
-            )
-            owned_roadmap_lineage = goal.goal_type == "roadmap" and (
-                await db.scalar(select(OrchestrationRoadmapVersion.id).where(
-                    OrchestrationRoadmapVersion.goal_id == goal.id
-                )) is not None
-                or await db.scalar(select(OrchestrationRoadmapItem.id).where(
-                    OrchestrationRoadmapItem.goal_id == goal.id
-                )) is not None
-            )
-            owned_continuous_lineage = goal.goal_type == "continuous" and (
-                bool((goal.continuous_state or {}).get("started_at"))
-                or await db.scalar(select(OrchestrationGoal.id).where(
-                    OrchestrationGoal.parent_goal_id == goal.id,
-                    OrchestrationGoal.continuous_origin_key.is_not(None),
-                ).limit(1)) is not None
-                or await db.scalar(select(OrchestrationBudgetReservation.id).where(
-                    OrchestrationBudgetReservation.parent_goal_id == goal.id,
-                    OrchestrationBudgetReservation.continuous_origin_key.is_not(None),
-                ).limit(1)) is not None
-            )
-            if (child_lineage or owned_roadmap_lineage or owned_continuous_lineage
-                    or await self.has_type_correction_lineage(db, goal.id)):
-                raise HTTPException(status_code=409, detail="Cannot reset goal with immutable execution lineage")
+        from huddleroom.services.orchestration_baseline_runtime import reset_baseline
+        await self._require_resettable_goal(db, project_id, goal_id)
+        if not caller_owns_transaction:
+            await db.rollback()
+        async with reset_baseline(goal_id), self._lock_goal_for_baseline_transition(db, goal_id):
+            goal = await self._require_resettable_goal(db, project_id, goal_id)
 
             # Bulk-delete goal-keyed tables (goal-keyed deletes first, then the run)
             await db.execute(delete(OrchestrationProcessRun).where(OrchestrationProcessRun.goal_id == goal_id))
@@ -7619,6 +7637,8 @@ class OrchestrationService:
             # Steering requests (DB-cascades transitions + result_links, which otherwise RESTRICT
             # the run's decisions/actions) and proposals; steering state is kept.
             await db.execute(delete(OrchestrationSteeringRequest).where(OrchestrationSteeringRequest.goal_id == goal_id))
+            # Conversation children (responses, feedback, reservations and proposals) cascade.
+            await db.execute(delete(ConversationMessage).where(ConversationMessage.goal_id == goal_id))
             await db.execute(delete(OrchestrationSteeringProposal).where(OrchestrationSteeringProposal.goal_id == goal_id))
 
             # Delete goal's run row(s) — CASCADEs run-keyed children (decisions/actions/gates/evidence/agent_suggestions)
@@ -10814,7 +10834,36 @@ class OrchestrationService:
                 return False
         return True
 
+    async def _clear_obsolete_authorization_blockers(self, db: AsyncSession, run: OrchestrationRun) -> None:
+        """Keep claim blockers only while their tasks are waiting to start."""
+        scoped_tasks = {}
+        for blocker in run.active_blockers or []:
+            scope = blocker.get("scope") if isinstance(blocker, dict) else None
+            if isinstance(scope, str) and scope.startswith("authorization:"):
+                task_id = self._event_uuid(scope.removeprefix("authorization:"))
+                if task_id is not None:
+                    scoped_tasks[scope] = task_id
+        if not scoped_tasks:
+            return
+        waiting_ids = set((await db.scalars(select(Task.id).where(
+            Task.id.in_(scoped_tasks.values()), Task.status.in_(("backlog", "queued")),
+        ))).all())
+        run.active_blockers = [
+            blocker for blocker in run.active_blockers or []
+            if not isinstance(blocker, dict)
+            or blocker.get("scope") not in scoped_tasks
+            or scoped_tasks[blocker["scope"]] in waiting_ids
+        ]
+
     async def tick(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False) -> dict:
+        try:
+            return await self._tick_baseline_impl(db, run_id, local_only=local_only)
+        except HTTPException as exc:
+            if exc.status_code == 409 and exc.detail == "Baseline operation discarded by reset":
+                return {"run_id": str(run_id), "status": "interrupted", "interrupted": True}
+            raise
+
+    async def _tick_baseline_impl(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False) -> dict:
         """No-op control-loop tick: consume new events, advance cursor, emit once."""
         # Preserve a caller's explicit transaction, but own SQLAlchemy's implicit
         # AUTOBEGIN transaction (including route preflight reads) so commit stays
@@ -10831,12 +10880,16 @@ class OrchestrationService:
             raise HTTPException(status_code=404, detail="Orchestration run not found")
         goal_id = run_temp.goal_id
 
+        from huddleroom.services.orchestration_baseline_runtime import baseline_operation, require_baseline_available
+        require_baseline_available(goal_id)
         # Lock goal-level to serialize concurrent ticks and force-starts on the same goal.
         # This prevents: (a) baseline_ready stale-gate race; (b) concurrent completion race.
         async with self._lock_goal_for_baseline_transition(
             db,
             goal_id,
             tick_owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(),
+        ), baseline_operation(
+            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(), tick=True
         ):
             # Reload run and goal inside lock with populate_existing=True (fix #5).
             run = await db.execute(
@@ -10856,6 +10909,7 @@ class OrchestrationService:
             goal = goal.scalar_one_or_none()
             if goal is None:
                 raise HTTPException(status_code=404, detail="Orchestration goal not found")
+            await self._clear_obsolete_authorization_blockers(db, run)
             from huddleroom.services.orchestration_steering import OrchestrationSteeringService
             steering_processing = await OrchestrationSteeringService().process_pending(db, goal, run)
             if local_only:

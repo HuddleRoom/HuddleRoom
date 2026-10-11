@@ -844,12 +844,16 @@ async def test_three_failures_escalate_once_and_success_recovers(db_session, tes
     backoff = clock["t"] + timedelta(seconds=settings.orchestration_semantic_progress_seconds)
     assert state["judgment_due_at"] == backoff.isoformat()
     assert blockers[0]["next_retry_at"] == backoff.isoformat() and backoff > clock["t"]
-    assert not any(ch.isdigit() for ch in warnings[0].message.split("retrying at")[0])
+    assert warnings[0].message == "Supervision judgment is failing repeatedly"
+    warning_id = warnings[0].id
 
     clock["t"] += timedelta(hours=1)
     await evaluate(fail)  # 4th failure; backoff due blocks the in-pass retry
     _state, warnings, blockers = await snapshot()
     assert len(warnings) == 1 and len(blockers) == 1 and blockers[0]["failure_count"] == 4
+    assert warnings[0].id == warning_id
+    assert warnings[0].message == "Supervision judgment is failing repeatedly"
+    assert blockers[0]["next_retry_at"] != backoff.isoformat()
 
     clock["t"] += timedelta(hours=1)
     await evaluate(ok)

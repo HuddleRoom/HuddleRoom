@@ -33,6 +33,18 @@ class SessionClaimAttention(HTTPException):
 
 class SessionService:
     @staticmethod
+    async def handle_claim_refusal(db: AsyncSession, exc: Exception) -> bool:
+        """Recognize claim refusals that recovery should treat as a no-op."""
+        if isinstance(exc, SessionClaimAttention):
+            await SessionService.persist_claim_attention(db, exc)
+            return True
+        return (
+            isinstance(exc, HTTPException)
+            and exc.status_code == 409
+            and exc.detail == "authorization_denied: run_not_active"
+        )
+
+    @staticmethod
     def _positive_limit(value: object, label: str) -> int:
         if isinstance(value, bool):
             raise HTTPException(status_code=422, detail=f"{label} must be a positive whole number")
@@ -522,7 +534,7 @@ class SessionService:
         run = await db.get(OrchestrationRun, run_id)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
         if run is None or goal is None:
-            return
+            raise HTTPException(status_code=409, detail="authorization_denied: lineage_invalid")
         result = await effective_authorization(db, goal, run, task)
         scope = f"authorization:{task.id}"
         if result.allowed:
@@ -541,7 +553,7 @@ class SessionService:
 
     async def preflight_claim(self, db: AsyncSession, task: Task, agent: Agent,
                               adapter_override: str | None = None) -> None:
-        """Read-only Roadmap claim validation for callers that mutate task state."""
+        """Validate a claim and clear its authorization blocker when allowed."""
         adapter_type = self._resolve_adapter_type(agent, task, adapter_override)
         context = await self._immutable_roadmap_context(db, task)
         roadmap = context.get("roadmap", {}) if isinstance(context, dict) else {}

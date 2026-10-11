@@ -247,6 +247,28 @@ class OrchestrationRecoveryService:
             wait.status = "cleared"
             wait.cleared_at = datetime.now(timezone.utc)
 
+    async def _clear_memory_upgrade_attention(self, db: AsyncSession, run: OrchestrationRun) -> None:
+        from huddleroom.models.orchestration_process import OrchestrationWarning
+        from huddleroom.services.orchestration_supervision import OrchestrationSupervisionService
+        from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+        await OrchestrationSupervisionService(None).clear_matching_waits(
+            db, run, event_type="memory.upgrade_resolved", matcher={
+                "goal_id": str(run.goal_id), "run_id": str(run.id),
+                "source": "accepted_source_reconciliation",
+            },
+        )
+        warnings = list(await db.scalars(select(OrchestrationWarning).where(
+            OrchestrationWarning.run_id == run.id,
+            OrchestrationWarning.warning_type == "supervision_attention",
+            OrchestrationWarning.message == "upgrade_reconciliation",
+            OrchestrationWarning.active.is_(True),
+        )))
+        for warning in warnings:
+            await OrchestrationWarningService().resolve_warning(
+                db, warning, resolved_by="system", reason="Memory source reconciliation resolved",
+            )
+
     @staticmethod
     def _current_session(sessions: tuple[OwnedSessionSnapshot, ...]) -> OwnedSessionSnapshot | None:
         """Prefer a current attempt; historical terminal attempts are fallback only."""
@@ -291,9 +313,12 @@ class OrchestrationRecoveryService:
             from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
             memory_marker = (run.supervision_state or {}).get("memory_upgrade_reconciled")
             session = self._current_session(snapshot.sessions)
-            unresolved = int(memory_marker.get("unresolved", 0)) if isinstance(memory_marker, dict) else await OrchestrationMemoryService().reconcile_accepted_sources(
+            reconcile_memory = not isinstance(memory_marker, dict) or memory_marker.get("outcome") == "unresolved"
+            unresolved = await OrchestrationMemoryService().reconcile_accepted_sources(
                 db, snapshot.goal_id, snapshot.run_id
-            )
+            ) if reconcile_memory else int(memory_marker.get("unresolved", 0))
+            if not unresolved:
+                await self._clear_memory_upgrade_attention(db, run)
             if session is None:
                 wait = await self._wait(db, run, None, "upgrade_reconciliation") if unresolved else None
                 if wait is not None:
@@ -315,7 +340,7 @@ class OrchestrationRecoveryService:
                 action = await self._completed_noop(db, run, None)
                 return RecoveryResult("memory_only", "memory_only", snapshot.goal_id,
                                       action_id=action.id if action else None, wait_id=wait.id if wait else None)
-            if not isinstance(memory_marker, dict) and not unresolved:
+            if reconcile_memory and not unresolved:
                 state = dict(run.supervision_state or {})
                 state["memory_upgrade_reconciled"] = {
                     "run_id": str(run.id), "outcome": "promoted", "unresolved": 0,

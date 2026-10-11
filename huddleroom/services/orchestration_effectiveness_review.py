@@ -704,24 +704,33 @@ class EffectivenessReviewProcess:
         db: AsyncSession,
         goal: OrchestrationGoal,
         run: OrchestrationRun,
+        *,
+        manual: bool = False,
     ) -> dict:
         current = await self.process_service.get_current(db, goal.id, PROCESS_TYPE)
         if current is not None and current.status == "skipped":
             return self._summary("skipped")
         if current is None or current.status == "completed":
             triggers = await detect_triggers(db, goal, run)
-            if not triggers or not await has_new_trigger_evidence(db, goal.id, triggers):
+            has_new_evidence = bool(triggers) and await has_new_trigger_evidence(db, goal.id, triggers)
+            if not has_new_evidence and not manual:
                 disposition = (
                     current.outputs.get("recommended_disposition")
                     if current is not None and isinstance(current.outputs, dict)
                     else None
                 )
                 return self._summary(current.status if current is not None else "idle", recommended_disposition=disposition)
+            if not has_new_evidence:
+                triggers = []
             current = await self.process_service.start_process(
                 db,
                 goal.id,
                 process_type=PROCESS_TYPE,
-                trigger_reason="automatic: " + ", ".join(trigger.name for trigger in triggers),
+                trigger_reason=(
+                    "manual: human requested effectiveness review"
+                    if not triggers
+                    else "automatic: " + ", ".join(trigger.name for trigger in triggers)
+                ),
                 run_id=run.id,
                 input_snapshot={"triggers": serialize_triggers(triggers)},
             )

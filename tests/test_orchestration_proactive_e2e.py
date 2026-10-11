@@ -1125,6 +1125,9 @@ async def test_no_progress_ask_state_survives_a_real_tick_and_reasks(db_session,
                 metadata_={"orchestration": {"run_id": str(run.id)}})
     db_session.add(task)
     await db_session.flush()
+    run.plan_state = {**run.plan_state, "expanded_items": [
+        {"plan_item_id": "released-item", "task_id": str(task.id)},
+    ]}
     db_session.add(Session(project_id=test_project.id, task_id=task.id, agent_id=agent.id, adapter_type="api", status="running"))
     await db_session.flush()
     _situation(monkeypatch, untracked_follow_ups=[STUCK])

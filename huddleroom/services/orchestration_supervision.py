@@ -24,6 +24,7 @@ from huddleroom.services.orchestration_decision_validator import (
     OPTIONAL_ACTION_FIELDS,
 )
 from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, root_goal_id
+from huddleroom.services.orchestration_progress_view import unreleased_plan_item_ids
 
 UNCHANGED_WAKE_LIMIT = 3
 VERIFICATION_ATTEMPT_LIMIT = 3
@@ -284,10 +285,10 @@ class OrchestrationSupervisionService:
     @staticmethod
     def _actionable(situation, held) -> tuple[list[dict], list[str]]:
         """Follow-ups and no_work criterion keys the orchestrator could act on now; a stalled task held by a provider/dependency, or a gate awaiting an owner answer, is not."""
-        follow_ups = [i for i in situation.untracked_follow_ups if not (i.get("kind") in ("stalled_task", "unverified_gate") and i["id"] in held)]
+        follow_ups = [i for i in situation.untracked_follow_ups if not (i.get("kind") in ("stalled_task", "authorization_wait", "unverified_gate") and i["id"] in held)]
         return follow_ups, sorted(c["criterion_key"] for c in situation.progress_view if c["state"] == "no_work")
 
-    async def _proactive_outcome(self, db, run, situation, held, state, now, commitments=()):
+    async def _proactive_outcome(self, db, run, situation, held, state, now, commitments=(), unreleased_items=()):
         """Proactive work exists: reconsider it; once the same work survived UNCHANGED_WAKE_LIMIT ticks, ask the owner once.
 
         # ponytail: time-gated counter (wake_max_seconds * 2**asks between increments), not per-wake tracking.
@@ -298,6 +299,7 @@ class OrchestrationSupervisionService:
         digest = self.orchestration._stable_hash({
             "follow_up_ids": sorted(i["id"] for i in follow_ups), "no_work_ids": no_work,
             **({"commitment_ids": sorted(c["id"] for c in commitments)} if commitments else {}),
+            **({"unreleased_plan_item_ids": sorted(unreleased_items)} if unreleased_items else {}),
         })
         unchanged = dict(state.get("unchanged") or {})
         # Any open owner question means the run is waiting on a human: neither count nor ask again.
@@ -325,7 +327,8 @@ class OrchestrationSupervisionService:
             return {"outcome": "continue"}
         generation = int(state.get("no_progress_asks") or 0)
         items = [i["summary"] for i in follow_ups] + [f"criterion {k} has no work in flight" for k in no_work] + [
-            f"meeting commitment {c['id']} ({c['description']}) unresolved: {c['reason']}" for c in commitments]
+            f"meeting commitment {c['id']} ({c['description']}) unresolved: {c['reason']}" for c in commitments] + [
+            f"plan item {item_id} is unreleased" for item_id in unreleased_items]
         action = await self.orchestration.execute_ask_human_action(db, run.id, {
             "action_type": "ask_human",
             "question": f"Orchestration made no progress after {UNCHANGED_WAKE_LIMIT} wakes. Still stuck: " + "; ".join(items) + ". How should it proceed?",
@@ -632,14 +635,25 @@ class OrchestrationSupervisionService:
                 OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()} - {"None", ""}
         future = [wait for wait in waits if not is_due(wait)]
         has_slot = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id)) > 0
+        unreleased_items = unreleased_plan_item_ids(run)
+        has_proactive_work = await self._has_proactive_work(situation_getter, held, has_slot)
+        from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
+        # Idle commitments need the same no-progress tracking as follow-ups.
+        open_commitments = [c for c in await meeting_commitments(db, run) if not c["fulfilled"]]
+        idle_commitments = open_commitments if not active_tasks else []
+        if not (has_proactive_work or unreleased_items or idle_commitments):
+            state.pop("unchanged", None)
+            run.supervision_state = state
         proactive = (
             (plan_accepted or plan_in_flight(run.plan_state))
             and (future or active_meeting is not None or active_graph_run is not None)
             and all((w.owner or {}).get("type") in SYSTEM_WAIT_OWNER_TYPES for w in future)
-            and await self._has_proactive_work(situation_getter, held, has_slot)
+            and has_proactive_work
         )
         if proactive:
-            result = await self._proactive_outcome(db, run, await situation_getter(), held, state, now)
+            result = await self._proactive_outcome(
+                db, run, await situation_getter(), held, state, now, unreleased_items=unreleased_items,
+            )
             if result is not None:
                 return result
         if active_meeting is not None or active_graph_run is not None:
@@ -660,12 +674,12 @@ class OrchestrationSupervisionService:
             OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
             OrchestrationGate.gate_type.not_in(NON_BLOCKING_GATE_TYPES),  # ad-hoc/retained gates never block closeout
         ).limit(1)) is not None
-        from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
         # Closeout rejects unfulfilled meeting commitments; let the orchestrator see them instead of idling.
-        open_commitments = [c for c in await meeting_commitments(db, run) if not c["fulfilled"]]
         commitments_open = bool(open_commitments)
-        idle_commitments = open_commitments if not active_tasks else []  # in-flight work already drives the run
-        if allow_release and not active_tasks and plan_accepted and not has_open_gate and not commitments_open:
+        run.active_blockers = [blocker for blocker in (run.active_blockers or []) if not (
+            isinstance(blocker, Mapping) and blocker.get("kind") == "plan_items_unreleased"
+        )] + ([{"kind": "plan_items_unreleased", "scope": "supervision", "item_ids": unreleased_items}] if unreleased_items else [])
+        if allow_release and not active_tasks and plan_accepted and not has_open_gate and not commitments_open and not unreleased_items:
             fingerprint = self.orchestration._stable_hash({"plan": run.plan_state, "run_id": str(run.id)})
             run.active_blockers = [blocker for blocker in run.active_blockers if not (
                 isinstance(blocker, Mapping) and blocker.get("kind") == "everyone_idle"
@@ -677,8 +691,10 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "closeout_ready", "fingerprint": fingerprint}
             run.supervision_state = state
             return {"outcome": "closeout_ready", "action_id": str(action.id), "fingerprint": fingerprint}
-        if plan_accepted and (idle_commitments or await self._has_proactive_work(situation_getter, held, has_slot)):
-            result = await self._proactive_outcome(db, run, await situation_getter(), held, state, now, idle_commitments)
+        if plan_accepted and (unreleased_items or idle_commitments or has_proactive_work):
+            result = await self._proactive_outcome(
+                db, run, await situation_getter(), held, state, now, idle_commitments, unreleased_items,
+            )
             if result is not None:
                 return result
         if not has_slot:  # every root slot is taken: a typed bounded wait, no provider call or blocker

@@ -792,6 +792,30 @@ async def test_pending_decision_makes_gate_not_actionable_and_uncounted(db_sessi
     assert gate.status == "open"
 
 
+async def test_no_proactive_work_clears_unchanged_counter(db_session, test_project, monkeypatch):
+    from tests.test_orchestration_progress_view import _action_item, _meeting, _task as _pv_task
+
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted"}
+    service = OrchestrationService()
+    await _no_release(service, monkeypatch)
+    source = await _pv_task(db_session, test_project, run)
+    source.status = "done"
+    meeting = await _meeting(db_session, test_project, source)
+    meeting.status = "completed"
+    item = await _action_item(db_session, meeting, description="Ship the thing")
+    await db_session.flush()
+    await service.supervision.reconcile_local(db_session, goal, run)
+    assert run.supervision_state["unchanged"]["n"] == 1
+
+    await db_session.delete(item)
+    await db_session.flush()
+    result = await service.supervision.reconcile_local(db_session, goal, run)
+
+    assert result["outcome"] == "closeout_ready"
+    assert "unchanged" not in run.supervision_state
+
+
 async def test_identical_supervision_question_after_answer_is_new_ask(db_session, test_project):
     goal, run = await _run(db_session, test_project)
     supervision = OrchestrationService().supervision

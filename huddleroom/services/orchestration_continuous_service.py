@@ -223,8 +223,9 @@ class OrchestrationContinuousService:
             run_kwargs["max_tokens"] = int(Decimal(source["budget"]["per_cycle"]["max_tokens"]))
         try:
             _, session_id = await task_service.run(db, goal.project_id, task.id, **run_kwargs)
-        except SessionClaimAttention as exc:
-            await SessionService.persist_claim_attention(db, exc)
+        except HTTPException as exc:
+            if not await SessionService.handle_claim_refusal(db, exc):
+                raise
             await OrchestrationBudgetService().settle_discovery_source(db, reservation, run, reason="needs_attention")
             self.orchestration._upsert_active_blocker(run, {
                 "kind": "continuous_discovery_source_unrunnable", "reason": str(exc.detail),
@@ -992,9 +993,16 @@ class OrchestrationContinuousService:
             OrchestrationBudgetReservation.discovery_run_id == run.id,
         ))
         try:
-            await OrchestrationBudgetService().settle_discovery_source(
-                db, reservation, run, reason="needs_attention",
+            # A refused retry can recover after assignment repair; its cycle still owns the reservation.
+            recoverable = (
+                reason == "continuous_discovery_source_execution_failed" and state.get("recovery") is None
+                and reservation is not None
+                and not any(item.get("kind") == "budget_integrity" for item in run.active_blockers)
             )
+            if not recoverable:
+                await OrchestrationBudgetService().settle_discovery_source(
+                    db, reservation, run, reason="needs_attention",
+                )
         except SessionClaimAttention as exc:
             await SessionService.persist_claim_attention(db, exc)
             self.orchestration._upsert_active_blocker(run, {
@@ -1037,10 +1045,8 @@ class OrchestrationContinuousService:
                 },
                 f"run:{run.id}:kind:create_delegation_task:discovery_repair:{task.id}",
             )
-        except SessionClaimAttention as exc:
-            await SessionService.persist_claim_attention(db, exc)
-            return None
-        except HTTPException:
+        except HTTPException as exc:
+            await SessionService.handle_claim_refusal(db, exc)
             return None
         if action.target_id is None:
             return None
@@ -1057,10 +1063,8 @@ class OrchestrationContinuousService:
             run_kwargs["max_tokens"] = int(Decimal(policy["discovery_source"]["budget"]["per_cycle"]["max_tokens"]))
         try:
             _, repair_session_id = await TaskService().run(db, goal.project_id, repair_task.id, **run_kwargs)
-        except SessionClaimAttention as exc:
-            await SessionService.persist_claim_attention(db, exc)
-            return None
-        except HTTPException:
+        except HTTPException as exc:
+            await SessionService.handle_claim_refusal(db, exc)
             return None
         state["active_session_id"] = str(repair_session_id)
         run.plan_state = {**self.orchestration._json_object_or_empty(run.plan_state), "discovery": state}
@@ -1088,16 +1092,14 @@ class OrchestrationContinuousService:
             if "max_tokens" in source["budget"]["per_cycle"]:
                 request["max_tokens"] = int(Decimal(source["budget"]["per_cycle"]["max_tokens"]))
             try:
+                retry_key = f"run:{run.id}:kind:retry_task:discovery:{task.id}"
+                if state.get("retry_generation"):
+                    retry_key += f":generation:{state['retry_generation']}"
                 action = await self.orchestration.execute_retry_task_action(
-                    db, run.id, request, f"run:{run.id}:kind:retry_task:discovery:{task.id}",
+                    db, run.id, request, retry_key,
                 )
-            except SessionClaimAttention as exc:
-                await SessionService.persist_claim_attention(db, exc)
-                return await self._discovery_needs_attention(
-                    db, goal, run, "continuous_discovery_source_execution_failed", state,
-                    "Source retry could not start", "", now,
-                )
-            except HTTPException:
+            except HTTPException as exc:
+                await SessionService.handle_claim_refusal(db, exc)
                 action = None
             if action is None or action.target_id is None:
                 return await self._discovery_needs_attention(
@@ -1174,6 +1176,25 @@ class OrchestrationContinuousService:
             discovery = self.orchestration._json_object_or_empty(
                 self.orchestration._json_object_or_empty(run.plan_state).get("discovery")
             )
+            if any(item.get("kind") == "continuous_discovery_source_execution_failed" for item in run.active_blockers):
+                # A consumed recovery remains terminal; only a refused retry can start a new generation.
+                if discovery.get("recovery") is not None:
+                    return {"step": "needs_attention"}
+                try:
+                    await self.validate_discovery_assignment(db, goal, policy["discovery_source"])
+                    await OrchestrationBudgetService().reactivate_discovery_source(
+                        db, goal, run, policy["discovery_source"], now,
+                    )
+                except HTTPException:
+                    return {"step": "needs_attention"}
+                run.active_blockers = [item for item in run.active_blockers if not (
+                    isinstance(item, dict) and item.get("kind") == "continuous_discovery_source_execution_failed"
+                )]
+                discovery["retry_generation"] = int(discovery.get("retry_generation") or 0) + 1
+                run.plan_state = {
+                    **self.orchestration._json_object_or_empty(run.plan_state), "discovery": discovery,
+                }
+                await db.flush()
             if discovery.get("active_task_id") or discovery.get("accepted_batch") is not None:
                 return await self._advance_discovery(db, goal, run, policy, now)
             if await available_slots(db, goal.id) <= 0:  # no source budget is reserved while the root is full
