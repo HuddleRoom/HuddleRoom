@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import delete, event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm import Session
 
@@ -60,6 +60,66 @@ def _service(test_engine, completion):
 
 def _factory(test_engine):
     return async_sessionmaker(test_engine, expire_on_commit=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_fails", [False, True])
+@pytest.mark.parametrize("deleted_model", [ConversationMessage, ConversationResponse])
+async def test_answer_ignores_rows_deleted_during_provider_call(
+    deleted_model, provider_fails, test_engine, conversation_goal_run, test_user, db_session, monkeypatch,
+):
+    goal, _ = conversation_goal_run
+    await db_session.commit()
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 10_000)
+
+    async def completion(**_kwargs):
+        async with _factory(test_engine)() as db:
+            await db.execute(delete(deleted_model))
+            await db.commit()
+        if provider_fails:
+            raise RuntimeError("provider failed after reset")
+        return {"choices": [{"message": {"content": "Late answer"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    service = _service(test_engine, completion)
+    turn = await service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question")
+    from huddleroom.routers.orchestration_goals import _conversation_turn
+    serialized = _conversation_turn(turn)
+    assert serialized.content == "Question"
+    assert serialized.answer is None
+    assert await service.history(goal.project_id, goal.id, test_user.id) == []
+    async with _factory(test_engine)() as db:
+        assert await db.scalar(select(ConversationResponse)) is None
+        assert await db.scalar(select(ConversationReservation)) is None
+
+
+@pytest.mark.asyncio
+async def test_investigation_ignores_reset_after_result_preflight(
+    test_engine, conversation_goal_run, test_user, db_session, monkeypatch,
+):
+    goal, _ = conversation_goal_run
+    await db_session.commit()
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 10_000)
+    monkeypatch.setattr(settings, "orchestration_conversation_investigation_enabled", True)
+
+    async def completion(**_kwargs):
+        return _tool_result()
+
+    service = _service(test_engine, completion)
+
+    executed = []
+    async def execute(*_args):
+        executed.append(True)
+        async with _factory(test_engine)() as db:
+            await db.execute(delete(ConversationMessage).where(ConversationMessage.goal_id == goal.id))
+            await db.commit()
+        raise ConversationDomainError("conversation_investigation_ineligible", 409, "Deleted by reset")
+
+    monkeypatch.setattr(service._investigations, "execute", execute)
+    turn = await service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Investigate")
+    assert executed == [True]
+    assert turn.investigation is None
+    assert await service.history(goal.project_id, goal.id, test_user.id) == []
 
 
 async def _set_workspace(db_session, project_id, workspace):

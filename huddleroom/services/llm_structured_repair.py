@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 from huddleroom.services.orchestration_llm_decision_adapter import _extract_content
 from huddleroom.services.secret_redaction import redact_secrets
+from huddleroom.services.orchestration_baseline_runtime import await_baseline_completion
 from huddleroom.services.agent_response_stream import AgentResponseCall, AgentResponseInvocation
 
 
@@ -113,10 +114,12 @@ async def complete_with_repair(
                     )
                 )
             if call is None:
-                response = await completion_fn(**call_request)
+                response = await await_baseline_completion(completion_fn, call_request)
             else:
                 async with call:
-                    response = await call.complete(completion_fn, call_request)
+                    async def provider_boundary(**values):
+                        return await await_baseline_completion(completion_fn, values)
+                    response = await call.complete(provider_boundary, call_request)
                 previous_call = call.response_call or call
 
             # Capture reconstructed response for metadata extraction (usage, finish_reason, etc.)

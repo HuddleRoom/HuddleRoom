@@ -149,7 +149,7 @@ class OrchestrationConversationService:
             return prepared
         claimed = await self._claim(goal_id, prepared.response.id)
         if claimed is None:
-            return await self._turn(prepared.response.id)
+            return await self._turn(prepared.response.id) or prepared
         provider_messages = prepared.provider_messages
         assert provider_messages is not None
         investigation_allowed = self._investigation_allowed(claimed)
@@ -187,7 +187,7 @@ class OrchestrationConversationService:
                         result = self._normalize(raw, investigation_allowed, steering_allowed)
                 except Exception:
                     pass
-        return await self._continue_result(project_id, goal_id, claimed.id, actor_id, result, authority)
+        return await self._continue_result(project_id, goal_id, claimed.id, actor_id, result, authority) or prepared
 
     async def history(
         self, project_id: uuid.UUID, goal_id: uuid.UUID, actor_id: uuid.UUID
@@ -398,8 +398,10 @@ class OrchestrationConversationService:
                         ConversationReservation,
                         conversation_reservation_id(response_id),
                     )
+                    message = await db.get(ConversationMessage, response.message_id) if response else None
                     if (
                         response is None
+                        or message is None
                         or reservation is None
                         or response.status != "pending"
                         or reservation.status != "reserved"
@@ -569,8 +571,10 @@ class OrchestrationConversationService:
                         ConversationReservation,
                         conversation_reservation_id(response_id),
                     )
+                    message = await db.get(ConversationMessage, response.message_id) if response else None
                     if (
                         response is None
+                        or message is None
                         or reservation is None
                         or response.status != "pending"
                         or reservation.status != "reserved"
@@ -589,7 +593,7 @@ class OrchestrationConversationService:
     async def _settle(
         self, goal_id: uuid.UUID, response_id: uuid.UUID, answer: str, usage: int | None,
         authority=None, proposal: SteeringDraft | None = None,
-    ) -> ConversationTurn:
+    ) -> ConversationTurn | None:
         async with self._session_factory() as db:
             async with db.begin():
                 async with self._orchestration._lock_goal_for_baseline_transition(
@@ -600,6 +604,9 @@ class OrchestrationConversationService:
                         ConversationReservation,
                         conversation_reservation_id(response_id),
                     )
+                    message = await db.get(ConversationMessage, response.message_id) if response else None
+                    if response is None or reservation is None or message is None:
+                        return None
                     if (
                         not self._authority_matches(response, authority)
                     ):
@@ -616,7 +623,6 @@ class OrchestrationConversationService:
                         now,
                     )
                     if proposal is not None and self._steering_allowed(response):
-                        message = await db.get(ConversationMessage, response.message_id)
                         await self._persist_proposal(db, message, response, proposal)
                     if usage is None or usage > reservation.reserved_tokens:
                         reservation.status = "held_unknown"
@@ -628,13 +634,13 @@ class OrchestrationConversationService:
                         ) = "settled", usage, reservation.reserved_tokens - usage
                         reservation.settled_at = reservation.released_at = now
                     return ConversationTurn(
-                        message=await db.get(ConversationMessage, response.message_id),
+                        message=message,
                         response=response,
                     )
 
     async def _fail_known(
         self, goal_id: uuid.UUID, response_id: uuid.UUID, code: str, usage: int | None, authority=None
-    ) -> ConversationTurn:
+    ) -> ConversationTurn | None:
         async with self._session_factory() as db:
             async with db.begin():
                 async with self._orchestration._lock_goal_for_baseline_transition(db, goal_id):
@@ -642,10 +648,11 @@ class OrchestrationConversationService:
                     reservation = await db.get(
                         ConversationReservation, conversation_reservation_id(response_id)
                     )
+                    message = await db.get(ConversationMessage, response.message_id) if response else None
                     if (
-                        response is None or reservation is None
+                        response is None or reservation is None or message is None
                     ):
-                        return await self._turn(response_id)
+                        return None
                     if not self._authority_matches(response, authority):
                         raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
                     if (
@@ -663,7 +670,7 @@ class OrchestrationConversationService:
                         )
                         reservation.settled_at = reservation.released_at = now
                     return ConversationTurn(
-                        message=await db.get(ConversationMessage, response.message_id), response=response
+                        message=message, response=response
                     )
 
     async def _persist_proposal(
@@ -701,7 +708,10 @@ class OrchestrationConversationService:
         actor_id: uuid.UUID,
         result: ConversationProviderResult,
         authority: _ChatAuthority | None = None,
-    ) -> ConversationTurn:
+    ) -> ConversationTurn | None:
+        turn = await self._turn(response_id)
+        if turn is None:
+            return None
         if result.kind == "answer":
             assert result.answer is not None
             return await self._settle(goal_id, response_id, result.answer, result.usage, authority)
@@ -717,15 +727,22 @@ class OrchestrationConversationService:
         if result.kind == "unknown":
             return await self._hold_unknown(goal_id, response_id, "provider_outcome_unknown", authority)
         assert result.request is not None
-        investigation = await self._investigations.execute(
-            project_id, goal_id, actor_id, response_id, authority.context_version if authority else (await self._turn(response_id)).response.context_version,
-            result.request, result.usage, authority,
-        )
+        try:
+            investigation = await self._investigations.execute(
+                project_id, goal_id, actor_id, response_id,
+                authority.context_version if authority else turn.response.context_version,
+                result.request, result.usage, authority,
+            )
+        except ConversationDomainError as exc:
+            # Reset can win the goal lock after the preflight read above.
+            if exc.code == "conversation_investigation_ineligible" and await self._turn(response_id) is None:
+                return None
+            raise
         return await self._turn(response_id, investigation)
 
     async def _hold_unknown(
         self, goal_id: uuid.UUID, response_id: uuid.UUID, code: str, authority=None
-    ) -> ConversationTurn:
+    ) -> ConversationTurn | None:
         async with self._session_factory() as db:
             async with db.begin():
                 async with self._orchestration._lock_goal_for_baseline_transition(
@@ -736,6 +753,9 @@ class OrchestrationConversationService:
                         ConversationReservation,
                         conversation_reservation_id(response_id),
                     )
+                    message = await db.get(ConversationMessage, response.message_id) if response else None
+                    if response is None or reservation is None or message is None:
+                        return None
                     if (
                         not self._authority_matches(response, authority)
                     ):
@@ -767,9 +787,12 @@ class OrchestrationConversationService:
 
     async def _turn(
         self, response_id: uuid.UUID, investigation: ConversationInvestigation | None = None
-    ) -> ConversationTurn:
+    ) -> ConversationTurn | None:
         async with self._session_factory() as db:
             response = await db.get(ConversationResponse, response_id)
+            message = await db.get(ConversationMessage, response.message_id) if response else None
+            if response is None or message is None:
+                return None
             if investigation is None:
                 investigation = await db.scalar(
                     select(ConversationInvestigation).where(
@@ -777,7 +800,7 @@ class OrchestrationConversationService:
                     )
                 )
             return ConversationTurn(
-                message=await db.get(ConversationMessage, response.message_id),
+                message=message,
                 response=response,
                 investigation=investigation,
             )

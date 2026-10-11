@@ -8,6 +8,7 @@ children (decisions/actions/gates/evidence/agent_suggestions) are gone too
 (cascade via the deleted run row).
 """
 import uuid
+from huddleroom.models.base import _utcnow
 
 import pytest
 from sqlalchemy import func, select
@@ -202,7 +203,11 @@ async def test_reset_goal_refuses_type_correction_lineage(db_session, test_proje
 
 @pytest.mark.asyncio
 async def test_reset_goal_wipes_steering_rows_blocking_run_delete(db_session, test_project, test_user, client):
-    from huddleroom.models.orchestration_conversation import ConversationMessage, ConversationResponse
+    from huddleroom.models.orchestration_conversation import (
+        ConversationFeedback, ConversationMessage, ConversationReservation, ConversationResponse,
+    )
+    from huddleroom.services.orchestration_conversation_dossier import ConversationDossierBuilder
+    from huddleroom.services.orchestration_service import OrchestrationService
     from huddleroom.models.orchestration_steering import (
         OrchestrationSteeringProposal,
         OrchestrationSteeringRequest,
@@ -229,11 +234,20 @@ async def test_reset_goal_wipes_steering_rows_blocking_run_delete(db_session, te
     db_session.add_all([decision, action, message])
     await db_session.flush()
     response = ConversationResponse(
-        message_id=message.id, dossier={}, context_manifest={}, context_version="v1",
+        message_id=message.id, run_id=run.id, dossier={}, context_manifest={}, context_version="v1",
         provider_request_id="rally-chat:reset-steering",
+        status="completed", answer="Previous answer", started_at=_utcnow(), deadline_at=_utcnow(),
+        finished_at=_utcnow(),
     )
     db_session.add(response)
     await db_session.flush()
+    db_session.add_all([
+        ConversationFeedback(id=uuid.uuid4(), response_id=response.id, actor_id=test_user.id, rating="helpful"),
+        ConversationReservation(
+            response_id=response.id, goal_id=goal.id, actor_id=test_user.id,
+            ceiling_snapshot=100, reserved_tokens=10,
+        ),
+    ])
     steering_request = OrchestrationSteeringRequest(
         id=uuid.uuid4(), goal_id=goal.id, actor_id=test_user.id, client_request_id=uuid.uuid4(), sequence=1,
         directive="x", target_type="goal", target_id=str(goal.id), scope="goal", lifetime="future_runs",
@@ -259,6 +273,9 @@ async def test_reset_goal_wipes_steering_rows_blocking_run_delete(db_session, te
     ))
     await db_session.flush()
 
+    before = await ConversationDossierBuilder(db_session).build(goal, run, "Question", [(message, response)])
+    assert before.dossier["prior_turns"]
+
     resp = await client.post(
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/reset"
     )
@@ -270,3 +287,14 @@ async def test_reset_goal_wipes_steering_rows_blocking_run_delete(db_session, te
     assert await _count(db_session, OrchestrationSteeringTransition, request_id=steering_request.id) == 0
     assert await _count(db_session, OrchestrationSteeringState, goal_id=goal.id) == 1
     assert await _count(db_session, OrchestrationDecision, run_id=run.id) == 0
+    assert await _count(db_session, ConversationMessage, goal_id=goal.id) == 0
+    assert await _count(db_session, ConversationResponse, message_id=message.id) == 0
+    assert await _count(db_session, ConversationFeedback, response_id=response.id) == 0
+    assert await _count(db_session, ConversationReservation, response_id=response.id) == 0
+    fresh_run = await OrchestrationService().get_run_for_goal(db_session, test_project.id, goal.id)
+    prior_turns = (await db_session.execute(
+        select(ConversationMessage, ConversationResponse).join(ConversationResponse)
+        .where(ConversationMessage.goal_id == goal.id)
+    )).all()
+    dossier = await ConversationDossierBuilder(db_session).build(goal, fresh_run, "Fresh question", prior_turns)
+    assert dossier.dossier["prior_turns"] == []

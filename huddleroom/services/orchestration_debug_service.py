@@ -21,6 +21,7 @@ from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES,
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 from huddleroom.services.project_service import ProjectService
+from huddleroom.services.orchestration_baseline_runtime import baseline_operation, BaselineSavepoint, require_baseline_available
 from huddleroom.schemas.orchestration import valid_lm_retry_checkpoint
 
 SUPPORTED_PROCESS_TYPES = frozenset({
@@ -58,7 +59,10 @@ class OrchestrationDebugService:
         if await orchestration_service.get_goal(db, project_id, goal_id) is None:
             raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
-        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id):
+        require_baseline_available(goal_id)
+        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), baseline_operation(
+            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction()
+        ):
             goal = await orchestration_service.get_goal(db, project_id, goal_id)
             if goal is None:
                 raise HTTPException(status_code=404, detail="Orchestration goal not found")
@@ -85,7 +89,7 @@ class OrchestrationDebugService:
             if current is not None and isinstance((current.outputs or {}).get("_lm_retry"), dict):
                 raise HTTPException(status_code=409, detail="Retry the failed LM request via baseline/retry")
             if current is not None and current.status == "waiting_decision":
-                nested = await db.begin_nested()
+                nested = await BaselineSavepoint.create(db, goal_id)
                 try:
                     process_summary = await self._rerun_waiting_process(db, goal, run, current)
                 except Exception:
@@ -114,7 +118,10 @@ class OrchestrationDebugService:
         )
         orchestration_service = OrchestrationService()
 
-        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id):
+        require_baseline_available(goal_id)
+        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), baseline_operation(
+            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction()
+        ):
             goal = await orchestration_service.get_goal(db, project_id, goal_id)
             run = await orchestration_service.get_active_run_for_goal(db, project_id, goal_id)
             current = await OrchestrationProcessService().get_current(db, goal_id, process_type)
@@ -210,7 +217,10 @@ class OrchestrationDebugService:
         if await orchestration_service.get_goal(db, project_id, goal_id) is None:
             raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
-        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id):
+        require_baseline_available(goal_id)
+        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), baseline_operation(
+            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction()
+        ):
             goal = await orchestration_service.get_goal(db, project_id, goal_id)
             if goal is None:
                 raise HTTPException(status_code=404, detail="Orchestration goal not found")
@@ -249,7 +259,7 @@ class OrchestrationDebugService:
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
 
-            nested = await db.begin_nested()
+            nested = await BaselineSavepoint.create(db, goal_id)
             try:
                 checkpoint = (selected.outputs or {}).get("_lm_retry")
                 retryable_stuck = selected.status in {"waiting_decision", "running"} and valid_lm_retry_checkpoint(
@@ -433,7 +443,7 @@ class OrchestrationDebugService:
         if process_type == "team_hierarchy":
             return await TeamHierarchyProcess().advance(db, goal, run, manual=True)
         if process_type == "effectiveness_review":
-            return await EffectivenessReviewProcess().advance(db, goal, run)
+            return await EffectivenessReviewProcess().advance(db, goal, run, manual=True)
 
         if process_type == "goal_closeout":
             orchestration_service = OrchestrationService()
