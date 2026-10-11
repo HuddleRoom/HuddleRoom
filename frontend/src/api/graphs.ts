@@ -200,24 +200,6 @@ export function useGraphRunSteps(
   })
 }
 
-export function useAdvanceRun(projectId: string | null) {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (runId: string) =>
-      apiFetch<GraphRun>(
-        `/api/v1/projects/${projectId}/graph-runs/${runId}/advance`,
-        { method: 'POST', body: JSON.stringify({}) }
-      ),
-    onSuccess: (run, runId) => {
-      qc.setQueryData(['graph-run', projectId, runId], run)
-      qc.invalidateQueries({ queryKey: ['graph-runs', projectId] })
-      qc.invalidateQueries({
-        queryKey: ['graph-run', 'steps', projectId, runId],
-      })
-    },
-  })
-}
-
 export function usePauseRun(projectId: string | null) {
   const qc = useQueryClient()
   return useMutation({

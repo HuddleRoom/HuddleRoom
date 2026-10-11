@@ -120,6 +120,8 @@ def validate_graph_definition(definition: dict) -> None:
     """Raise ValueError if a graph definition is malformed or uses legacy protocol keys."""
     if not isinstance(definition, dict):
         raise ValueError("Graph definition must be a mapping")
+    if "edges" in definition:
+        raise ValueError("Graph definition does not support top-level edges; use node-level edges under nodes")
 
     # Check for legacy template tokens early
     _check_legacy_template_tokens(definition)

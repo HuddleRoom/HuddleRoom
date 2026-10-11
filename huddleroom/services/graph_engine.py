@@ -427,13 +427,16 @@ class GraphEngineService:
             run.escalation_step = min(new_step, max(len(steps), 1))
             step_def = next((step for step in steps if step.get("step") == run.escalation_step), None)
             if step_def and step_def.get("action") == "human_notify":
+                message_template = await self._template_resolver.resolve(
+                    db, step_def.get("message_template", ""), run
+                )
                 await escalation_service.notify_humans(
                     db,
                     run.project_id,
                     run.id,
                     graph_name,
                     run.current_node,
-                    step_def.get("message_template", ""),
+                    message_template,
                 )
                 emitted_alert = True
 

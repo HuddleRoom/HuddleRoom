@@ -53,29 +53,29 @@ interface GraphFormState {
   triggers: string
 }
 
-const BLANK_FORM: GraphFormState = {
+export const BLANK_FORM: GraphFormState = {
   name: '',
   version: '1.0.0',
   description: '',
   definition: `start_node: pending
 nodes:
   pending:
-    type: initial
-  active: {}
+    edges:
+      - to: active
+        trigger_event: start
+  active:
+    edges:
+      - to: completed
+        trigger_event: done
+      - to: failed
+        trigger_event: error
   completed:
-    type: terminal
+    edges: []
   failed:
-    type: terminal
-edges:
-  - from: pending
-    to: active
-    event: start
-  - from: active
-    to: completed
-    event: done
-  - from: active
-    to: failed
-    event: error
+    edges: []
+terminal_nodes:
+  success: [completed]
+  failure: [failed]
 `,
   triggers: '',
 }
@@ -262,10 +262,16 @@ export interface ParsedFlow {
   startNode?: string
 }
 
-function parseGraphDefinition(definition: Record<string, unknown>): ParsedFlow {
+export function parseGraphDefinition(definition: Record<string, unknown>): ParsedFlow {
   const nodes = new Map<string, ParsedNodeInfo>()
   const edges: Array<{ from: string; to: string; event?: string }> = []
   let startNode: string | undefined
+  const terminalGroups = definition.terminal_nodes as Record<string, unknown> | undefined
+  const terminalNodes = new Set(
+    terminalGroups && typeof terminalGroups === 'object'
+      ? Object.values(terminalGroups).flatMap((group) => Array.isArray(group) ? group : [])
+      : [],
+  )
 
   // Parse nodes
   const nodesObj = definition.nodes as Record<string, unknown> | undefined
@@ -276,8 +282,8 @@ function parseGraphDefinition(definition: Record<string, unknown>): ParsedFlow {
 
       nodes.set(name, {
         id: name,
-        isInitial: type === 'initial',
-        isTerminal: type === 'terminal' || type === 'end' || (cfg?.is_terminal as boolean | undefined) === true,
+        isInitial: name === definition.start_node || type === 'initial',
+        isTerminal: terminalNodes.has(name) || type === 'terminal' || type === 'end' || (cfg?.is_terminal as boolean | undefined) === true,
       })
     })
   }
@@ -294,27 +300,20 @@ function parseGraphDefinition(definition: Record<string, unknown>): ParsedFlow {
   }
 
   // Parse edges
-  const edgesArr = definition.edges as Array<Record<string, unknown>> | undefined
-  if (Array.isArray(edgesArr)) {
-    edgesArr.forEach((t) => {
-      const from = (t.from as string | undefined) ?? (t.from_node as string | undefined)
-      const to = (t.to as string | undefined) ?? (t.to_node as string | undefined)
-      const eventRaw = t.event ?? t.event_type
-      const event: string | undefined = typeof eventRaw === 'string'
-        ? eventRaw
-        : typeof eventRaw === 'object' && eventRaw !== null
-          ? String((eventRaw as Record<string, unknown>).event_type ?? '')
-          : undefined
-      if (from && to) {
-        // Ensure nodes exist
-        if (!nodes.has(from)) {
-          nodes.set(from, { id: from, isInitial: false, isTerminal: false })
-        }
+  if (nodesObj && typeof nodesObj === 'object') {
+    Object.entries(nodesObj).forEach(([from, config]) => {
+      const edgesArr = (config as Record<string, unknown> | null)?.edges
+      if (!Array.isArray(edgesArr)) return
+      edgesArr.forEach((edge) => {
+        if (!edge || typeof edge !== 'object') return
+        const to = edge.to
+        const event = typeof edge.trigger_event === 'string' ? edge.trigger_event : undefined
+        if (typeof to !== 'string' || !to) return
         if (!nodes.has(to)) {
           nodes.set(to, { id: to, isInitial: false, isTerminal: false })
         }
         edges.push({ from, to, event })
-      }
+      })
     })
   }
 

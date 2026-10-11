@@ -96,6 +96,18 @@ async def create_graph(
         validate_graph_definition(data.definition)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    existing = await db.execute(
+        select(Graph.id).where(
+            Graph.project_id == project_id,
+            Graph.name == data.name,
+            Graph.version == data.version,
+        ).limit(1)
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A graph with this name and version already exists for the project",
+        )
     graph = Graph(
         project_id=project_id,
         name=data.name,
