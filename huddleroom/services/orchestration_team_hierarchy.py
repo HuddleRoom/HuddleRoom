@@ -80,6 +80,122 @@ _STANDARD_TIER_BLOCKING_GAPS = frozenset({
 })
 
 
+def semantic_fingerprint_from_projection(payload: dict) -> str:
+    """Hash a pre-built hierarchy projection without database access."""
+    return hashlib.sha256(json.dumps(
+        redact_semantic_payload(payload), sort_keys=True, separators=(",", ":"), default=str
+    ).encode()).hexdigest()
+
+
+def manager_from_projection(goal: OrchestrationGoal, agents: list[Agent] = ()) -> dict[str, str | None]:
+    if goal.manager_agent_id is not None:
+        manager: dict[str, str | None] = {"kind": "agent", "id": str(goal.manager_agent_id)}
+        selected = next((agent for agent in agents if agent.id == goal.manager_agent_id), None)
+        return {
+            **manager,
+            "name": selected.name if selected else None,
+            "role": selected.role if selected else None,
+        }
+    if goal.manager_user_id is not None:
+        return {"kind": "human", "id": str(goal.manager_user_id)}
+    return {"kind": "none", "id": None}
+
+
+def hierarchy_analysis_input_from_projection(
+    goal: OrchestrationGoal,
+    agents: list[Agent],
+    *,
+    loads: dict[uuid.UUID, object] | None = None,
+    exclusions: list[dict] | tuple[dict, ...] = (),
+    required_work_functions: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    """Build the hierarchy semantic input from already-loaded state."""
+    loads = loads or {}
+    ordered_agents = sorted(agents, key=lambda agent: (agent.name, agent.id))
+    return redact_semantic_payload({
+        "schema_version": 1,
+        "goal": {
+            "id": str(goal.id), "objective": goal.objective,
+            "success_criteria": goal.success_criteria, "constraints": goal.constraints,
+            "weight": goal.weight,
+        },
+        "selected_manager": manager_from_projection(goal, ordered_agents),
+        "required_work_functions": list(required_work_functions or infer_required_work_functions(goal)),
+        "agents": [
+            {
+                "id": str(agent.id), "name": agent.name, "role": agent.role,
+                "description": agent.description, "system_prompt": agent.system_prompt,
+                "provider": agent.provider, "model": agent.model,
+                "adapter_type": agent.adapter_type, "cli_runtime": agent.cli_runtime,
+                "capabilities": list(agent.capabilities or []), "config": agent.config or {},
+                "workload": (
+                    loads[agent.id].to_dict()
+                    if agent.id in loads and hasattr(loads[agent.id], "to_dict")
+                    else loads.get(agent.id, {
+                        "active_tasks": 0, "active_sessions": 0, "outcome_hint_count": 0, "penalty": 0,
+                    })
+                ),
+            }
+            for agent in ordered_agents
+        ],
+        "resolved_proposal_exclusions": list(exclusions),
+    })
+
+
+def resolved_proposal_exclusions_from_decisions(decisions: list[OrchestrationAuthorityDecision]) -> list[dict]:
+    exclusions = []
+    for decision in decisions:
+        if not (
+            decision.status == "answered"
+            and decision.decision_key.startswith("team_hierarchy:agent:")
+            and decision.selected_option in {"edit", "reject"}
+        ):
+            continue
+        option = next((item for item in decision.options if item.get("key") == decision.selected_option), None)
+        proposal = option.get("proposed_agent") if isinstance(option, dict) else None
+        definition = proposal.get("definition") if isinstance(proposal, dict) else None
+        if not isinstance(definition, dict):
+            continue
+        canonical_definition = AgentCreate.model_validate(definition).model_dump(mode="json")
+        canonical = json.dumps(canonical_definition, sort_keys=True, separators=(",", ":"))
+        exclusions.append({
+            "action": decision.selected_option,
+            "definition": canonical_definition,
+            "fingerprint": hashlib.sha256(canonical.encode()).hexdigest(),
+        })
+    return exclusions
+
+
+def hierarchy_fingerprint_from_projection(payload: dict, analysis: dict | None) -> str:
+    stripped = TeamHierarchyProcess._strip_volatile(payload)
+    return semantic_fingerprint_from_projection(
+        {"input": stripped, "analysis": analysis} if isinstance(analysis, dict) else stripped
+    )
+
+
+def trivial_hierarchy_fingerprint_from_projection(goal: OrchestrationGoal, proposal: dict) -> str:
+    payload = {
+        "weight": goal.weight,
+        "objective": goal.objective,
+        "success_criteria": goal.success_criteria,
+        "constraints": goal.constraints,
+        "authority_model": goal.authority_model,
+        "manager_agent_id": str(goal.manager_agent_id) if goal.manager_agent_id else None,
+        "manager_user_id": str(goal.manager_user_id) if goal.manager_user_id else None,
+        "source_agent_review_process_id": proposal["source_agent_review_process_id"],
+        "review_ids": proposal["review_ids"],
+        "required_work_functions": proposal["required_work_functions"],
+        "role_to_agent": proposal["role_to_agent"],
+        "candidate_agent_ids_by_function": {
+            work_function: sorted(set(proposal["candidate_agents"].get(work_function, [])))
+            for work_function in proposal["required_work_functions"]
+        },
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()).hexdigest()
+
+
 def infer_required_work_functions(goal: OrchestrationGoal) -> list[str]:
     """Infer a stable minimum hierarchy from the goal's durable definition."""
     if goal.weight == "trivial":
@@ -714,64 +830,16 @@ class TeamHierarchyProcess:
             select(Agent).where(Agent.is_active.is_(True)).order_by(Agent.name, Agent.id)
         )).scalars())
         loads = await self.roster_mapper.loads_by_agent(db, goal.project_id)
-        manager = self._manager(goal)
-        if manager["kind"] == "agent":
-            selected = next((agent for agent in agents if str(agent.id) == manager["id"]), None)
-            manager = {
-                **manager,
-                "name": selected.name if selected else None,
-                "role": selected.role if selected else None,
-            }
-        exclusions = []
-        for decision in await self.decision_service.list_decisions(db, goal.id):
-            if not (
-                decision.status == "answered"
-                and decision.decision_key.startswith("team_hierarchy:agent:")
-                and decision.selected_option in {"edit", "reject"}
-            ):
-                continue
-            option = next((item for item in decision.options if item.get("key") == decision.selected_option), None)
-            proposal = option.get("proposed_agent") if isinstance(option, dict) else None
-            definition = proposal.get("definition") if isinstance(proposal, dict) else None
-            if not isinstance(definition, dict):
-                continue
-            canonical_definition = AgentCreate.model_validate(definition).model_dump(mode="json")
-            canonical = json.dumps(canonical_definition, sort_keys=True, separators=(",", ":"))
-            exclusions.append({
-                "action": decision.selected_option,
-                "definition": canonical_definition,
-                "fingerprint": hashlib.sha256(canonical.encode()).hexdigest(),
-            })
-        return redact_semantic_payload({
-            "schema_version": 1,
-            "goal": {
-                "id": str(goal.id), "objective": goal.objective,
-                "success_criteria": goal.success_criteria, "constraints": goal.constraints,
-                "weight": goal.weight,
-            },
-            "selected_manager": manager,
-            "required_work_functions": infer_required_work_functions(goal),
-            "agents": [
-                {
-                    "id": str(agent.id), "name": agent.name, "role": agent.role,
-                    "description": agent.description, "system_prompt": agent.system_prompt,
-                    "provider": agent.provider, "model": agent.model,
-                    "adapter_type": agent.adapter_type, "cli_runtime": agent.cli_runtime,
-                    "capabilities": list(agent.capabilities or []), "config": agent.config or {},
-                    "workload": loads.get(agent.id).to_dict() if loads.get(agent.id) else {
-                        "active_tasks": 0, "active_sessions": 0, "outcome_hint_count": 0, "penalty": 0,
-                    },
-                }
-                for agent in agents
-            ],
-            "resolved_proposal_exclusions": exclusions,
-        })
+        exclusions = resolved_proposal_exclusions_from_decisions(
+            await self.decision_service.list_decisions(db, goal.id)
+        )
+        return hierarchy_analysis_input_from_projection(
+            goal, agents, loads=loads, exclusions=exclusions,
+        )
 
     @staticmethod
     def _semantic_fingerprint(payload: dict) -> str:
-        return hashlib.sha256(json.dumps(
-            redact_semantic_payload(payload), sort_keys=True, separators=(",", ":"), default=str
-        ).encode()).hexdigest()
+        return semantic_fingerprint_from_projection(payload)
 
     @staticmethod
     def _strip_volatile(
@@ -813,11 +881,7 @@ class TeamHierarchyProcess:
             current = await self.process_service.get_current(db, goal.id, PROCESS_TYPE)
             analysis = current.outputs.get("analysis") if current and isinstance(current.outputs, dict) else None
             payload = await self._analysis_input(db, goal)
-            stripped_payload = self._strip_volatile(payload)
-            return self._semantic_fingerprint(
-                {"input": stripped_payload, "analysis": analysis}
-                if isinstance(analysis, dict) else stripped_payload
-            )
+            return hierarchy_fingerprint_from_projection(payload, analysis)
         proposal = await self.build_proposal(db, goal, run)
         return self._fingerprint(goal, proposal)
 
@@ -1082,35 +1146,7 @@ class TeamHierarchyProcess:
 
     @staticmethod
     def _fingerprint(goal: OrchestrationGoal, proposal: dict) -> str:
-        payload = {
-            "weight": goal.weight,
-            "objective": goal.objective,
-            "success_criteria": goal.success_criteria,
-            "constraints": goal.constraints,
-            "authority_model": goal.authority_model,
-            "manager_agent_id": (
-                str(goal.manager_agent_id) if goal.manager_agent_id else None
-            ),
-            "manager_user_id": (
-                str(goal.manager_user_id) if goal.manager_user_id else None
-            ),
-            "source_agent_review_process_id": proposal[
-                "source_agent_review_process_id"
-            ],
-            "review_ids": proposal["review_ids"],
-            "required_work_functions": proposal["required_work_functions"],
-            "role_to_agent": proposal["role_to_agent"],
-            "candidate_agent_ids_by_function": {
-                work_function: sorted(
-                    set(proposal["candidate_agents"].get(work_function, []))
-                )
-                for work_function in proposal["required_work_functions"]
-            },
-        }
-        encoded = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), default=str
-        )
-        return hashlib.sha256(encoded.encode()).hexdigest()
+        return trivial_hierarchy_fingerprint_from_projection(goal, proposal)
 
     @staticmethod
     def _gaps(proposal: dict, agent_definition_review_skipped: bool) -> list[str]:

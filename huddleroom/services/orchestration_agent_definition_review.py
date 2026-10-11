@@ -280,6 +280,74 @@ def assess_agent_definition(
     }
 
 
+def coverage_fingerprint_from_projection(
+    goal: OrchestrationGoal,
+    targets: list[tuple[Agent, list[str], bool]],
+    *,
+    fields: tuple[str, ...] = FINGERPRINT_SNAPSHOT_FIELDS,
+) -> str:
+    """Hash the side-effect-free coverage projection shared by roster previews."""
+    payload = {
+        "weight": goal.weight,
+        "objective": goal.objective,
+        "success_criteria": copy.deepcopy(goal.success_criteria or []),
+        "constraints": copy.deepcopy(goal.constraints or {}),
+        "authority_model": goal.authority_model,
+        "selected_manager": (
+            str(goal.manager_agent_id or goal.manager_user_id)
+            if goal.manager_agent_id or goal.manager_user_id else None
+        ),
+        "targets": [
+            {"agent_id": str(agent.id), "proposed_work_functions": proposed,
+             "definition_snapshot": {field: copy.deepcopy(getattr(agent, field)) for field in fields}}
+            for agent, proposed, _inactive in targets
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def coverage_targets_from_projection(
+    goal: OrchestrationGoal,
+    assignments: list[tuple[Task, Agent, str]],
+    *,
+    active_agents: list[Agent] = (),
+    manager: Agent | None = None,
+    roster_mapper: OrchestrationRosterMapper | None = None,
+) -> list[tuple[Agent, list[str], bool]]:
+    """Build the coverage target payload without database access."""
+    if goal.weight == "trivial":
+        return []
+    proposed_by_agent: dict[Any, set[str]] = {}
+    assigned_ids = set()
+    agents = {agent.id: agent for _task, agent, _function in assignments}
+    for _task, agent, work_function in assignments:
+        assigned_ids.add(agent.id)
+        if work_function and (goal.weight == "standard" or not bool(agent.is_active)):
+            proposed_by_agent.setdefault(agent.id, set()).add(work_function)
+    if goal.weight == "standard":
+        if goal.authority_model == "agent_manager" and manager is not None:
+            agents[manager.id] = manager
+            proposed_by_agent.setdefault(manager.id, set()).add("management")
+    else:
+        if roster_mapper is None:
+            roster_mapper = OrchestrationRosterMapper()
+        for agent in active_agents:
+            agents[agent.id] = agent
+            proposed_by_agent.setdefault(agent.id, set()).update(
+                work_function
+                for work_function in PROFILES
+                if not roster_mapper.score_agent_definition(agent, work_function).weak
+            )
+    return [
+        (
+            agent,
+            sorted(proposed_by_agent.get(agent.id, set())),
+            agent.id in assigned_ids and not bool(agent.is_active),
+        )
+        for agent in sorted(agents.values(), key=lambda value: str(value.id))
+    ]
+
+
 class AgentDefinitionReviewProcess:
     """Run the Phase 7 definition review synchronously."""
 
@@ -1121,43 +1189,21 @@ class AgentDefinitionReviewProcess:
         goal: OrchestrationGoal,
         assignments: list[tuple[Task, Agent, str]],
     ) -> list[tuple[Agent, list[str], bool]]:
-        if goal.weight == "trivial":
-            return []
-        proposed_by_agent: dict[Any, set[str]] = {}
-        assigned_ids = set()
-        agents = {agent.id: agent for _task, agent, _function in assignments}
-        for _task, agent, work_function in assignments:
-            assigned_ids.add(agent.id)
-            if work_function and (goal.weight == "standard" or not bool(agent.is_active)):
-                proposed_by_agent.setdefault(agent.id, set()).add(work_function)
-
-        if goal.weight == "standard":
-            if goal.authority_model == "agent_manager" and goal.manager_agent_id is not None:
-                manager = await db.get(Agent, goal.manager_agent_id)
-                if manager is not None:
-                    agents[manager.id] = manager
-                    proposed_by_agent.setdefault(manager.id, set()).add("management")
-        else:
-            active = list(
-                (await db.execute(select(Agent).where(Agent.is_active.is_(True)))).scalars()
-            )
-            for agent in active:
-                agents[agent.id] = agent
-                inferred = {
-                    work_function
-                    for work_function in PROFILES
-                    if not self.roster_mapper.score_agent_definition(agent, work_function).weak
-                }
-                proposed_by_agent.setdefault(agent.id, set()).update(inferred)
-
-        return [
-            (
-                agent,
-                sorted(proposed_by_agent.get(agent.id, set())),
-                agent.id in assigned_ids and not bool(agent.is_active),
-            )
-            for agent in sorted(agents.values(), key=lambda value: str(value.id))
-        ]
+        manager = (
+            await db.get(Agent, goal.manager_agent_id)
+            if goal.weight == "standard" and goal.authority_model == "agent_manager"
+            and goal.manager_agent_id is not None
+            else None
+        )
+        active = (
+            list((await db.execute(select(Agent).where(Agent.is_active.is_(True)))).scalars())
+            if goal.weight == "substantial"
+            else []
+        )
+        return coverage_targets_from_projection(
+            goal, assignments, active_agents=active, manager=manager,
+            roster_mapper=self.roster_mapper,
+        )
 
     @staticmethod
     def _fingerprint(
@@ -1204,31 +1250,7 @@ class AgentDefinitionReviewProcess:
         *,
         fields: tuple[str, ...] = FINGERPRINT_SNAPSHOT_FIELDS,
     ) -> str:
-        payload = {
-            "weight": goal.weight,
-            "objective": goal.objective,
-            "success_criteria": copy.deepcopy(goal.success_criteria or []),
-            "constraints": copy.deepcopy(goal.constraints or {}),
-            "authority_model": goal.authority_model,
-            "selected_manager": (
-                str(goal.manager_agent_id or goal.manager_user_id)
-                if goal.manager_agent_id or goal.manager_user_id
-                else None
-            ),
-            "targets": [
-                {
-                    "agent_id": str(agent.id),
-                    "proposed_work_functions": proposed,
-                    "definition_snapshot": {
-                        field: copy.deepcopy(getattr(agent, field))
-                        for field in fields
-                    },
-                }
-                for agent, proposed, _inactive in targets
-            ],
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-        return hashlib.sha256(encoded.encode()).hexdigest()
+        return coverage_fingerprint_from_projection(goal, targets, fields=fields)
 
     async def _resolve_superseded_warnings(
         self, db: AsyncSession, goal_id, current_process_id

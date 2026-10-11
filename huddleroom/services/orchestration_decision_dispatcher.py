@@ -11,11 +11,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.schemas.orchestration_recovery import RecoveryDispatchContext, RecoveryProposalV1
 from huddleroom.services.orchestration_steering import (
     SteeringVersionsChanged,
     OrchestrationSteeringService, active_direction_ids,
     steering_versions_from_snapshot,
 )
+
+
+def recovery_wrapper_key(context: RecoveryDispatchContext) -> str:
+    if context.purpose == "apply":
+        return f"recovery:{context.proposal_id}:apply:{context.call_id}"
+    return f"recovery:{context.proposal_id}:retry:{context.approved_retry_ordinal}"
+
+
+def recovery_effect_key(context: RecoveryDispatchContext) -> str:
+    return f"{recovery_wrapper_key(context)}:effect"
 
 
 class OrchestrationDecisionDispatcher:
@@ -54,6 +65,8 @@ class OrchestrationDecisionDispatcher:
         db: AsyncSession,
         run: OrchestrationRun,
         decision: OrchestrationDecision,
+        *,
+        recovery_context: RecoveryDispatchContext | None = None,
     ) -> OrchestrationAction | None:
         if decision.validator_status != "accepted":
             return None
@@ -77,6 +90,17 @@ class OrchestrationDecisionDispatcher:
                 decision.rejection_reason = rejection
                 return None
         request = self._service.canonical_decision_request(action_type, parsed, run_id=run.id)
+        recovery = await self._recovery_dispatch_context(
+            db, run, applies_decision_id, recovery_context, request,
+        )
+        if recovery is None and recovery_context is not None:
+            decision.validator_status = "rejected"
+            decision.rejection_reason = "invalid recovery dispatch context"
+            return None
+        if recovery is False:
+            decision.validator_status = "rejected"
+            decision.rejection_reason = "invalid recovery dispatch identity"
+            return None
         input_snapshot = getattr(decision, "input_snapshot", {}) or {}
         versions = steering_versions_from_snapshot(input_snapshot)
         steering = None
@@ -92,15 +116,18 @@ class OrchestrationDecisionDispatcher:
                 decision.rejection_reason = "steering_forbidden_effect: Use the dedicated control"
                 return None
         method = getattr(self._service, executor)
-        if action_type == "request_roadmap_replan":
+        if recovery:
+            action_key = recovery_effect_key(recovery_context)
+        elif action_type == "request_roadmap_replan":
             action_key = await self._service.roadmap_replan_action_key(db, run)
         else:
             action_key = self.action_key(run.id, action_type, request)
             if action_type == "request_verification":
                 action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"))
-        action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
-        if capped is not None:
-            return capped  # rejected too often: no re-run, no new row; the backstop wait still applies
+        if not recovery:
+            action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
+            if capped is not None:
+                return capped  # rejected too often: no re-run, no new row; the backstop wait still applies
         if versions is not None:
             action_key, *_ = (
                 await self._service._steering_action_fence(db, run.id, action_key, decision.id)
@@ -159,10 +186,99 @@ class OrchestrationDecisionDispatcher:
             contract = dict(action.dispatch_contract or {})
             contract.setdefault("applies_decision_id", str(applies_decision_id))
             action.dispatch_contract = contract
+        if recovery:
+            wrapper = recovery
+            contract = dict(wrapper.dispatch_contract or {})
+            contract.update({
+                "authority_decision_id": str(recovery_context.authority_decision_id),
+                "canonical_request_hash": self._canonical_request_hash(request),
+                "effect_action_id": str(action.id),
+                "effect_idempotency_key": action.idempotency_key,
+            })
+            wrapper.dispatch_contract = contract
         if steering is not None and action.status != "failed":
             for request_id in active_direction_ids(input_snapshot):
                 await steering.link_result(db, request_id, decision.id, action.id)
         return action
+
+    @staticmethod
+    def _canonical_request_hash(request: dict[str, Any]) -> str:
+        encoded = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _recovery_dispatch_context(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun,
+        applies_decision_id: uuid.UUID | None,
+        context: RecoveryDispatchContext | None,
+        request: dict[str, Any],
+    ) -> OrchestrationAction | None | bool:
+        if applies_decision_id is None:
+            return None
+        authority = await db.get(OrchestrationAuthorityDecision, applies_decision_id)
+        proposal_action_id = getattr(authority, "related_action_id", None) if authority is not None else None
+        if proposal_action_id is None:
+            return None if context is None else False
+        proposal = await db.get(OrchestrationAction, proposal_action_id)
+        if proposal is None or proposal.run_id != run.id or proposal.action_type != "recovery_proposal":
+            return None if context is None else False
+        if (
+            context is None
+            or context.authority_decision_id != authority.id
+            or authority.status != "answered"
+            or authority.selected_option != "approve_fix"
+        ):
+            return False
+        proposal_request = proposal.request or {}
+        proposal_contract = proposal.dispatch_contract or {}
+        if str(proposal_request.get("proposal_id")) != str(context.proposal_id):
+            return False
+        proposal_hash = proposal_contract.get("proposal_hash")
+        if not isinstance(proposal_hash, str) or proposal_hash != self._canonical_request_hash(proposal_request):
+            return False
+        try:
+            recovery_proposal = RecoveryProposalV1.model_validate(proposal_request)
+        except ValueError:
+            return False
+        if context.purpose == "apply":
+            if sum(call.call_id == context.call_id for call in recovery_proposal.calls) != 1:
+                return False
+        elif context.approved_retry_ordinal > recovery_proposal.retry.max_attempts:
+            return False
+        wrapper_key = recovery_wrapper_key(context)
+        wrapper = await self._service._existing_action_for_key(db, run.id, wrapper_key)
+        expected_type = f"recovery_{context.purpose}"
+        wrapper_request = wrapper.request if wrapper is not None else {}
+        if (
+            wrapper is None
+            or wrapper.action_type != expected_type
+            or str(wrapper_request.get("proposal_action_id")) != str(proposal.id)
+            or wrapper_request.get("proposal_hash") != proposal_hash
+            or (
+                context.purpose == "apply"
+                and wrapper_request.get("call_id") != context.call_id
+            )
+            or (
+                context.purpose == "retry"
+                and wrapper_request.get("approved_retry_ordinal") != context.approved_retry_ordinal
+            )
+        ):
+            return False
+        request_hash = self._canonical_request_hash(request)
+        contract = wrapper.dispatch_contract or {}
+        if contract.get("canonical_request_hash") != request_hash:
+            return False
+        effect_id, effect_key = contract.get("effect_action_id"), contract.get("effect_idempotency_key")
+        if (effect_id is None) != (effect_key is None):
+            return False
+        if effect_id is not None:
+            if effect_key != recovery_effect_key(context):
+                return False
+            effect = await self._service._existing_action_for_key(db, run.id, effect_key)
+            if effect is None or str(effect.id) != str(effect_id):
+                return False
+        return wrapper
 
     @staticmethod
     def _savepoint(db: AsyncSession):

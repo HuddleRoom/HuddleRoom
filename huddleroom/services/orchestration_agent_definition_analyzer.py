@@ -42,7 +42,21 @@ class SemanticAgentAnalysisError(RuntimeError):
 
 def redact_semantic_payload(value: Any) -> Any:
     """Return a JSON-safe copy with nested credentials redacted."""
-    return json.loads(_redact_secrets(json.dumps(value, sort_keys=True, default=str)))
+    def redact(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {
+                key: "[REDACTED]" if re.fullmatch(
+                    r"apikey|accesstoken|authorization|bearer|token|secret|password",
+                    re.sub(r"[^a-z0-9]", "", key.lower()),
+                ) else redact(nested)
+                for key, nested in item.items()
+            }
+        if isinstance(item, list):
+            return [redact(nested) for nested in item]
+        return _redact_secrets(item) if isinstance(item, str) else item
+
+    # Redact parsed strings so free-text patterns cannot consume JSON delimiters.
+    return redact(json.loads(json.dumps(value, sort_keys=True, default=str)))
 
 
 def _required_text(payload: Mapping[str, Any], key: str) -> str:

@@ -1,4 +1,6 @@
 import uuid
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -50,6 +52,41 @@ async def test_dispatch_routes_request_plan_to_executor():
     _, kwargs = service.execute_request_plan_action.call_args
     assert kwargs["idempotency_key"].startswith(f"run:{run.id}:kind:request_plan:request:")
     assert kwargs["decision_id"] == decision.id
+
+
+@pytest.mark.asyncio
+async def test_ordinary_dispatch_keeps_run_type_request_identity_without_recovery_context():
+    """A recovery feature must not change the replay identity used by ordinary decisions."""
+    service = OrchestrationService()
+    service.execute_request_plan_action = AsyncMock(
+        return_value=SimpleNamespace(id=uuid.uuid4(), action_type="request_plan", status="completed")
+    )
+    service._steering_action_fence = AsyncMock()
+    run = SimpleNamespace(id=uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+    decision = SimpleNamespace(
+        id=uuid.uuid4(), validator_status="accepted", input_snapshot={}, rejection_reason=None,
+        parsed_decision={
+            "action_type": "request_plan",
+            "agent_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "work_function": "planning",
+            "scope": "Create the delivery plan.",
+        },
+    )
+
+    await OrchestrationDecisionDispatcher(service).dispatch(None, run, decision)
+
+    canonical_request = {
+        "action_type": "request_plan",
+        "agent_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "work_function": "planning",
+        "scope": "Create the delivery plan.",
+    }
+    fingerprint = hashlib.sha256(json.dumps(
+        canonical_request, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()[:16]
+    assert service.execute_request_plan_action.await_args.kwargs["idempotency_key"] == (
+        f"run:{run.id}:kind:request_plan:request:{fingerprint}"
+    )
 
 
 @pytest.mark.asyncio

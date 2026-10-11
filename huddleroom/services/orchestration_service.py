@@ -9945,17 +9945,26 @@ class OrchestrationService:
         return failure
 
     async def _validate_gate(self, db: AsyncSession, gate: OrchestrationGate) -> bool:
+        selected, failure = await self._gate_validation_result(db, gate, update_required_evidence=True)
+        if failure is not None:
+            reason, final = failure
+            if final:
+                self._fail_gate(gate, reason)
+                return True
+            gate.failure_reason = reason
+            return False
+        self._accept_gate(gate, selected)
+        return True
+
+    async def _gate_validation_result(
+        self, db: AsyncSession, gate: OrchestrationGate, *, update_required_evidence: bool = False,
+    ) -> tuple[list[OrchestrationEvidence], tuple[str, bool] | None]:
+        """Evaluate the ordinary evidence predicate without accepting or failing rows."""
         if gate.gate_type == RETAINED_GATE_TYPE:
             # Provenance only: no evidence rows, and not a plan-item gate, so it never satisfies criteria.
             if failure := await self._retained_gate_failure(db, gate):
-                reason, final = failure
-                if final:
-                    self._fail_gate(gate, reason)
-                    return True
-                gate.failure_reason = reason
-                return False
-            self._accept_gate(gate, [])
-            return True
+                return [], failure
+            return [], None
         evidence = await self._evidence_for_gate(db, gate)
         latest_evidence = self._latest_evidence_by_source(evidence)
         rejected = next(
@@ -9963,10 +9972,9 @@ class OrchestrationService:
             None,
         )
         if rejected is not None:
-            self._fail_gate(gate, f"Rejected evidence from {rejected.source_type}")
-            return True
+            return [], (f"Rejected evidence from {rejected.source_type}", True)
 
-        required_evidence = await self._required_evidence_for_gate(db, gate)
+        required_evidence = await self._required_evidence_for_gate(db, gate, update=update_required_evidence)
         configured_source_types = required_evidence.get("required_source_types", [])
         required_source_types = [
             source_type
@@ -9984,18 +9992,11 @@ class OrchestrationService:
             min_count,
         )
         if missing:
-            gate.failure_reason = f"Missing evidence: {', '.join(missing)}"
-            return False
+            return selected, (f"Missing evidence: {', '.join(missing)}", False)
         if len(selected) < min_count:
-            gate.failure_reason = "Missing evidence"
-            return False
+            return selected, ("Missing evidence", False)
         if gate.gate_type == ADHOC_GATE_TYPE and (failure := await self._adhoc_report_failure(db, gate)):
-            reason, final = failure
-            if final:
-                self._fail_gate(gate, reason)
-                return True
-            gate.failure_reason = reason
-            return False
+            return selected, failure
 
         run = await db.get(OrchestrationRun, gate.run_id)
         if (
@@ -10006,36 +10007,29 @@ class OrchestrationService:
             )
             and not await self._has_bound_outcome_verification_evidence(db, gate)
         ):
-            gate.failure_reason = "Independent verification evidence is missing"
-            return False
+            return selected, ("Independent verification evidence is missing", False)
 
         if gate.gate_type == FINAL_SUMMARY_GATE_TYPE:
             summary_failure = await self._final_summary_evidence_failure(db, gate, selected)
             if summary_failure is not None:
-                self._fail_gate(gate, summary_failure)
-                return True
+                return selected, (summary_failure, True)
 
         stale_reason = self._stale_evidence_reason(selected)
         if stale_reason is not None:
-            self._fail_gate(gate, stale_reason)
-            return True
+            return selected, (stale_reason, True)
 
-        independence_reason = await self._independence_failure_reason(db, gate, selected)
+        independence_reason = await self._independence_failure_reason(db, gate, selected, required_evidence=required_evidence)
         if independence_reason is not None:
             if gate.gate_type == "roadmap_integration":
-                gate.failure_reason = independence_reason
-                return False
+                return selected, (independence_reason, False)
             run = await db.get(OrchestrationRun, gate.run_id)
             if run is not None and await self._is_outcome_plan_item_gate(db, run, gate):
                 goal = await db.get(OrchestrationGoal, run.goal_id)
                 if goal is not None and goal.goal_type == "roadmap":
-                    gate.failure_reason = independence_reason
-                    return False
-            self._fail_gate(gate, independence_reason)
-            return True
+                    return selected, (independence_reason, False)
+            return selected, (independence_reason, True)
 
-        self._accept_gate(gate, selected)
-        return True
+        return selected, None
 
     async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
         """(reason, final) unless the done task's consumed report is valid with evidence.
@@ -10177,7 +10171,7 @@ class OrchestrationService:
         return (seq is None, seq or 0, evidence.created_at, str(evidence.id))
 
     async def _required_evidence_for_gate(
-        self, db: AsyncSession, gate: OrchestrationGate
+        self, db: AsyncSession, gate: OrchestrationGate, *, update: bool = True,
     ) -> dict[str, Any]:
         required_evidence = self._json_object_or_empty(gate.required_evidence)
         if gate.gate_type != PLAN_ITEM_GATE_TYPE:
@@ -10194,7 +10188,7 @@ class OrchestrationService:
             "min_count": 2,
             "requires_independent_agent": True,
         }
-        if normalized != required_evidence:
+        if update and normalized != required_evidence:
             gate.required_evidence = normalized
         return normalized
 
@@ -10203,8 +10197,10 @@ class OrchestrationService:
         db: AsyncSession,
         gate: OrchestrationGate,
         evidence: list[OrchestrationEvidence],
+        *, required_evidence: dict[str, Any] | None = None,
     ) -> str | None:
-        required_evidence = self._json_object_or_empty(gate.required_evidence)
+        if required_evidence is None:
+            required_evidence = self._json_object_or_empty(gate.required_evidence)
         if required_evidence.get("requires_independent_agent") is not True:
             return None
         if gate.gate_type == "roadmap_integration":

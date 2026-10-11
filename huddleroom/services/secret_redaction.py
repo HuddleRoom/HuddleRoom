@@ -6,10 +6,20 @@ _JSON_SECRET_PATTERN = re.compile(
     r'(?i)(["\'](?:api[_-]?key|authorization|bearer|token|secret|password)["\']\s*:\s*["\'])([^"\']+)(["\'])'
 )
 _SECRET_PATTERNS = (
-    re.compile(r"(?i)(authorization)\s*[:=]\s*(bearer\s+)?([^\s,;]+)"),
-    re.compile(r"(?i)(bearer)\s+([^\s,;]+)"),
-    re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*([^\s,;]+)"),
-    re.compile(r"(?i)(api[_-]?key|authorization|bearer|token|secret|password)=([^&\s]+)"),
+    # Keep redaction markers stable when validators inspect serialized JSON.
+    re.compile(
+        r"(?i)(authorization)\s*[:=]\s*(bearer\s+)?"
+        r"(?!\[REDACTED\](?:$|[\s,;\"'&}\]\\]))([^\s,;]+)"
+    ),
+    re.compile(r"(?i)(bearer)\s+(?!\[REDACTED\](?:$|[\s,;\"'&}\]\\]))([^\s,;]+)"),
+    re.compile(
+        r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*"
+        r"(?!\[REDACTED\](?:$|[\s,;\"'&}\]\\]))([^\s,;]+)"
+    ),
+    re.compile(
+        r"(?i)(api[_-]?key|authorization|bearer|token|secret|password)="
+        r"(?!\[REDACTED\](?:$|[\s,;\"'&}\]\\]))([^&\s]+)"
+    ),
     re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{10,}\b"),
     re.compile(r"\bsk-ant-[A-Za-z0-9_-]{10,}\b"),

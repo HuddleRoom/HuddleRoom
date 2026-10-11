@@ -145,6 +145,15 @@ def test_rejects_unknown_top_level_key():
         normalize_wake_when({"recheck_after_seconds": 60, "expected_result": "x", "bogus": 1})
 
 
+def test_rejects_model_invented_live_work_refs():
+    with pytest.raises(ValueError, match=r"unknown wake_when keys \['live_work_refs'\]"):
+        normalize_wake_when({
+            "recheck_after_seconds": 60,
+            "expected_result": "x",
+            "live_work_refs": [{"kind": "task", "id": U1}],
+        })
+
+
 def test_rejects_non_string_top_level_key():
     with pytest.raises(ValueError, match="wake_when keys must be strings"):
         normalize_wake_when({1: "x", "recheck_after_seconds": 60, "expected_result": "x"})
