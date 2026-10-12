@@ -218,8 +218,18 @@ async def test_meeting_websocket_streams_only_target_meeting(test_engine, monkey
     from huddleroom.models.agent import Agent
     from huddleroom.models.meeting import Meeting, MeetingTurn
     from huddleroom.models.project import Project
-    from huddleroom.services.event_bus import BusEvent, get_event_bus
+    from huddleroom.services.event_bus import BusEvent, EventBusService
     import huddleroom.routers.websocket as websocket_router
+
+    async def wait_for_subscriber_count(portal, expected_count):
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while (actual_count := portal.call(lambda: len(bus._subscribers))) != expected_count:
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail(
+                    f"Timed out waiting for {expected_count} event bus subscribers; "
+                    f"found {actual_count}"
+                )
+            await asyncio.sleep(0.01)
 
     session_factory = _test_session_factory(test_engine)
     async with session_factory() as session:
@@ -275,13 +285,15 @@ async def test_meeting_websocket_streams_only_target_meeting(test_engine, monkey
         await session.commit()
 
     monkeypatch.setattr(websocket_router, "AsyncSessionLocal", session_factory)
+    bus = EventBusService()
+    monkeypatch.setattr(websocket_router, "get_event_bus", lambda: bus)
     app = create_app()
-    bus = get_event_bus()
 
     with closing(TestClient(app)) as client:
         with client.websocket_connect(f"/ws/meetings/{target_meeting.id}") as ws:
-            await asyncio.sleep(0.05)
-            bus.put(
+            await wait_for_subscriber_count(ws.portal, 1)
+            ws.portal.call(
+                bus.put,
                 BusEvent(
                     id=uuid.uuid4(),
                     project_id=project.id,
@@ -295,7 +307,8 @@ async def test_meeting_websocket_streams_only_target_meeting(test_engine, monkey
                     emitted_at=datetime.now(timezone.utc),
                 )
             )
-            bus.put(
+            ws.portal.call(
+                bus.put,
                 BusEvent(
                     id=uuid.uuid4(),
                     project_id=project.id,
@@ -311,6 +324,7 @@ async def test_meeting_websocket_streams_only_target_meeting(test_engine, monkey
             )
             data = ws.receive_json()
             ws.close()
+            await wait_for_subscriber_count(ws.portal, 0)
 
     assert data["meeting_id"] == str(target_meeting.id)
     assert data["turn"]["content"] == "Target turn"

@@ -249,12 +249,19 @@ async def test_accepted_roadmap_reconcile_clears_lingering_orchestrator_waits_on
     assert orch and all(w.status == "cleared" and w.cleared_at is not None for w in orch)
 
 
-async def test_safety_net_runs_no_queries_without_orchestrator_waits(db_session, test_project, monkeypatch):
+async def test_safety_net_does_not_query_without_orchestrator_waits(db_session, test_project):
     goal, run = await _run(db_session, test_project)
-    await _system_wait(db_session, run)
+    sys_wait = await _system_wait(db_session, run)
+    waits = await _waits(db_session, run)
 
-    async def boom(self, db, goal, run):
+    class NoDatabaseAccess:
+        def __getattr__(self, name):
+            raise AssertionError(f"database access is not expected: {name}")
+
+    async def situation_getter():
         raise AssertionError("progress view must not be built")
 
-    monkeypatch.setattr(OrchestrationProgressView, "build_safe", boom)
-    await OrchestrationService().supervision.reconcile_local(db_session, goal, run)
+    await OrchestrationService().supervision._clear_stale_orchestrator_waits(
+        NoDatabaseAccess(), goal, run, waits, _utcnow(), situation_getter,
+    )
+    assert sys_wait.status == "open"
