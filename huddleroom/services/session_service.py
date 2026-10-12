@@ -80,6 +80,8 @@ class SessionService:
                 int(Decimal(remaining["max_hours"]) * 3600),
                 self._positive_limit(agent.config.get("session_timeout_seconds", 3600), "Agent session_timeout_seconds"),
             )
+        if any(value < 1 for value in limits.values()):
+            raise ValueError("Execution budget is exhausted")
         return {**limits, "_roadmap_budget_enforced": True}
 
     @staticmethod
@@ -306,7 +308,7 @@ class SessionService:
             run = await db.get(OrchestrationRun, claim_action.run_id)
             goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
             parent = await budget.roadmap_parent(db, goal) or await budget.continuous_parent(db, goal) if goal else None
-            if run is not None and goal is not None and parent is None:
+            if run is not None and goal is not None and parent is None and goal.goal_type != "outcome":
                 if run.status in ("completed", "failed", "cancelled") or goal.status in ("completed", "failed", "cancelled"):
                     raise SessionClaimAttention(run.id, {
                         "kind": "budget_integrity", "scope": f"claim:{goal.id}",
@@ -328,8 +330,27 @@ class SessionService:
                             "kind": "budget_integrity", "scope": f"claim:{goal.id}", "reason": str(exc),
                         }, str(exc)) from exc
                     return limits
-        run = await budget.owning_roadmap_run(db, task) or await budget.owning_continuous_run(db, task)
+        run = (
+            await budget.owning_roadmap_run(db, task)
+            or await budget.owning_continuous_run(db, task)
+            or await budget.owning_outcome_run(db, task)
+        )
         if run is None:
+            orchestration = OrchestrationService._json_object_or_empty(
+                OrchestrationService._json_object_or_empty(task.metadata_ if task else {}).get("orchestration")
+            )
+            expected_run_id = OrchestrationService._event_uuid(orchestration.get("run_id"))
+            expected_run = await db.get(OrchestrationRun, expected_run_id) if expected_run_id is not None else None
+            expected_goal = await db.get(OrchestrationGoal, expected_run.goal_id) if expected_run is not None else None
+            if (
+                expected_goal is not None and expected_goal.goal_type == "outcome"
+                and expected_goal.parent_goal_id is None
+                and await budget.claim_caps(db, expected_run, expected_goal, expected_goal)
+            ):
+                raise SessionClaimAttention(expected_run.id, {
+                    "kind": "budget_integrity", "scope": f"claim:{expected_goal.id}",
+                    "reason": "Outcome task budget lineage is missing or ambiguous.",
+                }, "Outcome task budget lineage is missing or ambiguous.")
             return {}
         plan_state = OrchestrationService._json_object_or_empty(run.plan_state)
         if "discovery" in plan_state:
@@ -339,6 +360,8 @@ class SessionService:
             }, "Discovery task is missing its discovery contract.")
         goal = await db.get(OrchestrationGoal, run.goal_id)
         parent = await budget.roadmap_parent(db, goal) or await budget.continuous_parent(db, goal)
+        if parent is None and goal.goal_type == "outcome" and goal.parent_goal_id is None:
+            parent = goal
         if parent is None:
             return {}
         if run.status in ("completed", "failed", "cancelled") or goal.status in ("completed", "failed", "cancelled"):
@@ -446,20 +469,25 @@ class SessionService:
     async def _validate_budget_adapter(
         self, db: AsyncSession, task: Task | None, limits: dict, roadmap_context: dict, adapter_type: str,
     ) -> dict:
-        """Keep Roadmap's explicit CLI authority separate from Continuous work."""
+        """Keep Roadmap's explicit CLI authority separate from other budget owners."""
         if not limits:
             return {}
         from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
 
-        run = await OrchestrationBudgetService().owning_continuous_run(db, task)
+        budget = OrchestrationBudgetService()
+        run = await budget.owning_continuous_run(db, task)
+        owner_type = "Continuous"
+        if run is None:
+            run = await budget.owning_outcome_run(db, task)
+            owner_type = "Outcome"
         if run is not None:
             unsupported = sorted(key for key in ("max_tokens",) if key in limits)
             if adapter_type == "cli" and unsupported:
                 raise SessionClaimAttention(run.id, {
                     "kind": "budget_integrity", "scope": f"adapter-capability:{run.id}",
                     "adapter_type": adapter_type, "unsupported_dimensions": unsupported,
-                    "reason": f"Continuous CLI cannot enforce reserved budget dimensions: {', '.join(unsupported)}.",
-                }, "Continuous CLI cannot enforce reserved budget dimensions")
+                    "reason": f"{owner_type} CLI cannot enforce reserved budget dimensions: {', '.join(unsupported)}.",
+                }, f"{owner_type} CLI cannot enforce reserved budget dimensions")
             if adapter_type not in {"api", "cli"}:
                 raise SessionClaimAttention(run.id, {
                     "kind": "budget_integrity", "scope": f"adapter-capability:{run.id}",
@@ -845,7 +873,7 @@ class SessionService:
             old_config = (session.metadata_ or {}).get("_run_config", {})
             metadata = session.metadata_ or {}
             prior_usage = {"max_turns": str(metadata.get("_roadmap_turn_count", 1))}
-            if "max_tokens" in old_config:
+            if "max_tokens" in old_config or "max_tokens" in budget_limits:
                 if isinstance(metadata.get("_roadmap_cli_budget_approval"), dict):
                     from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
                     prior_usage["max_tokens"] = str(OrchestrationBudgetService._session_spend(
@@ -856,7 +884,7 @@ class SessionService:
                         Decimal(str(metadata.get("token_count_in", 0)))
                         + Decimal(str(metadata.get("token_count_out", 0)))
                     )
-            if "timeout" in old_config:
+            if "timeout" in old_config or "timeout" in budget_limits:
                 elapsed = metadata.get("_roadmap_elapsed_seconds")
                 if elapsed is None:
                     elapsed = max(0, (session.ended_at - session.started_at).total_seconds())

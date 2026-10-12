@@ -24,6 +24,98 @@ from huddleroom.models.task import Task
 FAKE_API_KEY = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
 
 
+@pytest.mark.asyncio
+async def test_legacy_root_outcome_resume_preserves_spend_headroom_and_elapsed(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    from datetime import timedelta
+    from decimal import Decimal
+    from huddleroom.adapters.api_adapter import ApiAdapter
+    from huddleroom.models.base import _utcnow
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.schemas.session import SessionCreate
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+    from huddleroom.services.session_service import SessionClaimAttention, SessionService
+    from tests.test_session_orchestration_claims import _root_outcome
+
+    goal, run, task, _action = await _root_outcome(
+        db_session, test_project, test_agent, {"max_tokens": "100", "max_hours": "1"},
+    )
+    task.status = "failed"
+    started = _utcnow()
+    session = Session(
+        project_id=test_project.id, task_id=task.id, agent_id=test_agent.id,
+        adapter_type="api", status="failed", resumable=True,
+        started_at=started, ended_at=started + timedelta(seconds=900),
+        metadata_={"token_count_in": 10, "token_count_out": 20, "_run_config": {}},
+    )
+    next_task = Task(project_id=test_project.id, title="Next", assigned_to=test_agent.id,
+                     metadata_={"orchestration": {"run_id": str(run.id)}})
+    db_session.add_all([session, next_task])
+    await db_session.flush()
+    db_session.add(OrchestrationAction(
+        run_id=run.id, idempotency_key="legacy-next", action_type="create_delegation_task",
+        status="completed", target_type="task", target_id=next_task.id,
+    ))
+    await db_session.flush()
+    scheduled = []
+    monkeypatch.setattr(SessionService, "_schedule_dispatch_after_commit", lambda *args: scheduled.append(args[2]))
+
+    resumed = await SessionService().resume(db_session, session.id)
+
+    config = resumed.metadata_["_run_config"]
+    assert (config["max_tokens"], config["timeout"]) == (70, 2700)
+    assert config["_roadmap_prior_usage"]["max_tokens"] == "30"
+    assert Decimal(config["_roadmap_prior_usage"]["max_hours"]) == Decimal("0.25")
+    headroom = (await OrchestrationBudgetService().remaining(db_session, goal))["remaining"]
+    assert {key: Decimal(value) for key, value in headroom.items()} == {
+        "max_tokens": Decimal("0"), "max_hours": Decimal("0"),
+    }
+    with pytest.raises(SessionClaimAttention):
+        await SessionService().create(db_session, SessionCreate(
+            agent_id=test_agent.id, project_id=test_project.id, task_id=next_task.id,
+        ))
+    assert scheduled == [session.id]
+    assert list((await db_session.scalars(select(Session).where(Session.task_id == next_task.id))).all()) == []
+
+    # Completion of the resumed attempt adds elapsed time to the legacy baseline.
+    resumed.started_at = started
+    resumed.ended_at = started + timedelta(seconds=60)
+    ApiAdapter._store_roadmap_elapsed(resumed)
+    assert Decimal(resumed.metadata_["_roadmap_elapsed_seconds"]) == Decimal("960")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spent", [30, 100])
+async def test_root_outcome_resume_recomputes_remaining_before_state_change(
+    db_session, test_project, test_agent, monkeypatch, spent,
+):
+    from tests.test_session_orchestration_claims import _root_outcome
+    from huddleroom.services.session_service import SessionClaimAttention, SessionService
+
+    _goal, _run, task, _action = await _root_outcome(db_session, test_project, test_agent, {"max_tokens": "100"})
+    task.status = "failed"
+    session = Session(project_id=test_project.id, task_id=task.id, agent_id=test_agent.id,
+                      adapter_type="api", status="failed", resumable=True,
+                      metadata_={"token_count_in": spent, "token_count_out": 0,
+                                 "_run_config": {"max_tokens": 100, "_roadmap_budget_enforced": True}})
+    db_session.add(session)
+    await db_session.flush()
+    scheduled = []
+    monkeypatch.setattr(SessionService, "_schedule_dispatch_after_commit", lambda *args: scheduled.append(args[2]))
+    if spent == 100:
+        with pytest.raises(SessionClaimAttention):
+            await SessionService().resume(db_session, session.id)
+        assert session.status == "failed" and session.resumable is True
+        assert not scheduled and session.runner_task_id is None
+    else:
+        resumed = await SessionService().resume(db_session, session.id)
+        assert resumed.status == "pending" and resumed.resumable is False
+        assert resumed.metadata_["_run_config"]["max_tokens"] == 70
+        assert resumed.metadata_["_run_config"]["_roadmap_prior_usage"]["max_tokens"] == "30"
+        assert scheduled == [session.id]
+
+
 # ---------------------------------------------------------------------------
 # API session (litellm) failure -> resumable + redacted error
 # ---------------------------------------------------------------------------

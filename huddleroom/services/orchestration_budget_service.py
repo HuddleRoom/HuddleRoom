@@ -654,6 +654,24 @@ class OrchestrationBudgetService:
                 runs.append(run)
         return runs[0] if len({run.id for run in runs}) == 1 else None
 
+    async def owning_outcome_run(self, db, task: Task | None) -> OrchestrationRun | None:
+        """Resolve one root Outcome owner from completed task-targeted actions."""
+        if task is None:
+            return None
+        actions = list((await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.target_type == "task",
+            OrchestrationAction.target_id == task.id,
+            OrchestrationAction.action_type.in_(self.TASK_LINEAGE_ACTIONS),
+            OrchestrationAction.status == "completed",
+        ))).all())
+        runs = []
+        for action in actions:
+            run = await db.get(OrchestrationRun, action.run_id)
+            goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
+            if goal is not None and goal.goal_type == "outcome" and goal.parent_goal_id is None:
+                runs.append(run)
+        return runs[0] if len({run.id for run in runs}) == 1 else None
+
     @staticmethod
     def _sum(values, dimensions: set[str]) -> dict[str, str]:
         totals = {key: Decimal("0") for key in dimensions}

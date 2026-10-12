@@ -27,6 +27,7 @@ from huddleroom.services.session_service import SessionClaimAttention
 from huddleroom.services.task_service import TaskService
 from tests.test_orchestration_roadmap_integration import child_item, release
 from tests.test_orchestration_runtime_e2e import _agent
+from tests.test_session_orchestration_claims import _root_outcome
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +122,74 @@ async def _assert_one_claim(db, run_id, goal_id):
     blockers = [item for item in run.active_blockers if item.get("scope") == f"claim:{goal_id}"]
     assert len(blockers) == 1
     return blockers[0]
+
+
+@pytest.mark.parametrize("case,caps", [
+    ("tokens", {"max_tokens": "0"}),
+    ("fractional_tokens", {"max_tokens": "0.5"}),
+    ("turns", {"max_turns": "0.5"}),
+    ("hours", {"max_hours": "0"}),
+    ("subsecond", {"max_hours": "0.0001"}),
+    ("measurement", {"max_tokens": "100"}),
+    ("missing", {"max_tokens": "100"}),
+    ("conflicting", {"max_tokens": "100"}),
+    ("conflicting_plan", {"max_tokens": "100"}),
+])
+async def test_root_outcome_claim_refuses_unenforceable_or_invalid_capacity(committed_db, case, caps):
+    db, project, _engine = committed_db
+    agent = _agent("root-refusal", ["implementation"])
+    db.add(agent)
+    await db.flush()
+    goal, run, task, _action = await _root_outcome(db, project, agent, caps, lineage=case != "missing")
+    if case == "measurement":
+        db.add(Session(project_id=project.id, task_id=task.id, agent_id=agent.id,
+                       adapter_type="api", status="completed", metadata_={}))
+    if case in {"conflicting", "conflicting_plan"}:
+        if case == "conflicting_plan":
+            _action.action_type = "request_plan"
+        _other_goal, other_run, _other_task, _other_action = await _root_outcome(db, project, agent, caps)
+        db.add(OrchestrationAction(
+            run_id=other_run.id, idempotency_key="conflict", action_type="request_verification",
+            status="completed", target_type="task", target_id=task.id,
+        ))
+    await db.commit()
+    task_id, run_id, goal_id = task.id, run.id, goal.id
+    request = SessionCreate(agent_id=agent.id, project_id=project.id, task_id=task.id)
+    for _ in range(2):
+        with pytest.raises(SessionClaimAttention) as refused:
+            await sessions_router.create_session(request, None, db)
+        assert refused.value.blocker["kind"] == ("budget_measurement" if case == "measurement" else "budget_integrity")
+    assert not db.sync_session.info.get("pending_session_dispatches")
+    assert await db.scalar(select(func.count()).select_from(Session).where(
+        Session.task_id == task_id, Session.status.in_(["pending", "running"]),
+    )) == 0
+    await _assert_one_claim(db, run_id, goal_id)
+
+
+async def test_root_outcome_retry_and_reassign_refusals_are_replay_safe(committed_db):
+    db, project, _engine = committed_db
+    agent = _agent("root-recovery", ["implementation"])
+    db.add(agent)
+    await db.flush()
+    goal, run, task, _action = await _root_outcome(db, project, agent, {"max_tokens": "0"})
+    task.status = "failed"
+    await db.commit()
+    service = OrchestrationService()
+    for kind in ("retry", "reassign"):
+        request = {"task_id": str(task.id)}
+        if kind == "reassign":
+            request["agent_id"] = str(agent.id)
+        execute = getattr(service, f"execute_{kind}_task_action")
+        first = await execute(db, run.id, request, f"root-{kind}")
+        await db.commit()
+        replay = await execute(db, run.id, request, f"root-{kind}")
+        assert (replay.id, replay.status) == (first.id, "failed")
+    assert not db.sync_session.info.get("pending_session_dispatches")
+    assert await db.scalar(select(func.count()).select_from(Session).where(Session.task_id == task.id)) == 0
+    events = list((await db.scalars(select(EventLog.event_type).where(EventLog.project_id == project.id))).all())
+    assert "orchestration.task_retried" not in events and "orchestration.task_reassigned" not in events
+    assert task.status == "failed" and task.assigned_to == agent.id
+    await _assert_one_claim(db, run.id, goal.id)
 
 
 @pytest.mark.parametrize("scope", ["parent", "child"])

@@ -814,8 +814,12 @@ async def test_admitted_remediation_task_gets_a_session_while_the_run_is_baselin
     sessions = (await db_session.scalars(select(Session).where(Session.task_id == task.id))).all()
     if not sessions:
         sessions = [await SessionService().create(db_session, SessionCreate(
-            agent_id=task.assigned_to, task_id=task.id, project_id=task.project_id, origin="auto"))]
+            agent_id=task.assigned_to, task_id=task.id, project_id=task.project_id, origin="auto",
+            adapter_type_override="api"))]
     assert sessions and sessions[0].task_id == task.id and sessions[0].agent_id == rows.agent.id
+    assert sessions[0].adapter_type == "api"
+    config = sessions[0].metadata_["_run_config"]
+    assert config["_roadmap_budget_enforced"] is True and 0 < config["max_tokens"] <= 4096
     assert await status(db_session, svc, proposal) == "applying"
 
 

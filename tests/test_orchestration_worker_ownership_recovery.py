@@ -407,6 +407,7 @@ async def test_interrupted_safe_settles_source_budget_before_replacement_reserva
     )
     goal.budget = {"caps": {"max_tokens": 20}}
     run.phase = "authorized"
+    session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0}
     source_action.budget_ledger = {
         "allocation": {"max_tokens": "10"}, "reserved": {}, "committed": {"max_tokens": "10"},
         "consumed": {}, "usage_state": "known", "enforceability": "enforceable",
@@ -414,6 +415,11 @@ async def test_interrupted_safe_settles_source_budget_before_replacement_reserva
     task.metadata_ = {
         **task.metadata_, "orchestration_contract": {"budget": {"caps": {"max_tokens": 10}}},
     }
+    db_session.add(OrchestrationAction(
+        run_id=run.id, idempotency_key=f"seed:{task.id}:task-lineage", action_type="create_delegation_task",
+        status="completed", target_type="task", target_id=task.id,
+    ))
+    await db_session.flush()
 
     service = OrchestrationRecoveryService()
     snapshot = await service.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
@@ -427,7 +433,13 @@ async def test_interrupted_safe_settles_source_budget_before_replacement_reserva
         f"action:{source_action.id}:session:{session.id}:interrupted_safe:final"
     )
     replacement = await db_session.get(OrchestrationAction, result.action_id)
+    assert replacement is not None and replacement.status == "completed", replacement.error if replacement else None
     assert replacement is not None and replacement.budget_ledger["committed"] == {"max_tokens": "10"}
+    assert replacement.target_type == "session"
+    replacement_session = await db_session.get(Session, replacement.target_id)
+    assert replacement_session.adapter_type == "api" and replacement_session.task_id == task.id
+    assert replacement_session.metadata_["_run_config"]["max_tokens"] == 10
+    assert replacement_session.metadata_["_run_config"]["_roadmap_budget_enforced"] is True
 
 
 @pytest.mark.asyncio
