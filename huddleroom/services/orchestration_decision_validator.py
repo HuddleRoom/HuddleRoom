@@ -21,6 +21,7 @@ ALLOWED_ACTION_SCHEMAS: dict[str, frozenset[str]] = {
     "accept_plan": frozenset({"plan_artifact_id"}),
     "create_delegation_task": frozenset({"agent_id", "deliverable", "scope", "work_function"}),
     "request_verification": frozenset({"gate_id", "work_function"}),
+    "resolve_meeting_action_item": frozenset({"item_id", "reason"}),
     "retry_task": frozenset({"task_id"}),
     "reassign_task": frozenset({"agent_id", "task_id"}),
     "schedule_meeting": frozenset({"participant_agent_ids", "topic"}),
@@ -181,6 +182,12 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
             "Decision 'recover_blocker' evidence_refs must be a list of {kind, id} objects with kind in "
             f"{', '.join(sorted(RECOVER_BLOCKER_EVIDENCE_KINDS))} and a UUID id",
         )
+
+    if action_type == "resolve_meeting_action_item":
+        if not _is_uuid_string(decision["item_id"]):
+            return DecisionValidationResult(False, "item_id must be a UUID")
+        if not isinstance(decision["reason"], str) or not 1 <= len(decision["reason"].strip()) <= 500:
+            return DecisionValidationResult(False, "reason must be a nonblank string of 1–500 characters")
 
     if action_type == "retry_task":
         for key in ("timeout", "max_tokens"):

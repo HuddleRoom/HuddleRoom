@@ -1,7 +1,8 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { AlertTriangle, Ban, CheckCircle2, HelpCircle, RotateCcw, ShieldAlert } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
+import { useUpdateActionItem } from '@/api/meetings'
 import { Button, Textarea } from '@/components/common/uiPrimitives'
 import { ErrorRecord } from '@/components/common/ErrorRecord'
 import { STATUS_COLORS } from '@/lib/statusColors'
@@ -11,6 +12,7 @@ import type {
   OrchestrationBlocker,
   OrchestrationGate,
   OrchestrationGoal,
+  OrchestrationMeetingCommitment,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
   OrchestrationWarningRecord,
@@ -51,6 +53,7 @@ type QueueRow =
   | { kind: 'goal-definition-questions'; key: string; decisions: OrchestrationAuthorityDecisionRecord[]; process: OrchestrationProcessRunRecord | undefined }
   | { kind: 'recovery-proposal'; key: string; decision: OrchestrationAuthorityDecisionRecord }
   | { kind: 'gate'; key: string; gate: OrchestrationGate; description: string | undefined }
+  | { kind: 'meeting-commitment'; key: string; commitment: OrchestrationMeetingCommitment }
   | { kind: 'warning'; key: string; warning: OrchestrationWarningRecord; process: OrchestrationProcessRunRecord | undefined; canAcknowledge: boolean }
 
 function agentDefinitionReviewBatchDecisions(
@@ -108,6 +111,7 @@ export function buildQueueRows({
   gates,
   warnings,
   criteriaByKey,
+  meetingCommitments = [],
 }: {
   run: OrchestrationRun | null
   processes: readonly OrchestrationProcessRunRecord[]
@@ -115,6 +119,7 @@ export function buildQueueRows({
   recoveryDecisions?: readonly OrchestrationAuthorityDecisionRecord[]
   gates: readonly OrchestrationGate[]
   warnings: readonly OrchestrationWarningRecord[]
+  meetingCommitments?: readonly OrchestrationMeetingCommitment[]
   criteriaByKey: Map<string, string | undefined>
 }): QueueRow[] {
   const processesById = new Map(processes.map((process) => [process.id, process] as const))
@@ -186,6 +191,10 @@ export function buildQueueRows({
     rows.push({ kind: 'gate', key: `gate:${gate.id}`, gate, description: criteriaByKey.get(gate.success_criterion_key) })
   }
 
+  for (const commitment of meetingCommitments) {
+    rows.push({ kind: 'meeting-commitment', key: `meeting-commitment:${commitment.id}`, commitment })
+  }
+
   for (const warning of warnings.filter((candidate) => candidate.active && !lmRetryWarningIds.has(candidate.id))) {
     rows.push({
       kind: 'warning',
@@ -232,7 +241,7 @@ function emptyStateCopy(
       text: runningStep ? `Orchestrator is working — ${lowerFirst(stepActivityVerb(runningStep))}…` : 'Orchestrator is working…',
     }
   }
-  return { tone: 'on-track' as const, text: 'No blockers, failed gates, pending decisions, or active warnings — this goal is on track.' }
+  return { tone: 'on-track' as const, text: 'No blockers, failed gates, pending decisions, meeting obligations, or active warnings — this goal is on track.' }
 }
 
 export interface NeedsYouQueueProps {
@@ -241,6 +250,7 @@ export interface NeedsYouQueueProps {
   processes: readonly OrchestrationProcessRunRecord[]
   warnings: readonly OrchestrationWarningRecord[]
   gates: readonly OrchestrationGate[]
+  meetingCommitments?: readonly OrchestrationMeetingCommitment[]
   checkpointItems: readonly OrchestrationAuthorityDecisionRecord[]
   // Every decision of the goal (any status); the source of non-pending
   // recovery proposals shown as FIX PROPOSAL cards.
@@ -311,6 +321,7 @@ const EYEBROW: Record<QueueRow['kind'], { text: string; color: string; icon: typ
   'goal-definition-questions': { text: 'QUESTIONS', color: STATUS_COLORS.blue, icon: HelpCircle },
   'recovery-proposal': { text: 'FIX PROPOSAL', color: STATUS_COLORS.amber, icon: ShieldAlert },
   gate: { text: 'GATE FAILED', color: STATUS_COLORS.red, icon: ShieldAlert },
+  'meeting-commitment': { text: 'MEETING ITEM', color: STATUS_COLORS.amber, icon: HelpCircle },
   warning: { text: 'WARNING', color: STATUS_COLORS.amber, icon: AlertTriangle },
 }
 
@@ -546,8 +557,97 @@ function OwningStepTag({ process, onSelectProcess }: { process: OrchestrationPro
   </button>
 }
 
+const WAIVER_SCOPE = 'This removes the meeting obligation. Linked work will keep running; goal criteria and gates still apply.'
+const COMMITMENT_STATES: Record<string, string> = {
+  open: 'No linked work', assigned: 'Assigned — no linked work',
+  task_in_flight: 'Linked task unfinished', graph_in_flight: 'Linked graph unfinished',
+  task_failed: 'Linked task needs attention', graph_failed: 'Linked graph needs attention',
+  done_unverified: 'Linked task done — awaiting verification',
+}
+
+function MeetingCommitmentRow({ commitment, projectId, mutationBusy, registerPrimary, onRemoved }: {
+  commitment: OrchestrationMeetingCommitment
+  projectId: string
+  mutationBusy: boolean
+  registerPrimary: (element: HTMLButtonElement | null) => void
+  onRemoved: () => void
+}) {
+  const update = useUpdateActionItem(projectId, commitment.meeting_id)
+  const [expanded, setExpanded] = useState(false)
+  const [reason, setReason] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const submitted = useRef(false)
+  const rowRef = useRef<HTMLLIElement>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+  const reasonRef = useRef<HTMLTextAreaElement>(null)
+  const removalRef = useRef(onRemoved)
+  removalRef.current = onRemoved
+  const id = useId()
+  const { active, announceError, announceQueue } = useGoalAnnouncer()
+  const trimmed = reason.trim()
+  const overLimit = trimmed.length > 500
+  const pending = submitting || update.isPending
+  useEffect(() => { if (expanded) reasonRef.current?.focus() }, [expanded])
+  useEffect(() => { if (error && !pending) reasonRef.current?.focus() }, [error, pending])
+  useLayoutEffect(() => {
+    const row = rowRef.current
+    return () => {
+      if (row?.contains(document.activeElement)) removalRef.current()
+    }
+  }, [])
+
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    if (submitted.current || pending || mutationBusy || !trimmed || overLimit) return
+    submitted.current = true
+    setSubmitting(true)
+    setError(null)
+    update.mutate({ actionItemId: commitment.id, data: { status: 'dismissed', reason: trimmed } }, {
+      onSuccess: (item) => {
+        const message = item.status === 'dismissed' ? 'Meeting obligation waived.'
+          : item.status === 'completed' ? 'Meeting item already completed.'
+          : `Meeting item updated — current status: ${item.status.replace(/_/g, ' ')}.`
+        toast.success(message)
+        announceQueue(message)
+      },
+      onError: (failure) => {
+        const message = failure instanceof Error ? failure.message : 'Could not waive the meeting obligation. Try again.'
+        setError(message)
+        announceError(message)
+      },
+      onSettled: () => { submitted.current = false; setSubmitting(false) },
+    })
+  }
+
+  return <li ref={rowRef} className="py-3 first:pt-0 last:pb-0 motion-safe:animate-[queue-row-in_180ms_ease-out]" aria-busy={pending}>
+    <div className="flex flex-wrap items-start gap-3 sm:flex-nowrap">
+      <HelpCircle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: STATUS_COLORS.amber }} />
+      <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 sm:flex-nowrap">
+        <p className="w-[104px] shrink-0 text-[11px] font-semibold uppercase tracking-[0.1em]" style={{ color: STATUS_COLORS.amber }}>MEETING ITEM</p>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm text-huddleroom-text-primary">{commitment.description}</p>
+          <Link to={`/meetings/${commitment.meeting_id}`} className="inline-flex min-h-11 items-center text-xs font-medium text-huddleroom-primary hover:underline">{commitment.meeting_title}</Link>
+          <p className="text-xs text-huddleroom-text-secondary">{COMMITMENT_STATES[commitment.state] ?? commitment.state.replace(/_/g, ' ')}</p>
+        </div>
+      </div>
+      <Button ref={(element) => { triggerRef.current = element; registerPrimary(element) }} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || pending} aria-expanded={expanded} aria-controls={`${id}-form`} onClick={() => setExpanded(true)}>Waive</Button>
+    </div>
+    {expanded && <form id={`${id}-form`} className="mt-2 space-y-3" onSubmit={submit} aria-busy={pending}>
+      <p id={`${id}-scope`} className="text-sm text-huddleroom-text-secondary">{WAIVER_SCOPE}</p>
+      <Textarea ref={reasonRef} label="Reason" required aria-required="true" rows={3} value={reason} disabled={pending || mutationBusy} onChange={(event) => setReason(event.target.value)} aria-invalid={overLimit || !!error} aria-describedby={`${id}-scope ${id}-validation${error ? ` ${id}-error` : ''}`} />
+      <p id={`${id}-validation`} className="text-xs text-huddleroom-text-secondary">{overLimit ? 'Reason must be 500 characters or fewer.' : 'A reason of 1–500 characters is required.'}</p>
+      {error && <p id={`${id}-error`} role={active ? undefined : 'alert'} className="text-xs text-huddleroom-status-red">{error}</p>}
+      <div className="flex flex-wrap justify-end gap-3">
+        <Button type="submit" className="min-h-11" disabled={mutationBusy || pending || !trimmed || overLimit}>{pending ? 'Waiving…' : 'Confirm waive'}</Button>
+        <Button type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || pending} onClick={() => { setExpanded(false); triggerRef.current?.focus() }}>Cancel</Button>
+      </div>
+    </form>}
+  </li>
+}
+
 export function NeedsYouQueue({
-  goal, run, processes, warnings, gates, checkpointItems, recoveryDecisions = [], onAnswerRecoveryProposal, checkpointLoaded, queriesErrored, queriesUnready, deferredCount, isWorking, mutationBusy,
+  goal, run, processes, warnings, gates, meetingCommitments = [], checkpointItems, recoveryDecisions = [], onAnswerRecoveryProposal, checkpointLoaded, queriesErrored, queriesUnready, deferredCount, isWorking, mutationBusy,
   onSelectProcess, openAction, onOpenAction, onActionTrigger, renderActionForm, renderAgentDefinitionReviewBatch, renderTeamHierarchyProposal,
   onAcceptDecision, onAnswerGoalDefinitionQuestion,
   retryPending, retryError, onRetryProcess, onApproveStaleInputs, onDismissStaleInputs, onAcknowledgeWarning,
@@ -560,7 +660,7 @@ export function NeedsYouQueue({
   const { announceQueue } = useGoalAnnouncer()
 
   const criteriaByKey = new Map(goal.success_criteria.filter((criterion) => criterion.key).map((criterion) => [criterion.key as string, criterion.description]))
-  const allRows = buildQueueRows({ run, processes, checkpointItems, recoveryDecisions, gates, warnings, criteriaByKey })
+  const allRows = buildQueueRows({ run, processes, checkpointItems, recoveryDecisions, gates, warnings, criteriaByKey, meetingCommitments })
   const rows = allRows.filter((row) => !justResolvedIds.has(row.key))
   rowOrderRef.current = rows.map((row) => row.key)
   // Terminal read-only recovery history needs no action, so it isn't announced as "needs you".
@@ -615,8 +715,7 @@ export function NeedsYouQueue({
   // Moves focus to the next row's primary action after a row resolves (skipping
   // reference-only rows like blockers/gates, which register no ref); falls back
   // to the queue heading once the queue is empty.
-  function focusNextRow(key: string) {
-    const order = rowOrderRef.current ?? []
+  function focusNextRow(key: string, order = rowOrderRef.current ?? []) {
     const index = order.indexOf(key)
     queueMicrotask(() => {
       for (let i = index + 1; i < order.length; i += 1) {
@@ -660,6 +759,10 @@ export function NeedsYouQueue({
     <h2 ref={headingRef} id="needs-you-queue-heading" tabIndex={-1} className={ZONE_TITLE_CLASS}>Needs you</h2>
     <ul className="mt-2 divide-y divide-huddleroom-border">
       {rows.map((row) => {
+        if (row.kind === 'meeting-commitment') {
+          const priorOrder = rows.map((candidate) => candidate.key)
+          return <MeetingCommitmentRow key={row.key} commitment={row.commitment} projectId={goal.project_id} mutationBusy={mutationBusy} registerPrimary={(element) => registerRowRef(row.key, element)} onRemoved={() => focusNextRow(row.key, priorOrder)} />
+        }
         if (row.kind === 'recovery-proposal') {
           return <li key={row.key} className="py-3 first:pt-0 last:pb-0 motion-safe:animate-[queue-row-in_180ms_ease-out]">
             <RecoveryProposalCard

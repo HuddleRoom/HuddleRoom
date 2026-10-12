@@ -29,7 +29,9 @@ from huddleroom.database import AsyncSessionLocal
 from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.meeting import Meeting, MeetingDecision
-from huddleroom.services.orchestration_meeting_commitments import link_meeting_action_items, meeting_commitments
+from huddleroom.services.orchestration_meeting_commitments import (
+    link_meeting_action_items, meeting_commitments, waive_meeting_action_item, waiver_reason,
+)
 from huddleroom.models.orchestration import (
     ACTIVE_RUN_STATUSES,
     GOAL_STATUSES,
@@ -4338,6 +4340,40 @@ class OrchestrationService:
             retry_target={"kind": "decision_loop"}, fingerprint_basis={"decision": str(decision.id)},
         )
 
+    async def execute_resolve_meeting_action_item_action(
+        self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
+        decision_id: uuid.UUID | None = None,
+    ) -> OrchestrationAction:
+        run = await db.get(OrchestrationRun, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Orchestration run not found")
+        from huddleroom.services.orchestration_baseline_runtime import require_baseline_available
+        async with self._lock_goal_for_baseline_transition(db, run.goal_id):
+            require_baseline_available(run.goal_id)
+            # Hold a database write lock through the effect, including human PATCH and reset races.
+            await db.execute(update(OrchestrationRun).where(OrchestrationRun.id == run_id)
+                             .values(status=OrchestrationRun.status, updated_at=OrchestrationRun.updated_at)
+                             .execution_options(synchronize_session=False))
+            run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+            if run is None:
+                raise HTTPException(status_code=409, detail="Orchestration run discarded by reset")
+            goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True)
+            current = await self.get_active_run_for_goal(db, goal.project_id, goal.id) if goal else None
+            if (goal is None or goal.status not in {"active", "blocked"} or current is None or current.id != run.id
+                    or run.phase != "authorized" or run.status not in {"running", "blocked"}):
+                raise HTTPException(status_code=409, detail="Waiver requires the current authorized active run")
+            existing = await self._existing_action_for_key(db, run_id, idempotency_key)
+            stored = existing.request if existing is not None else self._canonical_resolve_meeting_action_item_request(request)
+            action = await self.reserve_action(db, run_id, idempotency_key, "resolve_meeting_action_item", stored,
+                                               decision_id=decision_id)
+            if action.status != "reserved":
+                return action
+            item, _changed = await waive_meeting_action_item(
+                db, item_id=self._required_uuid(action.request.get("item_id"), "item_id"),
+                reason=action.request.get("reason"), run_id=run_id, action_id=action.id,
+            )
+            return await self._mark_action_completed(db, action, "meeting_action_item", item.id)
+
     async def execute_recover_blocker_action(
         self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
         decision_id: uuid.UUID | None = None,
@@ -4371,6 +4407,8 @@ class OrchestrationService:
         A corrective action may only resume the identical APPROVED pending effect; an ordinary action may
         also resume its identical pending ordinary row (transport/provider retry)."""
         del source
+        if action_type == "resolve_meeting_action_item":
+            return CorrectiveDisposition.ORDINARY  # Waives the obligation only; never retries or repairs work.
         if action_type in _NON_MUTATING_ACTIONS:
             return CorrectiveDisposition.ORDINARY  # records or asks; never a fix (spec: not mutation tools)
         from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
@@ -4867,6 +4905,7 @@ class OrchestrationService:
             "accept_plan": self._canonical_accept_plan_request,
             "create_delegation_task": self._canonical_delegation_task_request,
             "request_verification": self._canonical_request_verification_request,
+            "resolve_meeting_action_item": self._canonical_resolve_meeting_action_item_request,
             "retry_task": self._canonical_retry_task_request,
             "reassign_task": self._canonical_reassign_task_request,
             "schedule_meeting": self._canonical_schedule_meeting_request,
@@ -4877,6 +4916,12 @@ class OrchestrationService:
             "recover_blocker": self._canonical_recover_blocker_request,
         }
         return canonicalizers[action_type](request)
+
+    def _canonical_resolve_meeting_action_item_request(self, request: Any) -> dict[str, Any]:
+        request_obj = self._json_object_or_empty(request)
+        reason = waiver_reason(request_obj.get("reason"))
+        return {"action_type": "resolve_meeting_action_item",
+                "item_id": str(self._required_uuid(request_obj.get("item_id"), "item_id")), "reason": reason}
 
     def _canonical_recover_blocker_request(self, request: Any) -> dict[str, Any]:
         request_obj = self._json_object_or_empty(request)

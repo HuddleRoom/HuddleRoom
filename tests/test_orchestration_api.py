@@ -407,6 +407,7 @@ async def test_goal_detail_without_run_returns_empty_ledgers(client, db_session,
     assert detail.status_code == 200, detail.text
     body = detail.json()
     assert body["run"] is None
+    assert body["meeting_commitments"] == []
     assert body["decisions_count"] == 0
     assert body["decisions"] == []
     assert body["actions_count"] == 0
@@ -1097,3 +1098,36 @@ async def test_ordinary_decisions_stay_backward_compatible_with_null_recovery(
     assert answered.json()["decision"]["status"] == "answered"
     assert answered.json()["decision"]["recovery"] is None
     assert answered.json()["continuation_applied"] is False
+
+
+@pytest.mark.asyncio
+async def test_goal_detail_projects_current_unfulfilled_meeting_commitments(client, db_session, test_project):
+    from tests.test_orchestration_delegation_contracts import _make_run
+    from tests.test_orchestration_progress_view import _task, _meeting, _action_item
+    _, goal, run = await _make_run(db_session, test_project.id)
+    source = await _task(db_session, test_project, run)
+    meeting = await _meeting(db_session, test_project, source)
+    live = await _task(db_session, test_project, run, status="in_progress")
+    tracked = await _action_item(db_session, meeting, description="Live obligation", task_id=live.id, status="task_created")
+    open_item = await _action_item(db_session, meeting, description="Open obligation")
+    await _action_item(db_session, meeting, description="Waived", status="dismissed")
+    done = await _task(db_session, test_project, run, status="done")
+    await _action_item(db_session, meeting, description="Fulfilled", task_id=done.id, status="task_created")
+    # A historical run of this same goal must not bleed into the current projection.
+    from datetime import timedelta
+    historical = OrchestrationRun(goal_id=goal.id, status="cancelled", phase="completed", started_at=run.started_at - timedelta(days=1))
+    db_session.add(historical)
+    await db_session.flush()
+    old_source = await _task(db_session, test_project, historical)
+    await _action_item(db_session, await _meeting(db_session, test_project, old_source), description="Old obligation")
+    response = await client.get(f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}")
+    assert response.status_code == 200, response.text
+    commitments = {entry["id"]: entry for entry in response.json()["meeting_commitments"]}
+    assert set(commitments) == {str(tracked.id), str(open_item.id)}
+    assert commitments[str(tracked.id)] == {
+        "id": str(tracked.id), "meeting_id": str(meeting.id), "meeting_title": meeting.title,
+        "description": "Live obligation", "state": "task_in_flight", "task_id": str(live.id),
+        "graph_run_id": None, "reason": "linked task still in flight",
+    }
+    assert commitments[str(open_item.id)]["state"] == "open"
+    assert commitments[str(open_item.id)]["task_id"] is None

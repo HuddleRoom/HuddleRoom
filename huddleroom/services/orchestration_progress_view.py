@@ -256,7 +256,7 @@ async def _follow_up_rows(
             "kind": "meeting_action_item",
             "id": str(item.id),
             "summary": item.description[:FOLLOW_UP_SUMMARY_MAX],
-            "suggested_actions": ["create_delegation_task", "ask_human"],
+            "suggested_actions": ["create_delegation_task", "ask_human", "resolve_meeting_action_item"],
         }))
     # Delegated items whose linked task died need re-delegation; the delegated_inputs filter must not hide them.
     # Task link is item.task_id, else the tagged-delegation fallback shared with meeting_commitments.
@@ -288,7 +288,7 @@ async def _follow_up_rows(
             "kind": "meeting_action_item",
             "id": str(item.id),
             "summary": (item.description[:FOLLOW_UP_SUMMARY_MAX - len(suffix)] + suffix)[:FOLLOW_UP_SUMMARY_MAX],
-            "suggested_actions": actions_,
+            "suggested_actions": [*actions_, "resolve_meeting_action_item"],
         }))
 
     # Completed actions name the decision they applied in dispatch_contract; decision_continuation is bookkeeping, not consumption.

@@ -194,3 +194,18 @@ def test_prompt_table_is_sorted_json_of_matcher_keys():
     table = json.loads(wake_when_prompt_table())
     assert table["session.created"] == sorted({"session_id", "task_id", "graph_run_id"})
     assert set(table) == set(EVENT_MATCHER_KEYS)
+
+
+@pytest.mark.asyncio
+async def test_waiver_wake_matcher_normalizes_and_clears_only_matching_item(db_session, test_project):
+    from tests.test_orchestration_wake_clearing import _run, _waits
+    from huddleroom.services.orchestration_service import OrchestrationService
+    spec = normalize_wake_when(_events(_ev("meeting.action_item_waived", {"meeting_id": U1, "item_id": U2})))
+    assert spec["events"][0]["matcher"] == {"meeting_id": U1, "item_id": U2}
+    _, run = await _run(db_session, test_project)
+    supervision = OrchestrationService().supervision
+    await supervision.create_orchestrator_waits(db_session, run, owner_id=uuid.uuid4(), wake_when=spec)
+    assert await supervision.clear_matching_waits(db_session, run, event_type="meeting.action_item_waived", matcher={"meeting_id": U1, "item_id": U1}) == 0
+    assert (await _waits(db_session, run))[0].status == "open"
+    assert await supervision.clear_matching_waits(db_session, run, event_type="meeting.action_item_waived", matcher={"meeting_id": U1, "item_id": U2}) == 1
+    assert (await _waits(db_session, run))[0].status == "cleared"

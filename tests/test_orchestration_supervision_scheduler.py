@@ -98,3 +98,12 @@ async def test_judgment_fence_fingerprints_full_reports_while_payload_is_concise
         if a["action_type"] == "report_consumed" and a["request"]["task_id"] == str(_tasks["unrelated"].id)
     ]
     assert unrelated["request"]["report"]["truncated"] == {"changes": 5, "decisions": 4}
+
+
+async def test_waiver_event_wakes_only_authorized_run(db_session, test_project):
+    _, run = await _run(db_session, test_project)
+    scheduler = OrchestrationSupervisionScheduler()
+    assert await scheduler.record_event(db_session, "meeting.action_item_waived", {"run_id": str(run.id)}) == [run.id]
+    assert run.supervision_state["judgment_dirty"] is True
+    run.phase = "completed"
+    assert await scheduler.record_event(db_session, "meeting.action_item_waived", {"run_id": str(run.id)}) == []

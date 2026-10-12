@@ -280,9 +280,10 @@ async def test_context_exposes_meeting_commitments(db_session, test_project):
     context = await OrchestrationService()._decision_context(db_session, goal, run)
 
     assert context["meeting_commitments"] == [{
-        "id": str(item.id), "description": "Follow up", "state": "open",
+        "id": str(item.id), "meeting_id": str(meeting.id), "meeting_title": "Sync", "graph_run_id": None,
+        "description": "Follow up", "state": "open",
         "task_id": None, "reason": "no task or resolution", "fulfilled": False,
-        "suggested_actions": ["create_delegation_task", "ask_human"],
+        "suggested_actions": ["create_delegation_task", "ask_human", "resolve_meeting_action_item"],
     }]
 
 

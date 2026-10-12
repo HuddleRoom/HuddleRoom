@@ -29,6 +29,7 @@ from huddleroom.config import settings
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EVENTS = frozenset({
+    "meeting.action_item_waived",
     "task.status_changed", "task.assigned", "session.created", "session.started",
     "session.completed", "session.failed", "session.cancelled", "session.resumed",
     "authority.decision_resolved", "artifact.created", "artifact.content_changed",

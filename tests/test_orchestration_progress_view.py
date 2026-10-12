@@ -426,7 +426,7 @@ async def test_meeting_action_item_included_when_open_untasked_from_run_meeting(
         "kind": "meeting_action_item",
         "id": str(item.id),
         "summary": "Write the report",
-        "suggested_actions": ["create_delegation_task", "ask_human"],
+        "suggested_actions": ["create_delegation_task", "ask_human", "resolve_meeting_action_item"],
     }]
     assert all("created_at" not in follow_up for follow_up in situation.untracked_follow_ups)
 

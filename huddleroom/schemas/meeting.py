@@ -232,6 +232,7 @@ class ActionItemUpdate(BaseModel):
     priority: int | None = None
     deadline_days: int | None = None
     status: str | None = None
+    reason: str | None = None
 
 
 class GrantTurnRequest(BaseModel):

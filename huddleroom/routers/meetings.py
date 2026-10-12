@@ -732,8 +732,14 @@ async def update_action_item(
     item = await db.get(MeetingActionItem, aid)
     if not item or item.meeting_id != meeting_id:
         raise HTTPException(status_code=404, detail="Action item not found")
-    for field, value in body.model_dump(exclude_none=True).items():
-        setattr(item, field, value)
+    if body.status == "dismissed":
+        from huddleroom.services.orchestration_meeting_commitments import waive_meeting_action_item
+        item, _changed = await waive_meeting_action_item(
+            db, item_id=aid, reason=body.reason, actor_user_id=current_user.id,
+        )
+    for field, value in body.model_dump(exclude_none=True, exclude={"reason"}).items():
+        if field != "status" or body.status != "dismissed":
+            setattr(item, field, value)
     await db.flush()
     return ActionItemResponse.model_validate(item)
 

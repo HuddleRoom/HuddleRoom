@@ -163,3 +163,24 @@ describe('isOrchestrationEvent', () => {
     expect(qc.getQueryData(ordinaryKey)).toEqual(ordinaryMeeting)
   })
 })
+
+
+it('coalesces waiver goal-detail refresh with existing meeting invalidations', () => {
+  mocks.events = ['one', 'two'].map((id) => ({ id, event_type: 'meeting.action_item_waived', payload: { meeting_id: 'meeting-1' }, emitted_at: '2026-10-12T20:00:00Z' }))
+  useWSQuerySync()
+  mocks.effects[0]()
+  const keys = mocks.invalidateQueries.mock.calls.map(([options]) => options.queryKey)
+  expect(keys.filter((key) => JSON.stringify(key) === JSON.stringify(['orchestration-goal', 'project-1']))).toHaveLength(1)
+  expect(keys).toContainEqual(['meeting', 'project-1', 'meeting-1'])
+  expect(keys).toContainEqual(['meeting', 'action-items', 'project-1', 'meeting-1'])
+  expect(keys).toContainEqual(['meetings', 'project-1'])
+})
+
+it('ordinary meeting events retain existing invalidations without goal-detail refresh', () => {
+  mocks.events = [{ id: 'ordinary', event_type: 'meeting.concluded', payload: { meeting_id: 'meeting-1' }, emitted_at: '2026-10-12T20:00:00Z' }]
+  useWSQuerySync()
+  mocks.effects[0]()
+  const keys = mocks.invalidateQueries.mock.calls.map(([options]) => options.queryKey)
+  expect(keys).toContainEqual(['meeting', 'project-1', 'meeting-1'])
+  expect(keys).not.toContainEqual(['orchestration-goal', 'project-1'])
+})

@@ -412,6 +412,7 @@ class OrchestrationDecisionDispatcher:
         "accept_plan": "execute_accept_plan_action",
         "create_delegation_task": "execute_create_delegation_task_action",
         "request_verification": "execute_request_verification_action",
+        "resolve_meeting_action_item": "execute_resolve_meeting_action_item_action",
         "retry_task": "execute_retry_task_action",
         "reassign_task": "execute_reassign_task_action",
         "schedule_meeting": "execute_schedule_meeting_action",

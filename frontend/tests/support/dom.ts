@@ -19,6 +19,13 @@ export class TestEvent {
 }
 
 export class TestNode {
+  contains(other: TestNode | null): boolean {
+    for (let node = other; node; node = node.parentNode) {
+      if (node === this) return true
+    }
+    return false
+  }
+
   parentNode: TestElement | TestNode | null = null
   childNodes: TestNode[] = []
 

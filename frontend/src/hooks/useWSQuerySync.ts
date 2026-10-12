@@ -53,6 +53,7 @@ export function useWSQuerySync() {
     let invalidateKnowledge = false
     let invalidateMemory = false
     let invalidateOrchestration = false
+    let invalidateGoalDetail = false
     const taskIds = new Set<string>()
     const meetingIds = new Set<string>()
 
@@ -92,6 +93,7 @@ export function useWSQuerySync() {
       } else if (type === 'meeting.turn_complete' && meetingId && qc.getQueryData<Meeting>(['meeting', projectId, meetingId])?.resume_state?.resuming) {
         meetingIds.add(meetingId)
       } else if (type.startsWith('meeting.') && type !== 'meeting.turn_complete' && type !== 'meeting.human_turn') {
+        if (type === 'meeting.action_item_waived') invalidateGoalDetail = true
         invalidateMeetings = true
         invalidateMeetingCount = true
         invalidateEvents = true
@@ -125,6 +127,9 @@ export function useWSQuerySync() {
       for (const queryKey of orchestrationInvalidationKeys(projectId)) {
         qc.invalidateQueries({ queryKey })
       }
+    }
+    if (invalidateGoalDetail && !invalidateOrchestration) {
+      qc.invalidateQueries({ queryKey: ['orchestration-goal', projectId] })
     }
     if (invalidateEvents && !invalidateOrchestration) {
       qc.invalidateQueries({ queryKey: ['events', projectId] })

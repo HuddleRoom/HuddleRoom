@@ -30,6 +30,7 @@ EVENT_MATCHER_KEYS: dict[str, frozenset[str]] = {
     "artifact.breaking_change": frozenset({"artifact_id"}),
     "meeting.scheduled": frozenset({"meeting_id"}),
     "meeting.concluded": frozenset({"meeting_id"}),
+    "meeting.action_item_waived": frozenset({"meeting_id", "item_id"}),
     "graph.run_completed": frozenset({"graph_run_id"}),
     "graph.run_failed": frozenset({"graph_run_id"}),
     "graph.run_advanced": frozenset({"graph_run_id"}),

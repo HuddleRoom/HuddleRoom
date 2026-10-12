@@ -1233,6 +1233,17 @@ class OrchestrationAuthorizationWaitResponse(BaseModel):
     required_decision: str | None = None
 
 
+class OrchestrationMeetingCommitmentResponse(BaseModel):
+    id: uuid.UUID
+    meeting_id: uuid.UUID
+    meeting_title: str
+    description: str
+    state: str
+    task_id: uuid.UUID | None
+    graph_run_id: uuid.UUID | None
+    reason: str | None
+
+
 class OrchestrationGoalDetailResponse(BaseModel):
     goal: OrchestrationGoalResponse
     run: OrchestrationRunResponse | None = None
@@ -1257,6 +1268,7 @@ class OrchestrationGoalDetailResponse(BaseModel):
     runs: list[OrchestrationRunSummaryResponse] = Field(default_factory=list)
     child_goals: list[OrchestrationChildGoalResponse] = Field(default_factory=list)
     task_reports: list[OrchestrationTaskReportResponse] = Field(default_factory=list)
+    meeting_commitments: list[OrchestrationMeetingCommitmentResponse] = Field(default_factory=list)
     plan: OrchestrationPlanView | None = None
     effective_authorization: AuthorizationResult | None = None
     authorization_wait: OrchestrationAuthorizationWaitResponse | None = None

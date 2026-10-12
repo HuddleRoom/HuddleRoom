@@ -892,3 +892,11 @@ async def test_diagnose_writes_the_steering_seal_on_the_proposal(db_session, con
     assert seal == await _steering_seal(db_session, goal, run)
     assert set(seal["versions"]) == {"inbox_version", "direction_version", "contract_version", "plan_version"}
     assert seal["active_directions"] == []
+
+
+@pytest.mark.asyncio
+async def test_waiver_is_only_autonomous_corrective_exception(db_session, test_project):
+    rows = await seed_rows(db_session, test_project, task_status="failed")
+    service = OrchestrationService()
+    assert await service.classify_corrective_action(db_session, rows.run, "resolve_meeting_action_item", {"item_id": str(rows.task.id), "reason": "Irrelevant"}, source="model") == CorrectiveDisposition.ORDINARY
+    assert await service.classify_corrective_action(db_session, rows.run, "retry_task", {"task_id": str(rows.task.id)}, source="model") == CorrectiveDisposition.REQUIRES_RECOVERY

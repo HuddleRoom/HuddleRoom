@@ -932,3 +932,41 @@ async def test_blocked_task_meeting_emits_scheduled_event_once(db_session, test_
             "meeting_id": str(meeting.id),
             "auto_start": True,
         }
+
+
+@pytest.mark.asyncio
+async def test_waiver_patch_reason_membership_and_other_updates(client, auth_headers, db_session, test_project):
+    from tests.test_orchestration_meeting_commitments import _setup
+    from tests.test_orchestration_progress_view import _action_item
+    _, meeting = await _setup(db_session, test_project)
+    item = await _action_item(db_session, meeting)
+    url = f"/api/v1/meetings/{meeting.id}/action-items/{item.id}"
+    for reason in (None, "", "   ", "x" * 501):
+        body = {"status": "dismissed"}
+        if reason is not None:
+            body["reason"] = reason
+        response = await client.patch(url, headers=auth_headers, json=body)
+        assert response.status_code == 422
+    response = await client.patch(url, headers=auth_headers, json={"priority": 23})
+    assert response.status_code == 200 and response.json()["priority"] == 23
+    _, other = await _setup(db_session, test_project)
+    response = await client.patch(f"/api/v1/meetings/{other.id}/action-items/{item.id}", headers=auth_headers, json={"status": "dismissed", "reason": "Irrelevant"})
+    assert response.status_code == 404
+    response = await client.patch(url, headers=auth_headers, json={"status": "dismissed", "reason": "  Irrelevant  "})
+    assert response.status_code == 200 and response.json()["status"] == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_task_creation_skips_dismissed_without_mislinking(db_session, test_project, monkeypatch):
+    from tests.test_orchestration_meeting_commitments import _setup
+    from tests.test_orchestration_progress_view import _action_item
+    from huddleroom.services.meeting_outcome import MeetingOutcomeService
+    from huddleroom.services.task_service import TaskService
+    _, meeting = await _setup(db_session, test_project)
+    dismissed = await _action_item(db_session, meeting, status="dismissed", description="Waived")
+    eligible = await _action_item(db_session, meeting, description="Still required")
+    monkeypatch.setattr(TaskService, "auto_start", AsyncMock())
+    tasks = await MeetingOutcomeService().create_tasks_from_action_items(db_session, meeting, [dismissed, eligible])
+    assert len(tasks) == 1 and tasks[0].title == "Still required"
+    assert dismissed.status == "dismissed" and dismissed.task_id is None
+    assert eligible.task_id == tasks[0].id

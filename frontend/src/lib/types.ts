@@ -169,7 +169,7 @@ export interface MeetingActionItem {
   description: string
   assignee_agent_id?: string
   assignee_user_id?: string
-  status: TaskStatus
+  status: string
   due_date?: string
   depends_on_decision_id?: string | null
   created_at: string
@@ -1026,7 +1026,19 @@ export interface OrchestrationMemoryOverview {
   preface: OrchestrationMemoryPreface
 }
 
+export interface OrchestrationMeetingCommitment {
+  id: string
+  meeting_id: string
+  meeting_title: string
+  description: string
+  state: string
+  task_id: string | null
+  graph_run_id: string | null
+  reason: string | null
+}
+
 export interface OrchestrationGoalDetail {
+  meeting_commitments?: OrchestrationMeetingCommitment[]
   goal: OrchestrationGoal
   run: OrchestrationRun | null
   decisions_count: number

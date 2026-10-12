@@ -1710,6 +1710,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         goal={goal}
         run={run}
         gates={detail.gates}
+        meetingCommitments={detail.meeting_commitments ?? []}
         mutationBusy={baselineBusy}
         acquireMutation={acquireMutation}
         releaseMutation={releaseMutation}

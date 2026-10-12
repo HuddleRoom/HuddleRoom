@@ -27,6 +27,7 @@ import type {
   OrchestrationDecisionOption,
   OrchestrationGate,
   OrchestrationGoal,
+  OrchestrationMeetingCommitment,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
   OrchestrationWarningRecord,
@@ -59,6 +60,7 @@ export interface BaselineDashboardProps {
   run: OrchestrationRun | null
   // Fetched by the goal-detail query (not useBaselineDashboard) — threaded in
   // so the Needs-you queue can rank failed gates without a duplicate fetch.
+  meetingCommitments?: readonly OrchestrationMeetingCommitment[]
   gates: readonly OrchestrationGate[]
   mutationBusy: boolean
   acquireMutation: (owner: BaselineMutationOwner) => boolean
@@ -553,7 +555,7 @@ function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: rea
   </section>
 }
 
-export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, renderBlockerRecovery, suppressQueueAnnouncement, getMutationGeneration }: BaselineDashboardProps) {
+export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, renderBlockerRecovery, suppressQueueAnnouncement, getMutationGeneration }: BaselineDashboardProps) {
   const health = useOrchestrationHealth()
   const answer = useAnswerOrchestrationDecision(projectId)
   const answerAgentDefinitionBatch = useAnswerAgentDefinitionReviewBatch(projectId)
@@ -984,7 +986,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
     <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
     {processState === 'ready' && <>
       <NeedsYouQueue
-        goal={goal} run={run} processes={processes} warnings={warnings} gates={gates}
+        goal={goal} run={run} processes={processes} warnings={warnings} gates={gates} meetingCommitments={meetingCommitments}
         checkpointItems={checkpointItems} recoveryDecisions={decisions} onAnswerRecoveryProposal={answerRecoveryProposal} checkpointLoaded={dashboard.checkpoint.isSuccess}
         queriesErrored={queueQueriesErrored} queriesUnready={queueQueriesUnready}
         deferredCount={deferredCount} isWorking={isWorking}

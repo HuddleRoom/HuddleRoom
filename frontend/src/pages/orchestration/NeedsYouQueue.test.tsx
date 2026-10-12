@@ -17,6 +17,9 @@ import type {
 const toastMock = vi.hoisted(() => Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }))
 vi.mock('sonner', () => ({ toast: toastMock }))
 
+const meetingMutation = vi.hoisted(() => ({ mutate: vi.fn(), isPending: false }))
+vi.mock('@/api/meetings', () => ({ useUpdateActionItem: () => meetingMutation }))
+
 import { buildQueueRows, NeedsYouQueue, type NeedsYouQueueProps } from './NeedsYouQueue'
 import type { BaselineFocusAction } from './BaselineDashboard'
 import { GoalAnnouncerProvider } from './goalAnnouncer'
@@ -1200,3 +1203,126 @@ describe('NeedsYouQueue recovery card follow-up', () => {
   })
 })
 
+
+
+const meetingObligation = {
+  id: 'item-1', meeting_id: 'meeting-1', meeting_title: 'Release review', description: 'Document deployment',
+  state: 'task_in_flight', task_id: 'task-1', graph_run_id: null, reason: null,
+}
+
+describe('meeting obligation waiver', () => {
+  beforeEach(() => { meetingMutation.mutate.mockReset(); meetingMutation.isPending = false })
+
+  it('shows live work and requires a short reason with scoped confirmation', async () => {
+    const view = await mountQueue({ meetingCommitments: [meetingObligation] })
+    try {
+      expect(textOf(view.container)).toContain('Document deployment')
+      expect(descendants(view.container).find(n => n.tagName === 'A' && textOf(n).includes('Release review'))).toBeTruthy()
+      await act(async () => getButton(view.container, 'Waive').click())
+      const reason = getByLabel(view.container, 'Reason')
+      expect(view.document.activeElement).toBe(reason)
+      expect(textOf(view.container)).toContain('This removes the meeting obligation. Linked work will keep running; goal criteria and gates still apply.')
+      expect(getButton(view.container, 'Confirm waive').disabled).toBe(true)
+      await act(async () => changeControl(reason, 'x'.repeat(501)))
+      expect(getButton(view.container, 'Confirm waive').disabled).toBe(true)
+      await act(async () => changeControl(reason, '  Irrelevant now  '))
+      await act(async () => getButton(view.container, 'Confirm waive').click())
+      expect(meetingMutation.mutate.mock.calls[0][0]).toMatchObject({ actionItemId: 'item-1', data: { status: 'dismissed', reason: 'Irrelevant now' } })
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('meeting waiver result and focus', () => {
+  beforeEach(() => { meetingMutation.mutate.mockReset(); meetingMutation.isPending = false })
+
+  it('retains exact typed input and announces errors, then lets the user retry', async () => {
+    meetingMutation.mutate.mockImplementation((_variables, options) => { options.onError(new Error('Try again')); options.onSettled?.() })
+    const view = await mountQueue({ meetingCommitments: [meetingObligation] })
+    try {
+      await act(async () => getButton(view.container, 'Waive').click())
+      await act(async () => changeControl(getByLabel(view.container, 'Reason'), '  Keep my input  '))
+      await act(async () => getButton(view.container, 'Confirm waive').click())
+      expect(getByLabel(view.container, 'Reason').value).toBe('  Keep my input  ')
+      expect(view.document.activeElement).toBe(getByLabel(view.container, 'Reason'))
+      expect(textOf(view.container)).toContain('Try again')
+      expect(getButton(view.container, 'Confirm waive').disabled).toBe(false)
+    } finally { view.cleanup() }
+  })
+
+  it('cancel returns focus to Waive and pending submission cannot be duplicated', async () => {
+    const view = await mountQueue({ meetingCommitments: [meetingObligation] })
+    try {
+      await act(async () => getButton(view.container, 'Waive').click())
+      await act(async () => getButton(view.container, 'Cancel').click())
+      expect(view.document.activeElement).toBe(getButton(view.container, 'Waive'))
+      await act(async () => getButton(view.container, 'Waive').click())
+      await act(async () => changeControl(getByLabel(view.container, 'Reason'), 'Irrelevant'))
+      await act(async () => getButton(view.container, 'Confirm waive').click())
+      expect(getByLabel(view.container, 'Reason').disabled).toBe(true)
+      expect(getButton(view.container, 'Cancel').disabled).toBe(true)
+      expect(meetingMutation.mutate).toHaveBeenCalledTimes(1)
+      expect(textOf(view.container)).toContain('Document deployment')
+    } finally { view.cleanup() }
+  })
+
+  it('does not claim a stale fulfilled item was waived and refocuses after refresh', async () => {
+    meetingMutation.mutate.mockImplementation((_variables, options) => { options.onSuccess({ status: 'task_created' }); options.onSettled?.() })
+    const props = { meetingCommitments: [meetingObligation], warnings: [warning({ message: 'Next risk' })] }
+    const view = await mountQueue(props)
+    try {
+      await act(async () => getButton(view.container, 'Waive').click())
+      await act(async () => changeControl(getByLabel(view.container, 'Reason'), 'Irrelevant'))
+      await act(async () => getButton(view.container, 'Confirm waive').click())
+      expect(textOf(view.container)).toContain('Document deployment')
+      expect(toastMock.success.mock.calls.flat().join(' ')).not.toContain('Meeting obligation waived')
+      await act(async () => view.rerender({ ...props, meetingCommitments: [] }))
+      expect(textOf(view.container)).not.toContain('Document deployment')
+      expect(view.document.activeElement).toBe(getButton(view.container, 'Acknowledge'))
+    } finally { view.cleanup() }
+  })
+})
+
+
+it('orders meeting obligations after failed gates and before warnings without stealing background focus', async () => {
+  const props = { meetingCommitments: [meetingObligation], gates: [gate()], warnings: [warning({ message: 'Next risk' })] }
+  const view = await mountQueue(props)
+  try {
+    const content = textOf(view.container)
+    expect(content.indexOf('Document deployment')).toBeGreaterThan(content.indexOf('No evidence submitted.'))
+    expect(content.indexOf('Next risk')).toBeGreaterThan(content.indexOf('Document deployment'))
+    const acknowledge = getButton(view.container, 'Acknowledge')
+    acknowledge.focus()
+    await act(async () => view.rerender({ ...props, meetingCommitments: [] }))
+    expect(view.document.activeElement).toBe(acknowledge)
+  } finally { view.cleanup() }
+})
+
+
+it.each([
+  ['dismissed', 'Meeting obligation waived.'],
+  ['completed', 'Meeting item already completed.'],
+])('announces actual returned %s state while awaiting refreshed projection', async (status, message) => {
+  meetingMutation.mutate.mockReset()
+  meetingMutation.isPending = false
+  meetingMutation.mutate.mockImplementation((_variables, options) => { options.onSuccess({ status }); options.onSettled?.() })
+  const view = await mountQueue({ meetingCommitments: [meetingObligation] })
+  try {
+    await act(async () => getButton(view.container, 'Waive').click())
+    await act(async () => changeControl(getByLabel(view.container, 'Reason'), 'Irrelevant'))
+    await act(async () => getButton(view.container, 'Confirm waive').click())
+    expect(toastMock.success).toHaveBeenCalledWith(message)
+    expect(textOf(view.container)).toContain('Document deployment')
+  } finally { view.cleanup() }
+})
+
+
+it.each([
+  ['task_in_flight', 'Linked task unfinished'],
+  ['graph_in_flight', 'Linked graph unfinished'],
+  ['task_failed', 'Linked task needs attention'],
+  ['graph_failed', 'Linked graph needs attention'],
+])('labels aggregate %s state truthfully', async (state, label) => {
+  const view = await mountQueue({ meetingCommitments: [{ ...meetingObligation, state }] })
+  try { expect(textOf(view.container)).toContain(label) } finally { view.cleanup() }
+})

@@ -16,6 +16,7 @@ def _id() -> str:
 
 
 ALLOWED_DECISIONS = {
+    "resolve_meeting_action_item": {"action_type": "resolve_meeting_action_item", "item_id": _id(), "reason": "Irrelevant"},
     "noop": {
         "action_type": "noop",
         "reason": "Nothing can advance yet.",
@@ -816,3 +817,9 @@ def test_recover_blocker_evidence_refs_are_strictly_typed(evidence_refs):
 
     assert result.accepted is False
     assert "evidence_refs" in result.rejection_reason
+
+
+@pytest.mark.parametrize("field,value", [("item_id", "invalid"), ("reason", ""), ("reason", "   "), ("reason", "x" * 501)])
+def test_waiver_decision_rejects_invalid_contract(field, value):
+    payload = {"action_type": "resolve_meeting_action_item", "item_id": _id(), "reason": "Irrelevant", field: value}
+    assert not validate_orchestration_decision(payload).accepted

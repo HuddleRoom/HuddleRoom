@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import litellm
-from sqlalchemy import func, insert, literal, select
+from sqlalchemy import func, insert, literal, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -292,6 +292,15 @@ class MeetingOutcomeService:
         meeting: Meeting,
         action_items: list[MeetingActionItem],
     ) -> list[Task]:
+        eligible_items = []
+        for item in action_items:
+            # Lock before refreshing so a stale loaded item cannot recreate a waived obligation.
+            await db.execute(update(MeetingActionItem).where(MeetingActionItem.id == item.id)
+                             .values(status=MeetingActionItem.status).execution_options(synchronize_session=False))
+            await db.refresh(item)
+            if item.status != "dismissed":
+                eligible_items.append(item)
+        action_items = eligible_items
         created: list[Task] = []
         for item in action_items:
             task = Task(

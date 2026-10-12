@@ -47,6 +47,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationGoalDefinitionRecoverRequest,
     OrchestrationGoalDetailResponse,
     OrchestrationGoalResponse,
+    OrchestrationMeetingCommitmentResponse,
     OrchestrationPlanItemView,
     OrchestrationPlanView,
     OrchestrationTaskReportResponse,
@@ -81,6 +82,7 @@ from huddleroom.services.orchestration_recovery_presenter import present_decisio
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_dependencies import evidence_semantics
 from huddleroom.services.orchestration_progress_view import plan_item_state, queued_authorization_wait
+from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
 from huddleroom.services.orchestration_work_report import persisted_report_validation, report_summary, work_report_payload
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
 from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService
@@ -801,6 +803,11 @@ async def _detail(
         runs=await _run_history(db, goal, run) if run is not None else [],
         child_goals=await _child_goals(db, goal),
         task_reports=_task_reports(actions),
+        meeting_commitments=[
+            OrchestrationMeetingCommitmentResponse.model_validate(item)
+            for item in await meeting_commitments(db, run)
+            if not item["fulfilled"]
+        ] if run is not None else [],
         plan=await _plan_view(db, goal, run, version) if run is not None else None,
         effective_authorization=(
             await effective_authorization(db, goal, run)

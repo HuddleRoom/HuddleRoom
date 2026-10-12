@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import React, { act, type ComponentProps } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { MemoryRouter } from 'react-router-dom'
 import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf, type TestElement } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
 import { toast } from 'sonner'
@@ -61,6 +62,9 @@ vi.mock('@/api/orchestration', () => ({
   useStepOrchestrationBaseline: () => api.debugStep,
   useRerunLastOrchestrationBaseline: () => api.debugRerun,
 }))
+
+const meetingMutation = vi.hoisted(() => ({ mutate: vi.fn(), isPending: false }))
+vi.mock('@/api/meetings', () => ({ useUpdateActionItem: () => meetingMutation }))
 
 import { BaselineActionForm, BaselineDashboard } from './BaselineDashboard'
 import { GoalAnnouncerProvider } from './goalAnnouncer'
@@ -178,11 +182,11 @@ function renderDashboard(props: Partial<ComponentProps<typeof BaselineDashboard>
 
 async function mountDashboard(props: Partial<ComponentProps<typeof BaselineDashboard>> = {}) {
   const renderDashboardComponent = (nextProps = props) => (
-    <GoalAnnouncerProvider>
+    <MemoryRouter><GoalAnnouncerProvider>
       <BaselineDashboard projectId="project-1" goalId="goal-00000000-0000-4000-8000-000000000001"
         goal={goal()} run={run()} gates={[]} mutationBusy={false} acquireMutation={() => true}
         releaseMutation={() => undefined} onMessage={() => undefined} {...nextProps} />
-    </GoalAnnouncerProvider>
+    </GoalAnnouncerProvider></MemoryRouter>
   )
   const view = await mountWithTestDom(() => renderDashboardComponent(), act)
   return { ...view, rerender: (nextProps: Partial<ComponentProps<typeof BaselineDashboard>> = props) => view.rerender(() => renderDashboardComponent(nextProps)) }
@@ -1939,4 +1943,16 @@ describe('Baseline dashboard recovery FIX PROPOSAL card', () => {
       expect(getButton(li, 'Approve fix').getAttribute('disabled')).toBeNull()
     } finally { view.cleanup() }
   })
+})
+
+
+it('threads current live meeting commitments into Needs You', async () => {
+  const view = await mountDashboard({ meetingCommitments: [{
+    id: 'item-1', meeting_id: 'meeting-1', meeting_title: 'Release review', description: 'Live meeting obligation',
+    state: 'task_in_flight', task_id: 'task-1', graph_run_id: null, reason: null,
+  }] })
+  try {
+    expect(textOf(view.container)).toContain('Live meeting obligation')
+    expect(() => getButton(view.container, 'Waive')).not.toThrow()
+  } finally { view.cleanup() }
 })

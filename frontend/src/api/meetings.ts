@@ -313,15 +313,18 @@ export function useUpdateActionItem(projectId: string | null, meetingId: string 
       data,
     }: {
       actionItemId: string
-      data: Partial<MeetingActionItem>
+      data: Partial<MeetingActionItem> & { reason?: string }
     }) =>
       apiFetch<MeetingActionItem>(
         `/api/v1/meetings/${meetingId}/action-items/${actionItemId}`,
         { method: 'PATCH', body: JSON.stringify(data) }
       ),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: meetingKeys.actionItems(projectId, meetingId) })
-      qc.invalidateQueries({ queryKey: meetingKeys.detail(projectId, meetingId) })
+      void Promise.all([
+        qc.invalidateQueries({ queryKey: meetingKeys.actionItems(projectId, meetingId) }),
+        qc.invalidateQueries({ queryKey: meetingKeys.detail(projectId, meetingId) }),
+        qc.invalidateQueries({ queryKey: ['orchestration-goal', projectId] }),
+      ])
     },
   })
 }
