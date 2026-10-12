@@ -312,3 +312,28 @@ async def test_competing_late_session_cannot_replace_consumed_lineage(
     await db_session.flush()
     with pytest.raises(Exception, match="lineage"):
         await service.consume_canonical_report(db_session, run, task, late.id)
+
+
+async def test_cached_invalid_report_retries_after_funding_returns(db_session, test_project, test_agent):
+    service, run, task, session = await _terminal_task(
+        db_session, test_project, test_agent, "not json", contract={"expected_result": "canonical_work_report"},
+    )
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    goal.budget = {"caps": {"max_tokens": 2}}
+    session.metadata_ = {"token_count_in": 2, "token_count_out": 0}
+    await service.consume_canonical_report(db_session, run, task, session.id)
+    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+    assert marker.request["clarification_count"] == 0
+    session.metadata_ = {"token_count_in": 0, "token_count_out": 0}
+    for _ in range(2):
+        await service.consume_canonical_report(db_session, run, task, session.id)
+    clarification = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}")
+    assert clarification is not None and clarification.status == "completed"
+    assert marker.request["clarification_count"] == 0
+    follow_up = await db_session.get(Task, clarification.target_id)
+    follow_up.status = "in_progress"
+    db_session.add(Session(task_id=follow_up.id, agent_id=test_agent.id, project_id=test_project.id,
+                          adapter_type="api", status="running", origin="orchestrator"))
+    await db_session.flush()
+    await service.consume_canonical_report(db_session, run, task, session.id)
+    assert marker.request["clarification_count"] == 1

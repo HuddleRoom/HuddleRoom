@@ -265,6 +265,7 @@ async def test_execute_expand_plan_item_action_creates_gate_and_work_task(db_ses
             "delegation_action_id": str(delegation_action.id),
             "task_id": str(task.id),
             "gate_id": str(gate.id),
+            "accepted_plan_fingerprint": run.plan_state["accepted_plan_snapshot"]["fingerprint"],
         }
     ]
 
@@ -426,7 +427,10 @@ async def test_expand_plan_item_replays_do_not_duplicate_or_rewrite_state(db_ses
     events = await _event_rows(db_session, project_id, "orchestration.plan_item_expanded")
 
     assert len(expand_actions) == 1
-    assert expand_actions[0].idempotency_key == f"run:{run_id}:kind:expand_plan_item:plan_item:implement-api"
+    assert expand_actions[0].idempotency_key == (
+        f"run:{run_id}:kind:expand_plan_item:plan_item:implement-api:version:"
+        f"{run.plan_state['accepted_plan_snapshot']['fingerprint']}"
+    )
     assert len(delegation_actions) == 1
     assert len(gates) == 1
     assert len([task for task in tasks if task is not None]) == 1
@@ -1050,6 +1054,7 @@ async def test_expanding_adopted_item_binds_active_task_without_new_work(db_sess
         "task_id": str(audit.id),
         "gate_id": str(gate.id),
         "adopted": True,
+        "accepted_plan_fingerprint": run.plan_state["accepted_plan_snapshot"]["fingerprint"],
     }]
     (event,) = await _event_rows(db_session, test_project.id, "orchestration.plan_item_expanded")
     assert event.payload["adopted"] is True and event.payload["task_id"] == str(audit.id)
@@ -1224,30 +1229,49 @@ async def test_unadopted_pre_plan_audit_must_be_explained_and_then_continues_unb
 
 
 @pytest.mark.asyncio
-async def test_second_plan_version_readopting_a_bound_task_is_rejected_or_replayed_never_rebound(db_session, test_project):
-    """Tester gap: a replan may not silently re-adopt a task already bound by an earlier accepted plan."""
+@pytest.mark.parametrize("status", ["in_progress", "done"])
+async def test_compatible_second_plan_refreshes_bound_task_without_rewriting_work(db_session, test_project, status):
+    """Compatible refresh preserves work and accepted historical evidence."""
+    from copy import deepcopy
+    from huddleroom.models.session import Session
+    from huddleroom.models.orchestration import OrchestrationEvidence
     service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
     await _expand(service, db_session, run, "audit-0")
+    audit.status = status
+    contract_before = deepcopy(audit.metadata_["orchestration_contract"])
+    gates_before = [row.id for row in await _run_rows(db_session, OrchestrationGate, run.id)]
+    evidence_before = [row.id for row in await _run_rows(db_session, OrchestrationEvidence, run.id)]
+    session = Session(task_id=audit.id, agent_id=audit.assigned_to, project_id=test_project.id,
+                      adapter_type="api", status="running" if status == "in_progress" else "completed")
+    artifact = Artifact(project_id=test_project.id, name="reference", artifact_type="document", status="draft")
+    db_session.add_all([session, artifact])
+    await db_session.flush()
+    task_count = await _task_count(db_session, test_project.id)
     request_action = (await _run_rows(db_session, OrchestrationAction, run.id, action_type="request_plan"))[0]
     planner = await db_session.get(Agent, uuid.UUID(request_action.request["agent_id"]))
 
     # A replan: put the run back in the revision state a request_plan_revision would leave it in.
     run.plan_state = {**run.plan_state, "status": "revision_requested"}
     await db_session.flush()
-    # Same item id, different content (new fingerprint): passes gate-identity validation, expansion must not rebind.
+    # New plan metadata may refresh the stable binding.
     await _accept_with_items(
         db_session, test_project.id, service, run, planner, request_action,
-        [_adopting_item(audit.id, item_id="audit-0", priority=99)],
+        [_adopting_item(audit.id, item_id="audit-0", priority=99, artifact_ids=[str(artifact.id)])],
     )
-    first_expand = (await _run_rows(db_session, OrchestrationAction, run.id, action_type="expand_plan_item"))[0]
     (marker,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")
     v1_request = dict(marker.request)
-    # Observed behavior: the expand idempotency key is plan-version independent, so v2 replays v1's binding
-    # (no adoption_conflict is reachable here; v2 priority is ignored) and nothing is bound twice.
-    assert (await _expand(service, db_session, run, "audit-0")).id == first_expand.id
-    assert audit.priority == 70
+    # Replaying this accepted version must preserve its existing release.
+    refreshed = await _expand(service, db_session, run, "audit-0")
+    assert (await _expand(service, db_session, run, "audit-0")).id == refreshed.id
+    assert audit.priority == 99
+    assert audit.status == status and audit.metadata_["orchestration_contract"] == contract_before
+    assert str(artifact.id) in audit.metadata_["orchestration_plan_item"]["artifact_ids"]
+    assert await _task_count(db_session, test_project.id) == task_count
+    assert [row.id for row in await _run_rows(db_session, OrchestrationGate, run.id)] == gates_before
+    assert set(evidence_before).issubset({row.id for row in await _run_rows(db_session, OrchestrationEvidence, run.id)})
+    assert list(await db_session.scalars(select(Session).where(Session.task_id == audit.id))) == [session]
     (marker,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")
-    assert marker.request == v1_request
+    assert marker.request["plan_item_id"] == v1_request["plan_item_id"]
 
     run.plan_state = {**run.plan_state, "status": "revision_requested"}
     await db_session.flush()
@@ -1317,3 +1341,18 @@ async def test_adopting_a_gated_ad_hoc_audit_hands_over_to_the_item_gate(db_sess
     assert task_gate_id(audit, run.id) == item_gate.id
     assert run.plan_state["expanded_items"][0]["gate_id"] == str(item_gate.id)
     assert (await db_session.get(OrchestrationGate, uuid.UUID(adhoc_gate_id))) is not None
+
+
+@pytest.mark.asyncio
+async def test_second_plan_rejects_substantive_adoption_before_mutating_binding(db_session, test_project):
+    from copy import deepcopy
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    await _expand(service, db_session, run, "audit-0")
+    before = deepcopy(audit.metadata_)
+    request = (await _run_rows(db_session, OrchestrationAction, run.id, action_type="request_plan"))[0]
+    planner = await db_session.get(Agent, uuid.UUID(request.request["agent_id"]))
+    run.plan_state = {**run.plan_state, "status": "revision_requested"}
+    item = {**_adopting_item(audit.id, item_id="audit-0"), "scope": "Different substantive work"}
+    with pytest.raises(HTTPException):
+        await _accept_with_items(db_session, test_project.id, service, run, planner, request, [item])
+    assert audit.metadata_ == before

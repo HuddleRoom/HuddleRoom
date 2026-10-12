@@ -1005,10 +1005,23 @@ async def _accepted_adopting_roadmap(db_session, accepted_roadmap, *, conflictin
     return service, goal, run, audits[0], adopted
 
 
-async def test_replan_skips_adoption_checks_for_already_bound_roadmap_item(db_session, test_project, accepted_roadmap):
+@pytest.mark.parametrize("legacy_null_adoption", [False, True])
+async def test_replan_refreshes_bound_metadata_and_preserves_frozen_snapshot(db_session, test_project, accepted_roadmap, legacy_null_adoption):
     service, goal, run, audit, adopted = await _accepted_adopting_roadmap(db_session, accepted_roadmap)
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "audit"
-    await TaskService().cancel(db_session, test_project.id, audit.id)  # bound work cancelled afterwards
+    from copy import deepcopy
+    row_before = await db_session.scalar(select(OrchestrationRoadmapItem).where(
+        OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "audit"))
+    frozen, first_version, contract = deepcopy(row_before.item_snapshot), row_before.first_version_id, deepcopy(audit.metadata_["orchestration_contract"])
+    original_gate_id = row_before.gate_id
+    evidence_before = {entry.id for entry in await db_session.scalars(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == original_gate_id))}
+    if legacy_null_adoption:
+        audit.metadata_ = {**audit.metadata_, "orchestration_plan_item": {
+            **audit.metadata_["orchestration_plan_item"], "adopt_task_id": None}}
+        assert frozen["adopt_task_id"] == str(audit.id)
+        await db_session.flush()
+    adopted = {**adopted, "priority": 99}
     first = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     first_artifact = await db_session.get(Artifact, first.plan_artifact_id)
     replan = await service.execute_request_roadmap_replan_action(
@@ -1046,6 +1059,24 @@ async def test_replan_skips_adoption_checks_for_already_bound_roadmap_item(db_se
         OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "audit",
     ))
     assert row.task_id == audit.id
+    assert audit.priority == 99
+    assert row.item_snapshot == frozen and row.first_version_id == first_version
+    assert audit.metadata_["orchestration_contract"] == contract
+    assert row.gate_id == original_gate_id
+    assert audit.metadata_["orchestration_plan_item"]["adopt_task_id"] == str(audit.id)
+    roadmap = OrchestrationRoadmapService(service)
+    current = await roadmap.current_version(db_session, goal.id)
+    counts = [await db_session.scalar(select(func.count()).select_from(model))
+              for model in (Task, OrchestrationGate, OrchestrationRoadmapItem, OrchestrationAction)]
+    parsed = parse_roadmap_items(candidate_items, set())[0]
+    for _ in range(2):
+        replay = await roadmap.release_task_item(db_session, goal, run, current, parsed)
+        assert replay["step"] == "release_item"
+    assert counts == [await db_session.scalar(select(func.count()).select_from(model))
+                      for model in (Task, OrchestrationGate, OrchestrationRoadmapItem, OrchestrationAction)]
+    assert evidence_before == {entry.id for entry in await db_session.scalars(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == original_gate_id))}
+    assert row.item_snapshot == frozen and audit.metadata_["orchestration_contract"] == contract
 
 
 async def test_roadmap_adoption_conflict_fails_release_and_blocks_without_half_binding(db_session, accepted_roadmap):
@@ -1068,3 +1099,64 @@ async def test_roadmap_adoption_conflict_fails_release_and_blocks_without_half_b
         for b in run.active_blockers
     )
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
+
+    gates = list(await db_session.scalars(select(OrchestrationGate).where(
+        OrchestrationGate.run_id == run.id, OrchestrationGate.success_criterion_key == "roadmap_item:audit",
+    )))
+    assert len(gates) == 1 and gates[0].status == "failed"
+
+
+@pytest.mark.parametrize("shape", ["known", "accepted", "ambiguous", "historical"])
+async def test_roadmap_failure_replay_repairs_only_exact_legacy_orphan(db_session, accepted_roadmap, shape):
+    service, goal, run, audit, _ = await _accepted_adopting_roadmap(db_session, accepted_roadmap, conflicting_marker=True)
+    roadmap = OrchestrationRoadmapService(service)
+    await roadmap.advance(db_session, goal, run)
+    gate = await db_session.scalar(select(OrchestrationGate).where(
+        OrchestrationGate.run_id == run.id, OrchestrationGate.success_criterion_key == "roadmap_item:audit"))
+    assert gate is not None
+    gate.status = "accepted" if shape == "accepted" else "open"
+    gate.failure_reason = None
+    if shape == "ambiguous":
+        gate.required_evidence = {**gate.required_evidence, "task_id": str(uuid.uuid4())}
+    await db_session.flush()
+    if shape == "historical":
+        from huddleroom.models.orchestration import OrchestrationRoadmapVersion
+        first = await roadmap.current_version(db_session, goal.id)
+        db_session.add(OrchestrationRoadmapVersion(goal_id=goal.id, run_id=run.id,
+            version=first.version + 1, plan_artifact_id=first.plan_artifact_id,
+            snapshot=first.snapshot, fingerprint="e" * 64, approval_reference=first.approval_reference))
+        await db_session.flush()
+    for _ in range(2):
+        await roadmap.advance(db_session, goal, run)
+    assert gate.status == ("failed" if shape == "known" else "accepted" if shape == "accepted" else "open")
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == 0
+
+
+@pytest.mark.parametrize("damage", ["missing_marker", "conflicting_marker", "task_binding"])
+async def test_legacy_null_adoption_requires_exact_historical_proofs(db_session, accepted_roadmap, damage):
+    from copy import deepcopy
+    service, goal, run, audit, adopted = await _accepted_adopting_roadmap(db_session, accepted_roadmap)
+    roadmap = OrchestrationRoadmapService(service)
+    await roadmap.advance(db_session, goal, run)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
+        OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "audit"))
+    audit.metadata_ = {**audit.metadata_, "orchestration_plan_item": {
+        **audit.metadata_["orchestration_plan_item"], "adopt_task_id": None}}
+    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:adopt_task:task:{audit.id}")
+    if damage == "missing_marker":
+        await db_session.delete(marker)
+    elif damage == "conflicting_marker":
+        marker.request = {**marker.request, "plan_item_id": "another-item"}
+    else:
+        alternate = Task(project_id=audit.project_id, title="Different audit", assigned_to=audit.assigned_to,
+                         metadata_=deepcopy(audit.metadata_))
+        db_session.add(alternate)
+        await db_session.flush()
+        assert alternate.id != audit.id
+        row.task_id = alternate.id
+    await db_session.flush()
+    before, frozen = deepcopy(audit.metadata_), deepcopy(row.item_snapshot)
+    with pytest.raises(HTTPException):
+        await roadmap.release_task_item(db_session, goal, run,
+            await roadmap.current_version(db_session, goal.id), parse_roadmap_items([adopted], set())[0])
+    assert audit.metadata_ == before and row.item_snapshot == frozen

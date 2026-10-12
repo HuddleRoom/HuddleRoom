@@ -400,7 +400,11 @@ async def test_roadmap_golden_path_reaches_independent_integration_closeout(
         OrchestrationGate.required_evidence["plan_item_id"].as_string() == "child-work")) == 1
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
         OrchestrationAction.run_id == child_run.id,
-        OrchestrationAction.idempotency_key == f"run:{child_run.id}:kind:expand_plan_item:plan_item:child-work")) == 1
+        OrchestrationAction.action_type == "expand_plan_item",
+        OrchestrationAction.request["plan_item_id"].as_string() == "child-work",
+        OrchestrationAction.idempotency_key == (
+            f"run:{child_run.id}:kind:expand_plan_item:plan_item:child-work:version:"
+            f"{child_run.plan_state['accepted_plan_snapshot']['fingerprint']}"))) == 1
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id,
         OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{version.fingerprint}",

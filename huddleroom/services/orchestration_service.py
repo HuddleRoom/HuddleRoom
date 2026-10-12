@@ -2674,7 +2674,7 @@ class OrchestrationService:
                         "plan_item_id": item.id,
                         "work_function": item.work_function,
                     },
-                    idempotency_key=self._expand_plan_item_idempotency_key(run.id, item.id),
+                    idempotency_key=self._expand_plan_item_idempotency_key(run.id, item.id, self._current_plan_fingerprint(run)),
                     decision_id=decision_id,
                     run=run,
                     artifact=artifact,
@@ -2724,11 +2724,13 @@ class OrchestrationService:
             for entry in expanded_items if isinstance(entry, Mapping) and isinstance(entry.get("plan_item_id"), str)
         } if isinstance(expanded_items, list) else set()
         discretionary_divisor = max(1, sum(candidate.id not in expanded_ids for candidate in items))
-        stable_idempotency_key = self._expand_plan_item_idempotency_key(run_id, item.id)
+        stable_idempotency_key = self._expand_plan_item_idempotency_key(run_id, item.id, self._current_plan_fingerprint(run))
+        if idempotency_key == self._expand_plan_item_idempotency_key(run_id, item.id):
+            idempotency_key = stable_idempotency_key
         if idempotency_key != stable_idempotency_key:
             raise HTTPException(
                 status_code=409,
-                detail=f"Expand plan item idempotency key must be '{stable_idempotency_key}'",
+                detail=f"Expand plan item idempotency key must be '{self._expand_plan_item_idempotency_key(run_id, item.id)}'",
             )
         if item.adopt_task_id is not None:
             return await self._expand_adopted_item(
@@ -2810,7 +2812,9 @@ class OrchestrationService:
             await self._fail_reserved_action_for_current_flow(db, action, "Delegated task not found")
             raise HTTPException(status_code=404, detail="Delegated task not found")
 
+        self._validate_bound_plan_item(task, run, item)
         self._attach_plan_item_metadata(task, artifact, item, action, gate)
+        task.priority = item.priority
         self._set_plan_item_expanded_state(run, item, action, delegation_action, task, gate)
         await self._emit_plan_item_expanded(db, project_id, goal, run, item, action, delegation_action, task, gate)
         return await self._mark_action_completed(db, action, target_type="task", target_id=task.id)
@@ -2865,12 +2869,13 @@ class OrchestrationService:
         fingerprint = state.get("accepted_plan_fingerprint") or self._json_object_or_empty(
             state.get("accepted_plan_snapshot")
         ).get("fingerprint")
+        self._validate_bound_plan_item(task, run, item)
         request = {"plan_item_id": item.id, "adopt_task_id": str(task.id), "accepted_plan_fingerprint": fingerprint}
         marker = await self.reserve_action(
             db, run_id=run.id, idempotency_key=f"run:{run.id}:kind:adopt_task:task:{task.id}",
             action_type="adopt_task", request=request,
         )
-        if marker.request != request:
+        if any(marker.request.get(key) != request[key] for key in ("plan_item_id", "adopt_task_id")):
             raise HTTPException(
                 status_code=409, detail=f"adoption_conflict: task {task.id} is already adopted by another plan item"
             )
@@ -5427,7 +5432,7 @@ class OrchestrationService:
         for item in items:
             roadmap = hasattr(item, "unit_type")
             key = item.item_key if roadmap else item.id
-            if goal is not None and key not in bound_keys:
+            if goal is not None:
                 missing = await self._first_missing_artifact(db, goal.project_id, getattr(item, "artifact_ids", None) or [])
                 if missing is not None:
                     raise HTTPException(
@@ -5435,6 +5440,13 @@ class OrchestrationService:
                     )
             task_id = getattr(item, "adopt_task_id", None)
             if task_id is None:
+                binding = next((entry for entry in expanded or [] if isinstance(entry, Mapping)
+                                and entry.get("plan_item_id") == key), None)
+                if binding is not None:
+                    bound_task = await db.get(Task, uuid.UUID(binding["task_id"]))
+                    if bound_task is None:
+                        raise HTTPException(status_code=409, detail=f"adoption_invalid: item {key}: bound task missing")
+                    self._validate_bound_plan_item(bound_task, run, item)
                 continue
 
             def invalid(reason: str) -> HTTPException:
@@ -5443,8 +5455,6 @@ class OrchestrationService:
             if task_id in seen:
                 raise invalid(f"task {task_id} is adopted by more than one item")
             seen.add(task_id)
-            if key in bound_keys:
-                continue
             if roadmap and (item.unit_type != "task" or item.mutates_shared_state):
                 raise invalid("only Roadmap task items with mutates_shared_state false can adopt work")
             if item.depends_on:
@@ -5458,6 +5468,22 @@ class OrchestrationService:
                 or orchestration.get("run_id") != str(run.id) or orchestration.get("goal_id") != str(run.goal_id)
             ):
                 raise invalid(f"task {task_id} is not work of this run")
+            if key in bound_keys:
+                binding = next((entry for entry in expanded or [] if isinstance(entry, Mapping)
+                                and entry.get("plan_item_id") == key), None)
+                roadmap_binding = await db.scalar(select(OrchestrationRoadmapItem).where(
+                    OrchestrationRoadmapItem.goal_id == run.goal_id, OrchestrationRoadmapItem.item_key == key,
+                )) if roadmap else None
+                bound_task_id = str(roadmap_binding.task_id) if roadmap_binding else (binding or {}).get("task_id")
+                if bound_task_id != str(task_id):
+                    raise invalid("task binding changed")
+                metadata_view = None
+                if roadmap:
+                    from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+                    metadata_view = await OrchestrationRoadmapService(self)._released_task_metadata(
+                        db, run, item, roadmap_binding, task
+                    )
+                self._validate_bound_plan_item(task, run, item, metadata_view)
             if task.status == "cancelled":
                 raise invalid(f"task {task_id} is cancelled")
             if (
@@ -5822,8 +5848,40 @@ class OrchestrationService:
         return fits[0].agent_id
 
     @staticmethod
-    def _expand_plan_item_idempotency_key(run_id: uuid.UUID, plan_item_id: str) -> str:
-        return f"run:{run_id}:kind:expand_plan_item:plan_item:{plan_item_id}"
+    def _current_plan_fingerprint(run: OrchestrationRun) -> str | None:
+        state = OrchestrationService._json_object_or_empty(run.plan_state)
+        return state.get("accepted_plan_fingerprint") or OrchestrationService._json_object_or_empty(
+            state.get("accepted_plan_snapshot")
+        ).get("fingerprint")
+
+    @staticmethod
+    def _validate_bound_plan_item(
+        task: Task, run: OrchestrationRun, item: Any, metadata_view: dict | None = None,
+    ) -> None:
+        metadata = OrchestrationService._json_object_or_empty(task.metadata_ if metadata_view is None else metadata_view)
+        orchestration = OrchestrationService._json_object_or_empty(metadata.get("orchestration"))
+        previous = OrchestrationService._json_object_or_empty(metadata.get("orchestration_plan_item"))
+        key = getattr(item, "item_key", None) or item.id
+        candidate = item.model_dump(mode="json")
+        if hasattr(item, "unit_type"):
+            candidate["id"] = candidate.pop("item_key")
+            candidate = {k: candidate.get(k, v) for k, v in previous.items()
+                         if not k.startswith("accepted_plan_")}
+        frozen = lambda value: {k: v for k, v in value.items() if k not in {
+            "priority", "artifact_ids", "accepted_plan_artifact_id", "accepted_plan_fingerprint",
+        }}
+        if previous and (orchestration.get("plan_item_id") != key or frozen(previous) != frozen(candidate)):
+            raise HTTPException(status_code=409, detail=f"adoption_invalid: item {key}: bound work contract changed")
+        if previous and metadata.get("orchestration_plan_contract", metadata.get("orchestration_contract")) != metadata.get("orchestration_contract"):
+            raise HTTPException(status_code=409, detail=f"adoption_invalid: item {key}: actual work contract changed")
+        if previous and (orchestration.get("run_id") != str(run.id)
+                         or orchestration.get("goal_id") != str(run.goal_id)):
+            raise HTTPException(status_code=409, detail=f"adoption_invalid: item {key}: task binding changed")
+
+    @staticmethod
+    def _expand_plan_item_idempotency_key(run_id: uuid.UUID, plan_item_id: str, fingerprint: str | None = None) -> str:
+        key = f"run:{run_id}:kind:expand_plan_item:plan_item:{plan_item_id}"
+        return f"{key}:version:{fingerprint}" if fingerprint else key
 
     @staticmethod
     def _plan_item_delegation_idempotency_key(run_id: uuid.UUID, plan_item_id: str) -> str:
@@ -5859,6 +5917,7 @@ class OrchestrationService:
             "success_criterion_keys": list(item.success_criterion_keys),
             "expand_action_id": str(action.id),
         }
+        metadata.setdefault("orchestration_plan_contract", deepcopy(metadata.get("orchestration_contract")))
         metadata["orchestration_plan_item"] = {
             **item.model_dump(mode="json"),
             "accepted_plan_artifact_id": str(artifact.id),
@@ -5884,6 +5943,7 @@ class OrchestrationService:
             "work_function": item.work_function,
             "expand_action_id": str(action.id),
             "delegation_action_id": str(delegation_action.id),
+            "accepted_plan_fingerprint": OrchestrationService._current_plan_fingerprint(run),
             "task_id": str(task.id),
             "gate_id": str(gate.id),
             **({"adopted": True} if adopted else {}),
@@ -7399,6 +7459,8 @@ class OrchestrationService:
                 self._json_object_or_empty(marker.request).get("report"),
                 self._json_object_or_empty(marker.request).get("report_validation_errors", []),
             )
+            if validation.report is None:
+                await self._handle_malformed_canonical_report(db, run, task, session_id, marker)
             return session_id, validation.report
         if marker is None and expected_session_id is None:
             sessions = list(await db.scalars(select(Session).where(
@@ -7473,6 +7535,35 @@ class OrchestrationService:
             if parent_marker is None:
                 return
         parent_request = self._json_object_or_empty(parent_marker.request)
+        parent = await db.get(Task, parent_task_id)
+        gate_id = task_gate_id(parent, run.id) if parent is not None else None
+        gate = await db.get(OrchestrationGate, gate_id) if gate_id else None
+        repair = await self._existing_action_for_key(
+            db, run.id, f"run:{run.id}:kind:report_clarification:task:{parent_task_id}"
+        )
+        if (gate is not None and gate.status == "failed" and gate.gate_type == ADHOC_GATE_TYPE
+                and gate.id == uuid.uuid5(uuid.NAMESPACE_URL,
+                                         f"rally:orchestration:gate:{run.id}:{ADHOC_GATE_TYPE}:adhoc_task:{parent_task_id}")
+                and gate.success_criterion_key == f"adhoc_task:{parent_task_id}"
+                and gate.required_evidence.get("task_id") == str(parent_task_id)
+                and gate.failure_reason == "Task report is invalid"
+                and parent_marker.status == "completed" and parent_marker.target_id == parent_task_id
+                and not parent_request.get("clarification_count") and repair is None
+                and run.status in LLM_DECISION_RUN_STATUSES
+                and run.id == await db.scalar(select(OrchestrationRun.id).where(
+                    OrchestrationRun.goal_id == run.goal_id
+                ).order_by(OrchestrationRun.started_at.desc(), OrchestrationRun.id.desc()).limit(1))):
+            self._reopen_gate(gate)
+        clarification_task = await db.get(Task, repair.target_id) if repair and repair.target_id else None
+        if clarification_task is not None:
+            dispatched = clarification_task.status == "in_progress" or await db.scalar(
+                select(Session.id).where(Session.task_id == clarification_task.id).limit(1)
+            ) is not None
+            if dispatched:
+                parent_request = {**parent_request, "clarification_count": 1}
+                parent_marker.request = parent_request
+            if parent_task_id == task.id:
+                return
         clarification_count = int(parent_request.get("clarification_count", 0))
         if clarification_count:
             key = f"run:{run.id}:kind:ask_human:report_clarification:task:{parent_task_id}"
@@ -7573,7 +7664,9 @@ class OrchestrationService:
                     **self._json_object_or_empty(clarification.metadata_),
                     "report_clarification_parent_task_id": str(parent_task_id),
                 }
-            parent_marker.request = {**parent_request, "clarification_count": 1}
+            if clarification is not None and (clarification.status == "in_progress"
+                    or await db.scalar(select(Session.id).where(Session.task_id == clarification.id).limit(1))):
+                parent_marker.request = {**parent_request, "clarification_count": 1}
 
     def _canonical_reassign_task_request(self, request: Any) -> dict[str, Any]:
         request_obj = self._json_object_or_empty(request)
@@ -10328,8 +10421,13 @@ class OrchestrationService:
                 return None if report.candidate_evidence else ("Task report has no evidence", True)
         if markers[0] is None:
             return "Task report is missing", False
-        repair_pending = clarification is not None and markers[1] is None
-        return "Task report is invalid", not repair_pending
+        repair = await db.get(Task, clarification.target_id) if clarification and clarification.target_id else None
+        if repair is not None and repair.status in {"failed", "cancelled"}:
+            dispatched = bool(self._json_object_or_empty(markers[0].request).get("clarification_count")) or (
+                await db.scalar(select(Session.id).where(Session.task_id == repair.id).limit(1)) is not None
+            )
+            return "Task report is invalid", dispatched
+        return "Task report is invalid", False if repair is None or markers[1] is None else True
 
     async def _retained_gate_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
         """(reason, final) unless the retained source still holds.
@@ -11059,9 +11157,22 @@ class OrchestrationService:
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, item: OrchestrationPlanItem
     ) -> bool:
         key = f"run:{run.id}:kind:release_item:{item.id}"
-        if await self._existing_action_for_key(db, run.id, key) is not None:
-            return False
-        expand_key = self._expand_plan_item_idempotency_key(run.id, item.id)
+        released = await self._existing_action_for_key(db, run.id, key) is not None
+        if released:
+            state = self._json_object_or_empty(run.plan_state)
+            entry = next((entry for entry in state.get("expanded_items", []) if isinstance(entry, Mapping)
+                          and entry.get("plan_item_id") == item.id), None)
+            if entry is None or entry.get("accepted_plan_fingerprint") == self._current_plan_fingerprint(run):
+                return False
+            task_id = self._optional_uuid(entry.get("task_id"), "task_id")
+            task = await db.get(Task, task_id) if task_id else None
+            metadata = self._json_object_or_empty(self._json_object_or_empty(task.metadata_ if task else None).get(
+                "orchestration_plan_item"
+            ))
+            if (not entry.get("accepted_plan_fingerprint")
+                    and metadata.get("accepted_plan_artifact_id") == state.get("accepted_artifact_id")):
+                return False
+        expand_key = self._expand_plan_item_idempotency_key(run.id, item.id, self._current_plan_fingerprint(run))
         try:
             action = await self.execute_expand_plan_item_action(
                 db,
@@ -11079,6 +11190,8 @@ class OrchestrationService:
             self._block_plan_integrity(
                 goal, run, f"Adopted plan item '{item.id}' could not bind: {action.error if action else 'unknown'}"
             )
+            return False
+        if released:
             return False
         # expand_plan_item creates (or, for adoption, binds) this item's task; mark the
         # release so the cap accounting and idempotency hold across ticks.

@@ -1002,7 +1002,10 @@ async def test_adhoc_gate_fails_for_final_invalid_or_evidence_free_report(db_ses
     await service.tick(db_session, run.id)
     await service.tick(db_session, run.id)
 
-    assert gate.status == "failed" and gate.failure_reason == reason
+    if reason == "Task report is invalid":
+        assert gate.status == "open"
+    else:
+        assert gate.status == "failed" and gate.failure_reason == reason
 
 
 @pytest.mark.asyncio
@@ -1368,3 +1371,56 @@ async def test_verification_request_scope_states_final_evidence_fit(db_session, 
     for phrase in ("live observation", "unit tests", "document review", "static analysis",
                    "Preliminary readiness reports never satisfy a final criterion"):
         assert phrase in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair_status", ["failed", "cancelled"])
+async def test_dispatched_failed_clarification_is_final(db_session, test_project, repair_status):
+    from huddleroom.models.orchestration import OrchestrationAction
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "terminal-clarification")
+    await _finish(db_session, test_project.id, task, report="not json")
+    await service.consume_canonical_report(db_session, run, task, None)
+    gate = await _adhoc_gate(db_session, task)
+    repair = Task(project_id=test_project.id, title="Repair", status=repair_status, assigned_to=agent.id)
+    db_session.add(repair)
+    await db_session.flush()
+    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+    marker.request = {**marker.request, "clarification_count": 1}
+    db_session.add(OrchestrationAction(run_id=run.id,
+        idempotency_key=f"run:{run.id}:kind:report_clarification:task:{task.id}",
+        action_type="create_delegation_task", status="completed", target_type="task", target_id=repair.id))
+    await db_session.flush()
+    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", True)
+
+
+@pytest.mark.asyncio
+async def test_predispatch_invalid_canonical_report_keeps_gate_pending(db_session, test_project):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "pending-clarification")
+    task.metadata_ = {**task.metadata_, "orchestration_contract": {
+        **task.metadata_["orchestration_contract"], "expected_result": "canonical_work_report"}}
+    await _finish(db_session, test_project.id, task, report="not json")
+    await service.consume_canonical_report(db_session, run, task, None)
+    gate = await _adhoc_gate(db_session, task)
+    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["known", "accepted", "ambiguous"])
+async def test_cached_predispatch_recovery_only_reopens_exact_legacy_gate(db_session, test_project, shape):
+    service, run, agent = await _adhoc_run(db_session, test_project.id)
+    task = await _delegate_adhoc(db_session, service, run, agent, "legacy-clarification")
+    task.metadata_ = {**task.metadata_, "orchestration_contract": {
+        **task.metadata_["orchestration_contract"], "expected_result": "canonical_work_report"}}
+    await _finish(db_session, test_project.id, task, report="not json")
+    await service.consume_canonical_report(db_session, run, task, None)
+    gate = await _adhoc_gate(db_session, task)
+    gate.status = "accepted" if shape == "accepted" else "failed"
+    gate.failure_reason = "Task report is invalid"
+    if shape == "ambiguous":
+        gate.required_evidence = {**gate.required_evidence, "task_id": str(uuid.uuid4())}
+    await db_session.flush()
+    for _ in range(2):
+        await service.consume_canonical_report(db_session, run, task, None)
+    assert gate.status == ("open" if shape == "known" else "accepted" if shape == "accepted" else "failed")

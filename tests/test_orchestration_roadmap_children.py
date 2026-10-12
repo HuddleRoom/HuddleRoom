@@ -1698,3 +1698,81 @@ async def test_grandchild_cli_cap_authority_lands_on_the_nested_roadmap(db_sessi
         OrchestrationAuthorityDecision.decision_key.like("roadmap_budget_adapter:%:grand:%:cli:max_tokens")))
     assert (decision.goal_id, decision.run_id) == (child.id, child_run.id)
     assert decision.decision_key.startswith(f"roadmap_budget_adapter:{version.id}:grand:")
+
+
+@pytest.mark.parametrize("change", ["goal", "run", "version", "depth", "descendants", "budget"])
+async def test_auto_child_revalidates_authority_after_classifier(db_session, test_project, change):
+    item = {**goal_item(), "goal_type": "auto"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    async def classify(self, project_id, data):
+        if change == "goal":
+            parent.status = "paused"
+        elif change == "run":
+            run.status = "cancelled"
+        elif change == "version":
+            db_session.add(OrchestrationRoadmapVersion(goal_id=parent.id, run_id=run.id,
+                version=version.version + 1, plan_artifact_id=version.plan_artifact_id,
+                snapshot=version.snapshot, fingerprint="f" * 64, approval_reference=version.approval_reference))
+        elif change in ("depth", "descendants"):
+            parent.orchestrator_context = {**parent.orchestrator_context, "expansion_policy": {
+                "max_goal_depth": 0 if change == "depth" else 3,
+                "max_descendant_goals": 0 if change == "descendants" else 50}}
+        else:
+            parent.budget = {"caps": {"max_tokens": 1, "max_turns": 10, "max_hours": 10}}
+        await db_session.flush()
+        return _shape("outcome", "delivery")
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        result = await roadmap.release_goal_item(db_session, parent, run, version,
+            parse_roadmap_items([item], set(parent.budget["caps"]))[0])
+    assert result["step"] in {"waiting", "needs_attention", "budget_exhausted"}
+    assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
+
+
+async def test_full_root_capacity_still_creates_one_queued_child(db_session, test_project):
+    from huddleroom.services.orchestration_capacity import available_slots, activate_ready
+    item = {**goal_item(), "goal_type": "outcome"}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item,
+                                                              include_planner_in_team=True)
+    parent.orchestrator_context = {**parent.orchestrator_context, "expansion_policy": {"max_concurrent_tasks": 1}}
+    busy = Task(project_id=test_project.id, title="Busy root work", status="in_progress",
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db_session.add(busy)
+    await db_session.flush()
+    assert await available_slots(db_session, parent.id) == 0
+    first = await roadmap.advance(db_session, parent, run)
+    assert first["step"] == "release_item"
+    await roadmap.advance(db_session, parent, run)
+    assert await _row_counts(db_session, parent, run) == [1, 1, 1, 1, 1]
+    child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent.id))
+    child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    queued = Task(project_id=test_project.id, title="Child work", status="backlog",
+                  metadata_={"orchestration": {"run_id": str(child_run.id)}})
+    db_session.add(queued)
+    await db_session.flush()
+    tasks = [queued]
+    assert all(task.status == "backlog" for task in tasks)
+    result = await activate_ready(db_session, parent.id, is_blocked=roadmap.orchestration._activation_blocker)
+    assert not result["started"]
+    assert busy.status == "in_progress" and all(task.status == "backlog" for task in tasks)
+
+
+async def test_auto_child_revalidates_dependency_gate_after_classifier(db_session, test_project):
+    prerequisite = {**goal_item("prerequisite"), "goal_type": "outcome"}
+    item = {**goal_item("dependent"), "goal_type": "auto", "depends_on": ["prerequisite"]}
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [prerequisite, item])
+    await roadmap.advance(db_session, parent, run)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
+        OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "prerequisite"))
+    gate = await db_session.get(OrchestrationGate, row.gate_id)
+    gate.status = "accepted"
+    await db_session.flush()
+    before = await _row_counts(db_session, parent, run)
+    async def classify(self, project_id, data):
+        gate.status = "failed"
+        await db_session.flush()
+        return _shape("outcome", "delivery")
+    with patch.object(OrchestrationGoalShapeService, "_classify", classify):
+        result = await roadmap.release_goal_item(db_session, parent, run, version,
+            parse_roadmap_items([prerequisite, item], set(parent.budget["caps"]))[1])
+    assert result == {"step": "waiting", "reason": "waiting_dependencies"}
+    assert await _row_counts(db_session, parent, run) == before

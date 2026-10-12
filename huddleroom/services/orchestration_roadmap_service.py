@@ -592,7 +592,77 @@ class OrchestrationRoadmapService:
         )
         db.add(version)
         await db.flush()
+        for item in items:
+            row = await db.scalar(select(OrchestrationRoadmapItem).where(
+                OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == item.item_key,
+            ))
+            if row is not None and row.unit_type == "task":
+                await self._refresh_released_task(db, run, version, item, row)
         return version
+
+    async def _released_task_metadata(self, db, run, item, row, task):
+        metadata = self.orchestration._json_object_or_empty(task.metadata_)
+        current = self.orchestration._json_object_or_empty(metadata.get("orchestration_plan_item"))
+        if item.adopt_task_id is not None and "adopt_task_id" not in current:
+            raise HTTPException(status_code=409, detail="Released roadmap adoption metadata is missing")
+        if current.get("adopt_task_id") is not None or item.adopt_task_id is None:
+            return metadata
+        first = await db.get(OrchestrationRoadmapVersion, row.first_version_id)
+        marker = await self.orchestration._existing_action_for_key(
+            db, run.id, f"run:{run.id}:kind:adopt_task:task:{task.id}"
+        )
+        orchestration = self.orchestration._json_object_or_empty(metadata.get("orchestration"))
+        if (row.unit_type == "task" and row.goal_id == run.goal_id and row.item_key == item.item_key
+                and row.task_id == task.id == item.adopt_task_id
+                and row.item_snapshot.get("adopt_task_id") == str(task.id)
+                and first is not None and first.run_id == run.id and first.goal_id == row.goal_id
+                and any(raw.get("item_key") == row.item_key and raw.get("adopt_task_id") == str(task.id)
+                        for raw in first.snapshot.get("items", []))
+                and current.get("id") == row.item_key
+                and orchestration.get("roadmap_item_key") == row.item_key
+                and orchestration.get("roadmap_version_id") == str(first.id)
+                and orchestration.get("run_id") == str(run.id)
+                and orchestration.get("goal_id") == str(run.goal_id)
+                and marker is not None and marker.status == "completed" and marker.target_type == "task"
+                and marker.target_id == task.id and marker.request.get("plan_item_id") == row.item_key
+                and marker.request.get("adopt_task_id") == str(task.id)):
+            return {**metadata, "orchestration_plan_item": {**current, "adopt_task_id": str(task.id)}}
+        return metadata
+
+    async def _refresh_released_task(self, db, run, version, item, row):
+        first_version = await db.get(OrchestrationRoadmapVersion, row.first_version_id)
+        if first_version is not None and first_version.run_id != run.id:
+            return  # retained predecessor work stays under its original run contract
+        current_version = await self.current_version(db, row.goal_id)
+        if current_version is None or current_version.id != version.id or version.run_id != run.id:
+            return
+        candidate = item.model_dump(mode="json")
+        if {k: v for k, v in candidate.items() if k not in {"priority", "artifact_ids"}} != {
+            k: v for k, v in row.item_snapshot.items() if k not in {"priority", "artifact_ids"}
+        }:
+            raise HTTPException(status_code=409, detail=f"Released roadmap item '{item.item_key}' cannot be changed")
+        if item.adopt_task_id is not None and (row.task_id != item.adopt_task_id
+                or row.item_snapshot.get("adopt_task_id") != str(row.task_id)):
+            raise HTTPException(status_code=409, detail="Released roadmap adopted task binding changed")
+        task = await db.get(Task, row.task_id)
+        if task is None:
+            raise HTTPException(status_code=409, detail="Released roadmap task is missing")
+        metadata = await self._released_task_metadata(db, run, item, row, task)
+        current = self.orchestration._json_object_or_empty(metadata.get("orchestration_plan_item"))
+        self.orchestration._validate_bound_plan_item(task, run, item, metadata)
+        if task.project_id != (await db.get(OrchestrationGoal, row.goal_id)).project_id:
+            raise HTTPException(status_code=409, detail="Released roadmap task project changed")
+        task.priority = item.priority
+        task.metadata_ = {
+            **metadata,
+            "orchestration": {**self.orchestration._json_object_or_empty(metadata.get("orchestration")),
+                              "roadmap_version_id": str(version.id)},
+            "orchestration_plan_item": {**current, "priority": item.priority,
+                                        "artifact_ids": [str(value) for value in item.artifact_ids],
+                                        "accepted_plan_artifact_id": str(version.plan_artifact_id),
+                                        "accepted_plan_fingerprint": version.fingerprint},
+        }
+        await db.flush()
 
     async def _validate_replan(self, db, goal, run, previous, candidate_items):
         # Released keys always stay in later versions, so previous's keys are this run's releases plus
@@ -608,7 +678,10 @@ class OrchestrationRoadmapService:
         for key, row in released.items():
             if key not in candidate:
                 raise HTTPException(status_code=409, detail=f"Released roadmap item '{key}' cannot be removed")
-            if candidate[key] != row.item_snapshot:
+            refresh_fields = {"priority", "artifact_ids"} if row.unit_type == "task" else set()
+            if {k: v for k, v in candidate[key].items() if k not in refresh_fields} != {
+                k: v for k, v in row.item_snapshot.items() if k not in refresh_fields
+            }:
                 raise HTTPException(status_code=409, detail=f"Released roadmap item '{key}' cannot be changed")
         await self._validate_candidate_allocations(db, goal, run, candidate_items, released)
 
@@ -894,6 +967,17 @@ class OrchestrationRoadmapService:
         return "waiting_dependencies"
 
     async def release_task_item(self, db, goal, run, version, item):
+        existing = await db.scalar(select(OrchestrationRoadmapItem).where(
+            OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == item.item_key,
+        ))
+        if existing is not None:
+            await self._refresh_released_task(db, run, version, item, existing)
+            return {"step": "release_item", "item_key": item.item_key, "unit_type": "task"}
+        release = await self.orchestration._existing_action_for_key(
+            db, run.id, f"run:{run.id}:kind:release_roadmap_item:{item.item_key}"
+        )
+        if release is not None and release.status == "failed":
+            return await self._adoption_failed(db, goal, run, release, item, release.error or "Adoption failed")
         unstaged = item.mutates_shared_state and await self._requires_mutation_authority(db, goal, version, item)
         if unstaged:
             authority = await self._mutation_authority(db, goal, run, version, item)
@@ -939,7 +1023,7 @@ class OrchestrationRoadmapService:
             inputs=item.inputs, forbidden_work=item.forbidden_work,
             success_evidence=item.success_evidence, required_capabilities=item.required_capabilities,
             depends_on=item.depends_on, priority=item.priority, artifact_ids=item.artifact_ids,
-            why_runnable=item.why_runnable,
+            why_runnable=item.why_runnable, adopt_task_id=item.adopt_task_id,
         )
         required_evidence = {
             "plan_item_id": item.item_key,
@@ -1032,6 +1116,25 @@ class OrchestrationRoadmapService:
 
     async def _adoption_failed(self, db, goal, run, release, item, reason):
         """Same as Outcome: fail the release and block on plan integrity instead of raising every tick."""
+        version = await self.current_version(db, goal.id)
+        if version is not None and version.run_id == run.id and item.adopt_task_id is not None:
+            gate_id = uuid.uuid5(uuid.NAMESPACE_URL,
+                                f"rally:orchestration:gate:{run.id}:roadmap_item:{version.id}:{item.item_key}")
+            gate = await db.get(OrchestrationGate, gate_id)
+            request = self.orchestration._json_object_or_empty(release.request)
+            if (gate is not None and gate.status == "open" and gate.run_id == run.id
+                    and gate.gate_type == "work_completed"
+                    and gate.success_criterion_key == f"roadmap_item:{item.item_key}"
+                    and gate.required_evidence.get("roadmap_version_id") == str(version.id)
+                    and gate.required_evidence.get("plan_item_id") == item.item_key
+                    and gate.required_evidence.get("task_id", str(item.adopt_task_id)) == str(item.adopt_task_id)
+                    and any(raw.get("item_key") == item.item_key
+                            and raw.get("adopt_task_id") == str(item.adopt_task_id)
+                            for raw in version.snapshot.get("items", []))
+                    and release.target_id in (None, item.adopt_task_id)
+                    and request == {"item_key": item.item_key, "unit_type": "task"}
+                    and release.idempotency_key == f"run:{run.id}:kind:release_roadmap_item:{item.item_key}"):
+                self.orchestration._fail_gate(gate, reason)
         if release.status == "reserved":
             await self.orchestration._fail_reserved_action_for_current_flow(db, release, reason)
         self.orchestration._block_plan_integrity(
@@ -1075,6 +1178,19 @@ class OrchestrationRoadmapService:
             if reservation is None:
                 raise HTTPException(status_code=409, detail="Roadmap child reservation is missing")
             return {"step": "release_item", "item_key": item.item_key, "unit_type": "goal"}
+        from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES
+        current = await self.current_version(db, goal.id)
+        if (goal.status not in {"active", "blocked"} or run.status not in LLM_DECISION_RUN_STATUSES
+                or current is None or current.id != version.id):
+            return {"step": "waiting", "reason": "child_shape_state_changed"}
+        if not await self._dependencies_accepted(db, goal.id, run, version, item.depends_on):
+            return {"step": "waiting", "reason": "waiting_dependencies"}
+        summary = await self.remaining_or_block(db, goal, run)
+        if summary is None:
+            return {"step": "waiting", "reason": "needs_attention"}
+        if shape is not None and any(Decimal(str(amount)) > Decimal(summary["remaining"].get(key, "0"))
+               for key, amount in item.allocation.items()):
+            return {"step": "waiting", "reason": "budget_wait"}
         # ponytail: backstop for cousin races and legacy versions; mirrors child_contract
         root, depth, limits = await expansion_scope(db, goal)
         existing_descendants = await descendant_count(db, root.id)
@@ -1131,11 +1247,14 @@ class OrchestrationRoadmapService:
                 })
                 await db.flush()
                 return {"step": "needs_attention"}
-            if committed:
+            if auto:
                 from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES
                 # Other writers may have moved while the writer was released: re-read and re-run every check.
-                await db.refresh(goal)
-                await db.refresh(run)
+                if committed:
+                    db.expire_all()  # ancestors, dependency gates and authority may also have changed
+                    await db.refresh(goal)
+                    await db.refresh(run)
+                    await db.refresh(version)
                 current = await self.current_version(db, goal.id)
                 if run.status not in LLM_DECISION_RUN_STATUSES or current is None or current.id != version.id:
                     return {"step": "waiting", "reason": "child_shape_state_changed"}
