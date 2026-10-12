@@ -1298,6 +1298,18 @@ it('orders meeting obligations after failed gates and before warnings without st
   } finally { view.cleanup() }
 })
 
+it('uses the minimum label typography token for queue and meeting eyebrows', async () => {
+  const view = await mountQueue({ meetingCommitments: [meetingObligation], warnings: [warning()] })
+  try {
+    const eyebrows = descendants(view.container).filter((element) => element.getAttribute('class')?.includes('w-[104px]'))
+    expect(eyebrows.length).toBeGreaterThanOrEqual(2)
+    for (const eyebrow of eyebrows) {
+      expect(eyebrow.getAttribute('class')?.split(' ')).toContain('text-label')
+      expect(eyebrow.getAttribute('class')).not.toContain('text-[11px]')
+    }
+  } finally { view.cleanup() }
+})
+
 
 it.each([
   ['dismissed', 'Meeting obligation waived.'],

@@ -31,7 +31,7 @@ export function Record({ rows, keyWidth = 64, className }: RecordProps) {
       {visible.map((row) => (
         <div key={row.id ?? row.key} className="flex items-baseline gap-2">
           <dt
-            className="shrink-0 text-[11px] font-medium uppercase tracking-[0.1em] text-huddleroom-text-muted"
+            className="shrink-0 text-label font-medium uppercase tracking-[0.1em] text-huddleroom-text-muted"
             style={{ width: keyWidth }}
           >
             {row.key}

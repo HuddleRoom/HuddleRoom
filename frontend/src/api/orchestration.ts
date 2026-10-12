@@ -752,7 +752,7 @@ export function useResetOrchestrationGoal(projectId: string | null) {
     mutationFn: ({ goalId }: { goalId: string }) => resetOrchestrationGoal(projectId!, goalId),
     onSuccess: (detail, { goalId }) => {
       syncOrchestrationGoalCache(queryClient, projectId, goalId, detail)
-      return invalidateGoalAndBaseline(queryClient, projectId, goalId)
+      return queryClient.invalidateQueries({ queryKey: orchestrationBaselineKey(projectId, goalId) })
     },
   })
 }
@@ -802,7 +802,7 @@ export function useApplyGoalTypeCorrection(projectId: string | null) {
     retry: false,
     onSuccess: (detail, { goalId }) => {
       syncOrchestrationGoalCache(queryClient, projectId, goalId, detail)
-      return invalidateGoalAndBaseline(queryClient, projectId, goalId)
+      return queryClient.invalidateQueries({ queryKey: orchestrationBaselineKey(projectId, goalId) })
     },
   })
 }

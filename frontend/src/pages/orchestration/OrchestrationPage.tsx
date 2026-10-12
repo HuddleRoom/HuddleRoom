@@ -176,11 +176,12 @@ function DangerZoneSection({
   onReset: () => void
 }) {
   return (
-    <section className="rounded-md border border-huddleroom-border bg-huddleroom-surface p-4">
+    <section id="goal-danger-zone" className="rounded-md border border-huddleroom-border bg-huddleroom-surface p-4">
       <h3 className="text-xs font-medium text-huddleroom-text-secondary">Danger zone</h3>
       <div className="mt-2 space-y-2">
         <p className="text-xs text-huddleroom-text-muted">This permanently deletes all decisions, assumptions, warnings, agent reviews, and process history for this goal. The goal returns to its freshly-created state.</p>
         <Button
+          id="goal-reset-button"
           ref={resetButton}
           variant="danger"
           className="text-xs min-h-11"
@@ -626,7 +627,7 @@ export function CreateGoalModal({
               return (
                 <label
                   key={choice.value}
-                  className={`flex cursor-pointer items-start gap-2 rounded-md border p-3 ${
+                  className={`flex cursor-pointer items-start gap-2 rounded-md border p-3 focus-within:ring-2 focus-within:ring-huddleroom-primary focus-within:ring-offset-2 focus-within:ring-offset-huddleroom-surface ${
                     checked
                       ? 'border-huddleroom-primary bg-huddleroom-depth'
                       : 'border-huddleroom-border'
@@ -898,7 +899,7 @@ export function CorrectGoalTypeDialog({
           <legend className="mb-2 text-sm font-medium text-huddleroom-text-primary">New type</legend>
           <div className="flex flex-wrap gap-4">
             {CORRECTABLE_TYPES.map((type) => (
-              <label key={type} className={`flex min-h-11 items-center gap-2 text-sm ${type === currentType ? 'text-huddleroom-text-muted' : 'text-huddleroom-text-primary'}`}>
+              <label key={type} className={`flex min-h-11 items-center gap-2 rounded-md text-sm focus-within:ring-2 focus-within:ring-huddleroom-primary focus-within:ring-offset-2 focus-within:ring-offset-huddleroom-surface ${type === currentType ? 'text-huddleroom-text-muted' : 'text-huddleroom-text-primary'}`}>
                 <input
                   type="radio"
                   name="corrected-goal-type"
@@ -933,7 +934,10 @@ export function CorrectGoalTypeDialog({
           </Button>
         </fieldset>
 
-        <div aria-live="polite" aria-busy={phase === 'previewing'}>
+        <p className="sr-only" aria-live="polite" aria-atomic="true">
+          {preview ? `Preview: ${goalTypeLabel(preview.data.current_goal_type)} to ${goalTypeLabel(preview.data.proposed_goal_type)}. ${preview.data.blockers.length} blockers. ${preview.data.retained_evidence_manifest.length} evidence items carried over. ${preview.data.requires_new_start ? 'A new Start is required.' : 'No new Start is required.'}` : ''}
+        </p>
+        <div aria-busy={phase === 'previewing'}>
           {preview ? (
             <section aria-labelledby={headingId} className="flex flex-col gap-3">
               <h3 id={headingId} ref={previewHeading} tabIndex={-1} className="text-sm font-medium text-huddleroom-text-primary">Preview</h3>
@@ -1078,7 +1082,7 @@ function GatesPanel({
                   )}
                   <StatusBadge status={gate.status} />
                 </div>
-                {gate.failure_reason && <p className="mt-1 break-words text-sm text-huddleroom-status-red">{gate.failure_reason}</p>}
+                {gate.failure_reason && <p className={`mt-1 break-words text-sm ${gate.status === 'failed' ? 'text-huddleroom-status-red' : 'text-huddleroom-text-muted'}`}>{gate.failure_reason}</p>}
                 {debug ? (
                   <JsonDetails label="Required evidence" value={gate.required_evidence} />
                 ) : (
@@ -1598,7 +1602,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
 
           {/* Freshness cue (reuses react-query dataUpdatedAt/isFetching) */}
           {query.dataUpdatedAt ? (
-            <p className={`mt-1 text-[11px] ${query.isError ? 'text-huddleroom-status-amber' : 'text-huddleroom-text-muted'}`}>
+            <p className={`mt-1 text-label ${query.isError ? 'text-huddleroom-status-amber' : 'text-huddleroom-text-muted'}`}>
               Data as of {absolute(query.dataUpdatedAt)}
               {query.isError ? ' · not updating' : query.isFetching ? ' · refreshing…' : ''}
             </p>

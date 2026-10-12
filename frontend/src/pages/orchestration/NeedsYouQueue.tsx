@@ -624,7 +624,7 @@ function MeetingCommitmentRow({ commitment, projectId, mutationBusy, registerPri
     <div className="flex flex-wrap items-start gap-3 sm:flex-nowrap">
       <HelpCircle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: STATUS_COLORS.amber }} />
       <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 sm:flex-nowrap">
-        <p className="w-[104px] shrink-0 text-[11px] font-semibold uppercase tracking-[0.1em]" style={{ color: STATUS_COLORS.amber }}>MEETING ITEM</p>
+        <p className="w-[104px] shrink-0 text-label font-semibold uppercase tracking-[0.1em]" style={{ color: STATUS_COLORS.amber }}>MEETING ITEM</p>
         <div className="min-w-0 flex-1">
           <p className="text-sm text-huddleroom-text-primary">{commitment.description}</p>
           <Link to={`/meetings/${commitment.meeting_id}`} className="inline-flex min-h-11 items-center text-xs font-medium text-huddleroom-primary hover:underline">{commitment.meeting_title}</Link>
@@ -892,7 +892,7 @@ export function NeedsYouQueue({
                 than muted, since the color is itself the signal (blocker vs
                 decision vs warning). Message is the value beside it. */}
             <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 sm:flex-nowrap">
-              <p className="w-[104px] shrink-0 text-[11px] font-semibold uppercase tracking-[0.1em]" style={{ color: eyebrow.color }}>{eyebrow.text}</p>
+              <p className="w-[104px] shrink-0 text-label font-semibold uppercase tracking-[0.1em]" style={{ color: eyebrow.color }}>{eyebrow.text}</p>
               <div className="min-w-0 flex-1">
                 <p className="text-sm text-huddleroom-text-primary">{message}</p>
                 {tag && <div className="mt-0.5">{tag}</div>}

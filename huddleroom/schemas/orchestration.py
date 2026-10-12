@@ -1244,6 +1244,12 @@ class OrchestrationMeetingCommitmentResponse(BaseModel):
     reason: str | None
 
 
+class OrchestrationCapacityWaitResponse(BaseModel):
+    root_goal_id: uuid.UUID
+    available_slots: int
+    queued_task_ids: list[uuid.UUID]
+
+
 class OrchestrationGoalDetailResponse(BaseModel):
     goal: OrchestrationGoalResponse
     run: OrchestrationRunResponse | None = None
@@ -1272,6 +1278,7 @@ class OrchestrationGoalDetailResponse(BaseModel):
     plan: OrchestrationPlanView | None = None
     effective_authorization: AuthorizationResult | None = None
     authorization_wait: OrchestrationAuthorizationWaitResponse | None = None
+    capacity_wait: OrchestrationCapacityWaitResponse | None = None
 
 
 class OrchestrationProcessRunResponse(BaseModel):

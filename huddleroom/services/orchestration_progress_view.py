@@ -495,6 +495,35 @@ async def queued_authorization_wait(db: AsyncSession, goal: OrchestrationGoal, r
     return _authorization_wait(tasks, await _unstarted_queued_ids(db, run, tasks))
 
 
+async def queued_capacity_wait(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+    tasks: list[Task] | None = None, queued_ids: list[uuid.UUID] | None = None,
+) -> dict | None:
+    """Report only queued work that could start if a root slot became free."""
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    if tasks is None:
+        tasks = await _run_tasks(db, goal, run)
+    if queued_ids is None:
+        queued_ids = await _unstarted_queued_ids(db, run, tasks)
+    if not queued_ids:
+        return None
+    root = await root_goal_id(db, goal.id)
+    if await available_slots(db, root) != 0:
+        return None
+    service = OrchestrationService()
+    startable = []
+    for task in tasks:
+        if task.id not in queued_ids:
+            continue
+        wait = _orchestration_meta(task).get("authorization_wait")
+        if isinstance(wait, dict) and wait.get("reason_code"):
+            continue
+        if not await service._task_start_blocked(db, run, task):
+            startable.append(str(task.id))
+    return {"root_goal_id": str(root), "available_slots": 0, "queued_task_ids": startable} if startable else None
+
+
 class OrchestrationProgressView:
     async def build(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> ProgressSituation:
         tasks = await _run_tasks(db, goal, run)
@@ -567,11 +596,7 @@ class OrchestrationProgressView:
         capacity_wait = authorization_wait = None
         queued_ids = await _unstarted_queued_ids(db, run, tasks)
         if queued_ids:
-            root = await root_goal_id(db, goal.id)
-            if await available_slots(db, root) == 0:
-                capacity_wait = {
-                    "root_goal_id": str(root), "available_slots": 0, "queued_task_ids": [str(i) for i in queued_ids],
-                }
+            capacity_wait = await queued_capacity_wait(db, goal, run, tasks, queued_ids)
             authorization_wait = _authorization_wait(tasks, queued_ids)
         return ProgressSituation(
             capacity_wait=capacity_wait,

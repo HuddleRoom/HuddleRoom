@@ -388,6 +388,34 @@ describe('ActivityLog steering anchors', () => {
     expect(find('work-queued')?.message).toBe('Queued: Write API · Needs: Start again')
   })
 
+  it('shows when queued work is waiting for a free slot', () => {
+    const base = hierarchyDetail()
+    const detail = {
+      ...base,
+      plan: { ...base.plan, items: [{ key: 'p1', title: 'Write API', task_id: 't-1', adopted: false }] },
+      capacity_wait: { root_goal_id: 'goal-1', available_slots: 0, queued_task_ids: ['t-1'] },
+    } as OrchestrationGoalDetail
+    const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+    expect(entries.find((entry) => entry.kind === 'work-queued')?.message)
+      .toBe('Queued: Write API · Waiting for a free slot')
+  })
+
+  it('shows one queue event for completed release and expansion of the same run item', () => {
+    const detail = hierarchyDetail()
+    detail.actions = [
+      action(1, { action_type: 'release_item', request: { plan_item_id: 'p1' } }),
+      action(2, { action_type: 'expand_plan_item', request: { plan_item_id: 'p1' } }),
+      action(3, { action_type: 'release_item', request: { plan_item_id: 'p2' } }),
+      action(4, { action_type: 'release_item', run_id: 'run-2', request: { plan_item_id: 'p1' } }),
+      action(5, { action_type: 'release_item', status: 'failed', request: { plan_item_id: 'p1' } }),
+    ]
+    const queued = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+      .filter((entry) => entry.kind === 'work-queued')
+    expect(queued).toHaveLength(4)
+    expect(queued.map((entry) => entry.id)).not.toContain('action-action-1')
+    expect(queued.some((entry) => entry.status === 'failed')).toBe(true)
+  })
+
   it('derives distinct events for every hierarchy kind with copy and one chip each', async () => {
     const detail = hierarchyDetail()
     const entries = buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })

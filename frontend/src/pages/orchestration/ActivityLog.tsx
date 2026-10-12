@@ -200,7 +200,9 @@ function ledgerMessage(kind: string | undefined, item: TimelineItem, detail: Orc
     const wait = detail.authorization_wait
     const needs = wait?.required_decision && planItem?.task_id && wait.task_ids.includes(planItem.task_id)
       ? ` · Needs: ${requiredDecisionLabel(wait.required_decision)}`
-      : ''
+      : planItem?.task_id && detail.capacity_wait?.queued_task_ids.includes(planItem.task_id)
+        ? ' · Waiting for a free slot'
+        : ''
     return `Queued: ${planItem?.title ?? fallback}${planItem?.adopted ? ' (existing work)' : ''}${needs}`
   }
   if (kind === 'plan-ingested') {
@@ -220,7 +222,14 @@ function ledgerKind(item: TimelineItem): string | undefined {
 }
 
 function goalLedgerEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
-  return buildOrchestrationTimeline(detail).map((item) => {
+  const expanded = new Set(detail.actions.filter((action) => action.action_type === 'expand_plan_item'
+    && action.status === 'completed' && typeof action.request?.plan_item_id === 'string')
+    .map((action) => `${action.run_id}:${action.request!.plan_item_id}`))
+  const duplicateReleaseIds = new Set(detail.actions.filter((action) => action.action_type === 'release_item'
+    && action.status === 'completed' && typeof action.request?.plan_item_id === 'string'
+    && expanded.has(`${action.run_id}:${action.request.plan_item_id}`)).map((action) => action.id))
+  return buildOrchestrationTimeline(detail).filter((item) => item.kind !== 'action' || !duplicateReleaseIds.has(item.id))
+    .map((item) => {
     const mapped = ledgerKind(item)
     return {
     id: `${item.kind}-${item.id}`,

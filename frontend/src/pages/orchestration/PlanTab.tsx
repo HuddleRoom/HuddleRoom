@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { useOrchestrationGoal } from '@/api/orchestration'
 import { Callout } from '@/components/common/Callout'
@@ -82,16 +82,19 @@ export interface PlanOverviewProps {
 }
 
 export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = false, planStatus = plan?.status ?? null, pendingDecisionId = null, onViewDecision }: PlanOverviewProps) {
+  const headingId = useId()
   const current = runs.find((run) => run.is_current)
   const earlier = runs.filter((run) => !run.is_current).sort((a, b) => b.started_at.localeCompare(a.started_at))
   const author = plan?.author_agent_id ? (agentRoles[plan.author_agent_id] ?? 'the plan author') : 'the plan author'
   const version = plan?.planning_version ?? null
+  const revisionPending = plan?.kind !== 'roadmap'
+    && (plan?.status === 'revision_requested' || plan?.status === 'revision_required')
   // ponytail: only the current plan version is projected; earlier ones are a count, not fetched.
   const earlierCount = version && version > 1 ? version - 1 : 0
 
   return <div className="flex flex-col gap-3">
-    <section aria-label="Runs" className="flex flex-col gap-2">
-      <h3 className={HEADING_CLASS}>Runs</h3>
+    <section aria-labelledby={`${headingId}-runs`} className="flex flex-col gap-2">
+      <h3 id={`${headingId}-runs`} className={HEADING_CLASS}>Runs</h3>
       {current && <RecordList keyWidth={120} rows={[{
         key: 'Run',
         value: <span className="flex flex-wrap items-center gap-2">
@@ -111,8 +114,8 @@ export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = fals
       </details>}
     </section>
 
-    <section aria-label="Plan" className="flex flex-col gap-2">
-      <h3 className={HEADING_CLASS}>Plan</h3>
+    <section aria-labelledby={`${headingId}-plan`} className="flex flex-col gap-2">
+      <h3 id={`${headingId}-plan`} className={HEADING_CLASS}>Plan</h3>
       {pendingReplan && <Callout variant="info">
         <p>A revised plan is proposed and awaiting approval. Items below are the current accepted plan.</p>
         {pendingDecisionId && onViewDecision && <Button type="button" variant="ghost" className="min-h-11" onClick={() => onViewDecision(pendingDecisionId)}>View the pending approval</Button>}
@@ -123,7 +126,7 @@ export function PlanOverview({ runs, plan, agentRoles = {}, pendingReplan = fals
           { key: 'Version', value: version ? `v${version} · Current` : null },
           { key: 'Author', value: plan.author_agent_id ? (agentRoles[plan.author_agent_id] ?? <MonoId id={plan.author_agent_id} />) : null },
           { key: 'Artifact', value: <MonoId id={plan.artifact_id} /> },
-          { key: 'Status', value: plan.status ? <StatusBadge status={plan.status === 'requested' ? 'pending' : plan.status} label={planStatusLabel(plan.status)} /> : null },
+          { key: 'Status', value: plan.status ? <StatusBadge status={plan.status === 'requested' ? 'pending' : plan.status} label={revisionPending ? 'Accepted (current plan; revision pending)' : planStatusLabel(plan.status)} /> : null },
         ]} />
         {earlierCount > 0 && <p className="text-xs text-huddleroom-text-muted">
           {earlierCount === 1 ? '1 earlier version (v1)' : `${earlierCount} earlier versions (v1–v${earlierCount})`}, not shown here.
@@ -174,6 +177,7 @@ export interface PlanItemListProps {
 export function PlanItemList({
   plan, evidence, taskReports, goal, taskTitles = {}, agentRoles = {}, runVersion = null, contractFingerprint = null,
 }: PlanItemListProps) {
+  const headingId = useId()
   const itemsByKey = new Map(plan.items.map((item) => [item.key, item] as const))
   const titleOf = (key: string) => itemsByKey.get(key)?.title ?? key
   const revisionPending = plan.kind !== 'roadmap' && (plan.status === 'revision_requested' || plan.status === 'revision_required')
@@ -267,8 +271,8 @@ export function PlanItemList({
     </li>
   }
 
-  return <section aria-label="Plan items section" className="flex flex-col gap-2">
-    <h3 className={HEADING_CLASS}>{heading}</h3>
+  return <section aria-labelledby={headingId} className="flex flex-col gap-2">
+    <h3 id={headingId} className={HEADING_CLASS}>{heading}</h3>
     <p className="text-xs text-huddleroom-text-muted">Preliminary evidence can unblock dependent work but never satisfies a final criterion.</p>
     <ol aria-label="Plan items" className="flex flex-col gap-3">{plan.items.map(renderItem)}</ol>
   </section>
@@ -323,6 +327,7 @@ export interface PlanTabProps {
 }
 
 export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRoles, onViewDecision }: PlanTabProps) {
+  const headingId = useId()
   const { plan, run } = detail
   const runs = detail.runs ?? []
   if (!run && runs.length === 0) return <section className="border-t border-huddleroom-border pt-4">
@@ -349,8 +354,8 @@ export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRo
       taskTitles={taskTitles} agentRoles={agentRoles}
       runVersion={currentRun?.version_label ?? null} contractFingerprint={run?.goal_contract_fingerprint ?? null}
     />}
-    {isRoadmap && <section aria-label="Child goals section" className="flex flex-col gap-2">
-      <h3 className={HEADING_CLASS}>Child goals</h3>
+    {isRoadmap && <section aria-labelledby={headingId} className="flex flex-col gap-2">
+      <h3 id={headingId} className={HEADING_CLASS}>Child goals</h3>
       <ChildGoalList projectId={projectId} goals={detail.child_goals ?? []} />
     </section>}
   </section>

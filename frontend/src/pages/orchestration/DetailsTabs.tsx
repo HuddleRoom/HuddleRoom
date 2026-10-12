@@ -218,6 +218,7 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
   const [activityScope, setActivityScope] = useState<ActivityScope>('goal')
   const [focusDecisionId, setFocusDecisionId] = useState<string | null>(null)
   const [focusDecisionPending, setFocusDecisionPending] = useState(false)
+  const [focusDangerZonePending, setFocusDangerZonePending] = useState(false)
   const sectionRef = useRef<HTMLElement | null>(null)
   const handledDecisionNavigation = useRef<string | null>(null)
 
@@ -227,6 +228,16 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
     setFocusDecisionId(decisionId)
     setFocusDecisionPending(true)
   }
+
+  useLayoutEffect(() => {
+    if (activeTab !== 'debug' || !focusDangerZonePending) return
+    afterLayout(() => {
+      const dangerZone = findDescendantById(sectionRef.current, 'goal-danger-zone')
+      dangerZone?.scrollIntoView?.({ block: 'start' })
+      findDescendantById(dangerZone, 'goal-reset-button')?.focus({ preventScroll: true })
+    })
+    setFocusDangerZonePending(false)
+  }, [activeTab, focusDangerZonePending])
 
   useLayoutEffect(() => {
     if (!decisionFocusId || !decisionNavigation) {
@@ -256,11 +267,7 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
     showDebugTab: () => {
       if (!debug) return
       setActiveTab('debug')
-      afterLayout(() => {
-        const tab = findDescendantById(sectionRef.current, 'details-tab-debug')
-        tab?.scrollIntoView?.({ block: 'nearest' })
-        tab?.focus()
-      })
+      setFocusDangerZonePending(true)
     },
   }))
 

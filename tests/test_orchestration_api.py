@@ -122,7 +122,7 @@ DETAIL_RESPONSE_KEYS = {
     "decisions_count", "actions_count", "gates_count", "evidence_count", "agent_suggestions_count",
     "roadmap_version", "roadmap_items", "children", "budget_summary", "supervision",
     "contract_fingerprint", "runs", "child_goals", "effective_authorization",
-    "task_reports", "plan", "authorization_wait",
+    "task_reports", "plan", "authorization_wait", "capacity_wait",
 }
 
 
@@ -1035,6 +1035,31 @@ async def test_detail_exposes_authorization_wait_for_stale_start_queued_task(cli
     await svc.start_run(db_session, test_project.id, goal.id, actor="human:a")  # re-Start
     assert await svc._start_released_tasks(db_session, goal, run) == 1
     assert (await client.get(url)).json()["authorization_wait"] is None
+
+
+@pytest.mark.asyncio
+async def test_detail_exposes_capacity_wait_for_startable_queued_task(client, db_session, test_project):
+    from tests.test_orchestration_progress_view import _run_with_criteria, _task
+    from tests.test_orchestration_runtime_e2e import _agent
+
+    goal, run = await _run_with_criteria(db_session, test_project, [])
+    agent = _agent("detail-capacity", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    queued = await _task(db_session, test_project, run, status="backlog")
+    queued.assigned_to = agent.id
+    await db_session.flush()
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}"
+    assert (await client.get(url)).json()["capacity_wait"] is None
+    await _task(db_session, test_project, run, status="in_progress")
+    await _task(db_session, test_project, run, status="ready")
+
+    response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json()["capacity_wait"] == {
+        "root_goal_id": str(goal.id), "available_slots": 0, "queued_task_ids": [str(queued.id)],
+    }
 
 
 @pytest.mark.asyncio

@@ -410,7 +410,9 @@ describe('OrchestrationPage', () => {
     const { OrchestrationPage } = await import('./OrchestrationPage')
     const markup = renderToStaticMarkup(<OrchestrationPage />)
 
-    expect(markup).toContain('aria-label="Runs"')
+    const runsHeading = markup.match(/<h3 id="([^"]+-runs)"[^>]*>Runs<\/h3>/)
+    expect(runsHeading).not.toBeNull()
+    expect(markup).toContain(`aria-labelledby="${runsHeading![1]}"`)
     expect(markup).toContain('Request independent validation')
     expect(markup).toContain('release-ready')
     expect(markup).toContain('No evidence recorded')
@@ -540,6 +542,24 @@ describe('OrchestrationPage', () => {
     expect(markup).toContain('1 open')
     expect(markup).toMatch(/<span class="font-semibold text-huddleroom-status-red">1 failed<\/span>/)
     expect(markup).toContain('1 accepted')
+  })
+
+  it('uses muted text for waiting gates and red only for failed gates', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = {
+      ...richDetail,
+      gates_count: 2,
+      gates: [
+        { ...richDetail.gates[0], id: 'gate-waiting', status: 'open', failure_reason: 'Waiting for Start' },
+        { ...richDetail.gates[0], id: 'gate-failed', status: 'failed', failure_reason: 'Missing evidence.' },
+      ],
+    }
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const markup = renderToStaticMarkup(<OrchestrationPage />)
+
+    expect(markup).toMatch(/<p class="mt-1 break-words text-sm text-huddleroom-text-muted">Waiting for Start<\/p>/)
+    expect(markup).toMatch(/<p class="mt-1 break-words text-sm text-huddleroom-status-red">Missing evidence\.<\/p>/)
   })
 
   it('handles a goal with no active run and keeps goal-level controls', async () => {
@@ -787,6 +807,7 @@ describe('OrchestrationPage', () => {
 
     expect(markup).toContain('text-huddleroom-status-amber')
     expect(markup).toContain('· not updating')
+    expect(markup).toContain('mt-1 text-label text-huddleroom-status-amber')
     expect(markup).not.toContain('· refreshing…')
   })
 
@@ -1042,6 +1063,9 @@ describe('CreateGoalModal goal type selector', () => {
     try {
       const fieldset = descendants(view.document.body).find((n) => n.tagName === 'FIELDSET')!
       expect(fieldset.getAttribute('disabled')).not.toBeNull()
+      const cards = descendants(view.document.body).filter((n) => n.tagName === 'LABEL' && n.childNodes.some((c) => 'tagName' in c && c.tagName === 'INPUT'))
+      expect(cards).toHaveLength(4)
+      expect(cards.every((card) => card.getAttribute('class')?.includes('focus-within:ring-huddleroom-primary'))).toBe(true)
     } finally { view.cleanup() }
   })
 })
@@ -1127,6 +1151,12 @@ describe('CorrectGoalTypeDialog', () => {
         'Readiness proof from the first run', 'Carried-over evidence is never accepted automatically.',
       ]) expect(text).toContain(copy)
       expect(getButton(view.container, 'Apply correction').getAttribute('disabled')).toBeNull()
+      const summary = descendants(view.container).find((node) => node.getAttribute('aria-live') === 'polite' && node.getAttribute('class') === 'sr-only')!
+      expect(summary.getAttribute('aria-atomic')).toBe('true')
+      expect(textOf(summary)).toBe('Preview: Outcome to Roadmap. 0 blockers. 1 evidence items carried over. A new Start is required.')
+      const cards = descendants(view.container).filter((n) => n.tagName === 'LABEL' && n.childNodes.some((c) => 'tagName' in c && c.tagName === 'INPUT'))
+      expect(cards).toHaveLength(3)
+      expect(cards.every((card) => card.getAttribute('class')?.includes('focus-within:ring-huddleroom-primary'))).toBe(true)
     } finally { view.cleanup() }
   })
 

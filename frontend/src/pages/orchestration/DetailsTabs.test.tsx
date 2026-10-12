@@ -417,17 +417,28 @@ describe('DetailsTabs', () => {
     }
   })
 
-  it('exposes an imperative handle that switches to the Debug tab and focuses it', async () => {
+  it('activates Debug before scrolling to the Danger zone and focusing Reset', async () => {
     const ref = createRef<DetailsTabsHandle>()
-    const view = await mount({ handleRef: ref, debug: true })
+    const view = await mount({ handleRef: ref, debug: true, debugContent: <section id="goal-danger-zone"><button id="goal-reset-button">Reset goal</button></section> })
     try {
       expect(tabPanel(view.container, 'debug').getAttribute('hidden')).not.toBeNull()
+      const dangerZone = descendants(view.container).find((node) => node.getAttribute('id') === 'goal-danger-zone')!
+      const resetButton = getButton(view.container, 'Reset goal')
+      const scroll = vi.fn(() => expect(tabPanel(view.container, 'debug').getAttribute('hidden')).toBeNull())
+      const focus = vi.fn()
+      Object.assign(dangerZone, { scrollIntoView: scroll })
+      Object.assign(resetButton, { focus })
 
       await act(async () => ref.current?.showDebugTab())
 
       expect(tabPanel(view.container, 'debug').getAttribute('hidden')).toBeNull()
       const debugTab = descendants(view.container).find((node) => node.getAttribute('id') === 'details-tab-debug')
       expect(debugTab?.getAttribute('aria-selected')).toBe('true')
+      expect(scroll).toHaveBeenCalledWith({ block: 'start' })
+      expect(focus).toHaveBeenCalledWith({ preventScroll: true })
+
+      await act(async () => ref.current?.showDebugTab())
+      expect(scroll).toHaveBeenCalledTimes(2)
     } finally {
       view.cleanup()
     }
@@ -510,6 +521,25 @@ function summaryOf(details: ReturnType<typeof detailsBySummary>) {
 }
 
 describe('Plan tab', () => {
+  it('names plan regions from their visible headings with unique references', async () => {
+    const detail = goalDetail({ runs: [run()], run: null, plan: { ...planBase, kind: 'roadmap', items: [item()] } })
+    const view = await mountWithTestDom(() => <MemoryRouter>
+      <PlanTab projectId="project-1" detail={detail} />
+      <PlanTab projectId="project-1" detail={detail} />
+    </MemoryRouter>, act)
+    try {
+      const nodes = descendants(view.container)
+      const regions = nodes.filter((node) => node.tagName === 'SECTION' && node.getAttribute('aria-labelledby'))
+      const references = regions.map((node) => node.getAttribute('aria-labelledby'))
+      expect(new Set(references).size).toBe(8)
+      expect(regions.map((region) => {
+        const heading = nodes.find((node) => node.getAttribute('id') === region.getAttribute('aria-labelledby'))
+        expect(heading?.tagName).toBe('H3')
+        return textOf(heading!)
+      })).toEqual(['Runs', 'Plan', 'Plan items', 'Child goals', 'Runs', 'Plan', 'Plan items', 'Child goals'])
+    } finally { view.cleanup() }
+  })
+
   it('labels current and historical runs and plan versions', async () => {
     const runs = [
       run({ id: 'run-1', version_label: 'v1', is_current: false, supersedes_run_id: null, terminal_reason: 'reclassified', status: 'cancelled', goal_type_snapshot: 'outcome' }),
@@ -544,7 +574,15 @@ describe('Plan tab', () => {
     const view = await mountPlan(goalDetail({ runs: [run()], run: pendingRun, plan: { ...planBase, items: [item()] } }))
     try { expect(textOf(view.container)).toContain('A revised plan is proposed and awaiting approval. Items below are the current accepted plan.') } finally { view.cleanup() }
     const revision = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, status: 'revision_requested', items: [item()] } }))
-    try { expect(textOf(revision.container)).toContain('Current accepted plan (revision requested)') } finally { revision.cleanup() }
+    try {
+      expect(textOf(revision.container)).toContain('Current accepted plan (revision requested)')
+      expect(textOf(revision.container)).toContain('Accepted (current plan; revision pending)')
+    } finally { revision.cleanup() }
+    const roadmap = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, kind: 'roadmap', status: 'revision_requested', items: [item()] } }))
+    try {
+      expect(textOf(roadmap.container)).toContain('Revision requested')
+      expect(textOf(roadmap.container)).not.toContain('Accepted (current plan; revision pending)')
+    } finally { roadmap.cleanup() }
   })
 
   it('renders item cards with dependencies, artifacts, adoption, owner and priority', async () => {

@@ -1095,3 +1095,32 @@ async def test_authorization_wait_lists_queued_tasks_parked_by_activation(db_ses
         "task_ids": [str(parked.id)], "reason_code": "contract_changed_since_start", "required_decision": "start",
     }
     assert situation.as_context()["authorization_wait"] == situation.authorization_wait
+
+
+async def test_capacity_wait_excludes_dependency_and_authorization_blocked_tasks(db_session, test_project):
+    from tests.test_orchestration_runtime_e2e import _agent
+
+    goal, run = await _run_with_criteria(db_session, test_project, [])
+    agent = _agent("capacity-blockers", ["implementation"])
+    db_session.add(agent)
+    await db_session.flush()
+    dependency = await _task(db_session, test_project, run, status="in_progress")
+    await _task(db_session, test_project, run, status="ready")
+    blocked = await _task(db_session, test_project, run, status="backlog")
+    denied = await _task(db_session, test_project, run, status="backlog")
+    ready = await _task(db_session, test_project, run, status="backlog")
+    blocked.assigned_to = denied.assigned_to = ready.assigned_to = agent.id
+    blocked.depends_on = [str(dependency.id)]
+    denied.metadata_ = {**denied.metadata_, "orchestration": {
+        **denied.metadata_["orchestration"], "authorization_wait": {
+            "reason_code": "agent_outside_accepted_team", "required_decision": "accept_team",
+        },
+    }}
+    await db_session.flush()
+
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+
+    assert situation.capacity_wait["queued_task_ids"] == [str(ready.id)]
+    ready.depends_on = [str(dependency.id)]
+    await db_session.flush()
+    assert (await OrchestrationProgressView().build(db_session, goal, run)).capacity_wait is None

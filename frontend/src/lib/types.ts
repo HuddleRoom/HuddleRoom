@@ -1064,6 +1064,11 @@ export interface OrchestrationGoalDetail {
     reason_code: string
     required_decision: string | null
   } | null
+  capacity_wait?: {
+    root_goal_id: string
+    available_slots: number
+    queued_task_ids: string[]
+  } | null
 }
 
 export interface OrchestrationRunSummary {

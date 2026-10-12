@@ -443,7 +443,7 @@ describe('orchestration API', () => {
     expect(mutation.retry).toBe(false)
   })
 
-  it('apply correction syncs the returned detail then invalidates goal and Baseline', async () => {
+  it('apply correction syncs detail and refreshes list and Baseline without refetching detail', async () => {
     const invalidateQueries = vi.fn().mockResolvedValue(undefined)
     const setQueryData = vi.fn()
     vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
@@ -455,10 +455,10 @@ describe('orchestration API', () => {
 
     expect(setQueryData).toHaveBeenCalledWith(['orchestration-goal', 'project-1', 'goal-1'], detail)
     expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
-      exact: true,
+      queryKey: ['orchestration-goals', 'project-1'],
     })
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: orchestrationBaselineKey('project-1', 'goal-1') })
+    expect(invalidateQueries).toHaveBeenCalledTimes(2)
   })
 
   it('posts the gate override decision reason and metadata', async () => {
@@ -710,7 +710,7 @@ describe('orchestration API', () => {
     expect(invalidateQueries).toHaveBeenCalledTimes(2)
   })
 
-  it('reset goal syncs returned detail and invalidates the Baseline subtree', async () => {
+  it('reset goal syncs detail and refreshes list and Baseline without refetching detail', async () => {
     const invalidateQueries = vi.fn().mockResolvedValue(undefined)
     const setQueryData = vi.fn()
     vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
@@ -723,12 +723,12 @@ describe('orchestration API', () => {
 
     expect(setQueryData).toHaveBeenCalledWith(['orchestration-goal', 'project-1', 'goal-1'], detail)
     expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
-      exact: true,
+      queryKey: ['orchestration-goals', 'project-1'],
     })
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: orchestrationBaselineKey('project-1', 'goal-1'),
     })
+    expect(invalidateQueries).toHaveBeenCalledTimes(2)
   })
 
   it('start work syncs the returned detail into the exact goal cache', () => {

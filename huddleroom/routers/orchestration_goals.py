@@ -81,7 +81,7 @@ from huddleroom.services.orchestration_authority_service import effective_author
 from huddleroom.services.orchestration_recovery_presenter import present_decision_response
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_dependencies import evidence_semantics
-from huddleroom.services.orchestration_progress_view import plan_item_state, queued_authorization_wait
+from huddleroom.services.orchestration_progress_view import plan_item_state, queued_authorization_wait, queued_capacity_wait
 from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
 from huddleroom.services.orchestration_work_report import persisted_report_validation, report_summary, work_report_payload
 from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
@@ -817,6 +817,7 @@ async def _detail(
             OrchestrationAuthorizationWaitResponse(**wait)
             if run is not None and (wait := await queued_authorization_wait(db, goal, run)) else None
         ),
+        capacity_wait=await queued_capacity_wait(db, goal, run) if run is not None else None,
     )
 
 

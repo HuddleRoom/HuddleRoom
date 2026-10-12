@@ -32,4 +32,10 @@ describe('Record', () => {
     const html = renderToStaticMarkup(<Record rows={[{ key: 'Role', value: 'Reviewer' }]} />)
     expect(html).toContain('width:64px')
   })
+
+  it('uses the minimum label typography token for record keys', () => {
+    const html = renderToStaticMarkup(<Record rows={[{ key: 'Role', value: 'Reviewer' }]} />)
+    expect(html).toContain('text-label')
+    expect(html).not.toContain('text-[11px]')
+  })
 })
