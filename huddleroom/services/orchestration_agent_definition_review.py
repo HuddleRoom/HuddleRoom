@@ -5,12 +5,15 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import re
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +27,7 @@ from huddleroom.models.orchestration_process import (
     OrchestrationWarning,
 )
 from huddleroom.models.task import Task
+from huddleroom.schemas.orchestration_recovery import EvidenceV1, _EligibilityV1
 from huddleroom.services.orchestration_agent_definition_analyzer import (
     AgentDefinitionSemanticAnalyzer,
     redact_semantic_payload,
@@ -280,6 +284,42 @@ def assess_agent_definition(
     }
 
 
+RECOVERY_TRIGGER_REASON = "approved_recovery"
+
+
+class RecoveryDefinitionAcceptanceV1(BaseModel):
+    """Typed input of the recovery-sourced agent_definition_review snapshot."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    call_id: str = Field(min_length=1, max_length=100)
+    canonical_request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    eligibility: dict[uuid.UUID, list[str]] = Field(min_length=1, max_length=128)
+    changed_agent_ids: list[uuid.UUID] = Field(default_factory=list, max_length=128)
+
+    @field_validator("eligibility")
+    @classmethod
+    def _functions(cls, value: dict[uuid.UUID, list[str]]) -> dict[uuid.UUID, list[str]]:
+        for functions in value.values():
+            _EligibilityV1._functions(functions)  # pylint: disable=protected-access
+            if not functions:
+                raise ValueError("eligibility requires at least one work function")
+        return value
+
+
+def recovery_eligibility_assessment(agent: Any, work_functions: list[str]) -> dict[str, Any]:
+    """Deterministic assessment of an exact post-state agent for its approved functions.
+
+    Recovery prose cannot override a hard disqualifier: every approved function must
+    survive ``assess_agent_definition`` unchanged, and the agent must be active.
+    """
+    if not bool(getattr(agent, "is_active", False)):
+        raise ValueError("inactive_or_unknown_agent")
+    assessment = assess_agent_definition(agent, list(work_functions))
+    if assessment["approved_for_work_functions"] != list(work_functions):
+        raise ValueError("definition_disqualified")
+    return assessment
+
+
 def coverage_fingerprint_from_projection(
     goal: OrchestrationGoal,
     targets: list[tuple[Agent, list[str], bool]],
@@ -384,9 +424,38 @@ class AgentDefinitionReviewProcess:
             raise ValueError("agent-definition decision context must be an object")
         return payload
 
+    def _targets_before_answers(self, targets, current, decisions) -> list:
+        """Targets with this process's answered approve/edit text reverted to the
+        proposal-time originals (the state the stored input fingerprint saw)."""
+        originals = {}
+        for decision in decisions:
+            if (
+                decision.source_process_run_id == current.id
+                and decision.status == "answered"
+                and decision.selected_option in {"approve", "edit"}
+            ):
+                context = self._decision_context(decision)
+                originals[context.get("agent_id")] = (
+                    context.get("original_description"), context.get("original_persona"),
+                )
+        if not originals:
+            return targets
+        reverted = []
+        for agent, proposed, inactive in targets:
+            if str(agent.id) in originals:
+                description, persona = originals[str(agent.id)]
+                agent = SimpleNamespace(**{
+                    **{field: getattr(agent, field) for field in SNAPSHOT_FIELDS},
+                    "id": agent.id, "is_active": agent.is_active,
+                    "description": description, "system_prompt": persona,
+                })
+            reverted.append((agent, proposed, inactive))
+        return reverted
+
     async def _apply_answered_proposals(
         self,
         db: AsyncSession,
+        run: OrchestrationRun,
         current: OrchestrationProcessRun,
         decisions: list[OrchestrationAuthorityDecision],
     ) -> bool:
@@ -422,11 +491,14 @@ class AgentDefinitionReviewProcess:
             current.outputs = {**current.outputs, "processed_decision_ids": sorted(processed)}
             await db.flush()
             return False
+        from huddleroom.services.orchestration_roster_mutation import ValidatedRosterDelta, _canonical_agent
+
+        targets = {}
         for decision in decisions:
             if decision.status != "answered" or str(decision.id) in processed:
                 continue
             context = self._decision_context(decision)
-            agent = await db.get(Agent, uuid.UUID(context["agent_id"]))
+            agent = await db.get(Agent, uuid.UUID(context["agent_id"]), populate_existing=True)
             if agent is None:
                 raise ValueError(f"agent {context['agent_id']} no longer exists")
             if decision.selected_option in {"approve", "edit"}:
@@ -436,8 +508,27 @@ class AgentDefinitionReviewProcess:
                     edited = edits[decision.id]
                     description = edited.get("description")
                     persona = edited.get("persona")
-                agent.description = description.strip()
-                agent.system_prompt = persona.strip()
+                targets[decision.id] = (agent, description.strip(), persona.strip())
+        updates = {
+            agent.id: dataclasses.replace(_canonical_agent(agent), description=description, system_prompt=persona)
+            for agent, description, persona in targets.values()
+            if (agent.description, agent.system_prompt) != (description, persona)
+        }
+        if updates:
+            # Global agent rows are written roster-first; under a goal lock this
+            # hands off (the answered decisions are the durable reservation).
+            from huddleroom.services.agent_service import hand_off_roster_delta
+
+            await hand_off_roster_delta(
+                db, ValidatedRosterDelta(updates=tuple(updates.values())),
+                goal_id=current.goal_id, run_id=run.id, process_id=current.id,
+                decision_ids=sorted(targets, key=str),
+            )
+        for decision in decisions:
+            if decision.status != "answered" or str(decision.id) in processed:
+                continue
+            if decision.id in targets:
+                agent = targets[decision.id][0]
                 changed = True
                 # The human just provided a definition, so the "both blank"
                 # warning this run raised for the agent is provably obsolete.
@@ -635,6 +726,19 @@ class AgentDefinitionReviewProcess:
             current is not None
             and current.status == "waiting_decision"
             and stored_fingerprint != fingerprint
+            and stored_fingerprint == self._fingerprint(
+                goal, _assignments, self._targets_before_answers(targets, current, proposal_decisions)
+            )
+        ):
+            # The only drift is this process's own approved text, applied
+            # roster-first after the goal lock was released: re-stamp.
+            current.input_snapshot = {**current.input_snapshot, "fingerprint": fingerprint}
+            stored_fingerprint = fingerprint
+            await db.flush()
+        if (
+            current is not None
+            and current.status == "waiting_decision"
+            and stored_fingerprint != fingerprint
         ):
             # Stale inputs while a decision is pending: never cancel the
             # pending decision or restart -- park stays parked, a one-time
@@ -666,7 +770,7 @@ class AgentDefinitionReviewProcess:
             if decision.status == "answered" and str(decision.id) not in processed
         ]
         if current is not None and answered:
-            proposal_changed = await self._apply_answered_proposals(db, current, answered)
+            proposal_changed = await self._apply_answered_proposals(db, run, current, answered)
             if not proposal_changed:
                 replacement_decisions = await self._proposal_decisions(db, goal.id)
                 if any(
@@ -1037,6 +1141,144 @@ class AgentDefinitionReviewProcess:
             created_by="orchestrator:agent_definition_review",
         )
 
+    async def persist_recovery_acceptance(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        *,
+        accepted_payload: dict,
+        proposal_id: uuid.UUID,
+        proposal_hash: str,
+        authority_decision_id: uuid.UUID,
+        evidence: tuple[EvidenceV1, ...],
+    ) -> OrchestrationProcessRun:
+        """Write the accepted snapshot of an approved recovery configuration.
+
+        A superseding, synchronously completed ``approved_recovery`` row: no semantic
+        review, no waiting_decision, no definition approval card. The caller owns the
+        transaction (the roster-first recovery aggregate). Everything is validated
+        before the first write.
+        """
+        payload = RecoveryDefinitionAcceptanceV1.model_validate(accepted_payload)
+        evidence = tuple(EvidenceV1.model_validate(item) for item in evidence)
+        if goal.weight == "trivial" or run.goal_id != goal.id:
+            raise ValueError("unsupported_recovery_goal")
+        provenance = await self.process_service.recovery_provenance(
+            db, goal.id, proposal_id=proposal_id, proposal_hash=proposal_hash,
+            authority_decision_id=authority_decision_id, call_id=payload.call_id,
+            canonical_request_hash=payload.canonical_request_hash,
+        )
+        agents, assessments = {}, {}
+        for agent_id, functions in payload.eligibility.items():
+            agent = await db.get(Agent, agent_id)
+            if agent is None:
+                raise ValueError("inactive_or_unknown_agent")
+            agents[agent_id] = agent
+            assessments[agent_id] = recovery_eligibility_assessment(agent, functions)
+        previous = await self.process_service.get_current(db, goal.id, PROCESS_TYPE)
+        previous_outputs = (previous.outputs or {}) if previous is not None and previous.status == "completed" else {}
+        previous_review_ids = {str(item) for item in previous_outputs.get("review_ids", [])}
+        accepted_reviews = {
+            review.agent_id: review for review in await self.review_service.list_reviews(db, goal.id)
+            if str(review.id) in previous_review_ids and review.agent_id is not None
+        }
+
+        # -- writes start here --------------------------------------------------------------
+        fingerprint = await self.current_fingerprint(db, goal, run)
+        current = await self.process_service.start_process(
+            db, goal.id, process_type=PROCESS_TYPE, trigger_reason=RECOVERY_TRIGGER_REASON,
+            run_id=run.id, input_snapshot={"fingerprint": fingerprint},
+            process_version=PROCESS_VERSION, supersede_waiting=True, supersede_running=True,
+        )
+        if current.trigger_reason != RECOVERY_TRIGGER_REASON or current.status != "running":
+            raise ValueError("recovery_snapshot_not_started")
+        for decision in await self._proposal_decisions(db, goal.id):
+            if decision.status == "pending":
+                await self.decision_service.cancel_decision(
+                    db, decision, reason="superseded by an approved recovery configuration",
+                )
+        changed = set(payload.changed_agent_ids)
+        evidence_payload = [item.model_dump(mode="json") for item in evidence]
+        kept, reviews, findings = [], [], []
+        for agent_id, functions in payload.eligibility.items():
+            agent, prior = agents[agent_id], accepted_reviews.get(agent_id)
+            if (
+                agent_id not in changed and prior is not None
+                and sorted(prior.approved_for_work_functions or []) == sorted(functions)
+                and self._snapshot_matches(prior.definition_snapshot, agent)
+            ):
+                kept.append(prior)  # unchanged definition: carry the accepted eligibility forward
+                continue
+            assessment = assessments[agent_id]
+            review = await self.review_service.create_review(
+                db, goal.id, agent_id=agent.id,
+                fit_summary=(
+                    f"Approved recovery configuration: accepted for {', '.join(functions)}. "
+                    "No standard definition review was run."
+                ),
+                review_context=json.dumps({
+                    "source": RECOVERY_TRIGGER_REASON, **provenance,
+                    "recovery_evidence": evidence_payload,
+                    "deterministic_findings": assessment["warnings"],
+                    "process_version": PROCESS_VERSION,
+                }, sort_keys=True, separators=(",", ":")),
+                proposed_work_functions=list(functions), strengths=assessment["strengths"],
+                risks=assessment["risks"], recommended_changes=assessment["recommended_changes"],
+                approved_for_work_functions=list(functions), run_id=run.id,
+                source_process_run_id=current.id,
+            )
+            reviews.append(review)
+            findings.extend((agent, review, warning) for warning in assessment["warnings"])
+        await self._resolve_superseded_warnings(
+            db, goal.id, current.id, keep_review_ids={review.id for review in kept},
+            reason="superseded by an approved recovery configuration",
+        )
+        warnings = [await self.warning_service.create_warning(
+            db, goal.id, warning_type=finding["warning_type"], severity=finding["severity"],
+            message=finding["message"], run_id=run.id, source_process_run_id=current.id,
+            related_agent_id=agent.id, source_agent_review_id=review.id,
+        ) for agent, review, finding in findings]
+        eligibility = {str(agent_id): list(functions) for agent_id, functions in payload.eligibility.items()}
+        target_ids = sorted(set(eligibility) | {str(item) for item in previous_outputs.get("target_ids", [])})
+        accepted = kept + reviews
+        outputs = {
+            "fingerprint": fingerprint,
+            "coverage_fingerprint": await self.current_coverage_fingerprint(
+                db, goal, run, covered_target_ids=set(target_ids),
+            ),
+            "review_ids": [str(review.id) for review in accepted],
+            "target_ids": target_ids,
+            "eligibility": eligibility,
+            "warning_ids": [str(warning.id) for warning in warnings],
+            "warning_count": len(warnings),
+            "compressed": False,
+            "semantic_assessments": {},
+            "decision_ids": [],
+            "process_version": PROCESS_VERSION,
+            "gates": {"agent_definitions_reviewed": True},
+            "recovery_provenance": {**provenance, "evidence_labels": [item.label for item in evidence]},
+        }
+        lines = [
+            f"Accepted through approved recovery (proposal {proposal_id}); no standard definition review was run.",
+            f"Accepted agent definitions: {len(accepted)} ({len(reviews)} re-assessed, {len(kept)} carried forward)",
+            f"Active findings: {len(warnings)}",
+            *(f"- agent:{agent_id}: eligible for {', '.join(functions)}" for agent_id, functions in eligibility.items()),
+        ]
+        await self.memory_service.upsert_section(
+            db, goal.project_id, goal.id, section_key=MEMORY_SECTION_KEY, title="Agent definition review",
+            body="\n".join(lines),
+            summary=f"Approved recovery accepted {len(accepted)} agent definitions; {len(warnings)} warnings.",
+            toc_order=MEMORY_TOC_ORDER, run_id=run.id, created_by="orchestrator:agent_definition_review",
+        )
+        return await self.process_service.complete_process(db, current, outputs=outputs)
+
+    def _snapshot_matches(self, snapshot: dict | None, agent: Agent) -> bool:
+        """The accepted snapshot still describes the live definition (fingerprint fields)."""
+        live = self.review_service._build_snapshot(agent)  # pylint: disable=protected-access
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        return all(snapshot.get(field) == live.get(field) for field in FINGERPRINT_SNAPSHOT_FIELDS)
+
     async def _current_run_assignments(
         self, db: AsyncSession, project_id, run_id
     ) -> list[tuple[Task, Agent, str]]:
@@ -1253,7 +1495,8 @@ class AgentDefinitionReviewProcess:
         return coverage_fingerprint_from_projection(goal, targets, fields=fields)
 
     async def _resolve_superseded_warnings(
-        self, db: AsyncSession, goal_id, current_process_id
+        self, db: AsyncSession, goal_id, current_process_id, *, keep_review_ids=frozenset(),
+        reason: str = "superseded by a successful agent definition review",
     ) -> None:
         process_ids = set(
             (
@@ -1276,7 +1519,7 @@ class AgentDefinitionReviewProcess:
                     )
                 )
             ).scalars()
-        )
+        ) - set(keep_review_ids)
         for warning in await self.warning_service.list_warnings(db, goal_id, active_only=True):
             linked_review = warning.source_agent_review_id in review_ids
             prior_skip = (
@@ -1288,7 +1531,7 @@ class AgentDefinitionReviewProcess:
                     db,
                     warning,
                     resolved_by="orchestrator:agent_definition_review",
-                    reason="superseded by a successful agent definition review",
+                    reason=reason,
                 )
 
     @staticmethod

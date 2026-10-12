@@ -2165,3 +2165,72 @@ async def test_debug_rerun_endpoint_accepts_selected_process_type(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["process_type"] == "goal_definition"
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: a debug step that reaches an approved roster effect
+# (interrupted handoff: process running, approval answered) reserves under the
+# goal lock, releases it, applies roster-first, then resumes after revalidation.
+# ---------------------------------------------------------------------------
+from tests.test_orchestration_roster_mutation import (  # noqa: E402
+    PROPOSED_DESCRIPTION,
+    act_debug_step,
+    agents_named,
+    approve_semantic_reviews,  # noqa: F401 -- fixture
+    assert_entry_handoff,
+    current_process,
+    decisions_for,
+    fresh_agent,
+    interfere_after_roster_release,
+    lock_tracer,  # noqa: F401 -- fixture
+    outcome_or_conflict,
+    seed_definition_proposal,
+    seed_hierarchy_proposal,
+    sessions,  # noqa: F401 -- fixture
+    single_agent_write,
+)
+
+
+async def test_debug_step_definition_update_reserves_then_applies_roster_first(
+    sessions, tmp_path, approve_semantic_reviews, lock_tracer
+):
+    seeded = await seed_definition_proposal(sessions, tmp_path, answer=True, running=True)
+    lock_tracer.start()
+
+    result = await act_debug_step(sessions, seeded, "agent_definition_review")
+
+    assert_entry_handoff(lock_tracer, seeded.goal_id)
+    single_agent_write(lock_tracer, agent_id=seeded.agent_id)
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
+    assert result["process_type"] == "agent_definition_review"
+    assert result["process"]["status"] == "completed"
+    assert result["goal_id"] == seeded.goal_id and result["run_id"] == seeded.run_id
+
+
+async def test_debug_step_hierarchy_agent_reserves_then_applies_roster_first(
+    sessions, tmp_path, monkeypatch, lock_tracer
+):
+    seeded = await seed_hierarchy_proposal(sessions, tmp_path, monkeypatch, answer="approve", running=True)
+    lock_tracer.start()
+
+    result = await act_debug_step(sessions, seeded, "team_hierarchy")
+
+    assert_entry_handoff(lock_tracer, seeded.goal_id)
+    single_agent_write(lock_tracer, name=seeded.proposal_name)
+    assert len(await agents_named(sessions, seeded.proposal_name)) == 1
+    assert result["process_type"] == "team_hierarchy"
+    assert any(
+        item.decision_key == "team_hierarchy:approval" and item.status == "pending"
+        for item in await decisions_for(sessions, seeded.goal_id)
+    )
+
+
+async def test_debug_step_resume_rejects_paused_run(sessions, tmp_path, approve_semantic_reviews, lock_tracer):
+    seeded = await seed_definition_proposal(sessions, tmp_path, answer=True, running=True)
+    lock_tracer.start()
+    interfere_after_roster_release(lock_tracer, sessions, seeded, "run_paused")
+
+    await outcome_or_conflict(act_debug_step(sessions, seeded, "agent_definition_review"))
+
+    single_agent_write(lock_tracer, agent_id=seeded.agent_id)
+    assert (await current_process(sessions, seeded.goal_id, "agent_definition_review")).status != "completed"

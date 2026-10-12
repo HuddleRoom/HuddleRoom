@@ -1003,7 +1003,8 @@ def test_prompt_includes_progress_contract_sections():
 def test_progress_contract_routes_owner_decisions_to_ask_human():
     from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
 
-    assert "Use ask_human only when a missing owner decision truly blocks starting" in PROGRESS_CONTRACT
+    # ask_human is only for an owner answer that itself removes the blocker (was: "truly blocks starting").
+    assert "Use ask_human only when the owner's answer itself removes the blocker" in PROGRESS_CONTRACT
     assert "Route those actions to ask_human" in PROGRESS_CONTRACT
 
 
@@ -1245,3 +1246,69 @@ def test_advertised_create_delegation_task_optional_fields_are_exact():
         "source_session_id", "depends_on", "decision_use", "why_runnable", "priority", "artifact_ids",
         "authorization_scope",
     })
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: recover_blocker is advertised and the progress contract
+# matches the server rule (noop / ask_human / recover_blocker / no claimed fix).
+# ---------------------------------------------------------------------------
+
+
+def _contract_sentences() -> list[str]:
+    import re
+
+    from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
+
+    return [part.strip().lower() for part in re.split(r"(?<=[.;:])\s+|\n", PROGRESS_CONTRACT) if part.strip()]
+
+
+def test_prompt_advertises_recover_blocker_schema():
+    schemas = json.loads(_system_text().split("Allowed action schemas: ", 1)[1])
+
+    assert schemas["recover_blocker"]["required"] == ["evidence_refs", "reason"]
+    assert schemas["recover_blocker"]["optional"] == []
+
+
+def test_progress_contract_uses_recover_blocker_for_repairable_gaps():
+    sentences = [s for s in _contract_sentences() if "recover_blocker" in s]
+
+    assert sentences, "PROGRESS_CONTRACT never names recover_blocker"
+    assert any(word in s for s in sentences for word in ("configuration", "capability")), sentences
+
+
+def test_progress_contract_allows_noop_only_for_observed_live_work():
+    sentences = [s for s in _contract_sentences() if "noop" in s and "only" in s]
+
+    assert any("live" in s or "in-flight" in s or "in flight" in s for s in sentences), sentences
+
+
+def test_progress_contract_allows_ask_human_only_when_the_answer_removes_the_blocker():
+    sentences = [s for s in _contract_sentences() if "ask_human" in s and "only" in s]
+
+    assert any("answer" in s and "blocker" in s for s in sentences), sentences
+
+
+def test_progress_contract_says_suggest_agent_and_record_warning_do_not_apply_a_fix():
+    sentences = [s for s in _contract_sentences() if "suggest_agent" in s and "record_warning" in s]
+
+    assert any(("not" in s or "never" in s) and ("fix" in s or "remed" in s or "repair" in s) for s in sentences), (
+        sentences
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_decide_accepts_a_recover_blocker_decision_unchanged():
+    decision = {
+        "action_type": "recover_blocker",
+        "reason": "No accepted agent can author the plan.",
+        "evidence_refs": [{"kind": "process", "id": str(uuid.uuid4())}],
+    }
+
+    async def fake_completion(**_kwargs):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"decision": decision})))])
+
+    result = await OrchestrationDecisionAdapter(model="openai/test-model", completion_fn=fake_completion).decide(
+        {"goal": {"objective": "Plan"}, "run": {"status": "running"}},
+    )
+
+    assert result.parsed_decision == decision

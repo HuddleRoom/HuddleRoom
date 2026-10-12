@@ -343,7 +343,9 @@ async def test_generation_suffix_after_clear_on_decision_path(db_session, test_p
     })
     await service.tick(db_session, run.id)
     decision = (await db_session.scalars(
-        select(OrchestrationDecision).where(OrchestrationDecision.run_id == run.id)
+        # the wake names no live producer, so a recovery exchange follows; read the loop decision.
+        select(OrchestrationDecision).where(OrchestrationDecision.run_id == run.id,
+                                            OrchestrationDecision.decision_type != "recovery")
         .order_by(OrchestrationDecision.created_at)
     )).all()[-1]
     assert decision.validator_status == "accepted"
@@ -639,10 +641,15 @@ async def test_scenario_1_fresh_authorized_run_acts_then_waits_and_replays_idemp
     assert len(result["authorized_execution"]["action_ids"]) == 2
 
 
-# 3a. Recoverable blocked task: missing agent + alternate -> reassign ---------
-async def test_scenario_3a_blocked_task_with_missing_agent_reassigns_not_asks(
+# 3a. Recoverable blocked task: missing agent + alternate -> recovery proposal ---
+# reassignment is a corrective fix; it needs the owner's approval through one recovery lineage.
+async def test_scenario_3a_blocked_task_with_missing_agent_starts_recovery_not_reassign(
     db_session, test_project, monkeypatch
 ):
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+    from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
+    from tests.test_orchestration_recovery_activation import _gap
+
     monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run([]))
     original = _recovery_agent("original", "developer", ["implementation"], is_active=False)
     alternate = _recovery_agent("alternate", "developer", ["implementation"])
@@ -651,18 +658,28 @@ async def test_scenario_3a_blocked_task_with_missing_agent_reassigns_not_asks(
     service, goal, run, task, _ = await _blocked_setup(db_session, test_project, agent=original, reason="no owner")
     before = await _snapshot(db_session, run)
 
-    assert await service.recover_run(db_session, run.id, baseline_ready=True) == 1
+    async def analyze(self, snapshot, *, project_id, evidence_query, on_raw=None):
+        return _gap(run.id)
 
-    await _assert_liveness(db_session, goal, run, before, expect="action")
+    monkeypatch.setattr(RecoveryAnalyzer, "analyze", analyze)
+
+    assert await service.recover_run(db_session, run.id, baseline_ready=True) == 1
+    triggers = await _recovery_actions(db_session, run.id, "recovery_trigger")
+    assert len(triggers) == 1
+    await OrchestrationBlockerRecoveryService().diagnose(db_session, triggers[0].id)
+
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+    await _assert_liveness(db_session, goal, run, before)
+    cards = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending",
+        OrchestrationAuthorityDecision.decision_key.startswith("recovery")))).all()
+    assert len(cards) == 1 and cards[0].question.strip()  # the actionable human recovery card
     await db_session.refresh(task)
-    assert task.assigned_to == alternate.id
-    assert [a.status for a in await _recovery_actions(db_session, run.id, "reassign_task")] == ["completed"]
+    assert task.assigned_to == original.id
+    assert await _recovery_actions(db_session, run.id, "reassign_task") == []
     assert await _recovery_actions(db_session, run.id, "ask_human") == []
-    # Replay: the reassigned (still blocked, fresh live session) task now waits on that session; nothing is
-    # reassigned or asked twice, and the next replay is a pure no-op.
-    await service.recover_run(db_session, run.id, baseline_ready=True)
-    assert len(await _recovery_actions(db_session, run.id, "reassign_task")) == 1
-    assert await _recovery_actions(db_session, run.id, "ask_human") == []
+    # Replay: the same blocked episode keeps its one lineage; the next replay is a pure no-op.
     settled = await _effect_counts(db_session, run)
     assert await service.recover_run(db_session, run.id, baseline_ready=True) == 0
     assert await _effect_counts(db_session, run) == settled

@@ -12,7 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationInfo, field_validator, model_validator
 
 from huddleroom.models.orchestration_process import PROCESS_TYPES
-from huddleroom.services.orchestration_llm_decision_adapter import _redact_secrets
+from huddleroom.services.secret_redaction import redact_secrets as _redact_secrets  # not the adapter: avoids a schemas import cycle
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
 

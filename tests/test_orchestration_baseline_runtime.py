@@ -207,3 +207,144 @@ async def test_real_repair_boundary_discards_late_provider_without_application_c
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: roster mutation transaction ownership. The coordinator
+# owns its transaction in apply(); an explicit caller-owned root transaction must
+# keep mutation_guard() across its real outer commit/rollback.
+# ---------------------------------------------------------------------------
+import dataclasses  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
+
+from huddleroom.models.agent import Agent  # noqa: E402
+from tests.test_orchestration_roster_mutation import (  # noqa: E402
+    GOAL_LOW,
+    RACE_TIMEOUT,
+    canonical,
+    create_from_delta,
+    fresh_agent,
+    lock_tracer,  # noqa: F401 -- fixture
+    new_agent_state,
+    outcome_of,
+    seed_roster_goals,
+    sessions,  # noqa: F401 -- fixture
+    stale_error,
+    roster_api,
+)
+
+
+async def _update_and_create_plans(sessions, tmp_path):
+    rm = roster_api()
+    seeded = await seed_roster_goals(sessions, tmp_path, goal_ids=[GOAL_LOW])
+    async with sessions() as s:
+        agent = await s.get(Agent, seeded.agent_id)
+        update_delta = rm.ValidatedRosterDelta(
+            updates=(dataclasses.replace(canonical(agent), description="caller edit"),))
+        update_plan = await rm.preview_roster_delta(s, update_delta, origin_goal_id=None)
+        create_delta = rm.ValidatedRosterDelta(creates=(new_agent_state(name="contender"),))
+        create_plan = await rm.preview_roster_delta(s, create_delta, origin_goal_id=None)
+        await s.commit()
+        return rm, seeded, agent.description, (update_delta, update_plan), (create_delta, create_plan)
+
+
+@pytest.mark.parametrize("outer", ["commit", "rollback"])
+async def test_caller_owned_root_transaction_keeps_roster_guard_through_outer_commit(
+    sessions, tmp_path, lock_tracer, outer
+):
+    rm, seeded, original, (delta, plan), (other_delta, other_plan) = await _update_and_create_plans(sessions, tmp_path)
+    lock_tracer.start()
+    contender_spy = AsyncMock(side_effect=create_from_delta)
+
+    async def contender():
+        async with sessions() as b:
+            return await outcome_of(rm.AgentRosterMutationCoordinator().apply(
+                b, other_delta, other_plan, contender_spy, origin_goal_id=None, provenance={}))
+
+    async with sessions() as a:
+        await a.begin()
+        async with rm.AgentRosterMutationCoordinator().mutation_guard(
+            a, delta, plan, origin_goal_id=None, transaction_owner="caller"
+        ) as locked:
+            assert locked.delta == delta and locked.plan == plan
+            await create_from_delta(a, locked.delta, locked.plan)
+            task_b = asyncio.create_task(contender())
+            await asyncio.sleep(0.2)
+            assert not task_b.done()
+            await (a.commit() if outer == "commit" else a.rollback())
+            await asyncio.sleep(0.2)
+            assert not task_b.done(), "guard released before the caller left mutation_guard"
+    contender_outcome = await asyncio.wait_for(task_b, RACE_TIMEOUT)
+
+    expected = "caller edit" if outer == "commit" else original
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == expected
+    if outer == "commit":
+        assert stale_error(contender_outcome) == "state_changed" and contender_spy.call_count == 0
+    else:
+        assert stale_error(contender_outcome) is None and contender_spy.call_count == 1
+
+
+async def test_caller_owned_savepoint_release_is_not_publication(sessions, tmp_path, lock_tracer):
+    rm, seeded, original, (delta, plan), (other_delta, other_plan) = await _update_and_create_plans(sessions, tmp_path)
+    lock_tracer.start()
+
+    async with sessions() as a:
+        await a.begin()
+        with pytest.raises(Exception):
+            async with rm.AgentRosterMutationCoordinator().mutation_guard(
+                a, delta, plan, origin_goal_id=None, transaction_owner="caller"
+            ) as locked:
+                async with a.begin_nested():
+                    await create_from_delta(a, locked.delta, locked.plan)
+                # Savepoint released and flushed, root transaction still open: not publication.
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == original
+    # The guard was still released: a later coordinated mutation proceeds.
+    async with sessions() as b:
+        result = await asyncio.wait_for(rm.AgentRosterMutationCoordinator().apply(
+            b, other_delta, other_plan, create_from_delta, origin_goal_id=None, provenance={}), RACE_TIMEOUT)
+    assert stale_error(result) is None
+    assert await fresh_agent(sessions, other_delta.creates[0].id) is not None
+
+
+async def test_apply_rejects_preexisting_explicit_root_transaction_before_effects(sessions, tmp_path, lock_tracer):
+    rm, seeded, original, (delta, plan), _ = await _update_and_create_plans(sessions, tmp_path)
+    lock_tracer.start()
+    spy = AsyncMock(side_effect=create_from_delta)
+
+    async with sessions() as a:
+        await a.begin()
+        outcome = await outcome_of(rm.AgentRosterMutationCoordinator().apply(
+            a, delta, plan, spy, origin_goal_id=None, provenance={}))
+        assert isinstance(outcome, Exception), "apply must reject a caller-owned root transaction"
+        assert a.in_transaction(), "the coordinator must not commit/close the caller's transaction"
+        await a.rollback()
+    assert spy.call_count == 0
+    assert not lock_tracer.of("agent:write")
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == original
+
+
+@pytest.mark.parametrize(("owner", "shape"), [
+    ("caller", "no_transaction"), ("caller", "autobegin"), ("coordinator", "explicit_root"),
+])
+async def test_mutation_guard_rejects_unsupported_transaction_shapes_before_effects(
+    sessions, tmp_path, lock_tracer, owner, shape
+):
+    rm, seeded, original, (delta, plan), _ = await _update_and_create_plans(sessions, tmp_path)
+    lock_tracer.start()
+    entered = []
+
+    async with sessions() as a:
+        if shape == "explicit_root":
+            await a.begin()
+        elif shape == "autobegin":
+            await a.get(Agent, seeded.agent_id)
+        with pytest.raises(Exception):
+            async with rm.AgentRosterMutationCoordinator().mutation_guard(
+                a, delta, plan, origin_goal_id=None, transaction_owner=owner
+            ) as locked:
+                entered.append(locked)
+                await create_from_delta(a, locked.delta, locked.plan)
+        await a.rollback()
+    assert entered == []
+    assert not lock_tracer.of("agent:write")
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == original

@@ -1774,3 +1774,169 @@ describe('same baseline owner replacement', () => {
     } finally { view.cleanup() }
   })
 })
+
+// recovery FIX PROPOSAL wiring. Answered/non-pending recovery decisions come from the
+// existing `decisions` query (GET /decisions); pending ones also arrive in `checkpoint.items`.
+describe('Baseline dashboard recovery FIX PROPOSAL card', () => {
+  const GOAL_ID = 'goal-00000000-0000-4000-8000-000000000001'
+  function recoveryDecision(id: string, status: string, extra: Record<string, unknown> = {}, overrides: Partial<OrchestrationAuthorityDecisionRecord> = {}) {
+    return decision({
+      id, decision_key: `blocker_recovery:${id}`, title: 'Fix proposal', context: null, recommendation: null,
+      options: ['approve_fix', 'reject'], status: status === 'pending_approval' ? 'pending' : 'answered',
+      ...overrides,
+      recovery: {
+        kind: 'recovery_proposal_v1', proposal_id: `proposal-${id}`, version: 1, status,
+        problem: 'No agent can review the finished work.', general_updates: ['Add a code reviewer'],
+        after_approval: 'The blocked review step restarts automatically.', global_effect: true,
+        exact_details: null, evidence: null, error: null,
+        source_blocker_id: 'blocker-1', source_action_id: null, source_decision_id: id, ...extra,
+      },
+    } as unknown as Partial<OrchestrationAuthorityDecisionRecord>)
+  }
+  const withDecisions = (items: OrchestrationAuthorityDecisionRecord[]) => dashboardData({
+    decisions: query(items),
+    checkpoint: query({ goal_id: GOAL_ID, items: items.filter((item) => item.status === 'pending'), deferred_count: 0, max_questions: 5 }),
+  })
+  const cardOf = (root: Parameters<typeof descendants>[0]) => {
+    const heading = descendants(root).find((node) => node.tagName === 'H3' && ['FIX PROPOSAL', 'CAPABILITY NEEDED'].includes(textOf(node)))
+    if (!heading) throw new Error('FIX PROPOSAL card not found')
+    let node: TestElement | null = heading
+    while (node && node.tagName !== 'LI') node = node.parentNode as TestElement | null
+    return node!
+  }
+
+  it('renders_a_simple_recovery_proposal_and_submits_approval_once', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval')])
+    const view = await mountDashboard()
+    try {
+      expect(descendants(view.container).some((node) => node.tagName === 'H3' && textOf(node) === 'FIX PROPOSAL')).toBe(true)
+      const li = cardOf(view.container)
+      await act(async () => getButton(li, 'Approve fix').click())
+      await act(async () => getButton(li, 'Approve fix').click())
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledWith(
+        expect.objectContaining({ goalId: GOAL_ID, decisionId: 'rec-1', selectedOption: 'approve_fix' }),
+        expect.any(Object),
+      )
+      expect(api.answer.mutate.mock.calls[0][0].reason ?? '').toBe('')
+      expect(getButton(li, 'Approve fix').disabled).toBe(true)
+      expect(getButton(li, 'Reject').disabled).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('marks a pending capability gap done through the answer mutation (capability_provided)', async () => {
+    api.dashboard = withDecisions([recoveryDecision('gap-1', 'unsupported', {}, { status: 'pending', options: ['capability_provided'] } as Partial<OrchestrationAuthorityDecisionRecord>)])
+    const view = await mountDashboard()
+    try {
+      const li = cardOf(view.container)
+      expect(textOf(li)).not.toContain('Approve fix')
+      await act(async () => getButton(li, "I've provided it").click())
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledWith(
+        expect.objectContaining({ goalId: GOAL_ID, decisionId: 'gap-1', selectedOption: 'capability_provided' }),
+        expect.any(Object),
+      )
+    } finally { view.cleanup() }
+  })
+
+  it('answers with the decision record id, not recovery.source_decision_id', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval', { source_decision_id: 'other-id' })])
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(cardOf(view.container), 'Approve fix').click())
+      expect(api.answer.mutate.mock.calls[0][0].decisionId).toBe('rec-1')
+    } finally { view.cleanup() }
+  })
+
+  it('rejects through the answer mutation with the required, trimmed reason', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval')])
+    const view = await mountDashboard()
+    try {
+      const li = cardOf(view.container)
+      await act(async () => getButton(li, 'Reject').click())
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(getButton(li, 'Confirm reject').disabled).toBe(true)
+      await act(async () => changeControl(getByLabel(li, 'Reason', 'textarea'), '  Too broad.  '))
+      await act(async () => getButton(li, 'Confirm reject').click())
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledWith(
+        expect.objectContaining({ decisionId: 'rec-1', selectedOption: 'reject', reason: 'Too broad.' }),
+        expect.any(Object),
+      )
+    } finally { view.cleanup() }
+  })
+
+  it('does not show the generic radio form or agent-definition batch for a recovery decision', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval')])
+    const view = await mountDashboard()
+    try {
+      expect(descendants(view.container).some((node) => node.tagName === 'INPUT' && node.type === 'radio')).toBe(false)
+      expect(textOf(view.container)).not.toContain('Submit all decisions')
+    } finally { view.cleanup() }
+  })
+
+  it('shows the answer error and re-enables the card when the request fails', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval')])
+    api.answer.mutate.mockImplementation((_v, options) => { options.onError?.(new Error('Backend said no.')); options.onSettled?.() })
+    const view = await mountDashboard()
+    try {
+      const li = cardOf(view.container)
+      await act(async () => getButton(li, 'Approve fix').click())
+      expect(textOf(li)).toContain('Backend said no.')
+      expect(getButton(li, 'Approve fix').disabled).toBe(false)
+    } finally { view.cleanup() }
+  })
+
+  it('shows only the newest recovery decision per blocker', async () => {
+    const older = recoveryDecision('older', 'failed', {}, { created_at: ISO.asked, asked_at: ISO.asked })
+    const newer = recoveryDecision('newer', 'pending_approval', {}, { created_at: ISO.answered, asked_at: ISO.answered })
+    api.dashboard = withDecisions([older, newer])
+    const view = await mountDashboard()
+    try {
+      expect(descendants(view.container).filter((node) => node.tagName === 'H3' && textOf(node) === 'FIX PROPOSAL')).toHaveLength(1)
+      expect(textOf(view.container)).not.toContain('The fix did not complete.')
+      expect(textOf(view.container)).toContain('Approve fix')
+    } finally { view.cleanup() }
+  })
+
+  it('hides a resolved recovery proposal', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'resolved')])
+    const view = await mountDashboard()
+    try { expect(textOf(view.container)).not.toContain('FIX PROPOSAL') } finally { view.cleanup() }
+  })
+
+  it.each([
+    ['rejected', 'Fix rejected. Nothing was changed.'],
+    ['failed', 'The fix did not complete.'],
+    ['unsupported', 'No executable fix is available with the current tools.'],
+    ['applying', 'Applying approved fix…'],
+    ['verifying', 'Verifying update…'],
+    ['retrying', 'Update verified. Retrying blocked work…'],
+  ])('failed_recovery_prevents_on_track_empty_state (%s)', async (status, copy) => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', status)])
+    const view = await mountDashboard()
+    try {
+      expect(textOf(view.container)).not.toMatch(/goal is on track/i)
+      expect(textOf(view.container)).toContain(copy)
+      const labels = descendants(cardOf(view.container)).filter((node) => node.tagName === 'BUTTON').map(textOf)
+      expect(labels).not.toContain('Approve fix')
+    } finally { view.cleanup() }
+  })
+
+  it('an unsupported (capability-gap) proposal never offers Approve fix even if the decision is still pending', async () => {
+    api.dashboard = withDecisions([recoveryDecision('gap', 'unsupported', {}, { status: 'pending' })])
+    const view = await mountDashboard()
+    try { expect(textOf(cardOf(view.container))).not.toContain('Approve fix') } finally { view.cleanup() }
+  })
+
+  it('re-enables the card when the mutation owner cannot be acquired', async () => {
+    api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval')])
+    const view = await mountDashboard({ acquireMutation: () => false })
+    try {
+      const li = cardOf(view.container)
+      await act(async () => getButton(li, 'Approve fix').click())
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(getButton(li, 'Approve fix').getAttribute('disabled')).toBeNull()
+    } finally { view.cleanup() }
+  })
+})

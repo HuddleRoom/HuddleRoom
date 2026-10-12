@@ -2914,3 +2914,242 @@ async def test_select_plan_author_child_team_uses_nearest_ancestor_eligibility(d
     child.orchestrator_context = {"team": {"role_to_agent": {"planning": "not-a-uuid", "implementation": "also-bad"}}}
     with pytest.raises(HTTPException):
         await select_plan_author(db_session, child, run)
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: approved definition updates leave the origin goal lock
+# before the roster-first apply, then resume after fresh revalidation.
+# ---------------------------------------------------------------------------
+from tests.test_orchestration_roster_mutation import (  # noqa: E402
+    PROPOSED_DESCRIPTION,
+    act_definition_batch,
+    act_tick,
+    approve_semantic_reviews,  # noqa: F401 -- fixture
+    assert_entry_handoff,
+    clear_reset_fence,
+    current_process,
+    fresh_agent,
+    interfere_after_roster_release,
+    lock_tracer,  # noqa: F401 -- fixture
+    outcome_or_conflict,
+    seed_definition_proposal,
+    sessions,  # noqa: F401 -- fixture
+    single_agent_write,
+    stub_prerequisite_processes,
+)
+
+
+@pytest.mark.asyncio
+async def test_definition_batch_answer_reserves_under_goal_lock_then_applies_roster_first(
+    sessions, tmp_path, approve_semantic_reviews, lock_tracer
+):
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    lock_tracer.start()
+
+    response = await act_definition_batch(sessions, seeded)
+
+    assert_entry_handoff(lock_tracer, seeded.goal_id)
+    single_agent_write(lock_tracer, agent_id=seeded.agent_id)
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
+    assert (await current_process(sessions, seeded.goal_id, "agent_definition_review")).status == "completed"
+    assert response.process["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_definition_tick_reserves_under_goal_lock_then_applies_roster_first(
+    sessions, tmp_path, approve_semantic_reviews, lock_tracer, monkeypatch
+):
+    seeded = await seed_definition_proposal(sessions, tmp_path, answer=True)
+    lock_tracer.start()
+    stub_prerequisite_processes(monkeypatch, hierarchy="waiting_decision")
+
+    result = await act_tick(sessions, seeded)
+
+    assert_entry_handoff(lock_tracer, seeded.goal_id)
+    single_agent_write(lock_tracer, agent_id=seeded.agent_id)
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
+    # The tick result contract is preserved across the handoff.
+    assert result["agent_definition_review_process"]["status"] == "completed"
+    assert result["team_hierarchy_process"]["status"] == "waiting_decision"
+
+
+@pytest.mark.asyncio
+async def test_definition_batch_resume_rejects_replaced_active_run(
+    sessions, tmp_path, approve_semantic_reviews, lock_tracer
+):
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    lock_tracer.start()
+    interfere_after_roster_release(lock_tracer, sessions, seeded, "run_replaced")
+
+    await outcome_or_conflict(act_definition_batch(sessions, seeded))
+
+    single_agent_write(lock_tracer, agent_id=seeded.agent_id)  # the apply itself committed once
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
+    assert (await current_process(sessions, seeded.goal_id, "agent_definition_review")).status != "completed"
+
+
+@pytest.mark.asyncio
+async def test_definition_tick_resume_honours_reset_fence(
+    sessions, tmp_path, approve_semantic_reviews, lock_tracer, monkeypatch
+):
+    seeded = await seed_definition_proposal(sessions, tmp_path, answer=True)
+    lock_tracer.start()
+    stub_prerequisite_processes(monkeypatch, hierarchy="waiting_decision")
+    interfere_after_roster_release(lock_tracer, sessions, seeded, "reset_fence")
+    try:
+        outcome = await outcome_or_conflict(act_tick(sessions, seeded))
+    finally:
+        clear_reset_fence(seeded.goal_id)
+
+    assert isinstance(outcome, HTTPException) or outcome.get("interrupted") is True, outcome
+    single_agent_write(lock_tracer, agent_id=seeded.agent_id)
+    assert (await current_process(sessions, seeded.goal_id, "agent_definition_review")).status != "completed"
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: approved recovery writes a superseding, recovery-sourced
+# agent_definition_review snapshot through persist_recovery_acceptance -- never a
+# semantic review, never waiting_decision, never a definition approval card.
+# ---------------------------------------------------------------------------
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision  # noqa: E402
+from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess  # noqa: E402
+from huddleroom.services.orchestration_agent_review_service import (  # noqa: E402
+    OrchestrationAgentReviewService as _Task8ReviewService,
+)
+from tests.test_orchestration_recovery_configuration import (  # noqa: E402
+    PLANNER_FUNCTIONS as T8_PLANNER_FUNCTIONS,
+    PROVENANCE_KEYS as T8_PROVENANCE_KEYS,
+    applied_flow as cfg_applied_flow,
+    approved_flow as cfg_approved_flow,
+    arm_semantic_guard as cfg_arm_semantic_guard,
+    created_planner_id as cfg_created_planner_id,
+    current as cfg_current,
+    fresh_snapshot as cfg_fresh_snapshot,
+    load_flow as cfg_load_flow,
+    pending_review_decisions as cfg_pending_review_decisions,
+    seed_spr180 as cfg_seed_spr180,
+    sha as cfg_sha,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["create", "update"])
+async def test_recovery_definition_snapshot_records_provenance_and_exact_approved_functions(
+    sessions, tmp_path, monkeypatch, mode
+):
+    seeded = await cfg_seed_spr180(sessions, tmp_path, mode=mode)
+    cfg_arm_semantic_guard(monkeypatch)
+    flow = await cfg_applied_flow(sessions, seeded)
+    async with sessions() as s:
+        proposal, call, _wrapper, authority = await cfg_load_flow(s, flow)
+        proposal_action = await s.get(OrchestrationAction, flow.proposal_action_id)
+        planner = await s.get(Agent, cfg_created_planner_id(proposal, seeded))
+        definition_run = await cfg_current(s, seeded.goal_id, "agent_definition_review")
+        outputs = definition_run.outputs
+        provenance = outputs["recovery_provenance"]
+        assert set(T8_PROVENANCE_KEYS) <= set(provenance)
+        assert provenance["proposal_id"] == str(proposal.proposal_id)
+        assert provenance["proposal_hash"] == proposal_action.dispatch_contract["proposal_hash"]
+        assert provenance["call_id"] == call.call_id
+        assert provenance["canonical_request_hash"] == cfg_sha(call.arguments)
+        assert provenance["authority_decision_id"] == str(authority.id)
+        assert outputs["gates"]["agent_definitions_reviewed"] is True
+        assert not outputs.get("semantic_assessments")
+        assert {str(planner.id), str(seeded.implementer_id)} <= set(outputs["target_ids"])
+        reviews = (await s.scalars(select(OrchestrationAgentReview).where(
+            OrchestrationAgentReview.source_process_run_id == definition_run.id))).all()
+        assert [review.agent_id for review in reviews] == [planner.id], "only the changed/new agent is re-reviewed"
+        review = reviews[0]
+        assert str(review.id) in outputs["review_ids"]
+        assert review.approved_for_work_functions == T8_PLANNER_FUNCTIONS
+        assert set(review.approved_for_work_functions) <= set(review.proposed_work_functions)
+        assert review.definition_snapshot == _Task8ReviewService()._build_snapshot(planner)
+        assert "approved recovery configuration" in review.fit_summary.lower()
+        assert "deterministic definition review" not in review.fit_summary.lower()
+        context = json.loads(review.review_context)
+        context_text = json.dumps(context)
+        for value in (str(proposal.proposal_id), provenance["proposal_hash"], str(authority.id)):
+            assert value in context_text
+        assert all(item.label in context_text for item in proposal.evidence), "recovery evidence missing"
+        assert await cfg_pending_review_decisions(s, seeded.goal_id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("implementer_definition", ["matching", "drifted"])
+async def test_recovery_definition_snapshot_carries_forward_unchanged_eligibility_only_on_matching_fingerprint(
+    sessions, tmp_path, monkeypatch, implementer_definition
+):
+    seeded = await cfg_seed_spr180(sessions, tmp_path)
+    assert seeded.implementer_review_id is not None
+    if implementer_definition == "drifted":  # the accepted snapshot no longer matches the live definition
+        async with sessions() as s:
+            implementer = await s.get(Agent, seeded.implementer_id)
+            implementer.description = "Implements scoped API changes with tests."
+            await s.commit()
+    cfg_arm_semantic_guard(monkeypatch)
+    flow = await cfg_applied_flow(sessions, seeded)
+    async with sessions() as s:
+        definition_run = await cfg_current(s, seeded.goal_id, "agent_definition_review")
+        outputs = definition_run.outputs
+        assert outputs["eligibility"][str(seeded.implementer_id)] == ["implementation"]
+        fresh = (await s.scalars(select(OrchestrationAgentReview).where(
+            OrchestrationAgentReview.source_process_run_id == definition_run.id,
+            OrchestrationAgentReview.agent_id == seeded.implementer_id))).all()
+        if implementer_definition == "matching":
+            assert str(seeded.implementer_review_id) in outputs["review_ids"]
+            assert fresh == [], "an unchanged, matching definition is carried forward, not re-reviewed"
+        else:
+            assert str(seeded.implementer_review_id) not in outputs["review_ids"], (
+                "eligibility was carried forward from a stale definition snapshot")
+            assert len(fresh) == 1
+            implementer = await s.get(Agent, seeded.implementer_id)
+            assert fresh[0].definition_snapshot == _Task8ReviewService()._build_snapshot(implementer)
+            assert fresh[0].approved_for_work_functions == ["implementation"]
+            assert str(fresh[0].id) in outputs["review_ids"]
+    assert flow.receipt.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_recovery_acceptance_cancels_obsolete_pending_definition_decisions(sessions, tmp_path, monkeypatch):
+    seeded = await cfg_seed_spr180(sessions, tmp_path, mode="update")
+    async with sessions() as s:
+        definition_run = await cfg_current(s, seeded.goal_id, "agent_definition_review")
+        obsolete = await OrchestrationAuthorityDecisionService().create_pending(
+            s, seeded.goal_id, decision_key=f"agent_definition_review:proposal:{seeded.planner_id}",
+            title="Review proposed definition", question="Approve, reject, or edit?", authority="human",
+            options=["approve", "reject", "edit"], run_id=seeded.run_id, source_process_run_id=definition_run.id,
+        )
+        await s.commit()
+    cfg_arm_semantic_guard(monkeypatch)
+    await cfg_applied_flow(sessions, seeded)
+    async with sessions() as s:
+        assert (await s.get(OrchestrationAuthorityDecision, obsolete.id)).status == "cancelled"
+        assert await cfg_pending_review_decisions(s, seeded.goal_id) == []
+        assert (await cfg_current(s, seeded.goal_id, "agent_definition_review")).trigger_reason == "approved_recovery"
+
+
+@pytest.mark.asyncio
+async def test_definition_persist_recovery_acceptance_rejects_untyped_payload_without_writes(
+    sessions, tmp_path, monkeypatch
+):
+    seeded = await cfg_seed_spr180(sessions, tmp_path)
+    cfg_arm_semantic_guard(monkeypatch)
+    flow = await cfg_approved_flow(sessions, seeded)
+    before = await cfg_fresh_snapshot(sessions, seeded.goal_id)
+    async with sessions() as s:
+        proposal, _call, _wrapper, authority = await cfg_load_flow(s, flow)
+        proposal_action = await s.get(OrchestrationAction, flow.proposal_action_id)
+        goal = await s.get(OrchestrationGoal, seeded.goal_id)
+        run = await s.get(OrchestrationRun, seeded.run_id)
+        with pytest.raises(Exception) as raised:
+            await AgentDefinitionReviewProcess().persist_recovery_acceptance(
+                s, goal, run, accepted_payload={"eligibility": "everyone", "unexpected": True},
+                proposal_id=proposal.proposal_id, proposal_hash=proposal_action.dispatch_contract["proposal_hash"],
+                authority_decision_id=authority.id, evidence=tuple(proposal.evidence),
+            )
+        assert not isinstance(raised.value, AttributeError), raised.value
+        try:
+            await s.commit()  # anything written before validation would now become visible
+        except Exception:  # noqa: BLE001
+            await s.rollback()
+    assert await cfg_fresh_snapshot(sessions, seeded.goal_id) == before

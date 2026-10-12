@@ -14,6 +14,7 @@ from pydantic_core import PydanticCustomError
 
 from huddleroom.config import settings
 from huddleroom.schemas.agent import AgentCreate
+from huddleroom.schemas.orchestration_recovery import RecoveryProposalResponse
 
 
 ROADMAP_BUDGET_DIMENSIONS = frozenset({"max_tokens", "max_turns", "max_hours"})
@@ -1393,6 +1394,7 @@ class OrchestrationAuthorityDecisionResponse(BaseModel):
     decided_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    recovery: RecoveryProposalResponse | None = None
 
 
 class OrchestrationDecisionAnswerResponse(BaseModel):

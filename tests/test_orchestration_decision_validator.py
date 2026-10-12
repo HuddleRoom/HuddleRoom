@@ -760,3 +760,59 @@ def test_create_delegation_task_unknown_key_still_rejected():
 )
 def test_create_delegation_task_null_optional_fields_are_treated_as_absent(key):
     assert validate_orchestration_decision({**ALLOWED_DECISIONS["create_delegation_task"], key: None}).accepted is True
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: strict, non-mutating ``recover_blocker`` decision.
+# ---------------------------------------------------------------------------
+
+_RECOVER_BLOCKER = {
+    "action_type": "recover_blocker",
+    "reason": "No accepted agent can author the plan, so planning cannot start.",
+    "evidence_refs": [{"kind": "process", "id": _id()}, {"kind": "decision", "id": _id()}],
+}
+
+
+@pytest.mark.parametrize("kind", ["action", "task", "gate", "process", "decision", "warning"])
+def test_recover_blocker_accepts_reason_and_typed_evidence_refs(kind):
+    result = validate_orchestration_decision({**_RECOVER_BLOCKER, "evidence_refs": [{"kind": kind, "id": _id()}]})
+
+    assert result.accepted is True, result.rejection_reason
+
+
+@pytest.mark.parametrize("missing", ["reason", "evidence_refs"])
+def test_recover_blocker_requires_reason_and_evidence_refs(missing):
+    decision = {key: value for key, value in _RECOVER_BLOCKER.items() if key != missing}
+
+    result = validate_orchestration_decision(decision)
+
+    assert result.accepted is False
+    assert missing in result.rejection_reason
+
+
+@pytest.mark.parametrize("mutation_key", [
+    "calls", "proposal", "agent_id", "task_id", "work_function", "wake_when", "fix", "arguments",
+])
+def test_recover_blocker_cannot_carry_a_proposed_mutation(mutation_key):
+    """The decision records the observed blocker only; the server builds any remedy."""
+    result = validate_orchestration_decision({**_RECOVER_BLOCKER, mutation_key: {"anything": "goes"}})
+
+    assert result.accepted is False
+    assert mutation_key in result.rejection_reason
+
+
+@pytest.mark.parametrize("evidence_refs", [
+    "process:123",
+    [{"kind": "run", "id": _id()}],  # run is not an allowed evidence ref kind
+    [{"kind": "agent", "id": _id()}],
+    [{"kind": "task", "id": "not-a-uuid"}],
+    [{"kind": "task"}],
+    [{"id": _id()}],
+    [{"kind": "task", "id": _id(), "note": "extra"}],
+    ["task"],
+])
+def test_recover_blocker_evidence_refs_are_strictly_typed(evidence_refs):
+    result = validate_orchestration_decision({**_RECOVER_BLOCKER, "evidence_refs": evidence_refs})
+
+    assert result.accepted is False
+    assert "evidence_refs" in result.rejection_reason

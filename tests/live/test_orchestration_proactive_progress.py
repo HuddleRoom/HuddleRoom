@@ -726,8 +726,7 @@ async def _seed_exhausted_failed_task(env, seed, title="Implement slice 1"):
         await s.flush()
         s.add(Session(project_id=seed.project_id, task_id=failed.id, agent_id=seed.dev, adapter_type="api", status="failed",
                       output="Provider quota exhausted while running the task.", metadata_={}, origin="auto"))
-        suffix = await OrchestrationService()._task_recovery_attempt_suffix(s, seed.run_id, failed.id)
-        s.add(OrchestrationAction(run_id=seed.run_id, idempotency_key=f"run:{seed.run_id}:kind:retry_task:task:{failed.id}{suffix}",
+        s.add(OrchestrationAction(run_id=seed.run_id, idempotency_key=f"run:{seed.run_id}:kind:retry_task:task:{failed.id}",
                                   action_type="retry_task", request={"action_type": "retry_task", "task_id": str(failed.id)}, status="completed"))
         await s.commit()
         return failed.id

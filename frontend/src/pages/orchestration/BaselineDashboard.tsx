@@ -34,7 +34,7 @@ import type {
 import { BASELINE_PROCESS_TYPES, processLabel, statusPhrase } from './humanize'
 import { frontierProcessType, isTerminalProcess, ProcessChain } from './ProcessChain'
 import { ProcessFocus } from './ProcessFocus'
-import { NeedsYouQueue } from './NeedsYouQueue'
+import { NeedsYouQueue, type RecoveryAnswerOption } from './NeedsYouQueue'
 import { useGoalAnnouncer } from './goalAnnouncer'
 import { hierarchyAgentResolver } from './hierarchyAgentNames'
 
@@ -775,6 +775,34 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
     })
   }
 
+  function answerRecoveryProposal(
+    decision: OrchestrationAuthorityDecisionRecord,
+    option: RecoveryAnswerOption,
+    reason: string,
+    callbacks: { onSuccess: () => void; onError: (error: unknown) => void; onSettled: () => void },
+  ) {
+    const owner: BaselineMutationOwner = `baseline:answer:${decision.id}`
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) { callbacks.onSettled(); return }
+    setFormError(null)
+    setFormErrorSource(null)
+    answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, selectedOption: option, reason }, {
+      onSuccess: () => {
+        if (!isCurrent()) return
+        onMessage(option === 'approve_fix' ? 'Fix approved.' : option === 'reject' ? 'Fix rejected.' : 'Marked as provided. Re-diagnosing the blocker…')
+        callbacks.onSuccess()
+      },
+      onError: (error) => {
+        if (!isCurrent()) return
+        callbacks.onError(error)
+      },
+      onSettled: () => {
+        if (isCurrent()) releaseMutation(owner)
+        callbacks.onSettled()
+      },
+    })
+  }
+
   function submitAgentDefinitionReviewBatch(answers: AgentDefinitionReviewBatchAnswerInput[], onSuccessFocus?: () => void) {
     const owner: BaselineMutationOwner = 'baseline:answer:agent-definition-review-batch'
     const isCurrent = beginMutation(owner)
@@ -957,7 +985,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, mutatio
     {processState === 'ready' && <>
       <NeedsYouQueue
         goal={goal} run={run} processes={processes} warnings={warnings} gates={gates}
-        checkpointItems={checkpointItems} checkpointLoaded={dashboard.checkpoint.isSuccess}
+        checkpointItems={checkpointItems} recoveryDecisions={decisions} onAnswerRecoveryProposal={answerRecoveryProposal} checkpointLoaded={dashboard.checkpoint.isSuccess}
         queriesErrored={queueQueriesErrored} queriesUnready={queueQueriesUnready}
         deferredCount={deferredCount} isWorking={isWorking}
         mutationBusy={mutationBusy} onSelectProcess={setSelectedProcessType}

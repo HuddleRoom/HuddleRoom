@@ -6,7 +6,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.base import _utcnow
-from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import WARNING_SEVERITIES, OrchestrationWarning
 from huddleroom.services.orchestration_linkage import check_goal_linkage
 
@@ -83,7 +83,11 @@ class OrchestrationWarningService:
         related_agent_id: uuid.UUID | None = None,
         source_agent_review_id: uuid.UUID | None = None,
         related_authority_decision_id: uuid.UUID | None = None,
+        cross_goal_recovery_action: bool = False,
     ) -> OrchestrationWarning:
+        """``cross_goal_recovery_action`` is the one sanctioned exception to the
+        same-goal linkage rule: a collateral roster-invalidation warning may name
+        another goal's ``recovery_proposal`` action as its provenance."""
         if severity not in WARNING_SEVERITIES:
             raise ValueError(f"unknown severity: {severity!r}")
         if severity == "blocker" and run_id is None:
@@ -104,13 +108,19 @@ class OrchestrationWarningService:
                 .where(OrchestrationGoal.id == goal_id)
                 .with_for_update()
             )
+        linked_action_id = related_action_id
+        if cross_goal_recovery_action:
+            action = await db.get(OrchestrationAction, related_action_id) if related_action_id else None
+            if action is None or action.action_type != "recovery_proposal":
+                raise ValueError("cross-goal warning provenance must be a recovery_proposal action")
+            linked_action_id = None
         await check_goal_linkage(
             db,
             goal_id,
             run_id=run_id,
             source_process_run_id=source_process_run_id,
             related_gate_id=related_gate_id,
-            related_action_id=related_action_id,
+            related_action_id=linked_action_id,
             source_agent_review_id=source_agent_review_id,
             related_authority_decision_id=related_authority_decision_id,
         )

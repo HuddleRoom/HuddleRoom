@@ -27,8 +27,14 @@ def _fake_db_seams(request, monkeypatch):
     async def same_key(self, _db, _run_id, key, *_a):
         return key, None
 
+    async def ordinary(self, _db, _run, _action_type, _request, *, source):
+        from huddleroom.schemas.orchestration_recovery import CorrectiveDisposition
+        return CorrectiveDisposition.ORDINARY
+
     monkeypatch.setattr(OrchestrationDecisionDispatcher, "_savepoint", staticmethod(lambda _db: nullcontext()))
     monkeypatch.setattr(OrchestrationDecisionDispatcher, "_attempt_key", same_key)
+    # the corrective classifier reads durable state; fake-db routing tests keep healthy work ordinary.
+    monkeypatch.setattr(OrchestrationService, "classify_corrective_action", ordinary, raising=False)
 
 
 @pytest.mark.asyncio
@@ -648,3 +654,53 @@ async def test_dispatch_invalid_depends_on_records_failed_action_without_raising
     rows = await db_session.scalar(select(count(OrchestrationAction.id)).where(
         OrchestrationAction.run_id == run_id, OrchestrationAction.status == "failed"))
     assert rows == 1
+
+
+# --------------------------------------------------------------------------- corrective classifier wiring
+
+
+async def test_dispatcher_classifies_through_its_injected_service_and_keeps_healthy_work_ordinary(
+    db_session, test_project, safe_effectiveness_review_continue,
+):
+    from huddleroom.schemas.orchestration_recovery import CorrectiveDisposition
+
+    service, _goal, run, gate = await _verifiable_gate(db_session, test_project)
+    real = service.classify_corrective_action
+    service.classify_corrective_action = AsyncMock(side_effect=real)
+
+    action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, _verify_decision(gate))
+
+    request = service.canonical_decision_request(
+        "request_verification", _verify_decision(gate).parsed_decision, run_id=run.id,
+    )
+    service.classify_corrective_action.assert_awaited_once_with(
+        db_session, run, "request_verification", request, source=ANY,
+    )
+    assert await real(db_session, run, "request_verification", request, source="model") == (
+        CorrectiveDisposition.ORDINARY
+    )
+    # Ordinary behavior unchanged: same executor result and legacy run/type/request identity.
+    assert action.status == "completed"
+    assert action.idempotency_key == OrchestrationDecisionDispatcher.action_key(run.id, "request_verification", request)
+
+
+def test_classifier_wiring_adds_no_reverse_top_level_import():
+    """Dispatcher reaches the classifier through its injected service; neither module imports the other at top level."""
+    import ast
+    from pathlib import Path
+
+    import huddleroom.services.orchestration_decision_dispatcher as dispatcher_module
+    import huddleroom.services.orchestration_service as service_module
+
+    def top_level_imports(module):
+        tree = ast.parse(Path(module.__file__).read_text())
+        names = set()
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module)
+            elif isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+        return names
+
+    assert "huddleroom.services.orchestration_service" not in top_level_imports(dispatcher_module)
+    assert "huddleroom.services.orchestration_decision_dispatcher" not in top_level_imports(service_module)

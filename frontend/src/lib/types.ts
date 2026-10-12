@@ -898,7 +898,29 @@ export interface OrchestrationWarningRecord {
   updated_at: string
 }
 
+export type RecoveryProposalStatus =
+  | 'pending_approval' | 'applying' | 'verifying' | 'retrying' | 'resolved' | 'rejected' | 'failed' | 'unsupported'
+
+// Mirrors huddleroom/schemas/orchestration_recovery.py RecoveryProposalResponse.
+export interface RecoveryProposalRecord {
+  kind: 'recovery_proposal_v1'
+  proposal_id: string
+  version: number
+  status: RecoveryProposalStatus
+  problem: string
+  general_updates: string[]
+  after_approval: string
+  global_effect: boolean
+  exact_details: Record<string, unknown> | null
+  evidence: Array<{ label: string; value: unknown; source_kind: string; source_id: string }> | null
+  error: string | null
+  source_blocker_id: string | null
+  source_action_id: string | null
+  source_decision_id: string | null
+}
+
 export interface OrchestrationAuthorityDecisionRecord {
+  recovery?: RecoveryProposalRecord | null
   id: string
   goal_id: string
   run_id: string | null

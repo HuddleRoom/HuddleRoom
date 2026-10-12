@@ -16,6 +16,21 @@ from tests.test_orchestration_act_until_wait import _setup
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
 
 
+@pytest.fixture
+def dispatch_without_corrective_interception(monkeypatch):
+    """retry_task/reassign_task are always corrective, so ordinary model dispatch now turns them into a
+    recovery trigger (pinned below). These SPR #148/#144 tests use them only as a vehicle for the dispatcher's
+    generic 4xx/attempt-key/cap/savepoint semantics -- the same executor path an approved recovery dispatch
+    runs -- so they classify the dispatch as ordinary."""
+    from huddleroom.schemas.orchestration_recovery import CorrectiveDisposition
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    async def ordinary(*_args, **_kwargs):
+        return CorrectiveDisposition.ORDINARY
+
+    monkeypatch.setattr(OrchestrationService, "classify_corrective_action", ordinary)
+
+
 def test_record_warning_severity_validated():
     base = {"action_type": "record_warning", "warning_type": "x", "message": "m"}
     bad = validate_orchestration_decision({**base, "severity": "high"})
@@ -45,6 +60,7 @@ async def _task_in(db, project, run, status, agent=None):
 
 
 @pytest.mark.parametrize("action_type", ["retry_task", "reassign_task"])
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_dispatch_4xx_failed_action_is_returned_and_rechecked(db_session, test_project, action_type):
     _goal, run = await _setup(db_session, test_project)
     task, agent = await _task_in(db_session, test_project, run, "backlog" if action_type == "retry_task" else "in_progress")
@@ -67,6 +83,7 @@ async def test_dispatch_4xx_failed_action_is_returned_and_rechecked(db_session, 
     assert len(await _actions(db_session, run.id, action_type)) == 2
 
 
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_tick_style_dispatch_creates_backstop_wait_and_one_iteration(db_session, test_project, monkeypatch):
     goal, run = await _setup(db_session, test_project)
     task, _ = await _task_in(db_session, test_project, run, "backlog")
@@ -114,6 +131,7 @@ async def test_invalid_record_warning_becomes_noop_backstop(db_session, test_pro
         OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"))).all()) == 1
 
 
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_5xx_and_non_http_still_propagate(db_session, test_project):
     _goal, run = await _setup(db_session, test_project)
     task, _ = await _task_in(db_session, test_project, run, "backlog")
@@ -147,29 +165,6 @@ async def test_5xx_and_non_http_still_propagate(db_session, test_project):
     assert (await dispatcher.dispatch(db_session, run, decision)).status == "failed"
 
 
-async def test_diagnose_keeps_failed_retry_row_and_asks_owner(db_session, test_project, monkeypatch):
-    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="stuck")
-    db_session.add(Session(
-        agent_id=agent.id, task_id=task.id, project_id=task.project_id, adapter_type="api",
-        status="failed", input_context={}, metadata_={}, origin="auto",
-    ))
-    await db_session.flush()
-
-    async def busy(*_a, **_k):
-        return True
-
-    monkeypatch.setattr(service, "_task_has_active_session", busy)
-
-    assert await service._diagnose_blocked_task(db_session, goal, run, task, None) is None
-    rows = await _actions(db_session, run.id, "retry_task")
-    assert len(rows) == 1 and rows[0].status == "failed"
-    assert await service._diagnose_blocked_task(db_session, goal, run, task, None) is None
-    assert len(await _actions(db_session, run.id, "retry_task")) == 1
-
-    await service.recover_run(db_session, run.id, baseline_ready=True)
-    assert len(await _actions(db_session, run.id, "ask_human")) == 1
-
-
 def test_unhashable_severity_rejected_without_typeerror():
     base = {"action_type": "record_warning", "warning_type": "x", "message": "m"}
     for sev in (["warning"], {"a": 1}):
@@ -196,6 +191,7 @@ async def _patch_run_4xx(monkeypatch, service, marker):
 
 
 @pytest.mark.parametrize("action_type", ["retry_task", "reassign_task"])
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_run_4xx_discards_budget_and_task_metadata_but_keeps_failed_action(
     db_session, test_project, monkeypatch, action_type,
 ):
@@ -225,6 +221,7 @@ async def test_run_4xx_discards_budget_and_task_metadata_but_keeps_failed_action
     assert len(await _actions(db_session, run.id, action_type)) == 1
 
 
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_rejected_decision_is_retried_with_new_attempt_key(db_session, test_project, monkeypatch):
     from huddleroom.models.session import Session
     from huddleroom.services.orchestration_service import OrchestrationService
@@ -321,39 +318,6 @@ async def test_completed_then_failed_iteration_stops_cleanly(db_session, test_pr
     assert calls["n"] == 2 and len(result["action_ids"]) == 2
 
 
-async def test_diagnose_non_http_error_propagates(db_session, test_project, monkeypatch):
-    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="stuck")
-    db_session.add(Session(
-        agent_id=agent.id, task_id=task.id, project_id=task.project_id, adapter_type="api",
-        status="failed", input_context={}, metadata_={}, origin="auto",
-    ))
-    await db_session.flush()
-
-    async def boom(*_a, **_k):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(service, "execute_retry_task_action", boom)
-    with pytest.raises(RuntimeError):
-        await service._diagnose_blocked_task(db_session, goal, run, task, None)
-
-
-async def test_diagnose_4xx_discards_executor_work_but_keeps_failed_row(db_session, test_project, monkeypatch):
-    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="stuck")
-    db_session.add(Session(
-        agent_id=agent.id, task_id=task.id, project_id=task.project_id, adapter_type="api",
-        status="failed", input_context={}, metadata_={"attempt": {"effect_state": "started"}}, origin="auto",
-    ))
-    await db_session.flush()
-    await _patch_run_4xx(monkeypatch, service, "x")
-
-    assert await service._diagnose_blocked_task(db_session, goal, run, task, None) is None
-
-    await db_session.refresh(run)
-    assert "leaked_budget" not in (run.plan_state or {})
-    rows = await _actions(db_session, run.id, "retry_task")
-    assert len(rows) == 1 and rows[0].status == "failed" and rows[0].error == "cannot run"
-
-
 # ---- second review ----
 
 async def test_budget_wait_keeps_state_written_before_it_was_raised(db_session, test_project):
@@ -380,6 +344,7 @@ async def test_budget_wait_keeps_state_written_before_it_was_raised(db_session, 
     assert len(pending) == 1 and pending[0].status == "pending"
 
 
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_4xx_rollback_drops_queued_bus_events_and_dispatches(db_session, test_project, monkeypatch):
     from huddleroom.services.orchestration_service import OrchestrationService
     from huddleroom.services.task_service import TaskService
@@ -424,6 +389,7 @@ async def test_steering_versions_changed_keeps_failed_row(db_session, test_proje
     assert [(r.status, r.error) for r in rows] == [("failed", "stale_steering_versions")]
 
 
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_rejection_attempts_are_capped(db_session, test_project):
     from huddleroom.services.orchestration_service import OrchestrationService
     _goal, run = await _setup(db_session, test_project)
@@ -435,26 +401,7 @@ async def test_rejection_attempts_are_capped(db_session, test_project):
     assert seen[3].id == seen[4].id == seen[2].id and seen[4].status == "failed"
 
 
-async def test_diagnose_budget_wait_keeps_state(db_session, test_project, monkeypatch):
-    from tests.test_orchestration_progress_view import _authority_decision
-    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
-    service, goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="stuck")
-    db_session.add(Session(
-        agent_id=agent.id, task_id=task.id, project_id=task.project_id, adapter_type="api",
-        status="failed", input_context={}, metadata_={}, origin="auto",
-    ))
-    await db_session.flush()
-
-    async def pend_then_wait(db, *_a, **_k):
-        await _authority_decision(db, goal, run, None, status="pending")
-        raise HTTPException(status_code=409, detail="budget_wait")
-
-    monkeypatch.setattr(service, "execute_retry_task_action", pend_then_wait)
-    assert await service._diagnose_blocked_task(db_session, goal, run, task, None) is None
-    assert len((await db_session.scalars(select(OrchestrationAuthorityDecision).where(
-        OrchestrationAuthorityDecision.run_id == run.id))).all()) == 1
-
-
+@pytest.mark.usefixtures("dispatch_without_corrective_interception")
 async def test_rejection_cap_resets_after_other_progress(db_session, test_project, monkeypatch):
     from huddleroom.models.session import Session
     from huddleroom.services.orchestration_service import OrchestrationService
@@ -495,3 +442,66 @@ async def test_attempt_prefix_match_uses_delimiter(db_session, test_project):
     await db_session.flush()
     key, capped = await dispatcher._attempt_key(db_session, run.id, base, uuid.uuid4(), False)
     assert capped is None and key == base + ":rejected:1"
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: ordinary model dispatch cannot apply a corrective fix after a
+# durable failure; it creates one idempotent recovery trigger and mutates nothing.
+# ---------------------------------------------------------------------------
+
+
+async def _failed_task_with_session(db, project, run):
+    task, agent = await _task_in(db, project, run, "failed")
+    db.add(Session(agent_id=agent.id, task_id=task.id, project_id=project.id, adapter_type="api", status="failed",
+                   input_context={}, metadata_={}, origin="auto"))
+    await db.flush()
+    return task, agent
+
+
+async def _durable_state(db, task):
+    from sqlalchemy import func
+    from huddleroom.models.task import Task
+
+    await db.refresh(task)
+    sessions = await db.scalar(select(func.count(Session.id)).where(Session.task_id == task.id))
+    tasks = await db.scalar(select(func.count(Task.id)))
+    return task.status, task.assigned_to, sessions, tasks
+
+
+@pytest.mark.parametrize("action_type", ["retry_task", "reassign_task", "replacement_delegation"])
+async def test_model_corrective_action_after_durable_failure_creates_one_trigger(
+    db_session, test_project, monkeypatch, action_type,
+):
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_basic_recovery import _fake_task_run
+
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+    _goal, run = await _setup(db_session, test_project)
+    task, agent = await _failed_task_with_session(db_session, test_project, run)
+    other = _agent("dev2", "developer", ["implementation"])
+    db_session.add(other)
+    await db_session.flush()
+    parsed = {
+        "retry_task": {"action_type": "retry_task", "task_id": str(task.id)},
+        "reassign_task": {"action_type": "reassign_task", "task_id": str(task.id), "agent_id": str(other.id)},
+        "replacement_delegation": {
+            "action_type": "create_delegation_task", "agent_id": str(other.id), "work_function": "implementation",
+            "scope": "Redo the failed implementation.", "deliverable": "A working patch.",
+            "parent_task_id": str(task.id),
+        },
+    }[action_type]
+    decision = await _decision(db_session, run, parsed)
+    before = await _durable_state(db_session, task)
+    dispatcher = OrchestrationDecisionDispatcher(OrchestrationService())
+
+    await dispatcher.dispatch(db_session, run, decision)
+    await dispatcher.dispatch(db_session, run, decision)  # replay
+
+    effect_type = "create_delegation_task" if action_type == "replacement_delegation" else action_type
+    assert [a for a in await _actions(db_session, run.id, effect_type) if a.status == "completed"] == []
+    assert calls == []
+    assert await _durable_state(db_session, task) == before
+    recovery_triggers = await _actions(db_session, run.id, "recovery_trigger")
+    assert len(recovery_triggers) == 1
+    assert recovery_triggers[0].request["run_id"] == str(run.id)

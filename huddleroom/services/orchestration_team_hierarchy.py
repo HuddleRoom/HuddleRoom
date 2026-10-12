@@ -5,7 +5,9 @@ import hashlib
 import json
 import re
 import uuid
+from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +20,7 @@ from huddleroom.models.orchestration_process import (
 )
 from huddleroom.models.user import User
 from huddleroom.schemas.agent import AgentCreate
+from huddleroom.schemas.orchestration_recovery import EvidenceV1, _AssignmentV1
 from huddleroom.services.agent_service import AgentService
 from huddleroom.services.orchestration_agent_review_service import OrchestrationAgentReviewService
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
@@ -227,6 +230,127 @@ def infer_required_work_functions(goal: OrchestrationGoal) -> list[str]:
     if not required.intersection(_SPECIALIST_FUNCTIONS):
         required.add("implementation")
     return [name for name in WORK_FUNCTION_ORDER if name in required]
+
+
+RECOVERY_TRIGGER_REASON = "approved_recovery"
+RECOVERY_APPROVAL = "approved_recovery"
+NO_INDEPENDENT_VERIFIER_GAP = "no_independent_verifier"
+# Registered recovery gap codes: one uncovered required work function, or an
+# independent-verification override -- the gaps the hierarchy already permits.
+RECOVERY_GAP_CODES = frozenset((*WORK_FUNCTION_ORDER, NO_INDEPENDENT_VERIFIER_GAP))
+_MEMBER_KEYS = ("team_leads", "contributors", "reviewers", "validators", "specialists")
+
+
+class _RecoveryStrict(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _RecoveryAssignment(_RecoveryStrict):
+    work_function: str
+    agent_id: uuid.UUID
+
+    @field_validator("work_function")
+    @classmethod
+    def _function(cls, value: str) -> str:
+        return _AssignmentV1._function(value)  # pylint: disable=protected-access
+
+
+class _RecoveryManager(_RecoveryStrict):
+    kind: Literal["agent", "human", "none"]
+    agent_id: uuid.UUID | None = None
+    user_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> "_RecoveryManager":
+        if (self.agent_id is not None) != (self.kind == "agent") or (self.user_id is not None) != (self.kind == "human"):
+            raise ValueError("manager reference does not match its kind")
+        return self
+
+
+class _RecoveryGap(_RecoveryStrict):
+    code: str = Field(min_length=1, max_length=255)
+    rationale: str = Field(min_length=1, max_length=4_000)
+
+
+class RecoveryHierarchyAcceptanceV1(_RecoveryStrict):
+    """Typed input of the recovery-sourced team_hierarchy snapshot."""
+
+    call_id: str = Field(min_length=1, max_length=100)
+    canonical_request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    assignments: list[_RecoveryAssignment] = Field(min_length=1, max_length=128)
+    manager: _RecoveryManager
+    team_leads: list[uuid.UUID] = Field(max_length=128)
+    contributors: list[uuid.UUID] = Field(max_length=128)
+    reviewers: list[uuid.UUID] = Field(max_length=128)
+    validators: list[uuid.UUID] = Field(max_length=128)
+    specialists: list[uuid.UUID] = Field(max_length=128)
+    documented_gaps: list[_RecoveryGap] = Field(max_length=128)
+
+
+def recovery_manager_matches(goal: OrchestrationGoal, manager: dict) -> bool:
+    """Recovery v1 keeps the selected manager: the sealed roster fingerprints assume it."""
+    kind = manager.get("kind")
+    if kind == "agent":
+        return goal.manager_agent_id is not None and str(goal.manager_agent_id) == str(manager.get("agent_id"))
+    if kind == "human":
+        return (goal.manager_agent_id is None and goal.manager_user_id is not None
+                and str(goal.manager_user_id) == str(manager.get("user_id")))
+    return kind == "none" and goal.manager_agent_id is None and goal.manager_user_id is None
+
+
+def derive_recovery_hierarchy(
+    goal: OrchestrationGoal,
+    role_to_agent: dict[str, str],
+    eligibility: dict[str, list[str]],
+    members: dict[str, list[str]],
+    documented_gaps: list[dict],
+) -> dict:
+    """Validate an approved recovery hierarchy and derive its server-side fields.
+
+    Assignments use only agents accepted for that function; required functions are
+    covered or documented by a registered gap; producer/verifier independence holds
+    or is explicitly overridden; role membership matches the assignments.
+    """
+    for work_function, agent_id in role_to_agent.items():
+        if work_function not in eligibility.get(agent_id, []):
+            raise ValueError("unapproved_assignment")
+    required = infer_required_work_functions(goal)
+    missing = [work_function for work_function in required if work_function not in role_to_agent]
+    independent_functions = TeamHierarchyProcess._independent_functions(goal)  # pylint: disable=protected-access
+    producers = {agent_id for work_function, agent_id in role_to_agent.items() if work_function not in _VERIFIER_FUNCTIONS}
+    possible = all(
+        work_function in role_to_agent
+        and TeamHierarchyProcess._independent_of(role_to_agent[work_function], producers, goal)  # pylint: disable=protected-access
+        for work_function in independent_functions
+    )
+    codes = [gap["code"] for gap in documented_gaps]
+    permitted = set(missing) | (set() if possible else {NO_INDEPENDENT_VERIFIER_GAP})
+    if len(set(codes)) != len(codes) or not set(codes) <= RECOVERY_GAP_CODES or not set(codes) <= permitted:
+        raise ValueError("invalid_documented_gap")
+    if not possible and NO_INDEPENDENT_VERIFIER_GAP not in codes:
+        raise ValueError("independent_verification_conflict")
+    if permitted - set(codes):
+        raise ValueError("undocumented_gap")
+    derived = TeamHierarchyProcess._hierarchy(goal, role_to_agent)  # pylint: disable=protected-access
+    for key in _MEMBER_KEYS:
+        values = members[key]
+        if len(set(values)) != len(values):
+            raise ValueError("hierarchy_mismatch")
+        if key in {"team_leads", "specialists"}:
+            if any(value not in eligibility for value in values):
+                raise ValueError("hierarchy_mismatch")
+        elif set(values) != set(derived[key]):
+            raise ValueError("hierarchy_mismatch")
+    independent = TeamHierarchyProcess._independent_verification(  # pylint: disable=protected-access
+        independent_functions, role_to_agent,
+    )
+    return {
+        "required_work_functions": required,
+        "missing_work_functions": missing,
+        "independent_verification": {**independent, "possible": possible},
+        "responsibility_conflicts": TeamHierarchyProcess._responsibility_conflicts(role_to_agent),  # pylint: disable=protected-access
+        "hierarchy": {"manager": TeamHierarchyProcess._manager(goal), **{key: list(members[key]) for key in _MEMBER_KEYS}},  # pylint: disable=protected-access
+    }
 
 
 class TeamHierarchyProcess:
@@ -516,6 +640,21 @@ class TeamHierarchyProcess:
     ) -> dict:
         payload = await self._analysis_input(db, goal)
         input_fingerprint = self._semantic_fingerprint(self._strip_volatile(payload))
+        if current is not None and current.status in {"running", "waiting_decision"}:
+            reserved = await self._apply_reserved_agents(db, goal, run, current)
+            snapshot = current.input_snapshot or {}
+            unstamped = reserved - set(snapshot.get("stamped_agent_ids") or ())
+            if unstamped and snapshot.get("fingerprint") != input_fingerprint and snapshot.get(
+                "fingerprint"
+            ) == self._semantic_fingerprint(self._strip_volatile({**payload, "agents": [
+                agent for agent in payload["agents"] if agent["id"] not in unstamped
+            ]})):
+                # The only drift is the agents this process's approvals created
+                # roster-first after the goal lock was released: re-stamp.
+                current.input_snapshot = {
+                    **snapshot, "fingerprint": input_fingerprint, "stamped_agent_ids": sorted(reserved),
+                }
+                await db.flush()
         if current is not None and current.status == "completed" and current.process_version != PROCESS_VERSION:
             # A PROCESS_VERSION bump absorbs a fingerprint-*formula* change
             # (dropping provider/model/adapter_type/cli_runtime/config from
@@ -545,7 +684,7 @@ class TeamHierarchyProcess:
         if (
             current is not None and current.status == "completed"
             and current.input_snapshot.get("fingerprint") == input_fingerprint
-            and current.outputs.get("approval") in {"approve", "approve_with_documented_gaps"}
+            and current.outputs.get("approval") in {"approve", "approve_with_documented_gaps", RECOVERY_APPROVAL}
         ):
             return self._summary("completed")
         if current is not None and current.status == "completed":
@@ -666,9 +805,9 @@ class TeamHierarchyProcess:
             metadata = self._decision_metadata(decision.reason)
             created_id = metadata.get("created_agent_id")
             if created_id is None:
-                proposal = proposal_by_key[decision.decision_key]
-                agent = await self.agent_service.create(db, AgentCreate(**proposal["definition"]))
-                created_id = str(agent.id)
+                # Reserve the id under the goal lock; the row is created roster-first.
+                AgentService.validate_create(AgentCreate(**proposal_by_key[decision.decision_key]["definition"]))
+                created_id = str(uuid.uuid4())
                 metadata["created_agent_id"] = created_id
                 await db.execute(update(OrchestrationAuthorityDecision).where(
                     OrchestrationAuthorityDecision.id == decision.id
@@ -677,8 +816,10 @@ class TeamHierarchyProcess:
             created_by_ref[f"proposal:{decision.decision_key.rsplit(':', 1)[-1]}"] = created_id
 
         if created_by_ref:
+            await self._apply_reserved_agents(db, goal, run, current)
             current.input_snapshot = {
-                "fingerprint": self._semantic_fingerprint(self._strip_volatile(await self._analysis_input(db, goal)))
+                "fingerprint": self._semantic_fingerprint(self._strip_volatile(await self._analysis_input(db, goal))),
+                "stamped_agent_ids": sorted(created_by_ref.values()),
             }
 
         if len(proposal_decisions) == len(proposal_by_key) and all(
@@ -786,6 +927,56 @@ class TeamHierarchyProcess:
                 questions_created += 1
         await self.process_service.park_process(db, current)
         return self._summary("waiting_decision", questions_created)
+
+    async def _apply_reserved_agents(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, current: OrchestrationProcessRun,
+    ) -> set[str]:
+        """Create reserved-but-missing approved agents roster-first; return reserved ids.
+
+        Approve/edit answers record ``created_agent_id`` under the goal lock. The
+        row is written by the roster coordinator (handoff), so a crash or stale
+        apply leaves a reservation this method reconstructs idempotently.
+        """
+        from huddleroom.services.agent_service import hand_off_roster_delta
+        from huddleroom.services.orchestration_roster_mutation import ValidatedRosterDelta
+
+        analysis = current.outputs.get("analysis") if isinstance(current.outputs, dict) else None
+        proposals = {
+            f"team_hierarchy:agent:{proposal['proposal_id']}": proposal
+            for proposal in (analysis or {}).get("proposed_agents", [])
+        }
+        reserved, missing, decision_ids = set(), [], []
+        for decision in await self.decision_service.list_decisions(db, goal.id):
+            if (
+                decision.source_process_run_id != current.id
+                or not decision.decision_key.startswith("team_hierarchy:agent:")
+                or decision.status != "answered"
+                or decision.selected_option not in {"approve", "edit"}
+            ):
+                continue
+            metadata = self._decision_metadata(decision.reason)
+            created_id = metadata.get("created_agent_id")
+            if not isinstance(created_id, str):
+                continue
+            reserved.add(created_id)
+            if await db.get(Agent, uuid.UUID(created_id)) is not None:
+                continue
+            definition = (
+                metadata.get("edited_agent") if decision.selected_option == "edit"
+                else (proposals.get(decision.decision_key) or {}).get("definition")
+            )
+            if not isinstance(definition, dict):
+                continue  # legacy answer created inline; nothing to reconstruct
+            data = AgentCreate(**definition)
+            AgentService.validate_create(data)
+            missing.append(AgentService.state_from_create(data, uuid.UUID(created_id)))
+            decision_ids.append(decision.id)
+        if missing:
+            await hand_off_roster_delta(
+                db, ValidatedRosterDelta(creates=tuple(missing)), goal_id=goal.id, run_id=run.id,
+                process_id=current.id, decision_ids=decision_ids,
+            )
+        return reserved
 
     @staticmethod
     def _decision_metadata(reason: str | None) -> dict:
@@ -946,6 +1137,139 @@ class TeamHierarchyProcess:
             created_by="orchestrator:team_hierarchy",
         )
 
+    async def persist_recovery_acceptance(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        *,
+        accepted_payload: dict,
+        proposal_id: uuid.UUID,
+        proposal_hash: str,
+        authority_decision_id: uuid.UUID,
+        evidence: tuple[EvidenceV1, ...],
+    ) -> OrchestrationProcessRun:
+        """Write the accepted hierarchy of an approved recovery configuration.
+
+        Derived server-side from the validated assignments against the recovery-sourced
+        definition snapshot of the same proposal; no LM analysis, no waiting_decision,
+        no hierarchy approval card. The caller owns the transaction.
+        """
+        payload = RecoveryHierarchyAcceptanceV1.model_validate(accepted_payload)
+        evidence = tuple(EvidenceV1.model_validate(item) for item in evidence)
+        if goal.weight == "trivial" or run.goal_id != goal.id:
+            raise ValueError("unsupported_recovery_goal")
+        if not recovery_manager_matches(goal, payload.manager.model_dump(mode="json")):
+            raise ValueError("manager_mismatch")
+        provenance = await self.process_service.recovery_provenance(
+            db, goal.id, proposal_id=proposal_id, proposal_hash=proposal_hash,
+            authority_decision_id=authority_decision_id, call_id=payload.call_id,
+            canonical_request_hash=payload.canonical_request_hash,
+        )
+        definition = await self.process_service.get_current(db, goal.id, "agent_definition_review")
+        definition_outputs = (definition.outputs or {}) if definition is not None else {}
+        if (
+            definition is None or definition.status != "completed"
+            or (definition_outputs.get("recovery_provenance") or {}).get("proposal_id") != str(proposal_id)
+            or (definition_outputs.get("recovery_provenance") or {}).get("proposal_hash") != proposal_hash
+        ):
+            raise ValueError("recovery_definition_snapshot_missing")
+        eligibility = definition_outputs.get("eligibility") or {}
+        role_to_agent: dict[str, str] = {}
+        for item in payload.assignments:
+            if item.work_function in role_to_agent:
+                raise ValueError("duplicate_function_assignment")
+            role_to_agent[item.work_function] = str(item.agent_id)
+        members = {key: [str(value) for value in getattr(payload, key)] for key in _MEMBER_KEYS}
+        referenced = set(role_to_agent.values()).union(*members.values())
+        agents = {}
+        for agent_id in sorted(referenced):
+            agent = await db.get(Agent, uuid.UUID(agent_id))
+            if agent is None or not agent.is_active:
+                raise ValueError("inactive_or_unknown_agent")
+            agents[agent_id] = agent
+        documented_gaps = [gap.model_dump(mode="json") for gap in payload.documented_gaps]
+        derived = derive_recovery_hierarchy(goal, role_to_agent, eligibility, members, documented_gaps)
+        previous = await self.process_service.get_current(db, goal.id, PROCESS_TYPE)
+        reporting_lines = (
+            list((previous.outputs or {}).get("reporting_lines", []))
+            if previous is not None and previous.status == "completed" else []
+        )
+
+        # -- writes start here --------------------------------------------------------------
+        fingerprint = hierarchy_fingerprint_from_projection(await self._analysis_input(db, goal), None)
+        current = await self.process_service.start_process(
+            db, goal.id, process_type=PROCESS_TYPE, trigger_reason=RECOVERY_TRIGGER_REASON,
+            run_id=run.id, input_snapshot={"fingerprint": fingerprint},
+            process_version=PROCESS_VERSION, supersede_waiting=True, supersede_running=True,
+        )
+        if current.trigger_reason != RECOVERY_TRIGGER_REASON or current.status != "running":
+            raise ValueError("recovery_snapshot_not_started")
+        for decision in await self.decision_service.list_decisions(db, goal.id, status="pending"):
+            if decision.decision_key.startswith(f"{PROCESS_TYPE}:"):
+                await self.decision_service.cancel_decision(
+                    db, decision, reason="superseded by an approved recovery configuration",
+                )
+        weak_fits = [
+            {"work_function": work_function, "agent_id": agent_id}
+            for work_function, agent_id in role_to_agent.items()
+            if work_function in PROFILES
+            and self.roster_mapper.score_agent_definition(agents[agent_id], work_function).score < WEAK_FIT_THRESHOLD
+        ]
+        proposal = {**derived, "role_to_agent": role_to_agent, "weak_fits": weak_fits}
+        warnings = await self._write_warnings(db, goal, run, current, proposal)
+        overridden = not derived["independent_verification"]["possible"]
+        if overridden:
+            derived["independent_verification"]["overridden_by_decision_id"] = str(authority_decision_id)
+        outputs = {
+            "source_agent_review_process_id": str(definition.id),
+            "review_ids": sorted(str(item) for item in definition_outputs.get("review_ids", [])),
+            "weight": goal.weight,
+            "compressed": goal.weight != "substantial",
+            **derived,
+            "role_to_agent": role_to_agent,
+            "assignments": [{"work_function": item.work_function, "agent_ref": str(item.agent_id)}
+                            for item in payload.assignments],
+            "reporting_lines": reporting_lines,
+            "documented_gaps": documented_gaps,
+            "weak_fits": weak_fits,
+            "suggestions": [],
+            "fingerprint": fingerprint,
+            "approval": RECOVERY_APPROVAL,
+            "approval_decision_id": str(authority_decision_id),
+            "warning_ids": [str(warning.id) for warning in warnings],
+            "gates": self._gates(
+                missing=bool(derived["missing_work_functions"]),
+                possible=bool(derived["independent_verification"]["possible"]),
+                documented_gaps=bool(documented_gaps),  # validated: every gap is documented
+                agent_definitions_reviewed=True,
+            ),
+            "recovery_provenance": {**provenance, "evidence_labels": [item.label for item in evidence]},
+        }
+        assignments_text = ", ".join(f"{fn}: agent:{agent_id}" for fn, agent_id in role_to_agent.items()) or "none"
+        independent = derived["independent_verification"]
+        await self.memory_service.upsert_section(
+            db, goal.project_id, goal.id, section_key=MEMORY_SECTION_KEY, title="Team hierarchy and role fit",
+            body="\n".join((
+                f"Accepted through approved recovery (proposal {proposal_id}); no standard hierarchy review was run.",
+                f"Required work functions: {', '.join(derived['required_work_functions']) or 'none'}",
+                f"Assignments: {assignments_text}",
+                f"Documented gaps: {', '.join(gap['code'] for gap in documented_gaps) or 'none'}",
+                "Independent verification: "
+                f"required={independent['required']}, possible={independent['possible']}, overridden={overridden}",
+            )),
+            summary=(
+                f"Approved recovery mapped {len(role_to_agent)} of "
+                f"{len(derived['required_work_functions'])} required work functions."
+            ),
+            toc_order=MEMORY_TOC_ORDER, run_id=run.id, created_by="orchestrator:team_hierarchy",
+        )
+        await self._resolve_prior_skip_warnings(
+            db, goal.id, current.id, all_types=True,
+            reason="superseded by an approved recovery configuration",
+        )
+        return await self.process_service.complete_process(db, current, outputs=outputs)
+
     async def build_proposal(
         self,
         db: AsyncSession,
@@ -1018,14 +1342,7 @@ class TeamHierarchyProcess:
 
         role_to_agent: dict[str, str] = {}
         producer_ids: set[uuid.UUID] = set()
-        explicit_independence = requires_independent_verification(
-            goal.success_criteria, goal.objective
-        )
-        independent_functions = (
-            ("review", "validation")
-            if explicit_independence
-            else ("validation",) if goal.weight == "substantial" else ()
-        )
+        independent_functions = self._independent_functions(goal)
         producer_functions = [name for name in required if name not in _VERIFIER_FUNCTIONS]
         for work_function in producer_functions:
             if canonical[work_function]:
@@ -1037,7 +1354,7 @@ class TeamHierarchyProcess:
             safe_candidates = [
                 agent_id
                 for agent_id in candidates
-                if agent_id not in producer_ids and agent_id != goal.manager_agent_id
+                if self._independent_of(agent_id, producer_ids, goal)
             ]
             if safe_candidates or work_function in independent_functions:
                 candidates = safe_candidates
@@ -1124,6 +1441,31 @@ class TeamHierarchyProcess:
         if goal.manager_user_id is not None:
             return {"kind": "human", "id": str(goal.manager_user_id)}
         return {"kind": "none", "id": None}
+
+    @staticmethod
+    def _independent_functions(goal: OrchestrationGoal) -> tuple[str, ...]:
+        """Verifier functions that must be performed by an independent agent."""
+        if requires_independent_verification(goal.success_criteria, goal.objective):
+            return ("review", "validation")
+        return ("validation",) if goal.weight == "substantial" else ()
+
+    @staticmethod
+    def _independent_of(agent_id, producer_ids, goal: OrchestrationGoal) -> bool:
+        """A verifier is independent of every producer and of the goal's manager agent."""
+        return (str(agent_id) not in {str(item) for item in producer_ids}
+                and (goal.manager_agent_id is None or str(agent_id) != str(goal.manager_agent_id)))
+
+    @staticmethod
+    def _gates(*, missing: bool, possible: bool, documented_gaps: bool,
+               agent_definitions_reviewed: bool) -> dict[str, bool]:
+        """Accepted-hierarchy completion gates (shared by review and approved recovery)."""
+        return {
+            "team_structure_reviewed": True,
+            "required_work_functions_mapped": not missing and not documented_gaps,
+            "agent_definitions_reviewed": agent_definitions_reviewed,
+            "missing_capabilities_handled": not missing or documented_gaps,
+            "independent_verification_possible_or_overridden": possible or documented_gaps,
+        }
 
     @staticmethod
     def _independent_verification(
@@ -1407,20 +1749,12 @@ class TeamHierarchyProcess:
                 "approval": approval.selected_option if approval else None,
                 "approval_decision_id": str(approval.id) if approval else None,
                 "warning_ids": [str(warning.id) for warning in warnings or []],
-                "gates": {
-                    "team_structure_reviewed": True,
-                    "required_work_functions_mapped": (
-                        not outputs["missing_work_functions"] and not documented_gaps
-                    ),
-                    "agent_definitions_reviewed": agent_definitions_reviewed,
-                    "missing_capabilities_handled": (
-                        not outputs["missing_work_functions"] or documented_gaps
-                    ),
-                    "independent_verification_possible_or_overridden": (
-                        outputs["independent_verification"]["possible"]
-                        or documented_gaps
-                    ),
-                },
+                "gates": self._gates(
+                    missing=bool(outputs["missing_work_functions"]),
+                    possible=bool(outputs["independent_verification"]["possible"]),
+                    documented_gaps=bool(documented_gaps),
+                    agent_definitions_reviewed=agent_definitions_reviewed,
+                ),
             }
         )
         await self._resolve_prior_skip_warnings(db, goal.id, current.id)
@@ -1450,7 +1784,11 @@ class TeamHierarchyProcess:
         db: AsyncSession,
         goal_id: uuid.UUID,
         current_process_id: uuid.UUID,
+        *,
+        all_types: bool = False,
+        reason: str = "superseded by a successful team hierarchy review",
     ) -> None:
+        """Resolve prior hierarchy rows' skip warnings (``all_types``: every active warning they raised)."""
         prior_ids = set(
             (
                 await db.execute(
@@ -1469,14 +1807,14 @@ class TeamHierarchyProcess:
         ):
             if (
                 warning.source_process_run_id in prior_ids
-                and warning.warning_type
-                in {"team_hierarchy_skipped", "team_hierarchy_not_reviewed"}
+                and (all_types or warning.warning_type
+                     in {"team_hierarchy_skipped", "team_hierarchy_not_reviewed"})
             ):
                 await self.warning_service.resolve_warning(
                     db,
                     warning,
                     resolved_by="orchestrator:team_hierarchy",
-                    reason="superseded by a successful team hierarchy review",
+                    reason=reason,
                 )
 
     @staticmethod

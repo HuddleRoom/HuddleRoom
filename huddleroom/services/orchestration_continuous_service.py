@@ -1,5 +1,6 @@
 import uuid
 import hashlib
+import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -12,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import SessionTransactionOrigin
+from sqlalchemy.orm.attributes import flag_modified
 
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import (
@@ -29,6 +31,8 @@ from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, available_
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.session_service import SessionClaimAttention, SessionService
 from huddleroom.services.task_service import TaskService
+
+logger = logging.getLogger(__name__)
 
 # The existing orchestration service deliberately owns these transition primitives.
 # pylint: disable=protected-access
@@ -186,7 +190,9 @@ class OrchestrationContinuousService:
         if agent is None or not agent.is_active or role_to_agent.get(source["work_function"]) != str(agent.id):
             raise HTTPException(status_code=409, detail="continuous_discovery_source_unrunnable")
 
-    async def dispatch_discovery_source(self, db, goal, run, now):
+    async def dispatch_discovery_source(self, db, goal, run, now, *, attempt: str | None = None):
+        """Dispatch the cycle's source task; ``attempt`` (an approved fix's proposal id) dispatches one fresh,
+        distinctly keyed source attempt after that fix resolved."""
         plan_state = self.orchestration._json_object_or_empty(run.plan_state)
         policy = self.orchestration._json_object_or_empty(plan_state.get("continuous_policy"))
         source = policy["discovery_source"]
@@ -212,10 +218,17 @@ class OrchestrationContinuousService:
                 "policy_version": policy["version"], "candidate_limit": candidate_limit}},
         }
         action = await self.orchestration.execute_create_delegation_task_action(
-            db, run.id, request, f"run:{run.id}:kind:create_delegation_task:discovery:{run.cycle_key}",
+            db, run.id, request, f"run:{run.id}:kind:create_delegation_task:discovery:{run.cycle_key}"
+            + (f":attempt:{attempt}" if attempt else ""),
         )
         task = await task_service.get(db, goal.project_id, action.target_id)
-        discovery = {**discovery, "source_task_id": str(task.id), "active_task_id": str(task.id)}
+        if attempt:
+            # Every fresh attempt stays budget-accounted (repair_task_ids); repair_task_id names the latest one.
+            attempts = [*(discovery.get("repair_task_ids") or []), str(task.id)]
+            discovery = {**discovery, "repair_task_id": str(task.id), "active_task_id": str(task.id),
+                         "repair_task_ids": list(dict.fromkeys(attempts))}
+        else:
+            discovery = {**discovery, "source_task_id": str(task.id), "active_task_id": str(task.id)}
         run.plan_state = {**plan_state, "discovery": discovery}
         await db.flush()
         run_kwargs = {"timeout": source["timeout_seconds"]}
@@ -446,7 +459,8 @@ class OrchestrationContinuousService:
             )
             if not discovery:
                 continue
-            for task_value in {discovery.get("source_task_id"), discovery.get("repair_task_id")} - {None}:
+            for task_value in {discovery.get("source_task_id"), discovery.get("repair_task_id"),
+                               *(discovery.get("repair_task_ids") or [])} - {None}:
                 task_id = self.orchestration._event_uuid(task_value)
                 task = await tasks.get(db, goal.project_id, task_id) if task_id else None
                 if task is None:
@@ -643,7 +657,7 @@ class OrchestrationContinuousService:
                     raise
                 discovery_state = {"source_task_id": None, "active_task_id": None, "active_session_id": None,
                                    "repair_task_id": None, "candidate_limit": candidate_limit,
-                                   "recovery": None, "accepted_batch": None}
+                                   "accepted_batch": None}
             cycle_key = _iso(due)
             action = await self.orchestration.reserve_action(
                 db, run.id, f"run:{run.id}:kind:claim_continuous_cycle:{cycle_key}",
@@ -995,7 +1009,7 @@ class OrchestrationContinuousService:
         try:
             # A refused retry can recover after assignment repair; its cycle still owns the reservation.
             recoverable = (
-                reason == "continuous_discovery_source_execution_failed" and state.get("recovery") is None
+                reason == "continuous_discovery_source_execution_failed"
                 and reservation is not None
                 and not any(item.get("kind") == "budget_integrity" for item in run.active_blockers)
             )
@@ -1020,62 +1034,111 @@ class OrchestrationContinuousService:
         await self.derive_health(db, goal, now)
         return {"step": "needs_attention"}
 
-    async def _dispatch_discovery_repair(self, db, goal, run, policy, state, task, session_id, error, output):
-        safe_output = self._rejected_discovery_output(output)
-        try:
-            action = await self.orchestration.execute_create_delegation_task_action(
-                db,
-                run.id,
-                {
-                "action_type": "create_delegation_task",
-                "agent_id": policy["discovery_source"]["agent_id"],
-                "work_function": "follow_up",
-                "parent_task_id": str(task.id),
-                "source_session_id": str(session_id) if session_id else None,
-                "scope": "Return a corrected discovery JSON batch for the validation errors.",
-                "inputs": [f"Validation error: {self._rejected_discovery_error(error)}", f"Rejected output: {safe_output['snippet']}",
-                           f"Rejected output digest: {safe_output['digest']}"],
-                "deliverable": "One corrected unfenced schema_version=1 JSON object.",
-                "forbidden_work": ["Do not change source scope, filter, identity rule, or candidate limit."],
-                "success_evidence": ["The corrected object passes the frozen discovery schema."],
-                "budget": policy["discovery_source"]["budget"]["per_cycle"],
-                "report_schema": {"schema_version": 1, "candidates": []},
-                "orchestrator_context": {"continuous": {"discovery_run_id": str(run.id), "cycle_key": run.cycle_key,
-                    "candidate_limit": state["candidate_limit"]}},
-                },
-                f"run:{run.id}:kind:create_delegation_task:discovery_repair:{task.id}",
+    async def _discovery_lineage(self, db, run, task_ids: set[str]):
+        """(proposal, trigger) of the newest recovery proposal whose lineage trigger's observed failure is one of
+        these discovery source tasks; (None, None) when no fix was proposed for them."""
+        # ponytail: scans the run's proposals each tick; index the failure source on the proposal if runs grow large.
+        proposals = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "recovery_proposal",
+        ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id.desc()))).all()
+        for proposal in proposals:
+            trigger_id = self.orchestration._event_uuid((proposal.dispatch_contract or {}).get("trigger_action_id"))
+            trigger = await db.get(OrchestrationAction, trigger_id) if trigger_id else None
+            source_id = self.orchestration._event_uuid((trigger.request or {}).get("source_id")) if trigger else None
+            source = await db.get(OrchestrationAction, source_id) if source_id else None
+            if (source is not None and source.action_type == "failure_observed"
+                    and (source.request or {}).get("task_id") in task_ids):
+                return proposal, trigger
+        return None, None
+
+    def _save_discovery(self, run, state) -> None:
+        run.plan_state = {**self.orchestration._json_object_or_empty(run.plan_state), "discovery": state}
+        flag_modified(run, "plan_state")
+
+    async def _follow_approved_recovery(self, db, goal, run, state, now) -> dict | None:
+        """Lineage-based follow-through of the fix for the active source attempt (any tool: retry, reassign,
+        delegated remediation, configuration). Nothing here starts work without an approved fix. Returns a step
+        to stop at, or None to continue with the (possibly updated) state."""
+        task_ids = {value for value in (state.get("active_task_id"), state.get("source_task_id")) if value}
+        proposal, trigger = await self._discovery_lineage(db, run, task_ids)
+        if proposal is None:
+            return None
+        pid = (proposal.request or {}).get("proposal_id")
+        if proposal.status == "failed":
+            # A failed attempt re-enters diagnosis in its lineage; with no open follow-up, attention is needed.
+            if await self.orchestration.open_recovery_trigger(
+                    db, run.id, (trigger.request or {}).get("source_fingerprint", "")) is not None:
+                return {"step": "waiting_discovery_recovery"}
+            return await self._discovery_needs_attention(
+                db, goal, run, "continuous_discovery_source_execution_failed", state,
+                f"Recovery proposal {pid} failed and its lineage has no open follow-up", "", now,
             )
-        except HTTPException as exc:
-            await SessionService.handle_claim_refusal(db, exc)
+        effects = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.status == "completed",
+            OrchestrationAction.target_type == "session",
+            OrchestrationAction.idempotency_key.startswith(f"recovery:{pid}:"),
+            OrchestrationAction.idempotency_key.endswith(":effect"),
+        ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id.desc()))).all()
+        for effect in effects:
+            # The fix started a new session of a source task (retry_task, reassign_task): consume that session.
+            session = await db.get(Session, effect.target_id)
+            if session is None or str(session.task_id) not in task_ids:
+                continue
+            if str(session.id) != state.get("active_session_id"):
+                state.update({"active_task_id": str(session.task_id), "active_session_id": str(session.id)})
+                self._save_discovery(run, state)
+                await db.flush()
             return None
-        if action.target_id is None:
-            return None
-        repair_task = await TaskService().get(db, goal.project_id, action.target_id)
-        if repair_task is None:
-            return None
-        # ponytail: not slot-checked; the source task that failed validation has just freed its slot.
-        state.update({"recovery": "repair", "repair_task_id": str(repair_task.id),
-                      "active_task_id": str(repair_task.id), "active_session_id": None})
-        run.plan_state = {**self.orchestration._json_object_or_empty(run.plan_state), "discovery": state}
-        await db.flush()
-        run_kwargs = {"timeout": policy["discovery_source"]["timeout_seconds"]}
-        if "max_tokens" in policy["discovery_source"]["budget"]["per_cycle"]:
-            run_kwargs["max_tokens"] = int(Decimal(policy["discovery_source"]["budget"]["per_cycle"]["max_tokens"]))
+        retry = await self.orchestration._existing_action_for_key(db, run.id, f"recovery:{pid}:retry:1")
+        if retry is None or retry.status == "failed" or state.get("recovery_attempt_action_id") == str(retry.id):
+            return None  # not yet applied/verified (the trigger path keeps waiting), or already followed
+        # The fix was separate work (e.g. delegated remediation) and its sealed retry has run: the run is no longer
+        # blocked, so discovery dispatches one fresh source attempt; its output is never read from the remediation.
+        previous = run.plan_state
+        self._save_discovery(run, {**state, "active_task_id": None, "active_session_id": None,
+                                   "recovery_attempt_action_id": str(retry.id)})
         try:
-            _, repair_session_id = await TaskService().run(db, goal.project_id, repair_task.id, **run_kwargs)
+            await OrchestrationBudgetService().reactivate_discovery_source(
+                db, goal, run, run.plan_state["continuous_policy"]["discovery_source"], now)
+            task = await self.dispatch_discovery_source(db, goal, run, now, attempt=str(pid))
         except HTTPException as exc:
-            await SessionService.handle_claim_refusal(db, exc)
-            return None
-        state["active_session_id"] = str(repair_session_id)
-        run.plan_state = {**self.orchestration._json_object_or_empty(run.plan_state), "discovery": state}
-        await db.flush()
-        return repair_task
+            run.plan_state = previous  # a later tick replays the same idempotent attempt key
+            return await self._discovery_needs_attention(
+                db, goal, run, "continuous_discovery_source_execution_failed", state, str(exc.detail), "", now,
+            )
+        if task is None:
+            await self.derive_health(db, goal, now)
+            return {"step": "needs_attention"}
+        return {"step": "discovery_running", "task_id": str(task.id)}
+
+    async def _attempt_recovery_effect(self, db, run, state):
+        """The recovery action that started the active attempt: the approved effect that created its session, or
+        the retry of the fix a fresh source attempt follows. None for an ordinary attempt."""
+        session_id = self.orchestration._event_uuid(state.get("active_session_id"))
+        if session_id is not None:
+            effect = await db.scalar(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run.id, OrchestrationAction.target_id == session_id,
+                OrchestrationAction.idempotency_key.startswith("recovery:"),
+                OrchestrationAction.idempotency_key.endswith(":effect"),
+            ).limit(1))
+            if effect is not None:
+                return effect
+        if state.get("active_task_id") and state.get("active_task_id") == state.get("repair_task_id"):
+            retry_id = self.orchestration._event_uuid(state.get("recovery_attempt_action_id"))
+            return await db.get(OrchestrationAction, retry_id) if retry_id else None
+        return None
 
     async def _advance_discovery(self, db, goal, run, policy, now):
         plan_state = self.orchestration._json_object_or_empty(run.plan_state)
         state = self.orchestration._json_object_or_empty(plan_state.get("discovery"))
         if state.get("accepted_batch") is not None:
+            if await self._hold_for_discovery_lineage(db, run, state):
+                return {"step": "waiting_discovery_recovery"}
             return await self.fan_out_discovery_batch(db, goal, run, now)
+        step = await self._follow_approved_recovery(db, goal, run, state, now)
+        if step is not None:
+            return step
+        plan_state = self.orchestration._json_object_or_empty(run.plan_state)
         task_id = self.orchestration._event_uuid(state.get("active_task_id"))
         task = await TaskService().get(db, goal.project_id, task_id) if task_id else None
         if task is None:
@@ -1083,62 +1146,97 @@ class OrchestrationContinuousService:
                 db, goal, run, "continuous_discovery_source_execution_failed", state, "Active source task is missing", "", now,
             )
         if task.status == "failed":
-            if state.get("recovery") is not None:
+            reservation = await db.scalar(select(OrchestrationBudgetReservation).where(
+                OrchestrationBudgetReservation.discovery_run_id == run.id,
+            ))
+            if reservation is None or any(item.get("kind") == "budget_integrity" for item in run.active_blockers):
                 return await self._discovery_needs_attention(
-                    db, goal, run, "continuous_discovery_source_execution_failed", state, "Source execution failed twice", "", now,
+                    db, goal, run, "continuous_discovery_source_execution_failed", state,
+                    "Source budget reservation is missing", "", now,
                 )
-            source = policy["discovery_source"]
-            request = {"action_type": "retry_task", "task_id": str(task.id), "timeout": source["timeout_seconds"]}
-            if "max_tokens" in source["budget"]["per_cycle"]:
-                request["max_tokens"] = int(Decimal(source["budget"]["per_cycle"]["max_tokens"]))
-            try:
-                retry_key = f"run:{run.id}:kind:retry_task:discovery:{task.id}"
-                if state.get("retry_generation"):
-                    retry_key += f":generation:{state['retry_generation']}"
-                action = await self.orchestration.execute_retry_task_action(
-                    db, run.id, request, retry_key,
+            # Every fix needs approve_fix: a new source attempt is a corrective retry, so it starts one recovery
+            # lineage (idempotent per failed attempt) and the cycle waits; nothing re-runs automatically. A failed
+            # recovery-produced attempt stays in its own lineage.
+            summary = f'Discovery source task "{task.title}" failed; retrying it needs approval.'
+            effect = await self._attempt_recovery_effect(db, run, state)
+            if effect is None or not await self.orchestration.route_failure_to_recovery_lineage(db, run, effect, summary):
+                await self.orchestration._task_recovery_trigger(  # pylint: disable=protected-access
+                    db, run, task, blocker_code="continuous_discovery_source_failed", summary=summary,
                 )
-            except HTTPException as exc:
-                await SessionService.handle_claim_refusal(db, exc)
-                action = None
-            if action is None or action.target_id is None:
-                return await self._discovery_needs_attention(
-                    db, goal, run, "continuous_discovery_source_execution_failed", state, "Source retry could not start", "", now,
-                )
-            state.update({"recovery": "retry", "active_session_id": str(action.target_id)})
-            run.plan_state = {**plan_state, "discovery": state}
-            await db.flush()
-            return {"step": "waiting_discovery_retry"}
+            return {"step": "waiting_discovery_recovery"}
         if task.status != "done":
             return {"step": "discovery_running"}
-        session_id, output = await self.orchestration.consume_terminal_task_output(
-            db, run, task, self.orchestration._event_uuid(state.get("active_session_id")),
-        )
+        try:
+            session_id, output = await self.orchestration.consume_terminal_task_output(
+                db, run, task, self.orchestration._event_uuid(state.get("active_session_id")),
+            )
+        except HTTPException as exc:
+            return await self._discovery_needs_attention(
+                db, goal, run, "continuous_discovery_source_execution_failed", state, str(exc.detail), "", now,
+            )
         output = output or ""
         try:
             if len(output) > self._MAX_REJECTED_DISCOVERY_OUTPUT:
                 raise ValueError("discovery output exceeds safe size")
             batch = parse_discovery_batch(output, state["candidate_limit"])
         except (ValueError, ValidationError) as exc:
-            if state.get("recovery") is not None:
+            # A repair delegation is a corrective fix: one recovery lineage per rejected output, no auto-repair.
+            # The source task is done, so its health does not close this lineage.
+            summary = (f'Discovery output of "{task.title}" was rejected '
+                       f'({self._rejected_discovery_error(exc)}); a repair needs approval.')
+            effect = await self._attempt_recovery_effect(db, run, state)
+            if effect is not None:
+                # An approved attempt that produced invalid output fails inside its lineage; never a silent wait.
+                if await self.orchestration.route_failure_to_recovery_lineage(db, run, effect, summary):
+                    return {"step": "waiting_discovery_recovery"}
                 return await self._discovery_needs_attention(
-                    db, goal, run, "continuous_discovery_source_output_invalid", state,
-                    self._rejected_discovery_error(exc), output, now,
+                    db, goal, run, "continuous_discovery_output_invalid", state, exc, output, now,
                 )
-            repaired = await self._dispatch_discovery_repair(
-                db, goal, run, policy, state, task, session_id, self._rejected_discovery_error(exc), output,
+            await self.orchestration._task_recovery_trigger(  # pylint: disable=protected-access
+                db, run, task, blocker_code="continuous_discovery_output_invalid", summary=summary,
+                closes_when_task_healthy=False,
             )
-            if repaired is None:
-                return await self._discovery_needs_attention(
-                    db, goal, run, "continuous_discovery_source_output_invalid", state,
-                    self._rejected_discovery_error(exc), output, now,
-                )
-            return {"step": "waiting_discovery_repair"}
+            return {"step": "waiting_discovery_recovery"}
         state.update({"accepted_batch": batch.model_dump(mode="json"), "accepted_task_id": str(task.id),
                       "accepted_session_id": str(session_id) if session_id else None})
         run.plan_state = {**plan_state, "discovery": state}
+        flag_modified(run, "plan_state")  # ``state`` may be the loaded dict mutated in place: always write it
         await db.flush()
+        if await self._hold_for_discovery_lineage(db, run, state):
+            return {"step": "waiting_discovery_recovery"}
         return await self.fan_out_discovery_batch(db, goal, run, now)
+
+    async def _hold_for_discovery_lineage(self, db, run, state) -> bool:
+        """Whether the accepted batch waits for its fix's lineage (e.g. verification still pending). A lineage
+        error never blocks fan-out or loops every tick: it is logged and the cycle proceeds."""
+        from huddleroom.services.orchestration_blocker_recovery import _RunFenced
+
+        try:
+            async with db.begin_nested():
+                return await self._resolve_discovery_lineage(db, run, state)
+        except _RunFenced:
+            raise
+        except (HTTPException, ValueError) as exc:
+            logger.warning("discovery lineage resolve skipped: %s", exc)
+            return False
+
+    async def _resolve_discovery_lineage(self, db, run, state) -> bool:
+        """A valid consumed output is the progress the fix's ``decision_loop`` retry waits on; continuous runs
+        have no decision loop, so discovery drives the approved lifecycle (verify, retry) and resolves it.
+        Returns True while the lineage proposal is still reserved afterwards (the cycle holds)."""
+        task_ids = {value for value in (state.get("active_task_id"), state.get("source_task_id")) if value}
+        proposal, _trigger = await self._discovery_lineage(db, run, task_ids)
+        if proposal is None or proposal.status != "reserved":
+            return False
+        from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+        recovery = OrchestrationBlockerRecoveryService()
+        await recovery.resume(db, proposal.id)
+        await db.refresh(proposal)
+        if proposal.status == "reserved":
+            await recovery.complete_retry_on_observed_progress(db, proposal)
+            await db.refresh(proposal)
+        return proposal.status == "reserved"
 
     async def advance(self, db, goal, run, now: datetime | None = None):  # pylint: disable=too-many-return-statements
         now = _utc(now or _utcnow())
@@ -1177,9 +1275,7 @@ class OrchestrationContinuousService:
                 self.orchestration._json_object_or_empty(run.plan_state).get("discovery")
             )
             if any(item.get("kind") == "continuous_discovery_source_execution_failed" for item in run.active_blockers):
-                # A consumed recovery remains terminal; only a refused retry can start a new generation.
-                if discovery.get("recovery") is not None:
-                    return {"step": "needs_attention"}
+                # Reactivate a source attempt that could not run (e.g. missing task or refused reservation).
                 try:
                     await self.validate_discovery_assignment(db, goal, policy["discovery_source"])
                     await OrchestrationBudgetService().reactivate_discovery_source(
@@ -1187,13 +1283,19 @@ class OrchestrationContinuousService:
                     )
                 except HTTPException:
                     return {"step": "needs_attention"}
+                if discovery.get("active_task_id") or discovery.get("accepted_batch") is not None:
+                    # The blocker clears only once the re-check no longer needs attention (no flip-flop, e.g. a
+                    # non-canonical terminal session stays in attention until the state changes).
+                    result = await self._advance_discovery(db, goal, run, policy, now)
+                    if result.get("step") != "needs_attention":
+                        run.active_blockers = [item for item in run.active_blockers if not (
+                            isinstance(item, dict) and item.get("kind") == "continuous_discovery_source_execution_failed"
+                        )]
+                        await db.flush()
+                    return result
                 run.active_blockers = [item for item in run.active_blockers if not (
                     isinstance(item, dict) and item.get("kind") == "continuous_discovery_source_execution_failed"
                 )]
-                discovery["retry_generation"] = int(discovery.get("retry_generation") or 0) + 1
-                run.plan_state = {
-                    **self.orchestration._json_object_or_empty(run.plan_state), "discovery": discovery,
-                }
                 await db.flush()
             if discovery.get("active_task_id") or discovery.get("accepted_batch") is not None:
                 return await self._advance_discovery(db, goal, run, policy, now)

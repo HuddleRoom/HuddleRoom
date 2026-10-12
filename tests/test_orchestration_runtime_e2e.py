@@ -2498,7 +2498,7 @@ async def test_pause_retains_active_work_and_resume_reconciles_it(
     assert gate.status == "open"
 
 
-async def test_runtime_recovery_retries_reassigns_then_escalates_needs_attention(
+async def test_runtime_recovery_triggers_then_escalates_needs_attention(
     db_session, test_engine, test_project, stub_decision, safe_effectiveness_review_continue
 ):
     original = _agent("recovery-original", ["implementation"])
@@ -2542,23 +2542,15 @@ async def test_runtime_recovery_retries_reassigns_then_escalates_needs_attention
 
     await fail_attempt(original.id)
     await service.tick(db_session, run.id)
-    retry = next(action for action in await _run_actions(db_session, run.id)
-                 if action.action_type == "retry_task")
-    assert retry.status == "completed" and task.status == "in_progress"
+    # retry/reassign are corrective fixes -> one recovery trigger; nothing re-runs without approval.
+    actions = await _run_actions(db_session, run.id)
+    assert not [action for action in actions if action.action_type in {"retry_task", "reassign_task"}]
+    assert len([action for action in actions if action.action_type == "recovery_trigger"]) == 1
+    assert task.status == "failed" and task.assigned_to == original.id
 
-    retried_session = await db_session.get(Session, retry.target_id)
-    retried_session.metadata_ = {"attempt": {"effect_state": "started"}}
-    task.status = retried_session.status = "failed"
-    await db_session.flush()
-    await service.tick(db_session, run.id)
-    reassign = next(action for action in await _run_actions(db_session, run.id)
-                    if action.action_type == "reassign_task")
-    assert reassign.status == "completed" and task.assigned_to == alternate.id, reassign.error
-
-    reassigned_session = await db_session.get(Session, reassign.target_id)
-    reassigned_session.metadata_ = {"attempt": {"effect_state": "started"}}
-    task.status = reassigned_session.status = "failed"
-    await db_session.flush()
+    # Two further failed attempts (e.g. approved fixes) reach the repeated-failure owner escalation.
+    await fail_attempt(original.id)
+    await fail_attempt(alternate.id)
     await service.tick(db_session, run.id)
     assert goal.status == run.status == "blocked"
     blocker = next(item for item in run.active_blockers if item["kind"] == "repeated_failure")

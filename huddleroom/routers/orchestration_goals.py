@@ -33,7 +33,6 @@ from huddleroom.schemas.orchestration import (
     OrchestrationActionResponse,
     OrchestrationAgentSuggestionResponse,
     OrchestrationAuthorizationWaitResponse,
-    OrchestrationAuthorityDecisionResponse,
     OrchestrationChildGoalResponse,
     OrchestrationDebugActionResponse,
     OrchestrationDebugRerunRequest,
@@ -78,6 +77,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationTickResponse,
 )
 from huddleroom.services.orchestration_authority_service import effective_authorization
+from huddleroom.services.orchestration_recovery_presenter import present_decision_response
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_dependencies import evidence_semantics
 from huddleroom.services.orchestration_progress_view import plan_item_state, queued_authorization_wait
@@ -106,6 +106,7 @@ from huddleroom.services.orchestration_conversation_learning import (
     ConversationLearningWindow,
     OrchestrationConversationLearningService,
 )
+
 
 router = APIRouter()
 service = OrchestrationService()
@@ -347,7 +348,7 @@ async def _run_history(
     labels = _version_labels(runs)
     return [
         OrchestrationRunSummaryResponse(
-            **{name: getattr(item, name) for name in OrchestrationRunSummaryResponse.model_fields
+            **{name: getattr(item, name) for name in OrchestrationRunSummaryResponse.model_fields  # pylint: disable=not-an-iterable
                if name not in ("version_label", "is_current")},
             version_label=labels[item.id], is_current=item.id == run.id)
         for item in runs
@@ -740,13 +741,14 @@ async def _detail(
                     "id": str(accepted.id), "key": f"evidence:{accepted.id}:accepted", "kind": "accepted_evidence",
                     "message": accepted.source_type, "occurred_at": accepted.created_at,
                 }
+        pending_direction = (await present_decision_response(db, direction)
+                             if condition == "needs_you" and direction else None)
         supervision = OrchestrationSupervisionResponse(
             condition=condition, operation=operation, next_action=next_action, rationale=rationale,
             criterion=criterion, verified_progress=verified_progress, useful_learning=[],
             accepted_evidence=accepted_evidence, workers=workers, waits=waits,
             recovery_history=recovery_history,
-            pending_direction=(OrchestrationAuthorityDecisionResponse.model_validate(direction)
-                               if condition == "needs_you" and direction else None),
+            pending_direction=pending_direction,
             budget=budget, transition=transition,
         )
 

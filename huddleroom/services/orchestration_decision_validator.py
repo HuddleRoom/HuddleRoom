@@ -29,7 +29,11 @@ ALLOWED_ACTION_SCHEMAS: dict[str, frozenset[str]] = {
     "pause_run": frozenset({"reason"}),
     "suggest_agent": frozenset({"missing_work_function", "reason"}),
     "record_warning": frozenset({"warning_type", "severity", "message"}),
+    # Non-mutating: records the observed blocker; the server builds any remedy (SPR 180/184).
+    "recover_blocker": frozenset({"reason", "evidence_refs"}),
 }
+
+RECOVER_BLOCKER_EVIDENCE_KINDS = frozenset({"action", "task", "gate", "process", "decision", "warning"})
 
 OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
     "schedule_meeting": frozenset(
@@ -171,6 +175,13 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
         if error is not None:
             return DecisionValidationResult(False, f"Decision 'create_delegation_task' {error}")
 
+    if action_type == "recover_blocker" and not _valid_evidence_refs(decision["evidence_refs"]):
+        return DecisionValidationResult(
+            False,
+            "Decision 'recover_blocker' evidence_refs must be a list of {kind, id} objects with kind in "
+            f"{', '.join(sorted(RECOVER_BLOCKER_EVIDENCE_KINDS))} and a UUID id",
+        )
+
     if action_type == "retry_task":
         for key in ("timeout", "max_tokens"):
             if key in decision and (isinstance(decision[key], bool) or not isinstance(decision[key], int) or decision[key] <= 0):
@@ -256,6 +267,14 @@ def independent_work_rejection(
     if unfinished & {str(i) for i in [*(request.get("depends_on") or []), *(request.get("artifact_ids") or [])]}:
         return invalid("depends on unfinished planning output")
     return None
+
+
+def _valid_evidence_refs(refs: Any) -> bool:
+    return isinstance(refs, list) and all(
+        isinstance(ref, Mapping) and set(ref) == {"kind", "id"}
+        and ref["kind"] in RECOVER_BLOCKER_EVIDENCE_KINDS and _is_uuid_string(ref["id"])
+        for ref in refs
+    )
 
 
 def _is_uuid_string(value: Any) -> bool:

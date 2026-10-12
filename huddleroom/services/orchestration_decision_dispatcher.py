@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -11,12 +12,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
-from huddleroom.schemas.orchestration_recovery import RecoveryDispatchContext, RecoveryProposalV1
+from huddleroom.schemas.orchestration_recovery import (
+    CorrectiveDisposition, RecoveryDispatchContext, RecoveryProposalV1,
+)
 from huddleroom.services.orchestration_steering import (
     SteeringVersionsChanged,
     OrchestrationSteeringService, active_direction_ids,
     steering_versions_from_snapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def recovery_wrapper_key(context: RecoveryDispatchContext) -> str:
@@ -37,7 +42,7 @@ class OrchestrationDecisionDispatcher:
     # Actions that do not perform applied work, so an answered decision is not
     # recorded on them.
     _UNLINKED_ACTION_TYPES = frozenset(
-        {"noop", "record_warning", "pause_run", "ask_human", "suggest_agent"}
+        {"noop", "record_warning", "pause_run", "ask_human", "suggest_agent", "recover_blocker"}
     )
 
     # Executors whose 4xx failure state (plan revision, replan attention) is read by the runner,
@@ -101,6 +106,12 @@ class OrchestrationDecisionDispatcher:
             decision.validator_status = "rejected"
             decision.rejection_reason = "invalid recovery dispatch identity"
             return None
+        if recovery_context is None:
+            # Every corrective fix needs approval: a model-selected corrective action becomes one recovery
+            # trigger and nothing is mutated. Only an approved recovery dispatch context may apply it.
+            disposition = await self._service.classify_corrective_action(db, run, action_type, request, source="model")
+            if disposition == CorrectiveDisposition.REQUIRES_RECOVERY:
+                return await self._corrective_trigger(db, run, decision, action_type, request)
         input_snapshot = getattr(decision, "input_snapshot", {}) or {}
         versions = steering_versions_from_snapshot(input_snapshot)
         steering = None
@@ -127,6 +138,13 @@ class OrchestrationDecisionDispatcher:
         if not recovery:
             action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
             if capped is not None:
+                # Rejected too often without progress: a durable failure without its own successful recovery.
+                await self._service.create_recovery_trigger(
+                    db, run, source_kind="failed_action", source_id=capped.id, blocker_code="action_rejected",
+                    summary=f"{action_type} was rejected repeatedly: {capped.error or 'rejected'}",
+                    retry_target={"kind": "action", "source_action_id": str(capped.id)},
+                    fingerprint_basis={"source": str(capped.id)},
+                )
                 return capped  # rejected too often: no re-run, no new row; the backstop wait still applies
         if versions is not None:
             action_key, *_ = (
@@ -135,6 +153,9 @@ class OrchestrationDecisionDispatcher:
         run_id, decision_id = run.id, decision.id
         # Only model-proposed delegation is ad hoc; internal callers keep the default.
         extra = {"ad_hoc": True} if action_type == "create_delegation_task" else {}
+        if extra and recovery and recovery_context.purpose == "apply" and recovery_context.baseline_repair_admission:
+            # Trusted only from a validated approve_fix context; the executor re-checks it against current state.
+            extra["baseline_repair_admission"] = recovery_context.baseline_repair_admission
         call = lambda: method(  # noqa: E731
             db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id, **extra,
         )
@@ -187,19 +208,25 @@ class OrchestrationDecisionDispatcher:
             contract.setdefault("applies_decision_id", str(applies_decision_id))
             action.dispatch_contract = contract
         if recovery:
-            wrapper = recovery
-            contract = dict(wrapper.dispatch_contract or {})
-            contract.update({
-                "authority_decision_id": str(recovery_context.authority_decision_id),
-                "canonical_request_hash": self._canonical_request_hash(request),
-                "effect_action_id": str(action.id),
-                "effect_idempotency_key": action.idempotency_key,
-            })
-            wrapper.dispatch_contract = contract
+            self.link_recovery_effect(recovery, recovery_context, request, action)
         if steering is not None and action.status != "failed":
             for request_id in active_direction_ids(input_snapshot):
                 await steering.link_result(db, request_id, decision.id, action.id)
         return action
+
+    @classmethod
+    def link_recovery_effect(
+        cls, wrapper: OrchestrationAction, context: RecoveryDispatchContext,
+        request: dict[str, Any], action: OrchestrationAction,
+    ) -> None:
+        """Durable wrapper-to-effect link of one recovery dispatch."""
+        wrapper.dispatch_contract = {
+            **(wrapper.dispatch_contract or {}),
+            "authority_decision_id": str(context.authority_decision_id),
+            "canonical_request_hash": cls._canonical_request_hash(request),
+            "effect_action_id": str(action.id),
+            "effect_idempotency_key": action.idempotency_key,
+        }
 
     @staticmethod
     def _canonical_request_hash(request: dict[str, Any]) -> str:
@@ -242,7 +269,13 @@ class OrchestrationDecisionDispatcher:
         except ValueError:
             return False
         if context.purpose == "apply":
-            if sum(call.call_id == context.call_id for call in recovery_proposal.calls) != 1:
+            matched = [call for call in recovery_proposal.calls if call.call_id == context.call_id]
+            if len(matched) != 1:
+                return False
+            sealed = [change.after for change in matched[0].changes if change.target_type == "baseline_repair_admission"]
+            carried = context.baseline_repair_admission
+            if len(sealed) > 1 or (sealed and (carried is None or carried.model_dump(mode="json") != sealed[0])) \
+                    or (carried is not None and not sealed):
                 return False
         elif context.approved_retry_ordinal > recovery_proposal.retry.max_attempts:
             return False
@@ -327,7 +360,30 @@ class OrchestrationDecisionDispatcher:
         )
         if action.status == "reserved":
             await self._service._fail_reserved_action_in_transaction(db, action, error)
+        if error.startswith("plan_author_unavailable"):
+            await self._service.planning_preflight_trigger(db, run_id, error)
         return action
+
+    async def _corrective_trigger(
+        self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision,
+        action_type: str, request: dict[str, Any],
+    ) -> OrchestrationAction | None:
+        """One open lineage per corrective request: re-selecting the same fix while its proposal is still
+        pending, or the action an open lineage's sealed retry re-runs, reuses that trigger instead of starting
+        another."""
+        basis = {"action_type": action_type, "request": {k: v for k, v in request.items() if k != "reason"}}
+        fingerprint = hashlib.sha256(json.dumps(basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        existing = (await self._service.open_recovery_trigger(db, run.id, fingerprint)
+                    or await self._service.open_recovery_trigger_for_action(db, run.id, action_type, request))
+        if existing is not None:
+            return existing
+        trigger, _created = await self._service.create_recovery_trigger(
+            db, run, source_kind="reported_blocker", source_id=decision.id, blocker_code=f"corrective_{action_type}",
+            summary=(f"The orchestrator selected {action_type} after a durable failure; "
+                     "a corrective fix needs approval before it runs."),
+            retry_target={"kind": "decision_loop"}, fingerprint_basis=basis,
+        )
+        return trigger
 
     @staticmethod
     async def _resolve_applied_decision(
@@ -364,4 +420,5 @@ class OrchestrationDecisionDispatcher:
         "pause_run": "execute_pause_run_action",
         "record_warning": "execute_record_warning_action",
         "suggest_agent": "execute_suggest_agent_action",
+        "recover_blocker": "execute_recover_blocker_action",
     }

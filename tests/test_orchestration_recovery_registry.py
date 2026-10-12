@@ -61,6 +61,18 @@ PROJECT_ID = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 SHA256 = "a" * 64
 
 
+@pytest.fixture
+def seal_without_post_state_validation(monkeypatch):
+    """(carry-in 5): ``prepare`` now runs the full post-state validation at seal time. These 
+    fixtures pin canonicalization, redaction and disclosure with partial team configurations (no gap
+    coverage, legacy gap codes, managers the goal lacks), so they bypass only that post-state check; the
+    seal-time rejection itself is pinned in test_orchestration_recovery_activation.py. Only the seal call site
+    is bypassed; apply-time validation (``_validate_post_state``) always runs."""
+    from huddleroom.services.orchestration_recovery_configuration import RecoveryConfigurationService
+
+    monkeypatch.setattr(RecoveryConfigurationService, "_validate_at_seal", lambda *_args: None)
+
+
 def _agent(agent_id: UUID, name: str, role: str) -> CanonicalAgentState:
     return CanonicalAgentState(
         id=agent_id,
@@ -672,6 +684,7 @@ async def test_roster_preview_hierarchy_keeps_objective_notes_from_goal_context(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_configuration_preparation_seals_complete_resolved_change_without_writes(db_session, test_engine, test_project):
     goal, run = await _seed_goal_run(db_session, test_project, objective="Plan the release.")
     draft = TeamConfigurationApplyV1.model_validate({
@@ -778,6 +791,7 @@ async def test_configuration_preparation_rejects_duplicate_updates_and_a_noop_co
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_configuration_prepare_mirrors_agent_service_cli_cleanup_and_sparse_patch(db_session, test_project):
     cli_agent = replace(
         _agent(PLANNER_ID, "CLI Planner", "planning"),
@@ -808,6 +822,7 @@ async def test_c1_configuration_prepare_mirrors_agent_service_cli_cleanup_and_sp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ("capabilities", "config"))
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_configuration_prepare_preserves_explicit_none_json_updates_like_agent_service(
     db_session, test_project, field: str,
 ):
@@ -831,6 +846,7 @@ async def test_c1_configuration_prepare_preserves_explicit_none_json_updates_lik
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_configuration_prepare_round_trips_sparse_poststate_without_writes(db_session, test_engine, test_project):
     planner = replace(
         _agent(PLANNER_ID, "Planner", "planning"),
@@ -864,6 +880,7 @@ async def test_c1_configuration_prepare_round_trips_sparse_poststate_without_wri
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_configuration_rejects_within_surface_duplicates_but_allows_cross_surface_reuse(db_session, test_project):
     planner = _agent(PLANNER_ID, "Planner", "planning")
     db_session.add(Agent(**planner.__dict__))
@@ -896,6 +913,7 @@ async def test_c1_configuration_rejects_within_surface_duplicates_but_allows_cro
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_configuration_changes_redact_legacy_secrets_and_disclose_all_aggregate_surfaces(db_session, test_project):
     secret = "sk-live-secret"
     planner = replace(
@@ -953,6 +971,7 @@ async def test_c1_configuration_changes_redact_legacy_secrets_and_disclose_all_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_correction_seals_new_refs_into_server_only_canonical_configuration(db_session, test_project):
     from huddleroom.services.orchestration_recovery_configuration import CanonicalTeamConfigurationApplyV1
 
@@ -990,6 +1009,7 @@ async def test_c1_correction_seals_new_refs_into_server_only_canonical_configura
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_correction_uses_accepted_before_surfaces_and_omits_unchanged_ones(db_session, test_project):
     planner = _agent(PLANNER_ID, "Planner", "planning")
     reviewer = _agent(REVIEWER_ID, "Reviewer", "review")
@@ -1060,6 +1080,7 @@ async def test_c1_correction_uses_accepted_before_surfaces_and_omits_unchanged_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_correction_semantic_redaction_keeps_benign_secretariat_text(db_session, test_project):
     planner = replace(
         _agent(PLANNER_ID, "Planner", "planning"),
@@ -1081,6 +1102,7 @@ async def test_c1_correction_semantic_redaction_keeps_benign_secretariat_text(db
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_correction_aggregates_large_complete_change_sets_within_changev1_bound(db_session, test_project):
     agents = tuple(_agent(UUID(int=index), f"Planner {index}", "planning") for index in range(10_000, 10_028))
     db_session.add_all(Agent(**agent.__dict__) for agent in agents)
@@ -1105,6 +1127,7 @@ async def test_c1_correction_aggregates_large_complete_change_sets_within_change
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_final_empty_accepted_reporting_lines_match_empty_member_groups(db_session, test_project):
     planner = _agent(PLANNER_ID, "Planner", "planning")
     db_session.add(Agent(**planner.__dict__))
@@ -1125,6 +1148,7 @@ async def test_c1_final_empty_accepted_reporting_lines_match_empty_member_groups
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c1_final_semantic_redaction_covers_nested_secret_key_values(db_session, test_project):
     secret = "sk-nested-secret"
     planner = replace(
@@ -1366,6 +1390,7 @@ async def _c2_complete_configuration_draft(db_session, test_project):
     "Planner", "new:reviewer", "review_capacity", "validation_override", "apply team configuration", "request plan",
     "generic_agent", "generic_orchestration",
 ))
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c2_complete_configuration_summary_rejects_each_missing_surface_identity_and_action(
     db_session, test_project, omitted,
 ):
@@ -1380,6 +1405,7 @@ async def test_c2_complete_configuration_summary_rejects_each_missing_surface_id
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c2_complete_configuration_derives_bounded_public_global_verification_and_retry_bullets(
     db_session, test_project,
 ):
@@ -1905,6 +1931,7 @@ async def test_configuration_preparation_enforces_effective_cli_runtime_before_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_configuration_changes_disclose_all_redacted_agent_fields_and_collateral_fingerprints(db_session, test_project):
     planner = _agent(PLANNER_ID, "Planner", "planning")
     db_session.add(Agent(**planner.__dict__))
@@ -1942,6 +1969,7 @@ async def test_configuration_changes_disclose_all_redacted_agent_fields_and_coll
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_configuration_summary_cannot_bypass_material_effect_disclosure_with_target_type_words(db_session, test_project):
     planner = _agent(PLANNER_ID, "Planner", "planning")
     db_session.add(Agent(**planner.__dict__))
@@ -2145,6 +2173,7 @@ async def test_registered_verifiers_pass_only_for_matching_real_linked_state(db_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_configuration_and_action_verifiers_reject_unlinked_completed_records(db_session, test_project):
     rows = await _c3_context(db_session, test_project, configuration=True)
     goal, run = rows["goal"], rows["run"]
@@ -2478,6 +2507,7 @@ async def test_c3_warning_requires_inactive_state_and_resolution_provenance(db_s
     "agent_definitions_reviewed", "missing_capabilities_handled", "independent_verification_possible_or_overridden",
     "proposal_provenance", "hash_provenance", "foreign_goal", "foreign_run", "foreign_project",
 ))
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c3_team_acceptance_requires_exact_sealed_state_fingerprints_gates_and_provenance(
     db_session, test_project, changed,
 ):
@@ -2664,6 +2694,7 @@ async def _c3_bound_receipt(db_session, rows, *, aggregate=False, artifact=False
         "failed_receipt", "unknown_effect", "waiting_without_live_producer", "foreign_goal", "foreign_run", "foreign_project",
     )),
 ))
+@pytest.mark.usefixtures("seal_without_post_state_validation")
 async def test_c3_action_completion_requires_immutable_receipt_wrapper_effect_and_approval_identity(
     db_session, test_project, mode, changed,
 ):

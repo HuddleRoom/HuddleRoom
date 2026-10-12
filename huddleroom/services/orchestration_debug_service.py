@@ -10,8 +10,11 @@ from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
+from huddleroom.services.agent_service import complete_roster_handoff
 from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
-from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+from huddleroom.services.orchestration_authority_service import (
+    RECOVERY_OWNED_KEY_PREFIXES, OrchestrationAuthorityDecisionService,
+)
 from huddleroom.services.orchestration_effectiveness_review import EffectivenessReviewProcess
 from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
 from huddleroom.services.orchestration_goal_definition import GoalDefinitionProcess
@@ -22,6 +25,11 @@ from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProces
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.orchestration_baseline_runtime import baseline_operation, BaselineSavepoint, require_baseline_available
+from huddleroom.services.orchestration_roster_mutation import (
+    RosterHandoffRequired,
+    commit_before_roster_handoff,
+    revalidate_roster_handoff,
+)
 from huddleroom.schemas.orchestration import valid_lm_retry_checkpoint
 
 SUPPORTED_PROCESS_TYPES = frozenset({
@@ -59,10 +67,28 @@ class OrchestrationDebugService:
         if await orchestration_service.get_goal(db, project_id, goal_id) is None:
             raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
+        try:
+            return await self._step_locked(db, project_id, goal_id, process_type, caller_owns_transaction)
+        except RosterHandoffRequired as handoff:
+            # Reservation published under the goal lock; apply roster-first, then
+            # resume the step under a fresh goal lock with revalidation.
+            return await complete_roster_handoff(
+                db, handoff.prepared,
+                lambda prepared: self._step_locked(
+                    db, project_id, goal_id, process_type, caller_owns_transaction, prepared=prepared
+                ),
+            )
+
+    async def _step_locked(
+        self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str,
+        caller_owns_transaction: bool, *, prepared=None,
+    ) -> dict:
+        orchestration_service = OrchestrationService()
         require_baseline_available(goal_id)
+        owns_transaction = not caller_owns_transaction and not db.in_nested_transaction()
         async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), baseline_operation(
-            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction()
-        ):
+            db, goal_id, owns_transaction=owns_transaction
+        ), commit_before_roster_handoff(db, owns_transaction):
             goal = await orchestration_service.get_goal(db, project_id, goal_id)
             if goal is None:
                 raise HTTPException(status_code=404, detail="Orchestration goal not found")
@@ -81,6 +107,8 @@ class OrchestrationDebugService:
             await db.refresh(run)
             if run.status not in LLM_DECISION_RUN_STATUSES:
                 raise HTTPException(status_code=409, detail=f"active run is '{run.status}'; not tickable")
+            if prepared is not None:
+                await revalidate_roster_handoff(db, prepared)
 
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
@@ -92,6 +120,9 @@ class OrchestrationDebugService:
                 nested = await BaselineSavepoint.create(db, goal_id)
                 try:
                     process_summary = await self._rerun_waiting_process(db, goal, run, current)
+                except RosterHandoffRequired:
+                    await nested.commit()  # the reservation must survive the handoff
+                    raise
                 except Exception:
                     await nested.rollback()
                     raise
@@ -116,12 +147,28 @@ class OrchestrationDebugService:
         caller_owns_transaction = (
             transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
         )
-        orchestration_service = OrchestrationService()
+        try:
+            return await self._retry_locked(db, project_id, goal_id, process_type, caller_owns_transaction)
+        except RosterHandoffRequired as handoff:
+            # The retried LM result reached an approved roster effect. The retry
+            # checkpoint is consumed, so resume continues the process like step().
+            return await complete_roster_handoff(
+                db, handoff.prepared,
+                lambda prepared: self._step_locked(
+                    db, project_id, goal_id, process_type, caller_owns_transaction, prepared=prepared
+                ),
+            )
 
+    async def _retry_locked(
+        self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str,
+        caller_owns_transaction: bool,
+    ) -> dict:
+        orchestration_service = OrchestrationService()
         require_baseline_available(goal_id)
+        owns_transaction = not caller_owns_transaction and not db.in_nested_transaction()
         async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), baseline_operation(
-            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction()
-        ):
+            db, goal_id, owns_transaction=owns_transaction
+        ), commit_before_roster_handoff(db, owns_transaction):
             goal = await orchestration_service.get_goal(db, project_id, goal_id)
             run = await orchestration_service.get_active_run_for_goal(db, project_id, goal_id)
             current = await OrchestrationProcessService().get_current(db, goal_id, process_type)
@@ -413,7 +460,12 @@ class OrchestrationDebugService:
         decision_service = OrchestrationAuthorityDecisionService()
         for decision in await decision_service.list_decisions(db, goal_id, status="pending"):
             if decision.source_process_run_id == process_run.id:
-                await decision_service.cancel_decision(
+                cancel = (
+                    decision_service.cancel_recovery_decision
+                    if decision.decision_key.startswith(RECOVERY_OWNED_KEY_PREFIXES)
+                    else decision_service.cancel_decision
+                )
+                await cancel(
                     db,
                     decision,
                     reason=f"manual rerun of process '{process_run.process_type}'",

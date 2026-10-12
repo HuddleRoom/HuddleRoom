@@ -100,6 +100,25 @@ def _stub_goal_shape_classifier(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_live_recovery_analyzer(request):
+    # ticks now diagnose recovery triggers. Without an injected completion the recovery analyzer
+    # would reach the configured provider; refuse instead (diagnosis records a rejected exchange). Tests that
+    # need an outcome stub RecoveryAnalyzer.analyze or inject completion_fn.
+    if any(request.node.get_closest_marker(m) for m in ("live", "integration")):
+        yield
+        return
+    from unittest.mock import patch
+
+    from huddleroom.services import orchestration_recovery_analyzer as analyzer_module
+
+    async def refuse(**_request):
+        raise RuntimeError("no live recovery analyzer provider in tests")
+
+    with patch.object(analyzer_module, "get_orchestration_completion", lambda completion_fn=None: completion_fn or refuse):
+        yield
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create a session-scoped event loop."""

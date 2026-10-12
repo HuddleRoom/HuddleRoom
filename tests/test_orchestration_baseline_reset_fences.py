@@ -168,3 +168,179 @@ async def test_rerun_postpublication_failure_restores_current_and_pending_questi
             assert question.status == "pending" and question.reason is None
     finally:
         await engine.dispose()
+
+
+# --------------------------------------------------------------------------- SPR 180/184: recovery reset fences
+#
+# Recovery honours the SPR 175/176 reset reservation instead of a parallel cancellation model: every
+# recovery phase checks require_baseline_available (and the original run identity) before any effect
+# and before its final commit. Harness: tests/test_orchestration_recovery_execution.py.
+
+from huddleroom.models.orchestration import OrchestrationAction  # noqa: E402
+from tests.test_orchestration_roster_mutation import seed_project_user, sessions  # noqa: E402,F401
+
+
+async def _recovery_at(db, project, user, monkeypatch, phase):
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+    from tests.test_orchestration_recovery_execution import (
+        Executors, ScriptedAnalyzer, approved, draft, propose, seed, trigger, verified, verify_call,
+    )
+
+    rows = await seed(db, project)
+    executors = Executors(monkeypatch, rows)
+    analyzer = ScriptedAnalyzer(draft(rows, verify_call(rows)))
+    flow = type("Flow", (), {})()
+    flow.rows, flow.executors, flow.trigger, flow.proposal = rows, executors, None, None
+    if phase == "diagnose":
+        flow.svc = OrchestrationBlockerRecoveryService(analyzer=analyzer)
+        flow.trigger = await flow.svc.create_trigger(db, trigger(rows))
+        return flow
+    if phase == "answer":
+        flow.svc, flow.proposal = await propose(db, rows, analyzer)
+        return flow
+    approved_flow = await approved(db, rows, user, verify_call(rows), analyzer=analyzer)
+    flow.svc, flow.proposal = approved_flow.svc, approved_flow.proposal
+    if phase == "verify":
+        await flow.svc.execute_next_call(db, flow.proposal)
+    elif phase == "retry":
+        await verified(db, approved_flow)
+    return flow
+
+
+async def _recovery_rows(db, run_id):
+    return sorted(((row.idempotency_key, row.status) for row in (await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run_id).execution_options(populate_existing=True))).all()))
+
+
+@pytest.mark.parametrize("phase", ("diagnose", "answer", "apply", "verify", "retry"))
+async def test_reset_reservation_fences_every_recovery_phase_before_any_effect(
+    db_session, test_project, test_user, monkeypatch, phase,
+):
+    flow = await _recovery_at(db_session, test_project, test_user, monkeypatch, phase)
+    rows = flow.rows
+    before = await _recovery_rows(db_session, rows.run.id)
+    calls_before = len(flow.executors.calls)
+    step = {
+        "diagnose": lambda: flow.svc.diagnose(db_session, flow.trigger.id),
+        "answer": lambda: flow.svc.reserve_answer(
+            db_session, decision, selected_option="approve_fix", reason=None, user_id=test_user.id),
+        "apply": lambda: flow.svc.execute_next_call(db_session, flow.proposal),
+        "verify": lambda: flow.svc.verify_proposal(db_session, flow.proposal),
+        "retry": lambda: flow.svc.retry_blocked_work(db_session, flow.proposal),
+    }[phase]
+    decision = None
+    if phase == "answer":
+        decision = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.related_action_id == flow.proposal.id))).one()
+
+    async with reset_baseline(rows.goal.id):
+        with pytest.raises(HTTPException) as exc:
+            await step()
+
+    assert exc.value.status_code == 409
+    assert await _recovery_rows(db_session, rows.run.id) == before, "a reserved reset admits no recovery write"
+    assert len(flow.executors.calls) == calls_before
+    if decision is not None:
+        await db_session.refresh(decision)
+        assert decision.status == "pending"
+
+
+async def test_reset_signalled_during_a_recovery_effect_discards_it_before_the_final_commit(sessions, tmp_path, monkeypatch):
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    from tests.test_orchestration_recovery_execution import ScriptedAnalyzer, approved, draft, seed, verify_call
+
+    async with sessions() as s:
+        project, user = await seed_project_user(s, tmp_path)
+        rows = await seed(s, project)
+        flow = await approved(s, rows, user, verify_call(rows), analyzer=ScriptedAnalyzer(draft(rows, verify_call(rows))))
+        await s.commit()
+        goal_id, run_id, proposal_id = rows.goal.id, rows.run.id, flow.proposal.id
+        wrapper_key = f"recovery:{flow.pid}:apply:call-1"
+    signalled = []
+
+    async def effect_then_reset(self, db, run_id, request, idempotency_key, decision_id=None, **extra):
+        action = await self.reserve_action(db, run_id, idempotency_key, "request_verification", request, decision_id)
+        runtime._resetting[goal_id] = runtime._resetting.get(goal_id, 0) + 1  # reset reserved mid-effect
+        signalled.append(True)
+        return await self._mark_action_completed(db, action, "task", rows.task.id)
+
+    monkeypatch.setattr(OrchestrationService, OrchestrationDecisionDispatcher._EXECUTORS["request_verification"],
+                        effect_then_reset)
+    try:
+        async with sessions() as s:
+            with pytest.raises(HTTPException) as exc:
+                await OrchestrationBlockerRecoveryService().resume(s, proposal_id)
+        assert exc.value.status_code == 409 and signalled
+    finally:
+        if runtime._resetting.get(goal_id):
+            runtime._resetting[goal_id] -= 1
+            if not runtime._resetting[goal_id]:
+                runtime._resetting.pop(goal_id)
+
+    async with sessions() as s:
+        wrapper = (await s.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.idempotency_key == wrapper_key))).one()
+        assert wrapper.status != "completed" and "tool_receipt_v1" not in (wrapper.dispatch_contract or {})
+        effect = (await s.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.idempotency_key == f"{wrapper_key}:effect"))).first()
+        assert effect is None or effect.status != "completed", "the discarded effect never reached its final commit"
+        retries = (await s.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_retry"))).all()
+        assert retries == []
+
+
+async def test_reset_during_recovery_diagnosis_discards_the_analyzer_result(sessions, tmp_path):
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+    from tests.test_orchestration_recovery_execution import draft, seed, trigger, verify_call
+
+    async with sessions() as s:
+        project, _user = await seed_project_user(s, tmp_path)
+        rows = await seed(s, project)
+        proposal_draft = draft(rows, verify_call(rows))
+        await s.commit()
+        project_id, goal_id, old_run_id = project.id, rows.goal.id, rows.run.id
+        trigger_model = trigger(rows)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class BlockingAnalyzer:
+        async def analyze(self, snapshot, *, project_id, evidence_query, on_raw=None):
+            entered.set()
+            await release.wait()  # the provider answers only after the reset began
+            return proposal_draft
+
+    svc = OrchestrationBlockerRecoveryService(analyzer=BlockingAnalyzer())
+    async with sessions() as s:
+        trigger_id = (await svc.create_trigger(s, trigger_model)).id
+        await s.commit()
+
+    async def diagnose():
+        async with sessions() as s:
+            return await svc.diagnose(s, trigger_id)
+
+    async def reset():
+        async with sessions() as s:
+            _goal, fresh = await OrchestrationService().reset_goal(s, project_id, goal_id)
+            return fresh.id
+
+    diagnosis = asyncio.create_task(diagnose())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        resetting = asyncio.create_task(reset())
+        await asyncio.sleep(0.2)
+        release.set()
+        fresh_id = await asyncio.wait_for(resetting, 10)
+        with pytest.raises(HTTPException) as exc:
+            await asyncio.wait_for(diagnosis, 10)
+        assert exc.value.status_code == 409
+    finally:
+        release.set()
+        await asyncio.gather(diagnosis, return_exceptions=True)
+
+    async with sessions() as s:
+        assert list((await s.scalars(select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id))).all()) == [fresh_id]
+        assert fresh_id != old_run_id
+        assert (await s.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == fresh_id))).all() == []
+        assert (await s.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.goal_id == goal_id))).all() == []

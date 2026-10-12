@@ -221,6 +221,18 @@ async def _team_configuration(db: AsyncSession, scope: _RecoveryScope) -> dict[s
     }
 
 
+def _attempt_summary(row: OrchestrationAction) -> dict[str, Any]:
+    """Compact attempt identity: lineage/attempt and the sealed tools, never the full sealed request."""
+    request, contract = row.request or {}, row.dispatch_contract or {}
+    summary = {"lineage_id": contract.get("lineage_id"), "attempt": contract.get("attempt"), "kind": request.get("kind")}
+    if isinstance(request.get("calls"), list):
+        summary["calls"] = [{"call_id": call.get("call_id"), "tool": call.get("tool")}
+                            for call in request["calls"] if isinstance(call, dict)]
+    if row.action_type == "recover_blocker":
+        summary["request"] = request
+    return _json(summary)
+
+
 class RecoveryContextBuilder:
     """Compose the fixed, durable recovery snapshot; no arbitrary model access."""
 
@@ -249,10 +261,15 @@ class RecoveryContextBuilder:
             if lineage_run is None:
                 break
             lineage_run_ids.append(lineage_run.id)
-        actions = list((await db.scalars(select(OrchestrationAction).where(
-            OrchestrationAction.run_id.in_(lineage_run_ids) if lineage_run_ids else False,
+        # The current run's attempts are the lineage too; a proposal belongs to this blocker only when
+        # its sealed source matches the trigger's stable identity.
+        source = {"kind": trigger.source_kind, "id": str(trigger.source_id), "blocker_code": trigger.blocker_code}
+        actions = [row for row in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id.in_([scope.run.id, *lineage_run_ids]),
             OrchestrationAction.action_type.in_(("recover_blocker", "recovery_proposal")),
-        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all())
+        ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id))).all()
+            if row.action_type == "recover_blocker" or row.run_id != scope.run.id
+            or {key: str((row.request or {}).get("source", {}).get(key)) for key in source} == source]
         context = {
             "goal_contract": _row(scope.goal, "id", "objective", "success_criteria", "constraints", "budget", "status"),
             "active_run": _row(scope.run, "id", "phase", "status", "active_blockers", "retry_state", "goal_contract_fingerprint"),
@@ -263,7 +280,8 @@ class RecoveryContextBuilder:
             "waits": [_row(row, "id", "owner", "awaited_event", "due_recheck_at") for row in waits],
             "warnings": [_row(row, "id", "warning_type", "severity", "message", "run_id", "related_action_id") for row in warnings],
             "team_configuration": await _team_configuration(db, scope),
-            "prior_lineage_attempts": [_row(row, "id", "run_id", "status", "request", "error") for row in actions],
+            "prior_lineage_attempts": [{**_row(row, "id", "run_id", "action_type", "status", "error"), **_attempt_summary(row)}
+                                       for row in actions],
             "registry_manifest": [manifest.model_dump(mode="json") for manifest in sorted(registry_manifest, key=lambda item: (item.name, item.version))],
         }
         return _bounded(context, RECOVERY_CONTEXT_MAX_BYTES, fixed_keys=(

@@ -1,4 +1,4 @@
-"""Task 9 acceptance tests for durable orchestration-worker ownership."""
+"""Acceptance tests for durable orchestration-worker ownership."""
 from datetime import datetime, timedelta, timezone
 import asyncio
 from types import SimpleNamespace
@@ -27,14 +27,17 @@ from huddleroom.workers import orchestration_recovery_tasks as recovery_tasks
 
 
 async def _owned(db, project, agent, *, session_status="running", task_status="in_progress", runner="runner-1",
-                 attempt=None, resumable=False, provider=None, goal_status="active"):
+                 attempt=None, resumable=False, provider=None, goal_status="active", approved_attempt=False):
     goal = OrchestrationGoal(project_id=project.id, objective="recover", original_request="recover",
                              success_criteria=[], constraints={}, budget={}, status=goal_status)
     db.add(goal); await db.flush()
     run = OrchestrationRun(goal_id=goal.id, status="paused" if goal_status == "paused" else "running", phase="baseline")
     db.add(run); await db.flush()
     db.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution", action_type="authorize_execution", status="completed")); await db.flush()
-    action = OrchestrationAction(run_id=run.id, idempotency_key=f"seed:{uuid.uuid4()}", action_type="retry_task", request={}, status="completed",
+    # approved_attempt: the owning action is an approved recovery effect, so ownership recovery may reconcile or
+    # resume that same approved attempt without new approval; an ordinary owner needs a proposal.
+    key = f"recovery:{uuid.uuid4()}:retry:1:effect" if approved_attempt else f"seed:{uuid.uuid4()}"
+    action = OrchestrationAction(run_id=run.id, idempotency_key=key, action_type="retry_task", request={}, status="completed",
         dispatch_contract={"owner": "orchestration_recovery"})
     db.add(action); await db.flush()
     task = Task(project_id=project.id, title="owned", description="owned", status=task_status, assigned_to=agent.id,
@@ -52,9 +55,10 @@ async def _owned(db, project, agent, *, session_status="running", task_status="i
 
 
 async def _applied(db, project, agent, *, status="running", backend="active", attempt=None, resumable=False,
-                   provider=None, goal_status="active", task_status="in_progress", runner="runner-1"):
+                   provider=None, goal_status="active", task_status="in_progress", runner="runner-1", approved_attempt=False):
     goal, run, action, task, session = await _owned(db, project, agent, session_status=status, task_status=task_status,
-        attempt=attempt, resumable=resumable, provider=provider, goal_status=goal_status, runner=runner)
+        attempt=attempt, resumable=resumable, provider=provider, goal_status=goal_status, runner=runner,
+        approved_attempt=approved_attempt)
     service = OrchestrationRecoveryService(); ready = datetime.now(timezone.utc) - timedelta(seconds=1)
     snapshot = await service.build_goal_snapshot(db, goal.id, ready)
     assert snapshot is not None and snapshot.sessions[0].session_id == session.id
@@ -399,6 +403,7 @@ async def test_interrupted_safe_settles_source_budget_before_replacement_reserva
             "claimed_runner_task_id": "runner-1", "attempt_version": 1,
             "effect_state": "not_started", "usage_complete": False,
         },
+        approved_attempt=True,  # replacement without new approval only for the approved attempt
     )
     goal.budget = {"caps": {"max_tokens": 20}}
     run.phase = "authorized"
@@ -861,6 +866,7 @@ async def test_definitive_pre_effect_failure_uses_existing_retry_key_once(db_ses
             "claimed_runner_task_id": "runner-1", "attempt_version": 1,
             "effect_state": "not_started", "usage_complete": False,
         },
+        approved_attempt=True,  # an ordinary owner gets a recovery trigger instead
     )
     assert result.classification == "interrupted_safe" and result.action_id is not None
     action = await db_session.get(OrchestrationAction, result.action_id)
@@ -870,12 +876,24 @@ async def test_definitive_pre_effect_failure_uses_existing_retry_key_once(db_ses
     assert action.dispatch_contract["task_id"] == str(task.id)
 
 
+async def _assert_failed_approved_attempt_routed_not_resumed(db, run, session, result, resumed):
+    """a durably failed APPROVED attempt is never exact-resumed without approval; its failure
+    goes to recovery (its lineage when known, else one trigger) and the failed session stays as it was."""
+    assert result.classification == "resume_exact" and resumed == []
+    retries = [a for a in await _run_actions(db, run, "retry_task") if not a.idempotency_key.startswith("recovery:")]
+    assert retries == []
+    assert len(await _run_actions(db, run, "recovery_trigger")) == 1
+    await db.refresh(session)
+    assert session.status == "failed" and not (session.metadata_ or {}).get("_recovery_exact")
+
+
 @pytest.mark.asyncio
-async def test_exact_resume_reuses_same_session_provider_and_retry_key_once(db_session, test_project, test_agent, monkeypatch):
+async def test_failed_approved_attempt_is_not_exact_resumed_without_approval(db_session, test_project, test_agent, monkeypatch):
     test_agent.cli_runtime = "claude_code"
     goal, _, _, task, session = await _owned(db_session, test_project, test_agent, session_status="failed", task_status="failed",
         resumable=True, provider="provider", attempt={"effect_state": "started", "usage_complete": True,
-            "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1})
+            "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1},
+        approved_attempt=True)  # exact resume without new approval only for the approved attempt
     session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     resumed = []
     original_resume = SessionService.resume
@@ -889,18 +907,18 @@ async def test_exact_resume_reuses_same_session_provider_and_retry_key_once(db_s
     snapshot = await service.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
     result = await service.apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "terminal_failure", datetime.now(timezone.utc))})
-    action = await db_session.get(OrchestrationAction, result.action_id)
-    assert result.classification == "resume_exact" and resumed == [session.id]
-    assert action.idempotency_key.endswith(f"task:{task.id}")
-    assert session.provider_session_id == "provider" and action.target_id == session.id
+    run = await db_session.get(OrchestrationRun, goal_run_id(snapshot))
+    await _assert_failed_approved_attempt_routed_not_resumed(db_session, run, session, result, resumed)
+    assert session.provider_session_id == "provider"
 
 
 @pytest.mark.asyncio
-async def test_fully_proven_failed_cli_resumes_when_backend_is_unavailable(db_session, test_project, test_agent, monkeypatch):
+async def test_fully_proven_failed_approved_cli_attempt_goes_to_recovery_when_backend_is_unavailable(db_session, test_project, test_agent, monkeypatch):
     test_agent.cli_runtime = "claude_code"
     goal, _, _, task, session = await _owned(db_session, test_project, test_agent, session_status="failed", task_status="failed",
         resumable=True, provider="provider", attempt={"effect_state": "started", "usage_complete": True,
-            "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1})
+            "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1},
+        approved_attempt=True)  # exact resume without new approval only for the approved attempt
     session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     resumed = []
     original_resume = SessionService.resume
@@ -910,33 +928,30 @@ async def test_fully_proven_failed_cli_resumes_when_backend_is_unavailable(db_se
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
     result = await OrchestrationRecoveryService().apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "unknown", datetime.now(timezone.utc))})
-    assert result.classification == "resume_exact" and resumed == [session.id]
+    run = await db_session.get(OrchestrationRun, goal_run_id(snapshot))
+    await _assert_failed_approved_attempt_routed_not_resumed(db_session, run, session, result, resumed)
 
 
 @pytest.mark.asyncio
-async def test_exact_resume_uses_existing_budget_accounting_and_complete_contract(db_session, test_project, test_agent):
+async def test_failed_approved_attempt_commits_no_resume_budget(db_session, test_project, test_agent):
     test_agent.cli_runtime = "claude_code"
     goal, run, source_action, task, session = await _owned(db_session, test_project, test_agent,
         session_status="failed", task_status="failed", resumable=True, provider="provider",
         attempt={"effect_state": "started", "usage_complete": True, "result_status": "failed",
-                 "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1})
+                 "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1},
+        approved_attempt=True)  # exact resume without new approval only for the approved attempt
     goal.budget = {"caps": {"max_tokens": 100}}
     run.phase = "authorized"
     task.metadata_ = {**task.metadata_, "orchestration_contract": {"budget": {"caps": {"max_tokens": 10}}}}
     session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
+    budget_before = (dict(source_action.budget_ledger or {}), dict(run.budget_state or {}))
     result = await OrchestrationRecoveryService().apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "terminal_failure", datetime.now(timezone.utc))})
-    action = await db_session.get(OrchestrationAction, result.action_id)
-    assert action.dispatch_contract["origin"] == "recovery_resume"
-    assert action.dispatch_contract["provider_session_id"] == "provider"
-    assert action.dispatch_contract["source_runner_task_id"] == "runner-1"
-    assert action.dispatch_contract["goal_id"] == str(goal.id)
-    assert action.dispatch_contract["run_id"] == str(run.id)
-    assert action.dispatch_contract["source_action_id"] == str(source_action.id)
-    assert action.dispatch_contract["task_id"] == str(task.id)
-    assert action.budget_ledger["committed"] == {"max_tokens": "10"}
-    assert session.metadata_["_run_config"]["max_tokens"] == 10
+    await _assert_failed_approved_attempt_routed_not_resumed(db_session, run, session, result, [])
+    # No new budget is committed for an unapproved resume.
+    assert (dict(source_action.budget_ledger or {}), dict(run.budget_state or {})) == budget_before
+    assert "_run_config" not in (session.metadata_ or {})
 
 
 @pytest.mark.asyncio
@@ -952,7 +967,7 @@ async def test_unproven_failed_attempt_reconciles_terminal_noop(db_session, test
     ("claude_code", "workspace"), ("claude_code", "path"), ("claude_code", "api_base"),
     ("claude_code", "openai_key"), ("codex", None),
 ))
-async def test_exact_resume_is_provable_despite_env_drift_and_for_codex(
+async def test_failed_approved_attempt_goes_to_recovery_despite_env_drift_and_for_codex(
     db_session, test_project, test_agent, monkeypatch, tmp_path, runtime, drift,
 ):
     test_agent.cli_runtime = runtime
@@ -960,6 +975,7 @@ async def test_exact_resume_is_provable_despite_env_drift_and_for_codex(
         db_session, test_project, test_agent, session_status="failed", task_status="failed", resumable=True,
         provider="provider", attempt={"effect_state": "started", "usage_complete": True,
             "result_status": "failed", "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1},
+        approved_attempt=True,  # exact resume without new approval only for the approved attempt
     )
     session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     if drift == "workspace":
@@ -982,8 +998,8 @@ async def test_exact_resume_is_provable_despite_env_drift_and_for_codex(
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
     result = await OrchestrationRecoveryService().apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "terminal_failure", datetime.now(timezone.utc))})
-    assert result.classification == "resume_exact" and resumed == [session.id]
-    assert session.metadata_["_recovery_exact"] is True
+    run = await db_session.get(OrchestrationRun, goal_run_id(snapshot))
+    await _assert_failed_approved_attempt_routed_not_resumed(db_session, run, session, result, resumed)
 
 
 @pytest.mark.asyncio
@@ -1219,12 +1235,13 @@ async def test_missing_exact_retry_proof_reconciles_terminal_without_dispatch(db
 
 
 @pytest.mark.asyncio
-async def test_resume_refusal_persists_actionable_attention(db_session, test_project, test_agent, monkeypatch):
+async def test_failed_approved_attempt_never_reaches_the_resume_executor(db_session, test_project, test_agent, monkeypatch):
     test_agent.cli_runtime = "claude_code"
     goal, run, source, task, session = await _owned(
         db_session, test_project, test_agent, session_status="failed", task_status="failed", resumable=True,
         provider="provider", attempt={"effect_state": "started", "usage_complete": True,
             "result_status": "failed", "provider_session_id": "provider"},
+        approved_attempt=True,  # exact resume without new approval only for the approved attempt
     )
     session.metadata_ = {**session.metadata_, "token_usage_complete": True}
     refused = []
@@ -1236,11 +1253,9 @@ async def test_resume_refusal_persists_actionable_attention(db_session, test_pro
     snapshot = await OrchestrationRecoveryService().build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
     result = await OrchestrationRecoveryService().apply_goal_recovery(db_session, snapshot, {
         session.id: RunnerObservation(session.runner_task_id, "terminal_failure", datetime.now(timezone.utc))})
-    assert result.action_id == refused[0] and result.wait_id is not None
-    failed = await db_session.get(OrchestrationAction, refused[0])
-    waits = list(await db_session.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id)))
-    assert failed.status == "failed" and failed.budget_ledger == {"reserved": {"max_tokens": "10"}}
-    assert len(waits) == 1 and waits[0].fallback["action_type"] == "attention"
+    # The executor is never reached, so there is nothing to refuse; recovery owns the failure instead.
+    assert refused == []
+    await _assert_failed_approved_attempt_routed_not_resumed(db_session, run, session, result, [])
 
 
 @pytest.mark.asyncio
@@ -1250,3 +1265,128 @@ async def test_recovery_state_preserves_sibling_sessions_and_action_wait_links(d
     value = next(iter(entry.values()))
     assert entry and result.wait_id and set(value) >= {"classification", "disposition", "backend_observation", "action_id", "wait_id"}
     assert value["action_id"] is None and value["wait_id"] == str(result.wait_id)
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: owned-session compatibility. Reconciling/adopting the identical
+# in-progress attempt needs no approval; a replacement or new attempt after durable failure
+# creates exactly one blocker-recovery trigger and changes nothing until approval.
+# ---------------------------------------------------------------------------
+
+
+def goal_run_id(snapshot):
+    return snapshot.run_id
+
+
+async def _run_actions(db, run, action_type):
+    return list((await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == action_type,
+    ).execution_options(populate_existing=True))).all())
+
+
+async def _owned_state(db, run, task, session, action):
+    await db.refresh(task); await db.refresh(session); await db.refresh(action)
+    sessions = list(await db.scalars(select(Session.id).where(Session.task_id == task.id)))
+    return (task.status, task.assigned_to, session.status, session.provider_session_id, sorted(map(str, sessions)),
+            action.budget_ledger, run.budget_state)
+
+
+async def _apply_twice(db, goal, session, backend):
+    service = OrchestrationRecoveryService()
+    results = []
+    for _ in range(2):
+        snapshot = await service.build_goal_snapshot(db, goal.id, datetime.now(timezone.utc))
+        results.append(await service.apply_goal_recovery(db, snapshot, {
+            session.id: RunnerObservation(session.runner_task_id, backend, datetime.now(timezone.utc))}))
+    return results
+
+
+@pytest.mark.asyncio
+async def test_owned_session_recovery_requires_proposal_for_new_attempt(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    """interrupted_safe: the dead pre-effect attempt is retired (non-corrective reconciliation: session failed,
+    source budget settled, task synced); only the replacement attempt waits for approval -- and the approved
+    retry can then actually run (no active-session/status deadlock)."""
+    goal, run, source_action, task, session = await _owned(
+        db_session, test_project, test_agent, session_status="pending",
+        attempt={"claimed_runner_task_id": "runner-1", "attempt_version": 1,
+                 "effect_state": "not_started", "usage_complete": False},
+    )
+    goal.budget = {"caps": {"max_tokens": 20}}
+    run.phase = "authorized"
+    source_action.budget_ledger = {
+        "allocation": {"max_tokens": "10"}, "reserved": {}, "committed": {"max_tokens": "10"},
+        "consumed": {}, "usage_state": "known", "enforceability": "enforceable",
+    }
+    task.metadata_ = {**task.metadata_, "orchestration_contract": {"budget": {"caps": {"max_tokens": 10}}}}
+    await db_session.flush()
+
+    await _apply_twice(db_session, goal, session, "unknown")
+
+    replacement_sessions = [s for s in await db_session.scalars(select(Session).where(Session.task_id == task.id))
+                            if s.id != session.id]
+    blocker_recovery_triggers = await _run_actions(db_session, run, "recovery_trigger")
+    assert replacement_sessions == []
+    assert len(blocker_recovery_triggers) == 1
+    assert blocker_recovery_triggers[0].request["run_id"] == str(run.id)
+    assert [a.id for a in await _run_actions(db_session, run, "retry_task")] == [source_action.id]
+    await db_session.refresh(task); await db_session.refresh(session); await db_session.refresh(source_action)
+    assert session.status == "failed" and task.status == "failed" and task.assigned_to == test_agent.id
+    assert source_action.budget_ledger["final_observation"].endswith(":interrupted_safe:final")
+
+    # The approved fix's retry (run under its recovery effect key) is no longer blocked by the dead session.
+    created = []
+
+    async def run_ok(_self, db, project_id, task_id, **_kwargs):
+        new = Session(project_id=project_id, agent_id=test_agent.id, task_id=task_id, adapter_type="cli",
+                      status="pending", metadata_={})
+        db.add(new)
+        await db.flush()
+        created.append(new.id)
+        return await db.get(Task, task_id), new.id
+
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", run_ok)
+    retry = await OrchestrationService().execute_retry_task_action(
+        db_session, run.id, {"action_type": "retry_task", "task_id": str(task.id)},
+        f"recovery:{uuid.uuid4()}:apply:call-1:effect",
+    )
+    assert retry.status == "completed" and len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_session_exact_resume_after_durable_failure_requires_proposal(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    """resume_exact used to commit a new budget and relaunch a durably failed attempt without approval."""
+    test_agent.cli_runtime = "claude_code"
+    goal, run, source_action, task, session = await _owned(
+        db_session, test_project, test_agent, session_status="failed", task_status="failed", resumable=True,
+        provider="provider", attempt={"effect_state": "started", "usage_complete": True, "result_status": "failed",
+                                      "provider_session_id": "provider", "token_count_in": 1, "token_count_out": 1})
+    session.metadata_ = {**session.metadata_, "token_usage_complete": True}
+    await db_session.flush()
+    resumed = []
+
+    async def resume_spy(_service, _db, session_id):
+        resumed.append(session_id)
+        raise AssertionError("a durably failed attempt must not be resumed without approval")
+
+    monkeypatch.setattr(SessionService, "resume", resume_spy)
+    before = await _owned_state(db_session, run, task, session, source_action)
+
+    await _apply_twice(db_session, goal, session, "terminal_failure")
+
+    assert resumed == []
+    assert [a.id for a in await _run_actions(db_session, run, "retry_task")] == [source_action.id]
+    assert len(await _run_actions(db_session, run, "recovery_trigger")) == 1
+    assert await _owned_state(db_session, run, task, session, source_action) == before
+
+
+@pytest.mark.asyncio
+async def test_owned_live_attempt_is_adopted_without_a_recovery_trigger(db_session, test_project, test_agent):
+    """Compatibility pin: adopting the identical in-progress attempt is not a corrective fix."""
+    result, _goal, run, _action, _task, _session = await _applied(db_session, test_project, test_agent, backend="active")
+
+    assert result.classification == "live" and result.wait_id
+    assert await _run_actions(db_session, run, "recovery_trigger") == []

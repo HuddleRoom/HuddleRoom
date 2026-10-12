@@ -24,6 +24,13 @@ from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_linkage import check_goal_linkage
 
 
+RECOVERY_DECISION_KEY_PREFIX = "recovery:"
+RECOVERY_GAP_DECISION_KEY_PREFIX = "recovery_gap:"
+# Every authority decision that owns a reserved recovery action; cancel only via cancel_recovery_decision.
+RECOVERY_OWNED_KEY_PREFIXES = (RECOVERY_DECISION_KEY_PREFIX, RECOVERY_GAP_DECISION_KEY_PREFIX)
+RECOVERY_APPROVAL_OPTIONS = (("approve_fix", "Approve fix"), ("reject", "Reject"))
+
+
 def runtime_decision_identity(
     run_id: uuid.UUID, subject: str, authority: str, contract_version: str
 ) -> str:
@@ -361,6 +368,48 @@ class OrchestrationAuthorityDecisionService:
             await db.refresh(current)
             return RuntimeAnswerResult(decision=current, continuation_applied=linked.rowcount == 1)
 
+    async def create_recovery_approval(
+        self,
+        db: AsyncSession,
+        goal_id: uuid.UUID,
+        *,
+        run_id: uuid.UUID,
+        proposal_action_id: uuid.UUID,
+        proposal_id: uuid.UUID,
+        proposal_hash: str,
+        question: str,
+        context: str,
+    ) -> OrchestrationAuthorityDecision:
+        """One human approve_fix/reject decision bound to the exact proposal hash."""
+        return await self.create_pending(
+            db, goal_id,
+            decision_key=f"{RECOVERY_DECISION_KEY_PREFIX}{proposal_id}:{proposal_hash}",
+            title="Fix proposal", question=question, authority="human",
+            options=[{"key": key, "label": label} for key, label in RECOVERY_APPROVAL_OPTIONS],
+            context=context, run_id=run_id, related_action_id=proposal_action_id,
+        )
+
+    async def answer_recovery_decision(
+        self,
+        db: AsyncSession,
+        decision: OrchestrationAuthorityDecision,
+        *,
+        selected_option: str,
+        reason: str | None,
+        decided_by_user_id: uuid.UUID,
+    ) -> OrchestrationAuthorityDecision:
+        """Record a recovery approval answer; callers own the drift check and goal lock."""
+        if not decision.decision_key.startswith(RECOVERY_DECISION_KEY_PREFIX):
+            raise ValueError("not a recovery proposal decision")
+        if selected_option not in {key for key, _ in RECOVERY_APPROVAL_OPTIONS}:
+            raise ValueError("recovery proposals accept only approve_fix or reject")
+        if selected_option == "reject" and not (reason and reason.strip()):
+            raise ValueError("rejecting a fix proposal requires a reason")
+        return await self._answer(
+            db, decision, selected_option=selected_option, reason=reason,
+            decided_by_user_id=decided_by_user_id, decided_by_agent_id=None,
+        )
+
     async def answer_decision(
         self,
         db: AsyncSession,
@@ -370,6 +419,25 @@ class OrchestrationAuthorityDecisionService:
         reason: str | None = None,
         decided_by_user_id: uuid.UUID | None = None,
         decided_by_agent_id: uuid.UUID | None = None,
+    ) -> OrchestrationAuthorityDecision:
+        # Recovery approvals must pass the proposal drift check first (spec: answer handling
+        # recognizes the recovery key prefix); the generic path can never approve one.
+        if decision.decision_key.startswith(RECOVERY_DECISION_KEY_PREFIX):
+            raise ValueError("recovery proposals must be answered through blocker recovery")
+        return await self._answer(
+            db, decision, selected_option=selected_option, reason=reason,
+            decided_by_user_id=decided_by_user_id, decided_by_agent_id=decided_by_agent_id,
+        )
+
+    async def _answer(
+        self,
+        db: AsyncSession,
+        decision: OrchestrationAuthorityDecision,
+        *,
+        selected_option: str,
+        reason: str | None,
+        decided_by_user_id: uuid.UUID | None,
+        decided_by_agent_id: uuid.UUID | None,
     ) -> OrchestrationAuthorityDecision:
         if decision.status != "pending":
             raise ValueError(f"cannot answer decision in status {decision.status!r}")
@@ -461,6 +529,39 @@ class OrchestrationAuthorityDecisionService:
             return decision
 
     async def cancel_decision(
+        self,
+        db: AsyncSession,
+        decision: OrchestrationAuthorityDecision,
+        *,
+        reason: str,
+    ) -> OrchestrationAuthorityDecision:
+        # A bare cancel would leave the linked recovery proposal / capability gap reserved forever.
+        if decision.decision_key.startswith(RECOVERY_OWNED_KEY_PREFIXES):
+            raise ValueError("recovery proposals must be cancelled through cancel_recovery_decision")
+        return await self._cancel(db, decision, reason=reason)
+
+    async def cancel_recovery_decision(
+        self,
+        db: AsyncSession,
+        decision: OrchestrationAuthorityDecision,
+        *,
+        reason: str,
+    ) -> OrchestrationAuthorityDecision:
+        """Cancel a recovery approval or capability-gap decision and fail its reserved proposal/gap action
+        with `reason` as the error."""
+        if not decision.decision_key.startswith(RECOVERY_OWNED_KEY_PREFIXES):
+            raise ValueError("not a recovery proposal decision")
+        decision = await self._cancel(db, decision, reason=reason)
+        if decision.related_action_id is not None:
+            from huddleroom.models.orchestration import OrchestrationAction
+            from huddleroom.services.orchestration_service import OrchestrationService
+
+            proposal = await db.get(OrchestrationAction, decision.related_action_id)
+            if proposal is not None and proposal.status == "reserved":
+                await OrchestrationService().mark_action_failed(db, proposal, reason)
+        return decision
+
+    async def _cancel(
         self,
         db: AsyncSession,
         decision: OrchestrationAuthorityDecision,

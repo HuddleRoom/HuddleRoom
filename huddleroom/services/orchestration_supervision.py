@@ -594,7 +594,11 @@ class OrchestrationSupervisionService:
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "needs_attention"}
             run.supervision_state = state
             return {"outcome": "needs_attention", "action_id": str(action.id)}
-        due = [wait for wait in waits if is_due(wait)]
+        def recovery_owned(wait):
+            # Recovery-owned waits (delegated remediation) are polled by the tick's recovery resume; they never
+            # fire the generic attention/noop fallback and stay an open wait until their lineage clears them.
+            return (wait.owner or {}).get("type") == "recovery"
+        due = [wait for wait in waits if is_due(wait) and not recovery_owned(wait)]
         if due:
             wait = due[0]
             wait.status, wait.cleared_at = "cleared", now
@@ -633,7 +637,7 @@ class OrchestrationSupervisionService:
             held |= {str((a.request or {}).get("gate_id")) for a in (await db.scalars(select(OrchestrationAction).where(
                 OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human",
                 OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()} - {"None", ""}
-        future = [wait for wait in waits if not is_due(wait)]
+        future = [wait for wait in waits if not is_due(wait) or recovery_owned(wait)]
         has_slot = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id)) > 0
         unreleased_items = unreleased_plan_item_ids(run)
         has_proactive_work = await self._has_proactive_work(situation_getter, held, has_slot)
@@ -743,11 +747,12 @@ class OrchestrationSupervisionService:
             canonical["source_session_id"] = str(source) if source else None
             key = self.orchestration._follow_up_delegation_key(run.id, canonical)
         else:
+            answered = 0
             if kind == "ask_human":  # same question replays regardless of origin
                 question = " ".join(str(canonical.get("question") or "").split()).lower()
                 basis = {"question": question, "gate_id": request.get("gate_id")}
                 # An identical question after the previous one was answered is a new ask.
-                answered = await db.scalar(select(func.count()).select_from(OrchestrationAction).join(
+                answered = await db.scalar(select(func.count()).select_from(OrchestrationAction).join(  # pylint: disable=not-callable
                     OrchestrationAuthorityDecision, OrchestrationAuthorityDecision.id == OrchestrationAction.target_id).where(
                     OrchestrationAction.run_id == run.id, OrchestrationAuthorityDecision.status != "pending",
                     OrchestrationAction.idempotency_key.like(

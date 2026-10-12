@@ -840,3 +840,48 @@ it('launches both submission refreshes without waiting for network requests', ()
   expect(mutation.onMutate({ goalId: 'goal-1' })).toBeUndefined()
   expect(invalidateQueries).toHaveBeenCalledTimes(2)
 })
+
+describe('blocker recovery proposals', () => {
+  const recovery = {
+    kind: 'recovery_proposal_v1', proposal_id: 'p-1', version: 1, status: 'pending_approval',
+    problem: 'Nobody can review the work.', general_updates: ['Add a reviewer'], after_approval: 'Blocked work resumes.',
+    global_effect: true, exact_details: { agent: 'reviewer' }, evidence: null, error: null,
+    source_blocker_id: 'b-1', source_action_id: null, source_decision_id: 'decision-1',
+  }
+
+  it('returns the typed recovery field untouched from the decisions list (answered decisions come from GET /decisions)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson([{ id: 'decision-1', status: 'answered', context: null, recovery }]))
+    vi.stubGlobal('fetch', fetchMock)
+    const decisions = await fetchOrchestrationDecisions('project-1', 'goal-1')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/projects/project-1/orchestration/goals/goal-1/decisions')
+    expect(decisions[0]).toHaveProperty('recovery', recovery)
+  })
+
+  it('posts approve_fix with no reason and no edited agent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({}))
+    vi.stubGlobal('fetch', fetchMock)
+    await answerOrchestrationDecision('project-1', 'goal-1', 'decision-1', 'approve_fix', '')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ selected_option: 'approve_fix', reason: null })
+  })
+
+  it('posts reject with the trimmed reason', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({}))
+    vi.stubGlobal('fetch', fetchMock)
+    await answerOrchestrationDecision('project-1', 'goal-1', 'decision-1', 'reject', '  Too broad.  ')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ selected_option: 'reject', reason: 'Too broad.' })
+  })
+
+  it('answer cache sync replaces the decision with the server record including its new recovery status', async () => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    const setQueryData = vi.fn()
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
+    const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
+      onSuccess: (data: unknown, variables: { goalId: string }) => Promise<void>
+    }
+    const answered = { id: 'decision-1', source_process_run_id: null, recovery: { ...recovery, status: 'applying' } }
+    await mutation.onSuccess({ decision: answered, process: null }, { goalId: 'goal-1' })
+    const updaters = setQueryData.mock.calls.map(([, updater]) => updater as (value: unknown) => unknown)
+    const decisionsUpdater = updaters[0]
+    expect(decisionsUpdater([{ id: 'decision-1', recovery }, { id: 'other' }])).toEqual([answered, { id: 'other' }])
+  })
+})

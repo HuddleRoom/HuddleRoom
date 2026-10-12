@@ -1065,3 +1065,35 @@ async def test_detail_ignores_malformed_authorization_wait(client, db_session, t
         response = await client.get(url)
         assert response.status_code == 200
         assert response.json()["authorization_wait"] is None
+
+
+@pytest.mark.asyncio
+async def test_ordinary_decisions_stay_backward_compatible_with_null_recovery(
+    client, db_session, auth_headers, test_project,
+):
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="Ordinary decision goal",
+        success_criteria=[], constraints={}, budget={},
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    decision = await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, goal.id, decision_key="ordinary:choice", title="Pick", question="Which?",
+        authority="human", options=[{"key": "a", "label": "A"}, {"key": "b", "label": "B"}],
+    )
+    base = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/decisions"
+
+    listed = await client.get(base, headers=auth_headers)
+    assert listed.status_code == 200
+    (item,) = listed.json()
+    assert "recovery" in item and item["recovery"] is None
+    checkpoint = await client.get(f"{base}/checkpoint", headers=auth_headers)
+    assert checkpoint.json()["items"][0]["recovery"] is None
+
+    answered = await client.post(f"{base}/{decision.id}/answer", json={"selected_option": "a"}, headers=auth_headers)
+    assert answered.status_code == 200
+    assert answered.json()["decision"]["status"] == "answered"
+    assert answered.json()["decision"]["recovery"] is None
+    assert answered.json()["continuation_applied"] is False

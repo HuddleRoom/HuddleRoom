@@ -28,7 +28,7 @@ PROGRESS_CONTRACT = (
     "Progress duty: move the goal to completion. Every decision must advance or unblock a success criterion. "
     "Wait only when every useful action is blocked on a named event or time.\n"
     "Fresh run (no accepted plan and no orchestrated work): normally request_plan with agent_id = plan_author.agent_id (the server-selected plan author; any other agent is rejected), or the best planning agent in the roster when plan_author.agent_id is null. "
-    "Use ask_human only when a missing owner decision truly blocks starting, and ask the owner the exact question. "
+    "Use ask_human only when the owner's answer itself removes the blocker, and ask the owner the exact question. "
     "If a plan task is already in flight, wait for it unless an independent investigation or review would improve "
     "a named decision or execution step: then create_delegation_task (work_function investigation or review) with "
     "decision_use naming that decision, concrete success_evidence, and no dependency on the unfinished plan. "
@@ -53,7 +53,11 @@ PROGRESS_CONTRACT = (
     '"do not start" wording is satisfied by that start. Specific restrictions still bind: live sends or messages, '
     "spending, purchases, account changes, publishing, and destructive operations. "
     "Route those actions to ask_human with the exact question for the owner.\n"
-    "Waiting: a wait (noop on the decision path, continue on the supervision path) must carry wake_when.\n"
+    "Waiting: a wait (noop on the decision path, continue on the supervision path) must carry wake_when. "
+    "Use noop only for observed in-flight work with a live event or recheck condition that can end the wait.\n"
+    "Blockers: use recover_blocker for configuration, capability, authority, or execution gaps that need a "
+    "proposed remedy; HuddleRoom diagnoses the blocker and asks the owner to approve any fix. "
+    "suggest_agent and record_warning never apply a fix.\n"
     "Reason: Top-level reason is required where the action schema lists it; otherwise it is optional but recommended. "
     "When present it states how the action advances or unblocks the goal."
 )

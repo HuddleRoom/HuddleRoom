@@ -2507,3 +2507,187 @@ async def test_direct_planning_and_delegation_require_terminal_team_hierarchy(
         "Goal definition, manager selection, agent definition review, and "
         "team hierarchy must complete before planning or delegation"
     )
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: approved hierarchy agent creation leaves the origin goal
+# lock before the roster-first apply, then resumes after fresh revalidation.
+# ---------------------------------------------------------------------------
+from tests.test_orchestration_roster_mutation import (  # noqa: E402
+    act_hierarchy_answer,
+    act_tick,
+    agents_named,
+    assert_entry_handoff,
+    decisions_for,
+    interfere_after_roster_release,
+    lock_tracer,  # noqa: F401 -- fixture
+    outcome_or_conflict,
+    seed_hierarchy_proposal,
+    sessions,  # noqa: F401 -- fixture
+    single_agent_write,
+    stub_prerequisite_processes,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["approve", "edit"])
+async def test_hierarchy_answer_reserves_under_goal_lock_then_creates_agent_roster_first(
+    sessions, tmp_path, monkeypatch, lock_tracer, option
+):
+    seeded = await seed_hierarchy_proposal(sessions, tmp_path, monkeypatch)
+    lock_tracer.start()
+    name = seeded.proposal_name if option == "approve" else f"edited-{seeded.proposal_name}"
+
+    await act_hierarchy_answer(sessions, seeded, option)
+
+    assert_entry_handoff(lock_tracer, seeded.goal_id)
+    single_agent_write(lock_tracer, name=name)
+    created = await agents_named(sessions, name)
+    assert len(created) == 1
+    decisions = await decisions_for(sessions, seeded.goal_id)
+    answered = next(item for item in decisions if item.id == seeded.decision_id)
+    assert answered.status == "answered"
+    if option == "approve":
+        assert json.loads(answered.reason)["created_agent_id"] == str(created[0].id)
+    assert any(item.decision_key == "team_hierarchy:approval" and item.status == "pending" for item in decisions)
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_tick_reserves_under_goal_lock_then_creates_agent_roster_first(
+    sessions, tmp_path, monkeypatch, lock_tracer
+):
+    seeded = await seed_hierarchy_proposal(sessions, tmp_path, monkeypatch, answer="approve")
+    lock_tracer.start()
+    stub_prerequisite_processes(monkeypatch, definition_review=True)
+
+    result = await act_tick(sessions, seeded)
+
+    assert_entry_handoff(lock_tracer, seeded.goal_id)
+    single_agent_write(lock_tracer, name=seeded.proposal_name)
+    assert len(await agents_named(sessions, seeded.proposal_name)) == 1
+    assert result["team_hierarchy_process"]["status"] == "waiting_decision"
+    assert any(
+        item.decision_key == "team_hierarchy:approval" and item.status == "pending"
+        for item in await decisions_for(sessions, seeded.goal_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_answer_resume_rejects_revoked_approval(sessions, tmp_path, monkeypatch, lock_tracer):
+    seeded = await seed_hierarchy_proposal(sessions, tmp_path, monkeypatch)
+    lock_tracer.start()
+    interfere_after_roster_release(lock_tracer, sessions, seeded, "approval_revoked")
+
+    await outcome_or_conflict(act_hierarchy_answer(sessions, seeded, "approve"))
+
+    single_agent_write(lock_tracer, name=seeded.proposal_name)
+    assert not any(
+        item.decision_key == "team_hierarchy:approval"
+        for item in await decisions_for(sessions, seeded.goal_id)
+    ), "the process resumed after its authorizing decision was revoked"
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: approved recovery writes a superseding, recovery-sourced
+# team_hierarchy snapshot through persist_recovery_acceptance, derived server-side
+# from the validated assignments -- no LM analysis, no hierarchy approval card.
+# ---------------------------------------------------------------------------
+from huddleroom.models.orchestration import OrchestrationAction  # noqa: E402
+from huddleroom.services.orchestration_team_hierarchy import accepted_role_map  # noqa: E402
+from tests.test_orchestration_recovery_configuration import (  # noqa: E402
+    PROVENANCE_KEYS as T8_PROVENANCE_KEYS,
+    applied_flow as cfg_applied_flow,
+    approved_flow as cfg_approved_flow,
+    arm_semantic_guard as cfg_arm_semantic_guard,
+    created_planner_id as cfg_created_planner_id,
+    current as cfg_current,
+    fresh_snapshot as cfg_fresh_snapshot,
+    load_flow as cfg_load_flow,
+    pending_review_decisions as cfg_pending_review_decisions,
+    seed_spr180 as cfg_seed_spr180,
+    sha as cfg_sha,
+)
+
+T8_GATES = ("team_structure_reviewed", "required_work_functions_mapped", "agent_definitions_reviewed",
+            "missing_capabilities_handled", "independent_verification_possible_or_overridden")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["create", "update"])
+async def test_recovery_hierarchy_snapshot_is_derived_server_side_with_provenance(
+    sessions, tmp_path, monkeypatch, mode
+):
+    seeded = await cfg_seed_spr180(sessions, tmp_path, mode=mode)
+    cfg_arm_semantic_guard(monkeypatch)
+    flow = await cfg_applied_flow(sessions, seeded)
+    async with sessions() as s:
+        proposal, call, _wrapper, authority = await cfg_load_flow(s, flow)
+        proposal_action = await s.get(OrchestrationAction, flow.proposal_action_id)
+        goal = await s.get(OrchestrationGoal, seeded.goal_id)
+        run = await s.get(OrchestrationRun, seeded.run_id)
+        planner, implementer = str(cfg_created_planner_id(proposal, seeded)), str(seeded.implementer_id)
+        hierarchy_run = await cfg_current(s, goal.id, "team_hierarchy")
+        outputs = hierarchy_run.outputs
+        assert hierarchy_run.trigger_reason == "approved_recovery" and hierarchy_run.status == "completed"
+        assert accepted_role_map(outputs) == {"planning": planner, "implementation": implementer,
+                                              "summarization": planner}
+        assert set(outputs["hierarchy"]["contributors"]) == {planner, implementer}
+        assert outputs["hierarchy"]["manager"]["kind"] == "human"
+        assert not outputs.get("documented_gaps")
+        assert all(outputs["gates"][gate] is True for gate in T8_GATES), outputs["gates"]
+        fingerprint = await TeamHierarchyProcess().current_fingerprint(s, goal, run)
+        assert outputs["fingerprint"] == hierarchy_run.input_snapshot["fingerprint"] == fingerprint
+        provenance = outputs["recovery_provenance"]
+        assert set(T8_PROVENANCE_KEYS) <= set(provenance)
+        assert provenance["proposal_id"] == str(proposal.proposal_id)
+        assert provenance["proposal_hash"] == proposal_action.dispatch_contract["proposal_hash"]
+        assert provenance["canonical_request_hash"] == cfg_sha(call.arguments)
+        assert provenance["authority_decision_id"] == str(authority.id)
+        assert await cfg_pending_review_decisions(s, goal.id) == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_acceptance_cancels_obsolete_pending_hierarchy_decisions(sessions, tmp_path, monkeypatch):
+    seeded = await cfg_seed_spr180(sessions, tmp_path)
+    async with sessions() as s:
+        hierarchy_run = await cfg_current(s, seeded.goal_id, "team_hierarchy")
+        obsolete = await OrchestrationAuthorityDecisionService().create_pending(
+            s, seeded.goal_id, decision_key=f"team_hierarchy:agent:{uuid.uuid4()}",
+            title="Review proposed agent", question="Approve, edit, or reject?", authority="human",
+            options=[{"key": "approve"}, {"key": "edit"}, {"key": "reject"}],
+            run_id=seeded.run_id, source_process_run_id=hierarchy_run.id,
+        )
+        await s.commit()
+    cfg_arm_semantic_guard(monkeypatch)
+    await cfg_applied_flow(sessions, seeded)
+    async with sessions() as s:
+        assert (await s.get(OrchestrationAuthorityDecision, obsolete.id)).status == "cancelled"
+        assert await cfg_pending_review_decisions(s, seeded.goal_id) == []
+        assert (await cfg_current(s, seeded.goal_id, "team_hierarchy")).trigger_reason == "approved_recovery"
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_persist_recovery_acceptance_rejects_untyped_payload_without_writes(
+    sessions, tmp_path, monkeypatch
+):
+    seeded = await cfg_seed_spr180(sessions, tmp_path)
+    cfg_arm_semantic_guard(monkeypatch)
+    flow = await cfg_approved_flow(sessions, seeded)
+    before = await cfg_fresh_snapshot(sessions, seeded.goal_id)
+    async with sessions() as s:
+        proposal, _call, _wrapper, authority = await cfg_load_flow(s, flow)
+        proposal_action = await s.get(OrchestrationAction, flow.proposal_action_id)
+        goal = await s.get(OrchestrationGoal, seeded.goal_id)
+        run = await s.get(OrchestrationRun, seeded.run_id)
+        with pytest.raises(Exception) as raised:
+            await TeamHierarchyProcess().persist_recovery_acceptance(
+                s, goal, run, accepted_payload={"assignments": "anyone", "unexpected": True},
+                proposal_id=proposal.proposal_id, proposal_hash=proposal_action.dispatch_contract["proposal_hash"],
+                authority_decision_id=authority.id, evidence=tuple(proposal.evidence),
+            )
+        assert not isinstance(raised.value, AttributeError), raised.value
+        try:
+            await s.commit()  # anything written before validation would now become visible
+        except Exception:  # noqa: BLE001
+            await s.rollback()
+    assert await cfg_fresh_snapshot(sessions, seeded.goal_id) == before

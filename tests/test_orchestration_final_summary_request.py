@@ -1455,17 +1455,22 @@ async def test_tick_resumes_reserved_complete_run_action(db_session, test_projec
     assert goal.status == "completed"
 
 
+async def _gate_triggers(db_session, run_id):
+    return [action for action in (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_trigger",
+    ))).all() if action.request["blocker_code"] == "final_summary_invalid"]
+
+
 @pytest.mark.asyncio
-async def test_invalid_summary_creates_one_replacement_and_valid_replacement_completes(
+async def test_invalid_summary_creates_one_recovery_trigger_not_a_replacement(
     db_session,
     test_project,
 ):
+    """a replacement summary task is a corrective fix -> one recovery trigger (owner approval),
+    never an automatic replacement delegation."""
     service, goal, run, writer, task, gate = await _request_summary(db_session, test_project)
     goal.weight = "trivial"
     await heal_baseline_drift_for_test(db_session, goal, run)
-    request_action_id = task.metadata_["orchestration_final_summary"]["request_action_id"]
-    accepted_gate_ids = task.metadata_["orchestration_final_summary"]["accepted_gate_ids"]
-    accepted_evidence_ids = task.metadata_["orchestration_final_summary"]["accepted_evidence_ids"]
     invalid_session = Session(
         agent_id=writer.id,
         task_id=task.id,
@@ -1485,6 +1490,7 @@ async def test_invalid_summary_creates_one_replacement_and_valid_replacement_com
         {"session_id": str(invalid_session.id), "task_id": str(task.id)},
         dedup_key=f"phase17-invalid-replacement:{invalid_session.id}",
     )
+    tasks_before = await db_session.scalar(select(func.count(Task.id)))
 
     failed_tick = await service.tick(db_session, run.id)
 
@@ -1496,171 +1502,50 @@ async def test_invalid_summary_creates_one_replacement_and_valid_replacement_com
             )
         )
     ).scalar_one()
-    replacement_actions = list(
-        (
-            await db_session.execute(
-                select(OrchestrationAction).where(
-                    OrchestrationAction.run_id == run.id,
-                    OrchestrationAction.idempotency_key
-                    == f"run:{run.id}:kind:create_delegation_task:final_summary:replacement:{failed_evidence.id}",
-                )
-            )
-        ).scalars().all()
-    )
+    replacement_key = f"run:{run.id}:kind:create_delegation_task:final_summary:replacement:{failed_evidence.id}"
     assert failed_tick["run_completed"] is False
     assert failed_tick["recoveries_created"] == 1
-    assert len(replacement_actions) == 1
-    replacement_action = replacement_actions[0]
-    replacement_task = await db_session.get(Task, replacement_action.target_id)
+    assert (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.idempotency_key == replacement_key))).all() == []
+    assert await db_session.scalar(select(func.count(Task.id))) == tasks_before
     await db_session.refresh(gate)
     assert gate.status == "failed"
-    assert replacement_action.action_type == "create_delegation_task"
-    assert replacement_task.id != task.id
-    assert replacement_task.metadata_["orchestration"]["gate_id"] == str(gate.id)
-    assert replacement_task.metadata_["orchestration"]["final_summary"] is True
-    assert replacement_task.metadata_["orchestration_final_summary"] == {
-        "request_action_id": request_action_id,
-        "gate_id": str(gate.id),
-        "accepted_gate_ids": accepted_gate_ids,
-        "accepted_evidence_ids": accepted_evidence_ids,
-    }
+    assert len(await _gate_triggers(db_session, run.id)) == 1
     await _complete_goal_definition(db_session, goal, run)
 
     replay = await service.tick(db_session, run.id)
     assert replay["recoveries_created"] == 0
-    assert await db_session.scalar(
-        select(func.count(OrchestrationAction.id)).where(
-            OrchestrationAction.run_id == run.id,
-            OrchestrationAction.idempotency_key
-            == f"run:{run.id}:kind:create_delegation_task:final_summary:replacement:{failed_evidence.id}",
-        )
-    ) == 1
-
-    valid_session = Session(
-        agent_id=replacement_task.assigned_to,
-        task_id=replacement_task.id,
-        project_id=test_project.id,
-        adapter_type="api",
-        status="completed",
-        output=await _valid_summary_output(db_session, goal, run),
-        metadata_={},
-        origin="auto",
-    )
-    db_session.add(valid_session)
-    await db_session.flush()
-    await emit_event_once(
-        db_session,
-        test_project.id,
-        "session.completed",
-        {"session_id": str(valid_session.id), "task_id": str(replacement_task.id)},
-        dedup_key=f"phase17-valid-replacement:{valid_session.id}",
-    )
-
-    completed_tick = await service.tick(db_session, run.id)
-
-    replacement_evidence = (
-        await db_session.execute(
-            select(OrchestrationEvidence).where(
-                OrchestrationEvidence.gate_id == gate.id,
-                OrchestrationEvidence.source_id == valid_session.id,
-            )
-        )
-    ).scalar_one()
-    completed_event = (await _events(db_session, test_project.id, "orchestration.run_completed"))[0]
-    await db_session.refresh(gate)
-    assert completed_tick["run_completed"] is True
-    assert gate.status == "accepted"
-    assert completed_event.payload["final_summary"] == {
-        "gate_id": str(gate.id),
-        "evidence_id": str(replacement_evidence.id),
-        "task_id": str(replacement_task.id),
-        "session_id": str(valid_session.id),
-        "agent_id": str(replacement_task.assigned_to),
-    }
+    assert len(await _gate_triggers(db_session, run.id)) == 1
 
 
 @pytest.mark.asyncio
-async def test_replacement_summary_key_is_stable_per_failed_evidence(db_session, test_project):
+async def test_recovery_trigger_is_stable_per_failed_summary_evidence(db_session, test_project):
     service, _goal, run, writer, task, gate = await _request_summary(db_session, test_project)
-    first_session = Session(
-        agent_id=writer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        adapter_type="api",
-        status="completed",
-        output="bad one",
-        metadata_={},
-        origin="auto",
-    )
-    db_session.add(first_session)
-    await db_session.flush()
-    await emit_event_once(
-        db_session,
-        test_project.id,
-        "session.completed",
-        {"session_id": str(first_session.id), "task_id": str(task.id)},
-        dedup_key=f"phase17-stable-replacement:{first_session.id}",
-    )
-    await service.tick(db_session, run.id)
-    first_evidence = (
-        await db_session.execute(
-            select(OrchestrationEvidence).where(
-                OrchestrationEvidence.gate_id == gate.id,
-                OrchestrationEvidence.source_id == first_session.id,
-            )
+
+    async def invalid(output):
+        session = Session(
+            agent_id=writer.id, task_id=task.id, project_id=test_project.id, adapter_type="api",
+            status="completed", output=output, metadata_={}, origin="auto",
         )
-    ).scalar_one()
-    first_key = f"run:{run.id}:kind:create_delegation_task:final_summary:replacement:{first_evidence.id}"
-    first_action = (
-        await db_session.execute(
-            select(OrchestrationAction).where(OrchestrationAction.idempotency_key == first_key)
+        db_session.add(session)
+        await db_session.flush()
+        await emit_event_once(
+            db_session, test_project.id, "session.completed",
+            {"session_id": str(session.id), "task_id": str(task.id)},
+            dedup_key=f"phase17-stable-replacement:{session.id}",
         )
-    ).scalar_one()
-    replacement_task = await db_session.get(Task, first_action.target_id)
+        await service.tick(db_session, run.id)
+
+    await invalid("bad one")
+    first = await _gate_triggers(db_session, run.id)
     await _complete_goal_definition(db_session, _goal, run)
-
     await service.tick(db_session, run.id)
-    assert await db_session.scalar(
-        select(func.count(OrchestrationAction.id)).where(
-            OrchestrationAction.idempotency_key == first_key
-        )
-    ) == 1
+    assert [row.id for row in await _gate_triggers(db_session, run.id)] == [row.id for row in first]
 
-    second_session = Session(
-        agent_id=replacement_task.assigned_to,
-        task_id=replacement_task.id,
-        project_id=test_project.id,
-        adapter_type="api",
-        status="completed",
-        output="bad two",
-        metadata_={},
-        origin="auto",
-    )
-    db_session.add(second_session)
-    await db_session.flush()
-    await emit_event_once(
-        db_session,
-        test_project.id,
-        "session.completed",
-        {"session_id": str(second_session.id), "task_id": str(replacement_task.id)},
-        dedup_key=f"phase17-stable-replacement:{second_session.id}",
-    )
-    await service.tick(db_session, run.id)
-    second_evidence = (
-        await db_session.execute(
-            select(OrchestrationEvidence).where(
-                OrchestrationEvidence.gate_id == gate.id,
-                OrchestrationEvidence.source_id == second_session.id,
-            )
-        )
-    ).scalar_one()
-    second_key = f"run:{run.id}:kind:create_delegation_task:final_summary:replacement:{second_evidence.id}"
-    assert second_key != first_key
-    assert await db_session.scalar(
-        select(func.count(OrchestrationAction.id)).where(
-            OrchestrationAction.idempotency_key.in_([first_key, second_key])
-        )
-    ) == 2
+    await invalid("bad two")
+    triggers = await _gate_triggers(db_session, run.id)
+    assert len(first) == 1 and len(triggers) == 2
+    assert len({row.request["source_id"] for row in triggers}) == 2  # one source per failed evidence
 
 
 @pytest.mark.asyncio

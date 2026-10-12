@@ -22,6 +22,7 @@ from huddleroom.services.agent_response_stream import AgentResponseInvocation, I
 
 
 MAX_RECOVERY_EVIDENCE_ROUNDS = 4
+RAW_OUTPUT_MAX_CHARS = 16_384
 _ASSESSMENT = TypeAdapter(RecoveryAssessmentV1)
 
 
@@ -57,12 +58,16 @@ class RecoveryAnalyzer:
         *,
         project_id: UUID,
         evidence_query: Callable[[RecoveryEvidenceQueryV1], Awaitable[EvidenceV1]],
+        on_raw: Callable[[str], None] | None = None,
     ) -> RecoveryAssessmentV1:
+        """`on_raw` receives each redacted, bounded raw model output (for audit storage)."""
         evidence: list[EvidenceV1] = []
         for _ in range(MAX_RECOVERY_EVIDENCE_ROUNDS + 1):
             request = self._request(snapshot, evidence)
 
             def parse(raw: str) -> Any:
+                if on_raw is not None:
+                    on_raw(_redact_secrets(raw)[:RAW_OUTPUT_MAX_CHARS])
                 payload = json.loads(raw)
                 if isinstance(payload, dict) and set(payload) == {"kind", "query"} and payload.get("kind") == "evidence_query":
                     return RECOVERY_EVIDENCE_QUERY_ADAPTER.validate_python(payload["query"])

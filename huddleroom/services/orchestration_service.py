@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
+import re
 from copy import deepcopy
 from decimal import Decimal
 from graphlib import CycleError, TopologicalSorter
@@ -12,7 +13,7 @@ import json
 import logging
 from textwrap import shorten
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from fastapi import HTTPException
@@ -58,6 +59,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationPlanItem,
     planning_envelope_report_schema,
 )
+from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
 from huddleroom.services.orchestration_plan_ingestion import (
     INGESTION_SOURCE,
@@ -127,8 +129,14 @@ from huddleroom.services.orchestration_dependencies import (
 
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
+RECOVERY_DIAGNOSIS_ERROR_BACKOFF_SECONDS = 60  # ponytail: fixed backoff; make it exponential if outages run long
 # Actions that hand off to a human or pause: `_act_until_wait` must not keep acting after them.
-_LOOP_STOP_ACTIONS = frozenset({"ask_human", "pause_run"})
+# recover_blocker / recovery_trigger: one tick never acts past a newly started recovery lineage.
+_LOOP_STOP_ACTIONS = frozenset({"ask_human", "pause_run", "recover_blocker", "recovery_trigger"})
+# Spec "Corrective-action ownership": these never repair state (accept_plan has its own approval contract).
+_NON_MUTATING_ACTIONS = frozenset({
+    "noop", "suggest_agent", "record_warning", "pause_run", "ask_human", "accept_plan", "recover_blocker",
+})
 ASK_HUMAN_EVENT_TYPE = "orchestration.human_input_required"
 NOOP_WAIT_EVENT_TYPE = "orchestration.waiting"
 AGENT_SUGGESTED_EVENT_TYPE = "orchestration.agent_suggested"
@@ -237,6 +245,17 @@ class _ReentrantAsyncioLock:
 # (review finding, MEDIUM) -- see _lock_goal_for_baseline_transition.
 _SQLITE_GOAL_LOCKS: dict[uuid.UUID, _ReentrantAsyncioLock] = {}
 _SQLITE_GOAL_LOCKS_GUARD = asyncio.Lock()
+
+# A baseline-repair admission (passed only by the dispatcher from a validated approve_fix recovery context,
+# never read from request JSON) is honored only for that approved call's own recovery effect key.
+_RECOVERY_APPLY_EFFECT_KEY = re.compile(r"recovery:[0-9a-f-]{36}:apply:[^:]+:effect")
+# Sealed delegate_remediation@1 contract keys kept verbatim on the canonical delegation request. The model
+# decision validator rejects them as unknown keys, so only the recovery broker's synthetic decision has them.
+REMEDIATION_REQUEST_KEYS = (
+    "objective", "expected_result", "requested_scope", "actual_execution_scope", "execution_evidence",
+    "deadline", "wait_events", "verifier", "retry_target",
+)
+
 
 
 class OrchestrationService:
@@ -1041,7 +1060,8 @@ class OrchestrationService:
     ) -> OrchestrationDecision | None:
         result = await db.execute(
             select(OrchestrationDecision)
-            .where(OrchestrationDecision.run_id == run_id)
+            # Recovery analyzer exchanges are not orchestrator loop decisions.
+            .where(OrchestrationDecision.run_id == run_id, OrchestrationDecision.decision_type != "recovery")
             .order_by(OrchestrationDecision.created_at.desc(), OrchestrationDecision.id.desc())
             .limit(1)
         )
@@ -1654,6 +1674,7 @@ class OrchestrationService:
         decision_id: uuid.UUID | None = None,
         skip_baseline_gate: bool = False,
         ad_hoc: bool = False,
+        baseline_repair_admission: BaselineRepairAdmissionV1 | None = None,
     ) -> OrchestrationAction:
         gate_run = await db.get(OrchestrationRun, run_id)
         if gate_run is None:
@@ -1668,7 +1689,10 @@ class OrchestrationService:
             # "waiting_decision") is itself blocking on, so gating them on baseline
             # readiness would deadlock -- the decision could never be delegated to
             # the agent who needs to answer it.
-            await self._ensure_baseline_processes_ready(db, gate_run.goal_id)
+            # An approved remediation may bypass only its one named failed process, and only for its own effect.
+            admission = (baseline_repair_admission
+                         if _RECOVERY_APPLY_EFFECT_KEY.fullmatch(idempotency_key or "") else None)
+            await self._ensure_baseline_processes_ready(db, gate_run.goal_id, admission=admission)
         request_to_store = self._canonical_delegation_task_request(request)
         if request_to_store["work_function"] == "follow_up":
             source_session_id = await self._follow_up_source_session_id(db, run_id, request_to_store)
@@ -1789,6 +1813,10 @@ class OrchestrationService:
         protected = (
             contract.work_function in {"verification", "final_summary", "report_clarification"}
             or ":verify_gate:" in idempotency_key or ":final_summary" in idempotency_key
+            # The approved final-summary recovery retry (server-built marker, never model-authored) is the same
+            # protected closeout work as the legacy replacement.
+            or (idempotency_key.startswith("recovery:")
+                and self._json_object_or_empty(contract.orchestrator_context).get("final_summary_recovery") is True)
         )
         # Discovery capacity is already reserved once per cycle by its durable
         # parent reservation; an action ledger would count that same hold twice.
@@ -3768,36 +3796,11 @@ class OrchestrationService:
         request: dict,
         idempotency_key: str,
         decision_id: uuid.UUID | None = None,
-        exact_source_session_id: uuid.UUID | None = None,
         recovery_disposition: str | None = None,
         source_session_id: uuid.UUID | None = None,
     ) -> OrchestrationAction:
         existing = await self._existing_action_for_key(db, run_id, idempotency_key)
-        if existing is not None and existing.status != "reserved" and exact_source_session_id is not None:
-            source = await db.get(Session, exact_source_session_id)
-            contract = self._json_object_or_empty(existing.dispatch_contract)
-            if not (
-                existing.status == "completed" and source is not None
-                and source.status in {"pending", "running"}
-                and existing.target_type == "session" and existing.target_id == source.id
-                and contract.get("owner") == "orchestration_recovery"
-                and contract.get("origin") == "recovery_resume"
-                and contract.get("recovery_disposition") == "resume_exact"
-                and contract.get("run_id") == str(run_id)
-                and contract.get("task_id") == str(source.task_id)
-                and contract.get("source_session_id") == str(source.id)
-                and contract.get("session_id") == str(source.id)
-                and contract.get("provider_session_id") == source.provider_session_id
-                and contract.get("current_runner_task_id") == source.runner_task_id
-                and (source.metadata_ or {}).get("orchestration", {}).get("action_id") == str(existing.id)
-            ):
-                raise HTTPException(status_code=409, detail="Exact continuation replay is not provable")
         request_to_store = existing.request if existing is not None else self._canonical_retry_task_request(request)
-        if exact_source_session_id is not None and existing is None:
-            task_id = self._required_uuid(request_to_store.get("task_id"), "task_id")
-            error = await self._exact_resume_proof(db, run_id, task_id, exact_source_session_id)
-            if error:
-                raise HTTPException(status_code=409, detail=error)
         action = await self.reserve_action(
             db,
             run_id=run_id,
@@ -3821,96 +3824,11 @@ class OrchestrationService:
         if await self._task_has_active_session(db, task.id):
             await self._fail_reserved_action_for_current_flow(db, action, "Task already has an active session")
             raise HTTPException(status_code=409, detail="Task already has an active session")
-        if exact_source_session_id is None and recovery_disposition is None:
+        if recovery_disposition is None:
             reason = await self._non_agent_failure_reason(db, task.id)
             if reason:
                 await self._fail_reserved_action_for_current_flow(db, action, reason)
                 raise HTTPException(status_code=409, detail=reason)
-        if exact_source_session_id is not None:
-            proof_error = await self._exact_resume_proof(db, run_id, task.id, exact_source_session_id)
-            if proof_error:
-                await self._fail_reserved_action_for_current_flow(db, action, proof_error)
-                return action
-            session = await db.get(Session, exact_source_session_id)
-            run = await db.get(OrchestrationRun, run_id)
-            goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
-            agent = await db.get(Agent, session.agent_id) if session is not None else None
-            metadata = session.metadata_ if session is not None and isinstance(session.metadata_, dict) else {}
-            attempt = metadata.get("attempt") if isinstance(metadata.get("attempt"), dict) else {}
-            source = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))
-            source_action_id = source.get("action_id")
-            if (session is None or run is None or goal is None or agent is None or session.task_id != task.id
-                    or goal.status != "active" or run.status != "running" or session.adapter_type != "cli"
-                    or (agent.config.get("cli_runtime", agent.cli_runtime or "claude_code") if agent is not None else None) not in {"claude_code", "codex"}
-                    or session.status != "failed" or not session.resumable or not session.provider_session_id
-                    or metadata.get("token_usage_complete") is not True
-                    or attempt.get("effect_state") != "started" or attempt.get("usage_complete") is not True
-                    or attempt.get("provider_session_id") not in (None, session.provider_session_id)
-                    or str(source.get("run_id")) != str(run_id) or not source_action_id):
-                await self._fail_reserved_action_for_current_flow(db, action, "Exact continuation is not provable")
-                return action
-            try:
-                await self._reserve_recovery_task_budget(db, run_id, action, task)
-            except HTTPException as exc:
-                await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
-                return action
-            task_metadata_before = task.metadata_
-            self._set_task_budget_action(task, action.id)
-            from huddleroom.services.session_service import SessionClaimAttention, SessionService
-            try:
-                source_runner_task_id = session.runner_task_id
-                resumed = await SessionService().resume(db, session.id)
-            except HTTPException as exc:
-                if isinstance(exc, SessionClaimAttention):
-                    await SessionService.persist_claim_attention(db, exc)
-                task.metadata_ = task_metadata_before
-                await self._release_recovery_action_budget(db, goal, run, action, "resume_refused")
-                await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
-                return action
-            if action.budget_ledger:
-                from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
-                try:
-                    await OrchestrationBudgetService().commit_action_budget(db, goal, run, action)
-                except HTTPException as exc:
-                    # The after-commit runner carries the old id; fencing it makes
-                    # the queued task a no-op before it reaches an adapter.
-                    resumed.status = "failed"
-                    resumed.resumable = True
-                    resumed.runner_task_id = None
-                    task.status = "failed"
-                    task.metadata_ = task_metadata_before
-                    await self._release_recovery_action_budget(db, goal, run, action, "budget_commit_refused")
-                    await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
-                    return action
-                allocation = self._json_object_or_empty(action.budget_ledger.get("allocation"))
-                config = dict((resumed.metadata_ or {}).get("_run_config", {}))
-                if "max_tokens" in allocation:
-                    config["max_tokens"] = int(allocation["max_tokens"])
-                if "max_hours" in allocation:
-                    config["timeout"] = int(Decimal(str(allocation["max_hours"])) * Decimal("3600"))
-                resumed.metadata_ = {**(resumed.metadata_ or {}), "_run_config": config}
-            resumed.metadata_ = {**(resumed.metadata_ or {}), "_recovery_exact": True}
-            resumed.metadata_ = {**resumed.metadata_, "orchestration": {"action_id": str(action.id)}}
-            task.status = "in_progress"
-            action.dispatch_contract = {
-                "owner": "orchestration_recovery", "origin": "recovery_resume",
-                "contract_version": "recovery_resume:1", "idempotency_key": action.idempotency_key,
-                "authority_basis": {"goal_status": goal.status, "run_status": run.status,
-                                    "source_action_id": str(source_action_id)},
-                "budget_basis": action.budget_ledger or {"mode": "unbudgeted"},
-                "retry_ceiling": {"maximum": 1, "attempt": 1},
-                "expected_result": "canonical_work_report", "recovery_disposition": "resume_exact",
-                "goal_id": str(goal.id), "run_id": str(run.id), "action_id": str(action.id),
-                "source_action_id": str(source_action_id), "source_session_id": str(session.id), "task_id": str(task.id),
-                "session_id": str(resumed.id), "provider_session_id": resumed.provider_session_id,
-                "source_runner_task_id": source_runner_task_id, "current_runner_task_id": resumed.runner_task_id,
-                "runner_task_id": resumed.runner_task_id,
-                "proof": {"attempt": attempt,
-                          "proved_at": datetime.now(timezone.utc).isoformat()},
-            }
-            self._remember_task_recovery(run, task.id, "resume_exact", action.id)
-            return await self._mark_action_completed(db, action, target_type="session", target_id=resumed.id)
-
         source_orchestration = self._json_object_or_empty(
             self._json_object_or_empty(task.metadata_).get("orchestration")
         )
@@ -4069,48 +3987,6 @@ class OrchestrationService:
             db, goal, run, action, amounts, enforceable=True,
         )
 
-    async def _release_recovery_action_budget(
-        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
-        action: OrchestrationAction, reason: str,
-    ) -> None:
-        """Settle an undispatched reservation at zero; never strand retry capacity."""
-        if not action.budget_ledger:
-            return
-        from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
-        await OrchestrationBudgetService().settle_action_budget(
-            db, goal, run, action, {}, measurement_complete=True,
-            observation_id=f"action:{action.id}:{reason}",
-        )
-
-    async def _exact_resume_proof(
-        self, db: AsyncSession, run_id: uuid.UUID, task_id: uuid.UUID, session_id: uuid.UUID,
-    ) -> str | None:
-        """Facts required before reserving an exact provider continuation."""
-        run = await db.get(OrchestrationRun, run_id, populate_existing=True)
-        goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True) if run is not None else None
-        task = await db.get(Task, task_id, populate_existing=True)
-        session = await db.get(Session, session_id, populate_existing=True)
-        agent = await db.get(Agent, session.agent_id, populate_existing=True) if session is not None else None
-        metadata = session.metadata_ if session is not None and isinstance(session.metadata_, dict) else {}
-        attempt = metadata.get("attempt") if isinstance(metadata.get("attempt"), dict) else {}
-        runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code") if agent is not None else None
-        source = self._json_object_or_empty(self._json_object_or_empty(task.metadata_ if task else {}).get("orchestration"))
-        source_action = await db.get(OrchestrationAction, uuid.UUID(str(source["action_id"])), populate_existing=True) if source.get("action_id") else None
-        counters = (attempt.get("token_count_in"), attempt.get("token_count_out"))
-        if (run is None or goal is None or task is None or session is None or agent is None
-                or goal.status != "active" or run.status != "running" or session.task_id != task.id
-                or task.status != "failed" or task.assigned_to != session.agent_id or session.adapter_type != "cli"
-                or runtime not in {"claude_code", "codex"}
-                or session.status != "failed" or not session.resumable or not session.provider_session_id
-                or metadata.get("token_usage_complete") is not True or attempt.get("effect_state") != "started"
-                or attempt.get("usage_complete") is not True or attempt.get("result_status") != "failed"
-                or attempt.get("provider_session_id") != session.provider_session_id
-                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 for value in counters)
-                or str(source.get("run_id")) != str(run_id) or not source_action
-                or source_action.run_id != run_id or source_action.status != "completed"):
-            return "Exact continuation is not provable"
-        return None
-
     def _set_task_budget_action(self, task: Task, action_id: uuid.UUID) -> None:
         metadata = self._json_object_or_empty(task.metadata_)
         task.metadata_ = {
@@ -4126,6 +4002,475 @@ class OrchestrationService:
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
         if goal is not None and run is not None and (await OrchestrationBudgetService().snapshot_for_run(db, goal, run))["caps"]:
             raise HTTPException(status_code=409, detail="Budgeted control provider requires measured session telemetry")
+
+    # ---- recovery triggers (SPR 180/184) ---------------------------------------------------
+
+    async def create_recovery_trigger(
+        self, db: AsyncSession, run: OrchestrationRun, *, source_kind: str, source_id: uuid.UUID,
+        blocker_code: str, summary: str, retry_target: dict[str, Any], fingerprint_basis: Any,
+    ) -> tuple[OrchestrationAction | None, bool]:
+        """Server-built ``RecoveryTriggerV1``; idempotent. Returns (trigger, newly created); (None, False) when
+        the source belongs to recovery's own lineage (never a recursive coordinator)."""
+        from huddleroom.schemas.orchestration_recovery import RecoveryTriggerV1
+        from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService, _trigger_key
+
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        trigger = RecoveryTriggerV1.model_validate({
+            "schema_version": 1, "goal_id": str(run.goal_id), "run_id": str(run.id), "source_kind": source_kind,
+            "source_id": str(source_id), "blocker_code": blocker_code[:255], "summary": summary[:4_000],
+            "source_fingerprint": fingerprint, "retry_target": retry_target,
+        })
+        existed = await self._existing_action_for_key(db, run.id, _trigger_key(trigger)) is not None
+        try:
+            action = await OrchestrationBlockerRecoveryService().create_trigger(db, trigger)
+        except ValueError:
+            return None, False
+        return action, not existed
+
+    async def open_recovery_trigger(
+        self, db: AsyncSession, run_id: uuid.UUID, source_fingerprint: str,
+    ) -> OrchestrationAction | None:
+        """A trigger with this fingerprint whose lineage is still open (awaiting diagnosis or approval/apply)."""
+        for row in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_trigger",
+        ))).all():
+            if (row.request or {}).get("source_fingerprint") != source_fingerprint:
+                continue
+            if row.status == "reserved":
+                return row
+            result = await db.get(OrchestrationAction, row.target_id) if row.target_id else None
+            if result is not None and result.status == "reserved":
+                return row
+        return None
+
+    async def recovery_holds_decision_loop(self, db: AsyncSession, run_id: uuid.UUID) -> bool:
+        """An approved proposal is applying/verifying/retrying toward a sealed retry other than the decision loop:
+        that retry owns progress this tick. A ``decision_loop`` retry never holds the loop it waits on."""
+        from huddleroom.services.orchestration_blocker_recovery import (
+            OrchestrationBlockerRecoveryService, RecoveryLifecycleStatus,
+        )
+
+        service = OrchestrationBlockerRecoveryService()
+        for proposal in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_proposal",
+            OrchestrationAction.status == "reserved",
+        ))).all():
+            target = ((proposal.request or {}).get("retry") or {}).get("target") or {}
+            if target.get("kind") in (None, "decision_loop"):
+                continue
+            if await service.project_status(db, proposal) in {
+                RecoveryLifecycleStatus.APPLYING, RecoveryLifecycleStatus.VERIFYING, RecoveryLifecycleStatus.RETRYING,
+            }:
+                return True
+        return False
+
+    async def open_recovery_trigger_for_action(
+        self, db: AsyncSession, run_id: uuid.UUID, action_type: str, request: dict[str, Any],
+    ) -> OrchestrationAction | None:
+        """An open lineage whose sealed retry re-runs this blocked action family (planning <-> request_plan; an
+        action target <-> the same action and request): a corrective re-selection joins it, no new lineage."""
+        def bare(value: Any) -> dict:
+            return {k: v for k, v in (value or {}).items() if k != "reason"}
+
+        for row in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_trigger",
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all():
+            target = (row.request or {}).get("retry_target") or {}
+            if target.get("kind") == "planning":
+                if action_type != "request_plan":
+                    continue
+            elif target.get("kind") == "action":
+                source = await db.get(OrchestrationAction, uuid.UUID(str(target.get("source_action_id"))))
+                if source is None or source.action_type != action_type or bare(source.request) != bare(request):
+                    continue
+            else:
+                continue
+            if row.status == "reserved":
+                return row
+            result = await db.get(OrchestrationAction, row.target_id) if row.target_id else None
+            if result is not None and result.id != row.id and result.status == "reserved":
+                return row
+        return None
+
+    async def open_recovery_lineage(
+        self, db: AsyncSession, run_id: uuid.UUID, source_kind: str, blocker_code: str | None = None,
+    ) -> OrchestrationAction | None:
+        """An open lineage (trigger awaiting diagnosis, or its outcome still awaiting approval/apply) of this kind."""
+        for row in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_trigger",
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all():
+            request = row.request or {}
+            if request.get("source_kind") != source_kind or blocker_code not in (None, request.get("blocker_code")):
+                continue
+            if row.status == "reserved":
+                return row
+            result = await db.get(OrchestrationAction, row.target_id) if row.target_id else None
+            if result is not None and result.id != row.id and result.status == "reserved":
+                return row
+        return None
+
+    async def _failure_source(
+        self, db: AsyncSession, run: OrchestrationRun, key: str, request: dict[str, Any],
+        target_type: str, target_id: uuid.UUID, error: str,
+    ) -> OrchestrationAction:
+        """Durable failed record of an observed failure that has no failed action of its own (a failed task
+        session, a failed gate); it is the ``failed_action`` source of the legacy-path recovery trigger."""
+        marker = await self.reserve_action(db, run.id, key, "failure_observed", request)
+        if marker.status == "reserved":
+            marker.target_type, marker.target_id = target_type, target_id
+            await self._fail_reserved_action_in_transaction(db, marker, error[:4_000])
+        return marker
+
+    async def _task_produced_by_recovery(self, db: AsyncSession, task: Task) -> bool:
+        """A delegated remediation task fails inside its own recovery lineage, never a new one."""
+        orchestration = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))
+        try:
+            action_id = uuid.UUID(str(orchestration.get("action_id")))
+        except ValueError:
+            return False
+        producer = await db.get(OrchestrationAction, action_id)
+        return producer is not None and producer.idempotency_key.startswith("recovery:")
+
+    async def _task_recovery_trigger(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task, *, blocker_code: str, summary: str,
+        closes_when_task_healthy: bool = True,
+    ) -> int:
+        """Legacy retry/reassign replacement: one trigger per failed-attempt episode, nothing mutated."""
+        if await self._task_produced_by_recovery(db, task):
+            return 0
+        session_id = await db.scalar(select(Session.id).where(Session.task_id == task.id, Session.status == "failed")
+                                     .order_by(Session.created_at.desc(), Session.id.desc()).limit(1))
+        effect = await self._recovery_effect_for_attempt(db, run, task)
+        if effect is not None and await self.route_failure_to_recovery_lineage(db, run, effect, summary):
+            return 0
+        episode = f"session:{session_id}" if session_id else f"status:{task.status}"
+        source = await self._failure_source(
+            db, run, f"run:{run.id}:kind:failure_observed:task:{task.id}:{episode}",
+            {"task_id": str(task.id), "session_id": str(session_id) if session_id else None,
+             "blocker_code": blocker_code, "closes_when_task_healthy": closes_when_task_healthy},
+            "task", task.id, summary,
+        )
+        _trigger, created = await self.create_recovery_trigger(
+            db, run, source_kind="failed_action", source_id=source.id, blocker_code=blocker_code, summary=summary,
+            retry_target={"kind": "decision_loop"}, fingerprint_basis={"source": str(source.id)},
+        )
+        return int(created)
+
+    async def _gate_recovery_trigger(
+        self, db: AsyncSession, run: OrchestrationRun, gate: OrchestrationGate, evidence_id: uuid.UUID,
+        *, blocker_code: str, summary: str, retry_action: dict[str, Any] | None = None,
+        link: dict[str, Any] | None = None,
+    ) -> int:
+        """Failed-gate replacement/fix work becomes one trigger per rejected evidence, nothing mutated.
+
+        The gate-linked creation the legacy path would have run is sealed on the source record as the
+        approved retry (``retry_action`` + ``link``): after approval the one retry dispatches it under the
+        recovery effect key and ``link_recovery_retry_effect`` links the new task to the gate."""
+        request = {"gate_id": str(gate.id), "evidence_id": str(evidence_id), "blocker_code": blocker_code}
+        if retry_action is not None:
+            request.update({"retry_action": retry_action, "link": link or {}})
+        source = await self._failure_source(
+            db, run, f"run:{run.id}:kind:failure_observed:gate:{gate.id}:evidence:{evidence_id}",
+            request, "gate", gate.id, summary,
+        )
+        retry_target = ({"kind": "action", "source_action_id": str(source.id)}
+                        if (source.request or {}).get("retry_action") else {"kind": "decision_loop"})
+        _trigger, created = await self.create_recovery_trigger(
+            db, run, source_kind="failed_action", source_id=source.id, blocker_code=blocker_code, summary=summary,
+            retry_target=retry_target, fingerprint_basis={"source": str(source.id)},
+        )
+        return int(created)
+
+    async def final_summary_retry_request(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+    ) -> dict[str, Any]:
+        """Build the approved replacement summary request now (fit + accepted manifest). Unavailable ->
+        ValueError, which fails the attempt into its lineage as evidence instead of crashing a tick."""
+        fits = await OrchestrationRosterMapper().rank_agents(
+            db, goal.project_id, FINAL_SUMMARY_WORK_FUNCTION, required_capabilities=[FINAL_SUMMARY_WORK_FUNCTION],
+        )
+        if not fits or fits[0].weak:
+            raise ValueError("final_summary_unavailable: no strong summarization agent fit")
+        try:
+            gates, evidence = await self._accepted_non_summary_manifest(db, run.id)
+        except HTTPException as exc:
+            raise ValueError(f"final_summary_unavailable: {exc.detail}") from None
+        request = self._final_summary_delegation_request(goal, run, fits[0].agent_id, gates, evidence)
+        request["orchestrator_context"] = {
+            **self._json_object_or_empty(request.get("orchestrator_context")), "final_summary_recovery": True,
+        }
+        return request
+
+    async def link_recovery_retry_effect(
+        self, db: AsyncSession, source: OrchestrationAction, effect: OrchestrationAction,
+    ) -> None:
+        """Link the task created by an approved gate retry to its gate, exactly as the legacy path did."""
+        link = self._json_object_or_empty((source.request or {}).get("link"))
+        if not link or effect.status != "completed" or effect.target_type != "task" or effect.target_id is None:
+            return
+        task = await db.get(Task, effect.target_id)
+        gate = await db.get(OrchestrationGate, uuid.UUID(str(link["gate_id"])))
+        if task is None or gate is None:
+            return
+        if link.get("kind") == "final_summary":
+            self._set_final_summary_task_metadata(task, gate, self._json_object_or_empty(link.get("final_summary")))
+        elif link.get("kind") == "review_fix":
+            metadata = self._json_object_or_empty(task.metadata_)
+            metadata["orchestration"] = {
+                **self._json_object_or_empty(metadata.get("orchestration")),
+                "plan_item_gate_id": str(gate.id), "recovery_kind": "review_rejected_fix",
+            }
+            task.metadata_ = metadata
+        await db.flush()
+
+    async def route_failure_to_recovery_lineage(
+        self, db: AsyncSession, run: OrchestrationRun, effect: OrchestrationAction, error: str,
+    ) -> bool:
+        """A failed attempt produced by an approved recovery effect belongs to that lineage: fail its still-active
+        attempt (feeding the lineage's next diagnosis) instead of starting another lineage. False when the
+        lineage already resolved (a new failure is a new blocker) or the proposal is unknown."""
+        parts = effect.idempotency_key.split(":")
+        if len(parts) < 3 or parts[0] != "recovery":
+            return False
+        proposal = await self._existing_action_for_key(db, run.id, f"recovery:{parts[1]}:proposal")
+        if proposal is None or proposal.status == "completed":
+            return False
+        if proposal.status == "reserved":
+            from huddleroom.schemas.orchestration_recovery import EvidenceV1
+            from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+            goal = await db.get(OrchestrationGoal, run.goal_id)
+            await OrchestrationBlockerRecoveryService()._fail_attempt(  # pylint: disable=protected-access
+                db, proposal, run, goal, error, [EvidenceV1(
+                    label="The approved attempt failed.", value={"error": error[:300]},
+                    source_kind="action", source_id=effect.id)],
+            )
+        return True  # failed proposals already re-entered diagnosis in their lineage
+
+    async def _recovery_effect_for_attempt(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task,
+    ) -> OrchestrationAction | None:
+        """The approved recovery effect (retry/reassign) that started this task's LATEST failed session, if any; an
+        older failure of a recovery attempt never swallows a later ordinary failure."""
+        rows = (await db.execute(select(Session.id, Session.created_at).where(
+            Session.task_id == task.id, Session.status == "failed"))).all()
+        if not rows:
+            return None
+        latest = max(created for _id, created in rows)
+        failed = [session_id for session_id, created in rows if created == latest]  # ties: same-instant writes
+        rows = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.target_id.in_(failed),
+            OrchestrationAction.idempotency_key.startswith("recovery:"),
+        ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id.desc()))).all()
+        return next((row for row in rows if row.idempotency_key.endswith(":effect")
+                     and str((row.request or {}).get("task_id")) == str(task.id)), None)
+
+    async def planning_preflight_trigger(self, db: AsyncSession, run_id: uuid.UUID, detail: str) -> None:
+        """A stable planning/preflight blocker (e.g. plan_author_unavailable) starts one recovery lineage per
+        team-configuration state; a recovery-applied configuration change is a new state."""
+        run = await db.get(OrchestrationRun, run_id)
+        if run is None or run.status not in ACTIVE_RUN_STATUSES:
+            return
+        from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+        processes = OrchestrationProcessService()
+        state = [str(getattr(await processes.get_current(db, run.goal_id, kind), "id", None))
+                 for kind in ("agent_definition_review", "team_hierarchy")]
+        await self.create_recovery_trigger(
+            db, run, source_kind="planning_preflight", source_id=run.id,
+            blocker_code=detail.split(":", 1)[0].strip(), summary=f"Planning cannot start: {detail}",
+            retry_target={"kind": "planning"}, fingerprint_basis={"detail": detail, "configuration": state},
+        )
+
+    async def live_work_refs(self, db: AsyncSession, run: OrchestrationRun, source) -> list:
+        """Server-built live producers of this run for ``OrchestrationWakeSourceService``; model output never
+        contributes. The service decides relevance to ``source`` and whether each producer can progress."""
+        from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+        from huddleroom.models.orchestration_steering import OrchestrationSteeringRequest
+        from huddleroom.services.orchestration_wake_source import LiveWorkRefV1
+
+        def ref(kind: str, row_id: uuid.UUID) -> LiveWorkRefV1:
+            return LiveWorkRefV1(kind, row_id, source.kind, source.id)
+
+        tasks = await self._orchestrated_tasks_for_run(
+            db, run.id, statuses=["backlog", "ready", "in_progress", "blocked", "failed"])
+        task_ids = [task.id for task in tasks]
+        refs = [ref("task", task.id) for task in tasks if task.status in {"backlog", "ready", "in_progress"}]
+        if task_ids:
+            refs += [ref("session", row) for row in await db.scalars(select(Session.id).where(
+                Session.task_id.in_(task_ids), Session.status.in_(("pending", "running"))))]
+            refs += [ref("meeting", row) for row in await db.scalars(select(Meeting.id).where(
+                Meeting.source_task_id.in_(task_ids),
+                Meeting.status.in_(("scheduled", "preparing", "active", "concluding"))))]
+            refs += [ref("graph_run", row) for row in await db.scalars(select(GraphRun.id).where(
+                GraphRun.linked_task_id.in_(task_ids), GraphRun.status == "active"))]
+        refs += [ref("steering_request", row) for row in await db.scalars(select(OrchestrationSteeringRequest.id).where(
+            OrchestrationSteeringRequest.goal_id == run.goal_id, OrchestrationSteeringRequest.submitted_run_id == run.id,
+            OrchestrationSteeringRequest.status.in_(("pending", "being_considered"))))]
+        refs += [ref("authority_decision", row) for row in await db.scalars(select(OrchestrationAuthorityDecision.id).where(
+            OrchestrationAuthorityDecision.goal_id == run.goal_id, OrchestrationAuthorityDecision.run_id == run.id,
+            OrchestrationAuthorityDecision.status == "pending"))]
+        return refs
+
+    async def _eventless_noop_trigger(self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision) -> None:
+        """SPR 184: an accepted noop whose wake has no relevant live producer becomes a recovery trigger. The
+        verdict comes from server-built live work only, never from the noop's prose."""
+        from huddleroom.services.orchestration_wake_source import OrchestrationWakeSourceService, SourceRef
+
+        wake_when = self._json_object_or_empty(decision.parsed_decision).get("wake_when")
+        if not isinstance(wake_when, Mapping):
+            return
+        source = SourceRef("run", run.id)
+        verdict = await OrchestrationWakeSourceService().evaluate(
+            db, run, blocked_source=source, wake_when=dict(wake_when),
+            live_work_refs=await self.live_work_refs(db, run, source),
+        )
+        if verdict.verdict == "live" or await self.open_recovery_lineage(db, run.id, "eventless_noop") is not None:
+            return  # one open eventless lineage per run: a stuck loop's repeated noops do not stack lineages
+        await self.create_recovery_trigger(
+            db, run, source_kind="eventless_noop", source_id=decision.id, blocker_code="eventless_noop",
+            summary=f"The orchestrator chose to wait, but no live work can end the wait ({verdict.reason_code}).",
+            retry_target={"kind": "decision_loop"}, fingerprint_basis={"decision": str(decision.id)},
+        )
+
+    async def execute_recover_blocker_action(
+        self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
+        decision_id: uuid.UUID | None = None,
+    ) -> OrchestrationAction:
+        """Non-mutating: records the reported blocker and starts its recovery lineage. Diagnosis runs later,
+        outside the decision path (tick), so no analyzer call happens here."""
+        action = await self.reserve_action(db, run_id, idempotency_key, "recover_blocker", deepcopy(request),
+                                           decision_id=decision_id)
+        if action.status != "reserved":
+            return action
+        run = await db.get(OrchestrationRun, run_id)
+        reason = self._optional_string(request.get("reason")) or "The orchestrator reported a blocker."
+        trigger = await self.open_recovery_lineage(db, run_id, "reported_blocker", "reported_blocker")
+        if trigger is not None:  # repeated reports while a lineage is open join it
+            await self._mark_action_completed(db, action, "orchestration_action", trigger.id)
+            return action
+        trigger, _created = await self.create_recovery_trigger(
+            db, run, source_kind="reported_blocker", source_id=decision_id or action.id, blocker_code="reported_blocker",
+            summary=reason, retry_target={"kind": "decision_loop"},
+            fingerprint_basis={"evidence_refs": request.get("evidence_refs") or []},
+        )
+        await self._mark_action_completed(db, action, "orchestration_action", trigger.id if trigger else action.id)
+        return action
+
+    async def classify_corrective_action(
+        self, db: AsyncSession, run: OrchestrationRun, action_type: str, request: dict[str, Any], *, source: str,
+    ) -> CorrectiveDisposition:
+        """Spec "Corrective-action ownership". Read-only; the disposition comes from durable task/gate/action
+        state and effect identity only, so ``source`` (the selecting path) and reason text never change it.
+
+        A corrective action may only resume the identical APPROVED pending effect; an ordinary action may
+        also resume its identical pending ordinary row (transport/provider retry)."""
+        del source
+        if action_type in _NON_MUTATING_ACTIONS:
+            return CorrectiveDisposition.ORDINARY  # records or asks; never a fix (spec: not mutation tools)
+        from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+        identity = OrchestrationDecisionDispatcher.action_key(run.id, action_type, request)
+        ordinary_key = identity
+        if action_type == "request_roadmap_replan":
+            try:
+                ordinary_key = await self.roadmap_replan_action_key(db, run)
+            except HTTPException:
+                ordinary_key = None  # no accepted version: no ordinary row can exist under that key
+        rows = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == action_type,
+            OrchestrationAction.status.in_(("reserved", "failed", "completed")),
+        ))).all()
+        same = [row for row in rows if row.status != "completed"
+                and OrchestrationDecisionDispatcher.action_key(run.id, action_type, row.request or {}) == identity]
+        effects = await self._recovery_effect_lineages(db, run, action_type, [
+            row for row in rows if row.status == "completed"
+            and row.idempotency_key.startswith("recovery:") and row.idempotency_key.endswith(":effect")])
+
+        def ordinary_row(row: OrchestrationAction) -> bool:
+            return ordinary_key is not None and (
+                row.idempotency_key == ordinary_key or row.idempotency_key.startswith(ordinary_key + ":"))
+
+        def recovered(row: OrchestrationAction) -> bool:
+            # B1/F1: a later completed approved effect recovered THIS failure only when its lineage names this row
+            # (sealed retry source / trigger source), it re-ran this exact identity, or it is the planning retry.
+            return any(created_at >= row.created_at and (row.id in sources or effect_identity == identity or planning)
+                       for created_at, sources, effect_identity, planning in effects)
+
+        corrective = action_type in {"retry_task", "reassign_task"} or any(
+            row.status == "failed" and ordinary_row(row)  # a new attempt after a durable failure
+            and not recovered(row) for row in same
+        ) or await self._has_corrective_source(db, run, action_type, request)
+        for row in same:
+            if row.status != "reserved":
+                continue
+            if row.idempotency_key.startswith("recovery:") and row.idempotency_key.endswith(":effect"):
+                wrapper = await self._existing_action_for_key(db, run.id, row.idempotency_key.removesuffix(":effect"))
+                if wrapper is not None and (wrapper.dispatch_contract or {}).get("effect_action_id") == str(row.id):
+                    return CorrectiveDisposition.SAME_ATTEMPT_RECONCILIATION
+            elif not corrective and ordinary_row(row):
+                return CorrectiveDisposition.SAME_ATTEMPT_RECONCILIATION
+        return CorrectiveDisposition.REQUIRES_RECOVERY if corrective else CorrectiveDisposition.ORDINARY
+
+    async def _recovery_effect_lineages(
+        self, db: AsyncSession, run: OrchestrationRun, action_type: str, effects: list[OrchestrationAction],
+    ) -> list[tuple[datetime, set[uuid.UUID], str, bool]]:
+        """(created_at, lineage source ids, canonical identity, planning retry) per completed recovery effect.
+        The proposal is found by the ``proposal_id`` embedded in the effect key ``recovery:<proposal_id>:...``."""
+        from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+        if not effects:
+            return []
+        proposals = {str((row.request or {}).get("proposal_id")): row.request or {}
+                     for row in (await db.scalars(select(OrchestrationAction).where(
+                         OrchestrationAction.run_id == run.id,
+                         OrchestrationAction.action_type == "recovery_proposal"))).all()}
+        lineages = []
+        for effect in effects:
+            proposal = proposals.get(effect.idempotency_key.split(":")[1], {})
+            target = (proposal.get("retry") or {}).get("target") or {}
+            sources = set()
+            for value in (target.get("source_action_id"), (proposal.get("source") or {}).get("id")):
+                try:
+                    sources.add(uuid.UUID(str(value)))
+                except ValueError:
+                    pass
+            lineages.append((effect.created_at, sources,
+                             OrchestrationDecisionDispatcher.action_key(run.id, action_type, effect.request or {}),
+                             target.get("kind") == "planning" and action_type == "request_plan"))
+        return lineages
+
+    async def _has_corrective_source(
+        self, db: AsyncSession, run: OrchestrationRun, action_type: str, request: dict[str, Any],
+    ) -> bool:
+        """The action targets a failed/blocked task or a failed gate. Recovery lineage alone is not a corrective
+        source: healthy work on a task produced by an approved recovery effect is ordinary ;
+        once that target durably fails or blocks, the status checks below make the next attempt corrective."""
+        task_ids, gate_ids = [], []
+        if action_type == "request_verification":
+            gate_ids.append(request.get("gate_id"))
+        elif action_type == "schedule_meeting":
+            task_ids.append(request.get("task_id"))
+            gate_ids.append(request.get("gate_id"))
+        elif action_type == "start_graph" and request.get("subject_type") == "task":
+            task_ids.append(request.get("subject_id"))
+        elif action_type == "request_plan_revision":
+            task_ids.append(request.get("plan_task_id"))
+        elif action_type == "create_delegation_task":
+            task_ids.append(request.get("parent_task_id"))  # a fix/replacement for its failed parent
+        elif action_type == "request_roadmap_replan":
+            return bool(await self._orchestrated_tasks_for_run(db, run.id, statuses=["failed"]))
+        task_ids = [uuid.UUID(str(value)) for value in task_ids if value]
+        gate_ids = [uuid.UUID(str(value)) for value in gate_ids if value]
+        if task_ids and await db.scalar(select(func.count(Task.id)).where(  # pylint: disable=not-callable
+            Task.id.in_(task_ids), Task.status.in_(("failed", "blocked")),
+            Task.metadata_["orchestration"]["run_id"].as_string() == str(run.id),
+        )):
+            return True
+        return bool(gate_ids) and bool(await db.scalar(select(func.count(OrchestrationGate.id)).where(  # pylint: disable=not-callable
+            OrchestrationGate.id.in_(gate_ids), OrchestrationGate.run_id == run.id, OrchestrationGate.status == "failed",
+        )))
 
     async def verification_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any) -> str:
         """Key suffix that makes a verification retryable: one attempt per prior FAILED
@@ -4156,26 +4501,13 @@ class OrchestrationService:
             return None
         metadata = session.metadata_ if isinstance(session.metadata_, dict) else {}
         attempt = metadata.get("attempt") if isinstance(metadata.get("attempt"), dict) else {}
+        if attempt.get("retired") == "interrupted_safe":
+            return None  # the runner died before effects; a fresh (approved) attempt is meaningful
         # effect_state is only written for orchestrated sessions; manual sessions carry no attempt record.
         never_ran = attempt.get("effect_state") != "started" if attempt else session.started_at is None
         if never_ran or (session.error or "").startswith("command_not_found"):
             return f"Not retryable: agent never ran ({session.error or 'unknown error'}); fix the cause before retrying"
         return None
-
-    async def _task_recovery_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, task_id: uuid.UUID) -> str:
-        """Key suffix for the next retry/reassign attempt of a task: one per prior
-        retry_task/reassign_task action that is not still reserved. Attempt 0 has no
-        suffix (legacy keys unchanged). Reserved rows are excluded so an in-flight
-        attempt replays onto its own key instead of minting a new one."""
-        rows = (await db.execute(
-            select(OrchestrationAction.request).where(
-                OrchestrationAction.run_id == run_id,
-                OrchestrationAction.action_type.in_(["retry_task", "reassign_task"]),
-                OrchestrationAction.status != "reserved",
-            )
-        )).scalars().all()
-        prior = sum(1 for req in rows if isinstance(req, dict) and str(req.get("task_id")) == str(task_id))
-        return f":a{prior}" if prior else ""
 
     async def execute_request_verification_action(
         self,
@@ -4538,8 +4870,19 @@ class OrchestrationService:
             "ask_human": self._canonical_ask_human_request,
             "pause_run": self._canonical_pause_run_request,
             "suggest_agent": self._canonical_suggest_agent_request,
+            "recover_blocker": self._canonical_recover_blocker_request,
         }
         return canonicalizers[action_type](request)
+
+    def _canonical_recover_blocker_request(self, request: Any) -> dict[str, Any]:
+        request_obj = self._json_object_or_empty(request)
+        refs = request_obj.get("evidence_refs") if isinstance(request_obj.get("evidence_refs"), list) else []
+        return {
+            "action_type": "recover_blocker",
+            "reason": self._optional_string(request_obj.get("reason")),
+            "evidence_refs": [{"kind": str(item.get("kind")), "id": str(item.get("id"))}
+                              for item in refs if isinstance(item, Mapping)],
+        }
 
     def _canonical_noop_request(self, request: Any) -> dict[str, Any]:
         return {
@@ -4595,6 +4938,7 @@ class OrchestrationService:
         }
         if context:
             canonical["orchestrator_context"] = context
+        canonical.update({key: request_obj[key] for key in REMEDIATION_REQUEST_KEYS if key in request_obj})
         title = request_obj.get("title")
         if isinstance(title, str) and title.strip():
             canonical["title"] = title.strip()
@@ -4763,13 +5107,6 @@ class OrchestrationService:
     @staticmethod
     def _final_summary_delegation_key(run_id: uuid.UUID) -> str:
         return f"run:{run_id}:kind:create_delegation_task:final_summary"
-
-    @staticmethod
-    def _final_summary_replacement_key(
-        run_id: uuid.UUID,
-        failed_evidence_id: uuid.UUID,
-    ) -> str:
-        return f"run:{run_id}:kind:create_delegation_task:final_summary:replacement:{failed_evidence_id}"
 
     @staticmethod
     def _complete_run_key(run_id: uuid.UUID) -> str:
@@ -5557,7 +5894,8 @@ class OrchestrationService:
         )
 
     async def _baseline_processes_ready_for_goal(
-        self, db: AsyncSession, goal_id: uuid.UUID, allow_heal: bool = True
+        self, db: AsyncSession, goal_id: uuid.UUID, allow_heal: bool = True,
+        admission: BaselineRepairAdmissionV1 | None = None,
     ) -> bool:
         """Check if all baseline processes are ready for a downstream transition.
 
@@ -5570,10 +5908,19 @@ class OrchestrationService:
         ) if run else {}
         if goal is not None and goal.parent_goal_id is not None and delta.get("status") == "accepted":
             return True
-        return await self._baseline_readiness_reason(db, goal_id, allow_heal=allow_heal) is None
+        return await self._baseline_readiness_reason(db, goal_id, allow_heal=allow_heal, admission=admission) is None
+
+    @staticmethod
+    def baseline_gate_fingerprint(process: OrchestrationProcessRun) -> str:
+        """Identity of one blocked baseline process run, as named by a baseline-repair admission."""
+        # Outputs (gates, decisions) carry the failure itself, so a changed failure is a different gate.
+        value = {"id": str(process.id), "process_type": process.process_type, "status": process.status,
+                 "input_fingerprint": (process.input_snapshot or {}).get("fingerprint"), "outputs": process.outputs}
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
     async def _baseline_readiness_reason(
-        self, db: AsyncSession, goal_id: uuid.UUID, allow_heal: bool = True
+        self, db: AsyncSession, goal_id: uuid.UUID, allow_heal: bool = True,
+        admission: BaselineRepairAdmissionV1 | None = None,
     ) -> str | None:
         """Return why the baseline processes are not ready, or None when ready.
 
@@ -5606,6 +5953,14 @@ class OrchestrationService:
             ):
                 # Reload current process with populate_existing inside lock (fix #3+#4).
                 current = await process_service.get_current(db, goal_id, process_type)
+                if (admission is not None and process_type == admission.process_type and current is not None
+                        and current.status not in ("completed", "skipped")):
+                    # Only a blocked (waiting_decision) run is admissible; a running/pending one is not a failure.
+                    # The one approved remediation admits exactly this failed run; any change rejects it.
+                    if (current.status != "waiting_decision" or current.id != admission.gate_id
+                            or self.baseline_gate_fingerprint(current) != admission.gate_fingerprint):
+                        return f"'{process_type}' changed since the approved repair admission"
+                    continue
                 if current is None or current.status not in ("completed", "skipped"):
                     return f"'{process_type}' is not yet complete"
                 if process_type == "manager_selection":
@@ -5700,7 +6055,8 @@ class OrchestrationService:
             return None
 
     async def _ensure_baseline_processes_ready(
-        self, db: AsyncSession, goal_id: uuid.UUID, allow_heal: bool = True
+        self, db: AsyncSession, goal_id: uuid.UUID, allow_heal: bool = True,
+        admission: BaselineRepairAdmissionV1 | None = None,
     ) -> None:
         """Shared gate (Phase 5 Finding 1, extended through Phase 8):
         every place that can move a run's plan_state forward or create a
@@ -5710,7 +6066,7 @@ class OrchestrationService:
 
         If allow_heal is False, reports stale answer without writing (fix #15).
         """
-        if not await self._baseline_processes_ready_for_goal(db, goal_id, allow_heal=allow_heal):
+        if not await self._baseline_processes_ready_for_goal(db, goal_id, allow_heal=allow_heal, admission=admission):
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -8753,6 +9109,13 @@ class OrchestrationService:
                     continue
             failure_counts[task.id] = max(1, len(failed_session_ids))
         for task in failed_tasks:
+            # An approved recovery attempt that failed again belongs to its own lineage (re-diagnosis there),
+            # never to the legacy ladder or a second lineage.
+            effect = await self._recovery_effect_for_attempt(db, run, task)
+            if task.id not in owned_task_ids and effect is not None and await self.route_failure_to_recovery_lineage(
+                    db, run, effect, f'Task "{task.title}" failed again after the approved fix.'):
+                owned_task_ids.add(task.id)
+        for task in failed_tasks:
             if task.id in owned_task_ids:
                 continue
             failure_count = failure_counts[task.id]
@@ -8903,7 +9266,6 @@ class OrchestrationService:
         ))).scalars().all()
         if any(str((act.request or {}).get("task_id")) == str(task.id) and in_episode(act) for act in prior):
             return None
-        attempt = await self._task_recovery_attempt_suffix(db, run.id, task.id)
         if agent_bad:
             work_function = self._task_work_function(task)
             fit = await self._best_recovery_agent(
@@ -8912,42 +9274,13 @@ class OrchestrationService:
             )
             if fit is None:
                 return None
-            action_type, extra = "reassign_task", {"agent_id": str(fit.agent_id)}
-            key = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{fit.agent_id}{attempt}"
-            execute = self.execute_reassign_task_action
+            code, summary = "task_blocked_agent_unavailable", "its agent is unavailable; reassignment needs approval"
         else:
-            action_type, extra = "retry_task", {}
-            key = f"run:{run.id}:kind:retry_task:task:{task.id}{attempt}"
-            execute = self.execute_retry_task_action
-        request = {"action_type": action_type, "task_id": str(task.id), **extra}
-        marks = self._side_effect_marks(db)
-        kept: HTTPException | None = None
-        try:
-            async with db.begin_nested():  # executor work (budget, task metadata) is all-or-nothing
-                try:
-                    await execute(db, run_id=run.id, request=request, idempotency_key=key)
-                except HTTPException as exc:
-                    if self._is_genuine_rejection(exc):
-                        raise
-                    kept = exc  # waits/5xx persist state on purpose
-            return None if kept is not None else 1
-        except HTTPException as exc:
-            # Rolled back; keep only the failed row so the episode check sees this attempt.
-            await self._after_savepoint_rollback(db, run, marks)
-            await db.refresh(task)
-            try:
-                async with db.begin_nested():
-                    failed = await self.reserve_action(
-                        db, run_id=run.id, idempotency_key=key, action_type=action_type, request=request,
-                    )
-                    if failed.status == "reserved":
-                        await self._fail_reserved_action_in_transaction(db, failed, str(exc.detail))
-            except HTTPException:
-                pass
-            return None
-        except Exception:
-            await self._after_savepoint_rollback(db, run, marks)
-            raise
+            code, summary = "task_blocked_session_failed", "its latest attempt failed; a retry needs approval"
+        # Retry/reassign are corrective fixes: one recovery lineage per blocked episode, nothing mutated.
+        return await self._task_recovery_trigger(
+            db, run, task, blocker_code=code, summary=f'Task "{task.title}" is blocked: {summary}.',
+        )
 
     async def _blocked_task_awaiting(
         self, db: AsyncSession, run: OrchestrationRun, task: Task
@@ -9015,9 +9348,6 @@ class OrchestrationService:
                 )
                 if latest_session_evidence is None or latest_session_evidence.verdict != "candidate":
                     continue
-                key = self._final_summary_replacement_key(run.id, latest_session_evidence.id)
-                if await self._existing_action_for_key(db, run.id, key) is not None:
-                    continue
                 source_session = (
                     await db.get(Session, latest_session_evidence.source_id)
                     if latest_session_evidence.source_id is not None
@@ -9030,42 +9360,17 @@ class OrchestrationService:
                 )
                 if source_task is None:
                     continue
-                source_metadata = self._json_object_or_empty(source_task.metadata_)
                 final_summary_metadata = self._json_object_or_empty(
-                    source_metadata.get("orchestration_final_summary")
+                    self._json_object_or_empty(source_task.metadata_).get("orchestration_final_summary")
                 )
-                fits = await OrchestrationRosterMapper().rank_agents(
-                    db,
-                    goal.project_id,
-                    FINAL_SUMMARY_WORK_FUNCTION,
-                    required_capabilities=[FINAL_SUMMARY_WORK_FUNCTION],
+                # A replacement summary task is a corrective fix: one recovery lineage per invalid summary. Only a
+                # typed marker is sealed; the gate-linked request (fit + accepted manifest) is built at retry time.
+                created += await self._gate_recovery_trigger(
+                    db, run, gate, latest_session_evidence.id, blocker_code="final_summary_invalid",
+                    summary=f"The final summary was rejected ({gate.failure_reason}); a replacement needs approval.",
+                    retry_action={"kind": "final_summary"},
+                    link={"kind": "final_summary", "gate_id": str(gate.id), "final_summary": final_summary_metadata},
                 )
-                if not fits or fits[0].weak:
-                    continue
-                gates, evidence = await self._accepted_non_summary_manifest(db, run.id)
-                replacement = await self.execute_create_delegation_task_action(
-                    db,
-                    run_id=run.id,
-                    request=self._final_summary_delegation_request(
-                        goal,
-                        run,
-                        fits[0].agent_id,
-                        gates,
-                        evidence,
-                    ),
-                    idempotency_key=key,
-                )
-                if replacement.status != "completed" or replacement.target_id is None:
-                    continue
-                replacement_task = await db.get(Task, replacement.target_id)
-                if replacement_task is None:
-                    continue
-                self._set_final_summary_task_metadata(
-                    replacement_task,
-                    gate,
-                    final_summary_metadata,
-                )
-                created += 1
                 continue
             if gate.failure_reason == "Evidence is stale":
                 if not baseline_ready:
@@ -9086,53 +9391,12 @@ class OrchestrationService:
         run: OrchestrationRun,
         task: Task,
     ) -> int:
-        work_function = self._task_work_function(task)
-        attempt = await self._task_recovery_attempt_suffix(db, run.id, task.id)
-        key = f"run:{run.id}:kind:retry_task:task:{task.id}{attempt}"
-        if await self._existing_action_for_key(db, run.id, key) is not None:
-            return 0
-        try:
-            await self.execute_retry_task_action(
-                db,
-                run_id=run.id,
-                request={"action_type": "retry_task", "task_id": str(task.id)},
-                idempotency_key=key,
-            )
-            return 1
-        except HTTPException:
-            gate_id = await self._gate_id_for_task(db, run.id, task)
-            ask_key = f"run:{run.id}:kind:ask_human:retry_task:{task.id}"
-            if await self._existing_action_for_key(db, run.id, ask_key) is not None:
-                return 0
-            ask = await self.execute_ask_human_action(
-                db,
-                run_id=run.id,
-                request={
-                    "action_type": "ask_human",
-                    "question": (
-                        "Task retry could not start and needs human help: "
-                        f"{task.title}"
-                    ),
-                    "work_function": work_function,
-                    "required_capabilities": [work_function],
-                    "candidate_agent_ids": [],
-                    "gate_id": str(gate_id) if gate_id else None,
-                    "reason": "Task retry failed to start during recovery.",
-                },
-                idempotency_key=ask_key,
-            )
-            self._mark_run_blocked(goal, run)
-            self._upsert_active_blocker(
-                run,
-                {
-                    "kind": "retry_required",
-                    "task_id": str(task.id),
-                    "gate_id": str(gate_id) if gate_id else None,
-                    "reason": "Task retry failed to start during recovery.",
-                    "decision_id": str(ask.target_id),
-                },
-            )
-            return 1
+        """Every corrective retry needs approval: start one recovery lineage instead of retrying."""
+        del goal
+        return await self._task_recovery_trigger(
+            db, run, task, blocker_code="task_failed",
+            summary=f'Task "{task.title}" failed; a new attempt is a corrective fix that needs approval.',
+        )
 
     async def _reassign_or_ask_human(
         self,
@@ -9151,30 +9415,11 @@ class OrchestrationService:
             exclude_agent_ids={task.assigned_to} if task.assigned_to else set(),
         )
         if fit is not None:
-            attempt = await self._task_recovery_attempt_suffix(db, run.id, task.id)
-            key = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{fit.agent_id}{attempt}"
-            existing = await self._existing_action_for_key(db, run.id, key)
-            if existing is None:
-                try:
-                    await self.execute_reassign_task_action(
-                        db,
-                        run_id=run.id,
-                        request={
-                            "action_type": "reassign_task",
-                            "task_id": str(task.id),
-                            "agent_id": str(fit.agent_id),
-                        },
-                        idempotency_key=key,
-                    )
-                    return 1
-                except HTTPException:
-                    # Reassign could not execute (agent went inactive, task raced,
-                    # session failed to start). Escalate to a human below instead of
-                    # aborting the whole recovery sweep.
-                    pass
-            elif existing.status != "failed":
-                return 0
-            # else: a prior reassign attempt failed -> fall through to human escalation.
+            # A reassignment is a corrective fix: recovery proposes it (or something better) for approval.
+            return await self._task_recovery_trigger(
+                db, run, task, blocker_code="task_failed_after_retry",
+                summary=f'Task "{task.title}" failed after the retry limit; reassignment needs approval.',
+            )
 
         key = f"run:{run.id}:kind:ask_human:reassign_task:{task.id}"
         if await self._existing_action_for_key(db, run.id, key) is not None:
@@ -9353,53 +9598,30 @@ class OrchestrationService:
                 },
             )
             return 1
-        action = await self.execute_create_delegation_task_action(
-            db,
-            run_id=run.id,
-            request={
-                "action_type": "create_delegation_task",
-                "agent_id": str(source_task.assigned_to),
-                "work_function": self._task_work_function(source_task),
-                "scope": (
-                    "Fix the rejected review findings for the linked orchestration gate. "
-                    "Keep the change scoped to the parent task deliverable."
-                ),
-                "inputs": [
-                    f"Parent task: {source_task.id}",
-                    f"Gate: {gate.id}",
-                    f"Rejected review evidence: {rejected.id}",
-                ],
-                "deliverable": "A corrected work item ready for fresh review.",
-                "forbidden_work": [
-                    "Do not mark orchestration gates complete.",
-                    "Do not edit unrelated artifacts.",
-                ],
-                "success_evidence": [
-                    "Complete the fix task and provide concrete evidence for a new review.",
-                ],
-                "budget": {},
-                "report_schema": {
-                    "status": "done|blocked|failed",
-                    "changes": "list[str]",
-                    "evidence": "list[str]",
-                    "notes": "str",
-                },
-                "parent_task_id": str(source_task.id),
-            },
-            idempotency_key=key,
+        # A fix task for rejected review is a corrective fix: one recovery lineage per rejected review; the
+        # gate-linked fix task is sealed as its approved retry.
+        request = {
+            "action_type": "create_delegation_task",
+            "agent_id": str(source_task.assigned_to),
+            "work_function": self._task_work_function(source_task),
+            "scope": (
+                "Fix the rejected review findings for the linked orchestration gate. "
+                "Keep the change scoped to the parent task deliverable."
+            ),
+            "inputs": [f"Parent task: {source_task.id}", f"Gate: {gate.id}", f"Rejected review evidence: {rejected.id}"],
+            "deliverable": "A corrected work item ready for fresh review.",
+            "forbidden_work": ["Do not mark orchestration gates complete.", "Do not edit unrelated artifacts."],
+            "success_evidence": ["Complete the fix task and provide concrete evidence for a new review."],
+            "budget": {},
+            "report_schema": {"status": "done|blocked|failed", "changes": "list[str]", "evidence": "list[str]", "notes": "str"},
+            "parent_task_id": str(source_task.id),
+        }
+        return await self._gate_recovery_trigger(
+            db, run, gate, rejected.id, blocker_code="review_rejected",
+            summary=f'Review rejected the work of task "{source_task.title}"; a fix task needs approval.',
+            retry_action={"action_type": "create_delegation_task", "request": request},
+            link={"kind": "review_fix", "gate_id": str(gate.id)},
         )
-        if action.status == "completed" and action.target_id is not None:
-            task = await db.get(Task, action.target_id)
-            if task is not None:
-                metadata = self._json_object_or_empty(task.metadata_)
-                orchestration = self._json_object_or_empty(metadata.get("orchestration"))
-                metadata["orchestration"] = {
-                    **orchestration,
-                    "plan_item_gate_id": str(gate.id),
-                    "recovery_kind": "review_rejected_fix",
-                }
-                task.metadata_ = metadata
-        return 1
 
     async def _pre_plan_lines(self, db: AsyncSession, run: OrchestrationRun, tasks: Sequence[Task]) -> list[str]:
         """One planner-facing line per pre-plan task: id | function | status | gate | title [| report: status: next step]."""
@@ -10427,6 +10649,9 @@ class OrchestrationService:
         if action is not None:
             if action.action_type == "noop" or action.status == "failed":
                 await self._create_noop_waits(db, run, decision)
+            if (action.action_type == "noop" and decision.validator_status == "accepted"
+                    and self._json_object_or_empty(decision.parsed_decision).get("action_type") == "noop"):
+                await self._eventless_noop_trigger(db, run, decision)
             return action
 
         parsed = self._json_object_or_empty(decision.parsed_decision)
@@ -10852,12 +11077,133 @@ class OrchestrationService:
         ]
 
     async def tick(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False) -> dict:
+        from huddleroom.services.orchestration_roster_mutation import RosterHandoffRequired
+
         try:
-            return await self._tick_baseline_impl(db, run_id, local_only=local_only)
+            if not local_only:
+                # B1: an approved fix progresses (apply/verify/retry) before the decision loop can re-select the
+                # blocked action; new triggers are diagnosed after the tick, below.
+                await self._drive_recovery(db, run_id, diagnose=False)
+            try:
+                result = await self._tick_baseline_impl(db, run_id, local_only=local_only)
+            except RosterHandoffRequired as handoff:
+                # The reservation was published under the goal lock, which is now
+                # released: apply roster-first, then a fresh tick resumes the goal.
+                from huddleroom.services.agent_service import complete_roster_handoff
+
+                result = await complete_roster_handoff(
+                    db, handoff.prepared,
+                    lambda _prepared: self._tick_baseline_impl(db, run_id, local_only=local_only),
+                )
         except HTTPException as exc:
             if exc.status_code == 409 and exc.detail == "Baseline operation discarded by reset":
                 return {"run_id": str(run_id), "status": "interrupted", "interrupted": True}
             raise
+        if not local_only:  # local-only passes are provider-free by contract
+            await self._drive_recovery(db, run_id)
+        return result
+
+    async def _drive_recovery(self, db: AsyncSession, run_id: uuid.UUID, *, diagnose: bool = True) -> None:
+        """Outside the tick's goal lock: resume every active proposal (apply/verify/retry progress,
+        delegated-remediation waits, in-wrapper retries), then diagnose reserved recovery triggers.
+        Approved proposals go first so a parallel trigger is never diagnosed ahead of an approved fix.
+
+        A tick-owned session commits before each step, so a trigger is durable and no SQLite write
+        transaction is held across the analyzer call. A domain failure (flushed only) is committed; any
+        other error rolls that step back and leaves the trigger/proposal for the next tick."""
+        from huddleroom.services.orchestration_blocker_recovery import (
+            OrchestrationBlockerRecoveryService, RecoveryDiagnosisFailed, RecoveryProposalStale,
+        )
+
+        transaction = db.sync_session.get_transaction()
+        owns = not db.in_nested_transaction() and (
+            transaction is None or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)
+
+        async def ids(action_type: str) -> list[uuid.UUID]:
+            return list(await db.scalars(select(OrchestrationAction.id).where(
+                OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == action_type,
+                OrchestrationAction.status == "reserved",
+            ).order_by(OrchestrationAction.created_at, OrchestrationAction.id)))
+
+        async def step(call, on_error=None) -> None:
+            if owns:
+                await db.commit()
+                try:
+                    await call()
+                except (RecoveryDiagnosisFailed, RecoveryProposalStale):
+                    pass
+                except Exception:  # noqa: BLE001 -- one recovery step never fails the tick
+                    await db.rollback()
+                    logger.warning("recovery step failed for run %s", run_id, exc_info=True)
+                    if on_error is not None:
+                        await on_error()
+                await db.commit()
+                return
+            try:
+                async with db.begin_nested():
+                    try:
+                        await call()
+                    except (RecoveryDiagnosisFailed, RecoveryProposalStale):
+                        pass
+            except Exception:  # noqa: BLE001
+                logger.warning("recovery step failed for run %s", run_id, exc_info=True)
+                if on_error is not None:
+                    await on_error()
+
+        def naive(value):
+            if value is None:
+                return datetime.min
+            return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+        async def next_trigger() -> uuid.UUID | None:
+            """Least recently attempted reserved trigger, so one that keeps failing never starves the others."""
+            triggers = list(await db.scalars(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "recovery_trigger",
+                OrchestrationAction.status == "reserved",
+            )))
+            if not triggers:
+                return None
+            attempted: dict[str, datetime] = {}
+            for exchange in await db.scalars(select(OrchestrationDecision).where(
+                    OrchestrationDecision.run_id == run_id, OrchestrationDecision.decision_type == "recovery")):
+                key = str((exchange.input_snapshot or {}).get("trigger_action_id"))
+                attempted[key] = max(attempted.get(key, datetime.min), naive(exchange.created_at))
+
+            def error_at(row):
+                value = (row.dispatch_contract or {}).get("last_diagnosis_error_at")
+                return naive(datetime.fromisoformat(value)) if value else datetime.min
+
+            def last_attempt(row):
+                return max(attempted.get(str(row.id), datetime.min), error_at(row))
+            # F3: back off a trigger whose diagnosis just errored (provider outage), instead of a call per tick.
+            cutoff = naive(_utcnow()) - timedelta(seconds=RECOVERY_DIAGNOSIS_ERROR_BACKOFF_SECONDS)
+            triggers = [row for row in triggers if error_at(row) <= cutoff]
+            if not triggers:
+                return None
+            return min(triggers, key=lambda row: (last_attempt(row), naive(row.created_at), str(row.id))).id
+
+        async def mark_diagnosis_error(trigger_id: uuid.UUID) -> None:
+            row = await db.get(OrchestrationAction, trigger_id)
+            if row is not None and row.status == "reserved":
+                row.dispatch_contract = {**(row.dispatch_contract or {}),
+                                         "last_diagnosis_error_at": _utcnow().isoformat()}
+                await db.flush()
+
+        try:
+            status = await db.scalar(select(OrchestrationRun.status).where(OrchestrationRun.id == run_id))
+            if status not in LLM_DECISION_RUN_STATUSES:
+                return
+            service = OrchestrationBlockerRecoveryService()
+            # Bounded: at most one analyzer diagnosis per run per tick, least recently attempted first.
+            for proposal_id in await ids("recovery_proposal"):
+                await step(lambda proposal_id=proposal_id: service.resume(db, proposal_id))
+            trigger_id = await next_trigger() if diagnose else None
+            if trigger_id is not None:
+                await step(lambda: service.diagnose(db, trigger_id),
+                           on_error=lambda: mark_diagnosis_error(trigger_id))
+        finally:
+            if owns:
+                await db.commit()  # the tick leaves no transaction open behind it
 
     async def _tick_baseline_impl(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False) -> dict:
         """No-op control-loop tick: consume new events, advance cursor, emit once."""
@@ -10877,6 +11223,7 @@ class OrchestrationService:
         goal_id = run_temp.goal_id
 
         from huddleroom.services.orchestration_baseline_runtime import baseline_operation, require_baseline_available
+        from huddleroom.services.orchestration_roster_mutation import commit_before_roster_handoff
         require_baseline_available(goal_id)
         # Lock goal-level to serialize concurrent ticks and force-starts on the same goal.
         # This prevents: (a) baseline_ready stale-gate race; (b) concurrent completion race.
@@ -10886,6 +11233,8 @@ class OrchestrationService:
             tick_owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(),
         ), baseline_operation(
             db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(), tick=True
+        ), commit_before_roster_handoff(
+            db, not caller_owns_transaction and not db.in_nested_transaction()
         ):
             # Reload run and goal inside lock with populate_existing=True (fix #5).
             run = await db.execute(
@@ -11225,6 +11574,8 @@ class OrchestrationService:
                         "dependency_cycle", "orphaned_ownership", "durable_source_active", "closeout_ready",
                     }:
                         authorized_execution = {"step": "local_liveness", **local_liveness}
+                    elif await self.recovery_holds_decision_loop(db, run.id):
+                        authorized_execution = {"step": "recovery_in_progress"}
                     elif goal.goal_type == "roadmap":
                         from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
 

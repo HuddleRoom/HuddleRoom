@@ -298,3 +298,129 @@ async def test_reset_goal_wipes_steering_rows_blocking_run_delete(db_session, te
     )).all()
     dossier = await ConversationDossierBuilder(db_session).build(goal, fresh_run, "Fresh question", prior_turns)
     assert dossier.dossier["prior_turns"] == []
+
+
+# --------------------------------------------------------------------------- SPR 180/184: recovery vs reset
+#
+# Reset during every recovery phase must leave the fresh run untouched: old-run recovery handles
+# (trigger, pending approval, approved apply, applied/verified proposal, delegated wait) can neither
+# resume nor write decisions/actions/tasks/warnings/snapshots/waits/retries after the reset. The
+# harness is the one in test_orchestration_recovery_execution.py (fake analyzer/executors).
+
+RECOVERY_RESET_PHASES = ("trigger", "pending_approval", "approved", "applied", "verified", "delegation_wait")
+
+
+async def _recovery_phase(db_session, test_project, test_user, monkeypatch, phase):
+    from tests.test_orchestration_recovery_execution import (
+        Executors, ScriptedAnalyzer, approved, bound_task, delegation_flow, draft, seed, trigger, verified, verify_call,
+    )
+
+    if phase == "delegation_wait":
+        flow = await delegation_flow(db_session, test_project, test_user, monkeypatch)
+        receipt = await flow.svc.execute_next_call(db_session, flow.proposal)
+        assert receipt.status == "waiting"
+        flow.task = await bound_task(db_session, receipt)
+        flow.trigger = None
+        flow.goal, flow.run, flow.executors = flow.rows.goal, flow.rows.run, flow.rows.retry_executors
+        return flow
+    rows = await seed(db_session, test_project)
+    rows.goal.status = "active"
+    executors = Executors(monkeypatch, rows)
+    analyzer = ScriptedAnalyzer(draft(rows, verify_call(rows)))
+    if phase == "trigger":
+        from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+        svc = OrchestrationBlockerRecoveryService(analyzer=analyzer)
+        trigger_action = await svc.create_trigger(db_session, trigger(rows))
+        return type("Flow", (), {"svc": svc, "trigger": trigger_action, "proposal": None, "goal": rows.goal,
+                                 "run": rows.run, "executors": executors, "analyzer": analyzer, "task": None})()
+    if phase == "pending_approval":
+        from tests.test_orchestration_recovery_execution import propose
+
+        svc, proposal = await propose(db_session, rows, analyzer)
+        flow = type("Flow", (), {})()
+        flow.svc, flow.proposal, flow.trigger, flow.analyzer = svc, proposal, None, analyzer
+    else:
+        flow = await approved(db_session, rows, test_user, verify_call(rows), analyzer=analyzer)
+        flow.trigger = None
+        if phase == "applied":
+            await flow.svc.execute_next_call(db_session, flow.proposal)
+        elif phase == "verified":
+            await verified(db_session, flow)
+    flow.goal, flow.run, flow.executors, flow.task = rows.goal, rows.run, executors, None
+    return flow
+
+
+async def _fresh_run_state(db_session, goal_id, project_id):
+    from huddleroom.models.orchestration import OrchestrationWait
+    from huddleroom.models.task import Task
+
+    run_ids = (await db_session.scalars(select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id))).all()
+    return {
+        "runs": list(run_ids),
+        "actions": await db_session.scalar(select(func.count(OrchestrationAction.id)).where(
+            OrchestrationAction.run_id.in_(run_ids))),
+        "decisions": await db_session.scalar(select(func.count(OrchestrationDecision.id)).where(
+            OrchestrationDecision.run_id.in_(run_ids))),
+        "waits": await db_session.scalar(select(func.count(OrchestrationWait.id)).where(
+            OrchestrationWait.run_id.in_(run_ids))),
+        "authority": await _count(db_session, OrchestrationAuthorityDecision, goal_id=goal_id),
+        "warnings": await _count(db_session, OrchestrationWarning, goal_id=goal_id),
+        "processes": await _count(db_session, OrchestrationProcessRun, goal_id=goal_id),
+        "tasks": await _count(db_session, Task, project_id=project_id),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", RECOVERY_RESET_PHASES)
+async def test_reset_during_recovery_phase_prevents_old_run_writes_in_the_fresh_run(
+    db_session, test_project, test_user, monkeypatch, phase,
+):
+    from fastapi import HTTPException
+
+    from huddleroom.schemas.orchestration_recovery import EvidenceV1
+    from huddleroom.services.orchestration_blocker_recovery import RecoveryProposalStale
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    flow = await _recovery_phase(db_session, test_project, test_user, monkeypatch, phase)
+    old_run_id = flow.run.id
+    old_proposal = flow.proposal
+    old_decision = None
+    if old_proposal is not None:
+        old_decision = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.related_action_id == old_proposal.id))).one()
+    calls_before = len(flow.executors.calls)
+
+    _goal, fresh = await OrchestrationService().reset_goal(db_session, test_project.id, flow.goal.id)
+    assert fresh.id != old_run_id
+    baseline = await _fresh_run_state(db_session, flow.goal.id, test_project.id)
+    assert baseline["runs"] == [fresh.id] and baseline["actions"] == 0 and baseline["authority"] == 0
+
+    if flow.task is not None:  # the delegated task outlives the run and finishes afterwards
+        flow.task.status = "done"
+        await db_session.flush()
+    stale = (ValueError, HTTPException, RecoveryProposalStale, LookupError)
+    attempts = []
+    if flow.trigger is not None:
+        attempts.append(lambda: flow.svc.diagnose(db_session, flow.trigger.id))
+    if old_proposal is not None:
+        attempts += [
+            lambda: flow.svc.resume(db_session, old_proposal.id),
+            lambda: flow.svc.execute_next_call(db_session, old_proposal),
+            lambda: flow.svc.verify_proposal(db_session, old_proposal),
+            lambda: flow.svc.retry_blocked_work(db_session, old_proposal),
+            lambda: flow.svc.rediagnose(db_session, old_proposal, EvidenceV1(
+                label="Old-run evidence.", value={"phase": phase}, source_kind="action", source_id=old_proposal.id)),
+        ]
+    if old_decision is not None and old_decision.status == "pending":
+        attempts.append(lambda: flow.svc.reserve_answer(
+            db_session, old_decision, selected_option="approve_fix", reason=None, user_id=test_user.id))
+    for call in attempts:
+        try:
+            result = await call()
+        except stale:
+            continue
+        assert not (isinstance(result, OrchestrationAction) and result.run_id == fresh.id), result
+
+    assert await _fresh_run_state(db_session, flow.goal.id, test_project.id) == baseline
+    assert len(flow.executors.calls) == calls_before, "no old-run effect or retry after the reset"

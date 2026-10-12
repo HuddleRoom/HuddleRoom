@@ -1,4 +1,4 @@
-"""Task 9 acceptance tests for goal-scoped memory provenance recovery."""
+"""Acceptance tests for goal-scoped memory provenance recovery."""
 import uuid
 from datetime import datetime, timezone
 
@@ -214,3 +214,53 @@ async def test_upgrade_replay_is_idempotent_and_never_invokes_start(db_session, 
         await service.apply_goal_recovery(db_session, snapshot, {})
     actions = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == run.id)))
     assert section.fact_status == "accepted" and len(actions) == 1 and started == []
+
+
+# ---------------------------------------------------------------------------
+# SPR 180/184: upgrade reconciliation stays a non-corrective reconciliation; when the
+# same pass would start a replacement attempt, that attempt becomes one blocker-recovery trigger.
+# ---------------------------------------------------------------------------
+
+
+async def _recovery_triggers(db, run):
+    return list(await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "recovery_trigger")))
+
+
+@pytest.mark.asyncio
+async def test_upgrade_uncertainty_wait_is_not_a_recovery_trigger(db_session, test_project):
+    """Compatibility pin: memory provenance reconciliation needs no approval."""
+    goal, run = await _goal_run(db_session, test_project)
+    await _section(db_session, goal, run, {"decision_id": str(uuid.uuid4())})
+    service = OrchestrationRecoveryService()
+    for _ in range(2):
+        snapshot = await service.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
+        await service.apply_goal_recovery(db_session, snapshot, {})
+    assert await _recovery_triggers(db_session, run) == []
+
+
+@pytest.mark.asyncio
+async def test_upgrade_pass_with_replacement_attempt_creates_one_trigger_and_no_new_session(
+    db_session, test_project, test_agent,
+):
+    from huddleroom.models.session import Session
+    from huddleroom.services.orchestration_recovery_service import RunnerObservation
+    from tests.test_orchestration_worker_ownership_recovery import _owned
+
+    goal, run, _action, task, session = await _owned(
+        db_session, test_project, test_agent, session_status="pending",
+        attempt={"claimed_runner_task_id": "runner-1", "attempt_version": 1,
+                 "effect_state": "not_started", "usage_complete": False},
+    )
+    await _section(db_session, goal, run, {"decision_id": str(uuid.uuid4())})  # unresolved provenance
+    service = OrchestrationRecoveryService()
+    for _ in range(2):
+        snapshot = await service.build_goal_snapshot(db_session, goal.id, datetime.now(timezone.utc))
+        await service.apply_goal_recovery(db_session, snapshot, {
+            session.id: RunnerObservation(session.runner_task_id, "unknown", datetime.now(timezone.utc))})
+
+    sessions = list(await db_session.scalars(select(Session).where(Session.task_id == task.id)))
+    # Fix-1 (C2): the dead pre-effect attempt is retired (non-corrective); only the replacement awaits approval.
+    await db_session.refresh(session)
+    assert [row.id for row in sessions] == [session.id] and session.status == "failed"
+    assert len(await _recovery_triggers(db_session, run)) == 1

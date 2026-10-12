@@ -1,4 +1,4 @@
-"""Task 9 acceptance tests for goal-first recovery scheduling and observation."""
+"""Acceptance tests for goal-first recovery scheduling and observation."""
 from datetime import datetime, timedelta, timezone
 import asyncio
 import time

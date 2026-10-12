@@ -785,3 +785,418 @@ describe('NeedsYouQueue', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// recovery FIX PROPOSAL card.
+// Interface assumptions (see task-14-tests-report.md):
+//  - NeedsYouQueueProps gains `recoveryDecisions: readonly OrchestrationAuthorityDecisionRecord[]`
+//    (every decision of the goal, from GET /decisions, any status) and
+//    `onAnswerRecoveryProposal(decision, 'approve_fix' | 'reject', reason, { onSuccess, onError, onSettled })`.
+//  - buildQueueRows accepts `recoveryDecisions` and emits `{ kind: 'recovery-proposal', decision }`.
+//  - Pending recovery decisions also appear in `checkpointItems` (server queue) and must NOT become generic rows.
+// ---------------------------------------------------------------------------
+type RecoveryStatus = 'pending_approval' | 'applying' | 'verifying' | 'retrying' | 'resolved' | 'rejected' | 'failed' | 'unsupported'
+
+function recoveryDecision(
+  id: string,
+  status: RecoveryStatus = 'pending_approval',
+  recoveryOverrides: Record<string, unknown> = {},
+  overrides: Partial<OrchestrationAuthorityDecisionRecord> = {},
+) {
+  return decision({
+    id, decision_key: `blocker_recovery:${id}`, title: 'Fix proposal', context: null,
+    options: ['approve_fix', 'reject'], recommendation: null,
+    status: status === 'pending_approval' ? 'pending' : 'answered',
+    ...overrides,
+    recovery: {
+      kind: 'recovery_proposal_v1', proposal_id: `proposal-${id}`, version: 1, status,
+      problem: 'No agent can review the finished work.',
+      general_updates: ['Add a code reviewer to the team', 'Let the reviewer sign off work'],
+      after_approval: 'The blocked review step restarts automatically.',
+      global_effect: true, exact_details: null, evidence: null, error: null,
+      source_blocker_id: 'blocker-1', source_action_id: null, source_decision_id: id,
+      ...recoveryOverrides,
+    },
+  } as unknown as Partial<OrchestrationAuthorityDecisionRecord>)
+}
+
+const STATUS_COPY: Array<[RecoveryStatus, string]> = [
+  ['applying', 'Applying approved fix…'],
+  ['verifying', 'Verifying update…'],
+  ['retrying', 'Update verified. Retrying blocked work…'],
+  ['resolved', 'Blocked work is moving again.'],
+  ['rejected', 'Fix rejected. Nothing was changed.'],
+  ['failed', 'The fix did not complete.'],
+  ['unsupported', 'No executable fix is available with the current tools.'],
+]
+
+function recoveryProps(items: OrchestrationAuthorityDecisionRecord[], extra: Record<string, unknown> = {}) {
+  const pending = items.filter((item) => item.status === 'pending')
+  return { checkpointItems: pending, recoveryDecisions: items, ...extra } as Partial<ComponentProps<typeof QueueHarness>>
+}
+
+function card(root: Parameters<typeof descendants>[0]) {
+  const heading = descendants(root).find((node) => node.tagName === 'H3' && ['FIX PROPOSAL', 'CAPABILITY NEEDED'].includes(textOf(node)))
+  if (!heading) throw new Error('FIX PROPOSAL card not found')
+  let node: typeof heading | null = heading
+  while (node && node.tagName !== 'LI') node = node.parentNode as typeof heading | null
+  return node!
+}
+
+const buttonsIn = (root: Parameters<typeof descendants>[0]) => descendants(root).filter((node) => node.tagName === 'BUTTON')
+const classOf = (node: { getAttribute: (name: string) => string | null }) => node.getAttribute('class') ?? ''
+
+describe('buildQueueRows recovery proposals', () => {
+  const criteriaByKey = new Map<string, string>()
+  const build = (checkpointItems: OrchestrationAuthorityDecisionRecord[], recoveryDecisions: OrchestrationAuthorityDecisionRecord[]) =>
+    (buildQueueRows as unknown as (input: unknown) => Array<{ kind: string; decision?: { id: string } }>)({
+      run: run(), processes: [], checkpointItems, recoveryDecisions, gates: [], warnings: [], criteriaByKey,
+    })
+
+  it('emits a recovery-proposal row, never a generic answer row, for a pending recovery decision', () => {
+    const pending = recoveryDecision('rec-1')
+    expect(build([pending], [pending]).map((row) => row.kind)).toEqual(['recovery-proposal'])
+  })
+
+  it('keeps a pending recovery card in checkpoint server order among other decisions', () => {
+    const a = decision({ id: 'a', source_process_run_id: null })
+    const b = decision({ id: 'b', source_process_run_id: null })
+    const rec = recoveryDecision('rec-1')
+    const rows = build([a, rec, b], [a, rec, b])
+    expect(rows.map((row) => row.kind)).toEqual(['answer', 'recovery-proposal', 'answer'])
+  })
+
+  it('shows only the newest recovery decision per source_blocker_id', () => {
+    const older = recoveryDecision('older', 'failed', {}, { created_at: '2026-08-05T08:00:00Z', asked_at: '2026-08-05T08:00:00Z' })
+    const newer = recoveryDecision('newer', 'pending_approval', {}, { created_at: '2026-08-05T09:00:00Z', asked_at: '2026-08-05T09:00:00Z' })
+    const rows = build([newer], [older, newer])
+    expect(rows.map((row) => row.decision?.id)).toEqual(['newer'])
+  })
+
+  it('shows one card per distinct blocker', () => {
+    const one = recoveryDecision('one', 'failed', { source_blocker_id: 'blocker-1' })
+    const two = recoveryDecision('two', 'unsupported', { source_blocker_id: 'blocker-2' })
+    expect(build([], [one, two]).map((row) => row.decision?.id).sort()).toEqual(['one', 'two'])
+  })
+
+  it('hides a resolved newest decision and does not resurrect the older one', () => {
+    const older = recoveryDecision('older', 'failed', {}, { created_at: '2026-08-05T08:00:00Z', asked_at: '2026-08-05T08:00:00Z' })
+    const newest = recoveryDecision('newest', 'resolved', {}, { created_at: '2026-08-05T09:00:00Z', asked_at: '2026-08-05T09:00:00Z' })
+    expect(build([], [older, newest])).toEqual([])
+  })
+
+  it.each(['rejected', 'failed', 'unsupported', 'applying', 'verifying', 'retrying'] as const)('keeps a %s recovery decision as a row until superseded', (status) => {
+    expect(build([], [recoveryDecision('x', status)]).map((row) => row.kind)).toEqual(['recovery-proposal'])
+  })
+})
+
+describe('NeedsYouQueue recovery FIX PROPOSAL card', () => {
+  it('renders heading, Problem / Proposed updates / After approval from server fields, Approve fix and Reject', async () => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
+    try {
+      const li = card(view.container)
+      const text = textOf(li)
+      for (const label of ['Problem', 'Proposed updates', 'After approval']) expect(text).toContain(label)
+      expect(text).toContain('No agent can review the finished work.')
+      const items = descendants(li).filter((node) => node.tagName === 'LI' && node !== li)
+      expect(items.map(textOf)).toEqual(['Add a code reviewer to the team', 'Let the reviewer sign off work'])
+      expect(text).toContain('The blocked review step restarts automatically.')
+      expect(getButton(li, 'Approve fix')).toBeDefined()
+      expect(getButton(li, 'Reject')).toBeDefined()
+      expect(buttonsIn(li).filter((b) => textOf(b) === 'Approve fix')).toHaveLength(1)
+      expect(descendants(li).some((node) => node.tagName === 'INPUT' && node.type === 'radio')).toBe(false)
+      expect(classOf(descendants(li).find((node) => node.tagName === 'H3')!)).toContain('text-xs')
+    } finally { view.cleanup() }
+  })
+
+  it('does not render the generic answer form or agent-definition batch for the recovery decision', async () => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
+    try {
+      const text = textOf(view.container)
+      expect(text).not.toContain('Submit approve_fix')
+      expect(text).not.toContain('Submit answer')
+      expect(text).not.toContain('Submit all decisions')
+    } finally { view.cleanup() }
+  })
+
+  it('shows the global-impact note only when global_effect is true', async () => {
+    const notice = 'This affects the global agent roster, so it applies to every project and goal.'
+    const on = await mountQueue(recoveryProps([recoveryDecision('rec-1', 'pending_approval', { global_effect: true })]))
+    try {
+      const note = descendants(card(on.container)).find((node) => node.getAttribute('role') === 'note')
+      expect(note && textOf(note)).toContain(notice)
+    } finally { on.cleanup() }
+    const off = await mountQueue(recoveryProps([recoveryDecision('rec-1', 'pending_approval', { global_effect: false })]))
+    try {
+      expect(textOf(off.container)).not.toContain(notice)
+      expect(descendants(card(off.container)).some((node) => node.getAttribute('role') === 'note')).toBe(false)
+    } finally { off.cleanup() }
+  })
+
+  it('submits Approve fix as exactly one answer request, then disables the whole card', async () => {
+    const onAnswer = vi.fn()
+    const pending = recoveryDecision('rec-1', 'pending_approval', { exact_details: { agent: 'reviewer' } })
+    const view = await mountQueue(recoveryProps([pending], { onAnswerRecoveryProposal: onAnswer }))
+    try {
+      const li = card(view.container)
+      await act(async () => getButton(li, 'Approve fix').click())
+      await act(async () => getButton(li, 'Approve fix').click())
+      expect(onAnswer).toHaveBeenCalledTimes(1)
+      expect(onAnswer.mock.calls[0][0].id).toBe('rec-1')
+      expect(onAnswer.mock.calls[0][1]).toBe('approve_fix')
+      expect(onAnswer.mock.calls[0][2] ?? '').toBe('')
+      for (const label of ['Approve fix', 'Reject']) expect(getButton(li, label).disabled).toBe(true)
+      expect(descendants(li).some((node) => node.getAttribute('aria-busy') === 'true')).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('Reject reveals a required Reason, focuses it, and Cancel returns focus to Reject', async () => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
+    try {
+      const li = card(view.container)
+      expect(descendants(li).some((node) => node.tagName === 'TEXTAREA')).toBe(false)
+      await act(async () => getButton(li, 'Reject').click())
+      const reason = getByLabel(li, 'Reason', 'textarea')
+      expect(view.document.activeElement === reason).toBe(true)
+      expect(getButton(li, 'Confirm reject').disabled).toBe(true)
+      await act(async () => changeControl(reason, '   '))
+      expect(getButton(li, 'Confirm reject').disabled).toBe(true)
+      await act(async () => getButton(li, 'Cancel').click())
+      expect(descendants(li).some((node) => node.tagName === 'TEXTAREA')).toBe(false)
+      expect(view.document.activeElement === getButton(li, 'Reject')).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('Confirm reject submits reject with the trimmed reason', async () => {
+    const onAnswer = vi.fn()
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')], { onAnswerRecoveryProposal: onAnswer }))
+    try {
+      const li = card(view.container)
+      await act(async () => getButton(li, 'Reject').click())
+      await act(async () => changeControl(getByLabel(li, 'Reason', 'textarea'), '  Too broad.  '))
+      await act(async () => getButton(li, 'Confirm reject').click())
+      expect(onAnswer).toHaveBeenCalledTimes(1)
+      expect(onAnswer.mock.calls[0].slice(0, 3).map((v: unknown) => (typeof v === 'object' ? (v as { id: string }).id : v))).toEqual(['rec-1', 'reject', 'Too broad.'])
+    } finally { view.cleanup() }
+  })
+
+  it('shows an error line and announces it when the answer fails, and re-enables the card', async () => {
+    const onAnswer = vi.fn((_d, _o, _r, callbacks) => { callbacks.onError(new Error('Backend said no.')); callbacks.onSettled() })
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')], { onAnswerRecoveryProposal: onAnswer }))
+    try {
+      const li = card(view.container)
+      await act(async () => getButton(li, 'Approve fix').click())
+      expect(textOf(li)).toContain('Backend said no.')
+      expect(getButton(li, 'Approve fix').disabled).toBe(false)
+    } finally { view.cleanup() }
+  })
+
+  it('moves focus to the card heading (tabindex -1) when the card stays after approval', async () => {
+    let callbacks: { onSuccess: () => void; onSettled: () => void } | undefined
+    const onAnswer = vi.fn((_d, _o, _r, cb) => { callbacks = cb })
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')], { onAnswerRecoveryProposal: onAnswer }))
+    try {
+      await act(async () => getButton(card(view.container), 'Approve fix').click())
+      await act(async () => { callbacks?.onSuccess(); callbacks?.onSettled() })
+      await act(async () => view.rerender(recoveryProps([recoveryDecision('rec-1', 'applying')])))
+      const heading = descendants(card(view.container)).find((node) => node.tagName === 'H3')!
+      expect(heading.getAttribute('tabindex')).toBe('-1')
+      expect(view.document.activeElement === heading).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  describe('exact details disclosure', () => {
+    it.each([
+      ['exact_details', { exact_details: { agent: 'reviewer' } }],
+      ['evidence', { evidence: [{ kind: 'note', summary: 'Observed' }] }],
+    ])('renders a read-only disclosure when %s is non-null', async (_label, extra) => {
+      const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', 'pending_approval', extra)]))
+      try {
+        const li = card(view.container)
+        const details = descendants(li).find((node) => node.tagName === 'DETAILS')!
+        const summary = descendants(details).find((node) => node.tagName === 'SUMMARY')!
+        expect(textOf(summary)).toBe('Show exact details')
+        expect(classOf(summary)).toContain('min-h-11')
+        const pre = descendants(details).find((node) => node.tagName === 'PRE')!
+        expect(pre.getAttribute('tabindex')).toBe('0')
+        expect(classOf(pre)).toContain('font-mono')
+        expect(descendants(details).some((node) => ['TEXTAREA', 'INPUT', 'BUTTON'].includes(node.tagName))).toBe(false)
+      } finally { view.cleanup() }
+    })
+
+    it('omits the disclosure entirely when exact_details and evidence are both null', async () => {
+      const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
+      try {
+        const li = card(view.container)
+        expect(descendants(li).some((node) => node.tagName === 'DETAILS')).toBe(false)
+        expect(textOf(li)).not.toContain('Show exact details')
+        expect(descendants(li).some((node) => node.tagName === 'PRE')).toBe(false)
+      } finally { view.cleanup() }
+    })
+
+    it('uses mono only inside the disclosure', async () => {
+      const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', 'pending_approval', { exact_details: { a: 1 } })]))
+      try {
+        const mono = descendants(card(view.container)).filter((node) => classOf(node).includes('font-mono'))
+        expect(mono.length).toBeGreaterThan(0)
+        expect(mono.every((node) => node.closest('details') !== null)).toBe(true)
+      } finally { view.cleanup() }
+    })
+  })
+
+  describe('lifecycle copy', () => {
+    it.each(STATUS_COPY)('shows exact copy for %s in the card and an aria-live status region', async (status, copy) => {
+      const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', status, status === 'failed' ? { error: 'Provider timed out.' } : {})]))
+      try {
+        // A resolved newest decision leaves the queue; its copy is still the contract for the card renderer
+        // when shown, so resolved is asserted via absence in the buildQueueRows tests instead.
+        if (status === 'resolved') { expect(textOf(view.container)).not.toContain('FIX PROPOSAL'); return }
+        const li = card(view.container)
+        expect(textOf(li)).toContain(copy)
+        const live = descendants(li).find((node) => node.getAttribute('role') === 'status')!
+        expect(live.getAttribute('aria-live')).toBe('polite')
+        expect(live.getAttribute('aria-atomic')).toBe('true')
+        expect(textOf(live)).toContain(copy)
+      } finally { view.cleanup() }
+    })
+
+    it('shows the failure error and rejection reason as readable history', async () => {
+      const failed = await mountQueue(recoveryProps([recoveryDecision('f', 'failed', { error: 'Provider timed out.' })]))
+      try { expect(textOf(card(failed.container))).toContain('Provider timed out.') } finally { failed.cleanup() }
+      const rejected = await mountQueue(recoveryProps([recoveryDecision('r', 'rejected', {}, { reason: 'Too broad.' })]))
+      try { expect(textOf(card(rejected.container))).toContain('Too broad.') } finally { rejected.cleanup() }
+    })
+
+    it.each(['applying', 'verifying', 'retrying', 'rejected', 'failed', 'unsupported'] as const)('has no Approve fix / Reject buttons once %s', async (status) => {
+      const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', status)]))
+      try {
+        const labels = buttonsIn(card(view.container)).map(textOf)
+        expect(labels).not.toContain('Approve fix')
+        expect(labels).not.toContain('Reject')
+      } finally { view.cleanup() }
+    })
+
+    it.each(['rejected', 'failed', 'unsupported'] as const)('renders %s as a read-only card with no buttons at all (no dismiss)', async (status) => {
+      const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', status)]))
+      try { expect(buttonsIn(card(view.container))).toHaveLength(0) } finally { view.cleanup() }
+    })
+
+    it.each(['failed', 'unsupported', 'rejected'] as const)('a %s proposal produces a row, so the on-track empty state never shows', async (status) => {
+      const view = await mountQueue({ ...recoveryProps([recoveryDecision('rec-1', status)]), isWorking: false })
+      try {
+        expect(textOf(view.container).toLowerCase()).not.toContain('on track')
+        expect(textOf(view.container)).toContain('FIX PROPOSAL')
+      } finally { view.cleanup() }
+    })
+
+    it('a resolved-only history falls back to the normal empty state', async () => {
+      const view = await mountQueue({ ...recoveryProps([recoveryDecision('rec-1', 'resolved')]), isWorking: false })
+      try {
+        expect(textOf(view.container)).not.toContain('FIX PROPOSAL')
+        expect(textOf(view.container)).toContain('on track')
+      } finally { view.cleanup() }
+    })
+  })
+
+  it('uses 44px (min-h-11 min-w-11) targets for Approve fix and Reject', async () => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
+    try {
+      const li = card(view.container)
+      for (const label of ['Approve fix', 'Reject']) {
+        expect(classOf(getButton(li, label))).toContain('min-h-11')
+        expect(classOf(getButton(li, label))).toContain('min-w-11')
+      }
+    } finally { view.cleanup() }
+  })
+})
+
+describe('NeedsYouQueue capability gap card (final fix wave F2)', () => {
+  const pendingGap = () => recoveryDecision('gap-1', 'unsupported', {
+    after_approval: 'Nothing happens automatically. After you provide the capability, HuddleRoom re-diagnoses the blocker.',
+  }, { status: 'pending', options: ['capability_provided'] } as Partial<OrchestrationAuthorityDecisionRecord>)
+
+  it('offers one secondary 44px "I\'ve provided it" and never Approve fix / Reject while the gap decision is pending', async () => {
+    const view = await mountQueue(recoveryProps([pendingGap()]))
+    try {
+      const li = card(view.container)
+      expect(buttonsIn(li).map(textOf)).toEqual(["I've provided it"])
+      const button = getButton(li, "I've provided it")
+      const h3 = descendants(li).find((node) => node.tagName === 'H3')!
+      expect(textOf(h3)).toBe('CAPABILITY NEEDED')
+      const ids = (button.getAttribute('aria-describedby') ?? '').split(' ')
+      expect(ids).toHaveLength(2)
+      expect(ids.map((id) => textOf(descendants(li).find((node) => node.getAttribute('id') === id)!))).toEqual([expect.any(String), expect.stringContaining('re-diagnoses')])
+      expect(textOf(li)).not.toContain('Proposed updates')
+      expect(textOf(li)).toContain("After you've provided it")
+      expect(classOf(button)).toContain('min-h-11')
+      expect(textOf(li)).toContain('No executable fix is available with the current tools.')
+          } finally { view.cleanup() }
+  })
+
+  it('posts capability_provided exactly once through the answer callback, then disables the card', async () => {
+    const onAnswer = vi.fn()
+    const view = await mountQueue(recoveryProps([pendingGap()], { onAnswerRecoveryProposal: onAnswer }))
+    try {
+      const li = card(view.container)
+      await act(async () => getButton(li, "I've provided it").click())
+      await act(async () => getButton(li, "I've provided it").click())
+      expect(onAnswer).toHaveBeenCalledTimes(1)
+      expect(onAnswer.mock.calls[0][0].id).toBe('gap-1')
+      expect(onAnswer.mock.calls[0][1]).toBe('capability_provided')
+      expect(getButton(li, "I've provided it").disabled).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('announces re-diagnosis after the answer and leaves quietly (no moving-again toast)', async () => {
+    const onAnswer = vi.fn((_d, _o, _r, cb) => { cb.onSuccess(); cb.onSettled() })
+    toastMock.success.mockClear()
+    const view = await mountQueue(recoveryProps([pendingGap()], { onAnswerRecoveryProposal: onAnswer }))
+    await act(async () => getButton(card(view.container), "I've provided it").click())
+    expect(textOf(card(view.container))).toContain('Marked as provided. Re-diagnosing the blocker…')
+    await act(async () => view.rerender(recoveryProps([])))
+    view.cleanup()
+    expect(toastMock.success).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a pending gap as actionable', true, '1 item needs you.'],
+    ['an answered (read-only) gap as not actionable', false, 'Queue clear.'],
+  ])('counts %s', async (_label, isPending, announced) => {
+    vi.useFakeTimers()
+    try {
+      const view = await mountQueue(recoveryProps([isPending ? pendingGap() : recoveryDecision('gap-1', 'unsupported')]))
+      try {
+        await act(async () => { vi.advanceTimersByTime(500) })
+        const regions = descendants(view.container).filter((node) => node.getAttribute('role') === 'status')
+        expect(regions.map(textOf)).toContain(announced)
+      } finally { view.cleanup() }
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('NeedsYouQueue recovery card follow-up', () => {
+  it('does not toast when an answered card unmounts while still applying', async () => {
+    const onAnswer = vi.fn((_d, _o, _r, cb) => { cb.onSuccess(); cb.onSettled() })
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')], { onAnswerRecoveryProposal: onAnswer }))
+    await act(async () => getButton(card(view.container), 'Approve fix').click())
+    await act(async () => view.rerender(recoveryProps([recoveryDecision('rec-1', 'applying')])))
+    view.cleanup()
+    expect(toastMock.success).not.toHaveBeenCalled()
+  })
+
+  it.each(['rejected', 'failed', 'unsupported'] as const)('hides After approval on %s', async (status) => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', status)]))
+    try { expect(textOf(card(view.container))).not.toContain('After approval') } finally { view.cleanup() }
+  })
+
+  it('shows After approval while pending', async () => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
+    try { expect(textOf(card(view.container))).toContain('After approval') } finally { view.cleanup() }
+  })
+
+  it('omits the disclosure for an empty evidence array', async () => {
+    const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', 'pending_approval', { evidence: [] })]))
+    try { expect(descendants(card(view.container)).some((node) => node.tagName === 'DETAILS')).toBe(false) } finally { view.cleanup() }
+  })
+})
+

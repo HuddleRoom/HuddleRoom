@@ -113,6 +113,8 @@ class OrchestrationWakeSourceService:
         row = await self._row(db, ref)
         if row is None:
             return False, "producer_missing"
+        if source.kind == "run":
+            return await self._is_live_for_run(db, run, source, ref, row)
         source_task = await self._source_task(db, run, source)
         if ref.kind == "task":
             if source_task is None or row.id == source_task.id or not self._belongs_to_run(row, run):
@@ -154,6 +156,42 @@ class OrchestrationWakeSourceService:
                 (row.goal_id == run.goal_id and row.run_id == run.id and row.status == "pending"),
                 "producer_terminal" if row.status != "pending" else "producer_unrelated",
             )
+        return False, "producer_unrelated"
+
+    async def _is_live_for_run(self, db: AsyncSession, run, source: SourceRef, ref: LiveWorkRefV1, row) -> tuple[bool, str]:
+        """Decision-loop source (the run itself): any producer of this run that can progress on its own.
+        A pending human decision of the run is live .
+        # ponytail: run-wide relevance; a decision-loop noop names no narrower blocked dependency."""
+        if source.id != run.id:
+            return False, "producer_unrelated"
+
+        async def run_task(task_id) -> bool:
+            task = await db.get(Task, task_id) if task_id else None
+            return task is not None and self._belongs_to_run(task, run)
+
+        if ref.kind == "task":
+            if not self._belongs_to_run(row, run):
+                return False, "producer_unrelated"
+            if row.status not in _TASK_LIVE_STATUSES or await first_unmet_dependency(db, run, row) is not None:
+                return False, "producer_not_independently_runnable"
+            return True, "matched_live_producer"
+        live, linked = {
+            "session": (row.status in _SESSION_LIVE_STATUSES, getattr(row, "task_id", None)),
+            "meeting": (row.status in _MEETING_LIVE_STATUSES, getattr(row, "source_task_id", None)),
+            "graph_run": (row.status == "active", getattr(row, "linked_task_id", None)),
+        }.get(ref.kind, (None, None))
+        if live is not None:
+            if not live:
+                return False, "producer_terminal"
+            return (True, "matched_live_producer") if await run_task(linked) else (False, "producer_unrelated")
+        if ref.kind == "steering_request":
+            if row.status not in _STEERING_LIVE_STATUSES:
+                return False, "producer_terminal"
+            return row.goal_id == run.goal_id and row.submitted_run_id == run.id, "producer_unrelated"
+        if ref.kind == "authority_decision":
+            if row.status != "pending":
+                return False, "producer_terminal"
+            return row.goal_id == run.goal_id and row.run_id == run.id, "producer_unrelated"
         return False, "producer_unrelated"
 
     @staticmethod

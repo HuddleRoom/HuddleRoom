@@ -414,8 +414,8 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     assert audit1.status == "in_progress" and await _live_count(db) == 2
     await _finish(db, project, leaf_run, audit1, None, failed=True)
     await service.tick(db, leaf_run.id)
+    retry = await _approved_retry(db, service, leaf_run, audit1)
     await db.refresh(audit1)
-    retry = next(a for a in await _run_actions(db, leaf_run.id) if a.action_type == "retry_task")
     assert retry.status == "completed" and audit1.status == "in_progress"
     await _finish(db, project, leaf_run, audit1, _report("Area 1 review notes."))
     await service.tick(db, leaf_run.id)
@@ -664,6 +664,19 @@ async def test_explicit_type_is_preserved_and_corrected_auto_root_needs_fresh_st
 
 # --- scenario 3: one failed predecessor attempt, retried, then its dependent releases --------------
 
+async def _approved_retry(db, service, run, task):
+    """the failed attempt starts one recovery lineage instead of an automatic retry; this stands in
+    for the owner-approved fix, whose retry runs the same executor under a recovery effect key."""
+    triggers = [a for a in await _run_actions(db, run.id)
+                if a.action_type == "recovery_trigger" and a.request["blocker_code"] == "task_failed"]
+    assert len(triggers) == 1
+    assert not [a for a in await _run_actions(db, run.id) if a.action_type == "retry_task"]
+    return await service.execute_retry_task_action(
+        db, run_id=run.id, request={"action_type": "retry_task", "task_id": str(task.id)},
+        idempotency_key=f"recovery:{uuid.uuid4()}:retry:1:effect",
+    )
+
+
 async def test_failed_predecessor_attempt_retries_then_its_accepted_gate_releases_the_dependent(
     db_session, test_project, monkeypatch, external_calls, safe_effectiveness_review_continue,
 ):
@@ -688,7 +701,7 @@ async def test_failed_predecessor_attempt_retries_then_its_accepted_gate_release
     assert first.status == "in_progress" and released("second") == []
     await _finish(db, project, run, first, None, failed=True)  # the failed predecessor attempt
     await service.tick(db, run.id)
-    retry = next(a for a in await _run_actions(db, run.id) if a.action_type == "retry_task")
+    retry = await _approved_retry(db, service, run, first)
     assert retry.status == "completed" and first.status == "in_progress", retry.error
     tasks = await _tasks_for_run(db, run.id)
     assert released("second") == []  # a failed predecessor is a wait, never a release

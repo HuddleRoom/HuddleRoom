@@ -396,3 +396,26 @@ async def test_step_four_budget_or_attention_409_returns_waiting(db_session, tes
     monkeypatch.setattr(service, "_release_ready_work", no_release)
     result = await service._advance_authorized_execution(db_session, goal, run)
     assert result == {"step": "waiting", "reason": detail}
+
+
+# SPR 180/184: recover_blocker is a loop stop -- one tick never acts past a new recovery wait.
+def test_recover_blocker_is_registered_as_a_loop_stop_action():
+    from huddleroom.services.orchestration_service import _LOOP_STOP_ACTIONS
+
+    assert "recover_blocker" in _LOOP_STOP_ACTIONS
+    assert {"ask_human", "pause_run"} <= _LOOP_STOP_ACTIONS
+
+
+async def test_recover_blocker_stops_loop_without_post_action_wait(db_session, test_project, monkeypatch):
+    from huddleroom.models.orchestration import OrchestrationWait
+
+    goal, run = await _setup(db_session, test_project)
+    service, calls = _wire(monkeypatch, db_session, run, [("recover_blocker", "completed")] * 3)
+
+    result = await service._advance_authorized_execution(db_session, goal, run)
+
+    assert calls["n"] == 1
+    assert "action_ids" not in result
+    waits = (await db_session.scalars(select(OrchestrationWait).where(
+        OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"))).all()
+    assert [w for w in waits if (w.owner or {}).get("type") == "orchestrator_decision"] == []

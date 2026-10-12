@@ -193,62 +193,6 @@ async def _events(db_session, project_id, event_type: str):
 
 
 @pytest.mark.asyncio
-async def test_recover_run_retries_failed_task_once(db_session, test_project):
-    developer = _agent("developer", "developer", ["implementation"])
-    db_session.add(developer)
-    await db_session.flush()
-    service, _goal, run = await _make_run(db_session, test_project.id)
-    gate = await _make_gate(db_session, run.id)
-    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id)
-    failed_session = await _add_failed_session(db_session, task, developer.id)
-
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    retry_actions = await _actions(db_session, run.id, "retry_task")
-
-    assert created == 1
-    assert task.status == "in_progress"
-    assert retry_actions[0].status == "completed"
-    assert retry_actions[0].target_type == "session"
-    assert retry_actions[0].target_id != failed_session.id
-    retried_session = await db_session.get(Session, retry_actions[0].target_id)
-    assert retried_session is not None
-    assert retried_session.task_id == task.id
-    assert retried_session.agent_id == developer.id
-    assert retried_session.status == "pending"
-    assert run.retry_state["tasks"][str(task.id)]["last_recovery"] == "retry_task"
-
-    replay_created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    assert replay_created == 0
-    assert await db_session.scalar(select(count(Session.id)).where(Session.task_id == task.id)) == 2
-
-
-@pytest.mark.asyncio
-async def test_recover_run_reassigns_after_retry_limit(db_session, test_project):
-    original = _agent("developer", "developer", ["implementation"])
-    alternate = _agent("alternate", "developer", ["implementation"])
-    db_session.add_all([original, alternate])
-    await db_session.flush()
-    service, _goal, run = await _make_run(db_session, test_project.id)
-    gate = await _make_gate(db_session, run.id)
-    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, original.id)
-    await _add_failed_session(db_session, task, original.id)
-    await _add_failed_session(db_session, task, original.id)
-
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    reassign_actions = await _actions(db_session, run.id, "reassign_task")
-
-    assert created == 1
-    assert task.assigned_to == alternate.id
-    assert task.status == "in_progress"
-    assert reassign_actions[0].status == "completed"
-    assert reassign_actions[0].target_type == "session"
-    session = await db_session.get(Session, reassign_actions[0].target_id)
-    assert session is not None
-    assert session.agent_id == alternate.id
-    assert run.retry_state["tasks"][str(task.id)]["last_recovery"] == "reassign_task"
-
-
-@pytest.mark.asyncio
 async def test_recover_run_asks_human_when_reassign_has_no_alternate_agent(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     db_session.add(developer)
@@ -474,26 +418,6 @@ async def test_blocked_task_with_active_meeting_source_waits(db_session, test_pr
 
 
 @pytest.mark.asyncio
-async def test_blocked_task_with_missing_agent_reassigns(db_session, test_project, monkeypatch):
-    calls: list = []
-    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
-    original = _agent("original", "developer", ["implementation"], is_active=False)
-    alternate = _agent("alternate", "developer", ["implementation"])
-    db_session.add_all([original, alternate])
-    await db_session.flush()
-    service, _goal, run, task, _ = await _blocked_setup(db_session, test_project, agent=original, reason="no owner")
-
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-
-    await db_session.refresh(task)
-    assert created == 1
-    assert task.assigned_to == alternate.id
-    assert len(await _actions(db_session, run.id, "reassign_task")) == 1
-    assert await _actions(db_session, run.id, "ask_human") == []
-    assert run.status == "running"
-
-
-@pytest.mark.asyncio
 async def test_blocked_task_with_no_alternate_agent_asks_human(db_session, test_project):
     original = _agent("original", "developer", ["implementation"], is_active=False)
     db_session.add(original)
@@ -504,26 +428,6 @@ async def test_blocked_task_with_no_alternate_agent_asks_human(db_session, test_
 
     assert len(await _actions(db_session, run.id, "ask_human")) == 1
     assert await _actions(db_session, run.id, "reassign_task") == []
-
-
-@pytest.mark.asyncio
-async def test_blocked_task_with_failed_latest_session_retries_once(db_session, test_project, monkeypatch):
-    calls: list = []
-    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
-    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="crashed")
-    await _add_failed_session(db_session, task, agent.id)
-
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    # Re-block within the same episode: retry is spent, so the owner is asked.
-    task.status = "blocked"
-    for session in await db_session.scalars(select(Session).where(Session.task_id == task.id)):
-        session.status = "failed"
-    await db_session.flush()
-    await service.recover_run(db_session, run.id, baseline_ready=True)
-
-    assert created == 1
-    assert len(await _actions(db_session, run.id, "retry_task")) == 1
-    assert len(await _actions(db_session, run.id, "ask_human")) == 1
 
 
 async def _with_dependency(db_session, project, run, task, agent, *, status="in_progress"):
@@ -735,59 +639,6 @@ async def test_recover_run_requests_verification_for_stale_gate(db_session, test
 
 
 @pytest.mark.asyncio
-async def test_recover_run_creates_fix_task_for_rejected_review(db_session, test_project):
-    developer = _agent("developer", "developer", ["implementation"])
-    reviewer = _agent("reviewer", "reviewer", ["review"])
-    db_session.add_all([developer, reviewer])
-    await db_session.flush()
-    service, goal, run = await _make_run(db_session, test_project.id)
-    gate = await _make_gate(db_session, run.id, status="failed", failure_reason="Rejected evidence from review")
-    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id, status="done")
-    review_session = Session(
-        agent_id=reviewer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        adapter_type="api",
-        status="completed",
-        input_context={},
-        output="changes requested",
-        metadata_={},
-        origin="auto",
-        started_at=datetime.now(timezone.utc),
-        ended_at=datetime.now(timezone.utc),
-    )
-    db_session.add(review_session)
-    await db_session.flush()
-    await _add_gate_evidence(
-        db_session,
-        run.id,
-        gate.id,
-        source_type="review",
-        source_id=review_session.id,
-        producer_agent_id=reviewer.id,
-        verdict="rejected",
-        event_seq=30,
-    )
-    await _refresh_baseline_processes(db_session, goal, run)
-
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    fix_actions = [
-        action
-        for action in await _actions(db_session, run.id, "create_delegation_task")
-        if action.request["work_function"] == "implementation"
-    ]
-
-    assert created == 1
-    assert fix_actions[0].status == "completed"
-    fix_task = await db_session.get(Task, fix_actions[0].target_id)
-    assert fix_task is not None
-    assert fix_task.assigned_to == developer.id
-    assert fix_task.parent_id == task.id
-    assert fix_task.metadata_["orchestration"]["recovery_kind"] == "review_rejected_fix"
-    assert "Fix the rejected review findings" in fix_actions[0].request["scope"]
-
-
-@pytest.mark.asyncio
 async def test_tick_reports_recoveries_created(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     db_session.add(developer)
@@ -894,32 +745,6 @@ async def test_execute_retry_task_action_fails_action_when_run_raises(db_session
     retry_actions = await _actions(db_session, run.id, "retry_task")
     assert len(retry_actions) == 1
     assert retry_actions[0].status == "failed"
-
-
-@pytest.mark.asyncio
-async def test_recover_run_escalates_when_retry_execution_fails(db_session, test_project, monkeypatch):
-    async def _raise(self, *a, **k):
-        raise HTTPException(status_code=409, detail="retry boom")
-
-    monkeypatch.setattr("huddleroom.services.orchestration_service.OrchestrationService.execute_retry_task_action", _raise)
-
-    developer = _agent("developer", "developer", ["implementation"])
-    db_session.add(developer)
-    await db_session.flush()
-    service, goal, run = await _make_run(db_session, test_project.id)
-    gate = await _make_gate(db_session, run.id)
-    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id)
-    await _add_failed_session(db_session, task, developer.id)
-
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    ask_actions = await _actions(db_session, run.id, "ask_human")
-
-    assert created == 1
-    assert goal.status == "blocked"
-    assert run.status == "blocked"
-    assert len(ask_actions) == 1
-    assert ask_actions[0].request["question"].startswith("Task retry could not start")
-    assert run.active_blockers[0]["kind"] == "retry_required"
 
 
 @pytest.mark.asyncio
@@ -1338,7 +1163,7 @@ async def test_execute_retry_and_reassign_still_refuse_other_statuses(db_session
 
 
 @pytest.mark.asyncio
-async def test_retry_key_is_attempt_aware_and_same_attempt_replay_is_idempotent(
+async def test_retry_after_failed_first_attempt_creates_trigger_and_replay_is_idempotent(
     db_session,
     test_project,
     monkeypatch,
@@ -1365,27 +1190,27 @@ async def test_retry_key_is_attempt_aware_and_same_attempt_replay_is_idempotent(
             idempotency_key=first_key,
         )
 
-    # Second recovery after the failed first attempt: new key, new action.
+    # a second attempt after the failed first one is a corrective fix -> one recovery trigger, no retry.
+    await service._retry_failed_task_once(db_session, goal, run, task)
     await service._retry_failed_task_once(db_session, goal, run, task)
     actions = await _actions(db_session, run.id, "retry_task")
-    assert len(actions) == 2
-    assert {a.idempotency_key for a in actions} == {first_key, f"{first_key}:a1"}
-    second = next(a for a in actions if a.idempotency_key == f"{first_key}:a1")
-    assert second.status == "failed"
+    assert [a.idempotency_key for a in actions] == [first_key]
+    assert actions[0].status == "failed"
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
 
     # Replaying the same attempt returns the same action without creating another.
     replay = await service.execute_retry_task_action(
         db_session,
         run_id=run.id,
-        request=second.request,
-        idempotency_key=second.idempotency_key,
+        request=actions[0].request,
+        idempotency_key=first_key,
     )
-    assert replay.id == second.id
-    assert len(await _actions(db_session, run.id, "retry_task")) == 2
+    assert replay.id == actions[0].id
+    assert len(await _actions(db_session, run.id, "retry_task")) == 1
 
 
 @pytest.mark.asyncio
-async def test_reassign_key_is_attempt_aware_after_failed_first_attempt(
+async def test_reassign_after_failed_first_attempt_creates_one_trigger(
     db_session,
     test_project,
     monkeypatch,
@@ -1408,10 +1233,10 @@ async def test_reassign_key_is_attempt_aware_after_failed_first_attempt(
     await service._reassign_or_ask_human(db_session, goal, run, task)
     await service._reassign_or_ask_human(db_session, goal, run, task)
 
-    actions = await _actions(db_session, run.id, "reassign_task")
-    assert len(actions) == 2
-    base = f"run:{run.id}:kind:reassign_task:task:{task.id}:agent:{alternate.id}"
-    assert {a.idempotency_key for a in actions} == {base, f"{base}:a1"}
+    # reassignment needs approval -> one idempotent recovery trigger, never a reassign row.
+    assert await _actions(db_session, run.id, "reassign_task") == []
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+    assert task.assigned_to == original.id
 
 
 @pytest.mark.asyncio
@@ -1539,9 +1364,10 @@ async def test_recover_run_does_not_persist_escalation_before_ask_human_reservat
     )
     monkeypatch.setattr(OrchestrationService, "reserve_action", _fail_ask_human_reservation)
 
+    # with an alternate agent the reassignment is a recovery trigger (no ask); the owner question --
+    # and this no-partial-persist guard -- remain for the no-alternate case.
     original = _agent("developer", "developer", ["implementation"])
-    alternate = _agent("alternate", "developer", ["implementation"])
-    db_session.add_all([original, alternate])
+    db_session.add(original)
     await db_session.flush()
     service, goal, run = await _make_run(db_session, test_project.id)
     gate = await _make_gate(db_session, run.id)
@@ -1607,31 +1433,165 @@ async def test_recover_run_does_not_persist_verification_escalation_before_ask_h
     assert run.active_blockers == []
 
 
+# ---------------------------------------------------------------------------
+# SPR 180/184: every corrective fix needs approval. Legacy recover_run
+# paths create one idempotent recovery trigger instead of mutating.
+# ---------------------------------------------------------------------------
+
+_FINGERPRINTED_RUN_FIELDS = ("status", "phase", "plan_state", "retry_state")
+
+
+def _run_fingerprint_fields(goal, run) -> dict:
+    blockers = [b for b in (run.active_blockers or []) if b.get("kind") != "recovery_blocked"]
+    return {"goal_status": goal.status, "blockers": blockers,
+            **{field: getattr(run, field) for field in _FINGERPRINTED_RUN_FIELDS}}
+
+
+async def _session_count(db_session, task) -> int:
+    return await db_session.scalar(select(count(Session.id)).where(Session.task_id == task.id))
+
+
 @pytest.mark.asyncio
-async def test_recover_run_escalates_when_reassign_execution_fails(db_session, test_project, monkeypatch):
-    async def _raise(self, *a, **k):
-        raise HTTPException(status_code=409, detail="reassign boom")
+async def test_legacy_recover_run_cannot_retry_failed_task_without_approval(db_session, test_project):
+    developer = _agent("developer", "developer", ["implementation"])
+    db_session.add(developer)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id)
+    await _add_failed_session(db_session, task, developer.id)
+    before = _run_fingerprint_fields(goal, run)
 
-    monkeypatch.setattr(
-        "huddleroom.services.orchestration_service.OrchestrationService.execute_reassign_task_action",
-        _raise,
-    )
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    await service.recover_run(db_session, run.id, baseline_ready=True)  # replay is idempotent
 
+    retry_actions = await _actions(db_session, run.id, "retry_task")
+    recovery_triggers = await _actions(db_session, run.id, "recovery_trigger")
+    await db_session.refresh(task)
+    assert retry_actions == []
+    assert len(recovery_triggers) == 1
+    trigger = recovery_triggers[0].request
+    assert (trigger["goal_id"], trigger["run_id"]) == (str(goal.id), str(run.id))
+    assert trigger["retry_target"]["kind"] in {"action", "decision_loop"}
+    assert task.status == "failed" and task.assigned_to == developer.id
+    assert await _session_count(db_session, task) == 1
+    assert _run_fingerprint_fields(goal, run) == before
+
+
+@pytest.mark.asyncio
+async def test_legacy_recover_run_cannot_reassign_failed_task_without_approval(db_session, test_project):
     original = _agent("developer", "developer", ["implementation"])
-    alternate = _agent("developer", "developer", ["implementation"])
+    alternate = _agent("alternate", "developer", ["implementation"])
     db_session.add_all([original, alternate])
     await db_session.flush()
-    service, _goal, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
     gate = await _make_gate(db_session, run.id)
     task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, original.id)
     await _add_failed_session(db_session, task, original.id)
     await _add_failed_session(db_session, task, original.id)
+    before = _run_fingerprint_fields(goal, run)
 
-    created = await service.recover_run(db_session, run.id, baseline_ready=True)
-    ask_actions = await _actions(db_session, run.id, "ask_human")
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
 
-    assert created == 1
-    assert run.status == "blocked"
-    assert len(ask_actions) == 1
-    assert ask_actions[0].request["question"].startswith("Task failed after retry limit")
-    assert run.active_blockers[0]["kind"] == "reassign_required"
+    await db_session.refresh(task)
+    assert await _actions(db_session, run.id, "reassign_task") == []
+    assert await _actions(db_session, run.id, "ask_human") == []
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+    assert task.assigned_to == original.id and task.status == "failed"
+    assert await _session_count(db_session, task) == 2
+    assert _run_fingerprint_fields(goal, run) == before
+
+
+@pytest.mark.asyncio
+async def test_legacy_rejected_review_fix_creates_trigger_not_replacement_task(db_session, test_project):
+    developer = _agent("developer", "developer", ["implementation"])
+    reviewer = _agent("reviewer", "reviewer", ["review"])
+    db_session.add_all([developer, reviewer])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, status="failed", failure_reason="Rejected evidence from review")
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id, status="done")
+    review_session = Session(
+        agent_id=reviewer.id, task_id=task.id, project_id=test_project.id, adapter_type="api", status="completed",
+        input_context={}, output="changes requested", metadata_={}, origin="auto",
+        started_at=datetime.now(timezone.utc), ended_at=datetime.now(timezone.utc),
+    )
+    db_session.add(review_session)
+    await db_session.flush()
+    await _add_gate_evidence(db_session, run.id, gate.id, source_type="review", source_id=review_session.id,
+                             producer_agent_id=reviewer.id, verdict="rejected", event_seq=30)
+    await _refresh_baseline_processes(db_session, goal, run)
+    tasks_before = await db_session.scalar(select(count(Task.id)))
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert await _actions(db_session, run.id, "create_delegation_task") == []
+    assert await db_session.scalar(select(count(Task.id))) == tasks_before
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+    assert gate.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_blocked_task_with_missing_agent_creates_trigger_not_reassignment(
+    db_session, test_project, monkeypatch,
+):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+    original = _agent("original", "developer", ["implementation"], is_active=False)
+    alternate = _agent("alternate", "developer", ["implementation"])
+    db_session.add_all([original, alternate])
+    await db_session.flush()
+    service, _goal, run, task, _ = await _blocked_setup(db_session, test_project, agent=original, reason="no owner")
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    await db_session.refresh(task)
+    assert calls == []
+    assert await _actions(db_session, run.id, "reassign_task") == []
+    assert task.assigned_to == original.id and task.status == "blocked"
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_blocked_task_with_failed_session_creates_trigger_not_retry(db_session, test_project, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run(calls))
+    service, _goal, run, task, agent = await _blocked_setup(db_session, test_project, reason="crashed")
+    await _add_failed_session(db_session, task, agent.id)
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert calls == []
+    assert await _actions(db_session, run.id, "retry_task") == []
+    assert await _session_count(db_session, task) == 1
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_recovery_remediation_task_never_starts_a_recursive_lineage(db_session, test_project):
+    """A task produced by an approved recovery effect fails inside its own lineage: no new trigger, no retry."""
+    developer = _agent("developer", "developer", ["implementation"])
+    db_session.add(developer)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id)
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id)
+    effect = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"recovery:{uuid.uuid4()}:apply:call-1:effect",
+        action_type="create_delegation_task", request={}, status="completed", target_type="task", target_id=task.id,
+    )
+    db_session.add(effect)
+    await db_session.flush()
+    task.metadata_ = {**task.metadata_, "orchestration": {**task.metadata_["orchestration"], "action_id": str(effect.id)}}
+    await _add_failed_session(db_session, task, developer.id)
+    await db_session.flush()
+
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+
+    assert await _actions(db_session, run.id, "retry_task") == []
+    assert await _actions(db_session, run.id, "reassign_task") == []
+    assert await _actions(db_session, run.id, "recovery_trigger") == []

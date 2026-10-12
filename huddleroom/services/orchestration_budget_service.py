@@ -578,7 +578,7 @@ class OrchestrationBudgetService:
         state = OrchestrationService._json_object_or_empty(discovery)
         return {
             uuid.UUID(value)
-            for value in (state.get("source_task_id"), state.get("repair_task_id"))
+            for value in (state.get("source_task_id"), state.get("repair_task_id"), *(state.get("repair_task_ids") or []))
             if isinstance(value, str) and value
         }
 

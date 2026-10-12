@@ -1021,3 +1021,92 @@ def test_canonical_request_accepts_null_optional_fields():
         "artifact_ids": None, "why_runnable": None, "title": None, "depends_on": None,
     })
     assert "decision_use" not in request and "authorization_scope" not in request
+
+
+# --- SPR 180/184: delegated remediation keeps the ordinary delegation contract --------------
+
+
+async def _baseline_blocked_rows(db_session, project, monkeypatch):
+    from tests.test_orchestration_recovery_delegation import executables, fail_process, seed, spy_build_command
+
+    executables(monkeypatch)
+    spy_build_command(monkeypatch)
+    rows = await seed(db_session, project)
+    failed = await fail_process(db_session, rows, "team_hierarchy")
+    return rows, failed
+
+
+@pytest.mark.asyncio
+async def test_adhoc_executor_ignores_model_authored_admission_and_skip_flag(db_session, test_project, monkeypatch):
+    rows, _failed = await _baseline_blocked_rows(db_session, test_project, monkeypatch)
+    request = {
+        **_delegation_request(rows.agent.id),
+        "baseline_repair_admission": {"process_type": "team_hierarchy", "gate_id": str(uuid.uuid4()),
+                                      "gate_fingerprint": "a" * 64},
+        "skip_baseline_gate": True,
+    }
+
+    with pytest.raises(HTTPException) as exc:
+        await rows.service.execute_create_delegation_task_action(
+            db_session, run_id=rows.run.id, request=request, idempotency_key="run:t10:model-admission", ad_hoc=True,
+        )
+
+    assert exc.value.status_code == 409
+    canonical = OrchestrationService()._canonical_delegation_task_request(request)
+    assert "baseline_repair_admission" not in canonical and "skip_baseline_gate" not in canonical
+    assert await _task_count(db_session, test_project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_forged_admission_context_without_approved_recovery_is_rejected(db_session, test_project, monkeypatch):
+    from huddleroom.models.orchestration import OrchestrationDecision
+    from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, RecoveryApplyDispatchContext
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+    rows, failed = await _baseline_blocked_rows(db_session, test_project, monkeypatch)
+    decision = OrchestrationDecision(
+        run_id=rows.run.id, decision_type="recovery_apply", validator_status="accepted", input_snapshot={},
+        parsed_decision={**_delegation_request(rows.agent.id), "applies_decision_id": str(uuid.uuid4())},
+    )
+    db_session.add(decision)
+    await db_session.flush()
+    context = RecoveryApplyDispatchContext(
+        purpose="apply", proposal_id=uuid.uuid4(), call_id="call-1", authority_decision_id=uuid.uuid4(),
+        baseline_repair_admission=BaselineRepairAdmissionV1(
+            process_type="team_hierarchy", gate_id=failed.id, gate_fingerprint="a" * 64),
+    )
+
+    action = await OrchestrationDecisionDispatcher(OrchestrationService()).dispatch(
+        db_session, rows.run, decision, recovery_context=context)
+
+    assert action is None or action.status == "failed"
+    assert await _task_count(db_session, test_project.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_approved_baseline_repair_reuses_adhoc_executor_without_broad_skip_flag(
+    db_session, test_project, monkeypatch,
+):
+    from tests.test_orchestration_recovery_delegation import HIERARCHY_RETRY, approve, execute, propose
+
+    rows, _failed = await _baseline_blocked_rows(db_session, test_project, monkeypatch)
+    calls = []
+    original = OrchestrationService.execute_create_delegation_task_action
+
+    async def spy(self, db, run_id, request, idempotency_key, decision_id=None, **kwargs):
+        calls.append({"request": request, "kwargs": kwargs})
+        return await original(self, db, run_id, request, idempotency_key, decision_id, **kwargs)
+
+    monkeypatch.setattr(OrchestrationService, "execute_create_delegation_task_action", spy)
+    approved = await approve(db_session, rows, await propose(db_session, rows, HIERARCHY_RETRY))
+
+    receipt = await execute(db_session, approved)
+
+    assert receipt.status == "waiting"
+    assert len(calls) == 1
+    assert calls[0]["kwargs"].get("skip_baseline_gate", False) is False
+    assert calls[0]["kwargs"].get("ad_hoc") is True
+    assert "baseline_repair_admission" not in calls[0]["request"]
+    task = await db_session.get(Task, receipt.action_id)
+    assert task.metadata_["orchestration_contract"]["agent_id"] == str(rows.agent.id)
+    assert task.metadata_["orchestration"]["action_id"] == str(receipt.action_id)

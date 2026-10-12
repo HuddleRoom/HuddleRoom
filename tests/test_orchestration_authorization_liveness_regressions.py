@@ -193,7 +193,8 @@ async def test_tick_sweeps_cancelled_task_authorization_blocker(db_session, test
     assert not any(b.get("scope") == scope for b in run.active_blockers)
 
 
-async def test_discovery_retry_stopped_claim_returns_noop(db_session, test_project, test_agent, monkeypatch):
+async def test_discovery_failed_source_never_reaches_the_retry_claim(db_session, test_project, test_agent, monkeypatch):
+    """a failed discovery source starts recovery; the retry executor (and its claim) never runs."""
     from tests.test_orchestration_continuous_service import dispatched_discovery_source
 
     goal, run, task, session, continuous = await dispatched_discovery_source(
@@ -202,10 +203,9 @@ async def test_discovery_retry_stopped_claim_returns_noop(db_session, test_proje
     task.status = session.status = "failed"
 
     async def stopped_claim(*_args, **_kwargs):
-        raise HTTPException(status_code=409, detail="authorization_denied: run_not_active")
+        raise AssertionError("the discovery retry must wait for an approved fix")
 
     monkeypatch.setattr(continuous.orchestration, "execute_retry_task_action", stopped_claim)
     result = await continuous.advance(db_session, goal, run)
-    assert result["step"] == "needs_attention"
+    assert result["step"] == "waiting_discovery_recovery"
     assert not result.get("action_id")
-    assert any(b.get("kind") == "continuous_discovery_source_execution_failed" for b in run.active_blockers)

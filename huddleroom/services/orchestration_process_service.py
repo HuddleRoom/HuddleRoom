@@ -77,13 +77,14 @@ class OrchestrationProcessService:
         input_snapshot: dict | None = None,
         process_version: int = 1,
         supersede_waiting: bool = False,
+        supersede_running: bool = False,
     ) -> OrchestrationProcessRun:
         if process_type not in PROCESS_TYPES:
             raise ValueError(f"unknown process_type: {process_type!r}")
         await check_goal_linkage(db, goal_id, run_id=run_id)
         current = await self.get_current(db, goal_id, process_type)
         if current is not None and (
-            current.status == "running"
+            (current.status == "running" and not supersede_running)
             or (current.status == "waiting_decision" and not supersede_waiting)
         ):
             return current  # idempotent retry: already active (running or parked), no duplicate
@@ -108,7 +109,7 @@ class OrchestrationProcessService:
             await nested.rollback()
             current = await self.get_current(db, goal_id, process_type)
             if current is not None and (
-                current.status == "running"
+                (current.status == "running" and not supersede_running)
                 or (current.status == "waiting_decision" and not supersede_waiting)
             ):
                 return current  # idempotent retry: another concurrent caller won the race
@@ -626,6 +627,44 @@ class OrchestrationProcessService:
             raise ValueError(f"cannot complete process run in status {process_run.status!r}")
         await db.refresh(process_run)
         return process_run
+
+    async def recovery_provenance(
+        self,
+        db: AsyncSession,
+        goal_id: uuid.UUID,
+        *,
+        proposal_id: uuid.UUID,
+        proposal_hash: str,
+        authority_decision_id: uuid.UUID,
+        call_id: str,
+        canonical_request_hash: str,
+    ) -> dict:
+        """Read-only: prove an answered approve_fix authority for this exact goal/proposal/hash.
+
+        Returns the provenance block recorded on recovery-sourced snapshots.
+        """
+        from huddleroom.models.orchestration import OrchestrationAction
+        from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+        decision = await db.get(OrchestrationAuthorityDecision, authority_decision_id)
+        action = await db.get(OrchestrationAction, decision.related_action_id) if decision and decision.related_action_id else None
+        if (
+            decision is None or action is None or decision.goal_id != goal_id
+            or decision.decision_key != f"recovery:{proposal_id}:{proposal_hash}"
+            or decision.status != "answered" or decision.selected_option != "approve_fix"
+            or action.action_type != "recovery_proposal" or action.run_id != decision.run_id
+            or str((action.request or {}).get("proposal_id")) != str(proposal_id)
+            or (action.dispatch_contract or {}).get("proposal_hash") != proposal_hash
+        ):
+            raise ValueError("recovery_authority_mismatch")
+        return {
+            "proposal_id": str(proposal_id),
+            "proposal_hash": proposal_hash,
+            "proposal_action_id": str(action.id),
+            "call_id": call_id,
+            "canonical_request_hash": canonical_request_hash,
+            "authority_decision_id": str(decision.id),
+        }
 
     async def list_process_runs(
         self,

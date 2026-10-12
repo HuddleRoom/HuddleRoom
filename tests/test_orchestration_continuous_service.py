@@ -28,6 +28,7 @@ from huddleroom.services.orchestration_authority_service import reauthorize_exec
 from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionClaimAttention, SessionService
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 # SQLAlchemy's dynamic function namespace is not statically callable to pylint.
 # pylint: disable=not-callable
@@ -766,9 +767,16 @@ async def test_discovery_overflow_rejects_fresh_batch_before_candidate_insertion
     assert any(blocker["kind"] == "continuous_backlog_overflow" for blocker in run.active_blockers)
 
 
-async def test_discovery_invalid_output_dispatches_one_repair_with_bounded_input(
+async def _discovery_triggers(db, run, blocker_code):
+    return [row for row in (await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "recovery_trigger",
+    ))).all() if row.request["blocker_code"] == blocker_code]
+
+
+async def test_discovery_invalid_output_starts_one_recovery_lineage_not_a_repair(
     db_session, test_project, test_agent, monkeypatch,
 ):
+    """a repair delegation is a corrective fix -> one recovery trigger, no auto-repair."""
     goal, run, task, session, continuous = await dispatched_discovery_source(
         db_session, test_project, test_agent, monkeypatch,
     )
@@ -780,19 +788,20 @@ async def test_discovery_invalid_output_dispatches_one_repair_with_bounded_input
 
     result = await continuous.advance(db_session, goal, run)
 
-    assert result["step"] == "waiting_discovery_repair"
-    assert run.plan_state["discovery"]["recovery"] == "repair"
-    repair = await db_session.scalar(select(OrchestrationAction).where(
+    assert result["step"] == "waiting_discovery_recovery"
+    assert run.plan_state["discovery"].get("recovery") is None
+    assert await db_session.scalar(select(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "create_delegation_task",
         OrchestrationAction.request["parent_task_id"].as_string() == str(task.id),
-    ))
-    assert repair is not None
-    assert max(map(len, repair.request["inputs"])) < 2_000
+    )) is None
+    triggers = await _discovery_triggers(db_session, run, "continuous_discovery_output_invalid")
+    assert len(triggers) == 1 and len(triggers[0].request["summary"]) < 4_001
 
 
-async def test_discovery_failed_source_retries_once_with_original_limits(
+async def test_discovery_failed_source_starts_one_recovery_lineage_not_a_retry(
     db_session, test_project, test_agent, monkeypatch,
 ):
+    """a new source attempt needs approve_fix -> one trigger, no retry/session/budget."""
     goal, run, task, session, continuous = await dispatched_discovery_source(
         db_session, test_project, test_agent, monkeypatch,
     )
@@ -802,76 +811,14 @@ async def test_discovery_failed_source_retries_once_with_original_limits(
                          "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
                          "attempt": {"effect_state": "started"}}
 
-    result = await continuous.advance(db_session, goal, run)
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"  # replay
 
-    assert result["step"] == "waiting_discovery_retry"
-    assert run.plan_state["discovery"]["recovery"] == "retry"
-    retry = await db_session.scalar(select(OrchestrationAction).where(
+    assert await db_session.scalar(select(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "retry_task",
-    ))
-    assert retry.request["timeout"] == 300
-    assert retry.request["max_tokens"] == 100
-    assert retry.target_id is not None
-    assert (await db_session.get(Session, retry.target_id)).task_id == task.id
-
-
-@pytest.mark.parametrize("legacy_settled", [False, True])
-async def test_discovery_retry_recovers_after_agent_reactivated(
-    db_session, test_project, test_agent, monkeypatch, legacy_settled,
-):
-    goal, run, task, session, continuous = await dispatched_discovery_source(
-        db_session, test_project, test_agent, monkeypatch,
-    )
-    task.status = session.status = "failed"
-    session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
-                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
-                         "attempt": {"effect_state": "started"}}
-    from huddleroom.services.task_service import TaskService
-    original_run = TaskService.run
-
-    async def refuse_inactive_agent(self, *args, **kwargs):
-        if not test_agent.is_active:
-            raise HTTPException(status_code=409, detail="Discovery agent is inactive")
-        return await original_run(self, *args, **kwargs)
-
-    # Model a refused dispatch while preserving the real action reservation and replay path.
-    monkeypatch.setattr(TaskService, "run", refuse_inactive_agent)
-    test_agent.is_active = False
-    await db_session.flush()
-    async with db_session.begin_nested():
-        assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-    failed_retry = await db_session.scalar(select(OrchestrationAction).where(
-        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "retry_task",
-    ))
-    assert failed_retry is not None and failed_retry.status == "failed"
-    assert any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
-    if legacy_settled:
-        reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
-            OrchestrationBudgetReservation.discovery_run_id == run.id,
-        ))
-        await OrchestrationBudgetService().settle_discovery_source(
-            db_session, reservation, run, reason="needs_attention",
-        )
-        assert reservation.status == "settled"
-
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-    test_agent.is_active = True
-    await db_session.flush()
-    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_retry", run.active_blockers
-    retries = (await db_session.scalars(select(OrchestrationAction).where(
-        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "retry_task",
-    ))).all()
-    assert len(retries) == 2
-    recovered_retry = next(action for action in retries if action.id != failed_retry.id)
-    assert recovered_retry.idempotency_key != failed_retry.idempotency_key
-    assert recovered_retry.target_id is not None
-    assert (await db_session.get(Session, recovered_retry.target_id)).task_id == task.id
-    assert run.plan_state["discovery"]["retry_generation"] == 1
-    assert not any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
-    task.status = "failed"
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-    assert run.plan_state["discovery"]["retry_generation"] == 1
+    )) is None
+    assert await db_session.scalar(select(func.count(Session.id)).where(Session.task_id == task.id)) == 1
+    assert len(await _discovery_triggers(db_session, run, "continuous_discovery_source_failed")) == 1
 
 
 @pytest.mark.parametrize(("limiting_budget", "expired", "can_reactivate"), [
@@ -912,7 +859,7 @@ async def test_legacy_discovery_reservation_reactivation_respects_budget_headroo
         assert reservation.status == "settled" and reservation.settled_spend["max_tokens"] == "20"
 
 
-async def test_discovery_second_invalid_output_needs_attention_without_reassignment(
+async def test_discovery_repeated_invalid_output_keeps_one_lineage_without_reassignment(
     db_session, test_project, test_agent, monkeypatch,
 ):
     goal, run, task, session, continuous = await dispatched_discovery_source(
@@ -923,46 +870,17 @@ async def test_discovery_second_invalid_output_needs_attention_without_reassignm
     session.output = "not json"
     session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
                          "token_usage_complete": True, "_roadmap_elapsed_seconds": 0}
-    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_repair"
-    repair = await db_session.get(Task, uuid.UUID(run.plan_state["discovery"]["active_task_id"]))
-    repair_session = await db_session.get(Session, uuid.UUID(run.plan_state["discovery"]["active_session_id"]))
-    repair.status = "done"
-    repair_session.status = "completed"
-    repair_session.output = "still not json"
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
 
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    assert len(await _discovery_triggers(db_session, run, "continuous_discovery_output_invalid")) == 1
     assert not await db_session.scalar(select(OrchestrationAction.id).where(
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "reassign_task",
     ))
-
-
-async def test_discovery_second_execution_failure_needs_attention(db_session, test_project, test_agent, monkeypatch):
-    goal, run, task, session, continuous = await dispatched_discovery_source(
-        db_session, test_project, test_agent, monkeypatch,
-    )
-    task.status = session.status = "failed"
-    session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
-                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
-                         "attempt": {"effect_state": "started"}}
-    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_retry"
-    task.status = "failed"
-
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-
-
-async def test_discovery_repair_dispatch_failure_needs_attention(db_session, test_project, test_agent, monkeypatch):
-    goal, run, task, session, continuous = await dispatched_discovery_source(
-        db_session, test_project, test_agent, monkeypatch,
-    )
-    task.status = "done"
-    session.status = "completed"
-    session.output = "not json"
-
-    async def dispatch_failure(*_args, **_kwargs):
-        raise HTTPException(status_code=409, detail="budget_wait")
-
-    monkeypatch.setattr(continuous.orchestration, "execute_create_delegation_task_action", dispatch_failure)
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    assert not await db_session.scalar(select(OrchestrationAction.id).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "create_delegation_task",
+        OrchestrationAction.request["parent_task_id"].as_string() == str(task.id),
+    ))
 
 
 async def test_completed_discovery_batch_replay_is_stable(db_session, test_project, test_agent, monkeypatch):
@@ -991,8 +909,10 @@ async def test_discovery_fresh_terminal_output_rejects_missing_expected_session(
     session.status = "completed"
     run.plan_state["discovery"]["active_session_id"] = str(uuid.uuid4())
 
-    with pytest.raises(HTTPException, match="Terminal task session is not canonical"):
-        await continuous.advance(db_session, goal, run)
+    # a non-canonical terminal session is surfaced as attention, never an every-tick raise.
+    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    blocker = next(b for b in run.active_blockers if b["kind"] == "continuous_discovery_source_execution_failed")
+    assert "Terminal task session is not canonical" in blocker["error"]
 
 
 async def test_discovery_missing_reservation_is_stable_budget_integrity(
@@ -1010,27 +930,6 @@ async def test_discovery_missing_reservation_is_stable_budget_integrity(
     assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
     assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
     assert any(blocker["kind"] == "budget_integrity" for blocker in run.active_blockers)
-
-
-async def test_discovery_retry_claim_attention_is_stable_budget_integrity(
-    db_session, test_project, test_agent, monkeypatch,
-):
-    goal, run, task, session, continuous = await dispatched_discovery_source(
-        db_session, test_project, test_agent, monkeypatch,
-    )
-    task.status = session.status = "failed"
-
-    async def claim_attention(*_args, **_kwargs):
-        raise SessionClaimAttention(run.id, {"kind": "budget_integrity", "reason": "claim refused"}, "claim refused")
-
-    monkeypatch.setattr(continuous.orchestration, "execute_retry_task_action", claim_attention)
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
-    assert any(blocker["kind"] == "budget_integrity" for blocker in run.active_blockers)
-    reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
-        OrchestrationBudgetReservation.discovery_run_id == run.id,
-    ))
-    assert reservation.status == "settled"
 
 
 def test_discovery_contract_is_strict():
@@ -2082,3 +1981,415 @@ async def test_continuous_successor_keeps_authorized_fingerprint(db_session, tes
     await continuous._complete_cycle(db_session, goal, run, "no_action", datetime.now(timezone.utc))
     successor = await db_session.get(OrchestrationRun, uuid.uuid5(uuid.NAMESPACE_URL, f"rally:continuous-successor:{run.id}"))
     assert successor.goal_contract_fingerprint == (new if reauthorized else old)
+
+
+# --- discovery follows the attempt an approved fix started ---------------------------
+
+_VALID_BATCH = '{"schema_version":1,"candidates":[]}'
+
+
+def _complete(session, output):
+    session.status = "completed"
+    session.output = output
+    session.metadata_ = {**(session.metadata_ or {}), "token_count_in": 0, "token_count_out": 0,
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0}
+
+
+async def _lineage_proposal(db, run, blocker_code):
+    """A recovery proposal in the lineage of the discovery trigger (what approve_fix acts on)."""
+    trigger = (await _discovery_triggers(db, run, blocker_code))[0]
+    pid = uuid.uuid4()
+    proposal = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"recovery:{pid}:proposal", action_type="recovery_proposal",
+        status="reserved", request={"proposal_id": str(pid)},
+        dispatch_contract={"trigger_action_id": str(trigger.id), "lineage_id": str(uuid.uuid4()), "attempt": 1},
+    )
+    db.add(proposal)
+    await db.flush()
+    trigger.status, trigger.target_type, trigger.target_id = "completed", "orchestration_action", proposal.id  # diagnosed
+    await db.flush()
+    return pid, proposal
+
+
+async def _failed_source(db, task, session):
+    task.status = session.status = "failed"
+    session.metadata_ = {**session.metadata_, "token_count_in": 0, "token_count_out": 0,
+                         "token_usage_complete": True, "_roadmap_elapsed_seconds": 0,
+                         "attempt": {"effect_state": "started"}}
+    await db.flush()
+
+
+@pytest.mark.parametrize("tool", ["retry_task", "reassign_task"])
+async def test_discovery_consumes_the_session_an_approved_fix_started(
+    db_session, test_project, test_agent, monkeypatch, tool,
+):
+    """Fix round 3 (R2): any lineage effect that starts a new session of the source task is followed and consumed."""
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    await _failed_source(db_session, task, session)
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    pid, _proposal = await _lineage_proposal(db_session, run, "continuous_discovery_source_failed")
+
+    service = continuous.orchestration
+    key = f"recovery:{pid}:apply:call-1:effect"
+    if tool == "retry_task":
+        effect = await service.execute_retry_task_action(
+            db_session, run.id, {"action_type": "retry_task", "task_id": str(task.id), "timeout": 300,
+                                 "max_tokens": 100}, key)
+    else:
+        effect = await service.execute_reassign_task_action(
+            db_session, run.id, {"action_type": "reassign_task", "task_id": str(task.id),
+                                 "agent_id": str(test_agent.id)}, key)
+    assert effect.status == "completed" and effect.target_id != session.id, effect.error
+    attempt = await db_session.get(Session, effect.target_id)
+    task.status = "done"
+    _complete(attempt, _VALID_BATCH)
+    await db_session.flush()
+
+    await continuous.advance(db_session, goal, run)
+
+    discovery = run.plan_state["discovery"]
+    assert discovery["active_session_id"] == str(attempt.id)
+    assert discovery["accepted_batch"] == {"schema_version": 1, "candidates": []}
+    assert discovery["accepted_session_id"] == str(attempt.id)
+
+
+async def test_discovery_dispatches_a_fresh_source_attempt_after_a_delegated_remediation(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    """Fix round 3 (R1): a delegated remediation (no parent_task_id) is never parsed; once its sealed retry ran,
+    discovery dispatches one fresh source attempt and consumes that."""
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    task.status = "done"
+    _complete(session, "not json")
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    pid, proposal = await _lineage_proposal(db_session, run, "continuous_discovery_output_invalid")
+    remediation = await continuous.orchestration.execute_create_delegation_task_action(
+        db_session, run.id, {
+            "action_type": "create_delegation_task", "agent_id": str(test_agent.id), "work_function": "implementation",
+            "scope": "Fix the discovery source access.", "deliverable": "Source access fixed.",
+            "budget": {"max_tokens": "100"},
+        }, f"recovery:{pid}:apply:call-1:effect", skip_baseline_gate=True,
+    )
+    assert remediation.status == "completed", remediation.error
+    # Applied but not yet verified/retried: still waiting, nothing dispatched.
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    assert run.plan_state["discovery"]["active_task_id"] == str(task.id)
+
+    retry = await continuous.orchestration.reserve_action(
+        db_session, run.id, f"recovery:{pid}:retry:1", "recovery_retry", {"proposal_action_id": str(proposal.id)})
+    result = await continuous.advance(db_session, goal, run)
+
+    assert result["step"] == "discovery_running"
+    fresh_id = result["task_id"]
+    assert fresh_id not in {str(task.id), str(remediation.target_id)}
+    discovery = run.plan_state["discovery"]
+    assert discovery["active_task_id"] == discovery["repair_task_id"] == fresh_id
+    assert discovery["source_task_id"] == str(task.id)
+    assert discovery["recovery_attempt_action_id"] == str(retry.id)
+    # Replay never dispatches a second attempt.
+    assert (await continuous.advance(db_session, goal, run))["step"] == "discovery_running"
+    assert run.plan_state["discovery"]["active_task_id"] == fresh_id
+
+    fresh = await db_session.get(Task, uuid.UUID(fresh_id))
+    fresh_session = await db_session.get(Session, uuid.UUID(run.plan_state["discovery"]["active_session_id"]))
+    fresh.status = "done"
+    _complete(fresh_session, _VALID_BATCH)
+    await db_session.flush()
+    await continuous.advance(db_session, goal, run)
+    assert run.plan_state["discovery"]["accepted_task_id"] == fresh_id
+
+
+@pytest.mark.parametrize("lineage_open", [True, False])
+async def test_recovery_attempt_with_invalid_output_fails_into_its_lineage_or_needs_attention(
+    db_session, test_project, test_agent, monkeypatch, lineage_open,
+):
+    """Fix round 3 (R3): a recovery-produced attempt that ends done-with-invalid-output never waits silently."""
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    await _failed_source(db_session, task, session)
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    pid, proposal = await _lineage_proposal(db_session, run, "continuous_discovery_source_failed")
+    if not lineage_open:
+        proposal.status = "completed"  # lineage already resolved: a new bad output is not its evidence
+    effect = await continuous.orchestration.execute_retry_task_action(
+        db_session, run.id, {"action_type": "retry_task", "task_id": str(task.id), "timeout": 300, "max_tokens": 100},
+        f"recovery:{pid}:apply:call-1:effect",
+    )
+    task.status = "done"
+    _complete(await db_session.get(Session, effect.target_id), "not json")
+    await db_session.flush()
+
+    result = await continuous.advance(db_session, goal, run)
+
+    if lineage_open:
+        assert result["step"] == "waiting_discovery_recovery"
+        assert proposal.status == "failed"
+        follow_up = await continuous.orchestration._existing_action_for_key(  # pylint: disable=protected-access
+            db_session, run.id, f"recovery:trigger:{proposal.dispatch_contract['trigger_action_id']}:attempt:2")
+        assert follow_up is not None and follow_up.status == "reserved"
+        assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+        # The follow-up closes without a newer proposal: attention, never a silent wait.
+        follow_up.status = "completed"
+        follow_up.target_id = follow_up.id
+        await db_session.flush()
+        assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    else:
+        assert result["step"] == "needs_attention"
+        assert any(b["kind"] == "continuous_discovery_output_invalid" for b in run.active_blockers)
+    assert len(await _discovery_triggers(db_session, run, "continuous_discovery_output_invalid")) == 0
+
+
+async def test_non_canonical_terminal_session_stays_in_attention_without_flip_flop(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    task.status = "done"
+    _complete(session, _VALID_BATCH)
+    run.plan_state = {**run.plan_state, "discovery": {**run.plan_state["discovery"],
+                                                      "active_session_id": str(uuid.uuid4())}}
+    await db_session.flush()
+
+    for _ in range(3):
+        assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+        assert any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
+
+
+async def test_discovery_execution_blocker_reactivates_and_clears(db_session, test_project, test_agent, monkeypatch):
+    """advance()'s blocker-clearing/reactivation branch: a recoverable execution blocker is cleared once the
+    assignment is valid and the cycle reservation reactivates; the source attempt then continues."""
+    goal, run, task, _session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    real_task_id = run.plan_state["discovery"]["active_task_id"]
+    run.plan_state = {**run.plan_state, "discovery": {**run.plan_state["discovery"], "active_task_id": str(uuid.uuid4())}}
+    await db_session.flush()
+    assert (await continuous.advance(db_session, goal, run))["step"] == "needs_attention"
+    assert any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
+
+    run.plan_state = {**run.plan_state, "discovery": {**run.plan_state["discovery"], "active_task_id": real_task_id}}
+    await db_session.flush()
+    assert (await continuous.advance(db_session, goal, run))["step"] == "discovery_running"
+    assert not any(b["kind"] == "continuous_discovery_source_execution_failed" for b in run.active_blockers)
+
+
+# --- discovery resolves its lineage; every fresh attempt stays budget-accounted ----
+
+
+async def _active_recovery_warnings(db, run):
+    from huddleroom.models.orchestration_process import OrchestrationWarning
+
+    return (await db.scalars(select(OrchestrationWarning).where(
+        OrchestrationWarning.run_id == run.id, OrchestrationWarning.active.is_(True),
+        OrchestrationWarning.warning_type == "recovery_blocked"))).all()
+
+
+@pytest.mark.parametrize("verification_pending", [False, True])
+async def test_discovery_consume_resolves_an_approved_retry_lineage(
+    db_session, test_project, test_agent, test_user, monkeypatch, verification_pending,
+):
+    """I1: a real approved retry_task lineage; discovery's valid consume drives verify + retry:1 and resolves it."""
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+    from tests.test_orchestration_recovery_activation import _Scripted, _retry_draft
+
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    await _failed_source(db_session, task, session)
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    (trigger,) = await _discovery_triggers(db_session, run, "continuous_discovery_source_failed")
+    svc = OrchestrationBlockerRecoveryService(analyzer=_Scripted(_retry_draft(task.id)))
+    proposal = await svc.diagnose(db_session, trigger.id)
+    assert proposal.action_type == "recovery_proposal", proposal
+    decision = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.related_action_id == proposal.id))).one()
+    await svc.reserve_answer(db_session, decision, selected_option="approve_fix", reason=None, user_id=test_user.id)
+    await svc.execute_next_call(db_session, proposal)  # apply only: the retry_task effect starts a new session
+    assert await _active_recovery_warnings(db_session, run)
+
+    effect = next(row for row in (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "retry_task"))).all()
+        if row.idempotency_key.endswith(":effect"))
+    attempt = await db_session.get(Session, effect.target_id)
+    task.status = "done"
+    _complete(attempt, _VALID_BATCH)
+    await db_session.flush()
+
+    if verification_pending:
+        # Fix round 5: verification has not passed yet -> the accepted batch holds; nothing fans out.
+        async def pending(self, db, proposal_action):
+            return ()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(OrchestrationBlockerRecoveryService, "verify_proposal", pending)
+            assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+            assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+        assert run.plan_state["discovery"]["accepted_batch"] is not None and run.status != "completed"
+        await db_session.refresh(proposal)
+        assert proposal.status == "reserved"
+
+    result = await continuous.advance(db_session, goal, run)
+
+    assert result == {"step": "complete_cycle", "outcome": "no_action"}
+    assert run.plan_state["discovery"]["accepted_session_id"] == str(attempt.id)
+    await db_session.refresh(proposal)
+    assert proposal.status == "completed"
+    assert await svc.resume(db_session, proposal.id) == "resolved"
+    assert await _active_recovery_warnings(db_session, run) == []
+
+
+async def test_discovery_fresh_attempt_consume_resolves_the_delegated_remediation_lineage(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    """I1 (delegate path): after the fresh source attempt's valid consume, discovery drives the lineage's
+    lifecycle (resume) and completes its reserved decision_loop retry. The lifecycle itself is pinned end to end by
+    test_complete_retry_on_observed_progress_resolves_the_lineage (recovery activation tests)."""
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+    calls = []
+
+    async def resume(self, db, proposal_action_id):
+        calls.append(("resume", proposal_action_id))
+
+    async def complete(self, db, proposal_action):
+        calls.append(("complete", proposal_action.id))
+        proposal_action.status = "completed"
+        await db.flush()
+        return True
+
+    monkeypatch.setattr(OrchestrationBlockerRecoveryService, "resume", resume)
+    monkeypatch.setattr(OrchestrationBlockerRecoveryService, "complete_retry_on_observed_progress", complete)
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    task.status = "done"
+    _complete(session, "not json")
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    pid, proposal = await _lineage_proposal(db_session, run, "continuous_discovery_output_invalid")
+    await continuous.orchestration.reserve_action(
+        db_session, run.id, f"recovery:{pid}:retry:1", "recovery_retry", {"proposal_action_id": str(proposal.id)})
+    fresh_id = (await continuous.advance(db_session, goal, run))["task_id"]
+    assert calls == []
+    fresh = await db_session.get(Task, uuid.UUID(fresh_id))
+    fresh.status = "done"
+    _complete(await db_session.get(Session, uuid.UUID(run.plan_state["discovery"]["active_session_id"])), _VALID_BATCH)
+    await db_session.flush()
+
+    await continuous.advance(db_session, goal, run)
+
+    assert run.plan_state["discovery"]["accepted_task_id"] == fresh_id
+    assert calls == [("resume", proposal.id), ("complete", proposal.id)]
+    assert proposal.status == "completed"
+
+
+async def test_two_fresh_attempts_both_count_against_the_discovery_reservation(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    """I2: a second fresh source attempt never drops the first attempt's spend from the cycle's accounting."""
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    async def fresh_attempt(previous_task, previous_session, pid):
+        previous_task.status = "done"
+        _complete(previous_session, "not json")
+        run.plan_state = {**run.plan_state, "discovery": {**run.plan_state["discovery"], "active_session_id": None}}
+        await db_session.flush()
+        return await continuous.dispatch_discovery_source(db_session, goal, run, datetime.now(timezone.utc),
+                                                          attempt=pid)
+
+    first = await fresh_attempt(task, session, "p1")
+    assert first is not None, run.active_blockers
+    first_session = await db_session.get(Session, uuid.UUID(run.plan_state["discovery"]["active_session_id"]))
+    # The per-cycle cap is 2 turns: source + first attempt used both, so the second attempt is refused. Before the
+    # fix the first attempt's turn dropped out of the accounting and the second attempt ran past the cap.
+    assert await fresh_attempt(first, first_session, "p2") is None
+    assert any(b.get("reason") == "Execution budget is exhausted" for b in run.active_blockers)
+
+    discovery = run.plan_state["discovery"]
+    second_id = uuid.UUID(discovery["repair_task_id"])
+    assert discovery["repair_task_ids"] == [str(first.id), str(second_id)]
+    assert discovery["source_task_id"] == str(task.id)
+    assert OrchestrationBudgetService._discovery_task_ids(run) == {task.id, first.id, second_id}  # pylint: disable=protected-access
+    # Legacy state (a single repair_task_id) is still read.
+    run.plan_state = {**run.plan_state, "discovery": {"source_task_id": str(task.id), "repair_task_id": str(first.id)}}
+    assert OrchestrationBudgetService._discovery_task_ids(run) == {task.id, first.id}  # pylint: disable=protected-access
+
+
+async def test_discovery_lineage_error_is_logged_and_fan_out_proceeds(
+    db_session, test_project, test_agent, monkeypatch, caplog,
+):
+    """Fix round 5: a lineage error at the consume site never blocks fan-out or loops every tick."""
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+    calls = []
+
+    async def broken(self, db, proposal_action_id):
+        calls.append(proposal_action_id)
+        raise HTTPException(status_code=409, detail="baseline unavailable")
+
+    monkeypatch.setattr(OrchestrationBlockerRecoveryService, "resume", broken)
+    goal, run, task, session, continuous = await dispatched_discovery_source(
+        db_session, test_project, test_agent, monkeypatch,
+    )
+    await _failed_source(db_session, task, session)
+    assert (await continuous.advance(db_session, goal, run))["step"] == "waiting_discovery_recovery"
+    pid, proposal = await _lineage_proposal(db_session, run, "continuous_discovery_source_failed")
+    effect = await continuous.orchestration.execute_retry_task_action(
+        db_session, run.id, {"action_type": "retry_task", "task_id": str(task.id), "timeout": 300, "max_tokens": 100},
+        f"recovery:{pid}:apply:call-1:effect",
+    )
+    task.status = "done"
+    _complete(await db_session.get(Session, effect.target_id), _VALID_BATCH)
+    await db_session.flush()
+
+    with caplog.at_level("WARNING"):
+        result = await continuous.advance(db_session, goal, run)
+
+    assert result == {"step": "complete_cycle", "outcome": "no_action"}
+    assert "discovery lineage resolve skipped" in caplog.text
+    assert calls == [proposal.id]
+    assert (await continuous.advance(db_session, goal, run))["step"] == "complete_cycle"
+    assert calls == [proposal.id]  # the completed cycle never re-enters the lineage
+
+
+@pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
+async def test_approved_team_configuration_fix_on_a_continuous_run_applies_within_subsequent_ticks(
+    sessions, tmp_path, monkeypatch,
+):
+    """F5: apply is deferred under the goal lock (the continuous batch hold); the tick-level unlocked
+    _drive_recovery pass must still run it for a continuous goal."""
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+    from tests.test_orchestration_recovery_configuration import approved_flow, arm_semantic_guard, seed_spr180
+
+    seeded = await seed_spr180(sessions, tmp_path)
+    async with sessions() as s:
+        goal = await s.get(OrchestrationGoal, seeded.goal_id)
+        goal.goal_type, goal.planning_mode = "continuous", "continuous_policy"
+        goal.continuous_policy = direct_policy()
+        await s.commit()
+    flow = await approved_flow(sessions, seeded)
+    arm_semantic_guard(monkeypatch)
+    async with sessions() as s:  # the continuous batch hold: resume under the goal lock defers the apply
+        async with OrchestrationService()._lock_goal_for_baseline_transition(s, seeded.goal_id):
+            await OrchestrationBlockerRecoveryService().resume(s, flow.proposal_action_id)
+    async with sessions() as s:
+        assert (await s.get(OrchestrationAction, flow.wrapper_id)).status == "reserved"
+
+    for _ in range(3):
+        async with sessions() as s:
+            try:
+                await OrchestrationService().tick(s, seeded.run_id)
+            except Exception:  # noqa: BLE001 -- only the recovery pass matters here
+                pass
+        async with sessions() as s:
+            if (await s.get(OrchestrationAction, flow.wrapper_id, populate_existing=True)).status == "completed":
+                return
+    raise AssertionError("approved team_configuration fix never applied across continuous ticks")

@@ -19,7 +19,9 @@ from huddleroom.models.orchestration_process import (
     OrchestrationProcessRun,
 )
 from huddleroom.services.orchestration_agent_review_service import OrchestrationAgentReviewService
-from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+from huddleroom.services.orchestration_authority_service import (
+    RECOVERY_OWNED_KEY_PREFIXES, OrchestrationAuthorityDecisionService,
+)
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
@@ -544,7 +546,12 @@ class GoalCloseoutProcess:
     ) -> list[str]:
         cancelled_ids = []
         for decision in await self.decision_service.list_decisions(db, goal_id, status="pending"):
-            await self.decision_service.cancel_decision(db, decision, reason=reason)
+            cancel = (
+                self.decision_service.cancel_recovery_decision
+                if decision.decision_key.startswith(RECOVERY_OWNED_KEY_PREFIXES)
+                else self.decision_service.cancel_decision
+            )
+            await cancel(db, decision, reason=reason)
             cancelled_ids.append(str(decision.id))
         return cancelled_ids
 

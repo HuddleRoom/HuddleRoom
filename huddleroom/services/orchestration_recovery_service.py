@@ -8,7 +8,6 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
-from fastapi import HTTPException
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun, OrchestrationWait
 from huddleroom.models.session import Session
@@ -291,6 +290,28 @@ class OrchestrationRecoveryService:
                                                  session.session_id if session else run.id)
         return action
 
+    async def _new_attempt_trigger(self, db: AsyncSession, run: OrchestrationRun, session: OwnedSessionSnapshot,
+                                   disposition: str) -> OrchestrationAction | None:
+        """Recovery trigger for a new corrective attempt of an owned task (replacement or resume)."""
+        from huddleroom.services.orchestration_service import OrchestrationService
+
+        service = OrchestrationService()
+        summary = ("The owned attempt was interrupted before any effect and was retired; a replacement attempt needs "
+                   "approval."
+                   if disposition == "interrupted_safe" else
+                   "The owned attempt durably failed; resuming it is a new attempt that needs approval.")
+        source = await service._failure_source(  # pylint: disable=protected-access
+            db, run, f"run:{run.id}:kind:failure_observed:session:{session.session_id}:{disposition}",
+            {"session_id": str(session.session_id), "task_id": str(session.task_id),
+             "owner_action_id": str(session.action_id), "disposition": disposition},
+            "session", session.session_id, summary,
+        )
+        trigger, _created = await service.create_recovery_trigger(
+            db, run, source_kind="failed_action", source_id=source.id, blocker_code=f"owned_session_{disposition}",
+            summary=summary, retry_target={"kind": "decision_loop"}, fingerprint_basis={"source": str(source.id)},
+        )
+        return trigger
+
     async def apply_goal_recovery(self, db: AsyncSession, snapshot: GoalRecoverySnapshot,
                                   observations: dict[uuid.UUID, RunnerObservation],
                                   recovery_timing: dict[str, object] | None = None) -> RecoveryResult | None:
@@ -396,21 +417,17 @@ class OrchestrationRecoveryService:
             recovery["sessions"] = sessions; state["recovery"] = recovery; run.supervision_state = state
             action = None
             wait = None
+            owner = await db.get(OrchestrationAction, session.action_id)
+            approved_owner = owner is not None and owner.idempotency_key.startswith("recovery:")
             if disposition == "resume_exact":
-                try:
-                    action = await OrchestrationService().execute_retry_task_action(db, run.id,
-                        {"action_type": "retry_task", "task_id": str(session.task_id)},
-                        f"run:{run.id}:kind:retry_task:task:{session.task_id}", exact_source_session_id=session.session_id)
-                except HTTPException:
-                    action = None
-                if action is not None and action.status == "completed":
-                    await self._clear_recovery_wait(db, run, session)
-                else:
-                    wait = await self._wait(db, run, session, "exact_continuation_refused")
+                # Resuming a durably failed attempt is a new corrective attempt: an ordinary owner starts one
+                # recovery lineage; an approved recovery attempt's failure feeds its own lineage. Nothing resumes.
+                handled = approved_owner and await OrchestrationService().route_failure_to_recovery_lineage(
+                    db, run, owner, "approved_attempt_failed")
+                action = owner if handled else await self._new_attempt_trigger(db, run, session, disposition)
             elif disposition == "interrupted_safe":
-                # The authoritative backend says this pending attempt died before
-                # effects.  Retire it before TaskService's active-session guard
-                # creates the replacement attempt.
+                # The authoritative backend says this pending attempt died before effects. Retiring it (session
+                # failed, source budget settled, task synced) is non-corrective reconciliation and always runs.
                 source = await db.get(Session, session.session_id)
                 if source is None or source.status not in {"pending", "running"}:
                     return None
@@ -439,13 +456,22 @@ class OrchestrationRecoveryService:
                     settled_budget = True
                 source.status = "failed"
                 source.ended_at = datetime.now(timezone.utc)
+                # Marks an infrastructure interruption, so a later approved retry is not refused as "agent never ran".
+                source_metadata = dict(source.metadata_ or {})
+                source_metadata["attempt"] = {**dict(source_metadata.get("attempt") or {}), "retired": "interrupted_safe"}
+                source.metadata_ = source_metadata
                 from huddleroom.services.session_sync import sync_task_from_session
                 await sync_task_from_session(db, source, settle_budget=not settled_budget)
                 await self._clear_recovery_wait(db, run, session)
-                action = await OrchestrationService().execute_retry_task_action(db, run.id,
-                    {"action_type": "retry_task", "task_id": str(session.task_id)},
-                    f"run:{run.id}:kind:retry_task:task:{session.task_id}",
-                    recovery_disposition="interrupted_safe", source_session_id=session.session_id)
+                if approved_owner:
+                    # Pre-effect crash of the same approved attempt: re-running it needs no new approval.
+                    action = await OrchestrationService().execute_retry_task_action(db, run.id,
+                        {"action_type": "retry_task", "task_id": str(session.task_id)},
+                        f"run:{run.id}:kind:retry_task:task:{session.task_id}",
+                        recovery_disposition="interrupted_safe", source_session_id=session.session_id)
+                else:
+                    # Only the replacement attempt waits for approval.
+                    action = await self._new_attempt_trigger(db, run, session, disposition)
             elif disposition == "terminal":
                 await self._clear_recovery_wait(db, run, session)
                 action = await self._completed_noop(db, run, session)

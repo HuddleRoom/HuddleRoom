@@ -107,7 +107,14 @@ export class TestElement extends TestNode {
   value = ''
   private defaultValueState = ''
   checked = false
-  disabled = false
+  get disabled() {
+    return this.attributes.has('disabled')
+  }
+
+  set disabled(value: boolean) {
+    if (value) this.attributes.set('disabled', '')
+    else this.attributes.delete('disabled')
+  }
   multiple = false
   selected = false
   defaultSelected = false
