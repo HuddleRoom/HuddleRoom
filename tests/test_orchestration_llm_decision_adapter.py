@@ -918,6 +918,7 @@ async def test_request_llm_decision_committed_path_deduplicates_concurrent_reque
 
     started = asyncio.Event()
     release = asyncio.Event()
+    both_started = asyncio.Event()
 
     class BlockingAdapter:
         def __init__(self):
@@ -928,6 +929,8 @@ async def test_request_llm_decision_committed_path_deduplicates_concurrent_reque
             if self.calls > 2:
                 raise AssertionError("adapter called more than twice")
             started.set()
+            if self.calls == 2:
+                both_started.set()
             await release.wait()
             return OrchestrationDecisionAdapterResult(
                 input_snapshot=context,
@@ -944,7 +947,7 @@ async def test_request_llm_decision_committed_path_deduplicates_concurrent_reque
     first_task = asyncio.create_task(request_once())
     await started.wait()
     second_task = asyncio.create_task(request_once())
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(both_started.wait(), timeout=10)
     release.set()
 
     first_decision, second_decision = await asyncio.gather(first_task, second_task)

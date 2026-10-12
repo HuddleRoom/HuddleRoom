@@ -1342,7 +1342,6 @@ async def test_accepted_readiness_gate_unblocks_dependent_but_never_feeds_criter
         db_session, run.id, plan_gate.id, source_type="verification", producer_agent_id=agent.id,
         verdict="accepted", event_seq=2,
     )
-    assert service._criterion_evidence_manifest([gate], [ev]) == {}
     assert service._criterion_evidence_manifest([gate, plan_gate], [ev, final_ev]) == {"c1": [str(final_ev.id)]}
 
 

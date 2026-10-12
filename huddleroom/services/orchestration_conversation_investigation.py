@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import asyncio
 import json
@@ -15,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any, Callable, Literal
 
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from huddleroom.config import settings
@@ -617,64 +619,94 @@ class ConversationInvestigationService:
         self, project_id, goal_id, actor_id, response_id, context_version, request,
         chat_trigger_usage=_NO_CHAT_TRIGGER_USAGE, chat_authority=None,
     ):
-        # Capture only the workspace binding while locked; collection is deliberately off-thread.
-        async with self._session_factory() as db:
+        try:
+            return await self._prepare_once(
+                project_id, goal_id, actor_id, response_id, context_version, request,
+                chat_trigger_usage, chat_authority,
+            )
+        except IntegrityError:
+            # Another preparer may have committed the deterministic reservation first.
+            async with self._session_factory() as db:
+                row = await db.get(ConversationInvestigation, conversation_investigation_id(response_id, context_version))
+                if (row is None or row.response_id != response_id or row.goal_id != goal_id
+                        or row.actor_id != actor_id or row.context_version != context_version):
+                    raise
+                return row, False
+
+    @asynccontextmanager
+    async def _prepare_transaction(self, db, goal_id):
+        bind = db.get_bind()
+        if bind is not None and bind.dialect.name == "sqlite":
+            # SQLite's in-process lock must cover the commit, not just the flush.
+            async with self._orchestration._lock_goal_for_baseline_transition(db, goal_id):
+                async with db.begin():
+                    yield
+        else:
+            # Row locks are acquired inside their database transaction.
             async with db.begin():
                 async with self._orchestration._lock_goal_for_baseline_transition(db, goal_id):
-                    response, workspace = await self._eligible(db, project_id, goal_id, actor_id, response_id, context_version, False)
-                    if not self._chat_authority_matches(response, chat_authority):
-                        raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
-                    existing = await db.get(ConversationInvestigation, conversation_investigation_id(response_id, context_version))
-                    if existing is not None:
-                        return existing, False
-                    if response.status != "running":
-                        raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
+                    yield
+
+    async def _prepare_once(
+        self, project_id, goal_id, actor_id, response_id, context_version, request,
+        chat_trigger_usage=_NO_CHAT_TRIGGER_USAGE, chat_authority=None,
+    ):
+        # Capture only the workspace binding while locked; collection is deliberately off-thread.
+        async with self._session_factory() as db:
+            async with self._prepare_transaction(db, goal_id):
+                response, workspace = await self._eligible(db, project_id, goal_id, actor_id, response_id, context_version, False)
+                if not self._chat_authority_matches(response, chat_authority):
+                    raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
+                existing = await db.get(ConversationInvestigation, conversation_investigation_id(response_id, context_version))
+                if existing is not None:
+                    return existing, False
+                if response.status != "running":
+                    raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
         try:
             data = await asyncio.to_thread(self._reader.collect, workspace, request) if workspace else None
         except (UnsafeSource, OSError, ValueError):
             data = None
         async with self._session_factory() as db:
-            async with db.begin():
-                async with self._orchestration._lock_goal_for_baseline_transition(db, goal_id):
-                    response, current_workspace = await self._eligible(db, project_id, goal_id, actor_id, response_id, context_version, False)
-                    if not self._chat_authority_matches(response, chat_authority):
-                        raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
-                    ident = conversation_investigation_id(response_id, context_version)
-                    existing = await db.get(ConversationInvestigation, ident)
-                    if existing is not None:
-                        return existing, False
-                    if response.status != "running":
-                        raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
-                    if chat_trigger_usage is not _NO_CHAT_TRIGGER_USAGE:
-                        chat_reservation = await db.get(
-                            ConversationReservation, conversation_reservation_id(response_id)
+            async with self._prepare_transaction(db, goal_id):
+                response, current_workspace = await self._eligible(db, project_id, goal_id, actor_id, response_id, context_version, False)
+                if not self._chat_authority_matches(response, chat_authority):
+                    raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
+                ident = conversation_investigation_id(response_id, context_version)
+                existing = await db.get(ConversationInvestigation, ident)
+                if existing is not None:
+                    return existing, False
+                if response.status != "running":
+                    raise ConversationDomainError("conversation_investigation_ineligible", 409, "Conversation investigation is ineligible")
+                if chat_trigger_usage is not _NO_CHAT_TRIGGER_USAGE:
+                    chat_reservation = await db.get(
+                        ConversationReservation, conversation_reservation_id(response_id)
+                    )
+                    if (
+                        chat_reservation is None or chat_reservation.response_id != response_id
+                        or chat_reservation.goal_id != goal_id or chat_reservation.actor_id != actor_id
+                        or chat_reservation.status != "committed"
+                    ):
+                        raise ConversationDomainError(
+                            "conversation_investigation_ineligible", 409,
+                            "Conversation investigation is ineligible",
                         )
-                        if (
-                            chat_reservation is None or chat_reservation.response_id != response_id
-                            or chat_reservation.goal_id != goal_id or chat_reservation.actor_id != actor_id
-                            or chat_reservation.status != "committed"
-                        ):
-                            raise ConversationDomainError(
-                                "conversation_investigation_ineligible", 409,
-                                "Conversation investigation is ineligible",
-                            )
-                        self._settle_chat_trigger(chat_reservation, chat_trigger_usage)
-                    if data is None or current_workspace != workspace or not self._same_root(current_workspace, data.root_identity):
-                        return await self._no_dispatch(db, response, ident, goal_id, actor_id, context_version, request, "unavailable"), True
-                    payload = {"context_version": context_version, "objective": request.objective, "scope": list(data.scope),
-                               "sources": list(data.sources), "omissions": list(data.omissions)}
-                    demand = self._demand(payload)
-                    if await conversation_allowance_used(db, goal_id, actor_id) + demand > settings.orchestration_conversation_allowance_tokens:
-                        return await self._no_dispatch(db, response, ident, goal_id, actor_id, context_version, request, "limited"), True
-                    row = ConversationInvestigation(id=ident, response_id=response_id, goal_id=goal_id, actor_id=actor_id,
-                        context_version=context_version, objective=request.objective, scope=list(data.scope),
-                        input_manifest={**payload, "root_identity": list(data.root_identity)},
-                        provider_identity=conversation_investigation_provider_identity(ident))
-                    db.add(row); await db.flush()
-                    db.add(ConversationInvestigationReservation(id=conversation_investigation_reservation_id(ident), investigation_id=ident,
-                        goal_id=goal_id, actor_id=actor_id, ceiling_snapshot=settings.orchestration_conversation_allowance_tokens,
-                        reserved_tokens=demand))
-                    return row, True
+                    self._settle_chat_trigger(chat_reservation, chat_trigger_usage)
+                if data is None or current_workspace != workspace or not self._same_root(current_workspace, data.root_identity):
+                    return await self._no_dispatch(db, response, ident, goal_id, actor_id, context_version, request, "unavailable"), True
+                payload = {"context_version": context_version, "objective": request.objective, "scope": list(data.scope),
+                           "sources": list(data.sources), "omissions": list(data.omissions)}
+                demand = self._demand(payload)
+                if await conversation_allowance_used(db, goal_id, actor_id) + demand > settings.orchestration_conversation_allowance_tokens:
+                    return await self._no_dispatch(db, response, ident, goal_id, actor_id, context_version, request, "limited"), True
+                row = ConversationInvestigation(id=ident, response_id=response_id, goal_id=goal_id, actor_id=actor_id,
+                    context_version=context_version, objective=request.objective, scope=list(data.scope),
+                    input_manifest={**payload, "root_identity": list(data.root_identity)},
+                    provider_identity=conversation_investigation_provider_identity(ident))
+                db.add(row); await db.flush()
+                db.add(ConversationInvestigationReservation(id=conversation_investigation_reservation_id(ident), investigation_id=ident,
+                    goal_id=goal_id, actor_id=actor_id, ceiling_snapshot=settings.orchestration_conversation_allowance_tokens,
+                    reserved_tokens=demand))
+                return row, True
 
     @staticmethod
     def _settle_chat_trigger(reservation, usage):

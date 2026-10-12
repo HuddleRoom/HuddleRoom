@@ -486,7 +486,7 @@ async def test_paused_goal_stays_paused_after_correction(db_session, test_projec
 
 
 async def test_paused_child_stays_paused_after_correction(db_session, test_project):
-    _, _, _, child, old = await _released_child(db_session, test_project)
+    roadmap, parent, parent_run, child, old = await _released_child(db_session, test_project)
     child.goal_type_source = "parent_auto"
     child.status = old.status = "paused"
     await db_session.flush()
@@ -494,6 +494,7 @@ async def test_paused_child_stays_paused_after_correction(db_session, test_proje
 
     child, successor = await _apply(db_session, child, request)
 
+    await roadmap.renew_corrected_children(db_session, parent, parent_run)
     assert (child.status, successor.status) == ("paused", "paused")
 
 

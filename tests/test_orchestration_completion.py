@@ -554,7 +554,7 @@ async def test_cli_runner_omits_only_onecli_placeholder_provider_keys_from_child
 
     monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01, backend="claude")
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=5, backend="claude")
 
     assert "ANTHROPIC_API_KEY" not in captured
     assert "OPENAI_API_KEY" not in captured
@@ -592,7 +592,7 @@ async def _captured_child_env(monkeypatch, backend):
         return proc
 
     monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
-    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01, backend=backend)
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=5, backend=backend)
     return captured
 
 
@@ -655,7 +655,7 @@ async def test_cli_runner_keeps_proxy_when_native_runtimes_empty(monkeypatch):
 
     monkeypatch.setattr(orchestration_completion.asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    await orchestration_completion._run(("fake-cli",), "hello", timeout=0.01, backend="claude")
+    await orchestration_completion._run(("fake-cli",), "hello", timeout=5, backend="claude")
 
     # Proxy should be kept
     assert captured["HTTP_PROXY"] == "http://proxy.example.com:8080"

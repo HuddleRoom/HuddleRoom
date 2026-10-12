@@ -467,7 +467,7 @@ class OrchestrationRecoveryService:
                     # Pre-effect crash of the same approved attempt: re-running it needs no new approval.
                     action = await OrchestrationService().execute_retry_task_action(db, run.id,
                         {"action_type": "retry_task", "task_id": str(session.task_id)},
-                        f"run:{run.id}:kind:retry_task:task:{session.task_id}",
+                        f"run:{run.id}:kind:retry_task:task:{session.task_id}:session:{session.session_id}",
                         recovery_disposition="interrupted_safe", source_session_id=session.session_id)
                 else:
                     # Only the replacement attempt waits for approval.

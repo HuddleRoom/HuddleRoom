@@ -27,6 +27,9 @@ def _strip_config_env(environ=os.environ):
 
 _strip_config_env()
 
+# Use bundled model prices so collection never starts import-time network retries.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
 from huddleroom.config import Settings, settings
 from huddleroom.database import get_db
 

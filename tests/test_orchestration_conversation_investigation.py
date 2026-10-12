@@ -3120,11 +3120,54 @@ async def test_simultaneous_prepares_share_the_same_deterministic_reservation(
         return _valid_report("a.txt#L1-L1")
 
     service = _service(test_engine, completion, reader=SynchronizedReader())
+    real_lock = service._orchestration._lock_goal_for_baseline_transition
+
+    @asynccontextmanager
+    async def committed_prepare_lock(db, goal_id, **kwargs):
+        async with real_lock(db, goal_id, **kwargs):
+            yield
+            if any(isinstance(row, runtime.api.ConversationInvestigation) and row.status == "pending"
+                   for row in db.identity_map.values()):
+                assert not db.in_transaction(), "Prepared reservation must commit before releasing the goal lock"
+
+    monkeypatch.setattr(service._orchestration, "_lock_goal_for_baseline_transition", committed_prepare_lock)
     args = (goal.project_id, goal.id, actor.id, response.id, response.context_version, _request_for())
     first, second = await asyncio.gather(service.execute(*args), service.execute(*args))
     assert {first.status, second.status} <= {"running", "completed"}
     investigations, reservations = await _investigation_rows(test_engine)
     assert (calls, len(investigations), len(reservations)) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_prepare_rereads_committed_duplicate_and_preserves_unrelated_integrity_errors(
+    test_engine, conversation_goal_run, test_user, db_session, tmp_path, monkeypatch,
+):
+    from sqlalchemy.exc import IntegrityError
+
+    response, goal, actor = await _seed_running_response(test_engine, db_session, conversation_goal_run, test_user)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("fact\n", encoding="utf-8")
+    await _set_workspace(test_engine, goal.project_id, workspace)
+    runtime = _runtime()
+    monkeypatch.setattr(runtime.settings, "orchestration_conversation_allowance_tokens", 50_000)
+    service = _service(test_engine, None)
+    args = (goal.project_id, goal.id, actor.id, response.id, response.context_version, _request_for())
+    prepared, created = await service._prepare(*args)
+    assert created is True
+    conflict = IntegrityError("insert", {}, Exception("duplicate provider identity"))
+
+    async def competing_prepare(*_args, **_kwargs):
+        raise conflict
+
+    monkeypatch.setattr(service, "_prepare_once", competing_prepare)
+    replay, created = await service._prepare(*args)
+    assert (replay.id, created) == (prepared.id, False)
+    investigations, reservations = await _investigation_rows(test_engine)
+    assert (len(investigations), len(reservations)) == (1, 1)
+    with pytest.raises(IntegrityError) as error:
+        await service._prepare(goal.project_id, goal.id, uuid.uuid4(), *args[3:])
+    assert error.value is conflict
 
 
 @pytest.mark.asyncio

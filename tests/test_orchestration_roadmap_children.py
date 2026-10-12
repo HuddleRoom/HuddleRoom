@@ -450,7 +450,8 @@ async def test_concurrent_goal_item_release_cannot_overallocate(
 
     results = await asyncio.wait_for(asyncio.gather(tick(first), tick(second)), timeout=30)
     assert set(attempts) == {first, second} and len(attempts) == 2
-    winner, loser = attempts
+    winner = next(db for event, db in lock_events if event == "enter")
+    loser = second if winner is first else first
     assert lock_events == [("enter", winner), ("exit", winner), ("enter", loser), ("exit", loser)]
     successes = [result for result in results if isinstance(result, dict)]
     assert len(successes) == 2

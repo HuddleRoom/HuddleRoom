@@ -1,4 +1,6 @@
 import json
+import fcntl
+import hashlib
 import os
 import re
 import shutil
@@ -8,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import tomllib
 import venv
@@ -66,8 +69,22 @@ def _run(
         raise AssertionError(f"Command failed: {display_command}\nstdout:\n{stdout}\nstderr:\n{stderr}") from error
 
 
+@contextmanager
+def _source_build_lock() -> Iterator[None]:
+    # Both builders mutate the checkout; workers otherwise delete each other's staging files.
+    root_key = hashlib.sha256(os.fsencode(ROOT)).hexdigest()
+    lock_path = Path(tempfile.gettempdir()) / f"huddleroom-distribution-{root_key}.lock"
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _build_artifacts(output: Path) -> tuple[Path, Path]:
-    _run([sys.executable, "-m", "build", "--outdir", str(output)], cwd=ROOT, timeout=BUILD_TIMEOUT)
+    with _source_build_lock():
+        _run([sys.executable, "-m", "build", "--outdir", str(output)], cwd=ROOT, timeout=BUILD_TIMEOUT)
     return next(output.glob("*.whl")), next(output.glob("*.tar.gz"))
 
 
@@ -93,7 +110,8 @@ def _build_dashboard_if_needed() -> None:
         return
     if shutil.which("npm") is None:
         raise RuntimeError("npm is required to build the dashboard before testing the distribution")
-    _run(["make", "build-frontend"], cwd=ROOT, timeout=BUILD_TIMEOUT)
+    with _source_build_lock():
+        _run(["make", "build-frontend"], cwd=ROOT, timeout=BUILD_TIMEOUT)
 
 
 def _expected_static_files() -> set[str]:

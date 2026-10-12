@@ -163,34 +163,8 @@ async def _require_runnable_session_once(db, session_id: uuid.UUID, runner_task_
             raise
         detail = exc.detail
         failure_error = f"project_not_runnable: {detail['reason']}"
-        values = {"status": "failed", "error": failure_error, "ended_at": datetime.now(timezone.utc)}
-        where = [SessionModel.id == session.id, SessionModel.status == "pending"]
-        if runner_task_id:
-            metadata = dict(session.metadata_ or {})
-            metadata["attempt"] = {
-                "claimed_runner_task_id": runner_task_id,
-                "claimed_at": datetime.now(timezone.utc).isoformat(),
-                "attempt_version": 1,
-                "effect_state": "not_started",
-                "usage_complete": False,
-                "result_status": "failed",
-                "result_recorded_at": datetime.now(timezone.utc).isoformat(),
-                "provider_session_id": session.provider_session_id,
-            }
-            values["metadata_"] = metadata
-            where.extend((SessionModel.runner_task_id == runner_task_id, SessionModel.started_at.is_(None)))
-        result = await db.execute(update(SessionModel).where(*where).values(**values))
-        if not result.rowcount:
-            return False
-        await db.refresh(session)
-        await emit_event(db, session.project_id, "session.failed", {
-            "session_id": str(session.id),
-            "task_id": str(session.task_id) if session.task_id else None,
-            "error": session.error,
-            "project_id": str(session.project_id),
-        })
-        await sync_task_from_session(db, session)
-        return exc
+        await _fail_pending_session(db, session, failure_error, runner_task_id)
+        return exc if session.status == "failed" else False
     if runner_task_id is None:
         claim = await db.execute(
             update(SessionModel).where(

@@ -872,7 +872,7 @@ async def test_api_revalidates_project_immediately_before_orchestration_provider
 
 @pytest.mark.asyncio
 async def test_definitive_pre_effect_failure_uses_existing_retry_key_once(db_session, test_project, test_agent):
-    result, _, _, _, task, _ = await _applied(
+    result, _, _, _, task, session = await _applied(
         db_session, test_project, test_agent, status="pending", backend="terminal_failure",
         attempt={
             "claimed_runner_task_id": "runner-1", "attempt_version": 1,
@@ -882,7 +882,7 @@ async def test_definitive_pre_effect_failure_uses_existing_retry_key_once(db_ses
     )
     assert result.classification == "interrupted_safe" and result.action_id is not None
     action = await db_session.get(OrchestrationAction, result.action_id)
-    assert action.idempotency_key.endswith(f"task:{task.id}")
+    assert action.idempotency_key.endswith(f"task:{task.id}:session:{session.id}")
     assert action.dispatch_contract["owner"] == "orchestration_recovery"
     assert action.dispatch_contract["recovery_disposition"] == "interrupted_safe"
     assert action.dispatch_contract["task_id"] == str(task.id)

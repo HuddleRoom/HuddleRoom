@@ -26,6 +26,12 @@ async def terminate_process_group(proc: Any, grace_seconds: float = 0.5) -> None
                 os.killpg(process_group_id, 0)
             except ProcessLookupError:
                 return True
+            except PermissionError:
+                # macOS can report EPERM for a zombie group until its leader is reaped.
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+                await asyncio.sleep(min(0.05, grace_seconds))
+                continue
             if asyncio.get_running_loop().time() >= deadline:
                 return False
             await asyncio.sleep(min(0.05, grace_seconds))

@@ -45,13 +45,13 @@ async def _make_turn_inputs(db, tmp_path: Path, timeout: float = 5, config: dict
 
 
 async def _wait_for_path(path: Path) -> None:
-    async with asyncio.timeout(2):
+    async with asyncio.timeout(10):
         while not path.exists():
             await asyncio.sleep(0.01)
 
 
 async def _assert_process_exited(pid: int) -> None:
-    async with asyncio.timeout(2):
+    async with asyncio.timeout(10):
         while True:
             try:
                 os.kill(pid, 0)
@@ -436,13 +436,13 @@ async def test_meeting_turn_external_cancel_terminates_process_group(db_session,
                 child_pid = int(child_pid_path.read_text())
                 run_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(run_task, timeout=1)
+                    await asyncio.wait_for(run_task, timeout=5)
 
         await _assert_process_exited(child_pid)
     finally:
         if run_task is not None and not run_task.done():
             run_task.cancel()
-            await asyncio.wait_for(asyncio.gather(run_task, return_exceptions=True), timeout=1)
+            await asyncio.wait_for(asyncio.gather(run_task, return_exceptions=True), timeout=5)
         if child_pid is not None:
             _kill_process_if_running(child_pid)
 

@@ -4541,7 +4541,8 @@ class OrchestrationService:
     async def _non_agent_failure_reason(self, db: AsyncSession, task_id: uuid.UUID) -> str | None:
         """Reason the latest failed session never launched the agent (so a retry is pointless), else None."""
         result = await db.execute(
-            select(Session).where(Session.task_id == task_id).order_by(Session.created_at.desc()).limit(1)
+            select(Session).where(Session.task_id == task_id)
+            .order_by(Session.created_at.desc(), Session.id.desc()).limit(1)
         )
         session = result.scalar_one_or_none()
         if session is None or session.status != "failed":
@@ -5488,7 +5489,11 @@ class OrchestrationService:
                 raise invalid(f"task {task_id} is cancelled")
             if (
                 not self._json_object_or_empty(task.metadata_).get("orchestration_contract")
-                or await db.get(OrchestrationAction, task_id) is None
+                or await db.scalar(select(OrchestrationAction.id).where(
+                    OrchestrationAction.id == task_id,
+                    OrchestrationAction.action_type == "create_delegation_task",
+                    OrchestrationAction.run_id == run.id,
+                )) is None
             ):
                 raise invalid(f"task {task_id} was not created by a delegation")
             work_function = self._task_work_function(task)
@@ -9868,10 +9873,19 @@ class OrchestrationService:
             return "hard_stop"
         if self._budget_is_exhausted(run):
             return "budget_exhausted"
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        child_delta_ready = (
+            goal is not None and goal.parent_goal_id is not None
+            and self._json_object_or_empty(
+                self._json_object_or_empty(run.plan_state).get("child_delta_baseline")
+            ).get("status") == "accepted"
+        )
         for kind in (
             "repeated_failure", "goal_definition_analyzer_error", "agent_definition_review_analyzer_error",
             "plan_criterion_integrity", "budget_exhausted",
         ):
+            if kind == "agent_definition_review_analyzer_error" and child_delta_ready:
+                continue
             if self._has_active_blocker(run, kind):
                 return kind
         return None

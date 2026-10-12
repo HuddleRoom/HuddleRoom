@@ -356,7 +356,10 @@ async def _follow_up_rows(
     producer_gate_ids: set[str] = set()
     plan_titles: dict[str, str] = {}
     for task in tasks:
-        gate_id = _orchestration_meta(task).get("plan_item_gate_id")
+        orchestration = _orchestration_meta(task)
+        if orchestration.get("verification_gate_id"):
+            continue
+        gate_id = orchestration.get("plan_item_gate_id")
         if not isinstance(gate_id, str):
             continue
         plan_titles.setdefault(gate_id, task.title)

@@ -301,7 +301,10 @@ def _codex_usage(raw: str) -> dict[str, int] | None:
         if isinstance(usage, dict) and all(isinstance(usage.get(key), int) for key in ("input_tokens", "output_tokens")):
             prompt = usage["input_tokens"]
             completion = usage["output_tokens"]
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+            parsed_usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+            if isinstance(usage.get("cached_input_tokens"), int):
+                parsed_usage["cached_input_tokens"] = usage["cached_input_tokens"]
+            return parsed_usage
     return None
 
 

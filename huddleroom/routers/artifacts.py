@@ -74,7 +74,6 @@ async def create_artifact(
         url=data.url,
         metadata=data.metadata,
         linked_task_id=data.linked_task_id,
-        created_by_agent=data.created_by_agent,
         created_by_user=data.created_by_user,
     )
     return _artifact_response(artifact)

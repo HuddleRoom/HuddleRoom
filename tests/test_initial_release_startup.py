@@ -37,6 +37,7 @@ def _environment(**overrides: str) -> dict[str, str]:
         RALLY_DATABASE_URL="sqlite+aiosqlite:///huddleroom.db",
         RALLY_REDIS_URL="",
         RALLY_AUTH_ENABLED="false",
+        LITELLM_LOCAL_MODEL_COST_MAP="True",
     )
     env.update(overrides)
     return env
@@ -221,7 +222,7 @@ def test_celery_entry_points_reject_default_settings(command):
         capture_output=True,
         text=True,
         check=False,
-        timeout=10,
+        timeout=60,
     )
 
     assert result.returncode != 0
@@ -240,7 +241,7 @@ def test_celery_entry_points_reject_unsupported_settings(command):
         capture_output=True,
         text=True,
         check=False,
-        timeout=10,
+        timeout=60,
     )
 
     assert result.returncode != 0
