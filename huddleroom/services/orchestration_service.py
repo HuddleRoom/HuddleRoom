@@ -13,6 +13,7 @@ import json
 import logging
 from textwrap import shorten
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
@@ -245,6 +246,9 @@ class _ReentrantAsyncioLock:
 # (review finding, MEDIUM) -- see _lock_goal_for_baseline_transition.
 _SQLITE_GOAL_LOCKS: dict[uuid.UUID, _ReentrantAsyncioLock] = {}
 _SQLITE_GOAL_LOCKS_GUARD = asyncio.Lock()
+
+# Separate from goal locks: recovery may acquire the roster lock before goal locks.
+_RECOVERY_LIFECYCLE_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 # A baseline-repair admission (passed only by the dispatcher from a validated approve_fix recovery context,
 # never read from request JSON) is honored only for that approved call's own recovery effect key.
@@ -11103,6 +11107,27 @@ class OrchestrationService:
             await self._drive_recovery(db, run_id)
         return result
 
+    @asynccontextmanager
+    async def _lock_recovery_lifecycle(self, db: AsyncSession, run_id: uuid.UUID, owns: bool):
+        """Publish a tick-owned recovery pass before another pass reads its proposals.
+
+        Caller-owned transactions retain their existing savepoint/publication semantics;
+        their caller remains responsible for serialization through its outer commit.
+        This mutex is independent of baseline/roster locks and never covers diagnosis.
+        """
+        if not owns or db.get_bind().dialect.name != "sqlite":
+            yield
+            return
+        goal_id = await db.scalar(select(OrchestrationRun.goal_id).where(OrchestrationRun.id == run_id))
+        await db.commit()  # a waiter must not keep a SQLite writer open
+        loop_locks = _RECOVERY_LIFECYCLE_LOCKS.setdefault(asyncio.get_running_loop(), {})
+        lock = loop_locks.setdefault(goal_id, asyncio.Lock())
+        async with lock:
+            try:
+                yield
+            finally:
+                await db.commit()  # lifecycle updates must publish before the mutex is released
+
     async def _drive_recovery(self, db: AsyncSession, run_id: uuid.UUID, *, diagnose: bool = True) -> None:
         """Outside the tick's goal lock: resume every active proposal (apply/verify/retry progress,
         delegated-remediation waits, in-wrapper retries), then diagnose reserved recovery triggers.
@@ -11190,13 +11215,15 @@ class OrchestrationService:
                 await db.flush()
 
         try:
-            status = await db.scalar(select(OrchestrationRun.status).where(OrchestrationRun.id == run_id))
-            if status not in LLM_DECISION_RUN_STATUSES:
-                return
             service = OrchestrationBlockerRecoveryService()
+            async with self._lock_recovery_lifecycle(db, run_id, owns):
+                status = await db.scalar(select(OrchestrationRun.status).where(OrchestrationRun.id == run_id))
+                if status not in LLM_DECISION_RUN_STATUSES:
+                    return
+                for proposal_id in await ids("recovery_proposal"):
+                    await step(lambda proposal_id=proposal_id: service.resume(db, proposal_id))
+            # Diagnosis waits for the provider without a lifecycle, goal, or roster lock.
             # Bounded: at most one analyzer diagnosis per run per tick, least recently attempted first.
-            for proposal_id in await ids("recovery_proposal"):
-                await step(lambda proposal_id=proposal_id: service.resume(db, proposal_id))
             trigger_id = await next_trigger() if diagnose else None
             if trigger_id is not None:
                 await step(lambda: service.diagnose(db, trigger_id),
