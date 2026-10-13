@@ -1946,6 +1946,160 @@ async def test_terminal_hold_and_settlement_are_serialized_by_goal_lock(
     assert (await late).response.status == "interrupted_unknown"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_kind,late_kind,rollback", [
+    ("hold", "settle", False), ("hold", "fail", False),
+    ("settle", "hold", False), ("fail", "hold", False),
+    ("hold", "settle", True),
+])
+async def test_terminal_goal_mutex_spans_independent_transaction_commit_and_rollback(
+    test_engine, conversation_goal_run, test_user, db_session, monkeypatch, first_kind, late_kind, rollback,
+):
+    """Pause actual terminal DML after flush, at the existing transaction exit boundary."""
+    from sqlalchemy.ext.asyncio import AsyncSessionTransaction
+    goal, _ = conversation_goal_run
+    await db_session.commit()
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 10_000)
+    service = _service(test_engine, lambda **_kwargs: None)
+    pending, _ = await service._prepare(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question")
+    response_id = pending.response.id
+    await service._claim(goal.id, response_id)
+    prepared, release, late_attempted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    owner = None
+    snapshots = []
+    original_lock = service._orchestration._lock_goal_for_baseline_transition
+    original_exit = AsyncSessionTransaction.__aexit__
+    first_task = late_task = None
+
+    @asynccontextmanager
+    async def observed_lock(db, goal_id, **kwargs):
+        nonlocal owner
+        if asyncio.current_task() is late_task:
+            late_attempted.set()
+        async with original_lock(db, goal_id, **kwargs):
+            owner = asyncio.current_task()
+            try:
+                yield
+            finally:
+                owner = None
+
+    async def gated_exit(transaction, exc_type, exc, tb):
+        if asyncio.current_task() is first_task:
+            await transaction.session.flush()
+            snapshots.append(owner is first_task)
+            prepared.set()
+            await release.wait()
+            if rollback:
+                error = RuntimeError("injected terminal commit failure")
+                await original_exit(transaction, type(error), error, None)
+                snapshots.append(owner is first_task)
+                raise error
+            result = await original_exit(transaction, exc_type, exc, tb)
+            snapshots.append(owner is first_task)
+            return result
+        return await original_exit(transaction, exc_type, exc, tb)
+
+    monkeypatch.setattr(service._orchestration, "_lock_goal_for_baseline_transition", observed_lock)
+    monkeypatch.setattr(AsyncSessionTransaction, "__aexit__", gated_exit)
+    def operation(kind):
+        if kind == "hold":
+            return service._hold_unknown(goal.id, response_id, "provider_outcome_unknown")
+        if kind == "fail":
+            return service._fail_known(goal.id, response_id, "known_failure", 1)
+        return service._settle(goal.id, response_id, "late answer", 1)
+    first_task = asyncio.create_task(operation(first_kind))
+    try:
+        await asyncio.wait_for(prepared.wait(), 5)
+        late_task = asyncio.create_task(operation(late_kind))
+        await asyncio.wait_for(late_attempted.wait(), 5)
+        assert snapshots == [True], "goal mutex released after flush but before terminal commit"
+        assert not late_task.done()
+        # A separate reader sees only the prior committed ownership until release.
+        async with _factory(test_engine)() as check:
+            response = await check.get(ConversationResponse, response_id)
+            reservation = await check.get(ConversationReservation, conversation_reservation_id(response_id))
+            assert (response.status, reservation.status) == ("running", "committed")
+        release.set()
+        if rollback:
+            with pytest.raises(RuntimeError, match="injected terminal commit failure"):
+                await asyncio.wait_for(first_task, 5)
+        else:
+            await asyncio.wait_for(first_task, 5)
+        await asyncio.wait_for(late_task, 5)
+        assert snapshots == [True, True], "mutex must also cover actual commit or rollback completion"
+        terminal = "settle" if rollback else first_kind
+        expected = {"hold": ("interrupted_unknown", "held_unknown", 0),
+                    "settle": ("completed", "settled", 1), "fail": ("failed", "settled", 1)}[terminal]
+        async with _factory(test_engine)() as check:
+            response = await check.get(ConversationResponse, response_id)
+            reservation = await check.get(ConversationReservation, conversation_reservation_id(response_id))
+            assert (response.status, reservation.status, reservation.settled_tokens) == expected
+            assert response.finished_at is not None
+            if terminal == "hold":
+                assert response.answer is None and reservation.released_tokens == 0
+                assert response.error == {"code": "provider_outcome_unknown"}
+            else:
+                assert reservation.released_tokens == reservation.reserved_tokens - 1
+                assert response.answer == ("late answer" if terminal == "settle" else None)
+                assert response.error == (None if terminal == "settle" else {"code": "known_failure"})
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (first_task, late_task) if task), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["hold", "settle", "fail"])
+async def test_postgresql_terminal_writer_begins_before_row_lock_without_autobegin(operation):
+    """A row-lock SELECT must never implicitly begin before explicit db.begin()."""
+    from huddleroom.services.orchestration_conversation_service import ConversationTurn
+    goal_id, response_id, message_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    state, sequence = {"transaction": False}, []
+    response = SimpleNamespace(id=response_id, message_id=message_id, status="running", dossier={})
+    reservation = SimpleNamespace(status="committed", reserved_tokens=100)
+    message = SimpleNamespace(id=message_id)
+    class PostgreSQLSession:
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        @asynccontextmanager
+        async def begin(self):
+            assert not state["transaction"], "row lock caused AUTOBEGIN before explicit transaction"
+            state["transaction"] = True
+            sequence.append("begin")
+            try:
+                yield
+            finally:
+                sequence.append("commit")
+                state["transaction"] = False
+        async def get(self, model, identity):
+            return {ConversationResponse: response, ConversationReservation: reservation,
+                    ConversationMessage: message}[model]
+    @asynccontextmanager
+    async def factory():
+        yield PostgreSQLSession()
+    orchestration = OrchestrationService()
+    @asynccontextmanager
+    async def row_lock(db, identity):
+        if not state["transaction"]:
+            state["transaction"] = True  # mirror SELECT FOR UPDATE's implicit begin
+            sequence.append("autobegin")
+        sequence.append("row_lock")
+        try:
+            yield
+        finally:
+            sequence.append("row_unlock")
+    orchestration._lock_goal_for_baseline_transition = row_lock
+    service = OrchestrationConversationService(factory, lambda **kwargs: None, orchestration_service=orchestration)
+    if operation == "hold":
+        turn = await service._hold_unknown(goal_id, response_id, "unknown")
+    elif operation == "fail":
+        turn = await service._fail_known(goal_id, response_id, "known_failure", 1)
+    else:
+        turn = await service._settle(goal_id, response_id, "answer", 1)
+    assert isinstance(turn, ConversationTurn)
+    assert sequence == ["begin", "row_lock", "row_unlock", "commit"]
+    assert state["transaction"] is False
+
+
 def _tracked_service(test_engine, completion, lookup=None):
     factory = _factory(test_engine)
     state = {
