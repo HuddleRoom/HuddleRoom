@@ -30,6 +30,7 @@ _RETAINED_RESOURCE_IDS: ContextVar[tuple[str, ...]] = ContextVar("onecli_retaine
 _PROVIDER_PLACEHOLDERS = {
     "OPENAI_API_KEY": "onecli-openai-placeholder",
     "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
+    "OPENROUTER_API_KEY": "onecli-openrouter-placeholder",
 }
 _CONTEXT_KEYS = (
     "ONECLI_GATEWAY", "ONECLI_GATEWAY_SKILL_PATH", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",

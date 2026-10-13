@@ -249,8 +249,24 @@ def _wait_until_ready(process: subprocess.Popen, base_url: str) -> None:
     _block("controlled HuddleRoom server readiness timed out")
 
 
+def configure_artifact_dir(path: Path) -> None:
+    """Select evidence storage for a caller reusing the controlled runner."""
+    global ARTIFACT_DIR, CHECKPOINT_PATH, EVENT_LOG_PATH, PACKET_PATH, VERDICT_LOG_PATH, HTTP_TRACE_PATH
+    ARTIFACT_DIR = path
+    CHECKPOINT_PATH = path / "checkpoint.json"
+    EVENT_LOG_PATH = path / "events.jsonl"
+    PACKET_PATH = path / "judgment-packet.json"
+    VERDICT_LOG_PATH = path / "verdicts.jsonl"
+    HTTP_TRACE_PATH = path / "http-trace.jsonl"
+
+
 @contextmanager
-def _controlled_server():
+def _controlled_server(
+    *, environment: dict[str, str] | None = None, gateway: str | None = None,
+    management_url: str | None = None, reload: bool = True, artifact_dir: Path | None = None,
+):
+    if artifact_dir is not None:
+        configure_artifact_dir(artifact_dir)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -258,23 +274,21 @@ def _controlled_server():
     env = os.environ.copy()
     env["HUDDLEROOM_DEBUG"] = "true"
     env["HUDDLEROOM_ORCHESTRATION_BASELINE_E2E"] = "true"
+    env.update(environment or {})
+    if management_url is not None:
+        env["ONECLI_API_HOST"] = management_url
+        env["HUDDLEROOM_ONECLI_MANAGEMENT_URL"] = management_url
+    if gateway is not None:
+        env["HUDDLEROOM_ONECLI_GATEWAY_URL"] = f"http://{gateway}"
+    command = ["onecli", "run"]
+    if gateway is not None:
+        command.extend(["--gateway", gateway])
+    command.extend(["--agent", "rally-onecli", "--", sys.executable, "-m", "huddleroom.cli", "serve"])
+    if reload:
+        command.append("--reload")
+    command.extend(["--host", "127.0.0.1", "--port", str(port)])
     process = subprocess.Popen(
-        [
-            "onecli",
-            "run",
-            "--agent",
-            "rally-onecli",
-            "--",
-            sys.executable,
-            "-m",
-            "huddleroom.cli",
-            "serve",
-            "--reload",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
+        command,
         cwd=_PROJECT_ROOT,
         env=env,
         stdout=subprocess.PIPE,

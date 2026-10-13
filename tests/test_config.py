@@ -62,6 +62,18 @@ def test_load_provider_env_exports_openrouter_api_key(tmp_path, monkeypatch):
     assert os.environ["OPENROUTER_API_KEY"] == "or-test"
 
 
+def test_onecli_provider_env_replaces_openrouter_secret_and_discards_alias(tmp_path, monkeypatch):
+    from huddleroom.config import PROVIDER_ENV_KEYS, load_provider_env
+
+    for key in PROVIDER_ENV_KEYS:
+        monkeypatch.setenv(key, "synthetic-direct-value")
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENROUTER_API_KEY=synthetic-dotenv-value\n")
+    load_provider_env(env_file, tmp_path / "absent.toml", credential_mode="onecli")
+    assert os.environ["OPENROUTER_API_KEY"] == "onecli-openrouter-placeholder"
+    assert "OR_API_KEY" not in os.environ
+
+
 def test_onecli_config_import_discards_process_dotenv_and_toml_provider_values(tmp_path):
     """Mode must be known before config import can expose plaintext credentials."""
     home = tmp_path / "home"
@@ -118,7 +130,7 @@ def test_onecli_config_import_discards_process_dotenv_and_toml_provider_values(t
     assert json.loads(result.stdout) == {
         "OPENAI_API_KEY": "onecli-openai-placeholder",
         "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
-        "OPENROUTER_API_KEY": None,
+        "OPENROUTER_API_KEY": "onecli-openrouter-placeholder",
         "GEMINI_API_KEY": None,
         "OLLAMA_API_BASE": None,
         "ONECLI_API_KEY": "environment-only-management-key",
@@ -406,6 +418,20 @@ def test_orchestration_backend_and_effort_defaults_and_legacy_alias(monkeypatch)
         configured = Settings(_env_file=None)
     assert configured.orchestration_backend == "codex"
     assert configured.orchestration_effort == "high"
+
+
+@pytest.mark.parametrize("explicit", ["", "null", "none"])
+def test_explicit_orchestration_effort_overrides_inherited_low(tmp_path, monkeypatch, explicit):
+    import huddleroom.config as config
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("HUDDLEROOM_ORCHESTRATION_EFFORT=low\n")
+    toml = tmp_path / "config.toml"
+    toml.write_text('orchestration_effort = "low"\n')
+    monkeypatch.setattr(config, "DEFAULT_CONFIG_FILE", toml)
+    monkeypatch.setenv("HUDDLEROOM_ORCHESTRATION_EFFORT", explicit)
+    configured = config.Settings(_env_file=dotenv)
+    assert configured.orchestration_effort == ("none" if explicit == "none" else None)
 
 
 def test_orchestration_effort_is_a_literal_union():

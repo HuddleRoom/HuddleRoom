@@ -97,7 +97,11 @@ def load_provider_env(
     if credential_mode == "onecli":
         for key in PROVIDER_ENV_KEYS:
             os.environ.pop(key, None)
-        os.environ.update({"OPENAI_API_KEY": "onecli-openai-placeholder", "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder"})
+        os.environ.update({
+            "OPENAI_API_KEY": "onecli-openai-placeholder",
+            "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
+            "OPENROUTER_API_KEY": "onecli-openrouter-placeholder",
+        })
         return
     for key in PROVIDER_ENV_KEYS:
         if key in toml and not isinstance(toml[key], str):
@@ -196,6 +200,14 @@ class Settings(BaseSettings):
     onecli_gateway_url: str = "http://127.0.0.1:10255"
     onecli_native_auth_runtimes: list[str] = Field(default=["claude_code", "codex"])
     _setting_names: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @field_validator("orchestration_effort", mode="before")
+    @classmethod
+    def clear_orchestration_effort(cls, value):
+        """An explicit blank/null clears inherited effort; literal 'none' remains an effort."""
+        if isinstance(value, str) and (not value.strip() or value.strip().lower() == "null"):
+            return None
+        return value
 
     @model_validator(mode="after")
     def validate_judgment_lease(self):

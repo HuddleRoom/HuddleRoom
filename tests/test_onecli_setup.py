@@ -14,6 +14,16 @@ def _response(status_code, payload):
     return SimpleNamespace(status_code=status_code, json=lambda: payload)
 
 
+def test_onecli_child_environment_replaces_openrouter_secret_and_discards_alias():
+    from huddleroom.config import Settings
+    from huddleroom.onecli import apply_onecli_environment
+
+    env = {"OPENROUTER_API_KEY": "synthetic-direct-value", "OR_API_KEY": "synthetic-alias-value"}
+    apply_onecli_environment(env, Settings(_env_file=None, credential_mode="onecli"))
+    assert env["OPENROUTER_API_KEY"] == "onecli-openrouter-placeholder"
+    assert "OR_API_KEY" not in env
+
+
 def test_verify_onecli_returns_only_safe_resolved_agent_metadata(monkeypatch):
     from huddleroom.config import Settings
     import huddleroom.onecli as onecli
