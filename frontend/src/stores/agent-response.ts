@@ -5,6 +5,7 @@ import {
   AgentCallRecord,
   RequestDisplay,
   AgentCallItem,
+  FinalResponseSnapshot,
   isAgentResponseEvent,
   JsonValue,
 } from '@/lib/agentResponse'
@@ -25,6 +26,8 @@ export interface AgentResponseState {
 
 const RETENTION_RAW_EVENTS = 200
 const RETENTION_DERIVED_CALLS = 200
+const RETENTION_DERIVED_ITEMS = 128
+const RETENTION_OUTPUT_BYTES = 64 * 1024
 
 function getActorLabel(event: AgentResponseEvent): string {
   if (event.event_type === 'agent_response.started') {
@@ -43,6 +46,73 @@ function extractRequestDisplay(event: AgentResponseEvent): RequestDisplay {
     }
   }
   return { kind: 'unavailable', content: null, truncated: false }
+}
+
+function extractModelOrRuntime(event: AgentResponseEvent): string {
+  if (event.event_type === 'agent_response.started') {
+    const value = (event.payload as Record<string, unknown>).model_or_runtime
+    if (typeof value === 'string') return value
+  }
+  return 'Unknown runtime'
+}
+
+function boundedUtf8Suffix(text: string, maxBytes: number): string {
+  let result = ''
+  let bytes = 0
+  const chars = Array.from(text)
+  for (let index = chars.length - 1; index >= 0; index--) {
+    const char = chars[index]
+    const size = new TextEncoder().encode(char).length
+    if (bytes + size > maxBytes) break
+    result = char + result
+    bytes += size
+  }
+  return result
+}
+
+function enforceCallBounds(call: AgentCallRecord): AgentCallRecord {
+  let items = [...call.items]
+  let evicted = call.outputEvicted
+  const textBytes = () => items.reduce((sum, item) => sum + (item.type === 'output' ? new TextEncoder().encode(item.text).length : 0), 0)
+  while (items.length > RETENTION_DERIVED_ITEMS || textBytes() > RETENTION_OUTPUT_BYTES) {
+    const oldestOutput = items.findIndex((item) => item.type === 'output')
+    if (oldestOutput >= 0) {
+      const totalBytes = textBytes()
+      if (items.length <= RETENTION_DERIVED_ITEMS && totalBytes > RETENTION_OUTPUT_BYTES) {
+        const item = items[oldestOutput]
+        if (item.type === 'output') {
+          const remainingBytes = totalBytes - new TextEncoder().encode(item.text).length
+          const keepBytes = Math.max(0, RETENTION_OUTPUT_BYTES - remainingBytes)
+          const suffix = boundedUtf8Suffix(item.text, keepBytes)
+          if (suffix) items[oldestOutput] = { ...item, text: suffix }
+          else items.splice(oldestOutput, 1)
+        }
+      } else {
+        items.splice(oldestOutput, 1)
+      }
+      evicted = true
+    } else {
+      items.shift()
+      evicted = true
+    }
+  }
+  return { ...call, items, outputEvicted: evicted }
+}
+
+function extractFinalResponse(payload: Record<string, unknown>): FinalResponseSnapshot | null {
+  const value = payload.final_response
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const snapshot = value as Record<string, unknown>
+  return {
+    content: (snapshot.content ?? null) as JsonValue | null,
+    tool_calls: (snapshot.tool_calls ?? null) as JsonValue | null,
+    usage: (snapshot.usage ?? null) as JsonValue | null,
+    content_truncated: snapshot.content_truncated === true,
+    tool_calls_truncated: snapshot.tool_calls_truncated === true,
+    usage_truncated: snapshot.usage_truncated === true,
+    tool_count: typeof snapshot.tool_count === 'number' ? snapshot.tool_count : 0,
+    text_present: snapshot.text_present === true,
+  }
 }
 
 function eventToItem(event: AgentResponseEvent): AgentCallItem | null {
@@ -135,8 +205,12 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
     if (!isAgentResponseEvent(event)) return
 
     set((s) => {
+      if (s.projectId && event.project_id !== s.projectId) return s
       // Skip if already seen
       if (s.seenEventIds.has(event.id)) return s
+
+      const current = s.calls[event.call_id]
+      const stale = !!current && event.sequence <= current.lastSequence
 
       // Add to seen IDs
       const newSeenIds = new Set(s.seenEventIds)
@@ -172,6 +246,13 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
         }
       }
 
+      // Keep the raw bounded feed and remember stale IDs, but do not let a
+      // replayed payload overwrite newer derived content. A delayed `started`
+      // record can still enrich request/runtime metadata for an existing call.
+      if (stale && event.event_type !== 'agent_response.started') {
+        return { rawEvents: newRawEvents, calls: callsToUpdate, seenEventIds: newSeenIds }
+      }
+
       // Get or create call (immutable)
       const existingCall = callsToUpdate[event.call_id]
       let call: AgentCallRecord
@@ -186,16 +267,24 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
           actorKind: event.actor_kind,
           actorId: event.actor_id,
           actorLabel: getActorLabel(event),
+          modelOrRuntime: extractModelOrRuntime(event),
           requestDisplay: extractRequestDisplay(event),
           items: [],
           lastSequence: -1,
           sequenceGap: false,
           outputEvicted: false,
           terminalStatePreserved: false,
+          observationTruncated: false,
+          finalResponse: null,
           terminal: null,
         }
       } else {
         call = { ...existingCall }
+      }
+
+      if (event.event_type === 'agent_response.output') {
+        const payload = event.payload as Record<string, unknown>
+        call.observationTruncated = call.observationTruncated || payload.observation_truncated === true
       }
 
       // Update actor label if we have a better one (from started event)
@@ -206,12 +295,15 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
         }
         // Preserve request_display from started event
         call.requestDisplay = extractRequestDisplay(event)
+        call.modelOrRuntime = extractModelOrRuntime(event)
       }
 
       // Check for sequence gap: started events have sequence 0, so if we see
       // any non-zero sequence on a brand-new call (lastSequence === -1), it's a gap
       let hasGap = call.sequenceGap
-      if (call.lastSequence === -1) {
+      if (stale && event.event_type === 'agent_response.started') {
+        hasGap = call.sequenceGap
+      } else if (call.lastSequence === -1) {
         if (event.sequence > 0) {
           hasGap = true
         }
@@ -239,7 +331,14 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
         if (typeof payload.error === 'string') {
           terminalObj.error = payload.error
         }
-        call.terminal = terminalObj
+        call.terminal = {
+          ...terminalObj,
+          errorTruncated: payload.error_truncated === true,
+          metadata: (payload.metadata ?? null) as JsonValue | null,
+          metadataTruncated: payload.metadata_truncated === true,
+        }
+        call.finalResponse = extractFinalResponse(payload)
+        call.observationTruncated = call.observationTruncated || payload.observation_truncated === true
         // Only mark as preserved if output was evicted (folding happened)
         if (call.outputEvicted) {
           call.terminalStatePreserved = true
@@ -247,7 +346,7 @@ export const useAgentResponseStore = create<AgentResponseState>()((set, get) => 
       }
 
       // Assign updated call back to calls
-      callsToUpdate[event.call_id] = call
+      callsToUpdate[event.call_id] = enforceCallBounds(call)
 
       // Increment candidateRevision only on started/terminal/project-clear
       let newRevision = s.candidateRevision

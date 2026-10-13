@@ -4,237 +4,143 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { parseUtc } from '@/lib/time'
 import { useAgentResponseStore } from '@/stores/agent-response'
 import { useWSStore } from '@/stores/ws'
-import { orderedCalls, reconcileAgentTabs, AgentCallRecord, AgentCallItem, JsonValue } from '@/lib/agentResponse'
+import { orderedCalls, reconcileAgentTabs, AgentCallRecord, friendlyOperation, requestPreview, assembleStream, responsePresentation } from '@/lib/agentResponse'
 import { Tabs } from '@/components/common/Tabs'
-import { LedgerRow } from '@/components/common/LedgerRow'
 import { StatusBadge } from '@/components/common/uiPrimitives'
-import { cn } from '@/components/common/uiPrimitives'
 
-// Local helper to render values without JSON.stringify
+// Bound structured rendering separately from the captured original in Details.
 function ReadableValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined) return null
-
-  if (typeof value === 'string') {
-    return <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{value}</p>
-  }
-
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{String(value)}</p>
-  }
-
-  if (Array.isArray(value)) {
-    return (
-      <ul style={{ margin: '0.5em 0', paddingLeft: '1.5em' }}>
-        {value.map((item, idx) => (
-          <li key={idx}>
-            <ReadableValue value={item} />
-          </li>
-        ))}
-      </ul>
-    )
-  }
-
-  if (typeof value === 'object') {
-    const humanizeKey = (key: string): string => {
-      return key
-        .split('_')
-        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
-        .join(' ')
+  const budget = { remaining: 512 }
+  const render = (current: unknown, depth: number): React.ReactNode => {
+    if (--budget.remaining < 0 || depth > 12) return <span>Further content is available in Details.</span>
+    if (current === null) return <span>null</span>
+    if (current === undefined) return <span>Unavailable</span>
+    if (typeof current !== 'object') return <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{String(current)}</p>
+    if (Array.isArray(current)) {
+      if (!current.length) return <span>Empty list</span>
+      return <ul style={{ margin: '8px 0', paddingLeft: 20 }}>{current.slice(0, 128).map((item, index) => (
+        <li key={index}>{render(item, depth + 1)}</li>
+      ))}{current.length > 128 && <li>Further content is available in Details.</li>}</ul>
     }
-
-    const entries = Object.entries(value as Record<string, unknown>)
-    return (
-      <dl style={{ margin: '0.5em 0' }}>
-        {entries.map(([key, val]) => (
-          <React.Fragment key={key}>
-            <dt className="font-semibold" style={{ marginTop: '0.5em' }}>{humanizeKey(key)}</dt>
-            <dd style={{ margin: '0.25em 0 0 1em' }}>
-              <ReadableValue value={val} />
-            </dd>
-          </React.Fragment>
-        ))}
-      </dl>
-    )
+    const entries = Object.entries(current)
+    if (!entries.length) return <span>Empty object</span>
+    return <dl style={{ margin: '8px 0' }}>{entries.slice(0, 128).map(([key, item]) => (
+      <React.Fragment key={key}>
+        <dt className="font-semibold" style={{ marginTop: 8 }}>{friendlyOperation(key)}</dt>
+        <dd style={{ margin: '4px 0 0 12px' }}>{render(item, depth + 1)}</dd>
+      </React.Fragment>
+    ))}{entries.length > 128 && <dd>Further content is available in Details.</dd>}</dl>
   }
-
-  return null
+  return <>{render(value, 0)}</>
 }
 
-// Format duration in ms to readable string; freeze at terminal time
 function formatDuration(startedAt: string, terminatedAt?: string): string {
-  const start = parseUtc(startedAt).getTime()
-  const end = terminatedAt ? parseUtc(terminatedAt).getTime() : Date.now()
-  const ms = end - start
+  const ms = Math.max(0, (terminatedAt ? parseUtc(terminatedAt).getTime() : Date.now()) - parseUtc(startedAt).getTime())
   if (ms < 1000) return `${ms}ms`
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
   return `${(ms / 60000).toFixed(1)}m`
 }
 
-// Render a single call block
-function CallBlock({ call }: { call: AgentCallRecord }) {
-  const [reasoningOpen, setReasoningOpen] = useState(!call.terminal)
-  const [toolsOpen, setToolsOpen] = useState(false)
+function OriginalValue({ value }: { value: unknown }) {
+  return <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '4px 0 12px' }}>{JSON.stringify(value, null, 2) ?? 'Unavailable'}</pre>
+}
+
+function terminalExplanation(call: AgentCallRecord): string | null {
+  if (!call.terminal) return null
+  const status = call.terminal.status
+  const explanations: Record<string, string> = {
+    failed: 'This call failed.', timeout: 'This call timed out.', timed_out: 'This call timed out.',
+    cancelled: 'This call was cancelled.', canceled: 'This call was cancelled.', reset: 'This call was reset.',
+  }
+  const explanation = explanations[status]
+  if (explanation || call.terminal.error) return [explanation, call.terminal.error].filter(Boolean).join(' ')
+  return null
+}
+
+function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibleContent: () => void }) {
+  const isTerminal = !!call.terminal
+  const [reasoningOpen, setReasoningOpen] = useState(!isTerminal)
+  const wasTerminal = useRef(isTerminal)
+  const previousVisible = useRef<string | null>(null)
+  const reasoning = assembleStream(call.items, 'reasoning')
+  const stderr = assembleStream(call.items, 'stderr')
+  const response = responsePresentation(call)
+  const tools = call.items.filter((item) => item.type !== 'output')
+  const explanation = terminalExplanation(call)
+  const preview = requestPreview(call.requestDisplay, 240)
 
   useEffect(() => {
-    // Auto-close reasoning on terminal
-    if (call.terminal) {
-      setReasoningOpen(false)
-    }
-  }, [call.terminal])
+    if (isTerminal && !wasTerminal.current) setReasoningOpen(false)
+    wasTerminal.current = isTerminal
+  }, [isTerminal])
 
-  const reasoningItems = call.items.filter((item) => item.type === 'output' && item.stream === 'reasoning')
-  const outputItems = call.items.filter((item) => item.type === 'output' && item.stream === 'output')
-  const toolItems = call.items.filter((item) => item.type === 'tool_started' || item.type === 'tool_finished')
+  // Native disclosure changes themselves never count as new stream content.
+  const visibleSignature = JSON.stringify([
+    response.value, explanation, call.sequenceGap, call.outputEvicted, response.finalLimited,
+    reasoningOpen ? reasoning : null,
+  ])
+  useEffect(() => {
+    if (previousVisible.current !== visibleSignature) onVisibleContent()
+    previousVisible.current = visibleSignature
+  }, [visibleSignature, onVisibleContent])
 
   return (
-    <div
-      className="border-b border-huddleroom-border"
-      style={{
-        paddingBottom: 12,
-        marginBottom: 12,
-      }}
-    >
-      {/* Call header */}
-      <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+    <div data-call-id={call.callId} className="border-b border-huddleroom-border" style={{ paddingBottom: 12, marginBottom: 12, minWidth: 0, overflowWrap: 'anywhere' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 8 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <LedgerRow
-            iso={call.callStartedAt}
-            action={call.operation}
-            detail={
-              <>
-                {call.actorLabel} · ({call.invocationKind}) · {formatDuration(call.callStartedAt, call.terminal?.emittedAt)}
-                {call.parentCallId && <> · ← {call.parentCallId}</>}
-              </>
-            }
-          >
-            {/* Request section */}
-            <div style={{ marginBottom: 12, paddingBottom: 8 }}>
-              <details open style={{ display: 'block' }}>
-                <summary className="font-semibold text-xs" style={{ cursor: 'pointer', marginBottom: 8 }}>
-                  Request
-                </summary>
-                {call.requestDisplay.kind === 'unavailable' && (
-                  <p className="text-[13px] text-huddleroom-text-secondary" style={{ margin: 0 }}>
-                    Request unavailable; the start of this call was not observed.
-                  </p>
-                )}
-                {call.requestDisplay.kind === 'continuation' && (
-                  <p className="text-[13px] text-huddleroom-text-secondary" style={{ margin: 0 }}>
-                    Continuation after tool call
-                  </p>
-                )}
-                {call.requestDisplay.kind === 'prompt' && (
-                  <div className="text-[13px]">
-                    <ReadableValue value={call.requestDisplay.content} />
-                  </div>
-                )}
-                {call.requestDisplay.truncated && (
-                  <p className="text-xs text-huddleroom-text-muted" style={{ margin: '8px 0 0 0' }}>
-                    [Request truncated]
-                  </p>
-                )}
-              </details>
-            </div>
-
-            {/* Sequence gap notice */}
-            {call.sequenceGap && (
-              <p className="text-xs text-huddleroom-danger" style={{ margin: '8px 0' }}>
-                Sequence gap detected; some activity is unavailable.
-              </p>
-            )}
-
-            {/* Output evicted notice */}
-            {call.outputEvicted && (
-              <p className="text-xs text-huddleroom-text-muted" style={{ margin: '8px 0' }}>
-                Earlier output was evicted to keep this live view bounded.
-              </p>
-            )}
-
-            {/* Reasoning disclosure */}
-            {reasoningItems.length > 0 && (
-              <details open={reasoningOpen} onToggle={(e) => setReasoningOpen(e.currentTarget.open)}>
-                <summary className="font-semibold text-xs" style={{ cursor: 'pointer', marginBottom: 8 }}>
-                  Reasoning
-                </summary>
-                {reasoningItems.map((item) => (
-                  <div key={item.sequence} className="text-[13px]" style={{ marginBottom: 8 }}>
-                    <ReadableValue value={(item as any).text} />
-                  </div>
-                ))}
-              </details>
-            )}
-
-            {/* Output items */}
-            {outputItems.length > 0 && (
-              <div style={{ marginBottom: 8 }}>
-                {outputItems.map((item) => (
-                  <div key={item.sequence} className="text-[13px]" style={{ marginBottom: 8 }}>
-                    <ReadableValue value={(item as any).text} />
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Tools disclosure */}
-            {toolItems.length > 0 && (
-              <details open={toolsOpen} onToggle={(e) => setToolsOpen(e.currentTarget.open)}>
-                <summary className="font-semibold text-xs" style={{ cursor: 'pointer', marginBottom: 8 }}>
-                  Tools ({toolItems.length})
-                </summary>
-                {toolItems.map((item) => (
-                  <div key={item.sequence} style={{ marginBottom: 12, paddingLeft: 12 }}>
-                    {item.type === 'tool_started' && (
-                      <div>
-                        <div className="font-semibold text-xs">Call: {item.name}</div>
-                        {item.arguments && (
-                          <div style={{ marginTop: 4 }}>
-                            <ReadableValue value={item.arguments} />
-                          </div>
-                        )}
-                        {item.truncated && (
-                          <p className="text-xs text-huddleroom-text-muted" style={{ margin: '4px 0 0 0' }}>
-                            [Arguments truncated]
-                          </p>
-                        )}
-                      </div>
-                    )}
-                    {item.type === 'tool_finished' && (
-                      <div>
-                        <div className="font-semibold text-xs">Result: {item.name}</div>
-                        <div className="text-xs text-huddleroom-text-muted" style={{ marginTop: 2 }}>
-                          Outcome: <span className="font-medium text-huddleroom-text-primary">{item.outcome}</span>
-                        </div>
-                        {item.result && (
-                          <div style={{ marginTop: 4 }}>
-                            <ReadableValue value={item.result} />
-                          </div>
-                        )}
-                        {item.truncated && (
-                          <p className="text-xs text-huddleroom-text-muted" style={{ margin: '4px 0 0 0' }}>
-                            [Result truncated]
-                          </p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </details>
-            )}
-
-            {/* Terminal state preserved notice */}
-            {call.terminalStatePreserved && (
-              <p className="text-xs text-huddleroom-text-muted" style={{ margin: '8px 0' }}>
-                Terminal call state is preserved.
-              </p>
-            )}
-          </LedgerRow>
+          <div className="text-sm font-semibold text-huddleroom-primary">{friendlyOperation(call.operation)}</div>
+          <div className="text-xs text-huddleroom-text-muted">{call.actorLabel} · {formatDuration(call.callStartedAt, call.terminal?.emittedAt)}</div>
         </div>
-        {call.terminal ? (
-          <StatusBadge status={call.terminal.status} label={call.terminal.status} dot={true} />
-        ) : (
-          <StatusBadge status="running" label="Running" dot={true} />
-        )}
+        <StatusBadge status={call.terminal?.status || 'running'} label={call.terminal?.status || 'Running'} dot />
       </div>
+      {call.parentCallId && <p className="text-xs text-huddleroom-text-muted" style={{ margin: '8px 0' }}>Fallback or repair of an earlier call.</p>}
+      <p data-testid="call-request-preview" className="text-[13px] text-huddleroom-text-secondary" style={{ whiteSpace: 'pre-wrap', margin: '8px 0 12px' }}>
+        {call.requestDisplay.kind === 'unavailable' ? 'Request unavailable; the start of this call was not observed.' :
+          call.requestDisplay.kind === 'continuation' ? preview || 'Continuation after tool call' : preview || 'No request text captured.'}
+      </p>
+      {call.requestDisplay.truncated && <p className="text-xs text-huddleroom-text-muted">[Request truncated]</p>}
+      {call.sequenceGap && <p className="text-xs text-huddleroom-danger">Sequence gap detected; some activity is unavailable.</p>}
+      {call.outputEvicted && <p className="text-xs text-huddleroom-text-muted">Earlier output was evicted to keep this live view bounded.</p>}
+      {call.observationTruncated && <p className="text-xs text-huddleroom-text-muted">Some observed output was truncated.</p>}
+      {explanation && <p className="text-[13px] text-huddleroom-danger" style={{ whiteSpace: 'pre-wrap' }}>{explanation}</p>}
+      {call.terminal?.errorTruncated && <p className="text-xs text-huddleroom-text-muted">The captured failure explanation was truncated.</p>}
+      {reasoning && <details data-testid="call-thinking" open={reasoningOpen} style={{ marginBottom: 12 }}>
+        <summary className="font-semibold text-xs" style={{ cursor: 'pointer', marginBottom: 8 }} onClick={(event) => {
+          // Prevent a native toggle from racing the running-to-terminal state change.
+          event.preventDefault()
+          const nextOpen = !reasoningOpen
+          previousVisible.current = JSON.stringify([response.value, explanation, call.sequenceGap, call.outputEvicted, response.finalLimited, nextOpen ? reasoning : null])
+          setReasoningOpen(nextOpen)
+        }}>Thinking</summary>
+        <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{reasoning}</div>
+      </details>}
+      {response.value !== undefined && <div data-testid="call-response" style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', marginBottom: 12 }}><ReadableValue value={response.value} /></div>}
+      {response.mismatch && <p className="text-xs text-huddleroom-text-muted">The final response differs from the provisional stream; the final response is shown. The provisional response is in Details.</p>}
+      {response.finalLimited && <p className="text-xs text-huddleroom-text-muted">The captured final response was truncated; available streamed text is retained.</p>}
+      {response.toolOnly && <p data-testid="call-response" className="text-[13px] text-huddleroom-text-secondary">This call returned tool calls without response text. See Details.</p>}
+      {response.empty && <p data-testid="call-response" className="text-[13px] text-huddleroom-text-secondary">No response text was returned by this call.</p>}
+      {!isTerminal && response.value === undefined && <p className="text-xs text-huddleroom-text-muted">Waiting for response text…</p>}
+      <details data-testid="call-details" style={{ marginTop: 12 }}>
+        <summary className="font-semibold text-xs" style={{ cursor: 'pointer' }}>Details</summary>
+        <div className="font-mono text-xs" style={{ marginTop: 8, overflowWrap: 'anywhere' }}>
+          <dl style={{ margin: '8px 0' }}>
+            {Object.entries({ Operation: call.operation, 'Invocation kind': `(${call.invocationKind})`, 'Model or runtime': call.modelOrRuntime || 'Unavailable', 'Call ID': call.callId, 'Parent call ID': call.parentCallId || 'None' }).map(([label, value]) => <React.Fragment key={label}><dt className="font-semibold">{label}</dt><dd style={{ margin: '0 0 8px' }}>{value}</dd></React.Fragment>)}
+          </dl>
+          <div className="font-semibold">Full captured request</div><div>Request kind: {call.requestDisplay.kind}</div><ReadableValue value={call.requestDisplay.content} /><div className="font-semibold" style={{ marginTop: 8 }}>Captured original request</div><OriginalValue value={call.requestDisplay.content} /><div>Request truncated: {String(call.requestDisplay.truncated)}</div>
+          {response.value !== undefined && <><div className="font-semibold">Captured original response</div><OriginalValue value={call.finalResponse?.content ?? response.value} /></>}
+          {(response.mismatch || response.finalLimited) && <><div className="font-semibold">Provisional response</div><OriginalValue value={response.provisional} /></>}
+          {stderr && <><div className="font-semibold">Stderr diagnostics</div><pre style={{ whiteSpace: 'pre-wrap', margin: '4px 0 12px' }}>{stderr}</pre></>}
+          {tools.map((item) => <div key={item.sequence} style={{ marginBottom: 12 }}>
+            <div className="font-semibold">{item.type === 'tool_started' ? 'Tool arguments' : 'Tool result'}: {item.name}</div>
+            {item.type === 'tool_finished' && <div>Outcome: {item.outcome}</div>}
+            <OriginalValue value={item.type === 'tool_started' ? item.arguments : item.result} />
+            {item.truncated && <div>Captured tool content was truncated.</div>}
+          </div>)}
+          {call.finalResponse && <><div className="font-semibold">Final response envelope and truncation flags</div><OriginalValue value={call.finalResponse} /></>}
+          {call.terminal && <><div className="font-semibold">Terminal metadata and truncation flags</div><OriginalValue value={call.terminal} /></>}
+          {call.terminalStatePreserved && <p>Terminal call state is preserved.</p>}
+        </div>
+      </details>
     </div>
   )
 }
@@ -247,14 +153,28 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
   const state = useAgentResponseStore()
   const wsState = useWSStore()
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const contentRef = useRef<HTMLDivElement>(null)
+  const programmaticScrollTop = useRef<number | null>(null)
+  const followRef = useRef(true)
 
   const [selectedActor, setSelectedActor] = useState<string | null>(null)
   const [focusedActor, setFocusedActor] = useState<string | null>(null)
   const [visibleActors, setVisibleActors] = useState<string[]>([])
   const [followEnabled, setFollowEnabled] = useState(true)
   const [newUpdatesCount, setNewUpdatesCount] = useState(0)
-  const [lastContentHeight, setLastContentHeight] = useState(0)
+  const pauseFollow = useCallback(() => {
+    followRef.current = false
+    setFollowEnabled(false)
+  }, [])
+  const scrollToLatest = useCallback(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    programmaticScrollTop.current = el.scrollTop
+  }, [])
+  const onVisibleContent = useCallback(() => {
+    if (followRef.current) scrollToLatest()
+    else setNewUpdatesCount((count) => count + 1)
+  }, [scrollToLatest])
 
   const allCalls = useMemo(() => orderedCalls(state.calls), [state.calls])
   const nonterminalCount = allCalls.filter((c) => !c.terminal).length
@@ -271,71 +191,13 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
     setSelectedActor(selectedActorId)
     setFocusedActor(focusedActorId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.candidateRevision])
-
-  // Follow behavior: detect scroll distance from bottom
-  useEffect(() => {
-    if (!scrollContainerRef.current) return
-
-    const handleScroll = () => {
-      const el = scrollContainerRef.current
-      if (!el) return
-
-      const scrollTop = el.scrollTop
-      const scrollHeight = el.scrollHeight
-      const clientHeight = el.clientHeight
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-
-      if (distanceFromBottom > 60) {
-        setFollowEnabled(false)
-      } else if (distanceFromBottom <= 60 && !followEnabled) {
-        setFollowEnabled(true)
-        setNewUpdatesCount(0)
-      }
-    }
-
-    const el = scrollContainerRef.current
-    el.addEventListener('scroll', handleScroll)
-    return () => el.removeEventListener('scroll', handleScroll)
-  }, [followEnabled])
-
-  // Auto-scroll when follow is enabled and new items arrive
-  useEffect(() => {
-    if (!followEnabled || !scrollContainerRef.current) return
-
-    const newHeight = contentRef.current?.scrollHeight || 0
-    if (newHeight > lastContentHeight) {
-      const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-
-      if (prefersReducedMotion) {
-        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight
-      } else {
-        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight
-      }
-
-      setLastContentHeight(newHeight)
-    }
-  }, [followEnabled, lastContentHeight, allCalls])
-
-  // Track new updates when follow is disabled
-  useEffect(() => {
-    if (followEnabled) {
-      setNewUpdatesCount(0)
-    } else {
-      const newHeight = contentRef.current?.scrollHeight || 0
-      if (newHeight > lastContentHeight) {
-        setNewUpdatesCount((c) => c + 1)
-        setLastContentHeight(newHeight)
-      }
-    }
-  }, [allCalls, followEnabled, lastContentHeight])
+  }, [state.candidateRevision, selectedActor, focusedActor])
 
   const handleNewUpdatesClick = () => {
+    followRef.current = true
     setFollowEnabled(true)
     setNewUpdatesCount(0)
-    if (scrollContainerRef.current) {
-      scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight
-    }
+    scrollToLatest()
   }
 
   // Determine which calls to show based on selected actor tab
@@ -367,7 +229,15 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
   const connectivityStatus = wsState.connected ? 'active' : (wsState.connecting || wsState.retrying ? 'preparing' : 'active')
 
   return (
-    <div className="bg-huddleroom-surface border border-huddleroom-border rounded-[6px]" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div onFocusCapture={(event) => {
+      const target = event.target as HTMLElement
+      const id = target.getAttribute('id')
+      if (id?.startsWith('agent-activity-tab-')) {
+        const actor = id.slice('agent-activity-tab-'.length)
+        setFocusedActor(actor === 'all' ? null : actor)
+        pauseFollow()
+      }
+    }} className="bg-huddleroom-surface border border-huddleroom-border rounded-[6px]" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {/* Header */}
       <div className="border-b border-huddleroom-border" style={{ padding: 12 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
@@ -388,7 +258,8 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
           activeId={selectedActor || 'all'}
           onChange={(id) => {
             setSelectedActor(id === 'all' ? null : id)
-            setFollowEnabled(true)
+            setFocusedActor(id === 'all' ? null : id)
+            pauseFollow()
           }}
           idPrefix="agent-activity"
           ariaLabel="Agent activity calls"
@@ -428,6 +299,7 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
                   setVisibleActors(newVisible)
                   setSelectedActor(selectedId)
                   setFocusedActor(selectedId)
+                  pauseFollow()
                 }
                 e.target.value = ''
               }
@@ -455,22 +327,31 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         <div
           ref={scrollContainerRef}
-          onFocusCapture={() => {
-            // Focusing inside content disables follow
-            setFollowEnabled(false)
+          data-testid="calls-scroll"
+          onFocusCapture={pauseFollow}
+          onWheel={pauseFollow}
+          onTouchMove={pauseFollow}
+          onPointerDown={(event) => { if ((event.target as HTMLElement).closest('summary')) pauseFollow() }}
+          onKeyDown={(event) => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) pauseFollow() }}
+          onScroll={(event) => {
+            const top = event.currentTarget.scrollTop
+            if (programmaticScrollTop.current !== null && Math.abs(top - programmaticScrollTop.current) < 1) return
+            programmaticScrollTop.current = null
+            pauseFollow()
           }}
           style={{
             flex: 1,
             overflowY: 'auto',
+            overflowAnchor: 'none',
             padding: 12,
           }}
         >
-          <div ref={contentRef}>
+          <div>
             {displayedCalls.length === 0 && (
               <p className="text-[13px] text-huddleroom-text-muted" style={{ margin: 0 }}>No activity yet.</p>
             )}
             {displayedCalls.map((call) => (
-              <CallBlock key={call.callId} call={call} />
+              <CallBlock key={call.callId} call={call} onVisibleContent={onVisibleContent} />
             ))}
           </div>
         </div>
@@ -479,36 +360,17 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
         <div className="border-t border-huddleroom-border" style={{ padding: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
           <button
             aria-pressed={followEnabled}
-            onClick={() => {
-              setFollowEnabled(!followEnabled)
-              if (!followEnabled && scrollContainerRef.current) {
-                scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight
-              }
-            }}
-            className={cn(
-              'text-xs border border-huddleroom-border rounded-[4px]',
-              followEnabled ? 'bg-huddleroom-surface font-semibold' : 'bg-huddleroom-depth font-normal'
-            )}
-            style={{
-              padding: '4px 8px',
-              cursor: 'pointer',
-            }}
+            onClick={pauseFollow}
+            className="text-xs border border-huddleroom-border rounded-[4px] bg-huddleroom-surface"
+            style={{ padding: '4px 8px', cursor: 'pointer' }}
           >
-            Follow
+            {followEnabled ? 'Follow' : 'Follow paused'}
           </button>
-
-          {newUpdatesCount > 0 && !followEnabled && (
-            <button
-              onClick={handleNewUpdatesClick}
-              className="text-xs border border-huddleroom-border rounded-[4px] bg-huddleroom-surface-blue text-huddleroom-primary font-medium"
-              style={{
-                padding: '4px 8px',
-                cursor: 'pointer',
-              }}
-            >
-              {newUpdatesCount} new update{newUpdatesCount !== 1 ? 's' : ''}
-            </button>
-          )}
+          {!followEnabled && <button
+            onClick={handleNewUpdatesClick}
+            className="text-xs border border-huddleroom-border rounded-[4px] bg-huddleroom-surface-blue text-huddleroom-primary font-medium"
+            style={{ padding: '4px 8px', cursor: 'pointer' }}
+          >Jump to latest{newUpdatesCount > 0 ? ` (${newUpdatesCount} new update${newUpdatesCount === 1 ? '' : 's'})` : ''}</button>}
         </div>
       </div>
     </div>

@@ -10,6 +10,7 @@ import { useAgentResponseStore } from '@/stores/agent-response'
 import { useWSStore } from '@/stores/ws'
 import { isAgentResponseEvent, orderedCalls, AgentResponseEvent, reconcileAgentTabs } from '@/lib/agentResponse'
 import { AgentActivityPanel } from './AgentActivityPanel'
+import * as responseHelpers from '@/lib/agentResponse'
 
 // Shell test mocks (for mounted Shell tests)
 const shellTestState = vi.hoisted(() => ({
@@ -1698,7 +1699,7 @@ describe('AgentActivityPanel - shell integration and CSS breakpoints', () => {
       }
     })
 
-    it('Request details are open by default', async () => {
+    it('Technical Details are closed by default', async () => {
       useAgentResponseStore.getState().ingest(baseEvent({ call_id: 'test-req', sequence: 0 }))
       const view = await mountWithTestDom(
         () => <AgentActivityPanel projectId="proj-1" />,
@@ -1707,7 +1708,7 @@ describe('AgentActivityPanel - shell integration and CSS breakpoints', () => {
       try {
         const details = descendants(view.container).find((n) => n.tagName === 'DETAILS')
         expect(details).toBeDefined()
-        expect(details?.getAttribute('open') !== null).toBe(true)
+        expect(details?.getAttribute('open')).toBeNull()
       } finally {
         view.cleanup()
       }
@@ -1938,5 +1939,216 @@ describe('reconcileAgentTabs unit tests', () => {
     const result = reconcileAgentTabs(calls, [], 'agent-gone', 'agent-also-gone')
     expect(result.selectedActorId).toBeNull()
     expect(result.focusedActorId).toBeNull()
+  })
+})
+
+
+const finalSnapshot = (content: unknown, extra: Record<string, unknown> = {}) => ({
+  content, tool_calls: [], usage: { total_tokens: 12 }, content_truncated: false,
+  tool_calls_truncated: false, usage_truncated: false, tool_count: 0, text_present: !!content, ...extra,
+})
+const sprOutput = (sequence: number, text: string, stream = 'output', extra = {}) => baseEvent({
+  event_type: 'agent_response.output', sequence, payload: { stream, text, ...extra },
+})
+
+describe('SPR189/190 bounded readable Calls contracts', () => {
+  beforeEach(() => {
+    useAgentResponseStore.getState().clear()
+    useAgentResponseStore.getState().setProject('proj-123')
+    useWSStore.setState({ connected: true, connecting: false, retrying: false, hasConnectedOnce: true, events: [] })
+  })
+
+  it('retains runtime/final snapshot/terminal flags and sticky one-time observation limit', () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    store.ingest(sprOutput(1, 'provisional', 'output', { observation_truncated: true }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ answer: [null, { extra_key: 'final' }] }),
+      metadata: { finish_reason: 'stop' }, metadata_truncated: true, error_truncated: true } }))
+    expect(useAgentResponseStore.getState().calls['call-1']).toMatchObject({
+      modelOrRuntime: 'claude-sonnet-5-5', observationTruncated: true,
+      finalResponse: finalSnapshot({ answer: [null, { extra_key: 'final' }] }),
+      terminal: { metadata: { finish_reason: 'stop' }, metadataTruncated: true, errorTruncated: true },
+    })
+  })
+
+  it('rejects foreign project and stale sequence duplicates without corrupting current output', () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    store.ingest(sprOutput(1, 'first'))
+    store.ingest(baseEvent({ id: 'foreign', project_id: 'foreign', call_id: 'foreign' }))
+    store.ingest(sprOutput(1, 'stale'))
+    store.ingest(sprOutput(0, 'older'))
+    store.ingest(sprOutput(3, 'last'))
+    expect(Object.keys(useAgentResponseStore.getState().calls)).toEqual(['call-1'])
+    expect(responseHelpers.assembleStream(useAgentResponseStore.getState().calls['call-1'].items)).toBe('firstlast')
+    expect(useAgentResponseStore.getState().calls['call-1'].sequenceGap).toBe(true)
+  })
+
+  it('bounds derived items and UTF8 output independently while retaining newest output', () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    for (let sequence = 1; sequence <= 150; sequence++) store.ingest(sprOutput(sequence, '🙂'.repeat(1000)))
+    const call = useAgentResponseStore.getState().calls['call-1']
+    expect(call.items.length).toBeLessThanOrEqual(128)
+    expect(new TextEncoder().encode(call.items.filter((item) => item.type === 'output').map((item) => item.text).join('')).length).toBeLessThanOrEqual(65536)
+    expect(call.outputEvicted).toBe(true)
+    expect(call.items.at(-1)?.sequence).toBe(150)
+  })
+
+  it('uses friendly labels and deterministic principal text previews within240characters', () => {
+    expect(responseHelpers.friendlyOperation('unknown_new_operation')).toBe('Unknown New Operation')
+    expect(responseHelpers.friendlyOperation('goal_analysis')).not.toContain('_')
+    const preview = responseHelpers.requestPreview({ kind: 'prompt', content: { task: 'Read me '.repeat(100), z: 'ignore' }, truncated: false })
+    expect(preview.length).toBeLessThanOrEqual(240)
+    expect(preview.startsWith('Read me')).toBe(true)
+    expect(preview.endsWith('…')).toBe(true)
+    expect(responseHelpers.requestPreview({ kind: 'prompt', content: { b: 2, a: 1 }, truncated: false })).toBe(
+      responseHelpers.requestPreview({ kind: 'prompt', content: { a: 1, b: 2 }, truncated: false }))
+  })
+
+  it('renders continuous incomplete response and inert markup with one closed Details', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    store.ingest(sprOutput(1, '{"answer":"Hello '))
+    store.ingest(sprOutput(2, '<script>hostile</script>'))
+    store.ingest(sprOutput(3, 'diagnostic', 'stderr'))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const nodes = descendants(view.container)
+      expect(nodes.some((node) => node.tagName === 'P' && node.textContent === '{"answer":"Hello <script>hostile</script>')).toBe(true)
+      expect(nodes.filter((node) => node.tagName === 'SCRIPT')).toHaveLength(0)
+      const details = nodes.filter((node) => node.tagName === 'DETAILS' && node.childNodes.some((child) => child.textContent === 'Details'))
+      expect(details).toHaveLength(1)
+      expect(details[0].getAttribute('open')).toBeNull()
+      expect(textOf(details[0])).toContain('diagnostic')
+      expect(textOf(details[0])).toContain('claude-sonnet-5-5')
+    } finally { view.cleanup() }
+  })
+
+  it.each([true, false])('formats final structured content with%snapshot and preserves unknown/null fields', async (snapshot) => {
+    const store = useAgentResponseStore.getState()
+    const content = { answer: ['one', { unknown_key: null }], extra_field: true }
+    store.ingest(baseEvent())
+    store.ingest(sprOutput(1, JSON.stringify(content)))
+    store.ingest(terminalEvent({ payload: snapshot ? { final_response: finalSnapshot(content) } : {} }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const nodes = descendants(view.container)
+      expect(nodes.some((node) => node.tagName === 'DL' && textOf(node).includes('Extra Field'))).toBe(true)
+      expect(nodes.some((node) => node.tagName === 'UL' && textOf(node).includes('one'))).toBe(true)
+      expect(textOf(view.container)).toContain('null')
+    } finally { view.cleanup() }
+  })
+
+  it('uses complete authoritative final while preserving provisional mismatch in Details', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, 'provisional draft'))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot('final answer') } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      expect(textOf(view.container)).toContain('final answer')
+      expect(textOf(view.container).toLowerCase()).toContain('differ')
+      const detail = descendants(view.container).find((node) => node.tagName === 'DETAILS' && textOf(node).includes('Details'))!
+      expect(textOf(detail)).toContain('provisional draft')
+      const outside = descendants(view.container).filter((node) => node.tagName === 'P' && !detail.contains(node))
+      expect(outside.some((node) => node.textContent === 'provisional draft')).toBe(false)
+    } finally { view.cleanup() }
+  })
+
+  it('retains longer provisional passage when final snapshot is limited and shows notice', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, 'a longer captured response'))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot('a longer', { content_truncated: true }) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      expect(textOf(view.container)).toContain('a longer captured response')
+      expect(textOf(view.container).toLowerCase()).toMatch(/final.*(limit|truncat)/)
+    } finally { view.cleanup() }
+  })
+
+  it.each([['empty', finalSnapshot(null)], ['tool', finalSnapshot(null, { tool_count: 1, tool_calls: [{ function: { name: 'observe', arguments: '{}' } }] })]])('explains%sresult', async (kind, snapshot) => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(terminalEvent({ payload: { final_response: snapshot } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try { expect(textOf(view.container).toLowerCase()).toMatch(kind === 'tool' ? /tool/ : /no.*text|empty/) }
+    finally { view.cleanup() }
+  })
+
+  it('keeps failure explanation outside Details and labels provider reasoning Thinking', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, 'provider thought', 'reasoning'))
+    store.ingest(terminalEvent({ payload: { status: 'failed', error: 'Provider failed visibly' } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      expect(descendants(view.container).some((node) => node.tagName === 'SUMMARY' && textOf(node) === 'Thinking')).toBe(true)
+      const detail = descendants(view.container).find((node) => node.tagName === 'DETAILS' && textOf(node).includes('Details'))!
+      expect(descendants(view.container).some((node) => node.tagName === 'P' && textOf(node).includes('Provider failed visibly') && !detail.contains(node))).toBe(true)
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('SPR189/190 authoritative wire snapshot and captured original regressions', () => {
+  beforeEach(() => {
+    useAgentResponseStore.getState().clear()
+    useAgentResponseStore.getState().setProject('proj-123')
+  })
+  it('parses JSON string content from actual backend final snapshot into fields', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, 'provisional'))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot('{"answer":[null,{"extra_key":"actual"}]}') } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try { expect(descendants(view.container).some((node) => node.tagName === 'DL' && textOf(node).includes('Extra Key'))).toBe(true) }
+    finally { view.cleanup() }
+  })
+  it.each([null, ''])('complete empty final%snever restores stale provisional response', async (content) => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, 'stale provisional'))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot(content) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response)).not.toContain('stale provisional')
+      expect(textOf(response).toLowerCase()).toMatch(/no.*text|empty/)
+      const detail = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-details')!
+      expect(textOf(detail)).toContain('stale provisional')
+    } finally { view.cleanup() }
+  })
+  it('normalizes equivalent terminal JSON null strings without false mismatch', () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, ' null '))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot('null') } }))
+    expect(responseHelpers.responsePresentation(useAgentResponseStore.getState().calls['call-1']).mismatch).toBe(false)
+  })
+  it('explains no-snapshot legacy tool-only completion', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    store.ingest(baseEvent({ event_type: 'agent_response.tool_started', sequence: 1,
+      payload: { name: 'observe', arguments: {}, truncated: false } }))
+    store.ingest(terminalEvent())
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response).toLowerCase()).toContain('tool')
+    } finally { view.cleanup() }
+  })
+  it('explains empty-string snapshot without provisional output', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(terminalEvent({ payload: { final_response: finalSnapshot('') } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response).toLowerCase()).toMatch(/no.*text|empty/)
+    } finally { view.cleanup() }
+  })
+  it('exposes complete bounded captured request even beyond readable renderer item limit', async () => {
+    const content = Array.from({ length: 140 }, (_, index) => ({ field: `captured-${index}` }))
+    useAgentResponseStore.getState().ingest(baseEvent({ payload: { actor_label: 'Test Agent', model_or_runtime: 'model',
+      request_display: { kind: 'prompt', content, truncated: false } } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const detail = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-details')!
+      expect(textOf(detail)).toContain('captured-139')
+    } finally { view.cleanup() }
   })
 })
