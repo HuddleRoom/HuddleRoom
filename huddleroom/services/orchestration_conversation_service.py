@@ -607,15 +607,26 @@ class OrchestrationConversationService:
                     await db.flush()
                     return response
 
+    def _terminal_transaction_contexts(self, db: AsyncSession, goal_id: uuid.UUID):
+        """Keep SQLite terminal publication under the mutex through commit/rollback.
+
+        PostgreSQL needs the transaction first: acquiring its row lock would
+        otherwise autobegin before the explicit transaction is entered.
+        """
+        transaction = db.begin()
+        goal_lock = self._orchestration._lock_goal_for_baseline_transition(db, goal_id)
+        if db.get_bind().dialect.name == "sqlite":
+            return goal_lock, transaction
+        return transaction, goal_lock
+
     async def _settle(
         self, goal_id: uuid.UUID, response_id: uuid.UUID, answer: str, usage: int | None,
         authority=None, proposal: SteeringDraft | None = None,
     ) -> ConversationTurn | None:
         async with self._session_factory() as db:
-            async with db.begin():
-                async with self._orchestration._lock_goal_for_baseline_transition(
-                    db, goal_id
-                ):
+            outer, inner = self._terminal_transaction_contexts(db, goal_id)
+            async with outer:
+                async with inner:
                     response = await db.get(ConversationResponse, response_id)
                     reservation = await db.get(
                         ConversationReservation,
@@ -663,8 +674,9 @@ class OrchestrationConversationService:
         self, goal_id: uuid.UUID, response_id: uuid.UUID, code: str, usage: int | None, authority=None
     ) -> ConversationTurn | None:
         async with self._session_factory() as db:
-            async with db.begin():
-                async with self._orchestration._lock_goal_for_baseline_transition(db, goal_id):
+            outer, inner = self._terminal_transaction_contexts(db, goal_id)
+            async with outer:
+                async with inner:
                     response = await db.get(ConversationResponse, response_id)
                     reservation = await db.get(
                         ConversationReservation, conversation_reservation_id(response_id)
@@ -769,10 +781,9 @@ class OrchestrationConversationService:
         self, goal_id: uuid.UUID, response_id: uuid.UUID, code: str, authority=None
     ) -> ConversationTurn | None:
         async with self._session_factory() as db:
-            async with db.begin():
-                async with self._orchestration._lock_goal_for_baseline_transition(
-                    db, goal_id
-                ):
+            outer, inner = self._terminal_transaction_contexts(db, goal_id)
+            async with outer:
+                async with inner:
                     response = await db.get(ConversationResponse, response_id)
                     reservation = await db.get(
                         ConversationReservation,

@@ -771,20 +771,19 @@ class ConversationInvestigationService:
 
     async def _claim(self, goal_id, investigation_id, repair):
         async with self._session_factory() as db:
-            async with db.begin():
-                async with self._orchestration._lock_goal_for_baseline_transition(db, goal_id):
-                    row = await db.get(ConversationInvestigation, investigation_id)
-                    reservation = await db.get(ConversationInvestigationReservation, conversation_investigation_reservation_id(investigation_id))
-                    expected = 1 if repair else 0
-                    if row is None or reservation is None or row.status != "pending" and not (repair and row.status == "running") or row.attempt_count != expected or reservation.status not in ("reserved", "committed"):
-                        return None
-                    now = _utcnow(); attempt = expected + 1
-                    row.status, row.attempt_count = "running", attempt
-                    row.provider_request_id = conversation_investigation_provider_request_id(row.id, attempt)
-                    if not repair: row.started_at = now
-                    row.deadline_at = now + timedelta(seconds=120)
-                    if reservation.status == "reserved": reservation.status, reservation.committed_at = "committed", now
-                    await db.flush(); return row
+            async with self._prepare_transaction(db, goal_id):
+                row = await db.get(ConversationInvestigation, investigation_id)
+                reservation = await db.get(ConversationInvestigationReservation, conversation_investigation_reservation_id(investigation_id))
+                expected = 1 if repair else 0
+                if row is None or reservation is None or row.status != "pending" and not (repair and row.status == "running") or row.attempt_count != expected or reservation.status not in ("reserved", "committed"):
+                    return None
+                now = _utcnow(); attempt = expected + 1
+                row.status, row.attempt_count = "running", attempt
+                row.provider_request_id = conversation_investigation_provider_request_id(row.id, attempt)
+                if not repair: row.started_at = now
+                row.deadline_at = now + timedelta(seconds=120)
+                if reservation.status == "reserved": reservation.status, reservation.committed_at = "committed", now
+                await db.flush(); return row
 
     async def _dispatch(self, goal_id, row):
         while row.status == "running":
