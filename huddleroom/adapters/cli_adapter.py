@@ -312,15 +312,16 @@ class CliAdapter:
             for key in self._COPILOT_API_KEYS:
                 if key in os.environ:
                     env[key] = os.environ[key]
-        if runtime in {"opencode", "pi"}:
-            for key in self._OPENROUTER_API_KEYS:
-                if key in os.environ:
-                    env[key] = os.environ[key]
         if runtime in settings.onecli_native_auth_runtimes:
             # Native runtimes use the user's local login: no gateway, proxy, placeholder keys or base URLs.
             return strip_native_auth_env(env) if settings.credential_mode == "onecli" else env
         from huddleroom.onecli import apply_onecli_environment
         apply_onecli_environment(env, settings)
+        if runtime in {"opencode", "pi"}:
+            if "OPENROUTER_API_KEY" in os.environ:
+                env["OPENROUTER_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
+            else:
+                env.setdefault("OPENROUTER_API_KEY", "onecli-openrouter-placeholder")
         return env
 
     async def run(self, session_id: uuid.UUID, db: AsyncSession, runner_task_id: str | None = None) -> None:

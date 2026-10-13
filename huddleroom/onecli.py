@@ -30,7 +30,6 @@ _RETAINED_RESOURCE_IDS: ContextVar[tuple[str, ...]] = ContextVar("onecli_retaine
 _PROVIDER_PLACEHOLDERS = {
     "OPENAI_API_KEY": "onecli-openai-placeholder",
     "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
-    "OPENROUTER_API_KEY": "onecli-openrouter-placeholder",
 }
 _CONTEXT_KEYS = (
     "ONECLI_GATEWAY", "ONECLI_GATEWAY_SKILL_PATH", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
@@ -256,7 +255,7 @@ def launch_onecli(config: Settings, host: str, port: int, reload: bool) -> None:
     agent = verify_onecli(config)
     _container_config(config)
     env = os.environ.copy()
-    for key in _PROTECTED_ENV_KEYS - {"ONECLI_API_KEY"}:
+    for key in _PROTECTED_ENV_KEYS - {"ONECLI_API_KEY", "OPENROUTER_API_KEY"}:
         if key in _PROVIDER_PLACEHOLDERS:
             continue
         env.pop(key, None)

@@ -62,15 +62,24 @@ def test_load_provider_env_exports_openrouter_api_key(tmp_path, monkeypatch):
     assert os.environ["OPENROUTER_API_KEY"] == "or-test"
 
 
-def test_onecli_provider_env_replaces_openrouter_secret_and_discards_alias(tmp_path, monkeypatch):
+@pytest.mark.parametrize("defined", ["synthetic-defined-value", "", None])
+def test_onecli_provider_env_preserves_defined_openrouter_without_global_fallback(tmp_path, monkeypatch, defined):
     from huddleroom.config import PROVIDER_ENV_KEYS, load_provider_env
 
     for key in PROVIDER_ENV_KEYS:
         monkeypatch.setenv(key, "synthetic-direct-value")
+    if defined is None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_API_KEY", defined)
     env_file = tmp_path / ".env"
     env_file.write_text("OPENROUTER_API_KEY=synthetic-dotenv-value\n")
     load_provider_env(env_file, tmp_path / "absent.toml", credential_mode="onecli")
-    assert os.environ["OPENROUTER_API_KEY"] == "onecli-openrouter-placeholder"
+    if defined is None:
+        present = "OPENROUTER_API_KEY" in os.environ
+        assert not present
+    else:
+        assert os.environ["OPENROUTER_API_KEY"] == defined
     assert "OR_API_KEY" not in os.environ
 
 
@@ -130,7 +139,7 @@ def test_onecli_config_import_discards_process_dotenv_and_toml_provider_values(t
     assert json.loads(result.stdout) == {
         "OPENAI_API_KEY": "onecli-openai-placeholder",
         "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
-        "OPENROUTER_API_KEY": "onecli-openrouter-placeholder",
+        "OPENROUTER_API_KEY": "process-openrouter-sentinel",
         "GEMINI_API_KEY": None,
         "OLLAMA_API_BASE": None,
         "ONECLI_API_KEY": "environment-only-management-key",

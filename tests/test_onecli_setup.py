@@ -14,13 +14,13 @@ def _response(status_code, payload):
     return SimpleNamespace(status_code=status_code, json=lambda: payload)
 
 
-def test_onecli_child_environment_replaces_openrouter_secret_and_discards_alias():
+def test_general_onecli_child_environment_has_no_openrouter_fallback():
     from huddleroom.config import Settings
     from huddleroom.onecli import apply_onecli_environment
 
     env = {"OPENROUTER_API_KEY": "synthetic-direct-value", "OR_API_KEY": "synthetic-alias-value"}
     apply_onecli_environment(env, Settings(_env_file=None, credential_mode="onecli"))
-    assert env["OPENROUTER_API_KEY"] == "onecli-openrouter-placeholder"
+    assert "OPENROUTER_API_KEY" not in env
     assert "OR_API_KEY" not in env
 
 
@@ -906,8 +906,9 @@ def test_onecli_environment_keeps_only_loopback_bypass_in_both_casings(monkeypat
         ("http://[::1]:10255", "[::1]"),
     ],
 )
+@pytest.mark.parametrize("defined", ["synthetic-defined-value", "", None])
 def test_launch_onecli_execs_native_wrapper_with_current_interpreter_and_env_auth(
-    monkeypatch, gateway_url, native_gateway,
+    monkeypatch, gateway_url, native_gateway, defined,
 ):
     from huddleroom.config import Settings
     import huddleroom.onecli as onecli
@@ -918,6 +919,10 @@ def test_launch_onecli_execs_native_wrapper_with_current_interpreter_and_env_aut
         onecli_management_url="http://management.example:10256", onecli_gateway_url=gateway_url,
     )
     monkeypatch.setenv("ONECLI_API_KEY", "environment-only-management-key")
+    if defined is None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_API_KEY", defined)
     monkeypatch.setattr(onecli, "verify_onecli", lambda *_args: {"id": "id", "identifier": "gateway", "name": "Gateway"})
     monkeypatch.setattr(onecli, "_container_config", lambda *_args: {"env": {}, "caCertificate": "pem", "caCertificateContainerPath": "/unused"})
     monkeypatch.setattr(onecli.os, "execvpe", lambda executable, argv, env: captured.update(executable=executable, argv=argv, env=env))
@@ -931,6 +936,11 @@ def test_launch_onecli_execs_native_wrapper_with_current_interpreter_and_env_aut
     ]
     assert captured["env"]["ONECLI_API_KEY"] == "environment-only-management-key"
     assert captured["env"]["ONECLI_API_HOST"] == "http://management.example:10256"
+    if defined is None:
+        present = "OPENROUTER_API_KEY" in captured["env"]
+        assert not present
+    else:
+        assert captured["env"]["OPENROUTER_API_KEY"] == defined
 
 
 @pytest.mark.parametrize(

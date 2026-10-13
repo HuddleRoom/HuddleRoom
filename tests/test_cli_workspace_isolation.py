@@ -435,6 +435,25 @@ def test_step8_cli_commands_are_noninteractive_and_bound_to_workspace(
         assert command[command.index("--dir") + 1] == str(workspace)
 
 
+@pytest.mark.parametrize("runtime", ["opencode", "pi", "codex", "claude_code", "copilot"])
+@pytest.mark.parametrize("defined", ["synthetic-defined-value", "", None])
+def test_openrouter_fallback_is_missing_only_and_runtime_scoped(monkeypatch, runtime, defined):
+    import huddleroom.adapters.cli_adapter as cli_adapter
+
+    monkeypatch.setattr(cli_adapter.settings, "credential_mode", "onecli")
+    if defined is None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_API_KEY", defined)
+    agent = Agent(name=f"agent-{uuid.uuid4()}", role="reviewer", provider="openrouter", model="test",
+                  adapter_type="cli", capabilities=[], config={"cli_runtime": runtime})
+    env = CliAdapter()._build_env(uuid.uuid4(), None, agent, None)
+    if runtime in {"opencode", "pi"}:
+        assert env["OPENROUTER_API_KEY"] == (defined if defined is not None else "onecli-openrouter-placeholder")
+    else:
+        assert "OPENROUTER_API_KEY" not in env
+
+
 @pytest.mark.parametrize(
     ("runtime", "included", "excluded"),
     [

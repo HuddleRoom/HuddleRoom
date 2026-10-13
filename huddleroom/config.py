@@ -96,11 +96,11 @@ def load_provider_env(
     dotenv = dotenv_values(env_file)
     if credential_mode == "onecli":
         for key in PROVIDER_ENV_KEYS:
-            os.environ.pop(key, None)
+            if key != "OPENROUTER_API_KEY":
+                os.environ.pop(key, None)
         os.environ.update({
             "OPENAI_API_KEY": "onecli-openai-placeholder",
             "ANTHROPIC_API_KEY": "onecli-anthropic-placeholder",
-            "OPENROUTER_API_KEY": "onecli-openrouter-placeholder",
         })
         return
     for key in PROVIDER_ENV_KEYS:
