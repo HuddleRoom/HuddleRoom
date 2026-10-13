@@ -5294,3 +5294,203 @@ async def test_absent_workspace_is_a_durable_unavailable_terminal_without_dispat
         ) == first_response
         assert reservation is None
     assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repair", [False, True], ids=["initial", "repair"])
+@pytest.mark.parametrize("rollback", [False, True], ids=["commit", "rollback"])
+async def test_claim_mutex_spans_actual_commit_and_admits_one_provider_owner(
+    test_engine, conversation_goal_run, test_user, db_session, tmp_path, monkeypatch, repair, rollback,
+):
+    from contextvars import ContextVar
+    from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
+
+    response, goal, actor = await _seed_running_response(test_engine, db_session, conversation_goal_run, test_user)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("fact\n", encoding="utf-8")
+    await _set_workspace(test_engine, goal.project_id, workspace)
+    runtime = _runtime()
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs["litellm_call_id"])
+        return _valid_report("a.txt#L1-L1")
+
+    service = _service(test_engine, completion)
+    prepared, _ = await service._prepare(
+        goal.project_id, goal.id, actor.id, response.id, response.context_version, _request_for(),
+    )
+    if repair:
+        assert await service._claim(goal.id, prepared.id, repair=False) is not None
+    in_lock = ContextVar("claim_commit_lock", default=False)
+    real_lock = service._orchestration._lock_goal_for_baseline_transition
+    real_exit, real_get = AsyncSessionTransaction.__aexit__, AsyncSession.get
+    entered, release, committed, stale_read = (asyncio.Event() for _ in range(4))
+    owner = None
+    attempted = asyncio.Event()
+    ownership = []
+    exit_ownership = []
+
+    @asynccontextmanager
+    async def observed_lock(*args, **kwargs):
+        if owner is not None and asyncio.current_task() is not owner:
+            attempted.set()
+        async with real_lock(*args, **kwargs):
+            token = in_lock.set(True)
+            try:
+                yield
+            finally:
+                in_lock.reset(token)
+
+    async def gated_exit(transaction, *args):
+        nonlocal owner
+        rows = [row for row in transaction.session.identity_map.values()
+                if isinstance(row, runtime.Investigation) and row.status == "running"
+                and row.attempt_count == (2 if repair else 1)]
+        if rows and owner is None:
+            owner = asyncio.current_task()
+            await transaction.session.flush()
+            ownership.append(in_lock.get())
+            entered.set()
+            await asyncio.wait_for(release.wait(), 5)
+            if rollback:
+                error = RuntimeError("injected claim rollback")
+                await real_exit(transaction, type(error), error, error.__traceback__)
+                exit_ownership.append(in_lock.get())
+                committed.set()
+                raise error
+            result = await real_exit(transaction, *args)
+            exit_ownership.append(in_lock.get())
+            committed.set()
+            return result
+        return await real_exit(transaction, *args)
+
+    async def observed_get(db, model, *args, **kwargs):
+        row = await real_get(db, model, *args, **kwargs)
+        if (model is runtime.Investigation and owner is not None
+                and asyncio.current_task() is not owner and row is not None
+                and row.attempt_count == int(repair)):
+            stale_read.set()
+            await asyncio.wait_for(committed.wait(), 5)
+        return row
+
+    monkeypatch.setattr(service._orchestration, "_lock_goal_for_baseline_transition", observed_lock)
+    monkeypatch.setattr(AsyncSessionTransaction, "__aexit__", gated_exit)
+    monkeypatch.setattr(AsyncSession, "get", observed_get)
+    first = asyncio.create_task(service._claim(goal.id, prepared.id, repair=repair))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        async with _factory(test_engine)() as observer:
+            durable = await real_get(observer, runtime.Investigation, prepared.id)
+            assert durable.attempt_count == int(repair)
+            assert durable.status == ("running" if repair else "pending")
+        second = asyncio.create_task(service._claim(goal.id, prepared.id, repair=repair))
+        await asyncio.wait_for(attempted.wait(), 5)
+        if ownership[0]:
+            assert not stale_read.is_set(), "competitor must remain outside the goal mutex"
+        if not ownership[0]:
+            # Reproduce the historical stale read before the first owner's commit.
+            await asyncio.wait_for(stale_read.wait(), 5)
+        release.set()
+        claims = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 5)
+        if rollback:
+            assert isinstance(claims[0], RuntimeError)
+            assert str(claims[0]) == "injected claim rollback"
+            claims = claims[1:]
+        else:
+            assert not any(isinstance(claim, BaseException) for claim in claims)
+        for claim in claims:
+            if claim is not None:
+                await service._dispatch(goal.id, claim)
+        assert len(calls) == 1, f"duplicate provider owners: {calls}"
+        assert calls == [runtime.api.conversation_investigation_provider_request_id(prepared.id, 2 if repair else 1)]
+        assert exit_ownership == [True]
+        assert ownership == [True], "goal mutex must cover the actual claim commit"
+        investigations, reservations = await _investigation_rows(test_engine)
+        assert (len(investigations), len(reservations)) == (1, 1)
+        assert (investigations[0].status, investigations[0].attempt_count) == ("completed", 2 if repair else 1)
+        assert reservations[0].status == "settled"
+    finally:
+        release.set()
+        committed.set()
+        await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_claim_uses_owned_session_without_committing_callers_explicit_transaction(
+    test_engine, conversation_goal_run, test_user, db_session, tmp_path,
+):
+    from sqlalchemy import text
+
+    response, goal, actor = await _seed_running_response(test_engine, db_session, conversation_goal_run, test_user)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("fact\n", encoding="utf-8")
+    await _set_workspace(test_engine, goal.project_id, workspace)
+    service = _service(test_engine, None)
+    prepared, _ = await service._prepare(
+        goal.project_id, goal.id, actor.id, response.id, response.context_version, _request_for(),
+    )
+    async with _factory(test_engine)() as caller:
+        async with caller.begin():
+            await caller.execute(text("SELECT 1"))
+            transaction = caller.get_transaction()
+            claimed = await service._claim(goal.id, prepared.id, repair=False)
+            assert claimed is not None
+            assert caller.get_transaction() is transaction
+            assert transaction.is_active
+            async with _factory(test_engine)() as observer:
+                saved = await observer.get(_runtime().Investigation, prepared.id)
+                assert (saved.status, saved.attempt_count) == ("running", 1)
+            await caller.rollback()
+    async with _factory(test_engine)() as observer:
+        saved = await observer.get(_runtime().Investigation, prepared.id)
+        assert (saved.status, saved.attempt_count) == ("running", 1)
+
+
+@pytest.mark.asyncio
+async def test_postgresql_claim_begins_before_row_lock_without_implicit_autobegin(monkeypatch):
+    api = _api()
+    events = []
+    active = False
+
+    class Session:
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        @asynccontextmanager
+        async def begin(self):
+            nonlocal active
+            assert not active, "row-lock read must not create an implicit transaction before begin"
+            active = True
+            events.append("begin")
+            try:
+                yield
+            finally:
+                events.append("commit")
+                active = False
+
+        async def get(self, *_args):
+            assert active
+            return None
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    @asynccontextmanager
+    async def lock(*_args):
+        assert active, "PostgreSQL row lock must enter inside explicit begin"
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    service = api.ConversationInvestigationService.__new__(api.ConversationInvestigationService)
+    service._session_factory = factory
+    service._orchestration = SimpleNamespace(_lock_goal_for_baseline_transition=lock)
+    assert await service._claim(uuid.uuid4(), uuid.uuid4(), repair=False) is None
+    assert events == ["begin", "lock", "unlock", "commit"]
