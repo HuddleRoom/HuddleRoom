@@ -11114,7 +11114,8 @@ class OrchestrationService:
                 reason="stale_plan_generation" if isinstance(exc, PlanGenerationChanged) else "stale_steering_versions",
             )
             if stale_retry:
-                action = None
+                await self._create_noop_waits(db, run, decision)
+                return None
             else:
                 refreshed = await self.request_llm_decision(db, run.id)
                 return await self._dispatch_execution_decision(

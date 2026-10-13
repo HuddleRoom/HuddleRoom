@@ -8,6 +8,7 @@ event or human while holding a lock: a wait is stored and the call returns.
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -985,8 +986,15 @@ class OrchestrationBlockerRecoveryService:
             decision = (await db.get(OrchestrationDecision, UUID(contract["retry_decision_id"]))
                         if contract.get("retry_decision_id") else None)
             if decision is None:  # one decision row per retry, reused on replay
+                input_snapshot = {}
+                if action_type == "request_plan":
+                    current_run = await db.get(OrchestrationRun, ctx.run.id, populate_existing=True)
+                    input_snapshot = {
+                        "run": {"id": str(current_run.id), "plan_state": deepcopy(current_run.plan_state)},
+                    }
                 decision = OrchestrationDecision(
-                    run_id=ctx.run.id, decision_type="recovery_retry", validator_status="accepted", input_snapshot={},
+                    run_id=ctx.run.id, decision_type="recovery_retry", validator_status="accepted",
+                    input_snapshot=input_snapshot,
                     parsed_decision={**request, "action_type": action_type, "applies_decision_id": str(ctx.decision.id)},
                 )
                 db.add(decision)

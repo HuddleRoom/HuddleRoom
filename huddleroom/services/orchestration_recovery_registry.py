@@ -682,11 +682,15 @@ class RecoveryToolRegistry:
             await self._assert_sealed_steering(db, run, authority_decision)
             if delegation:
                 await self._revalidate_delegation(db, run, call, admission)
+            input_snapshot = {}
+            if action_type == "request_plan":
+                run = await db.get(OrchestrationRun, run.id, populate_existing=True)
+                input_snapshot = {"run": {"id": str(run.id), "plan_state": copy.deepcopy(run.plan_state)}}
             decision = OrchestrationDecision(
                 run_id=run.id, decision_type="recovery_apply", validator_status="accepted",
                 # Steering is fenced against the versions sealed at proposal time (_assert_sealed_steering),
                 # not via input_snapshot: the ordinary fence would re-key the approved ``:effect`` row.
-                input_snapshot={},
+                input_snapshot=input_snapshot,
                 parsed_decision={**call.arguments, "action_type": action_type, "applies_decision_id": str(authority_decision.id)},
             )
             db.add(decision)

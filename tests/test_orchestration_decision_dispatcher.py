@@ -822,8 +822,13 @@ async def test_stale_plan_generation_is_durably_rejected_and_refreshed_once(
     assert stale.validator_status == "rejected"
     assert stale.rejection_reason == "stale_plan_generation"
     if fresh_stale:
+        from huddleroom.models.orchestration import OrchestrationAction
+        assert result is None
         waits = list(await db_session.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id)))
         assert waits, "the bounded second-stale path must leave an ordinary wait"
+        assert list(await db_session.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+        ))) == []
     else:
         assert result is not None and result.action_type == "noop"
 

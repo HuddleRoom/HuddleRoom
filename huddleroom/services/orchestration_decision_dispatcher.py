@@ -94,10 +94,22 @@ class OrchestrationDecisionDispatcher:
         from huddleroom.services.orchestration_service import PlanGenerationChanged, _plan_generation_seal
 
         request = self._service.canonical_decision_request("request_plan", decision.parsed_decision, run_id=run.id)
+        # Recovery approval identity is read-only admission and precedes both
+        # exact replay and generation freshness. Invalid authority retains its
+        # existing ordinary rejection rather than entering the plan fence.
+        parsed = decision.parsed_decision or {}
+        if "applies_decision_id" in parsed or recovery_context is not None:
+            applies_id, rejection = (await self._resolve_applied_decision(db, run, parsed["applies_decision_id"])
+                                     if "applies_decision_id" in parsed else (None, None))
+            if rejection is not None:
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+            recovery = await self._recovery_dispatch_context(db, run, applies_id, recovery_context, request)
+            if recovery is False or (recovery is None and recovery_context is not None):
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
         key = (recovery_effect_key(recovery_context) if recovery_context
                else self.action_key(run.id, "request_plan", request))
         snapshot = getattr(decision, "input_snapshot", {}) or {}
-        versions = steering_versions_from_snapshot(snapshot)
+        versions = steering_versions_from_snapshot(snapshot) if isinstance(snapshot, dict) else None
         if not recovery_context:
             key, _ = await self._attempt_key(db, run.id, key, decision.id, versions is not None, check_steering=False)
         if versions is not None:

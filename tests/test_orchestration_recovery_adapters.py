@@ -209,6 +209,9 @@ async def test_existing_action_adapter_dispatches_canonical_request_through_disp
     db_session, test_project, monkeypatch, tool,
 ):
     rows = await seed_rows(db_session, test_project, task_status="failed")
+    if tool == "orchestration.request_plan":
+        rows.run.plan_state = {"test_nested": {"items": []}}
+        await db_session.flush()
     approved = await approved_call(db_session, rows, tool)
     recorder = ExecutorRecorder(monkeypatch, rows)
     seen = spy_dispatch(monkeypatch)
@@ -231,6 +234,12 @@ async def test_existing_action_adapter_dispatches_canonical_request_through_disp
     assert str(decision.parsed_decision["applies_decision_id"]) == str(approved.authority.id)
     stored = await db_session.get(OrchestrationDecision, decision.id)
     assert stored is not None and stored.run_id == rows.run.id
+    if tool == "orchestration.request_plan":
+        assert decision.input_snapshot == {"run": {
+            "id": str(rows.run.id), "plan_state": {"test_nested": {"items": []}},
+        }}
+        rows.run.plan_state["test_nested"]["items"].append("later state mutation")
+        assert decision.input_snapshot["run"]["plan_state"]["test_nested"]["items"] == []
     # Same canonical request and executor as an ordinary model decision would reach.
     ordinary_request = OrchestrationService().canonical_decision_request(
         action_type, {"action_type": action_type, **tool_arguments(tool, rows)}, run_id=rows.run.id,
@@ -302,7 +311,8 @@ async def test_adapter_rejection_matches_ordinary_dispatch_rejection(db_session,
 
     # Ordinary dispatch of the same request: same failed-row semantics and error.
     ordinary = OrchestrationDecision(
-        run_id=rows.run.id, decision_type="execution", validator_status="accepted", input_snapshot={},
+        run_id=rows.run.id, decision_type="execution", validator_status="accepted",
+        input_snapshot={"run": {"id": str(rows.run.id), "plan_state": rows.run.plan_state}},
         parsed_decision={"action_type": "request_plan", **tool_arguments("orchestration.request_plan", rows)},
     )
     db_session.add(ordinary)
