@@ -33,6 +33,9 @@ def _fake_db_seams(request, monkeypatch):
 
     monkeypatch.setattr(OrchestrationDecisionDispatcher, "_savepoint", staticmethod(lambda _db: nullcontext()))
     monkeypatch.setattr(OrchestrationDecisionDispatcher, "_attempt_key", same_key)
+    # These routing-only fake-db cases cannot express a durable server generation.
+    # Real database cases below exercise the public admission wrapper and its lock.
+    monkeypatch.setattr(OrchestrationDecisionDispatcher, "dispatch", OrchestrationDecisionDispatcher._dispatch)
     # the corrective classifier reads durable state; fake-db routing tests keep healthy work ordinary.
     monkeypatch.setattr(OrchestrationService, "classify_corrective_action", ordinary, raising=False)
 
@@ -704,3 +707,189 @@ def test_classifier_wiring_adds_no_reverse_top_level_import():
 
     assert "huddleroom.services.orchestration_service" not in top_level_imports(dispatcher_module)
     assert "huddleroom.services.orchestration_decision_dispatcher" not in top_level_imports(service_module)
+
+
+@pytest.mark.asyncio
+async def test_distinct_late_empty_snapshot_plan_decision_cannot_supersede_live_generation(
+    db_session, test_project, monkeypatch,
+):
+    import copy
+    from tests.test_orchestration_plan_delegation_gate import _make_run, _bind_team, _plan_request
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision
+    from sqlalchemy import select
+    planner = _agent("generation-planner", ["planning"])
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
+    empty = copy.deepcopy(run.plan_state or {})
+    async def decision(scope):
+        row = OrchestrationDecision(
+            run_id=run.id, decision_type="execution", validator_status="accepted",
+            input_snapshot={"run": {"id": str(run.id), "plan_state": copy.deepcopy(empty)}},
+            parsed_decision={**_plan_request(planner.id), "scope": scope},
+        )
+        db_session.add(row)
+        await db_session.flush()
+        return row
+    first, late = await decision("first plan"), await decision("distinct late plan")
+    dispatcher = OrchestrationDecisionDispatcher(service)
+    first_action = await dispatcher.dispatch(db_session, run, first)
+    v1 = copy.deepcopy(run.plan_state)
+    cancel = AsyncMock(side_effect=AssertionError("stale decision must not cancel v1"))
+    monkeypatch.setattr(service, "_cancel_superseded_planning_task", cancel)
+    with pytest.raises(Exception) as caught:
+        await dispatcher.dispatch(db_session, run, late)
+    assert type(caught.value).__name__ == "PlanGenerationChanged"
+    cancel.assert_not_awaited()
+    await db_session.refresh(run)
+    assert run.plan_state == v1
+    actions = list(await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_plan",
+    )))
+    assert [row.id for row in actions] == [first_action.id]
+    # Exact action replay precedes freshness, despite its original empty snapshot.
+    replay = await dispatcher.dispatch(db_session, run, first)
+    assert replay.id == first_action.id
+    cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot", [{}, {"run": {}}, {"run": {"id": "not-a-uuid", "plan_state": {}}},
+                                        {"run": {"id": None, "plan_state": []}}])
+async def test_distinct_request_plan_rejects_missing_or_malformed_server_generation(
+    db_session, conversation_goal_run, monkeypatch, snapshot,
+):
+    from huddleroom.models.orchestration import OrchestrationDecision
+    goal, run = conversation_goal_run
+    service = OrchestrationService()
+    service.execute_request_plan_action = AsyncMock()
+    from huddleroom.schemas.orchestration_recovery import CorrectiveDisposition
+    service.classify_corrective_action = AsyncMock(return_value=CorrectiveDisposition.ORDINARY)
+    row = OrchestrationDecision(run_id=run.id, decision_type="execution", validator_status="accepted",
+                                input_snapshot=snapshot, parsed_decision={
+                                    "action_type": "request_plan", "agent_id": str(uuid.uuid4()),
+                                    "scope": "plan", "work_function": "planning",
+                                })
+    db_session.add(row)
+    await db_session.flush()
+    with pytest.raises(Exception) as caught:
+        await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, row)
+    assert type(caught.value).__name__ == "PlanGenerationChanged"
+    service.execute_request_plan_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fresh_stale", [False, True])
+async def test_stale_plan_generation_is_durably_rejected_and_refreshed_once(
+    db_session, conversation_goal_run, monkeypatch, fresh_stale,
+):
+    from huddleroom.models.orchestration import OrchestrationDecision, OrchestrationWait
+    from huddleroom.schemas.orchestration_recovery import CorrectiveDisposition
+    from sqlalchemy import select
+    goal, run = conversation_goal_run
+    run.status = "running"
+    run.phase = "authorized"
+    run.plan_state = {"status": "requested", "planning_version": 1,
+                      "planning_task_id": str(uuid.uuid4()), "request_action_id": str(uuid.uuid4())}
+    stale = OrchestrationDecision(
+        run_id=run.id, decision_type="execution", validator_status="accepted",
+        input_snapshot={"run": {"id": str(run.id), "plan_state": {}}},
+        parsed_decision={"action_type": "request_plan", "agent_id": str(uuid.uuid4()),
+                         "scope": "late plan", "work_function": "planning"},
+    )
+    db_session.add(stale)
+    await db_session.flush()
+    service = OrchestrationService()
+    service.classify_corrective_action = AsyncMock(return_value=CorrectiveDisposition.ORDINARY)
+    service.execute_request_plan_action = AsyncMock(side_effect=AssertionError("stale executor entered"))
+    async def refresh(_db, _run_id):
+        fresh = OrchestrationDecision(
+            run_id=run.id, decision_type="execution", validator_status="accepted",
+            input_snapshot={"run": {"id": str(run.id), "plan_state": {} if fresh_stale else dict(run.plan_state)}},
+            parsed_decision={**stale.parsed_decision, "scope": "second stale plan"} if fresh_stale else {
+                "action_type": "noop", "reason": "Current live planner needs no replacement.",
+            },
+        )
+        _db.add(fresh)
+        await _db.flush()
+        return fresh
+    service.request_llm_decision = AsyncMock(side_effect=refresh)
+    result = await service._dispatch_execution_decision(db_session, run, stale)
+    service.request_llm_decision.assert_awaited_once()
+    service.execute_request_plan_action.assert_not_awaited()
+    await db_session.refresh(stale)
+    assert stale.validator_status == "rejected"
+    assert stale.rejection_reason == "stale_plan_generation"
+    if fresh_stale:
+        waits = list(await db_session.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id)))
+        assert waits, "the bounded second-stale path must leave an ordinary wait"
+    else:
+        assert result is not None and result.action_type == "noop"
+
+
+def test_plan_generation_seal_tracks_only_server_generation_fields():
+    run_id, task_id, action_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    service = OrchestrationService()
+    assert service._plan_generation_seal(run_id, {}) == {
+        "run_id": str(run_id), "status": None, "planning_version": 0,
+        "planning_task_id": None, "request_action_id": None,
+    }
+    state = {"status": "requested", "planning_version": 1, "planning_task_id": str(task_id),
+             "request_action_id": str(action_id)}
+    expected = {"run_id": str(run_id), **state}
+    assert service._plan_generation_seal(run_id, state) == expected
+    assert service._plan_generation_seal(run_id, {
+        **state, "planning_session_id": str(uuid.uuid4()), "requested_at": "later", "active_blockers": ["changed"],
+    }) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["inherited_context", "successful_retry"])
+async def test_exact_plan_replay_preserves_server_enrichment_and_successful_retry(
+    db_session, test_project, monkeypatch, case,
+):
+    import copy
+    from tests.test_orchestration_plan_delegation_gate import _make_run, _bind_team, _plan_request
+    from huddleroom.models.orchestration import OrchestrationDecision, OrchestrationAction
+    from sqlalchemy import select
+    planner = _agent("replay-planner", ["planning"])
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
+    if case == "inherited_context":
+        goal.orchestrator_context = {**(goal.orchestrator_context or {}), "product_context": {"scope": "synthetic"}}
+    decision = OrchestrationDecision(
+        run_id=run.id, decision_type="execution", validator_status="accepted",
+        input_snapshot={"run": {"id": str(run.id), "plan_state": copy.deepcopy(run.plan_state or {})}},
+        parsed_decision=_plan_request(planner.id),
+    )
+    db_session.add(decision)
+    await db_session.flush()
+    canonical = service.canonical_decision_request("request_plan", decision.parsed_decision, run_id=run.id)
+    key = OrchestrationDecisionDispatcher.action_key(run.id, "request_plan", canonical)
+    if case == "successful_retry":
+        failed = OrchestrationAction(run_id=run.id, idempotency_key=key, action_type="request_plan",
+                                     request=canonical, status="failed", error="prior precondition rejected")
+        db_session.add(failed)
+        await db_session.flush()
+        # Seed a genuine successful action through the production executor under
+        # the existing retry key, then replay the original controller request.
+        action = await service.execute_request_plan_action(
+            db_session, run_id=run.id, request=canonical, idempotency_key=f"{key}:rejected:1",
+        )
+    else:
+        action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
+        assert action.request["orchestrator_context"]["product_context"] == {"scope": "synthetic"}
+    state = copy.deepcopy(run.plan_state)
+    cancel = AsyncMock(side_effect=AssertionError("exact replay cancelled live planner"))
+    monkeypatch.setattr(service, "_cancel_superseded_planning_task", cancel)
+    replay = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
+    assert replay.id == action.id
+    assert run.plan_state == state
+    cancel.assert_not_awaited()
+    rows = list(await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_plan",
+    )))
+    assert len(rows) == (2 if case == "successful_retry" else 1)

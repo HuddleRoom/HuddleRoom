@@ -207,6 +207,30 @@ RECOVERY_RUN_PAUSED_EVENT_TYPE = "orchestration.run_paused"
 MEETING_SCHEDULED_EVENT_TYPE = "orchestration.meeting_scheduled"
 GRAPH_STARTED_EVENT_TYPE = "orchestration.graph_started"
 
+
+class PlanGenerationChanged(Exception):
+    """A server-snapshot planning generation is no longer current."""
+
+
+def _plan_generation_seal(run_id: Any, plan_state: Any) -> dict[str, Any]:
+    if not isinstance(plan_state, Mapping):
+        raise PlanGenerationChanged("Malformed planning generation")
+    try:
+        run_id = str(uuid.UUID(str(run_id)))
+        version = plan_state.get("planning_version", 0)
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("Invalid planning version")
+        status = plan_state.get("status")
+        if status is not None and not isinstance(status, str):
+            raise ValueError("Invalid planning status")
+        identities = {
+            field: str(uuid.UUID(str(plan_state[field]))) if plan_state.get(field) is not None else None
+            for field in ("planning_task_id", "request_action_id")
+        }
+    except (ValueError, TypeError, AttributeError):
+        raise PlanGenerationChanged("Malformed planning generation") from None
+    return {"run_id": run_id, "status": status, "planning_version": version, **identities}
+
 logger = logging.getLogger(__name__)
 
 class _ReentrantAsyncioLock:
@@ -269,6 +293,14 @@ REMEDIATION_REQUEST_KEYS = (
 
 
 class OrchestrationService:
+    _plan_generation_seal = staticmethod(_plan_generation_seal)
+
+    async def _assert_current_plan_generation(self, db, run_id: uuid.UUID, expected: dict) -> OrchestrationRun:
+        run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+        if run is None or _plan_generation_seal(run.id, run.plan_state) != expected:
+            raise PlanGenerationChanged("Planning generation changed")
+        return run
+
     @property
     def supervision(self):
         """Lazy to avoid a circular service import during baseline startup."""
@@ -2123,6 +2155,7 @@ class OrchestrationService:
         request: dict,
         idempotency_key: str,
         decision_id: uuid.UUID | None = None,
+        plan_dispatch_request: dict | None = None,
     ) -> OrchestrationAction:
         gate_run = await db.get(OrchestrationRun, run_id)
         if gate_run is None:
@@ -2189,6 +2222,11 @@ class OrchestrationService:
         )
         if action.status != "reserved":
             return action
+
+        if plan_dispatch_request is not None:
+            contract = dict(action.dispatch_contract or {})
+            contract.setdefault("plan_dispatch_request", deepcopy(plan_dispatch_request))
+            action.dispatch_contract = contract
 
         project_id = await self._project_id_for_run(db, run_id)
         if run is None:
@@ -10855,12 +10893,14 @@ class OrchestrationService:
         )
         return hard_stop_id is not None
 
-    async def _reject_stale_steering_decision(self, db, decision_id: uuid.UUID) -> None:
+    async def _reject_stale_steering_decision(
+        self, db, decision_id: uuid.UUID, *, reason: str = "stale_steering_versions",
+    ) -> None:
         """Durably reject stale work without racing SQLite's sole writer."""
         statement = (
             update(OrchestrationDecision)
             .where(OrchestrationDecision.id == decision_id)
-            .values(validator_status="rejected", rejection_reason="stale_steering_versions")
+            .values(validator_status="rejected", rejection_reason=reason)
         )
         if db.bind is not None and db.bind.dialect.name == "sqlite":
             # SQLite cannot safely use a second writer while the caller owns a
@@ -10913,15 +10953,19 @@ class OrchestrationService:
         except Exception as exc:
             from huddleroom.services.orchestration_steering import SteeringVersionsChanged
 
-            if not isinstance(exc, SteeringVersionsChanged):
+            if not isinstance(exc, (SteeringVersionsChanged, PlanGenerationChanged)):
                 raise
-            await self._reject_stale_steering_decision(db, decision.id)
-            if stale_retry:
-                return None
-            refreshed = await self.request_llm_decision(db, run.id)
-            return await self._dispatch_execution_decision(
-                db, run, refreshed, stale_retry=True,
+            await self._reject_stale_steering_decision(
+                db, decision.id,
+                reason="stale_plan_generation" if isinstance(exc, PlanGenerationChanged) else "stale_steering_versions",
             )
+            if stale_retry:
+                action = None
+            else:
+                refreshed = await self.request_llm_decision(db, run.id)
+                return await self._dispatch_execution_decision(
+                    db, run, refreshed, stale_retry=True,
+                )
         if action is not None:
             if action.action_type == "noop" or action.status == "failed":
                 await self._create_noop_waits(db, run, decision)
