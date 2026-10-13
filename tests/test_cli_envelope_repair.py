@@ -245,3 +245,37 @@ async def test_cli_adapter_repairs_share_one_decreasing_deadline(monkeypatch):
         )
 
     assert observed_timeouts == [9.0, 3.0]
+
+
+@pytest.mark.parametrize(("start", "end"), [
+    (datetime(2026, 1, 1), datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc)),
+    (datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, 0, 30)),
+    (datetime(2026, 1, 1, 2, tzinfo=timezone(timedelta(hours=2))),
+     datetime(2025, 12, 31, 19, 30, tzinfo=timezone(timedelta(hours=-5)))),
+], ids=["sqlite-naive-start", "naive-end", "aware-offsets"])
+def test_cli_elapsed_normalizes_both_operands_as_utc_without_mutating_them(start, end):
+    session = Session(started_at=start, ended_at=end, metadata_={"_run_config": {
+        "_roadmap_budget_enforced": True,
+        "_roadmap_prior_usage": {"max_hours": "1.5", "max_turns": "2"},
+    }})
+    CliAdapter._store_roadmap_elapsed(session)
+    assert session.metadata_["_roadmap_elapsed_seconds"] == "7200"
+    assert session.metadata_["_roadmap_turn_count"] == 3
+    assert session.started_at is start and session.ended_at is end
+
+
+@pytest.mark.parametrize(("start", "end", "enforced", "expected"), [
+    (datetime(2026, 1, 1), datetime(2026, 1, 1, 0, 30), True, "7200"),
+    (datetime(2026, 1, 1), datetime(2025, 12, 31, 23, 30, tzinfo=timezone.utc), True, "5400"),
+    (None, datetime(2026, 1, 1, tzinfo=timezone.utc), True, "5400"),
+    (datetime(2026, 1, 1), datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc), False, None),
+], ids=["both-sqlite-naive", "negative-clamped", "missing-start", "unenforced"])
+def test_cli_elapsed_preserves_existing_budget_edge_controls(start, end, enforced, expected):
+    session = Session(started_at=start, ended_at=end, metadata_={"_run_config": {
+        "_roadmap_budget_enforced": enforced,
+        "_roadmap_prior_usage": {"max_hours": "1.5", "max_turns": "2"},
+    }})
+    CliAdapter._store_roadmap_elapsed(session)
+    assert session.metadata_.get("_roadmap_elapsed_seconds") == expected
+    assert session.metadata_.get("_roadmap_turn_count") == (3 if enforced else None)
+    assert session.started_at is start and session.ended_at is end

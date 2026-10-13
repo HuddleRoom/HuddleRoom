@@ -88,7 +88,11 @@ class CliAdapter:
         prior_seconds = Decimal(str(prior.get("max_hours", "0"))) * Decimal("3600")
         elapsed = Decimal("0")
         if session.started_at is not None and session.ended_at is not None:
-            elapsed = max(Decimal("0"), Decimal(str((session.ended_at - session.started_at).total_seconds())))
+            def utc(value: datetime) -> datetime:
+                return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+            started_at, ended_at = utc(session.started_at), utc(session.ended_at)
+            elapsed = max(Decimal("0"), Decimal(str((ended_at - started_at).total_seconds())))
         session.metadata_ = {
             **(session.metadata_ or {}),
             "_roadmap_elapsed_seconds": format((prior_seconds + elapsed).normalize(), "f"),
