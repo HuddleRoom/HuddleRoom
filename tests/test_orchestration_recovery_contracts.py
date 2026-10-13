@@ -877,3 +877,208 @@ def test_recovery_prompt_includes_authoritative_terminal_and_query_schemas():
     # Compare schema values, not a handful of field names that an incomplete prompt could contain.
     assert json.dumps(TypeAdapter(RecoveryAssessmentV1).json_schema(), sort_keys=True) in prompt
     assert json.dumps(TypeAdapter(RecoveryEvidenceQueryV1).json_schema(), sort_keys=True) in prompt
+
+
+@pytest.fixture
+def recovery_call_events(monkeypatch):
+    """Capture real Calls boundaries without relay/database background work."""
+    from huddleroom.services.agent_response_stream import AgentResponseInvocation as RealInvocation
+    events = []
+
+    async def publish(event):
+        events.append(event)
+
+    async def never_reset(_project_id):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_recovery_analyzer.AgentResponseInvocation",
+        lambda context: RealInvocation(context, publish=publish),
+    )
+    monkeypatch.setattr("huddleroom.services.agent_response_relay.register_project_reset_monitor",
+                        AsyncMock(return_value=SimpleNamespace(generation=None)))
+    monkeypatch.setattr("huddleroom.services.agent_response_relay.unregister_project_reset_monitor", AsyncMock())
+    monkeypatch.setattr("huddleroom.services.agent_response_stream.wait_for_project_reset", never_reset)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_recovery_default_api_observations_arrive_before_baseline_completion(
+    db_session, monkeypatch, recovery_call_events,
+):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    from huddleroom.services import orchestration_completion as completion
+    release = asyncio.Event()
+    requests = []
+    final = {"choices": [{"message": {"content": json.dumps(_proposal_draft())}}],
+             "usage": {"total_tokens": 17}}
+    chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+        content="Live recovery response\n", reasoning_content="Provider recovery thinking\n"))])
+
+    async def chunks():
+        assert runtime._current.get() is None
+        yield chunk
+        await release.wait()
+
+    async def api(**request):
+        assert runtime._current.get() is None and "observer" not in request
+        requests.append(request)
+        if request.get("stream"):
+            return chunks()
+        await release.wait()
+        return final
+
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(completion.litellm, "acompletion", api)
+    monkeypatch.setattr(completion.litellm, "stream_chunk_builder", lambda *_args, **_kwargs: final)
+
+    async def analyze():
+        async with runtime.baseline_operation(db_session, uuid4(), owns_transaction=False):
+            return await RecoveryAnalyzer(completion_fn=completion.orchestration_completion).analyze(
+                {}, project_id=UUID_A, evidence_query=AsyncMock())
+
+    task = asyncio.create_task(analyze())
+    try:
+        async def both_updates():
+            while {event.payload.get("stream") for event in recovery_call_events
+                   if event.event_type == "agent_response.output"} != {"output", "reasoning"}:
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(both_updates(), 1)
+        assert not task.done(), "recovery observations must precede final completion"
+        assert len(requests) == 1 and requests[0]["stream"] is True
+        release.set()
+        assert isinstance(await task, ProposalDraftV1)
+        terminals = [event for event in recovery_call_events if event.event_type == "agent_response.terminal"]
+        assert len(terminals) == 1 and terminals[0].payload["status"] == "completed"
+        assert terminals[0].payload["final_response"]["usage"] == {"total_tokens": 17}
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("baseline", [False, True])
+async def test_recovery_nonadvertising_injection_preserves_request_contract(
+    db_session, recovery_call_events, baseline,
+):
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    requests = []
+
+    async def injected(**request):
+        requests.append(request)
+        return {"choices": [{"message": {"content": json.dumps(_proposal_draft())}}]}
+
+    analyzer = RecoveryAnalyzer(completion_fn=injected)
+    if baseline:
+        async with runtime.baseline_operation(db_session, uuid4(), owns_transaction=False):
+            result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
+    else:
+        result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
+    assert isinstance(result, ProposalDraftV1) and len(requests) == 1
+    expected = RecoveryAnalyzer._request({}, [])
+    if not baseline:
+        expected["stream"] = True
+    assert requests == [expected]
+    assert "observer" not in requests[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("baseline", [False, True])
+async def test_recovery_default_api_prechunk_unsupported_uses_one_linked_fallback(
+    db_session, monkeypatch, recovery_call_events, baseline,
+):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion as completion
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    requests = []
+
+    async def api(**request):
+        requests.append(request)
+        if request.get("stream"):
+            raise TypeError("unexpected keyword argument 'stream'")
+        return {"choices": [{"message": {"content": json.dumps(_proposal_draft())}}]}
+
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(completion.litellm, "acompletion", api)
+    analyzer = RecoveryAnalyzer(completion_fn=completion.orchestration_completion)
+    if baseline:
+        async with runtime.baseline_operation(db_session, uuid4(), owns_transaction=False):
+            result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
+    else:
+        result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
+    assert isinstance(result, ProposalDraftV1)
+    assert len(requests) == 2 and requests[0]["stream"] is True and "stream" not in requests[1]
+    started = [event for event in recovery_call_events if event.event_type == "agent_response.started"]
+    assert len(started) == 2 and started[1].parent_call_id == started[0].call_id
+    terminal = [event for event in recovery_call_events if event.event_type == "agent_response.terminal"]
+    assert [event.payload["status"] for event in terminal] == ["failed", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_default_api_postchunk_failure_is_classified_without_duplicate_call(
+    monkeypatch, recovery_call_events,
+):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion as completion
+    from huddleroom.services.orchestration_recovery_analyzer import RecoveryProviderUnavailable
+    requests = []
+
+    async def chunks():
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+            content="Observed recovery prefix\n", reasoning_content=None))])
+        raise TypeError("unexpected keyword argument 'stream'")
+
+    async def api(**request):
+        requests.append(request)
+        return chunks()
+
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(completion.litellm, "acompletion", api)
+    with pytest.raises(RecoveryProviderUnavailable):
+        await RecoveryAnalyzer(completion_fn=completion.orchestration_completion).analyze(
+            {}, project_id=UUID_A, evidence_query=AsyncMock())
+    assert len(requests) == 1
+    assert any(event.event_type == "agent_response.output" and "Observed recovery prefix" in event.payload["text"]
+               for event in recovery_call_events)
+    terminal = [event for event in recovery_call_events if event.event_type == "agent_response.terminal"]
+    assert len(terminal) == 1 and terminal[0].payload["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_recovery_nonstream_fallback_failure_is_provider_unavailable(recovery_call_events):
+    from huddleroom.services.orchestration_recovery_analyzer import RecoveryProviderUnavailable
+    requests = []
+
+    async def injected(**request):
+        requests.append(request)
+        raise TypeError("unexpected keyword argument 'stream'")
+
+    with pytest.raises(RecoveryProviderUnavailable):
+        await RecoveryAnalyzer(completion_fn=injected).analyze(
+            {}, project_id=UUID_A, evidence_query=AsyncMock())
+    assert len(requests) == 2 and requests[0]["stream"] is True and "stream" not in requests[1]
+    terminals = [event for event in recovery_call_events if event.event_type == "agent_response.terminal"]
+    assert len(terminals) == 2 and all(event.payload["status"] == "failed" for event in terminals)
+
+
+@pytest.mark.asyncio
+async def test_recovery_advertised_injection_postobservation_never_falls_back(recovery_call_events):
+    from huddleroom.services.orchestration_recovery_analyzer import RecoveryProviderUnavailable
+    requests = []
+
+    async def injected(*, observer=None, **request):
+        requests.append(request)
+        if observer is not None:
+            await observer("output", "Already observed recovery text\n")
+            await observer("reasoning", "Actual recovery thinking\n")
+        raise TypeError("unexpected keyword argument 'stream'")
+
+    with pytest.raises(RecoveryProviderUnavailable):
+        await RecoveryAnalyzer(completion_fn=injected).analyze(
+            {}, project_id=UUID_A, evidence_query=AsyncMock())
+    assert len(requests) == 1, "provider failure after observations must not cause another physical call"
+    outputs = [event for event in recovery_call_events if event.event_type == "agent_response.output"]
+    assert {event.payload["stream"] for event in outputs} == {"output", "reasoning"}
+    terminals = [event for event in recovery_call_events if event.event_type == "agent_response.terminal"]
+    assert len(terminals) == 1 and terminals[0].payload["status"] == "failed"

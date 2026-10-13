@@ -18,7 +18,9 @@ from huddleroom.schemas.orchestration_recovery import (
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_completion import get_orchestration_completion, orchestration_runtime_metadata
 from huddleroom.services.orchestration_llm_decision_adapter import _redact_secrets
-from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
+from huddleroom.services.agent_response_stream import (
+    AgentResponseCall, AgentResponseInvocation, CompletionObserver, InvocationContext, supports_observer,
+)
 
 
 MAX_RECOVERY_EVIDENCE_ROUNDS = 4
@@ -119,11 +121,42 @@ class RecoveryAnalyzer:
 
             invocation_kind, runtime_model = orchestration_runtime_metadata(self._completion_fn, request["model"])
 
-            async def safe_completion(**values: Any) -> Any:
+            async def classified_completion(values: dict[str, Any], *, observing: bool = False) -> Any:
+                observation_seen = False
+                observer = values.get("observer")
+                if observer is not None:
+                    async def observed(stream, text):
+                        nonlocal observation_seen
+                        observation_seen = True
+                        await observer(stream, text)
+                    values = {**values, "observer": observed}
                 try:
-                    return await self._completion_fn(**values)
+                    response = await self._completion_fn(**values)
                 except Exception as exc:
+                    if not observation_seen and (observing or values.get("stream") is True) and AgentResponseCall._streaming_unsupported(exc):
+                        raise
                     raise RecoveryProviderUnavailable(_redact_secrets(str(exc))) from None
+                if hasattr(response, "__aiter__"):
+                    async def classified_stream():
+                        seen = False
+                        try:
+                            async for chunk in response:
+                                seen = True
+                                yield chunk
+                        except Exception as exc:
+                            if not seen and not observation_seen and values.get("stream") is True and AgentResponseCall._streaming_unsupported(exc):
+                                raise
+                            raise RecoveryProviderUnavailable(_redact_secrets(str(exc))) from None
+                    return classified_stream()
+                return response
+
+            async def plain_completion(**values: Any) -> Any:
+                return await classified_completion(values)
+
+            async def observed_completion(*, observer: CompletionObserver | None = None, **values: Any) -> Any:
+                return await classified_completion({**values, "observer": observer}, observing=observer is not None)
+
+            safe_completion = observed_completion if supports_observer(self._completion_fn) else plain_completion
 
             try:
                 result = await complete_with_repair(
