@@ -874,3 +874,100 @@ async def test_roadmap_workspace_requires_distinct_registered_git_worktree(test_
             await ProjectService().require_roadmap_workspace(
                 db, project.id, {"type": "git_worktree", "identifier": "shared", "reversible": True},
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_usage", [True, False], ids=["known-usage", "unknown-usage"])
+async def test_real_cli_worker_sqlite_start_preserves_terminal_facts_and_budget_usage(
+    test_engine, tmp_path, monkeypatch, known_usage,
+):
+    import json
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from huddleroom.workers import session_tasks
+    from huddleroom.models.task import Task
+    from tests.test_orchestration_plan_delegation_gate import _make_run, _agent, _plan_request, _bind_team
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    class ClaimClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return start
+
+    class EndClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return start + timedelta(seconds=30)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    records = [
+        {"type": "thread.started", "thread_id": "synthetic-thread"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "synthetic final answer"}},
+    ]
+    if known_usage:
+        records.append({"type": "turn.completed", "usage": {"input_tokens": 11, "output_tokens": 7}})
+    output = "\n".join(json.dumps(record) for record in records)
+    script = tmp_path / "synthetic_cli.py"
+    script.write_text(f"#!{sys.executable}\nprint({output!r})\n")
+    script.chmod(0o755)
+    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    runner = str(uuid.uuid4())
+    async with factory() as db:
+        project = Project(name=f"elapsed-{uuid.uuid4()}", workspace_path=str(workspace), config={})
+        planner = _agent("elapsed-planner")
+        planner.adapter_type, planner.config = "cli", {"cli_runtime": "codex"}
+        db.add_all([project, planner])
+        await db.flush()
+        service, goal, run = await _make_run(db, project.id)
+        await _bind_team(db, goal, planner)
+        action = await service.execute_request_plan_action(db, run_id=run.id,
+            request=_plan_request(planner.id), idempotency_key=f"elapsed:{runner}")
+        task = await db.get(Task, action.target_id)
+        task.status = "in_progress"
+        session = Session(agent_id=planner.id, project_id=project.id, task_id=action.target_id,
+            adapter_type="cli", status="pending", runner_task_id=runner,
+            metadata_={"_run_config": {"timeout": 5, "_roadmap_budget_enforced": True,
+                "_roadmap_prior_usage": {"max_hours": "1", "max_turns": "2"}}})
+        db.add(session)
+        await db.commit()
+        sid, project_id = session.id, project.id
+    monkeypatch.setattr(session_tasks, "AsyncSessionLocal", factory)
+    monkeypatch.setattr(session_tasks, "datetime", ClaimClock)
+    monkeypatch.setattr("huddleroom.adapters.cli_adapter.datetime", EndClock)
+    monkeypatch.setattr(CliAdapter, "_build_command", staticmethod(lambda *_args, **_kwargs: [str(script)]))
+    original_elapsed = CliAdapter._store_roadmap_elapsed
+    observed = []
+
+    def observe_elapsed(row):
+        observed.append((row.started_at.tzinfo, row.ended_at.tzinfo))
+        return original_elapsed(row)
+
+    monkeypatch.setattr(CliAdapter, "_store_roadmap_elapsed", staticmethod(observe_elapsed))
+    await session_tasks.execute_cli_session(str(sid), runner)
+    assert observed == [(None, timezone.utc)], "actual worker must exercise SQLite naive start with aware end"
+    async with factory() as verify:
+        from huddleroom.models.task import Task
+        saved = await verify.get(Session, sid)
+        task = await verify.get(Task, saved.task_id)
+        assert task.status == "done"
+        assert saved.status == "completed" and saved.ended_at is not None
+        assert saved.output == "synthetic final answer" and saved.provider_session_id == "synthetic-thread"
+        assert saved.metadata_["_roadmap_elapsed_seconds"] == "3630"
+        assert saved.metadata_["_roadmap_turn_count"] == 3
+        assert saved.metadata_["token_usage_complete"] is known_usage
+        attempt = saved.metadata_["attempt"]
+        assert attempt["claimed_runner_task_id"] == runner
+        assert attempt["effect_state"] == "started" and attempt["result_status"] == "completed"
+        assert attempt["attempt_version"] == 3 and attempt["result_recorded_at"]
+        assert attempt["usage_complete"] is known_usage
+        if known_usage:
+            assert (saved.metadata_["token_count_in"], saved.metadata_["token_count_out"]) == (11, 7)
+            assert (attempt["token_count_in"], attempt["token_count_out"]) == (11, 7)
+        else:
+            assert "token_count_in" not in saved.metadata_ and "token_count_out" not in saved.metadata_
+        events = list((await verify.scalars(select(EventLog).where(
+            EventLog.project_id == project_id, EventLog.event_type.in_(["session.completed", "session.failed"])
+        ))).all())
+        assert len(events) == 1 and events[0].event_type == "session.completed"
