@@ -340,7 +340,7 @@ async def test_analyzer_failure_is_recorded_on_a_rejected_exchange(db_session, g
 
     exchange = await db_session.get(OrchestrationDecision, caught.value.exchange_id)
     assert exchange.decision_type == "recovery" and exchange.validator_status == "rejected"
-    assert exchange.rejection_reason.startswith("analysis_failed")
+    assert exchange.rejection_reason.startswith("analysis_provider_failed")
     assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in exchange.rejection_reason
     await db_session.refresh(trigger)
     assert trigger.status == "reserved"

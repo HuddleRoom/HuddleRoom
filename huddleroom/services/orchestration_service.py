@@ -252,6 +252,9 @@ _SQLITE_GOAL_LOCKS_GUARD = asyncio.Lock()
 
 # Separate from goal locks: recovery may acquire the roster lock before goal locks.
 _RECOVERY_LIFECYCLE_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# Admission only for public ticks in the same process/event loop; persistence
+# still decides the winner for direct callers and other processes.
+_RECOVERY_DIAGNOSES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 # A baseline-repair admission (passed only by the dispatcher from a validated approve_fix recovery context,
 # never read from request JSON) is honored only for that approved call's own recovery effect key.
@@ -11513,8 +11516,19 @@ class OrchestrationService:
             # Bounded: at most one analyzer diagnosis per run per tick, least recently attempted first.
             trigger_id = await next_trigger() if diagnose else None
             if trigger_id is not None:
-                await step(lambda: service.diagnose(db, trigger_id),
-                           on_error=lambda: mark_diagnosis_error(trigger_id))
+                active = _RECOVERY_DIAGNOSES.setdefault(asyncio.get_running_loop(), set())
+                # No await between checking and inserting: a losing tick skips,
+                # rather than queuing another logical analysis behind this one.
+                if trigger_id in active:
+                    return
+                active.add(trigger_id)
+                try:
+                    # Directly await diagnosis so cancellation cannot release
+                    # admission while an analyzer is still unwinding.
+                    await step(lambda: service.diagnose(db, trigger_id),
+                               on_error=lambda: mark_diagnosis_error(trigger_id))
+                finally:
+                    active.discard(trigger_id)
         finally:
             if owns:
                 await db.commit()  # the tick leaves no transaction open behind it
