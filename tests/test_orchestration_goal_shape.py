@@ -259,6 +259,22 @@ async def test_large_bounded_result_weight_is_independent_of_shape():
 
 
 @real_shape
+async def test_classifier_request_explains_delivery_feature_and_leaf_fix_boundary():
+    fake = scripted(shape_reply("outcome", "delivery"))
+    await OrchestrationGoalShapeService(fake).resolve_creation_shape(
+        PROJECT_ID, create("Add CSV export to the reports page"),
+    )
+    assert len(fake.calls) == 1
+    system = fake.calls[0]["messages"][0]["content"]
+    assert "user-visible reports export feature" in system
+    assert "behavior, UI, safety, and qualification" in system
+    assert "localized pagination-helper correction" in system
+    assert "leaf implementation plan" in system
+    assert "representative structural examples" in system
+    assert "structure only: size, cost, budget, effort, number of success criteria" in system
+
+
+@real_shape
 @pytest.mark.parametrize("goal_type", ["outcome", "roadmap", "continuous"])
 async def test_explicit_bypasses_model(goal_type):
     async def forbidden(**request):

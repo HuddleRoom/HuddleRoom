@@ -71,6 +71,10 @@ SHAPE_PROMPT = (
     "functions never make a goal a roadmap. planning_mode must fit goal_type: roadmap→roadmap; "
     "continuous→continuous_policy; outcome→delivery when the result needs coordinated work across several "
     "functions, implementation when it is a single leaf technical change one specialist can plan. "
+    "For example, a user-visible reports export feature is outcome/delivery: it coordinates behavior, UI, "
+    "safety, and qualification. A localized pagination-helper correction is outcome/implementation: "
+    "one specialist can make a leaf implementation plan. These are representative structural examples, "
+    "not an objective-text lookup; keep size, criteria, and budget independent of shape. "
     "Rationales are short and user-facing."
 )
 
