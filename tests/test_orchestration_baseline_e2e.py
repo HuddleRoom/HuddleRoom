@@ -407,3 +407,45 @@ def test_missing_huddleroom_url_persists_blocker_invocation_evidence(tmp_path, m
     assert (invocation_dir / "server.log").read_text() == "\n"
     assert (invocation_dir / "http-trace.jsonl").read_text() == ""
     assert json.loads((invocation_dir / "judgment-packet.json").read_text())["reason"] == "HUDDLEROOM_URL is required"
+
+
+@pytest.mark.parametrize("caller_origin", [None, "http://wrong-origin.invalid:8000"])
+def test_controlled_server_binds_settings_and_native_context_to_own_http_origin(tmp_path, monkeypatch, caller_origin):
+    from types import SimpleNamespace
+    from uuid import uuid4
+    import huddleroom.config as config_module
+    import huddleroom.adapters.cli_adapter as cli_module
+
+    class Socket:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def bind(self, *args): pass
+        def getsockname(self): return ("127.0.0.1", 12345)
+
+    class Process:
+        stdout = io.StringIO("")
+        stderr = io.StringIO("")
+        def poll(self): return 0
+
+    launched = {}
+    def popen(*args, **kwargs):
+        launched.update(kwargs)
+        return Process()
+    monkeypatch.setattr(runner.socket, "socket", lambda *args: Socket())
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(runner, "_wait_until_ready", lambda *args: None)
+    environment = {"HUDDLEROOM_API_BASE_URL": caller_origin} if caller_origin else {}
+    with runner._controlled_server(environment=environment, reload=False) as base_url:
+        assert launched["env"]["HUDDLEROOM_API_BASE_URL"] == base_url
+        monkeypatch.setenv("HUDDLEROOM_API_BASE_URL", launched["env"]["HUDDLEROOM_API_BASE_URL"])
+        monkeypatch.setattr(config_module, "DEFAULT_CONFIG_FILE", tmp_path / "missing.toml")
+        configured = config_module.Settings(_env_file=None)
+        assert configured.api_base_url == base_url
+        monkeypatch.setattr(cli_module, "settings", configured)
+        sandbox = tmp_path / "synthetic-session"
+        cli_module.CliAdapter()._setup_sandbox(
+            sandbox, uuid4(), None, SimpleNamespace(id=uuid4()), uuid4(), task_content="Public synthetic task"
+        )
+        context = json.loads((sandbox / "huddleroom_context.json").read_text())
+        assert context["api_base"] == base_url
+        assert context["api_key"] == ""

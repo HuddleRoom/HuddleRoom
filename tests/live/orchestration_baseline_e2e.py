@@ -275,6 +275,7 @@ def _controlled_server(
     env["HUDDLEROOM_DEBUG"] = "true"
     env["HUDDLEROOM_ORCHESTRATION_BASELINE_E2E"] = "true"
     env.update(environment or {})
+    env["HUDDLEROOM_API_BASE_URL"] = base_url
     if management_url is not None:
         env["ONECLI_API_HOST"] = management_url
         env["HUDDLEROOM_ONECLI_MANAGEMENT_URL"] = management_url
