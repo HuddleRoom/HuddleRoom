@@ -83,7 +83,14 @@ def orchestration_runtime_metadata(completion_fn: CompletionFn, api_model: str, 
 async def orchestration_completion(**request: Any) -> Any:
     backend = settings.orchestration_backend
     if backend == "api":
-        _validate_api_effort(request.get("model") or settings.orchestration_model, settings.orchestration_effort)
+        model = request.get("model") or settings.orchestration_model
+        _validate_api_effort(model, settings.orchestration_effort)
+        provider = request.get("custom_llm_provider")
+        openrouter = provider == "openrouter" or (
+            provider is None and isinstance(model, str) and model.startswith("openrouter/")
+        )
+        if settings.credential_mode == "onecli" and openrouter and "OPENROUTER_API_KEY" not in os.environ:
+            request.setdefault("api_key", "onecli-openrouter-placeholder")
         if settings.orchestration_effort is not None:
             request = {key: value for key, value in request.items() if key != "temperature"}
             request["reasoning_effort"] = settings.orchestration_effort

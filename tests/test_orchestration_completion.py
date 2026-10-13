@@ -123,6 +123,90 @@ async def test_missing_cli_backend_never_falls_back_to_api(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("defined", ["synthetic-environment-value", "", None])
+@pytest.mark.parametrize("explicit", ["synthetic-request-value", "", None])
+async def test_onecli_openrouter_api_key_is_absent_only_and_preserves_explicit_values(monkeypatch, defined, explicit):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(settings, "credential_mode", "onecli")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    if defined is None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_API_KEY", defined)
+    seen = {}
+
+    async def completion(**request):
+        seen.update(request)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(orchestration_completion.litellm, "acompletion", completion)
+    request = {"model": "openrouter/test", "messages": []}
+    if explicit is not None:
+        request["api_key"] = explicit
+    await orchestration_completion.orchestration_completion(**request)
+    if explicit is not None:
+        assert seen["api_key"] == explicit
+    elif defined is not None:
+        assert "api_key" not in seen
+    else:
+        assert seen["api_key"] == "onecli-openrouter-placeholder"
+    assert seen["model"] == request["model"] and seen["messages"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential_mode,model", [("direct", "openrouter/test"), ("onecli", "openai/test")])
+async def test_openrouter_api_fallback_does_not_affect_direct_or_other_providers(monkeypatch, credential_mode, model):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(settings, "credential_mode", credential_mode)
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    seen = {}
+
+    async def completion(**request):
+        seen.update(request)
+        return {"choices": []}
+
+    monkeypatch.setattr(orchestration_completion.litellm, "acompletion", completion)
+    request = {"model": model, "messages": []}
+    await orchestration_completion.orchestration_completion(**request)
+    assert seen == request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+async def test_openrouter_api_fallback_does_not_enter_native_cli_request(monkeypatch, backend):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion
+
+    monkeypatch.setattr(settings, "orchestration_backend", backend)
+    monkeypatch.setattr(settings, "credential_mode", "onecli")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(orchestration_completion, "_executable", lambda _backend: "/unit/native-cli")
+
+    async def authenticate(*_args):
+        return None
+
+    seen = {}
+
+    async def complete(_executable, _backend, request, _meta):
+        seen.update(request)
+        return {"choices": []}
+
+    monkeypatch.setattr(orchestration_completion, "_authenticate", authenticate)
+    monkeypatch.setattr(orchestration_completion, "_complete_cli", complete)
+    request = {"model": "openrouter/test", "messages": []}
+    await orchestration_completion.orchestration_completion(**request)
+    assert seen == request
+
+
+@pytest.mark.asyncio
 async def test_claude_gateway_preflights_auth_and_normalizes_native_envelope(monkeypatch, tmp_path):
     """Claude uses its authenticated print contract without model or effort overrides by default."""
     from huddleroom.config import settings
