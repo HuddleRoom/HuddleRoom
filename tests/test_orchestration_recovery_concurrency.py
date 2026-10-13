@@ -88,31 +88,37 @@ async def test_public_ticks_enter_real_analyzer_once_before_completion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_limit", [False, True])
 async def test_public_ticks_exhaust_three_contract_refusals_without_provider_backoff(
-    db_session, test_engine, conversation_goal_run, monkeypatch,
+    db_session, test_engine, conversation_goal_run, monkeypatch, evidence_limit,
 ):
+    import json
     from unittest.mock import AsyncMock
     from huddleroom.models.orchestration import OrchestrationDecision
-    completion = AsyncMock(return_value={"choices": [{"message": {"content": '{"kind":"proposal"}'}}]})
+    payload = {"kind": "evidence_query", "query": {"kind": "waits"}} if evidence_limit else {"kind": "proposal"}
+    completion = AsyncMock(return_value={"choices": [{"message": {"content": json.dumps(payload)}}]})
+    physical_per_diagnosis = 5 if evidence_limit else 3
     factory, run_id, trigger_id, tick = await _diagnosis_ticks(
         db_session, test_engine, conversation_goal_run, monkeypatch, completion,
     )
     for attempt in range(3):
         await tick()
-        assert completion.await_count == (attempt + 1) * 3
+        assert completion.await_count == (attempt + 1) * physical_per_diagnosis
         async with factory() as check:
             trigger = await check.get(OrchestrationAction, trigger_id)
             assert not trigger.dispatch_contract.get("last_diagnosis_error_at")
     await tick()
     await tick()
-    assert completion.await_count == 9
+    assert completion.await_count == 3 * physical_per_diagnosis
     async with factory() as check:
         exchanges = list(await check.scalars(select(OrchestrationDecision).where(
             OrchestrationDecision.run_id == run_id, OrchestrationDecision.decision_type == "recovery",
         )))
         rejected = [row for row in exchanges if row.validator_status == "rejected"]
         assert len(rejected) == 3
-        assert all(row.rejection_reason.startswith("analysis_contract_rejected") for row in rejected)
+        assert all(row.rejection_reason.startswith(
+            "analysis_evidence_limit" if evidence_limit else "analysis_contract_rejected") for row in rejected)
+        assert all(len(row.input_snapshot["evidence_queries"]) == (4 if evidence_limit else 0) for row in rejected)
         assert len([row for row in exchanges if row.validator_status == "accepted"]) == 1
 
 

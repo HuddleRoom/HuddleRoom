@@ -375,6 +375,15 @@ async def execute_cli_session(session_id: str, runner_task_id: str) -> None:
             await CliAdapter().run(sid, db, runner_task_id)
             await _mark_attempt_result(db, sid, runner_task_id)
             await db.commit()
+        except asyncio.CancelledError:
+            # The adapter already prepared the owned attempt/session/event once.
+            # Acknowledgement must wait until that transaction is durable.
+            try:
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            raise
         except Exception as e:
             logger.error("CLI session %s failed: %s", session_id, e)
             await db.rollback()

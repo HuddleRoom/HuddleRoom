@@ -70,12 +70,32 @@ class OrchestrationDecisionDispatcher:
         self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision, *,
         recovery_context: RecoveryDispatchContext | None = None,
     ) -> OrchestrationAction | None:
-        if decision.validator_status != "accepted" or (decision.parsed_decision or {}).get("action_type") != "request_plan":
+        action_type = (decision.parsed_decision or {}).get("action_type")
+        if decision.validator_status == "accepted" and action_type == "request_plan_revision":
+            with db.no_autoflush:
+                live_cli = await self._service._sqlite_cli_planning_replacement_session(db, run)
+                if live_cli is not None and not (run.plan_state or {}).get("pending_replan"):
+                    request = self._service.canonical_decision_request(
+                        "request_plan_revision", decision.parsed_decision, run_id=run.id,
+                    )
+                    key = self.action_key(run.id, "request_plan_revision", request)
+                    existing = await self._service._existing_action_for_key(db, run.id, key)
+                    if existing is None or existing.status == "reserved":
+                        await self._service._assert_sqlite_replacement_transaction(db)
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+        if decision.validator_status != "accepted" or action_type != "request_plan":
             return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+        with db.no_autoflush:
+            return await self._dispatch_plan_generation(db, run, decision, recovery_context=recovery_context)
+
+    async def _dispatch_plan_generation(
+        self, db, run, decision, *, recovery_context=None,
+    ):
         from huddleroom.services.orchestration_service import PlanGenerationChanged, _plan_generation_seal
 
         request = self._service.canonical_decision_request("request_plan", decision.parsed_decision, run_id=run.id)
-        key = recovery_effect_key(recovery_context) if recovery_context else self.action_key(run.id, "request_plan", request)
+        key = (recovery_effect_key(recovery_context) if recovery_context
+               else self.action_key(run.id, "request_plan", request))
         snapshot = getattr(decision, "input_snapshot", {}) or {}
         versions = steering_versions_from_snapshot(snapshot)
         if not recovery_context:
@@ -89,7 +109,8 @@ class OrchestrationDecisionDispatcher:
             OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_plan",
             OrchestrationAction.idempotency_key == key,
         ))
-        replay_request = (existing.dispatch_contract or {}).get("plan_dispatch_request", existing.request) if existing else None
+        replay_request = ((existing.dispatch_contract or {}).get("plan_dispatch_request", existing.request)
+                          if existing else None)
         if existing is not None and existing.status != "reserved" and replay_request == request:
             return existing
         snapshot_run = snapshot.get("run") if isinstance(snapshot, dict) else None
@@ -97,8 +118,12 @@ class OrchestrationDecisionDispatcher:
             raise PlanGenerationChanged("Missing server planning generation")
         expected = _plan_generation_seal(snapshot_run.get("id"), snapshot_run["plan_state"])
         async with self._service._lock_goal_for_baseline_transition(db, run.goal_id):
+            if await self._service._sqlite_cli_planning_replacement_session(db, run) is not None:
+                await self._service._assert_sqlite_replacement_transaction(db)
             current = await self._service._assert_current_plan_generation(db, run.id, expected)
-            return await self._dispatch(db, current, decision, recovery_context=recovery_context)
+            return await self._dispatch(
+                db, current, decision, recovery_context=recovery_context, expected_plan_generation=expected,
+            )
 
     async def _dispatch(
         self,
@@ -107,6 +132,7 @@ class OrchestrationDecisionDispatcher:
         decision: OrchestrationDecision,
         *,
         recovery_context: RecoveryDispatchContext | None = None,
+        expected_plan_generation: dict | None = None,
     ) -> OrchestrationAction | None:
         if decision.validator_status != "accepted":
             return None
@@ -190,13 +216,21 @@ class OrchestrationDecisionDispatcher:
         extra = {"ad_hoc": True} if action_type == "create_delegation_task" else {}
         if action_type == "request_plan":
             extra["plan_dispatch_request"] = request
+            if expected_plan_generation is not None:
+                extra["expected_plan_generation"] = expected_plan_generation
         if extra and recovery and recovery_context.purpose == "apply" and recovery_context.baseline_repair_admission:
             # Trusted only from a validated approve_fix context; the executor re-checks it against current state.
             extra["baseline_repair_admission"] = recovery_context.baseline_repair_admission
         call = lambda: method(  # noqa: E731
             db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id, **extra,
         )
-        if action_type in self._OWN_RECOVERY_ACTION_TYPES:
+        sqlite_cli_replacement = (
+            (action_type == "request_plan" and expected_plan_generation is not None
+             or action_type == "request_plan_revision")
+            and await self._service._sqlite_cli_planning_replacement_session(db, run) is not None
+            and not (action_type == "request_plan_revision" and (run.plan_state or {}).get("pending_replan"))
+        )
+        if action_type in self._OWN_RECOVERY_ACTION_TYPES or sqlite_cli_replacement:
             if action_type == "request_roadmap_replan" and await self._service._existing_action_for_key(
                 db, run_id, action_key
             ) is None:

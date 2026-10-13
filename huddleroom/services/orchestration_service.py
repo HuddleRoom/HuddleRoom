@@ -2149,6 +2149,117 @@ class OrchestrationService:
             )
 
     async def execute_request_plan_action(
+        self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
+        decision_id: uuid.UUID | None = None, plan_dispatch_request: dict | None = None,
+        expected_plan_generation: dict | None = None,
+    ) -> OrchestrationAction:
+        pending_writes = bool(db.new or db.dirty or db.deleted)
+        flushed_writes = await self._sqlite_transaction_has_writes(db)
+        with db.no_autoflush:
+            run = await db.get(OrchestrationRun, run_id)
+            lookup_key = await self._plan_action_lookup_key(db, idempotency_key, decision_id)
+            existing = await self._existing_action_for_key(db, run_id, lookup_key)
+            old_session = await self._sqlite_cli_planning_replacement_session(db, run) if run else None
+        if existing is not None and existing.status != "reserved":
+            replay_request = (existing.dispatch_contract or {}).get("plan_dispatch_request", existing.request)
+            if replay_request == self._canonical_plan_request(request):
+                return existing
+            return await self._execute_request_plan_action(
+                db, run_id, request, idempotency_key, decision_id, plan_dispatch_request,
+            )
+        if old_session is not None:
+            if pending_writes or flushed_writes:
+                raise HTTPException(status_code=409, detail="planning_replacement_transaction_conflict")
+            await self._assert_sqlite_replacement_transaction(db)
+            expected = expected_plan_generation or _plan_generation_seal(run.id, run.plan_state)
+            goal_id = run.goal_id
+            async with self._lock_goal_for_baseline_transition(db, goal_id):
+                run = await self._assert_current_plan_generation(db, run_id, expected)
+                # Admission checks precede destructive cancellation, just as
+                # they precede reservation in the original executor.
+                await self._ensure_baseline_processes_ready(db, goal_id)
+                await self._ensure_plan_request_allowed(db, run)
+                canonical = self._canonical_plan_request(request)
+                goal = await db.get(OrchestrationGoal, goal_id)
+                inherited_context = self._json_object_or_empty(goal.orchestrator_context)
+                if self._has_delegable_orchestrator_context(inherited_context):
+                    canonical = {**canonical, "orchestrator_context": delegable_context(inherited_context)}
+                await self._require_plan_author(db, goal, run, canonical.get("agent_id"))
+                _, agent, _ = await self._validate_delegation_targets(db, run_id, {**canonical, "parent_task_id": None})
+                authority = await self.roadmap_pre_release_authority(
+                    db, run_id, agent, self._json_object_or_empty(canonical.get("orchestrator_context")),
+                )
+                if authority.get("status") in {"pending", "rejected"}:
+                    raise HTTPException(
+                        status_code=409, detail="budget_wait" if authority["status"] == "pending" else "needs_attention",
+                    )
+                await self._terminalize_sqlite_planning_replacement(db, run_id, expected, old_session)
+                return await self._execute_request_plan_action(
+                    db, run_id, request, idempotency_key, decision_id, plan_dispatch_request,
+                )
+        return await self._execute_request_plan_action(
+            db, run_id, request, idempotency_key, decision_id, plan_dispatch_request,
+        )
+
+    async def _terminalize_sqlite_planning_replacement(self, db, run_id, expected, old_session) -> None:
+        session_id, task_id = old_session.id, old_session.task_id
+        await self._assert_sqlite_replacement_transaction(db)
+        await db.commit()
+        await SessionService().cancel(db, session_id)
+        await self._assert_current_plan_generation(db, run_id, expected)
+        old_task = await db.get(Task, task_id, populate_existing=True)
+        if old_task is not None and "cancelled" in Task.VALID_TRANSITIONS.get(old_task.status, set()):
+            await TaskService().cancel(db, old_task.project_id, task_id)
+        await db.commit()  # old facts survive every later replacement failure
+        await self._assert_current_plan_generation(db, run_id, expected)
+
+    @staticmethod
+    async def _plan_action_lookup_key(db, key, decision_id) -> str:
+        """Derive exact replay identity without checking mutable steering state."""
+        from huddleroom.services.orchestration_steering import (
+            OrchestrationSteeringService, steering_versions_from_snapshot,
+        )
+        decision = await db.get(OrchestrationDecision, decision_id) if decision_id else None
+        versions = steering_versions_from_snapshot(decision.input_snapshot or {}) if decision else None
+        if versions is not None:
+            suffix = f":steering:{OrchestrationSteeringService.version_digest(versions)}"
+            if not key.endswith(suffix):
+                key = key[:255 - len(suffix)] + suffix
+        return key
+
+    @staticmethod
+    async def _assert_sqlite_replacement_transaction(db: AsyncSession) -> None:
+        transaction = db.sync_session.get_transaction()
+        if (db.new or db.dirty or db.deleted or db.in_nested_transaction()
+                or transaction is None or transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+                or await OrchestrationService._sqlite_transaction_has_writes(db)):
+            raise HTTPException(status_code=409, detail="planning_replacement_transaction_conflict")
+
+    @staticmethod
+    async def _sqlite_transaction_has_writes(db: AsyncSession) -> bool:
+        if db.get_bind().dialect.name != "sqlite" or not db.in_transaction():
+            return False
+        connection = await db.connection()
+        raw = await connection.get_raw_connection()
+        # sqlite3/aiosqlite starts its native transaction at the first DML.
+        # ORM dirty sets alone miss writes that the caller already flushed.
+        return bool(raw.driver_connection.in_transaction)
+
+    async def _sqlite_cli_planning_replacement_session(self, db, run) -> Session | None:
+        if db.get_bind().dialect.name != "sqlite" or run is None:
+            return None
+        state = self._json_object_or_empty(run.plan_state)
+        if state.get("status") not in {"requested", "revision_requested"}:
+            return None
+        task_id = self._optional_uuid(state.get("planning_task_id"), "planning_task_id")
+        if task_id is None:
+            return None
+        return await db.scalar(select(Session).where(
+            Session.task_id == task_id, Session.adapter_type == "cli",
+            Session.status.in_(("pending", "running")),
+        ).order_by(Session.created_at.desc(), Session.id.desc()).limit(1))
+
+    async def _execute_request_plan_action(
         self,
         db: AsyncSession,
         run_id: uuid.UUID,
@@ -2311,6 +2422,49 @@ class OrchestrationService:
         return await self._mark_action_completed(db, action, target_type="task", target_id=task.id)
 
     async def execute_request_plan_revision_action(
+        self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
+        decision_id: uuid.UUID | None = None,
+    ) -> OrchestrationAction:
+        with db.no_autoflush:
+            run = await db.get(OrchestrationRun, run_id)
+            lookup_key = await self._plan_action_lookup_key(db, idempotency_key, decision_id)
+            existing = await self._existing_action_for_key(db, run_id, lookup_key)
+            old_session = await self._sqlite_cli_planning_replacement_session(db, run)
+            pending_replan = (self._json_object_or_empty(
+                self._json_object_or_empty(run.plan_state).get("pending_replan"),
+            ) if run else {})
+        if (existing is not None and existing.status != "reserved"
+                and existing.request == self._canonical_plan_revision_request(request)):
+            return existing
+        if old_session is not None and not pending_replan and (existing is None or existing.status == "reserved"):
+            await self._assert_sqlite_replacement_transaction(db)
+            goal_id = run.goal_id
+            expected = _plan_generation_seal(run.id, run.plan_state)
+            async with self._lock_goal_for_baseline_transition(db, goal_id):
+                run = await self._assert_current_plan_generation(db, run_id, expected)
+                await self._ensure_plan_revision_allowed(db, run)
+                canonical = self._canonical_plan_revision_request(request)
+                planning_task = await self._planning_task_for_run(
+                    db, run, self._required_uuid(canonical.get("plan_task_id"), "plan_task_id"),
+                )
+                agent = await db.get(Agent, planning_task.assigned_to) if planning_task.assigned_to else None
+                if agent is None:
+                    raise HTTPException(status_code=409, detail="Roadmap planning agent is invalid")
+                goal = await db.get(OrchestrationGoal, goal_id)
+                authority = await self.roadmap_pre_release_authority(
+                    db, run_id, agent, goal.orchestrator_context if goal else None,
+                )
+                if authority.get("status") in {"pending", "rejected"}:
+                    raise HTTPException(
+                        status_code=409, detail="budget_wait" if authority["status"] == "pending" else "needs_attention",
+                    )
+                await self._terminalize_sqlite_planning_replacement(db, run_id, expected, old_session)
+                return await self._execute_request_plan_revision_action(
+                    db, run_id, request, idempotency_key, decision_id,
+                )
+        return await self._execute_request_plan_revision_action(db, run_id, request, idempotency_key, decision_id)
+
+    async def _execute_request_plan_revision_action(
         self,
         db: AsyncSession,
         run_id: uuid.UUID,

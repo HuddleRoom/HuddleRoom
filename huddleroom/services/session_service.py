@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import SessionTransactionOrigin
 from fastapi import HTTPException
 
 from huddleroom.models.session import Session
@@ -836,9 +837,44 @@ class SessionService:
         return items, next_cursor
 
     async def cancel(self, db: AsyncSession, session_id: uuid.UUID) -> Session:
-        session = await self.get_or_404(db, session_id)
+        pending_writes = bool(db.new or db.dirty or db.deleted)
+        with db.no_autoflush:
+            session = await self.get_or_404(db, session_id)
         if session.status in ("completed", "failed", "cancelled"):
             raise HTTPException(status_code=409, detail=f"Session already {session.status}")
+
+        from huddleroom.config import settings
+        if settings.is_sqlite and session.adapter_type == "cli":
+            from huddleroom.workers.task_runner import cancel_task
+            from huddleroom.services.orchestration_service import OrchestrationService
+
+            runner_id = session.runner_task_id
+            transaction = db.sync_session.get_transaction()
+            if (pending_writes or db.new or db.dirty or db.deleted or db.in_nested_transaction()
+                    or transaction is None or transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+                    or await OrchestrationService._sqlite_transaction_has_writes(db)):
+                raise HTTPException(status_code=409, detail={"code": "cli_cancel_transaction_conflict"})
+            await db.commit()  # release only a proven clean read before the independent worker write
+            error = None
+            acknowledged = False
+            try:
+                acknowledged = await cancel_task(runner_id) if runner_id else False
+            except Exception as exc:
+                error = exc
+            # The worker is the sole writer of cancellation facts. Discard the
+            # cached row and observe its independently committed transaction.
+            db.expire(session)
+            session = await self.get_or_404(db, session_id)
+            if session.status == "cancelled" and session.ended_at is not None:
+                return session
+            if session.status in ("completed", "failed"):
+                return session
+            if error is not None:
+                raise error
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "cli_cancel_not_terminalized" if acknowledged else "cli_runner_not_owned"},
+            )
 
         if session.runner_task_id:
             try:
