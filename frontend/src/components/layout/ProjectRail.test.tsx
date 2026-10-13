@@ -16,8 +16,8 @@ vi.mock('./AgentActivityPanel', () => ({
   AgentActivityPanel: () => <div data-testid="calls-panel">Calls panel</div>,
 }))
 
-vi.mock('./ProjectAdvisorPanel', () => ({
-  ProjectAdvisorPanel: () => <div data-testid="ask-panel">Ask panel</div>,
+vi.mock('./ProjectChatPanel', () => ({
+  ProjectChatPanel: () => <div data-testid="ask-panel">Ask panel</div>,
 }))
 
 import { ProjectRail } from './ProjectRail'
@@ -117,13 +117,12 @@ describe('ProjectRail', () => {
     } finally { view.cleanup() }
   })
 
-  it('renders AgentActivityPanel directly with no tab strip when advisor allowance is disabled', async () => {
+  it('keeps Ask history accessible when the advisor allowance is disabled', async () => {
     advisor.query.data = { items: [], allowance: { enabled: false, unlimited: false, limit: 0, remaining: 0 } }
     const view = await mount()
     try {
-      expect(descendants(view.container).find((node) => node.getAttribute('data-testid') === 'calls-panel')).toBeDefined()
-      expect(descendants(view.container).filter((node) => node.getAttribute('role') === 'tab')).toHaveLength(0)
-      expect(descendants(view.container).find((node) => node.getAttribute('data-testid') === 'ask-panel')).toBeUndefined()
+      expect(descendants(view.container).filter((node) => node.getAttribute('role') === 'tab')).toHaveLength(2)
+      expect(descendants(view.container).find((node) => node.getAttribute('data-testid') === 'ask-panel')).toBeDefined()
     } finally { view.cleanup() }
   })
 })

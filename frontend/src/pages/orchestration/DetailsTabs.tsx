@@ -18,7 +18,6 @@ import type {
   OrchestrationWarningRecord,
 } from '@/lib/types'
 import { ActivityLog, type ActivityScope } from './ActivityLog'
-import { ConversationPanel } from './ConversationPanel'
 import { BASELINE_PROCESS_TYPES, errorRecord, processLabel } from './humanize'
 import { useGoalAnnouncer } from './goalAnnouncer'
 import { PlanTab } from './PlanTab'
@@ -293,7 +292,7 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
       <TabPanel tabId="ledger" activeId={activeTab} idPrefix="details" className="p-4">
         <Panel>
           <div className="flex flex-col gap-4">
-            <ConversationPanel projectId={projectId} goalId={goalId} />
+            <Button type="button" variant="secondary" onClick={() => window.dispatchEvent?.(new CustomEvent('orchestration-open-chat', { detail: { projectId, goalId } }))}>Open conversation</Button>
             <ActivityLog
               processes={processes} decisions={decisions} warnings={warnings} detail={detail} selectedStepType={selectedStepType}
               scope={activityScope}

@@ -180,12 +180,24 @@ beforeEach(() => {
 })
 
 describe('DetailsTabs', () => {
+  it('opens the unified thread with goal context and never mounts a second composer', async () => {
+    const view = await mount()
+    try {
+      const dispatch = vi.fn()
+      window.dispatchEvent = dispatch
+      expect(descendants(view.container).filter((node) => node.tagName === 'TEXTAREA')).toHaveLength(0)
+      await act(async () => getButton(view.container, 'Open conversation').click())
+      expect(dispatch).toHaveBeenCalledOnce()
+      expect(dispatch.mock.calls[0][0].type).toBe('orchestration-open-chat')
+      expect(dispatch.mock.calls[0][0].detail).toMatchObject({ projectId: 'project-1', goalId: 'goal-1' })
+    } finally { view.cleanup() }
+  })
   it('places Conversation before the Activity log', async () => {
     const view = await mount()
     try {
       const activity = tabPanel(view.container, 'ledger')
       const content = textOf(activity)
-      const conversationIndex = content.indexOf('Conversation')
+      const conversationIndex = content.indexOf('Open conversation')
       const logIndex = content.indexOf('Whole goal')
       expect(conversationIndex).toBeGreaterThanOrEqual(0)
       expect(logIndex).toBeGreaterThanOrEqual(0)

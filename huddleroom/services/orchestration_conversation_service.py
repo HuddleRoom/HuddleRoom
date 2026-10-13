@@ -136,6 +136,7 @@ class OrchestrationConversationService:
         actor_id: uuid.UUID,
         client_request_id: uuid.UUID,
         content: str,
+        *, chat_turn_id: uuid.UUID | None = None,
     ) -> ConversationTurn:
         content = content.strip() if isinstance(content, str) else ""
         if not content:
@@ -143,7 +144,7 @@ class OrchestrationConversationService:
                 "conversation_invalid_content", 422, "Conversation content is required"
             )
         prepared, created = await self._prepare(
-            project_id, goal_id, actor_id, client_request_id, content
+            project_id, goal_id, actor_id, client_request_id, content, chat_turn_id
         )
         if not created:
             return prepared
@@ -310,7 +311,7 @@ class OrchestrationConversationService:
                 continue
             result = ConversationProviderResult("unknown", None, None, None)
             allowed = isinstance(dossier, dict) and isinstance(dossier.get("_conversation_runtime"), dict) and dossier["_conversation_runtime"].get("investigation_enabled") is True
-            steering_allowed = isinstance(dossier, dict) and isinstance(dossier.get("_conversation_runtime"), dict) and dossier["_conversation_runtime"].get("steering_enabled") is True
+            steering_allowed = isinstance(dossier, dict) and isinstance(dossier.get("_conversation_runtime"), dict) and not dossier["_conversation_runtime"].get("chat_turn_id") and dossier["_conversation_runtime"].get("steering_enabled") is True
             authority = self._authority_values(response_id, context_version, provider_request_id, dossier) if allowed or steering_allowed else None
             if self._lookup_fn is not None:
                 try:
@@ -426,6 +427,7 @@ class OrchestrationConversationService:
         actor_id: uuid.UUID,
         request_id: uuid.UUID,
         content: str,
+        chat_turn_id: uuid.UUID | None = None,
     ) -> tuple[ConversationTurn, bool]:
         async with self._session_factory() as db:
             async with db.begin():
@@ -454,6 +456,9 @@ class OrchestrationConversationService:
                                 ConversationInvestigation.response_id == response.id
                             )
                         )
+                        if chat_turn_id is not None:
+                            from huddleroom.services.orchestration_chat_interpretation import sync_goal_chat_provider
+                            await sync_goal_chat_provider(db, chat_turn_id, response, message)
                         return ConversationTurn(
                             message=message, response=response, investigation=investigation
                         ), False
@@ -478,6 +483,9 @@ class OrchestrationConversationService:
                     build = await ConversationDossierBuilder(db).build(
                         goal, run, content, pairs
                     )
+                    if chat_turn_id is not None:
+                        from huddleroom.services.orchestration_chat_interpretation import prepare_goal_chat
+                        await prepare_goal_chat(db, build, chat_turn_id, project_id, goal_id, actor_id)
                     steering_allowed = (
                         settings.orchestration_conversation_steering_enabled
                         and run is not None
@@ -527,6 +535,8 @@ class OrchestrationConversationService:
                         content=content,
                     )
                     runtime = {}
+                    if chat_turn_id is not None:
+                        runtime["chat_turn_id"] = str(chat_turn_id)
                     if settings.orchestration_conversation_investigation_enabled:
                         runtime["investigation_enabled"] = True
                     if steering_allowed:
@@ -554,6 +564,9 @@ class OrchestrationConversationService:
                     await db.flush()
                     db.add(reservation)
                     await db.flush()
+                    if chat_turn_id is not None:
+                        from huddleroom.services.orchestration_chat_interpretation import sync_goal_chat_provider
+                        await sync_goal_chat_provider(db, chat_turn_id, response, message)
                     return ConversationTurn(
                         message=message, response=response, provider_messages=build.provider_messages
                     ), True
@@ -587,6 +600,10 @@ class OrchestrationConversationService:
                         now + timedelta(seconds=120),
                     )
                     reservation.status, reservation.committed_at = "committed", now
+                    chat_turn_id = (response.dossier.get("_conversation_runtime") or {}).get("chat_turn_id")
+                    if chat_turn_id:
+                        from huddleroom.services.orchestration_chat_interpretation import sync_goal_chat_provider
+                        await sync_goal_chat_provider(db, chat_turn_id, response, message)
                     await db.flush()
                     return response
 
@@ -616,6 +633,10 @@ class OrchestrationConversationService:
                         or reservation.status != "committed"
                     ):
                         return await self._turn(response_id)
+                    runtime = response.dossier.get("_conversation_runtime", {})
+                    if runtime.get("chat_turn_id"):
+                        from huddleroom.services.orchestration_chat_interpretation import publish_goal_interpretation
+                        answer = await publish_goal_interpretation(db, runtime["chat_turn_id"], answer, message, reservation, usage)
                     now = _utcnow()
                     response.status, response.answer, response.finished_at = (
                         "completed",
@@ -669,6 +690,10 @@ class OrchestrationConversationService:
                             "settled", usage, reservation.reserved_tokens - usage
                         )
                         reservation.settled_at = reservation.released_at = now
+                    chat_turn_id = (response.dossier.get("_conversation_runtime") or {}).get("chat_turn_id")
+                    if chat_turn_id:
+                        from huddleroom.services.orchestration_chat_interpretation import sync_goal_chat_provider
+                        await sync_goal_chat_provider(db, chat_turn_id, response, message)
                     return ConversationTurn(
                         message=message, response=response
                     )
@@ -905,7 +930,7 @@ class OrchestrationConversationService:
     @staticmethod
     def _steering_allowed(response: ConversationResponse) -> bool:
         runtime = response.dossier.get("_conversation_runtime") if isinstance(response.dossier, dict) else None
-        return isinstance(runtime, dict) and runtime.get("steering_enabled") is True
+        return isinstance(runtime, dict) and not runtime.get("chat_turn_id") and runtime.get("steering_enabled") is True
 
     @staticmethod
     def _completion_tokens(steering_allowed: bool) -> int:

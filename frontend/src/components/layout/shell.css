@@ -175,3 +175,20 @@
     animation: none !important;
   }
 }
+
+/* One mounted rail preserves the conversation, draft and Calls selection. */
+@media (max-width: 1279px) {
+  .agent-activity-panel-container.agent-activity-panel-open {
+    display: block !important;
+    position: fixed;
+    top: 72px;
+    bottom: 72px;
+    right: 12px;
+    width: min(440px, calc(100vw - 24px));
+    z-index: 40;
+    overflow-y: auto;
+    background: var(--huddleroom-bg);
+    border: 1px solid var(--huddleroom-text);
+    border-radius: 8px;
+  }
+}

@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import timedelta
+from huddleroom.models.base import _utcnow
 from typing import Any, Mapping
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,25 +118,57 @@ class OrchestrationProjectAdvisorService:
         self._completion_fn = get_orchestration_completion(completion_fn)
 
     async def ask(
-        self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str
+        self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str,
+        *, chat_turn_id: uuid.UUID | None = None,
     ) -> ProjectAdvisorTurn:
         question = question.strip() if isinstance(question, str) else ""
         if not question:
             raise ConversationDomainError("invalid_content", 422, "Question is required")
 
         limit = settings.orchestration_advisor_allowance_tokens
+        if chat_turn_id is not None:
+            from huddleroom.models.orchestration_chat import ProjectChatTurn
+            chat = await db.get(ProjectChatTurn, chat_turn_id)
+            if chat is not None and await db.get(ProjectAdvisorTurn, chat.source_record_id) is not None:
+                lock = _finite_advisor_locks.setdefault((project_id, actor_id), asyncio.Lock())
+                async with lock:
+                    return await self._ask(db, project_id, actor_id, question, limit, chat_turn_id)
         if limit == 0:
             raise ConversationDomainError("advisor_disabled", 409, "Project advisor is disabled")
 
-        if limit > 0:
+        if limit > 0 or chat_turn_id is not None:
             lock = _finite_advisor_locks.setdefault((project_id, actor_id), asyncio.Lock())
             async with lock:
-                return await self._ask(db, project_id, actor_id, question, limit)
-        return await self._ask(db, project_id, actor_id, question, limit)
+                return await self._ask(db, project_id, actor_id, question, limit, chat_turn_id)
+        return await self._ask(db, project_id, actor_id, question, limit, chat_turn_id)
 
     async def _ask(
-        self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str, limit: int
+        self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str, limit: int,
+        chat_turn_id: uuid.UUID | None = None,
     ) -> ProjectAdvisorTurn:
+        chat = None
+        source = None
+        if chat_turn_id is not None:
+            from huddleroom.models.orchestration_chat import ProjectChatTurn
+            chat = await db.get(ProjectChatTurn, chat_turn_id)
+            if chat is None or (chat.project_id, chat.actor_id, chat.content, chat.context_goal_id) != (project_id, actor_id, question, None):
+                raise ConversationDomainError("chat_context_mismatch", 409, "Frozen conversation context does not match")
+            source = await db.get(ProjectAdvisorTurn, chat.source_record_id)
+            if source is not None:
+                if (source.project_id, source.actor_id, source.question) != (project_id, actor_id, question):
+                    raise ConversationDomainError("chat_source_mismatch", 409, "Conversation source does not match")
+                chat.accounting_snapshot = {**(chat.accounting_snapshot or {}),
+                    "scope": "project_advisor", "tokens_observed": source.tokens_used,
+                    "unknown_usage": source.tokens_used is None}
+                if source.status == "completed":
+                    if not chat.interpretation:
+                        chat.interpretation = {"intent": "question", "answer": source.answer}
+                    chat.answer, chat.provider_status = source.answer, "completed"
+                    chat.source_references = [{"kind": "project_advisor", "id": str(source.id)}]
+                else:
+                    chat.provider_status = "interrupted_unknown"
+                await db.commit()
+                return source
         if limit > 0:
             used = await advisor_allowance_used(db, project_id, actor_id)
             if used is None or used >= limit:
@@ -149,6 +183,9 @@ class OrchestrationProjectAdvisorService:
             if project is not None else None
         )
 
+        if chat is not None:
+            from huddleroom.services.orchestration_chat_interpretation import INTERPRETATION_POLICY, project_followups
+            context["project_history"] = await project_followups(db, chat)
         system_text = orchestrator_preamble(project=project_dict) + "\n\n" + _RESPONSE_INSTRUCTIONS
         messages = [
             {"role": "system", "content": system_text},
@@ -159,6 +196,8 @@ class OrchestrationProjectAdvisorService:
                 ),
             },
         ]
+        if chat is not None:
+            messages[0]["content"] += "\nThe answer field must contain a JSON string interpretation. " + INTERPRETATION_POLICY
         request = {
             "model": self.model,
             "messages": messages,
@@ -166,11 +205,36 @@ class OrchestrationProjectAdvisorService:
             "temperature": 0,
         }
 
+        if chat is not None:
+            source = ProjectAdvisorTurn(id=chat.source_record_id, project_id=project_id, actor_id=actor_id,
+                                        question=question, status="pending", citations=[], off_topic=False)
+            db.add(source)
+            chat.provider_status = "running"
+            chat.deadline_at = _utcnow() + timedelta(seconds=120)
+            await db.commit()
         usage_holder = {"tokens": 0, "unknown": False, "started": 0, "observed": 0}
+        if chat is not None:
+            request["max_tokens"] = 800
+            request["litellm_call_id"] = chat.provider_request_id
 
         async def _counted_completion(**completion_request: Any) -> Any:
+            if chat is not None:
+                pending = await db.scalar(select(ProjectAdvisorTurn.id).where(
+                    ProjectAdvisorTurn.project_id == project_id, ProjectAdvisorTurn.actor_id == actor_id,
+                    ProjectAdvisorTurn.status == "pending", ProjectAdvisorTurn.id != source.id).limit(1))
+                if pending is not None:
+                    raise ConversationDomainError("advisor_allowance_exhausted", 429, "Project advisor has an unresolved provider claim")
+            if limit > 0:
+                persisted = await advisor_allowance_used(db, project_id, actor_id)
+                if persisted is None or usage_holder["unknown"] or persisted + usage_holder["tokens"] + (len(json.dumps(completion_request, default=str).encode("utf-8")) + 800 if chat is not None else 1) > limit:
+                    raise ConversationDomainError("advisor_allowance_exhausted", 429, "Project advisor allowance is exhausted")
             usage_holder["started"] += 1
-            return await self._completion_fn(**completion_request)
+            if chat is not None:
+                chat.accounting_snapshot = {"scope": "project_advisor", "limit_tokens": limit,
+                    "calls_admitted": usage_holder["started"], "tokens_observed": usage_holder["tokens"],
+                    "unknown_usage": usage_holder["unknown"]}
+                await db.commit()
+            return await asyncio.wait_for(self._completion_fn(**completion_request), timeout=120)
 
         def _observe(response: Any) -> None:
             usage_holder["observed"] += 1
@@ -193,28 +257,53 @@ class OrchestrationProjectAdvisorService:
                 response_observer=_observe,
             )
         except asyncio.CancelledError:
+            if chat is not None:
+                chat.provider_status = "interrupted_unknown"
+                chat.accounting_snapshot = {**(chat.accounting_snapshot or {}),
+                    "tokens_observed": usage_holder["tokens"], "unknown_usage": _tokens_used() is None}
             await self._persist_failed_turn(
                 db, project_id, actor_id, question,
                 _tokens_used(),
-                "cancelled",
+                "cancelled", source=source,
             )
             raise
         except Exception as exc:
             error_text = redact_secrets(" ".join(str(exc).split()))
             if len(error_text) > _MAX_ERROR_LEN:
                 error_text = error_text[: _MAX_ERROR_LEN - 3] + "..."
+            if chat is not None:
+                chat.provider_status = "interrupted_unknown"
+                chat.accounting_snapshot = {**(chat.accounting_snapshot or {}),
+                    "tokens_observed": usage_holder["tokens"], "unknown_usage": _tokens_used() is None}
             await self._persist_failed_turn(
                 db, project_id, actor_id, question,
                 _tokens_used(),
-                error_text,
+                error_text, source=source,
             )
             raise
 
-        turn = ProjectAdvisorTurn(
+        interpretation = None
+        if chat is not None:
+            from huddleroom.services.orchestration_chat_interpretation import parse_chat_interpretation
+            interpretation = parse_chat_interpretation(parsed["answer"], question)
+            if parsed["off_topic"]:
+                from huddleroom.schemas.orchestration_chat import ChatInterpretation
+                interpretation = ChatInterpretation(intent="question", answer=interpretation.answer or "Please ask about this project.")
+            parsed["answer"] = interpretation.answer or interpretation.clarification or "Action prepared for validation."
+            chat.interpretation = interpretation.model_dump(mode="json")
+            chat.provider_status = "completed"
+            chat.source_kind = "project_advisor"
+            chat.source_references = [{"kind": "project_advisor", "id": str(source.id)}]
+            chat.accounting_snapshot = {**(chat.accounting_snapshot or {}), "tokens_observed": usage_holder["tokens"],
+                                        "unknown_usage": _tokens_used() is None}
+        turn = source or ProjectAdvisorTurn(
             project_id=project_id, actor_id=actor_id, question=question,
             answer=parsed["answer"], citations=parsed["citations"], off_topic=parsed["off_topic"],
             tokens_used=_tokens_used(), status="completed",
         )
+        if source is not None:
+            turn.answer, turn.citations, turn.off_topic = parsed["answer"], parsed["citations"], parsed["off_topic"]
+            turn.tokens_used, turn.status = _tokens_used(), "completed"
         db.add(turn)
         await db.commit()
         await db.refresh(turn)
@@ -223,9 +312,12 @@ class OrchestrationProjectAdvisorService:
     @staticmethod
     async def _persist_failed_turn(
         db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str,
-        tokens_used: int | None, error: str,
+        tokens_used: int | None, error: str, source: ProjectAdvisorTurn | None = None,
     ) -> None:
-        db.add(ProjectAdvisorTurn(
+        if source is not None:
+            source.answer, source.citations, source.off_topic = None, [], False
+            source.tokens_used, source.status, source.error = tokens_used, "failed", error
+        db.add(source or ProjectAdvisorTurn(
             project_id=project_id, actor_id=actor_id, question=question,
             answer=None, citations=[], off_topic=False, tokens_used=tokens_used,
             status="failed", error=error,

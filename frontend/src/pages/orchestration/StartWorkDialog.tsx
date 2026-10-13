@@ -72,6 +72,7 @@ function blockedText(authorization: OrchestrationAuthorization | null, missingRe
 
 interface StartWorkDialogProps {
   open: boolean
+  targetSummary?: string
   goal: OrchestrationGoal
   authorization: OrchestrationAuthorization | null
   missingRecurringPolicy: boolean
@@ -85,7 +86,7 @@ interface StartWorkDialogProps {
 }
 
 export function StartWorkDialog({
-  open, goal, authorization, missingRecurringPolicy, isPending, error, onOpenChange, onConfirm, restartReason, onCloseAutoFocus,
+  open, goal, targetSummary, authorization, missingRecurringPolicy, isPending, error, onOpenChange, onConfirm, restartReason, onCloseAutoFocus,
 }: StartWorkDialogProps) {
   const confirmFocusIntent = useRef(false)
   const primaryRef = useRef<HTMLButtonElement>(null)
@@ -118,6 +119,7 @@ export function StartWorkDialog({
         primaryDisabled: blocked !== null,
       }}
     >
+      {targetSummary && <p className="mb-4 break-words text-sm">{targetSummary}</p>}
       {blocked && <Callout variant="warning" className="mb-4">{blocked}</Callout>}
       <Record
         keyWidth={120}

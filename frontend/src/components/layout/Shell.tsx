@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Link, Outlet } from 'react-router-dom'
+import { Link, Outlet, useLocation } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Toaster } from 'sonner'
 import { Sidebar } from './Sidebar'
@@ -22,6 +22,14 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
   const menuButtonRef = useRef<HTMLButtonElement>(null)
   const stripRef = useRef<HTMLButtonElement>(null)
   const [overlayOpen, setOverlayOpen] = useState(false)
+  const [chatFocusRequest, setChatFocusRequest] = useState(0)
+  const location = useLocation()
+  const contextGoalId = location.pathname.match(/^\/orchestration\/([^/]+)$/)?.[1] ?? null
+  useEffect(() => {
+    const openChat = () => { setOverlayOpen(true); setChatFocusRequest((value) => value + 1) }
+    window.addEventListener?.('orchestration-open-chat', openChat)
+    return () => window.removeEventListener?.('orchestration-open-chat', openChat)
+  }, [])
 
   const activeProjectId = useUIStore((s) => s.activeProjectId)
   const sidebarCollapsed = useUIStore((s) => s.sidebarCollapsed)
@@ -65,7 +73,7 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && !e.defaultPrevented) {
+      if (e.key === 'Escape' && !e.defaultPrevented && !document.querySelector?.('[role="dialog"], [role="alertdialog"]')) {
         if (overlayOpen) {
           setOverlayOpen(false)
           stripRef.current?.focus()
@@ -191,8 +199,8 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
           </main>
 
           {/* Rail (Ask|Calls tabs): persistent at >=1280px (always visible), strip+overlay below 1280px */}
-          <div className="agent-activity-panel-container">
-            {activeProjectId && <ProjectRail projectId={activeProjectId} />}
+          <div className={`agent-activity-panel-container${overlayOpen ? ' agent-activity-panel-open' : ''}`}>
+            {activeProjectId && <ProjectRail key={activeProjectId} projectId={activeProjectId} contextGoalId={contextGoalId} focusRequest={chatFocusRequest} />}
           </div>
         </div>
 
@@ -209,11 +217,7 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
           </button>
         </div>
 
-        {overlayOpen && (
-          <div className="agent-activity-overlay">
-            {activeProjectId && <ProjectRail projectId={activeProjectId} />}
-          </div>
-        )}
+
       </div>
     </div>
       <Toaster

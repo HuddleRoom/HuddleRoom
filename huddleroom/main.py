@@ -30,6 +30,7 @@ from huddleroom.routers import (
     optimizations,
     orchestration,
     orchestration_advisor,
+    orchestration_chat,
     orchestration_decisions,
     orchestration_goals,
     orchestration_memory,
@@ -367,6 +368,7 @@ def create_app() -> FastAPI:
         prefix="/api/v1/projects/{project_id}/orchestration",
         tags=["orchestration"],
     )
+    app.include_router(orchestration_chat.router, prefix="/api/v1/projects/{project_id}/orchestration", tags=["orchestration"])
     app.include_router(
         orchestration_advisor.router,
         prefix="/api/v1/projects/{project_id}/orchestration",

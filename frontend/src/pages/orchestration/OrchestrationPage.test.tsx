@@ -585,7 +585,8 @@ describe('OrchestrationPage', () => {
     const markup = renderToStaticMarkup(<OrchestrationPage />)
 
     expect(markup).toContain('No orchestration run is attached to this goal.')
-    expect(markup).toContain('Conversation')
+    expect(markup).toContain('Open conversation')
+    expect(markup).not.toContain('textarea')
     expect(markup).toContain('data-testid="baseline-dashboard"')
     expect(markup).toContain('data-run-id="none"')
     expect(markup).toContain('Ship an evidence-backed release')

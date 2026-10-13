@@ -1236,3 +1236,24 @@ export interface OrchestrationGoalCreateInput {
   budget?: Record<string, unknown>
   goal_type?: OrchestrationGoalTypeSelection
 }
+
+export interface ProjectChatAction {
+ action_id: string; operation: string; project_id: string; goal_id: string; run_id: string | null
+ target_id: string | null; frozen_versions: Record<string, string | number | null>; payload: Record<string, unknown>
+ summary: string; status: string; requires_confirmation: boolean
+}
+export interface ProjectChatReceipt {
+ action_id: string; operation: string; project_id: string; goal_id: string; run_id: string | null
+ status: string; message: string; error_code: string | null
+}
+export interface ProjectChatTurn {
+ id: string; content: string; answer: string | null; status: string; created_at: string
+ context_goal_id: string | null; historical: boolean
+ source_references: { kind: string; id: string; goal_id: string | null }[]
+ citations: ProjectAdvisorCitation[]; error: Record<string, unknown> | null
+ goal_turn: OrchestrationConversationTurn | null; actions: ProjectChatAction[]; receipts: ProjectChatReceipt[]
+}
+export interface ProjectChatHistory {
+ items: ProjectChatTurn[]; total: number; omitted: number; allowance: ProjectAdvisorAllowance
+ goal_allowances: Record<string, OrchestrationConversationAllowance>; steering: Record<string, OrchestrationSteeringLedger>
+}

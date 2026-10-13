@@ -62,7 +62,35 @@ import {
   useStepOrchestrationBaseline,
   useOrchestrationGoal,
   useBaselineDashboard,
+  fetchProjectChat,
+  submitProjectChat,
+  projectChatKey,
+  useSubmitProjectChat,
 } from './orchestration'
+
+describe('unified project conversation', () => {
+  it('keeps one project query key across navigation and posts explicit typed action binding', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(okJson({ items: [], actions: [], receipts: [] })))
+    vi.stubGlobal('fetch', fetchMock)
+    await fetchProjectChat('project-1')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/projects/project-1/orchestration/chat')
+    await submitProjectChat('project-1', { clientRequestId: 'request-1', content: 'yes', contextGoalId: 'goal-alpha', actionId: 'action-alpha' })
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ client_request_id: 'request-1', content: 'yes', context_goal_id: 'goal-alpha', action_id: 'action-alpha' })
+    expect(projectChatKey('project-1')).toEqual(['project-chat', 'project-1'])
+  })
+
+  it('refreshes unified history and affected goal state after an action without retrying mutation', async () => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries } as never)
+    const mutation = useSubmitProjectChat('project-1') as unknown as {
+      retry: boolean; onSuccess: (data: unknown, input: unknown) => Promise<void>
+    }
+    expect(mutation.retry).toBe(false)
+    await mutation.onSuccess({}, { contextGoalId: 'goal-alpha' })
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: projectChatKey('project-1') })
+    expect(invalidateQueries.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+})
 
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),

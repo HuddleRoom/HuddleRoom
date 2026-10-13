@@ -2,6 +2,7 @@ import React from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   descendants,
+  getButton,
   mountWithTestDom,
   textOf,
 } from '../../../tests/support/dom'
@@ -42,6 +43,7 @@ vi.mock('react-router-dom', () => ({
     <a href={to}>{children}</a>
   ),
   Outlet: () => null,
+  useLocation: () => ({ pathname: '/orchestration/goal-1', hash: '', search: '' }),
 }))
 
 vi.mock('sonner', () => ({
@@ -106,6 +108,28 @@ const project: Project = {
   created_at: '2026-07-29T00:00:00Z',
   updated_at: '2026-07-29T00:00:00Z',
 }
+
+describe('Shell unified responsive rail', () => {
+  it('keeps one composer and sticky Calls selection when the same rail opens and closes', async () => {
+    projectState.projects = [{ ...project, workspace_path: '/mock/workspace' }]
+    projectState.isSuccess = true
+    const { Shell } = await import('./Shell')
+    const view = await mountWithTestDom(() => <Shell />, React.act)
+    try {
+      const rails = () => descendants(view.container).filter((node) => node.getAttribute('class')?.split(' ').includes('agent-activity-panel-container'))
+      expect(rails()).toHaveLength(1)
+      expect(descendants(view.container).filter((node) => node.tagName === 'TEXTAREA')).toHaveLength(1)
+      await React.act(async () => getButton(view.container, 'Calls').click())
+      await React.act(async () => getButton(view.container, 'Activity').click())
+      expect(rails()).toHaveLength(1)
+      expect(rails()[0].getAttribute('class')).toContain('agent-activity-panel-open')
+      await React.act(async () => getButton(view.container, 'Activity').click())
+      expect(rails()[0].getAttribute('class')).not.toContain('agent-activity-panel-open')
+      expect(getButton(view.container, 'Calls').getAttribute('aria-selected')).toBe('true')
+      expect(descendants(view.container).filter((node) => node.tagName === 'TEXTAREA')).toHaveLength(1)
+    } finally { view.cleanup() }
+  })
+})
 
 describe('Shell workspace warning', () => {
   beforeEach(() => {

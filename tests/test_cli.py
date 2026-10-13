@@ -581,6 +581,16 @@ def test_onecli_wrapped_serve_validates_then_migrates_without_rewrapping(monkeyp
     assert validated.onecli_management_url == onecli.resolve_management_url(configured)
 
 
+def _migration_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    import huddleroom.cli as cli
+
+    migration_config = Config(str(cli._migration_config_path()))
+    migration_config.set_main_option("script_location", str(cli._migration_config_path().parent / "alembic"))
+    return ScriptDirectory.from_config(migration_config).get_current_head()
+
+
 def test_run_migrations_upgrades_an_old_database_without_losing_sentinel(tmp_path, monkeypatch):
     from alembic import command
     from alembic.config import Config
@@ -602,7 +612,7 @@ def test_run_migrations_upgrades_an_old_database_without_losing_sentinel(tmp_pat
 
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve me",)
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("049",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (_migration_head(),)
 
 
 def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
@@ -627,7 +637,7 @@ def test_concurrent_first_migrations_leave_a_usable_database(tmp_path):
 
     assert 0 in results
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("049",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (_migration_head(),)
         assert connection.execute("SELECT value FROM sentinel").fetchone() == ("preserve me",)
     for returncode, output in zip(results, outcomes):
         if returncode:

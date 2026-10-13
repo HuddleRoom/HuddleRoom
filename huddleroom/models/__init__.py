@@ -54,3 +54,5 @@ from huddleroom.models.orchestration_process import (  # noqa: F401
     OrchestrationProcessRun,
     OrchestrationWarning,
 )
+
+from huddleroom.models.orchestration_chat import ProjectChatTurn  # noqa: F401

@@ -7793,11 +7793,12 @@ class OrchestrationService:
         goal_id: uuid.UUID,
         *,
         actor: str,
+        commit: bool = True,
     ) -> tuple[OrchestrationGoal, OrchestrationRun]:
         """Explicit human authorization of spend + execution (spec: Start work).
         Idempotent. The scheduler never executes a run whose phase != authorized."""
         transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = (
+        caller_owns_transaction = not commit or (
             transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
         )
         async with self._lock_goal_for_baseline_transition(db, goal_id):
@@ -7931,9 +7932,11 @@ class OrchestrationService:
         db: AsyncSession,
         project_id: uuid.UUID,
         goal_id: uuid.UUID,
+        *,
+        commit: bool = True,
     ) -> tuple[OrchestrationGoal, OrchestrationRun | None]:
         transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+        caller_owns_transaction = not commit or transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
         async with self._lock_goal_for_baseline_transition(db, goal_id):
             goal = await self.get_goal(db, project_id, goal_id)
             if goal is None:
@@ -7980,9 +7983,10 @@ class OrchestrationService:
         goal_id: uuid.UUID,
         *,
         cancelled_by: str = "human:anonymous",
+        commit: bool = True,
     ) -> tuple[OrchestrationGoal, OrchestrationRun | None]:
         transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = (
+        caller_owns_transaction = not commit or (
             transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
         )
         async with self._lock_goal_for_baseline_transition(db, goal_id):

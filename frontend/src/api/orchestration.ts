@@ -898,3 +898,26 @@ export function useDismissOrchestrationSteeringProposal(projectId: string | null
     onSuccess: (_data, { goalId }) => invalidateConversation(queryClient, projectId, goalId),
   })
 }
+
+export const projectChatKey = (projectId: string | null) => ['project-chat', projectId] as const
+export interface ProjectChatSubmitInput {
+ clientRequestId: string; content: string; contextGoalId?: string | null; actionId?: string | null
+}
+export function fetchProjectChat(projectId: string) {
+ return apiFetch<import('@/lib/types').ProjectChatHistory>(`/api/v1/projects/${projectId}/orchestration/chat`)
+}
+export function submitProjectChat(projectId: string, input: ProjectChatSubmitInput) {
+ return apiFetch<import('@/lib/types').ProjectChatTurn>(`/api/v1/projects/${projectId}/orchestration/chat`, {
+ method: 'POST', body: JSON.stringify({ client_request_id: input.clientRequestId, content: input.content,
+ context_goal_id: input.contextGoalId ?? null, action_id: input.actionId ?? null }),
+ })
+}
+export function useProjectChat(projectId: string | null) {
+ return useQuery({ queryKey: projectChatKey(projectId), queryFn: () => fetchProjectChat(projectId!), enabled: !!projectId, refetchInterval: 5000 })
+}
+export function useSubmitProjectChat(projectId: string | null) {
+ const qc = useQueryClient()
+ return useMutation({ mutationFn: (input: ProjectChatSubmitInput) => submitProjectChat(projectId!, input), retry: false,
+ onSuccess: async () => { await Promise.all([qc.invalidateQueries({ queryKey: projectChatKey(projectId) }),
+ qc.invalidateQueries({ queryKey: ['orchestration-goal', projectId] }), qc.invalidateQueries({ queryKey: ['orchestration-goals', projectId] })]) } })
+}
