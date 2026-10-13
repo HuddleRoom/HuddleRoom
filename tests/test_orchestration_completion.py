@@ -234,7 +234,7 @@ async def test_claude_gateway_preflights_auth_and_normalizes_native_envelope(mon
 
     assert calls[0][0][-2:] == ("auth", "status")
     argv, stdin = next((argv, stdin) for argv, stdin in calls if "--print" in argv)
-    assert {"--print", "--output-format", "json", "--no-session-persistence"} <= set(argv)
+    assert {"--print", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--no-session-persistence", "--safe-mode", "--permission-prompts", "none", "--tools", ""} <= set(argv)
     assert "--model" not in argv
     assert "--effort" not in argv
     assert b"hello" in stdin
@@ -1410,3 +1410,64 @@ async def test_invalid_cli_model_is_unsupported_at_argv_build(monkeypatch, tmp_p
 
     assert error.value.kind == orchestration_completion.OrchestrationBackendErrorKind.UNSUPPORTED
     assert all("-x" not in argv for argv, _stdin in calls)
+
+
+@pytest.mark.asyncio
+async def test_cli_runner_delivers_observation_before_process_exit(monkeypatch):
+    from huddleroom.services import orchestration_completion as module
+    observed = asyncio.Event()
+    process = _GrowingCliProcess(stdout_chunks=[
+        b'{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"live"}}\n'
+    ])
+    async def create(*_args, **_kwargs):
+        return process
+    async def observer(stream, text):
+        assert (stream, text) == ("output", "live")
+        assert process.returncode is None
+        observed.set()
+    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", create)
+    task = asyncio.create_task(module._run(("codex",), None, backend="codex", observer=observer))
+    try:
+        await asyncio.wait_for(observed.wait(), 1)
+        assert not task.done()
+        process.returncode = 0
+        process._released.set()
+        stdout, stderr = await task
+        assert '"text":"live"' in stdout and stderr == ""
+    finally:
+        process._released.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cli_failure_escaped_password_detail_is_safe(monkeypatch, tmp_path):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion as module
+    monkeypatch.setattr(settings, "orchestration_backend", "claude")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    stderr = (json.dumps({"password": 'correct " horse battery'}) + "\n").encode()
+    _install_fake_cli(monkeypatch, module, "claude", tmp_path / "claude", lambda argv:
+        b'{"loggedIn":true}' if argv[-2:] == ("auth", "status") else {"stderr": stderr, "returncode": 1})
+    with pytest.raises(module.OrchestrationBackendError) as error:
+        await module.orchestration_completion(messages=[])
+    assert error.value.kind == module.OrchestrationBackendErrorKind.EXIT
+    assert not any(word in str(error.value) for word in ("correct", "horse", "battery"))
+
+
+@pytest.mark.asyncio
+async def test_api_nonstream_message_observation_redacts_escaped_password_before_sink(monkeypatch):
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_completion as module
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(settings, "orchestration_effort", None)
+    content = json.dumps({"password": 'correct " horse battery'})
+    response = {"choices": [{"message": {"content": content}}]}
+    async def api(**_request):
+        return response
+    updates = []
+    async def observer(stream, text):
+        updates.append((stream, text))
+    monkeypatch.setattr(module.litellm, "acompletion", api)
+    assert await module.orchestration_completion(messages=[], observer=observer) is response
+    assert updates and content == response["choices"][0]["message"]["content"]
+    assert not any(word in str(updates) for word in ("correct", "horse", "battery"))

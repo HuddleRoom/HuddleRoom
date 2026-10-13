@@ -64,11 +64,11 @@ def test_request_is_source_minimized_verbatim_and_bounded():
             },
         ]
     )
-    assert display.content == {"question": "Deploy?", "token": "secret-value"}
+    assert display.content == {"question": "Deploy?", "token": "[REDACTED]"}
     assert not display.truncated
     assert extract_request_display(
         [{"role": "user", "content": '{"token":"plaintext"}'}]
-    ).content == {"token": "plaintext"}
+    ).content == {"token": "[REDACTED]"}
     assert extract_request_display([{"role": "user", "content": "[1, 2]"}]).content == [
         1,
         2,
@@ -98,7 +98,7 @@ async def test_verbatim_tools_terminal_and_lossless_output():
     output = [event for event in events if event.event_type == "agent_response.output"]
     assert (
         "".join(event.payload["text"] for event in output)
-        == "prefix-sk-plaintext\ntoken=secret-value\n" + "🙂" * 5000
+        == "prefix-sk-plaintext\ntoken=[REDACTED]\n" + "🙂" * 5000
     )
     assert all(len(event.payload["text"].encode()) <= 16 * 1024 for event in output)
     tool = next(
@@ -110,15 +110,15 @@ async def test_verbatim_tools_terminal_and_lossless_output():
     assert tool.payload == {
         "name": "tool",
         "outcome": "ok",
-        "result": {"authorization": "Bearer plaintext"},
+        "result": {"authorization": "[REDACTED]"},
         "truncated": False,
     }
     assert (
-        terminal.payload["error"] == "token=secret-value"
+        terminal.payload["error"] == "token=[REDACTED]"
         and not terminal.payload["error_truncated"]
     )
     assert (
-        terminal.payload["metadata"] == {"token": "plaintext"}
+        terminal.payload["metadata"] == {"token": "[REDACTED]"}
         and not terminal.payload["metadata_truncated"]
     )
 
@@ -550,7 +550,7 @@ async def test_tool_continuation_emits_verbatim_tool_events(stream_monitors, mon
     assert starts[1].parent_call_id == starts[0].call_id
     assert starts[1].payload["request_display"] == {"kind": "continuation", "content": None, "truncated": False}
     assert tool_started.payload["arguments"] == '{"query":"plaintext"}'
-    assert tool_finished.payload["result"] == '{"token":"plaintext"}'
+    assert tool_finished.payload["result"] == '{"token":"[REDACTED]"}'
 
 
 @pytest.mark.asyncio
@@ -828,3 +828,139 @@ async def test_orchestration_analyzers_use_reserved_context_only_with_a_project_
     )
     await OrchestrationDecisionAdapter(completion_fn=AsyncMock()).decide({}, project={"id": "not-a-uuid"})
     assert "invocation" not in calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_final_snapshot_preserves_shape_and_redacts_only_display(stream_monitors):
+    secret = "sk-" + "Ab9" * 16
+    response = {"choices": [{"message": {"content": {"nested": [None, {"text": "<script>" + secret}]},
+        "tool_calls": [{"id": "t", "function": {"name": "observe", "arguments": "{}"}}]}}],
+        "usage": {"total_tokens": 7}}
+    async def completion(**_request):
+        return response
+    events = []
+    call = AgentResponseInvocation(context(), publish=publisher(events)).call(messages=[{"role": "user", "content": secret}])
+    async with call:
+        assert await call.complete(completion, {}) is response
+    snapshot = events[-1].payload["final_response"]
+    assert snapshot["content"]["nested"][0] is None
+    assert "<script>" in snapshot["content"]["nested"][1]["text"]
+    assert secret not in str([e.payload for e in events])
+    assert secret in str(response)
+    assert snapshot["usage"] == {"total_tokens": 7}
+    assert snapshot["tool_count"] == 1
+    assert not snapshot["content_truncated"]
+
+
+@pytest.mark.asyncio
+async def test_final_snapshot_caps_each_field_without_changing_result(stream_monitors):
+    response = {"choices": [{"message": {"content": "🙂" * 5000,
+        "tool_calls": [{"function": {"name": "tool", "arguments": "x" * 20000}}]}}],
+        "usage": {"detail": "u" * 3000}}
+    async def completion(**_request):
+        return response
+    events = []
+    call = AgentResponseInvocation(context(), publish=publisher(events)).call(messages=[])
+    async with call:
+        assert await call.complete(completion, {}) is response
+    snapshot = events[-1].payload["final_response"]
+    for field, cap in (("content", 16384), ("tool_calls", 16384), ("usage", 2048)):
+        assert snapshot[field + "_truncated"]
+        assert len(str(snapshot[field]).encode()) <= cap
+    assert snapshot["text_present"] and snapshot["tool_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["output", "reasoning", "stderr"])
+@pytest.mark.parametrize("fragments", [
+    ("token", "=privatevalue", "\npublic"),
+    ("sk-", "Ab9" * 16, "\npublic"),
+    ('{"api_key": "', "privatevalue", '"}\npublic'),
+    ("Bearer ", "Ab9" * 16, "\npublic"),
+    ("token=", "Ab9" * 10000, "\npublic"),
+])
+async def test_fragmented_credentials_never_reach_wire_across_deadline(stream_monitors, stream, fragments):
+    events = []
+    call = AgentResponseInvocation(context(), publish=publisher(events)).call(messages=[])
+    async with call:
+        for fragment in fragments:
+            await call.output(stream, fragment)
+            await asyncio.sleep(0.12)
+            display = str([event.payload for event in events])
+            assert "privatevalue" not in display and "Ab9" not in display
+    output = "".join(event.payload["text"] for event in events if event.event_type == "agent_response.output")
+    assert "public" in output
+    assert "[REDACTED]" in output
+    assert len(output.encode()) < 16384
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["output", "reasoning", "stderr"])
+@pytest.mark.parametrize("fragments", [
+    ['{"password":"correct horse', ' battery staple"}'],
+    ['{"password":"correct\\" horse', ' battery staple"}'],
+    ['{"password":"' + "correct horse " * 2000, ' battery staple"}'],
+])
+async def test_quoted_password_whitespace_split_never_leaks_on_deadline(stream_monitors, stream, fragments):
+    events = []
+    call = AgentResponseInvocation(context(), publish=publisher(events)).call(messages=[])
+    async with call:
+        for fragment in fragments:
+            await call.output(stream, fragment)
+            await asyncio.sleep(0.12)
+            assert not any(word in str([event.payload for event in events]) for word in ("correct", "horse", "battery", "staple"))
+    assert not any(word in str([event.payload for event in events]) for word in ("correct", "horse", "battery", "staple"))
+    assert "[REDACTED]" in str([event.payload for event in events])
+
+
+@pytest.mark.asyncio
+async def test_repair_observer_is_live_and_each_attempt_is_distinct(stream_monitors):
+    import json
+    from huddleroom.services.llm_structured_repair import complete_with_repair
+    events, requests = [], []
+    observed, release = asyncio.Event(), asyncio.Event()
+    async def publish(event):
+        events.append(event)
+        if event.event_type == "agent_response.output":
+            observed.set()
+    async def provider(*, observer=None, **request):
+        requests.append(request)
+        text = "invalid" if len(requests) == 1 else '{"answer":"fixed"}'
+        await observer("output", text + "\n")
+        if len(requests) == 1:
+            await release.wait()
+        return {"choices": [{"message": {"content": text}}]}
+    invocation = AgentResponseInvocation(context(), publish=publish)
+    task = asyncio.create_task(complete_with_repair(provider, {"messages": [{"role": "user", "content": "go"}]}, json.loads,
+                                                   invocation=invocation, max_attempts=2))
+    try:
+        await asyncio.wait_for(observed.wait(), 1)
+        assert not task.done()
+        assert not any(event.event_type == "agent_response.terminal" for event in events)
+        release.set()
+        assert await task == {"answer": "fixed"}
+        starts = [event for event in events if event.event_type == "agent_response.started"]
+        terminals = [event for event in events if event.event_type == "agent_response.terminal"]
+        assert len(starts) == len(terminals) == len(requests) == 2
+        assert starts[0].call_id != starts[1].call_id and starts[1].parent_call_id == starts[0].call_id
+        assert all("observer" not in request for request in requests)
+        assert [event.payload["final_response"]["content"] for event in terminals] == ["invalid", '{"answer":"fixed"}']
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_observation_truncation_marker_is_sent_once_on_next_existing_payload(stream_monitors):
+    from huddleroom.services.agent_response_stream import mark_observation_truncated
+    events = []
+    call = AgentResponseInvocation(context(), publish=publisher(events)).call(messages=[])
+    async with call:
+        mark_observation_truncated(call.output)
+        await call.output("output", "first\n")
+        await call.output("output", "second\n")
+    flagged = [event for event in events if event.payload.get("observation_truncated") is True]
+    assert len(flagged) == 1
+    assert flagged[0].event_type == "agent_response.output"
+    assert flagged[0].payload["text"] == "first\n"
+    assert call.observation_truncated is True

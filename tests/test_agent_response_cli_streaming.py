@@ -1029,3 +1029,77 @@ def test_parse_jsonl_final_codex_returns_last_agent_message_only():
         '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\": true}"}}\n'
     )
     assert parse_jsonl_final(raw, "codex") == ('{"ok": true}', "t1")
+
+
+# SPR189: native 2.1.296 stream_event records, distinct from full assistant envelopes.
+def test_claude_partial_records_utf8_and_full_message_are_not_duplicated():
+    import json
+    decoder = decoder_for_runtime("claude_code")
+    records = [
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"id": "msg_live"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "Hello 🙂"}}},
+        {"type": "stream_event", "event": {"type": "content_block_delta", "index": 1,
+            "delta": {"type": "thinking_delta", "thinking": "considering"}}},
+        {"type": "assistant", "message": {"id": "msg_live", "content": [
+            {"type": "text", "text": "Hello 🙂"}]}},
+        {"type": "assistant", "message": {"id": "msg_live", "content": [
+            {"type": "thinking", "thinking": "considering"}]}},
+        {"type": "result", "result": "authoritative"},
+    ]
+    raw = ("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n").encode()
+    updates = []
+    before_full = ("\n".join(json.dumps(record, ensure_ascii=False) for record in records[:3]) + "\n").encode()
+    for byte in before_full:
+        updates.extend(decoder.feed_stdout(bytes([byte])))
+    assert [(u.kind, u.text) for u in updates] == [("output", "Hello 🙂"), ("reasoning", "considering")]
+    updates.extend(decoder.feed_stdout(raw[len(before_full):]))
+    assert [(u.kind, u.text) for u in updates] == [("output", "Hello 🙂"), ("reasoning", "considering")]
+    assert decoder.finish(raw, b"").content == "authoritative"
+
+
+def test_claude_full_thinking_uses_native_thinking_field_and_unknown_records_are_inert():
+    decoder = decoder_for_runtime("claude_code")
+    raw = b'{"type":"assistant","message":{"id":"m","content":[{"type":"thinking","thinking":"native thought"}]}}\n'
+    updates = decoder.feed_stdout(raw + b'{"type":"unknown","text":"do not render"}\nnot-json\n')
+    assert [(u.kind, u.text) for u in updates] == [("reasoning", "native thought")]
+
+
+@pytest.mark.parametrize("second_text", ["Hello again", "Hello"])
+def test_claude_dedup_is_block_identity_not_substring_or_identical_text(second_text):
+    import json
+    decoder = decoder_for_runtime("claude_code")
+    def stream(event):
+        return {"type": "stream_event", "event": event}
+    def full(text):
+        return {"type": "assistant", "message": {"id": "msg_blocks", "content": [{"type": "text", "text": text}]}}
+    records = [
+        stream({"type": "message_start", "message": {"id": "msg_blocks"}}),
+        stream({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        stream({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}),
+        full("Hello"),
+        stream({"type": "content_block_stop", "index": 0}),
+        stream({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        full(second_text),
+        stream({"type": "content_block_stop", "index": 1}),
+    ]
+    updates = decoder.feed_stdout(("\n".join(json.dumps(record) for record in records) + "\n").encode())
+    assert [(u.kind, u.text) for u in updates] == [("output", "Hello"), ("output", second_text)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", ["claude_code", "codex"])
+async def test_native_stderr_escaped_credential_is_redacted_before_transport(stream_monitors, runtime):
+    import json
+    events = []
+    call = AgentResponseInvocation(context(), publish=publisher(events)).call(messages=[])
+    decoder = decoder_for_runtime(runtime)
+    raw = (json.dumps({"password": 'correct " horse battery'}) + "\n").encode()
+    async with call:
+        for byte in raw:
+            for update in decoder.feed_stderr(bytes([byte])):
+                assert not any(word in (update.text or "") for word in ("correct", "horse", "battery"))
+                await call.output(update.kind, update.text or "")
+    display = str([event.payload for event in events])
+    assert not any(word in display for word in ("correct", "horse", "battery"))
+    assert "[REDACTED]" in display

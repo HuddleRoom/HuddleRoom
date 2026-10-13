@@ -348,3 +348,145 @@ async def test_mutation_guard_rejects_unsupported_transaction_shapes_before_effe
     assert entered == []
     assert not lock_tracer.of("agent:write")
     assert (await fresh_agent(sessions, seeded.agent_id)).description == original
+
+
+async def test_observations_cross_empty_context_and_stop_immediately_on_reset(db_session):
+    from contextvars import ContextVar
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    sentinel = ContextVar("spr189_sentinel", default=None)
+    release, seen, ended = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    records = []
+    async def provider(*, observer=None):
+        assert runtime._current.get() is None and sentinel.get() is None
+        await observer("output", "live\n")
+        await release.wait()
+        await observer("output", "discarded\n")
+        ended.set()
+        raise RuntimeError("late error must be drained")
+    async def observer(stream, text):
+        assert runtime._current.get() is not None and sentinel.get() == "parent"
+        records.append((stream, text))
+        seen.set()
+    goal_id = uuid.uuid4()
+    async def action():
+        token = sentinel.set("parent")
+        try:
+            async with runtime.baseline_operation(db_session, goal_id, owns_transaction=False):
+                await runtime.await_baseline_completion(provider, {}, observer=observer)
+        finally:
+            sentinel.reset(token)
+    task = asyncio.create_task(action())
+    try:
+        await asyncio.wait_for(seen.wait(), 1)
+        await asyncio.wait_for(runtime.interrupt_baseline(goal_id), 1)
+        with pytest.raises(HTTPException):
+            await task
+        assert not release.is_set()
+        release.set()
+        await asyncio.wait_for(ended.wait(), 1)
+        await asyncio.sleep(0)
+        assert records == [("output", "live\n")]
+        assert goal_id not in runtime._active
+        assert not runtime._detached
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_observer_is_not_forwarded_to_unadvertised_injected_completion(db_session):
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    received = []
+    async def provider(**request):
+        received.append(request)
+        return "final"
+    async def observer(*_args):
+        pytest.fail("nonobservable completion emitted an update")
+    async with runtime.baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+        assert await runtime.await_baseline_completion(provider, {"messages": []}, observer=observer) == "final"
+    assert received == [{"messages": []}]
+
+
+async def test_observation_queue_overflow_drops_display_without_blocking_final(db_session, monkeypatch):
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    async def no_reset(_project):
+        await asyncio.Event().wait()
+    monkeypatch.setattr("huddleroom.services.agent_response_relay.register_project_reset_monitor",
+                        AsyncMock(return_value=SimpleNamespace(generation=None)))
+    monkeypatch.setattr("huddleroom.services.agent_response_relay.unregister_project_reset_monitor", AsyncMock())
+    monkeypatch.setattr("huddleroom.services.agent_response_stream.wait_for_project_reset", no_reset)
+    records = []
+    async def publish(event):
+        records.append(event)
+    final = {"choices": [{"message": {"content": "authoritative"}}]}
+    async def provider(*, observer=None):
+        # No await that yields between observations: maxsize32 must cut off rather than block.
+        for index in range(100):
+            await observer("output", str(index) + "\n")
+        return final
+    invocation = AgentResponseInvocation(
+        InvocationContext(uuid.uuid4(), "system", "test", None, "api", "test", "model"), publish=publish)
+    call = invocation.call(messages=[])
+    async with call:
+        async with runtime.baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+            assert await asyncio.wait_for(runtime.await_baseline_completion(provider, {}, observer=call.output), 1) is final
+    outputs = [event for event in records if event.event_type == "agent_response.output"]
+    assert 0 < len(outputs) <= 32
+    assert all(len(event.payload["text"].encode()) <= 16384 for event in outputs)
+    terminal = [event for event in records if event.event_type == "agent_response.terminal"]
+    assert len(terminal) == 1
+    assert sum(event.payload.get("observation_truncated") is True for event in records) == 1
+    assert "99\n" not in "".join(event.payload["text"] for event in outputs)
+
+
+async def test_default_api_iteration_and_reconstruction_are_provider_owned(db_session, monkeypatch):
+    from contextvars import ContextVar
+    from types import SimpleNamespace
+    from huddleroom.config import settings
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    from huddleroom.services import orchestration_completion as completion
+    sentinel = ContextVar("spr189_api_parent", default=None)
+    first_seen, release = asyncio.Event(), asyncio.Event()
+    final = {"choices": [{"message": {"content": "live"}}], "usage": {"total_tokens": 11}}
+    chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="live\n", reasoning_content="think\n"))])
+    async def chunks():
+        assert runtime._current.get() is None and sentinel.get() is None
+        yield chunk
+        await release.wait()
+    async def api(**request):
+        assert request["stream"] is True
+        assert "observer" not in request
+        assert runtime._current.get() is None and sentinel.get() is None
+        return chunks()
+    def build(items, **_kwargs):
+        assert runtime._current.get() is None and sentinel.get() is None
+        assert items == [chunk]
+        return final
+    monkeypatch.setattr(settings, "orchestration_backend", "api")
+    monkeypatch.setattr(completion.litellm, "acompletion", api)
+    monkeypatch.setattr(completion.litellm, "stream_chunk_builder", build)
+    updates = []
+    async def observe(stream, text):
+        assert sentinel.get() == "parent" and runtime._current.get() is not None
+        updates.append((stream, text))
+        first_seen.set()
+    async def action():
+        token = sentinel.set("parent")
+        try:
+            async with runtime.baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+                return await runtime.await_baseline_completion(completion.orchestration_completion,
+                    {"messages": []}, observer=observe)
+        finally:
+            sentinel.reset(token)
+    task = asyncio.create_task(action())
+    try:
+        await asyncio.wait_for(first_seen.wait(), 1)
+        assert not task.done()
+        release.set()
+        assert await task is final
+        assert updates == [("output", "live\n"), ("reasoning", "think\n")]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

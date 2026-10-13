@@ -10,8 +10,6 @@ from typing import Any, Literal
 
 from pydantic import JsonValue
 
-from huddleroom.services.secret_redaction import redact_secrets
-
 logger = logging.getLogger(__name__)
 
 
@@ -84,13 +82,19 @@ class CliStreamDecoder:
     """Incremental decoder for CLI output with runtime-specific parsing."""
 
     def __init__(self, runtime: str):
+        from huddleroom.services.agent_response_stream import DisplayTextBuffer
         self.runtime = runtime
+        self._stderr_display = DisplayTextBuffer()
         # Separate incremental decoders for stdout and stderr
         self.stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         self.stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         # Line buffer for parsing
         self.stdout_buffer = ""
         self.stderr_buffer = ""
+        self._claude_message_id: str | None = None
+        self._claude_partial_blocks: dict[int, tuple[str | None, int]] = {}
+        self._claude_seen_uuids: set[str] = set()
+        self._codex_items: set[str] = set()
 
     def feed_stdout(self, chunk: bytes) -> list[CliDisplayUpdate]:
         """Process stdout chunk and return any readable updates."""
@@ -142,7 +146,9 @@ class CliStreamDecoder:
 
         for line in lines[:-1]:
             if line:
-                updates.append(CliDisplayUpdate(kind="stderr", text=redact_secrets(line)))
+                safe = self._stderr_display.feed("stderr", line + "\n")
+                if safe:
+                    updates.append(CliDisplayUpdate(kind="stderr", text=safe.rstrip("\n")))
         return updates
 
     def _parse_claude_json_line(self, line: str) -> list[CliDisplayUpdate]:
@@ -154,19 +160,77 @@ class CliStreamDecoder:
             # Malformed line: keep for final parsing, emit no live update
             return []
 
+        if not isinstance(data, dict):
+            return []
         msg_type = data.get("type")
+
+        if msg_type == "stream_event":
+            event = data.get("event")
+            if not isinstance(event, dict):
+                return []
+            if event.get("type") == "message_start":
+                message = event.get("message")
+                self._claude_message_id = message.get("id") if isinstance(message, dict) else None
+                self._claude_partial_blocks.clear()
+            elif event.get("type") == "content_block_start":
+                block = event.get("content_block", {})
+                block_type = block.get("type") if isinstance(block, dict) else None
+                kind = "output" if block_type == "text" else "reasoning" if block_type == "thinking" else None
+                self._claude_partial_blocks[event.get("index", 0)] = (kind, 0)
+                if len(self._claude_partial_blocks) > 128:
+                    self._claude_partial_blocks.pop(next(iter(self._claude_partial_blocks)))
+            elif event.get("type") == "content_block_delta":
+                delta = event.get("delta")
+                if not isinstance(delta, dict):
+                    return []
+                kind, text = (
+                    ("output", delta.get("text")) if delta.get("type") == "text_delta"
+                    else ("reasoning", delta.get("thinking")) if delta.get("type") == "thinking_delta"
+                    else (None, None)
+                )
+                if kind and isinstance(text, str) and text:
+                    index = event.get("index", 0)
+                    _, count = self._claude_partial_blocks.get(index, (kind, 0))
+                    self._claude_partial_blocks[index] = (kind, count + len(text))
+                    if len(self._claude_partial_blocks) > 128:
+                        self._claude_partial_blocks.pop(next(iter(self._claude_partial_blocks)))
+                    updates.append(CliDisplayUpdate(kind=kind, text=text))
+            return updates
 
         if msg_type == "assistant":
             # Extract text from message content
             message = data.get("message", {})
+            if not isinstance(message, dict):
+                return []
+            message_id = message.get("id")
+            record_id = data.get("uuid")
+            if isinstance(record_id, str):
+                if record_id in self._claude_seen_uuids:
+                    return []
+                if len(self._claude_seen_uuids) >= 128:
+                    self._claude_seen_uuids.clear()
+                self._claude_seen_uuids.add(record_id)
             content = message.get("content", [])
+            if not isinstance(content, list):
+                return []
             for block in content:
+                if not isinstance(block, dict):
+                    continue
                 block_type = block.get("type")
-                text = block.get("text")
-                if block_type == "text" and text:
-                    updates.append(CliDisplayUpdate(kind="output", text=text))
-                elif block_type == "thinking" and text:
-                    updates.append(CliDisplayUpdate(kind="reasoning", text=text))
+                kind = "output" if block_type == "text" else "reasoning" if block_type == "thinking" else None
+                text = (block.get("thinking") or block.get("text")) if kind == "reasoning" else block.get("text")
+                if kind and isinstance(text, str) and text:
+                    # SDK full AssistantMessages are per-block envelopes without
+                    # an index. Consume their streamed counterparts in block order;
+                    # text equality never identifies a distinct block.
+                    if message_id == self._claude_message_id:
+                        index = next((index for index, (channel, _) in sorted(self._claude_partial_blocks.items())
+                                      if channel == kind), None)
+                        if index is not None:
+                            _, count = self._claude_partial_blocks.pop(index)
+                            text = text[count:]
+                    if text:
+                        updates.append(CliDisplayUpdate(kind=kind, text=text))
 
         elif msg_type == "tool_use":
             # Tool invocation: tool_started
@@ -217,6 +281,15 @@ class CliStreamDecoder:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(record, dict):
+                continue
+            if self.runtime == "codex" and record.get("type") == "item.completed":
+                item = record.get("item")
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if item_id and item_id in self._codex_items:
+                    continue
+                if item_id:
+                    self._codex_items.add(item_id)
             text = _json_live_text(record, self.runtime)
             if text:
                 updates.append(CliDisplayUpdate(kind="output", text=text))
@@ -230,7 +303,9 @@ class CliStreamDecoder:
 
         for line in lines[:-1]:
             if line:
-                updates.append(CliDisplayUpdate(kind="stderr", text=redact_secrets(line)))
+                safe = self._stderr_display.feed("stderr", line + "\n")
+                if safe:
+                    updates.append(CliDisplayUpdate(kind="stderr", text=safe.rstrip("\n")))
         return updates
 
     def finish(self, stdout: bytes, stderr: bytes) -> DecodedCliOutput:
@@ -247,7 +322,8 @@ class CliStreamDecoder:
         else:
             # Plain runtimes: use decoded stdout and include stderr for diagnostics
             stdout_text = stdout.decode("utf-8", errors="ignore")
-            stderr_text = redact_secrets(stderr.decode("utf-8", errors="ignore"))
+            from huddleroom.services.agent_response_stream import DisplayTextBuffer
+            stderr_text = DisplayTextBuffer().feed("stderr", stderr.decode("utf-8", errors="ignore"), final=True)
             content = stdout_text
             if stderr_text:
                 if content:

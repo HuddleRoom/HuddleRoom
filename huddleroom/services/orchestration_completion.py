@@ -15,7 +15,8 @@ from uuid import uuid4
 import litellm
 
 from huddleroom.config import Settings, settings, validate_cli_model
-from huddleroom.services.cli_streaming import _json_session_id, _jsonl_records, terminate_process_group
+from huddleroom.services.cli_streaming import _json_session_id, _jsonl_records, terminate_process_group, decoder_for_runtime
+from huddleroom.services.agent_response_stream import CompletionObserver, AgentResponseCall, DisplayTextBuffer
 from huddleroom.services.llm_debug_logging import log_orchestration_exchange
 from huddleroom.services.secret_redaction import redact_secrets
 
@@ -80,7 +81,7 @@ def orchestration_runtime_metadata(completion_fn: CompletionFn, api_model: str, 
     return "cli_main", f"{config.orchestration_backend} CLI ({config.orchestration_cli_model or 'configured CLI default'})"
 
 
-async def orchestration_completion(**request: Any) -> Any:
+async def orchestration_completion(*, observer: CompletionObserver | None = None, **request: Any) -> Any:
     backend = settings.orchestration_backend
     if backend == "api":
         model = request.get("model") or settings.orchestration_model
@@ -94,7 +95,9 @@ async def orchestration_completion(**request: Any) -> Any:
         if settings.orchestration_effort is not None:
             request = {key: value for key, value in request.items() if key != "temperature"}
             request["reasoning_effort"] = settings.orchestration_effort
-        return await litellm.acompletion(**request)
+        if observer is None:
+            return await litellm.acompletion(**request)
+        return await _observed_api_completion(request, observer)
     if backend not in {"claude", "codex"}:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNSUPPORTED, "Unknown orchestration backend.")
     executable = _executable(backend)
@@ -103,12 +106,67 @@ async def orchestration_completion(**request: Any) -> Any:
     meta = {"exchange_id": uuid4().hex, "backend": backend, "model": settings.orchestration_cli_model, "effort": settings.orchestration_effort, "session_id": None}
     log_orchestration_exchange("request", request=request, **meta)
     try:
-        result = await _complete_cli(executable, backend, request, meta)
+        if observer is None:
+            result = await _complete_cli(executable, backend, request, meta)
+        else:
+            result = await _complete_cli(executable, backend, request, meta, observer=observer)
     except BaseException as error:
         log_orchestration_exchange("failure", error=error, **meta)
         raise
     log_orchestration_exchange("response", response=result, **meta)
     return result
+
+
+async def _observed_api_completion(request: dict[str, Any], observer: CompletionObserver) -> Any:
+    """Iterate in the provider context and return authoritative LiteLLM data."""
+    seen = False
+    display = DisplayTextBuffer()
+    try:
+        stream = await litellm.acompletion(**{**request, "stream": True})
+        if not hasattr(stream, "__aiter__"):
+            await _observe_message(stream, observer)
+            return stream
+        chunks = []
+        async for chunk in stream:
+            seen = True
+            chunks.append(chunk)
+            choices = getattr(chunk, "choices", None)
+            delta = choices[0].delta if choices else None
+            for channel, text in (
+                ("output", getattr(delta, "content", None)),
+                ("reasoning", getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)),
+            ):
+                if isinstance(text, str) and text:
+                    safe = display.feed(channel, text)
+                    if safe:
+                        await observer(channel, safe)
+        for channel in ("output", "reasoning"):
+            safe = display.feed(channel, "", final=True)
+            if safe:
+                await observer(channel, safe)
+        response = litellm.stream_chunk_builder(chunks, messages=list(request.get("messages", [])))
+        if response is None:
+            raise RuntimeError("LiteLLM could not reconstruct streamed completion")
+        return response
+    except BaseException as error:
+        # Preserve the existing physical fallback boundary: AgentResponseCall
+        # owns it and must never fallback after any provider chunk was seen.
+        if seen and AgentResponseCall._streaming_unsupported(error):
+            raise RuntimeError("Provider stream failed after output began") from error
+        raise
+
+
+async def _observe_message(response: Any, observer: CompletionObserver) -> None:
+    def field(value, key, default=None):
+        return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+    choices = field(response, "choices", []) or []
+    message = field(choices[0], "message") if choices else None
+    for channel, text in (
+        ("output", field(message, "content")),
+        ("reasoning", field(message, "reasoning_content") or field(message, "reasoning")),
+    ):
+        if isinstance(text, str) and text:
+            await observer(channel, DisplayTextBuffer().feed(channel, text, final=True))
 
 
 def _executable(backend: str) -> str:
@@ -132,20 +190,21 @@ async def _authenticate(executable: str, backend: str) -> None:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.UNAUTHENTICATED, f"The {backend} CLI is not signed in. Sign in, rerun setup, or select API via LiteLLM.")
 
 
-async def _complete_cli(executable: str, backend: str, request: dict[str, Any], meta: dict[str, Any] | None = None) -> dict[str, Any]:
+async def _complete_cli(executable: str, backend: str, request: dict[str, Any], meta: dict[str, Any] | None = None, *, observer: CompletionObserver | None = None) -> dict[str, Any]:
     schema = _schema(request.get("tools"))
     prompt = "Return only the required JSON envelope for this request:\n" + json.dumps({key: request[key] for key in ("messages", "tools", "tool_choice", "response_format") if key in request}, default=str)
     if len(prompt.encode()) + len(json.dumps(schema).encode()) > _MAX_OUTPUT:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.MALFORMED_OUTPUT, "CLI request exceeded the allowed size.")
     with tempfile.TemporaryDirectory(prefix="huddleroom-orchestration-") as directory:
         if backend == "claude":
-            command = [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema), "--no-session-persistence", "--safe-mode", "--permission-prompts", "none", "--tools", ""]
+            command = [executable, "--print", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--json-schema", json.dumps(schema), "--no-session-persistence", "--safe-mode", "--permission-prompts", "none", "--tools", ""]
             if model := _cli_model():
                 command.extend(("--model", model))
             if settings.orchestration_effort is not None:
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("--effort", settings.orchestration_effort))
-            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), backend=backend)
+            observation = {"observer": observer} if observer is not None else {}
+            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), backend=backend, **observation)
             if meta is not None:
                 meta["session_id"] = _cli_session_id(backend, stdout)
             envelope, usage = _claude_result(stdout)
@@ -160,7 +219,8 @@ async def _complete_cli(executable: str, backend: str, request: dict[str, Any], 
                 _validate_cli_effort(settings.orchestration_effort)
                 command.extend(("-c", f"model_reasoning_effort={settings.orchestration_effort}"))
             command.append("-")
-            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), artifact_path=result_path, backend=backend)
+            observation = {"observer": observer} if observer is not None else {}
+            stdout, _ = await _run(tuple(command), prompt, cwd=directory, timeout=_timeout(request), artifact_path=result_path, backend=backend, **observation)
             if meta is not None:
                 meta["session_id"] = _cli_session_id(backend, stdout)
             try:
@@ -187,7 +247,7 @@ def strip_native_auth_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k not in _PROTECTED_ENV_KEYS and not k.endswith("_BASE_URL")}
 
 
-async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None = None, timeout: float = _TIMEOUT, artifact_path: Path | None = None, backend: str | None = None) -> tuple[str, str]:
+async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None = None, timeout: float = _TIMEOUT, artifact_path: Path | None = None, backend: str | None = None, observer: CompletionObserver | None = None) -> tuple[str, str]:
     proc = None
     tasks: list[asyncio.Task[Any]] = []
     environment = dict(os.environ)
@@ -201,12 +261,29 @@ async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None =
     environment = {k: v for k, v in environment.items() if not k.startswith(("HUDDLEROOM_", "RALLY_"))}
     try:
         proc = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd, env=environment, start_new_session=True)
-        async def read(stream: Any) -> bytes:
+        decoder = decoder_for_runtime(runtime) if observer is not None and runtime else None
+        display = DisplayTextBuffer()
+        async def emit(updates):
+            for update in updates:
+                if update.kind in {"output", "reasoning", "stderr"} and update.text:
+                    safe = display.feed(update.kind, update.text)
+                    if safe:
+                        await observer(update.kind, safe)
+        async def read(stream: Any, feed=None) -> bytes:
             output = bytearray()
             while chunk := await stream.read(65536):
                 output.extend(chunk)
                 if len(output) > _MAX_OUTPUT:
                     raise OverflowError
+                if feed is not None:
+                    await emit(feed(chunk))
+            if feed is not None:
+                await emit(feed(b"\n"))
+                channels = ("stderr",) if stream is proc.stderr else ("output", "reasoning")
+                for channel in channels:
+                    safe = display.feed(channel, "", final=True)
+                    if safe:
+                        await observer(channel, safe)
             return bytes(output)
         async def write() -> None:
             if stdin is not None:
@@ -218,8 +295,8 @@ async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None =
                 if artifact_path is not None and artifact_path.exists() and artifact_path.stat().st_size > _MAX_OUTPUT:
                     raise OverflowError
                 await asyncio.sleep(0.01)
-        stdout_task = asyncio.create_task(read(proc.stdout))
-        stderr_task = asyncio.create_task(read(proc.stderr))
+        stdout_task = asyncio.create_task(read(proc.stdout, decoder.feed_stdout if decoder else None))
+        stderr_task = asyncio.create_task(read(proc.stderr, decoder.feed_stderr if decoder else None))
         tasks = [stdout_task, stderr_task, asyncio.create_task(write()), asyncio.create_task(proc.wait()), asyncio.create_task(monitor())]
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
         stdout, stderr = stdout_task.result(), stderr_task.result()
@@ -254,7 +331,8 @@ async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None =
         await terminate_process_group(proc)
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.MALFORMED_OUTPUT, "CLI output exceeded the allowed size.")
     if proc.returncode:
-        detail = " ".join(redact_secrets(stderr.decode(errors="replace")).split())[-300:]
+        safe_stderr = DisplayTextBuffer().feed("stderr", stderr.decode(errors="replace"), final=True)
+        detail = " ".join(safe_stderr.split())[-300:]
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.EXIT, f"CLI exited unsuccessfully (code {proc.returncode})." + (f" {detail}" if detail else ""))
     return stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
@@ -275,9 +353,9 @@ def _schema(tools: Any) -> dict[str, Any]:
 
 def _claude_result(raw: str) -> tuple[Any, dict[str, int] | None]:
     try:
-        result = json.loads(raw)
+        result = _claude_terminal_record(raw)
         envelope = result["structured_output"]
-    except (json.JSONDecodeError, KeyError, TypeError) as error:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, StopIteration) as error:
         raise OrchestrationBackendError(OrchestrationBackendErrorKind.MALFORMED_OUTPUT, "Claude returned no valid structured result.") from error
     usage = result.get("usage") if isinstance(result, dict) else None
     keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
@@ -288,10 +366,21 @@ def _claude_result(raw: str) -> tuple[Any, dict[str, int] | None]:
     return envelope, {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
 
 
+def _claude_terminal_record(raw: str) -> dict[str, Any]:
+    try:
+        record = json.loads(raw)
+        if isinstance(record, dict):
+            return record
+    except json.JSONDecodeError:
+        pass
+    records = _jsonl_records(raw)
+    return next(record for record in reversed(records) if record.get("type") == "result")
+
+
 def _cli_session_id(backend: str, stdout: str) -> str | None:
     try:
         if backend == "claude":
-            session_id = json.loads(stdout).get("session_id")
+            session_id = _claude_terminal_record(stdout).get("session_id")
             return session_id if isinstance(session_id, str) else None
         return next((session_id for record in _jsonl_records(stdout) if (session_id := _json_session_id(record, "codex"))), None)
     except Exception:

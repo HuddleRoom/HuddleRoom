@@ -75,9 +75,13 @@ async def reset_baseline(goal_id):
         if not _resetting[goal_id]:
             _resetting.pop(goal_id)
 
-async def await_baseline_completion(completion_fn, request):
+async def await_baseline_completion(completion_fn, request, *, observer=None):
+    from huddleroom.services.agent_response_stream import supports_observer, mark_observation_truncated, _prefix, DisplayTextBuffer
+    observable = observer is not None and supports_observer(completion_fn)
     operation = _current.get()
     if operation is None:
+        if observable:
+            return await completion_fn(**request, observer=observer)
         return await completion_fn(**request)
     if operation.interrupted.is_set():
         raise BaselineInterrupted()
@@ -95,22 +99,83 @@ async def await_baseline_completion(completion_fn, request):
             await operation.db.commit()
     # Provider-only task: application writes and streaming output stay in parent.
     values = {key: value for key, value in request.items() if key != "stream"}
-    provider = asyncio.create_task(completion_fn(**values), context=Context())
+    # The provider closure retains only bounded transport state, never the call
+    # or application context. Closing this conduit also releases queued records.
+    queue = asyncio.Queue(maxsize=32)
+    state = {"active": True, "truncated": False}
+    display = DisplayTextBuffer()
+    async def enqueue(stream, text, *, final=False):
+        if not state["active"] or state["truncated"] or (not text and not final):
+            return
+        part, cutoff = _prefix(display.feed(stream, text, final=final), 16 * 1024)
+        if not part:
+            return
+        try:
+            queue.put_nowait((stream, part))
+        except asyncio.QueueFull:
+            state["truncated"] = True
+        if cutoff:
+            state["truncated"] = True
+    async def drain():
+        while True:
+            stream, text = await queue.get()
+            try:
+                if state["active"] and not operation.interrupted.is_set():
+                    if state["truncated"]:
+                        mark_observation_truncated(observer)
+                    await observer(stream, text)
+            finally:
+                queue.task_done()
+    if observable:
+        values["observer"] = enqueue
+    observation_drain = asyncio.create_task(drain()) if observable else None
+    async def invoke_provider():
+        result = await completion_fn(**values)
+        if observable:
+            for channel in ("output", "reasoning", "stderr"):
+                await enqueue(channel, "", final=True)
+        return result
+    provider = asyncio.create_task(invoke_provider(), context=Context())
     _detached.add(provider)
     provider.add_done_callback(_drain, context=Context())
     signal = asyncio.create_task(operation.interrupted.wait())
     try:
-        await asyncio.wait({provider, signal}, return_when=asyncio.FIRST_COMPLETED)
+        waiting = {provider, signal}
+        if observation_drain:
+            waiting.add(observation_drain)
+        await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
         if operation.interrupted.is_set():
             raise BaselineInterrupted()
+        if observation_drain and observation_drain.done():
+            observation_drain.result()
         if operation.run_id is not None and await operation.db.scalar(
             select(OrchestrationRun.id).where(OrchestrationRun.id == operation.run_id)
         ) is None:
             raise BaselineInterrupted()
         if operation.interrupted.is_set():
             raise BaselineInterrupted()
+        if observation_drain:
+            joined = asyncio.create_task(queue.join())
+            try:
+                await asyncio.wait({joined, signal, observation_drain}, return_when=asyncio.FIRST_COMPLETED)
+                if operation.interrupted.is_set():
+                    raise BaselineInterrupted()
+                if observation_drain.done():
+                    observation_drain.result()
+                if state["truncated"]:
+                    mark_observation_truncated(observer)
+            finally:
+                joined.cancel()
+                await asyncio.gather(joined, return_exceptions=True)
         return provider.result()
     finally:
+        state["active"] = False
+        if observation_drain:
+            observation_drain.cancel()
+            await asyncio.gather(observation_drain, return_exceptions=True)
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
         signal.cancel()
         await asyncio.gather(signal, return_exceptions=True)
 

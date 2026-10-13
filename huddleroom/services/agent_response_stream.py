@@ -3,6 +3,8 @@
 
 import asyncio
 import json
+import inspect
+import re
 import logging
 from weakref import WeakKeyDictionary
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -13,6 +15,7 @@ from uuid import UUID, uuid4
 
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from huddleroom.services.secret_redaction import redact_secrets
 
 ActorKind = Literal["system", "agent"]
 InvocationKind = Literal["api", "cli_main", "cli_resume", "cli_meeting"]
@@ -20,6 +23,7 @@ OutputStream = Literal["output", "reasoning", "stderr"]
 TerminalStatus = Literal["completed", "failed", "cancelled", "timeout", "project_reset"]
 EventPublisher = Callable[["AgentResponseEvent"], Awaitable[None]]
 CompletionFn = Callable[..., Awaitable[Any]]
+CompletionObserver = Callable[[OutputStream, str], Awaitable[None]]
 logger = logging.getLogger(__name__)
 _ACTIVE_RESET_CALLS: WeakKeyDictionary[asyncio.AbstractEventLoop, set["AgentResponseCall"]] = WeakKeyDictionary()
 _CAP = 16 * 1024
@@ -45,6 +49,18 @@ class StartedPayload(StrictWireModel):
 class OutputPayload(StrictWireModel):
     stream: OutputStream
     text: str
+    observation_truncated: bool = False
+
+
+class FinalResponseSnapshot(StrictWireModel):
+    content: JsonValue | None = None
+    tool_calls: JsonValue | None = None
+    usage: JsonValue | None = None
+    content_truncated: bool = False
+    tool_calls_truncated: bool = False
+    usage_truncated: bool = False
+    tool_count: int = 0
+    text_present: bool = False
 
 
 class ToolStartedPayload(StrictWireModel):
@@ -66,6 +82,8 @@ class TerminalPayload(StrictWireModel):
     error_truncated: bool = False
     metadata: JsonValue | None = None
     metadata_truncated: bool = False
+    final_response: FinalResponseSnapshot | None = None
+    observation_truncated: bool = False
 
 
 class AgentResponseEvent(StrictWireModel):
@@ -99,6 +117,10 @@ class AgentResponseEvent(StrictWireModel):
             "agent_response.terminal": TerminalPayload,
         }[self.event_type]
         self.payload = model.model_validate(self.payload).model_dump(mode="json")
+        if not self.payload.get("observation_truncated"):
+            self.payload.pop("observation_truncated", None)
+        if self.payload.get("final_response") is None:
+            self.payload.pop("final_response", None)
         return self
 
 
@@ -134,11 +156,47 @@ def _prefix(text: str, limit: int) -> tuple[str, bool]:
 
 
 def _bounded(value: Any, limit: int) -> tuple[JsonValue | None, bool]:
-    normalized = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    normalized = json.loads(json.dumps(
+        value, ensure_ascii=False,
+        default=lambda item: item.model_dump(mode="json") if hasattr(item, "model_dump") else str(item),
+    ))
+    def safe_display(item):
+        if isinstance(item, str):
+            return redact_secrets(DisplayTextBuffer._quoted(item, True)[0])
+        if isinstance(item, list):
+            return [safe_display(child) for child in item]
+        if isinstance(item, dict):
+            return {
+                key: "[REDACTED]" if isinstance(child, str) and re.fullmatch(
+                    r"(?i)api[_-]?key|authorization|bearer|token|secret|password", key
+                ) else safe_display(child)
+                for key, child in item.items()
+            }
+        return item
+    normalized = safe_display(normalized)
     serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
     if len(serialized.encode("utf-8")) <= limit:
         return normalized, False
     return _prefix(serialized, limit)
+
+
+def supports_observer(completion_fn: CompletionFn) -> bool:
+    """Only explicitly advertised control-plane parameters receive observers."""
+    try:
+        parameter = inspect.signature(completion_fn).parameters.get("observer")
+        return parameter is not None and parameter.kind in {
+            inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+    except (TypeError, ValueError):
+        return False
+
+
+def mark_observation_truncated(observer: CompletionObserver | None) -> None:
+    owner = getattr(observer, "__self__", None)
+    if owner is not None and hasattr(owner, "observation_truncated") and not owner._closing:
+        owner.observation_truncated = True
 
 
 def extract_request_display(
@@ -232,6 +290,98 @@ async def clear_project_reset(project_id: UUID, generation: str) -> None:
     await clear(project_id, generation)
 
 
+class DisplayTextBuffer:
+    """Bounded credential tail using the existing secret redactor."""
+    def __init__(self):
+        self.pending = {channel: "" for channel in ("output", "reasoning", "stderr")}
+        self.suppress = {channel: False for channel in self.pending}
+        self.suppress_quote = {channel: None for channel in self.pending}
+        self.quote_escape = {channel: False for channel in self.pending}
+
+    @staticmethod
+    def _quoted(text: str, final: bool) -> tuple[str, str, str | None]:
+        """Redact whole quoted credentials, honoring escaped quote boundaries."""
+        pattern = r'''(?i)(["'])(?:api[_-]?key|authorization|bearer|token|secret|password)\1\s*:\s*(["'])'''
+        parts, cursor = [], 0
+        while match := re.search(pattern, text[cursor:]):
+            start, value_start = cursor + match.start(), cursor + match.end()
+            quote, escaped, end = match.group(2), False, value_start
+            while end < len(text):
+                char = text[end]
+                if char == quote and not escaped:
+                    break
+                escaped = not escaped if char == "\\" else False
+                end += 1
+            if end == len(text):
+                parts.append(text[cursor:start])
+                if final:
+                    parts.append(text[start:value_start] + "[REDACTED]")
+                    return "".join(parts), "", None
+                return "".join(parts), text[start:], quote
+            parts.append(text[cursor:value_start] + "[REDACTED]" + quote)
+            cursor = end + 1
+        parts.append(text[cursor:])
+        return "".join(parts), "", None
+
+    def feed(self, stream: OutputStream, text: str, *, final: bool = False) -> str:
+        """Withhold unfinished credential tokens across coalescing deadlines."""
+        if self.suppress[stream]:
+            quote = self.suppress_quote[stream]
+            if quote:
+                escaped, end_index = self.quote_escape[stream], None
+                for index, char in enumerate(text):
+                    if char == quote and not escaped:
+                        end_index = index
+                        break
+                    escaped = not escaped if char == "\\" else False
+                self.quote_escape[stream] = escaped
+            else:
+                end = re.search(r"[\s,;\"'&}\]\\]", text)
+                end_index = end.start() if end else None
+            if end_index is None:
+                return ""
+            text = text[end_index:]
+            self.suppress[stream] = False
+            self.suppress_quote[stream] = None
+        text = self.pending[stream] + text
+        self.pending[stream] = ""
+        text, quoted_pending, quote = self._quoted(text, final)
+        if quoted_pending:
+            self.pending[stream] = quoted_pending
+            if len(quoted_pending.encode()) > _CAP:
+                text += self._quoted(quoted_pending, True)[0]
+                self.pending[stream] = ""
+                self.suppress[stream] = True
+                self.suppress_quote[stream] = quote
+                self.quote_escape[stream] = (len(quoted_pending) - len(quoted_pending.rstrip("\\"))) % 2 == 1
+            return redact_secrets(text)
+        if final:
+            return redact_secrets(text)
+        candidate = re.search(
+            r"(?i)(?:\b(?:sk-(?:proj-|ant-)?|rk-(?:live|test)-|xai-|AIza)[^\s,;\"'&}\]\\]*|"
+            r"\bbearer\s+[^\s,;\"'&}\]\\]*|"
+            r"[\"'](?:api[_-]?key|authorization|bearer|token|secret|password)[\"']\s*:?[ \t]*[\"']?|"
+            r"[\"']?(?:api[_-]?key|authorization|bearer|token|secret|password)[\"']?\s*[:=]\s*"
+            r"(?:bearer\s+)?[\"']?[^\s,;\"'&}\]\\]*)$", text,
+        )
+        start = candidate.start() if candidate else None
+        tail = re.search(r"(?:^|[\s\"'{,:])([A-Za-z_-]+)$", text)
+        if start is None and tail:
+            word = tail.group(1).lower()
+            prefixes = ("sk-", "rk-live-", "rk-test-", "xai-", "aiza", "api_key", "api-key",
+                        "apikey", "authorization", "bearer", "token", "secret", "password")
+            if any(prefix.startswith(word) for prefix in prefixes):
+                start = tail.start(1)
+        if start is not None:
+            self.pending[stream] = text[start:]
+            text = text[:start]
+            if len(self.pending[stream].encode()) > _CAP:
+                text += redact_secrets(self.pending[stream])
+                self.pending[stream] = ""
+                self.suppress[stream] = True
+        return redact_secrets(text)
+
+
 class _OutputBuffer:
     def __init__(self, call: "AgentResponseCall"):
         self.call = call
@@ -244,6 +394,7 @@ class _OutputBuffer:
         self.timer_task: asyncio.Task[None] | None = None
         self.closed = False
         self._lock = asyncio.Lock()
+        self.display = DisplayTextBuffer()
 
     async def feed(self, stream: OutputStream, text: str | None) -> None:
         if not text:
@@ -251,7 +402,7 @@ class _OutputBuffer:
         async with self._lock:
             if self.closed:
                 return
-            self.buffers[stream] += text
+            self.buffers[stream] += self.display.feed(stream, text)
             if "\n" in text or len(self.buffers[stream].encode()) >= 4096:
                 await self._flush(stream)
             elif self.timer is None:
@@ -270,6 +421,8 @@ class _OutputBuffer:
             if self.timer:
                 self.timer.cancel()
                 self.timer = None
+            for channel in self.buffers:
+                self.buffers[channel] += self.display.feed(channel, "", final=True)
             await self._flush(allow_closing=True)
 
     async def flush(self, stream: OutputStream | None = None) -> None:
@@ -283,11 +436,13 @@ class _OutputBuffer:
         streams = (stream,) if stream else tuple(self.buffers)
         for channel in streams:
             text, self.buffers[channel] = self.buffers[channel], ""
+            text = redact_secrets(text)
             while text:
                 part, split = _prefix(text, _CAP)
                 await self.call._event(  # pylint: disable=protected-access
                     "agent_response.output",
-                    {"stream": channel, "text": part},
+                    {"stream": channel, "text": part,
+                     "observation_truncated": self.call.observation_truncated},
                     allow_closing=allow_closing,
                 )
                 text = text[len(part) :] if split else ""
@@ -357,6 +512,9 @@ class AgentResponseCall:
         self._reset_ack = None
         self._owner_task: asyncio.Task | None = None
         self.response_call: AgentResponseCall | None = None
+        self.final_response: FinalResponseSnapshot | None = None
+        self.observation_truncated = False
+        self._observation_marker_sent = False
 
     async def __aenter__(self):
         self.call_started_at = datetime.now(timezone.utc)
@@ -475,6 +633,11 @@ class AgentResponseCall:
         async with self._publish_lock:
             if self._closing and not allow_closing:
                 return
+            marker = event_type in {"agent_response.output", "agent_response.terminal"} and (
+                self.observation_truncated and not self._observation_marker_sent
+            )
+            if event_type in {"agent_response.output", "agent_response.terminal"}:
+                payload = {**payload, "observation_truncated": marker}
             event = AgentResponseEvent(
                 project_id=self.invocation.context.project_id,
                 call_id=self.call_id,
@@ -490,6 +653,8 @@ class AgentResponseCall:
                 payload=payload,
             )
             await self.invocation.publish(event)
+            if marker:
+                self._observation_marker_sent = True
             self.sequence += 1
 
     async def output(self, stream: OutputStream, text: str) -> None:
@@ -542,6 +707,8 @@ class AgentResponseCall:
                         "error_truncated": error_truncated,
                         "metadata": safe_metadata,
                         "metadata_truncated": metadata_truncated,
+                        "final_response": self.final_response.model_dump(mode="json") if self.final_response else None,
+                        "observation_truncated": self.observation_truncated,
                     },
                     allow_closing=True,
                 )
@@ -590,6 +757,11 @@ class AgentResponseCall:
     ) -> Any:
         provider_chunk_seen = False
         try:
+            if supports_observer(completion_fn):
+                response = await completion_fn(**dict(request), observer=self.output)
+                self._snapshot_response(response)
+                self.response_call = self
+                return response
             stream_request = dict(request)
             stream_request["stream"] = True
             stream = await completion_fn(**stream_request)
@@ -616,6 +788,7 @@ class AgentResponseCall:
             if response is None:
                 raise RuntimeError("LiteLLM could not reconstruct streamed completion")
             self.response_call = self
+            self._snapshot_response(response)
             return response
         except BaseException as exc:
             if not provider_chunk_seen and self._streaming_unsupported(exc):
@@ -685,6 +858,7 @@ class AgentResponseCall:
             return response
 
     async def _emit_response(self, response: Any) -> None:
+        self._snapshot_response(response)
         choices = (response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)) or []
         choice = choices[0] if choices else None
         message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
@@ -693,4 +867,24 @@ class AgentResponseCall:
                 "reasoning",
                 (message.get("reasoning_content") or message.get("reasoning")) if isinstance(message, dict) else (getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)),
             )
-            await self._output.feed("output", message.get("content") if isinstance(message, dict) else getattr(message, "content", None))
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+            if isinstance(content, str):
+                await self._output.feed("output", content)
+
+    def _snapshot_response(self, response: Any) -> None:
+        def field(value, key, default=None):
+            return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+        choices = field(response, "choices", []) or []
+        message = field(choices[0], "message") if choices else None
+        if message is None:
+            return
+        content, calls, usage = field(message, "content"), field(message, "tool_calls"), field(response, "usage")
+        safe_content, content_truncated = _bounded(content, _CAP)
+        safe_calls, calls_truncated = _bounded(calls, _CAP)
+        safe_usage, usage_truncated = _bounded(usage, _ERROR_CAP)
+        self.final_response = FinalResponseSnapshot(
+            content=safe_content, tool_calls=safe_calls, usage=safe_usage,
+            content_truncated=content_truncated, tool_calls_truncated=calls_truncated,
+            usage_truncated=usage_truncated, tool_count=len(calls) if isinstance(calls, (list, tuple)) else 0,
+            text_present=bool(content),
+        )
