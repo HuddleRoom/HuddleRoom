@@ -22,12 +22,21 @@ from huddleroom.services.orchestration_roadmap_service import parse_roadmap_item
 from huddleroom.services.orchestration_work_report import _DuplicateReportKey, _report_object
 
 INGESTION_SOURCE = "planning_output_ingestion"
+BUDGET_REQUIRED_CODE = "roadmap_child_budget_required"
+BUDGET_REQUIRED_MESSAGE = (
+    "This roadmap needs explicit budget limits before it can create child goals. "
+    "Create a new goal with limits for tokens, turns, or hours, then complete its review and Start work. "
+    "No child work has been created."
+)
 
 
 class PlanIngestionError(ValueError):
-    def __init__(self, reason: str, *, stale: bool = False):
+    def __init__(self, reason: str, *, stale: bool = False, code: str | None = None,
+                 diagnostics: list[str] | None = None):
         super().__init__(reason)
         self.reason, self.stale = reason, stale
+        self.code = code
+        self.diagnostics = diagnostics or []
 
 
 def plan_artifact_id(task_id, planning_version) -> uuid.UUID:
@@ -48,6 +57,12 @@ def parse_envelope(output: str | None, expected_kind: str, goal: Any) -> dict:
         raise PlanIngestionError("output must be exactly one JSON object") from exc
     if not isinstance(data, dict):
         raise PlanIngestionError("output must be exactly one JSON object")
+    budget_required = (
+        expected_kind == data.get("plan_kind") == "roadmap"
+        and isinstance(data.get("plan_items"), list)
+        and any(isinstance(item, dict) and item.get("unit_type") == "goal" for item in data["plan_items"])
+        and not parent_caps(goal)
+    )
     try:
         envelope = PLANNING_ENVELOPE_ADAPTER.validate_python(data)
     except ValidationError as exc:
@@ -55,7 +70,10 @@ def parse_envelope(output: str | None, expected_kind: str, goal: Any) -> dict:
             f"field {'.'.join(str(p) for p in e.get('loc', ())) or '<root>'}: {e.get('msg', 'invalid')}"
             for e in exc.errors()
         ]
-        raise PlanIngestionError("; ".join(errors[:3])) from exc
+        raise PlanIngestionError(
+            BUDGET_REQUIRED_MESSAGE if budget_required else "; ".join(errors[:3]),
+            code=BUDGET_REQUIRED_CODE if budget_required else None, diagnostics=errors,
+        ) from exc
     if envelope.plan_kind != expected_kind:
         raise PlanIngestionError(f"plan_kind '{envelope.plan_kind}' does not match expected '{expected_kind}'")
     items = [item.model_dump(mode="json") for item in envelope.plan_items]
@@ -69,7 +87,12 @@ def parse_envelope(output: str | None, expected_kind: str, goal: Any) -> dict:
             copies = service._plan_items_from_raw(items)
             service._validate_plan_criterion_links(goal, copies)
     except HTTPException as exc:
-        raise PlanIngestionError(str(exc.detail)) from exc
+        raise PlanIngestionError(
+            BUDGET_REQUIRED_MESSAGE if budget_required else str(exc.detail),
+            code=BUDGET_REQUIRED_CODE if budget_required else None, diagnostics=[str(exc.detail)],
+        ) from exc
+    if budget_required:
+        raise PlanIngestionError(BUDGET_REQUIRED_MESSAGE, code=BUDGET_REQUIRED_CODE)
     return {
         "schema_version": envelope.schema_version,
         "plan_kind": envelope.plan_kind,

@@ -65,6 +65,7 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
 from huddleroom.services.orchestration_plan_ingestion import (
+    BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
     INGESTION_SOURCE,
     PlanIngestionError,
     ingest,
@@ -831,6 +832,10 @@ class OrchestrationService:
         cannot see it.
         """
         from huddleroom.models.project import Project
+
+        current_run = await db.get(OrchestrationRun, run_id)
+        if current_run is not None:
+            self._require_roadmap_child_budget(current_run)
 
         def _orch_decide_ctx(project, goal):
             return (
@@ -2443,6 +2448,7 @@ class OrchestrationService:
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, action: OrchestrationAction,
         stored: dict, version: OrchestrationRoadmapVersion, extra_inputs: Sequence[str] = (),
     ) -> OrchestrationAction:
+        self._require_roadmap_child_budget(run)
         run_id = run.id
         state = self._json_object_or_empty(run.plan_state)
         project_id, agent, _ = await self._validate_delegation_targets(
@@ -6190,6 +6196,7 @@ class OrchestrationService:
             )
 
     async def _ensure_plan_revision_allowed(self, db: AsyncSession, run: OrchestrationRun) -> None:
+        self._require_roadmap_child_budget(run)
         await self._ensure_baseline_processes_ready(db, run.goal_id)
         pending = self._json_object_or_empty(self._json_object_or_empty(run.plan_state).get("pending_replan"))
         if pending:
@@ -6217,7 +6224,13 @@ class OrchestrationService:
         if gate_status == "failed":
             raise HTTPException(status_code=409, detail="Terminal plan cannot be revised for this run")
 
+    @staticmethod
+    def _require_roadmap_child_budget(run: OrchestrationRun) -> None:
+        if OrchestrationService._json_object_or_empty(run.plan_state).get("budget_required"):
+            raise HTTPException(status_code=409, detail=BUDGET_REQUIRED_CODE)
+
     async def _ensure_plan_request_allowed(self, db: AsyncSession, run: OrchestrationRun, check_readiness: bool = True) -> None:
+        self._require_roadmap_child_budget(run)
         if check_readiness:
             await self._ensure_baseline_processes_ready(db, run.goal_id)
         plan_state = OrchestrationService._json_object_or_empty(run.plan_state)
@@ -7089,13 +7102,82 @@ class OrchestrationService:
         if contract.work_function == PLAN_WORK_FUNCTION:
             kind = report_schema.get("plan_kind")
             schema = planning_envelope_report_schema(kind if kind in PLAN_KINDS else plan_kind_for(goal))
+            rules = [
+                "Planning rules:",
+                "Adoption: use only a supplied existing task ID from the same run, in one item only, with a "
+                "compatible work function and assignment. Every adopted item must have depends_on: []. "
+                "An adopted preliminary audit cannot become a future final review; create a separate final review item.",
+                "Dependencies: name only immediate necessary predecessors whose gates must be accepted. "
+                "Put artifact and report references in inputs/artifact_ids, not redundant transitive scheduling edges. "
+                "Pattern: adopted preliminary audit (no dependencies) → new implementation → new final review; "
+                "the final review depends only on implementation and reads the audit as input.",
+                "Do not implement the plan: this restriction applies to your planning assignment. Future child goals "
+                "own implementation plus verification of their delivered outcome under inherited parent constraints. "
+                "Every required candidate needs a named producer in the plan; do not make delivery children read_only "
+                "unless the requested outcome itself is read-only, and never relax actual parent restrictions.",
+                "The type-labelled field inventory below describes allowed fields, not values to copy or a demand "
+                "to populate every field. Omit optional/default fields when unused.",
+            ]
+            task_example = {
+                "id": "audit", "work_function": "investigation", "scope": "Inspect the current behavior.",
+                "deliverable": "Audit findings and evidence references.", "depends_on": [],
+                "why_runnable": "Initial discovery needs no predecessor.",
+            }
+            if schema["plan_kind"] == "roadmap":
+                from huddleroom.services.orchestration_budget_service import parent_caps
+
+                caps = parent_caps(goal)
+                rules.extend([
+                    "Roadmap adoption: unit_type: task and mutates_shared_state: false are required for adopted work.",
+                    "Task variant: require work_function, scope, deliverable; objective and goal_type must be null "
+                    "or absent; success_criteria, constraints, allocation must be empty or absent. Goal variant: "
+                    "require objective, success_criteria and complete nonzero allocation; work_function, scope, "
+                    "deliverable, agent_id must be null or absent. Shared inputs, evidence and priority are allowed.",
+                    "Staging: declare mutates_shared_state truthfully for the future work. A nonnull staging_boundary "
+                    "has {type: git_branch|git_worktree|transaction|draft, identifier: nonblank, reversible: true}. "
+                    "The local workspace adapter resolves only an existing active branch or registered worktree; "
+                    "schema validity does not establish adapter support. Never invent a path, branch, transaction "
+                    "or draft. Null is legal and requires the existing mutation-authority wait before execution.",
+                    "Measured parent caps: " + json.dumps(caps, sort_keys=True) + ". Child allocation must cover "
+                    "exactly every parent dimension, use finite nonnegative numbers with at least one positive "
+                    "amount, and summed child allocations must fit each parent cap and remaining capacity. "
+                    "Explicit measurable parent caps are required before creating child goals. Missing caps mean "
+                    "Budget required; do not invent limits or propose zero-only reservations. Zero/exhausted caps "
+                    "require the existing budget-exhaustion path.",
+                ])
+                task_example.pop("id")
+                task_example.update(item_key="audit", unit_type="task", title="Audit current behavior",
+                                    mutates_shared_state=False)
+                if caps and any(Decimal(amount) > 0 for amount in caps.values()):
+                    child_example = {
+                        "item_key": "delivery", "unit_type": "goal", "title": "Deliver bounded outcome",
+                        "objective": "Implement the bounded outcome and independently verify its delivered behavior.",
+                        "success_criteria": [{"key": "delivered", "description": "Implemented behavior has verification evidence."}],
+                        "allocation": {key: format(Decimal(amount) / 2, "f") for key, amount in caps.items()},
+                        "mutates_shared_state": True, "staging_boundary": None, "depends_on": [],
+                        "why_runnable": "Delivery starts after normal release and mutation authority are granted.",
+                    }
+                    rules.append("Valid goal example: " + json.dumps({
+                        "schema_version": 1, "plan_kind": "roadmap", "summary": "Bounded delivery with authority wait.",
+                        "plan_items": [child_example],
+                    }, sort_keys=True))
+            rules.append("Valid task example: " + json.dumps({
+                "schema_version": 1, "plan_kind": schema["plan_kind"], "summary": "Initial evidence collection.",
+                "plan_items": [task_example],
+            }, sort_keys=True))
+            sections.append("\n".join(rules))
         elif report_schema.keys() & SPECIAL_REPORT_KEYS:
             schema, strict = report_schema, False
         else:
             schema = CANONICAL_WORK_REPORT_SCHEMA
+        field_instruction = (
+            "include required fields and omit unused optional/default fields; no extra keys (values show types). "
+            if contract.work_function == PLAN_WORK_FUNCTION
+            else "no missing or extra keys (values show types). "
+        )
         output = (
             "Required output:\nWhen done, return exactly one JSON object as your final message: no prose, "
-            "no Markdown fences, no missing or extra keys (values show types). "
+            f"no Markdown fences, {field_instruction}"
             "Read-only work reports its findings in this JSON.\n" + json.dumps(schema, indent=2)
         )
         if strict:
@@ -7405,6 +7487,31 @@ class OrchestrationService:
             artifact = await ingest(db, goal, run, task, session_id, version, output)
         except PlanIngestionError as exc:
             marker.request = {**self._json_object_or_empty(marker.request), "plan_ingestion_error": exc.reason}
+            if exc.code == BUDGET_REQUIRED_CODE:
+                details = {
+                    "code": exc.code, "title": "Budget required", "message": BUDGET_REQUIRED_MESSAGE,
+                    "raw_output": output, "diagnostics": exc.diagnostics,
+                }
+                marker.request = {**marker.request, "plan_ingestion_error_code": exc.code,
+                                  "plan_validation_diagnostics": exc.diagnostics, "rejected_output": output}
+                run.plan_state = {**plan_state, "status": "budget_required", "budget_required": details}
+                self._mark_run_blocked(goal, run)
+                self._upsert_active_blocker(run, {
+                    "kind": BUDGET_REQUIRED_CODE, "reason": f"Budget required: {BUDGET_REQUIRED_MESSAGE}",
+                    "details": details,
+                })
+                ask = await self.execute_ask_human_action(
+                    db, run.id, {
+                        "action_type": "ask_human", "question": BUDGET_REQUIRED_MESSAGE,
+                        "subject": BUDGET_REQUIRED_CODE, "contract_version": "explicit_parent_caps:v1",
+                        "reason": json.dumps(details, ensure_ascii=False),
+                        "options": [{"key": "acknowledge", "label": "Acknowledge"}],
+                    }, f"run:{run.id}:kind:ask_human:{BUDGET_REQUIRED_CODE}",
+                )
+                question = await db.get(OrchestrationAuthorityDecision, ask.target_id)
+                question.title = "Budget required"
+                await self._mark_action_completed(db, marker, "task", task.id)
+                return
             # ponytail: legacy self-registering planners keep working; drop this check once they are gone.
             manual_plan = await db.scalar(select(Artifact.id).where(
                 Artifact.linked_task_id == task.id,
@@ -9885,6 +9992,7 @@ class OrchestrationService:
             ).get("status") == "accepted"
         )
         for kind in (
+            BUDGET_REQUIRED_CODE,
             "repeated_failure", "goal_definition_analyzer_error", "agent_definition_review_analyzer_error",
             "plan_criterion_integrity", "budget_exhausted",
         ):
@@ -10970,6 +11078,9 @@ class OrchestrationService:
         LLM only chooses when code cannot."""
         from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 
+        if self._has_active_blocker(run, BUDGET_REQUIRED_CODE):
+            return {"step": "needs_attention", "reason": BUDGET_REQUIRED_CODE}
+
         if self._has_active_blocker(run, "plan_criterion_integrity"):
             return {"step": "needs_attention"}
         if await self._sync_measured_budget_exhaustion(db, goal, run):
@@ -11458,6 +11569,10 @@ class OrchestrationService:
             if goal is None:
                 raise HTTPException(status_code=404, detail="Orchestration goal not found")
             await self._clear_obsolete_authorization_blockers(db, run)
+            if self._has_active_blocker(run, BUDGET_REQUIRED_CODE):
+                return {**self._tick_noop_result(run), "authorized_execution": {
+                    "step": "needs_attention", "reason": BUDGET_REQUIRED_CODE,
+                }}
             from huddleroom.services.orchestration_steering import OrchestrationSteeringService
             steering_processing = await OrchestrationSteeringService().process_pending(db, goal, run)
             if local_only:
@@ -11728,7 +11843,7 @@ class OrchestrationService:
                     await self._accepted_plan_items(db, run)
                 except HTTPException as exc:
                     self._block_plan_integrity(goal, run, str(exc.detail))
-            if self._has_active_blocker(run, "plan_criterion_integrity"):
+            if self._has_active_blocker(run, "plan_criterion_integrity") or self._has_active_blocker(run, BUDGET_REQUIRED_CODE):
                 await db.flush()
                 if not caller_owns_transaction:
                     await db.commit()

@@ -43,7 +43,7 @@ def _contract(**kw):
 def _goal(**kw):
     return SimpleNamespace(
         objective="Ship it", orchestrator_context={}, success_criteria=[],
-        goal_type="outcome", planning_mode=None, **kw,
+        goal_type="outcome", planning_mode=None, budget={}, **kw,
     )
 
 

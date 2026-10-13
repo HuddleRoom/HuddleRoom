@@ -90,10 +90,18 @@ async def _exhausted_child(db, project):
     db.add(agent)
     await db.flush()
     _roadmap, parent, _parent_run, _result, row = await release(db, project, child_item(
-        allocation={"max_tokens": 0, "max_turns": 0, "max_hours": 0},
+        allocation={"max_tokens": 2, "max_turns": 1, "max_hours": 1},
     ))
     child = await db.get(OrchestrationGoal, row.child_goal_id)
     run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
+    # Exhaust a lawful positive reservation with measured usage, preserving frozen caps.
+    measured_task = await _claim_task(db, project, run, agent, status="done")
+    db.add(Session(
+        task_id=measured_task.id, agent_id=agent.id, project_id=project.id, adapter_type="api",
+        status="completed", origin="orchestrator",
+        metadata_={"token_count_in": 2, "token_count_out": 0,
+                   "_roadmap_turn_count": 1, "_roadmap_elapsed_seconds": 0},
+    ))
     await db.flush()
     return parent, child, run, agent
 

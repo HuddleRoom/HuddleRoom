@@ -21,6 +21,94 @@ from huddleroom.services.orchestration_plan_ingestion import (
 GOAL = SimpleNamespace(success_criteria=[{"key": "c1"}], budget={"caps": {"max_tokens": "1000"}})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [{}, {"caps": {}}])
+async def test_roadmap_missing_budget_requires_attention(db_session, test_project, test_user, monkeypatch, budget):
+    from copy import deepcopy
+    from huddleroom.models.orchestration import (
+        OrchestrationAction, OrchestrationGate, OrchestrationGoal, OrchestrationBudgetReservation,
+    )
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    service, goal, run, task, session = await _planning_run(db_session, test_project.id, roadmap_budget=budget)
+    original_budget, original_constraints = deepcopy(goal.budget), deepcopy(goal.constraints)
+    from huddleroom.schemas.task import TaskCreate
+    from huddleroom.services.task_service import TaskService
+    audit = await TaskService().create(db_session, test_project.id, TaskCreate(
+        title="Existing audit", status="done", metadata={"orchestration": {
+            "goal_id": str(goal.id), "run_id": str(run.id), "work_function": "investigation",
+        }},
+    ))
+    audit_id, audit_status = audit.id, audit.status
+    child = {"item_key": "child", "unit_type": "goal", "title": "Child", "objective": "Deliver child",
+             "success_criteria": [{"key": "done"}], "allocation": {}, "why_runnable": "ready",
+             "scope": "invalid task field"}
+    malformed_task = {"item_key": "audit", "unit_type": "task", "title": "Audit",
+                      "work_function": "investigation", "scope": "Inspect", "deliverable": "Audit",
+                      "why_runnable": "ready", "staging_boundary": {"type": "fictional", "identifier": "x"}}
+    output = json.dumps(_env("roadmap", [child, malformed_task]))
+    await _finish(db_session, task, session, output)
+    before = {model: await db_session.scalar(select(func.count()).select_from(model))
+              for model in (Task, Artifact, OrchestrationGoal, OrchestrationGate, OrchestrationBudgetReservation)}
+    provider_calls = []
+
+    async def no_provider(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        pytest.fail("missing owner budget must not invoke a provider")
+
+    monkeypatch.setattr(service, "request_llm_decision", no_provider)
+    await service._ingest_session_evidence(db_session, run, _completed(session.id))
+    assert run.plan_state["status"] == "budget_required"
+    assert run.plan_state["budget_required"]["code"] == "roadmap_child_budget_required"
+    assert run.plan_state["budget_required"]["raw_output"] == output
+    diagnostics = json.dumps(run.plan_state["budget_required"]["diagnostics"])
+    assert "allocation" in diagnostics and "staging boundary" in diagnostics
+    assert run.status == "blocked" and "plan_artifact_id" not in run.plan_state
+    questions = list(await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human",
+    )))
+    assert len(questions) == 1
+    assert "Create a new goal with limits" in json.dumps(questions[0].request)
+
+    async def assert_blocked_replay():
+        await service._ingest_session_evidence(db_session, run, _completed(session.id))
+        await service.tick(db_session, run.id, local_only=True)
+        with pytest.raises(HTTPException) as exc:
+            await service.execute_request_plan_revision_action(
+                db_session, run_id=run.id,
+                request={"action_type": "request_plan_revision", "plan_task_id": str(task.id),
+                         "revision_request": "Try again"},
+                idempotency_key=f"run:{run.id}:kind:request_plan_revision:budget-test",
+            )
+        assert exc.value.status_code == 409 and exc.value.detail == "roadmap_child_budget_required"
+
+    await assert_blocked_replay()
+    decision = await db_session.get(OrchestrationAuthorityDecision, questions[0].target_id)
+    assert decision.title == "Budget required"
+    await OrchestrationAuthorityDecisionService().answer_runtime_question(
+        db_session, decision, "acknowledge", actor_user_id=test_user.id,
+        contract_version=decision.contract_version,
+    )
+    await assert_blocked_replay()
+    assert run.status == "blocked" and not provider_calls
+    assert goal.budget == original_budget and goal.constraints == original_constraints
+    assert session.output == output and run.plan_state["planning_task_id"] == str(task.id)
+    assert (await db_session.get(Task, audit_id)).status == audit_status
+    for model, count in before.items():
+        assert await db_session.scalar(select(func.count()).select_from(model)) == count
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human",
+    )) == 1
+
+
+def test_task_only_roadmap_needs_no_parent_caps():
+    item = {"item_key": "task", "unit_type": "task", "title": "Task", "work_function": "investigation",
+            "scope": "Inspect", "deliverable": "Audit", "why_runnable": "ready"}
+    goal = SimpleNamespace(success_criteria=[{"key": "c1"}], budget={})
+    assert _parse(_env("roadmap", [item]), "roadmap", goal)["plan_items"][0]["item_key"] == "task"
+
+
 def _item(**kw):
     base = {"id": "a", "work_function": "implementation", "scope": "s", "deliverable": "d", "why_runnable": "ready"}
     return {**base, **kw}
@@ -83,13 +171,26 @@ def test_ids_and_hash():
     assert plan_output_hash({"a": 1, "b": 2}) == plan_output_hash({"b": 2, "a": 1})
 
 
-async def _planning_run(db_session, project_id):
+async def _planning_run(db_session, project_id, *, roadmap_budget=None):
     from tests.test_orchestration_plan_delegation_gate import _agent, _make_run, _plan_request
 
     planner = _agent("planner")
     db_session.add(planner)
     await db_session.flush()
-    service, goal, run = await _make_run(db_session, project_id)
+    if roadmap_budget is None:
+        service, goal, run = await _make_run(db_session, project_id)
+    else:
+        from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+        from huddleroom.services.orchestration_service import OrchestrationService
+        from tests.test_orchestration_plan_delegation_gate import _complete_goal_definition
+
+        service = OrchestrationService()
+        goal, run = await service.create_goal(
+            db_session, project_id=project_id, created_by_user_id=None,
+            data=OrchestrationGoalCreate(objective="Deliver synthetic roadmap", goal_type="roadmap",
+                                         success_criteria=[{"key": "plan"}], budget=roadmap_budget),
+        )
+        await _complete_goal_definition(db_session, goal, run)
     action = await service.execute_request_plan_action(
         db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key=f"run:{run.id}:kind:request_plan"
     )

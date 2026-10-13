@@ -179,7 +179,7 @@ async def test_malformed_report_in_exhausted_outcome_records_attention_without_f
 ):
     _roadmap, _parent, _parent_run, _result, row = await release(
         db_session, test_project,
-        child_item(allocation={"max_tokens": 0, "max_turns": 0, "max_hours": 0}),
+        child_item(allocation={"max_tokens": 2, "max_turns": 1, "max_hours": 1}),
     )
     goal = await db_session.get(OrchestrationGoal, row.child_goal_id)
     run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == goal.id))
@@ -204,12 +204,16 @@ async def test_malformed_report_in_exhausted_outcome_records_attention_without_f
         Session(
             task_id=task.id, agent_id=test_agent.id, project_id=test_project.id, adapter_type="api",
             status="completed", output="not json", origin="orchestrator",
-            metadata_={"token_count_in": 0, "token_count_out": 0, "_roadmap_turn_count": 0,
-                       "_roadmap_elapsed_seconds": 0},
+            metadata_={"token_count_in": 2, "token_count_out": 0, "_roadmap_turn_count": 1,
+                       "_roadmap_elapsed_seconds": 3600},
         ),
     ])
     await db_session.flush()
     session = await db_session.scalar(select(Session).where(Session.task_id == task.id))
+    from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+
+    summary = await OrchestrationBudgetService().supervision_summary(db_session, goal, run)
+    assert summary["remaining"] == {"max_tokens": "0", "max_turns": "0", "max_hours": "0"}
 
     _event, _ = await emit_event_once(db_session, test_project.id, "session.completed", {
         "session_id": str(session.id),

@@ -84,6 +84,8 @@ def parse_roadmap_items(raw: object, parent_dimensions: set[str]) -> list[Orches
                 raise HTTPException(status_code=422, detail=f"Invalid allocation for '{dimension}'")
         if item.unit_type == "goal" and set(item.allocation) != parent_dimensions:
             raise HTTPException(status_code=409, detail="Roadmap child allocation must include every parent budget dimension")
+        if item.unit_type == "goal" and not any(Decimal(str(amount)) > 0 for amount in item.allocation.values()):
+            raise HTTPException(status_code=409, detail="Roadmap child allocation must reserve nonzero budget capacity")
         items.append(item)
         by_key[item.item_key] = item
     graph = {item.item_key: list(item.depends_on) for item in items}

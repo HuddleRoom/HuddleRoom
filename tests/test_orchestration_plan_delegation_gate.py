@@ -2596,3 +2596,53 @@ async def test_pre_plan_line_shows_gate_status_and_consumed_report_summary(db_se
         f"{audited.id} | investigation | backlog | gate open | Audit auth | report: done: {'N' * 120}",
         f"{bare.id} | implementation | backlog | gate none | Draft API",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["implementation", "delivery", "roadmap"])
+async def test_planning_descriptions_explain_semantic_contract(db_session, test_project, mode):
+    from huddleroom.services.orchestration_plan_ingestion import parse_envelope
+
+    planner = _agent("semantic-contract")
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    set_committed_value(run, "planning_mode_snapshot", mode)
+    if mode == "roadmap":
+        goal.budget = {"caps": {"max_tokens": 20000}}
+        await db_session.flush()
+    await _bind_team(db_session, goal, planner)
+    action = await service.execute_request_plan_action(
+        db_session, run_id=run.id, request=_plan_request(planner.id),
+        idempotency_key=f"run:semantic-contract:{mode}",
+    )
+    task = await db_session.get(Task, action.target_id)
+    description = task.description
+    assert "Planning rules:" in description
+    assert "depends_on: []" in description
+    assert "same run" in description
+    assert "immediate necessary predecessors" in description
+    assert "Do not implement the plan" in description
+    labels = [("Valid task example:", "task")]
+    if mode == "roadmap":
+        assert "20000" in description and "max_tokens" in description
+        assert "git_branch" in description and "git_worktree" in description
+        assert "reversible" in description
+        labels.append(("Valid goal example:", "goal"))
+    for label, unit in labels:
+        example_line = next(line for line in description.splitlines() if line.startswith(label))
+        output = example_line.removeprefix(label).strip()
+        parsed = parse_envelope(output, mode, goal)
+        if mode == "roadmap":
+            assert parsed["plan_items"][0]["unit_type"] == unit
+
+    await service.execute_request_plan_revision_action(
+        db_session, run_id=run.id,
+        request={"action_type": "request_plan_revision", "plan_task_id": str(task.id),
+                 "revision_request": "Keep all semantic rules while covering rollback."},
+        idempotency_key=f"run:semantic-contract:revision:{mode}",
+    )
+    revised = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
+    assert "Planning rules:" in revised.description
+    assert "depends_on: []" in revised.description
+    assert "immediate necessary predecessors" in revised.description

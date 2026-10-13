@@ -334,18 +334,50 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     root.weight = "trivial"  # keep the unrelated effectiveness analyzer deterministic
     await heal_baseline_drift_for_test(db, root, root_run)
 
-    build = {**roadmap_task("build"), "agent_id": str(builder.id)}
+    root_audits = []
+    for index, function in enumerate(("investigation", "review")):
+        action = await service.execute_create_delegation_task_action(
+            db, root_run.id,
+            {"action_type": "create_delegation_task", "agent_id": str(auditor.id),
+             "work_function": function, "scope": f"Preliminary roadmap audit {index}",
+             "deliverable": "Preliminary sequencing and risk findings", "decision_use": "Choose roadmap checks",
+             "success_evidence": ["Concrete risks and milestone checks"],
+             "budget": {"max_tokens": 30, "max_turns": 2, "max_hours": 0.25}},
+            f"root:preliminary:{index}",
+        )
+        root_audits.append(await db.get(Task, action.target_id))
+    adopted_root_items = [
+        {**roadmap_task(f"preliminary-{index}"), "work_function": function,
+         "mutates_shared_state": False, "adopt_task_id": str(task.id)}
+        for index, (function, task) in enumerate(zip(("investigation", "review"), root_audits))
+    ]
+    build = {**roadmap_task("build", depends_on=["preliminary-0", "preliminary-1"]),
+             "agent_id": str(builder.id)}
     area = {**goal_item("area", allocation={"max_tokens": 600, "max_turns": 24, "max_hours": 4}),
             "goal_type": "roadmap", "depends_on": ["build"]}
-    await _plan_roadmap_by_tick(db, project, service, scripts, root, root_run, planner, [build, area],
-                                "Build first, then the nested platform area.")
+    await _plan_roadmap_by_tick(db, project, service, scripts, root, root_run, planner, [*adopted_root_items, build, area],
+                                "Use preliminary risks, then deliver and independently integrate the platform area.")
     version = await OrchestrationRoadmapService(service).current_version(db, root.id)
     assert version is not None and version.run_id == root_run.id
     await _assert_budget_conserved(db, root)
     assert external_calls == []
 
+    # Preliminary adopted audits retain real provenance and never substitute for final qualification.
+    for task in root_audits:
+        await _record_measured_completion(db, project.id, root_run, task, auditor.id,
+                                          _report("Preliminary roadmap risk evidence."))
+    await service.tick(db, root_run.id)
+    await service.tick(db, root_run.id)
+    assert await _item(db, root, "build") is None
+    for index, task in enumerate(root_audits):
+        item = await _item(db, root, f"preliminary-{index}")
+        assert item is not None, [(r.item_key, r.task_id) for r in await db.scalars(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == root.id))]
+        assert item.task_id == task.id and item.item_snapshot["depends_on"] == []
+        await _complete_roadmap_task(db, project.id, service, root_run, item, verifier.id, complete_producer=False)
+        if index == 0:
+            assert await _item(db, root, "build") is None
     # 2. build accepted -> P releases only the nested Roadmap C (parent_explicit: no classifier call).
-    assert (await service.tick(db, root_run.id))["authorized_execution"]["item_key"] == "build"
+    await service.tick(db, root_run.id)
     build_row = await _item(db, root, "build")
     await _complete_roadmap_task(db, project.id, service, root_run, build_row, verifier.id)
     await service.tick(db, root_run.id)

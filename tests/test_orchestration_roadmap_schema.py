@@ -4,6 +4,23 @@ from fastapi import HTTPException
 from huddleroom.services.orchestration_roadmap_service import parse_roadmap_items
 
 
+@pytest.mark.parametrize("allocation", [{"max_tokens": 0}, {"max_tokens": "0", "max_turns": 0}])
+def test_child_allocation_must_reserve_nonzero_capacity(allocation):
+    child = {"item_key": "child", "unit_type": "goal", "title": "Child", "objective": "Deliver child",
+             "success_criteria": [{"key": "done"}], "allocation": allocation}
+    with pytest.raises(HTTPException, match="nonzero|positive|greater than zero"):
+        parse_roadmap_items([child], set(allocation))
+
+
+@pytest.mark.parametrize("field,value", [("scope", "Implement"), ("deliverable", "Candidate"),
+                                        ("work_function", "implementation")])
+def test_goal_item_rejects_task_fields_even_with_valid_allocation(field, value):
+    child = {"item_key": "child", "unit_type": "goal", "title": "Child", "objective": "Deliver child",
+             "success_criteria": [{"key": "done"}], "allocation": {"max_tokens": 1}, field: value}
+    with pytest.raises(HTTPException, match="goal item cannot define task-only fields"):
+        parse_roadmap_items([child], {"max_tokens"})
+
+
 def _task(key, depends_on=()):
     return {
         "item_key": key,
