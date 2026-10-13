@@ -975,7 +975,7 @@ async def test_tick_runs_effectiveness_after_recovery_and_only_waiting_blocks_fi
 
     goal, run = await _goal_run(db_session, test_project)
     # can_finish (final_summary/closeout/completion) now gates on
-    # run.phase == "authorized" (Task 3); this test's finish_expected=True
+    # run.phase == "authorized"; this test's finish_expected=True
     # cases require the completion tail to run.
     run.phase = "authorized"
     await db_session.flush()

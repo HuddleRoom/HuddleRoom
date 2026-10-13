@@ -378,8 +378,8 @@ class OrchestrationService:
         if run is not None and run.phase == "ready":
             return "waiting_authority"
         if run is not None and run.phase == "authorized":
-            # "working" once anything is in flight is refined in Task 7; the
-            # deterministic default here is safe (never claims work exists).
+            # An authorized run reports waiting_work; this default never
+            # claims work exists.
             return "waiting_work"
         return "working"
 
@@ -3427,7 +3427,7 @@ class OrchestrationService:
                         # "waiting_decision", etc.) is blocking on -- gating this
                         # call on baseline readiness would deadlock forever, since
                         # that readiness can never become true until this decision
-                        # is answered. See Task 8.5.
+                        # is answered.
                         skip_baseline_gate=True,
                     )
                 except HTTPException as exc:
@@ -9250,8 +9250,8 @@ class OrchestrationService:
                 current_metadata = current_session.metadata_ if current_session is not None and isinstance(current_session.metadata_, dict) else {}
                 current_attempt = current_metadata.get("attempt") if isinstance(current_metadata.get("attempt"), dict) else {}
                 current_owned = await ownership_recovery.resolve_owned_session(db, failed_session_ids[0])
-                # A task-link alone predates Task 9 and is not a durable worker
-                # claim.  Only the current, fenced Task 9 attempt takes recovery
+                # A task-link alone is not a durable worker claim. Only the
+                # current, fenced attempt takes recovery
                 # ownership away from the legacy retry/reassign ladder.
                 if (current_owned is not None
                         and current_attempt.get("claimed_runner_task_id") == current_session.runner_task_id

@@ -871,7 +871,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     })
   }
 
-  // Task 12b: gates the baseline chain per run.baseline_authorized — the
+  // Gates the baseline chain per run.baseline_authorized — the
   // button itself lives in ProcessChain's Z2 header, this just owns the
   // mutation the same way mutateChain/retryProcess do.
   function authorizeBaseline(trigger: HTMLButtonElement | null) {
@@ -901,7 +901,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     })
   }
 
-  // Task 12: stale-inputs suggestion row wiring (Approve/Dismiss in the
+  // Stale-inputs suggestion row wiring (Approve/Dismiss in the
   // Needs-you queue) — Approve reruns the step then resolves the warning so
   // it never resurfaces for the process run that triggered the rerun; Dismiss
   // just resolves it. Both reuse the existing rerun/resolve mutations, no new

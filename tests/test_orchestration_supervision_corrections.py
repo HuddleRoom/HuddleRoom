@@ -1,4 +1,4 @@
-"""Production-path regressions for Task 8 supervision corrections."""
+"""Production-path regressions for supervision corrections."""
 # pylint: disable=cyclic-import
 import asyncio
 import importlib

@@ -131,8 +131,8 @@ async def completion_ready_goal(db_session, test_project):
     service._ensure_baseline_processes_ready = baseline_ready
 
     # This fixture drives the goal through closeout/completion, which tick()
-    # now gates on run.phase == "authorized" (Task 3). Authorize directly
-    # since Start (Task 4) is not built yet.
+    # gates on run.phase == "authorized". Authorize directly so the fixture
+    # can exercise completion without invoking the baseline start flow.
     run.phase = "authorized"
     await db_session.flush()
 

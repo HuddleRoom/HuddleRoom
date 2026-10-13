@@ -264,7 +264,7 @@ class OrchestrationProcessService:
             goal = await db.get(OrchestrationGoal, goal_id)
             # Check that the returned skipped row is still current -- a stale
             # retry racing a newer completed rerun could otherwise clobber a
-            # real manager selection back to no_manager (Task 8). The check
+            # real manager selection back to no_manager. The check
             # and handle_skip() must be atomic (review finding, MEDIUM): a
             # force-started rerun can only supersede this row by writing its
             # superseded_by_id column, so locking THIS row FOR UPDATE and

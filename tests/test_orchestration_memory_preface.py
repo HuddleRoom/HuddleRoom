@@ -56,7 +56,7 @@ async def test_preface_builder_handles_mixed_tz_aware_naive_datetimes(db_session
     # Create two decisions with asked_at/decided_at
     svc = OrchestrationAuthorityDecisionService()
 
-    # Decision 1: created with default _utcnow (becomes identity-resident with tz-aware datetime)
+    # The first decision uses default _utcnow (becomes identity-resident with tz-aware datetime).
     decision1 = await svc.create_pending(
         db_session,
         orch_goal.id,
@@ -67,7 +67,7 @@ async def test_preface_builder_handles_mixed_tz_aware_naive_datetimes(db_session
         options=["yes", "no"],
     )
 
-    # Decision 2: created similarly
+    # The second decision uses the same timestamp default.
     decision2 = await svc.create_pending(
         db_session,
         orch_goal.id,

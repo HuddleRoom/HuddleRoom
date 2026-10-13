@@ -1658,6 +1658,6 @@ class OrchestrationRoadmapService:
         return settled
 
     async def _settle_terminal_children(self, db, goal, run):
-        """Compatibility shim for Task 4 callers."""
+        """Return finished-child settlement in the legacy step-result format."""
         settled = await self.settle_finished_children(db, goal, run)
         return {"step": "settle_children", "count": settled} if settled else None

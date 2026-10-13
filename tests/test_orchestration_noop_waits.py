@@ -151,7 +151,7 @@ async def test_stub_decision_wake_when_is_renormalized_and_clamped(db_session, t
     assert all(_recheck_seconds(wait) == pytest.approx(clamp_recheck_seconds(10 ** 9), abs=5) for wait in waits)
 
 
-# Plan R7: roadmap accepted plans rely on decision/context reuse, not waits.
+# Roadmap accepted plans rely on decision/context reuse, not waits.
 async def test_roadmap_accepted_plan_noop_creates_no_waits(db_session, test_project):
     run = await _run(db_session, test_project, goal_type="roadmap")
     run.plan_state = {"status": "accepted"}

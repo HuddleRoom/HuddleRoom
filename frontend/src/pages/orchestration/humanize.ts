@@ -157,7 +157,7 @@ export function nowLine({
   checkpointItems: readonly OrchestrationAuthorityDecisionRecord[]
   // Optional — callers/tests that don't need the baseline-gate line keep
   // working. Only affects the line while `run.phase === 'baseline'` and the
-  // human hasn't authorized it yet (Task 12b).
+  // human hasn't authorized it yet.
   run?: Pick<OrchestrationRun, 'phase' | 'baseline_authorized'> | null
 }): NowLineSegment[] {
   if (goal.status === 'cancelled') return [{ text: 'This goal was cancelled.' }]

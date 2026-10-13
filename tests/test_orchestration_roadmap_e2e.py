@@ -697,7 +697,7 @@ async def _run_of(db, goal):
 async def nested_roadmap(db, project, monkeypatch):
     """P (build -> area) -> C (area, a Roadmap) with C's plan accepted; g1/g2 are C's Outcome children."""
     default_actions = settings.orchestration_max_actions_per_tick
-    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)  # one decision per tick, as in the T7 e2e
+    monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)  # one decision per tick
     planner, producer, verifier, summarizer = await _child_actors(db)
     builder = _agent("nested-builder", ["implementation"])
     db.add(builder)

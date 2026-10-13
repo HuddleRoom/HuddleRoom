@@ -208,7 +208,7 @@ describe('nowLine', () => {
     expect(text(nowLine({ goal, processes: [], checkpointItems: [] }))).toBe('Not started yet.')
   })
 
-  // Task 12b: while the baseline gate is unauthorized, the now-line names the
+  // While the baseline gate is unauthorized, the now-line names the
   // gate instead of the (nonexistent, since nothing has run yet) step.
   it('reports the baseline gate is waiting for Start baseline when unauthorized with no processes yet', () => {
     const goal: Pick<OrchestrationGoal, 'status'> = { status: 'active' }

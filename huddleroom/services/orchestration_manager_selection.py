@@ -870,7 +870,7 @@ class ManagerSelectionProcess:
         the explicit no_manager option are the same real-world outcome, so
         this reuses the same warning type/message/consequence as
         `_complete`'s NO_MANAGER_OPTION branch. Called from the skip REST
-        route (Task 4) right after the generic Phase 2 skip succeeds; the
+        route right after the generic Phase 2 skip succeeds; the
         generic `manager_selection_skipped` warning is unaffected and both
         warnings remain active side by side.
 

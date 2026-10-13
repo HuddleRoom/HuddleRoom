@@ -99,8 +99,8 @@ class OrchestrationMemoryService:
                 source="orchestrator",
                 dedup_key=f"memory.upgrade_resolved:{run.id}:accepted_source_reconciliation",
             )
-            # This Task 9 boundary produces the exact event that resolves its
-            # aggregate wait; do not broaden Task 8's scheduler event surface.
+            # Accepted-source reconciliation produces the exact event that
+            # resolves its aggregate wait without broadening scheduler events.
             from huddleroom.services.orchestration_supervision import OrchestrationSupervisionService
             await OrchestrationSupervisionService(None).clear_matching_waits(
                 db, run, event_type=event.event_type, event_id=event.id, matcher=event.payload,

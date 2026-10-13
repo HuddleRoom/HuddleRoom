@@ -69,7 +69,7 @@ class OrchestrationAuthorityDecisionService:
     it back unchanged, but once a decision goes terminal (answered /
     cancelled / expired) the key is free again — a process rerun must be
     able to raise a fresh question under the same logical key (spec 6.3).
-    This mirrors the partial unique index on the table (Task 2); querying
+    This mirrors the partial unique index on the table; querying
     for status='pending' here keeps the service and the DB constraint in
     sync. Phase 9 wires the human answer endpoint and the manager-agent
     decision-task path onto answer_decision(). Creation shares the Phase 1

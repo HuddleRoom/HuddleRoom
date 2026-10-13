@@ -34,6 +34,7 @@ vi.mock('react-router-dom', () => ({
     <a href={to}>{children}</a>
   ),
   Outlet: () => null,
+  useLocation: () => ({ pathname: '/' }),
 }))
 
 vi.mock('sonner', () => ({

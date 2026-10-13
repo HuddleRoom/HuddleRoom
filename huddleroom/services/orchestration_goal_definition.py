@@ -38,7 +38,7 @@ GOAL_WEIGHT_ORDER = {"trivial": 0, "standard": 1, "substantial": 2}
 # large budget, or multiple inferred/flagged work functions) is weighted to
 # hit the threshold by itself. A tiny explicit budget is neutral per spec
 # 6.2; constraints presence is the only standard-only signal here. All
-# constants are module-level so the human override endpoint (Task 3) remains
+# constants are module-level so the human override endpoint remains
 # the escape hatch for anything the proxies get wrong.
 SUCCESS_CRITERIA_SUBSTANTIAL_COUNT = 2
 SUCCESS_CRITERIA_SUBSTANTIAL_SCORE = 3

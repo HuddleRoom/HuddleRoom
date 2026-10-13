@@ -63,7 +63,7 @@ async def sync_deferred_questions_memory(
     question that gets answered or re-prioritized out of the deferred set
     disappears from here instead of rotting.
 
-    Called once per tick per goal (Task 11), so a goal with zero deferred
+    Called once per tick per goal, so a goal with zero deferred
     questions and no prior `open_questions` section must be a true no-op --
     otherwise every goal gets a DB write every tick forever for a section
     that would only ever say "no open questions". Once a section exists

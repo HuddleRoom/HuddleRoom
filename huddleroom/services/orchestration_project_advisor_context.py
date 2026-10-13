@@ -1,4 +1,4 @@
-"""Bounded, READ-ONLY project-context assembler for "Ask the orchestrator" (Decision 3 / T2.1).
+"""Bounded, READ-ONLY project-context assembler for "Ask the orchestrator".
 
 Assembles a summarized snapshot of project state for a project-scoped advisor
 LLM call. Pure reads only (SELECTs) — never mutates. Every list has an
@@ -19,7 +19,7 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.services.orchestration_memory_preface import OrchestrationMemoryPrefaceBuilder
 from huddleroom.services.orchestration_service import OrchestrationService
 
-# Explicit numeric caps (Decision 3 / T2.1).
+# Explicit numeric caps bound the project-context snapshot.
 OPEN_GOALS_LIMIT = 5
 RECENT_DECISIONS_LIMIT = 10
 RECENT_MEETING_DECISIONS_LIMIT = 5

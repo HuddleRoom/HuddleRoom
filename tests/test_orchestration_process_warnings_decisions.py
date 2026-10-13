@@ -352,8 +352,8 @@ async def test_process_skip_records_who_and_reason(db_session, orch_goal):
         await svc.complete_process(db_session, row)
 
     # skip_process must create the process's skip warning inline (spec 6.5) —
-    # this test only touches the OrchestrationWarning model (Task 1), not the
-    # Task 4 warning service, to keep task ordering independent.
+    # this test only touches the OrchestrationWarning model, keeping its
+    # assertions independent of the warning service.
     warnings = await _goal_warnings(db_session, orch_goal.id)
     assert {warning.warning_type for warning in warnings} == {
         "team_hierarchy_skipped",

@@ -1,4 +1,4 @@
-"""Pydantic schemas for the "Ask the orchestrator" project advisor endpoint (T4.1).
+"""Pydantic schemas for the "Ask the orchestrator" project advisor endpoint.
 
 Mirrors the field naming/serialization conventions of the existing
 OrchestrationConversation* schemas (huddleroom/schemas/orchestration.py) so the

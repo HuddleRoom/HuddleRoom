@@ -540,7 +540,7 @@ async def test_managed_advance_waits_then_accepts_and_replays_once(
     action = await db_session.get(OrchestrationAction, uuid.UUID(result["action_id"]))
     assert action.action_type == "accept_plan" and action.status == "completed"
     projection = deepcopy(run.plan_state)
-    # Replay the actual dispatched action after acceptance, without entering Task 3 release work.
+    # Replay the actual dispatched action after acceptance, without entering plan release work.
     for _ in range(2):
         replay = await service.execute_accept_plan_action(
             db_session, run.id, action.request, action.idempotency_key, action.decision_id,

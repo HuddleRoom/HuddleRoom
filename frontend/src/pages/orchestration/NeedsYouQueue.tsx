@@ -34,7 +34,7 @@ function isBaselineProcessType(type: string): type is OrchestrationBaselineProce
   return (BASELINE_PROCESS_TYPES as readonly string[]).includes(type)
 }
 
-// Stale-inputs suggestion warnings (Task 12) carry `warning_type` =
+// Stale-inputs suggestion warnings carry `warning_type` =
 // `${process_type}_stale_inputs` (orchestration_warning_service.py
 // suggest_stale_inputs) — derive the process type back out, or null if this
 // isn't one of the four gated baseline steps.
@@ -299,7 +299,7 @@ export interface NeedsYouQueueProps {
   retryPending: boolean
   retryError: string | null
   onRetryProcess: (processType: OrchestrationBaselineProcessType, trigger: HTMLButtonElement | null, onSuccessFocus?: () => void) => void
-  // Stale-inputs suggestion row (Task 12): Approve reruns the derived step
+  // For stale-inputs suggestions, Approve reruns the derived step
   // then resolves the warning; Dismiss just resolves it. Both reuse the
   // existing rerun/resolve mutations (see BaselineDashboard).
   onApproveStaleInputs: (warning: OrchestrationWarningRecord, processType: OrchestrationBaselineProcessType, onSuccessFocus?: () => void) => void

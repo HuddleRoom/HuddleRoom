@@ -104,7 +104,7 @@ export interface ProcessChainProps {
   // callers/tests that only exercise the stepper itself keep working.
   goal?: OrchestrationGoal
   checkpointItems?: readonly OrchestrationAuthorityDecisionRecord[]
-  // Baseline-gate button (Task 12b) — "Start baseline" / "Continue baseline",
+  // Baseline-gate button — "Start baseline" / "Continue baseline",
   // visible only while run.phase === 'baseline' && !run.baseline_authorized.
   // Optional so callers/tests that don't exercise the gate keep working.
   run?: OrchestrationRun | null

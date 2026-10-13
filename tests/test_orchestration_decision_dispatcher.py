@@ -624,7 +624,7 @@ def test_every_dispatcher_executor_method_exists_on_orchestration_service():
 
 @pytest.mark.asyncio
 async def test_dispatch_invalid_depends_on_records_failed_action_without_raising(db_session, test_project):
-    """Task 8 tester: an LLM create_delegation_task with a missing dependency is a failed action, no Task, no raise."""
+    """An LLM delegation with a missing dependency fails without creating a task or raising."""
     from sqlalchemy import select
     from sqlalchemy.sql.functions import count
     from huddleroom.models.orchestration import OrchestrationAction

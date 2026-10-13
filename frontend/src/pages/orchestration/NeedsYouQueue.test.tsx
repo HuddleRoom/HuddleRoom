@@ -479,7 +479,7 @@ describe('NeedsYouQueue', () => {
     }
   })
 
-  // Task 12: stale-inputs suggestion rows (warning_type ending in
+  // Stale-inputs suggestion rows (warning_type ending in
   // "_stale_inputs") get Approve/Dismiss instead of Acknowledge/Resolve.
   it('renders Approve/Dismiss (not Acknowledge/Resolve) for a stale-inputs suggestion warning', async () => {
     const warn = warning({ id: 'warn-stale', warning_type: 'team_hierarchy_stale_inputs', severity: 'recommendation', message: 'Definitions changed since Team hierarchy ran — re-run?' })

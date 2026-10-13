@@ -788,8 +788,8 @@ async def test_integration_gate_is_created_once_across_replay(
         await _finish_integration_verification(db_session, test_project.id, service, run, first, verifier.id)
         decision = {"action_type": "noop", "reason": "Replan before summarizing V1."}
 
-    # Task 7 owns public replan admission.  This immutable V2 setup isolates
-    # Task 6's required retained-lineage/current-version integration behavior.
+    # This immutable V2 setup bypasses public replan admission to isolate
+    # retained-lineage/current-version integration behavior.
     next_item = {**roadmap_task("next", mutates_shared_state=False), "agent_id": str(builder.id)}
     v2 = OrchestrationRoadmapVersion(
         goal_id=parent.id, run_id=run.id, version=version.version + 1,

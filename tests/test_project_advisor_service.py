@@ -1,4 +1,4 @@
-"""Unit tests for OrchestrationProjectAdvisorService (T3.3).
+"""Unit tests for OrchestrationProjectAdvisorService.
 
 Uses a bare (non-transaction-wrapped) session rather than the shared
 db_session fixture: the service commits internally (mirrors

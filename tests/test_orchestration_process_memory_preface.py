@@ -431,7 +431,7 @@ async def test_preface_full_content(db_session, full_state, orch_run):
     from huddleroom.services.orchestration_memory_preface import OrchestrationMemoryPrefaceBuilder
 
     # Explicit large budget: this test pins content, not budget behavior. The
-    # full_state preface sits near the 3000-char default; without this, Task 4's
+    # full_state preface sits near the 3000-char default; without this, budget
     # eviction would trim the toc and break the assertions below.
     preface = await OrchestrationMemoryPrefaceBuilder().build(
         db_session, full_state, orch_run, budget_chars=10_000

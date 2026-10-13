@@ -1,4 +1,4 @@
-"""Endpoint contract tests for the project advisor router (T4.3)."""
+"""Endpoint contract tests for the project advisor router."""
 import json
 import uuid
 

@@ -70,8 +70,8 @@ async def _complete_goal_definition(db_session, goal, run):
     await complete_baseline_processes(db_session, goal, run)
     # This whole file exercises completion machinery downstream of
     # baseline_ready (final summary / closeout / complete_run), which tick()
-    # now gates on run.phase == "authorized" (Task 3). Authorize directly
-    # since Start (Task 4) is not built yet.
+    # gates on run.phase == "authorized". Authorize directly so the fixture
+    # can exercise completion without invoking the baseline start flow.
     run.phase = "authorized"
     await db_session.flush()
     # This file's tests routinely mutate goal/roster state (new agents,

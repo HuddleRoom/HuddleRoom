@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 def _api():
-    """Import at execution time: this RED suite must collect before Task 2 exists."""
+    """Import at execution time so collection does not require the runtime implementation."""
     return importlib.import_module("huddleroom.services.orchestration_conversation_investigation")
 
 
@@ -1859,7 +1859,7 @@ def test_reader_omits_no_byte_limit_marker_when_final_file_has_no_matching_line_
     assert result.omissions == ()
 
 
-# Task 3 RED contracts deliberately keep runtime imports inside execution tests.
+# Runtime contracts deliberately keep imports inside execution tests.
 # The reader/parser module remains importable before the runtime exists.
 def _runtime():
     api = _api()
