@@ -669,6 +669,10 @@ class CliAdapter:
                 session.status = "cancelled"
                 session.error = None
                 session.ended_at = datetime.now(timezone.utc)
+                metadata = dict(session.metadata_ or {})
+                if not isinstance(metadata.get("token_usage_complete"), bool):
+                    metadata["token_usage_complete"] = False
+                session.metadata_ = metadata
                 self._store_roadmap_elapsed(session)
                 if not await finish_if_owned():
                     return

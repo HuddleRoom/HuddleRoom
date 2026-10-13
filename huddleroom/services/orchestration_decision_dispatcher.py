@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import uuid
+from datetime import timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -66,12 +67,84 @@ class OrchestrationDecisionDispatcher:
         return f"run:{run_id}:kind:{action_type}:request:{fingerprint}"
 
     async def dispatch(
+        self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision, *,
+        recovery_context: RecoveryDispatchContext | None = None,
+    ) -> OrchestrationAction | None:
+        action_type = (decision.parsed_decision or {}).get("action_type")
+        if decision.validator_status == "accepted" and action_type == "request_plan_revision":
+            with db.no_autoflush:
+                live_cli = await self._service._sqlite_cli_planning_replacement_session(db, run)
+                if live_cli is not None and not (run.plan_state or {}).get("pending_replan"):
+                    request = self._service.canonical_decision_request(
+                        "request_plan_revision", decision.parsed_decision, run_id=run.id,
+                    )
+                    key = self.action_key(run.id, "request_plan_revision", request)
+                    existing = await self._service._existing_action_for_key(db, run.id, key)
+                    if existing is None or existing.status == "reserved":
+                        await self._service._assert_sqlite_replacement_transaction(db)
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+        if decision.validator_status != "accepted" or action_type != "request_plan":
+            return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+        with db.no_autoflush:
+            return await self._dispatch_plan_generation(db, run, decision, recovery_context=recovery_context)
+
+    async def _dispatch_plan_generation(
+        self, db, run, decision, *, recovery_context=None,
+    ):
+        from huddleroom.services.orchestration_service import PlanGenerationChanged, _plan_generation_seal
+
+        request = self._service.canonical_decision_request("request_plan", decision.parsed_decision, run_id=run.id)
+        # Recovery approval identity is read-only admission and precedes both
+        # exact replay and generation freshness. Invalid authority retains its
+        # existing ordinary rejection rather than entering the plan fence.
+        parsed = decision.parsed_decision or {}
+        if "applies_decision_id" in parsed or recovery_context is not None:
+            applies_id, rejection = (await self._resolve_applied_decision(db, run, parsed["applies_decision_id"])
+                                     if "applies_decision_id" in parsed else (None, None))
+            if rejection is not None:
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+            recovery = await self._recovery_dispatch_context(db, run, applies_id, recovery_context, request)
+            if recovery is False or (recovery is None and recovery_context is not None):
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+        key = (recovery_effect_key(recovery_context) if recovery_context
+               else self.action_key(run.id, "request_plan", request))
+        snapshot = getattr(decision, "input_snapshot", {}) or {}
+        versions = steering_versions_from_snapshot(snapshot) if isinstance(snapshot, dict) else None
+        if not recovery_context:
+            key, _ = await self._attempt_key(db, run.id, key, decision.id, versions is not None, check_steering=False)
+        if versions is not None:
+            suffix = f":steering:{OrchestrationSteeringService.version_digest(versions)}"
+            if not key.endswith(suffix):
+                key = key[:255 - len(suffix)] + suffix
+        # Read-only exact replay precedes freshness and all dispatch side effects.
+        existing = await db.scalar(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_plan",
+            OrchestrationAction.idempotency_key == key,
+        ))
+        replay_request = ((existing.dispatch_contract or {}).get("plan_dispatch_request", existing.request)
+                          if existing else None)
+        if existing is not None and existing.status != "reserved" and replay_request == request:
+            return existing
+        snapshot_run = snapshot.get("run") if isinstance(snapshot, dict) else None
+        if not isinstance(snapshot_run, dict) or "plan_state" not in snapshot_run:
+            raise PlanGenerationChanged("Missing server planning generation")
+        expected = _plan_generation_seal(snapshot_run.get("id"), snapshot_run["plan_state"])
+        async with self._service._lock_goal_for_baseline_transition(db, run.goal_id):
+            if await self._service._sqlite_cli_planning_replacement_session(db, run) is not None:
+                await self._service._assert_sqlite_replacement_transaction(db)
+            current = await self._service._assert_current_plan_generation(db, run.id, expected)
+            return await self._dispatch(
+                db, current, decision, recovery_context=recovery_context, expected_plan_generation=expected,
+            )
+
+    async def _dispatch(
         self,
         db: AsyncSession,
         run: OrchestrationRun,
         decision: OrchestrationDecision,
         *,
         recovery_context: RecoveryDispatchContext | None = None,
+        expected_plan_generation: dict | None = None,
     ) -> OrchestrationAction | None:
         if decision.validator_status != "accepted":
             return None
@@ -153,13 +226,23 @@ class OrchestrationDecisionDispatcher:
         run_id, decision_id = run.id, decision.id
         # Only model-proposed delegation is ad hoc; internal callers keep the default.
         extra = {"ad_hoc": True} if action_type == "create_delegation_task" else {}
+        if action_type == "request_plan":
+            extra["plan_dispatch_request"] = request
+            if expected_plan_generation is not None:
+                extra["expected_plan_generation"] = expected_plan_generation
         if extra and recovery and recovery_context.purpose == "apply" and recovery_context.baseline_repair_admission:
             # Trusted only from a validated approve_fix context; the executor re-checks it against current state.
             extra["baseline_repair_admission"] = recovery_context.baseline_repair_admission
         call = lambda: method(  # noqa: E731
             db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id, **extra,
         )
-        if action_type in self._OWN_RECOVERY_ACTION_TYPES:
+        sqlite_cli_replacement = (
+            (action_type == "request_plan" and expected_plan_generation is not None
+             or action_type == "request_plan_revision")
+            and await self._service._sqlite_cli_planning_replacement_session(db, run) is not None
+            and not (action_type == "request_plan_revision" and (run.plan_state or {}).get("pending_replan"))
+        )
+        if action_type in self._OWN_RECOVERY_ACTION_TYPES or sqlite_cli_replacement:
             if action_type == "request_roadmap_replan" and await self._service._existing_action_for_key(
                 db, run_id, action_key
             ) is None:
@@ -320,14 +403,23 @@ class OrchestrationDecisionDispatcher:
     _MAX_REJECTED_ATTEMPTS = 3
 
     async def _attempt_key(
-        self, db: AsyncSession, run_id: uuid.UUID, key: str, decision_id: uuid.UUID, fenced: bool,
+        self, db: AsyncSession, run_id: uuid.UUID, key: str, decision_id: uuid.UUID, fenced: bool, *,
+        check_steering: bool = True,
     ) -> tuple[str, OrchestrationAction | None]:
         """A previously rejected (failed) action must not block the same decision forever:
         retry under a new attempt key so the executor re-checks its preconditions, up to a cap.
         Returns (key, None), or (key, latest failed action) once the cap is reached."""
         probe = key
         if fenced:
-            probe, *_ = await self._service._steering_action_fence(db, run_id, key, decision_id)
+            if check_steering:
+                probe, *_ = await self._service._steering_action_fence(db, run_id, key, decision_id)
+            else:
+                decision = await db.get(OrchestrationDecision, decision_id)
+                versions = steering_versions_from_snapshot(decision.input_snapshot or {}) if decision else None
+                if versions is not None:
+                    suffix = f":steering:{OrchestrationSteeringService.version_digest(versions)}"
+                    if not probe.endswith(suffix):
+                        probe = probe[:255 - len(suffix)] + suffix
         status = await db.scalar(select(OrchestrationAction.status).where(
             OrchestrationAction.run_id == run_id, OrchestrationAction.idempotency_key == probe,
         ))
@@ -344,7 +436,9 @@ class OrchestrationDecisionDispatcher:
         progress_at = await db.scalar(select(func.max(OrchestrationAction.created_at)).where(
             OrchestrationAction.run_id == run_id, OrchestrationAction.status == "completed",
         ))
-        since_progress = [a for a in failed if progress_at is None or a.created_at > progress_at]
+        def naive(value):
+            return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+        since_progress = [a for a in failed if progress_at is None or naive(a.created_at) > naive(progress_at)]
         if len(since_progress) >= self._MAX_REJECTED_ATTEMPTS:
             return key, failed[0]
         return f"{key}:rejected:{len(failed)}", None

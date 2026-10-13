@@ -133,7 +133,8 @@ async def _recovery_fixture(db, conversation_goal_run, *, purpose="apply", autho
     )
     wrapper.dispatch_contract = {"canonical_request_hash": _request_hash()}
     decision = OrchestrationDecision(
-        run_id=run.id, decision_type="execution", validator_status="accepted", input_snapshot={},
+        run_id=run.id, decision_type="execution", validator_status="accepted",
+        input_snapshot={"run": {"id": str(run.id), "plan_state": run.plan_state}},
         parsed_decision={**_request(), "applies_decision_id": str(authority.id)},
     )
     db.add(decision)

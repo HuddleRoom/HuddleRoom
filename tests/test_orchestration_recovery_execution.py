@@ -1144,3 +1144,46 @@ async def test_retry_replay_after_a_transient_error_reuses_one_decision_row(db_s
         OrchestrationDecision.run_id == rows.run.id, OrchestrationDecision.decision_type == "recovery_retry"))).all()
     assert len(rows_) == 1
     assert await status(db_session, flow.svc, flow.proposal) == "resolved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_replay", [False, True])
+async def test_server_planning_retry_captures_current_generation_and_never_refreshes_reused_snapshot(
+    db_session, test_project, test_user, monkeypatch, stale_replay,
+):
+    from copy import deepcopy
+    from huddleroom.models.orchestration import OrchestrationDecision
+    from huddleroom.services.orchestration_service import PlanGenerationChanged
+    rows = await seed(db_session, test_project)
+    rows.run.plan_state = {"test_nested": {"items": []}}
+    await db_session.flush()
+    flow = await approved_with(db_session, rows, test_user,
+                               {"kind": "planning", "requested_agent_id": str(rows.planner.id)}, verify_call(rows))
+    async def unavailable(db, rows):
+        raise HTTPException(status_code=503, detail="provider unavailable")
+    executors = Executors(monkeypatch, rows, plan={"request_plan": [unavailable, "ok"]})
+    await verified(db_session, flow)
+    with pytest.raises(HTTPException):
+        await flow.svc.retry_blocked_work(db_session, flow.proposal)
+    decisions = list(await db_session.scalars(select(OrchestrationDecision).where(
+        OrchestrationDecision.run_id == rows.run.id, OrchestrationDecision.decision_type == "recovery_retry",
+    )))
+    assert len(decisions) == 1
+    decision = decisions[0]
+    expected = {"run": {"id": str(rows.run.id), "plan_state": {"test_nested": {"items": []}}}}
+    assert decision.input_snapshot == expected
+    retained = deepcopy(decision.input_snapshot)
+    rows.run.plan_state["test_nested"]["items"].append("later state mutation")
+    assert decision.input_snapshot == retained
+    if stale_replay:
+        rows.run.plan_state = {**rows.run.plan_state, "planning_version": 1}
+        await db_session.flush()
+        with pytest.raises(PlanGenerationChanged):
+            await flow.svc.retry_blocked_work(db_session, flow.proposal)
+        assert len(executors.keys("request_plan")) == 1
+    else:
+        retry = await flow.svc.retry_blocked_work(db_session, flow.proposal)
+        assert retry.status == "completed"
+        assert len(executors.keys("request_plan")) == 2
+    await db_session.refresh(decision)
+    assert decision.input_snapshot == retained

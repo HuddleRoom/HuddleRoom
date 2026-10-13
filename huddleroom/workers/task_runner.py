@@ -73,14 +73,15 @@ async def cancel_task(task_id: str) -> bool:
     task = _running_tasks.get(task_id)
     if task is None:
         return False
-    task.cancel()
+    if not task.cancelling():
+        task.cancel()
     try:
-        await task
+        # A second caller or cancellation of this waiter must not interrupt
+        # the worker's process cleanup and terminal transaction commit.
+        await asyncio.shield(task)
     except asyncio.CancelledError:
-        pass
-    finally:
-        _running_tasks.pop(task_id, None)
-        _task_projects.pop(task_id, None)
+        if not task.done() or asyncio.current_task().cancelling():
+            raise
     return True
 
 

@@ -843,3 +843,37 @@ async def test_recovery_analyzer_redacts_evidence_callback_failures_and_drops_ra
     assert "[REDACTED]" in str(caught.value)
     assert secret not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, expected, physical, lookups", [
+    ("provider", "RecoveryProviderUnavailable", 1, 0),
+    ("contract", "RecoveryContractRejected", 3, 0),
+    ("evidence", "RecoveryEvidenceUnavailable", 1, 1),
+    ("limit", "RecoveryEvidenceLimitReached", 5, 4),
+])
+async def test_recovery_analyzer_preserves_failure_classification(failure, expected, physical, lookups):
+    query = {"kind": "evidence_query", "query": {"kind": "waits"}}
+    completion = AsyncMock(return_value={"choices": [{"message": {"content": json.dumps(
+        {"kind": "proposal"} if failure == "contract" else query,
+    )}}]})
+    if failure == "provider":
+        completion.side_effect = OSError("provider transport failed")
+    evidence = AsyncMock(return_value=EvidenceV1.model_validate(_evidence()))
+    if failure == "evidence":
+        evidence.side_effect = OSError("local evidence unavailable")
+    with pytest.raises(Exception) as caught:
+        await RecoveryAnalyzer(completion_fn=completion).analyze(
+            {}, project_id=UUID_A, evidence_query=evidence,
+        )
+    assert type(caught.value).__name__ == expected
+    assert completion.await_count == physical
+    assert evidence.await_count == lookups
+
+
+def test_recovery_prompt_includes_authoritative_terminal_and_query_schemas():
+    from huddleroom.schemas.orchestration_recovery import RecoveryAssessmentV1
+    prompt = RecoveryAnalyzer._request({}, [])["messages"][0]["content"]
+    # Compare schema values, not a handful of field names that an incomplete prompt could contain.
+    assert json.dumps(TypeAdapter(RecoveryAssessmentV1).json_schema(), sort_keys=True) in prompt
+    assert json.dumps(TypeAdapter(RecoveryEvidenceQueryV1).json_schema(), sort_keys=True) in prompt

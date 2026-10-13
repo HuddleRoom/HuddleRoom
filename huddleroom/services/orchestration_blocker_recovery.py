@@ -8,6 +8,7 @@ event or human while holding a lock: a wait is stored and the call returns.
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -38,7 +39,10 @@ from huddleroom.services.orchestration_decision_dispatcher import OrchestrationD
 from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 from huddleroom.services.orchestration_llm_decision_adapter import _redact_secrets
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
-from huddleroom.services.orchestration_recovery_analyzer import MAX_RECOVERY_EVIDENCE_ROUNDS, RecoveryAnalyzer
+from huddleroom.services.orchestration_recovery_analyzer import (
+    MAX_RECOVERY_EVIDENCE_ROUNDS, RecoveryAnalyzer, RecoveryContractRejected,
+    RecoveryEvidenceLimitReached, RecoveryEvidenceUnavailable, RecoveryProviderUnavailable,
+)
 from huddleroom.services.orchestration_recovery_configuration import RecoveryConfigurationService
 from huddleroom.services.orchestration_recovery_evidence import (
     RECOVERY_EVIDENCE_MAX_BYTES, RecoveryContextBuilder, RecoveryEvidenceService, _bounded,
@@ -59,8 +63,12 @@ AFTER_APPROVAL = "HuddleRoom applies these updates, verifies the expected state,
 # Code-owned loop bound (spec): not a model field or operator setting.
 MAX_RECOVERY_ATTEMPTS_WITHOUT_PROGRESS = 3
 ANALYSIS_FAILED = "analysis_failed"
+ANALYSIS_PROVIDER_FAILED = "analysis_provider_failed"
+ANALYSIS_CONTRACT_REJECTED = "analysis_contract_rejected"
+ANALYSIS_EVIDENCE_FAILED = "analysis_evidence_failed"
+ANALYSIS_EVIDENCE_LIMIT = "analysis_evidence_limit"
 ADMISSION_REJECTED = "baseline_repair_admission_rejected"
-_NOT_A_REFUSAL = (ANALYSIS_FAILED, ADMISSION_REJECTED)
+_NOT_A_REFUSAL = (ANALYSIS_FAILED, ANALYSIS_PROVIDER_FAILED, ANALYSIS_EVIDENCE_FAILED, ADMISSION_REJECTED)
 _WRAPPER_TYPES = ("recovery_apply", "recovery_verify", "recovery_retry")
 _GAP_KEY_PREFIX = RECOVERY_GAP_DECISION_KEY_PREFIX
 _WARNING_TYPE = registry_module.RECOVERY_WARNING_TYPE
@@ -252,9 +260,22 @@ class OrchestrationBlockerRecoveryService:
                 )
             except Exception as exc:
                 await self._require_run_current(db, goal.id, run.id)
-                # F3: a provider/analyzer outage is not a refusal; the tick backs off on this stamp instead.
-                trigger_action.dispatch_contract = {**contract, "last_diagnosis_error_at": datetime.now(timezone.utc).isoformat()}
-                raise await rejected(None, _redact_secrets(f"{ANALYSIS_FAILED}: {exc}")[:4_000]) from None
+                code = ANALYSIS_FAILED
+                if isinstance(exc, RecoveryProviderUnavailable):
+                    code = ANALYSIS_PROVIDER_FAILED
+                elif isinstance(exc, RecoveryContractRejected):
+                    code = ANALYSIS_CONTRACT_REJECTED
+                elif isinstance(exc, RecoveryEvidenceUnavailable):
+                    code = ANALYSIS_EVIDENCE_FAILED
+                elif isinstance(exc, RecoveryEvidenceLimitReached):
+                    code = ANALYSIS_EVIDENCE_LIMIT
+                # Contract/limit failures consume the existing logical refusal
+                # allowance. Outages and internal errors retain error backoff.
+                if code in _NOT_A_REFUSAL:
+                    trigger_action.dispatch_contract = {
+                        **contract, "last_diagnosis_error_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                raise await rejected(None, _redact_secrets(f"{code}: {exc}")[:4_000]) from None
         # A reset during the provider call discards this result: nothing is written for the old run.
         await self._require_run_current(db, goal.id, run.id)
 
@@ -965,8 +986,15 @@ class OrchestrationBlockerRecoveryService:
             decision = (await db.get(OrchestrationDecision, UUID(contract["retry_decision_id"]))
                         if contract.get("retry_decision_id") else None)
             if decision is None:  # one decision row per retry, reused on replay
+                input_snapshot = {}
+                if action_type == "request_plan":
+                    current_run = await db.get(OrchestrationRun, ctx.run.id, populate_existing=True)
+                    input_snapshot = {
+                        "run": {"id": str(current_run.id), "plan_state": deepcopy(current_run.plan_state)},
+                    }
                 decision = OrchestrationDecision(
-                    run_id=ctx.run.id, decision_type="recovery_retry", validator_status="accepted", input_snapshot={},
+                    run_id=ctx.run.id, decision_type="recovery_retry", validator_status="accepted",
+                    input_snapshot=input_snapshot,
                     parsed_decision={**request, "action_type": action_type, "applies_decision_id": str(ctx.decision.id)},
                 )
                 db.add(decision)

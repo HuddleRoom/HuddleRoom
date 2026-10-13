@@ -207,6 +207,30 @@ RECOVERY_RUN_PAUSED_EVENT_TYPE = "orchestration.run_paused"
 MEETING_SCHEDULED_EVENT_TYPE = "orchestration.meeting_scheduled"
 GRAPH_STARTED_EVENT_TYPE = "orchestration.graph_started"
 
+
+class PlanGenerationChanged(Exception):
+    """A server-snapshot planning generation is no longer current."""
+
+
+def _plan_generation_seal(run_id: Any, plan_state: Any) -> dict[str, Any]:
+    if not isinstance(plan_state, Mapping):
+        raise PlanGenerationChanged("Malformed planning generation")
+    try:
+        run_id = str(uuid.UUID(str(run_id)))
+        version = plan_state.get("planning_version", 0)
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("Invalid planning version")
+        status = plan_state.get("status")
+        if status is not None and not isinstance(status, str):
+            raise ValueError("Invalid planning status")
+        identities = {
+            field: str(uuid.UUID(str(plan_state[field]))) if plan_state.get(field) is not None else None
+            for field in ("planning_task_id", "request_action_id")
+        }
+    except (ValueError, TypeError, AttributeError):
+        raise PlanGenerationChanged("Malformed planning generation") from None
+    return {"run_id": run_id, "status": status, "planning_version": version, **identities}
+
 logger = logging.getLogger(__name__)
 
 class _ReentrantAsyncioLock:
@@ -252,6 +276,9 @@ _SQLITE_GOAL_LOCKS_GUARD = asyncio.Lock()
 
 # Separate from goal locks: recovery may acquire the roster lock before goal locks.
 _RECOVERY_LIFECYCLE_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# Admission only for public ticks in the same process/event loop; persistence
+# still decides the winner for direct callers and other processes.
+_RECOVERY_DIAGNOSES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 # A baseline-repair admission (passed only by the dispatcher from a validated approve_fix recovery context,
 # never read from request JSON) is honored only for that approved call's own recovery effect key.
@@ -266,6 +293,14 @@ REMEDIATION_REQUEST_KEYS = (
 
 
 class OrchestrationService:
+    _plan_generation_seal = staticmethod(_plan_generation_seal)
+
+    async def _assert_current_plan_generation(self, db, run_id: uuid.UUID, expected: dict) -> OrchestrationRun:
+        run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+        if run is None or _plan_generation_seal(run.id, run.plan_state) != expected:
+            raise PlanGenerationChanged("Planning generation changed")
+        return run
+
     @property
     def supervision(self):
         """Lazy to avoid a circular service import during baseline startup."""
@@ -2114,12 +2149,124 @@ class OrchestrationService:
             )
 
     async def execute_request_plan_action(
+        self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
+        decision_id: uuid.UUID | None = None, plan_dispatch_request: dict | None = None,
+        expected_plan_generation: dict | None = None,
+    ) -> OrchestrationAction:
+        pending_writes = bool(db.new or db.dirty or db.deleted)
+        flushed_writes = await self._sqlite_transaction_has_writes(db)
+        with db.no_autoflush:
+            run = await db.get(OrchestrationRun, run_id)
+            lookup_key = await self._plan_action_lookup_key(db, idempotency_key, decision_id)
+            existing = await self._existing_action_for_key(db, run_id, lookup_key)
+            old_session = await self._sqlite_cli_planning_replacement_session(db, run) if run else None
+        if existing is not None and existing.status != "reserved":
+            replay_request = (existing.dispatch_contract or {}).get("plan_dispatch_request", existing.request)
+            if replay_request == self._canonical_plan_request(request):
+                return existing
+            return await self._execute_request_plan_action(
+                db, run_id, request, idempotency_key, decision_id, plan_dispatch_request,
+            )
+        if old_session is not None:
+            if pending_writes or flushed_writes:
+                raise HTTPException(status_code=409, detail="planning_replacement_transaction_conflict")
+            await self._assert_sqlite_replacement_transaction(db)
+            expected = expected_plan_generation or _plan_generation_seal(run.id, run.plan_state)
+            goal_id = run.goal_id
+            async with self._lock_goal_for_baseline_transition(db, goal_id):
+                run = await self._assert_current_plan_generation(db, run_id, expected)
+                # Admission checks precede destructive cancellation, just as
+                # they precede reservation in the original executor.
+                await self._ensure_baseline_processes_ready(db, goal_id)
+                await self._ensure_plan_request_allowed(db, run)
+                canonical = self._canonical_plan_request(request)
+                goal = await db.get(OrchestrationGoal, goal_id)
+                inherited_context = self._json_object_or_empty(goal.orchestrator_context)
+                if self._has_delegable_orchestrator_context(inherited_context):
+                    canonical = {**canonical, "orchestrator_context": delegable_context(inherited_context)}
+                await self._require_plan_author(db, goal, run, canonical.get("agent_id"))
+                _, agent, _ = await self._validate_delegation_targets(db, run_id, {**canonical, "parent_task_id": None})
+                authority = await self.roadmap_pre_release_authority(
+                    db, run_id, agent, self._json_object_or_empty(canonical.get("orchestrator_context")),
+                )
+                if authority.get("status") in {"pending", "rejected"}:
+                    raise HTTPException(
+                        status_code=409, detail="budget_wait" if authority["status"] == "pending" else "needs_attention",
+                    )
+                await self._terminalize_sqlite_planning_replacement(db, run_id, expected, old_session)
+                return await self._execute_request_plan_action(
+                    db, run_id, request, idempotency_key, decision_id, plan_dispatch_request,
+                )
+        return await self._execute_request_plan_action(
+            db, run_id, request, idempotency_key, decision_id, plan_dispatch_request,
+        )
+
+    async def _terminalize_sqlite_planning_replacement(self, db, run_id, expected, old_session) -> None:
+        session_id, task_id = old_session.id, old_session.task_id
+        await self._assert_sqlite_replacement_transaction(db)
+        await db.commit()
+        await SessionService().cancel(db, session_id)
+        await self._assert_current_plan_generation(db, run_id, expected)
+        old_task = await db.get(Task, task_id, populate_existing=True)
+        if old_task is not None and "cancelled" in Task.VALID_TRANSITIONS.get(old_task.status, set()):
+            await TaskService().cancel(db, old_task.project_id, task_id)
+        await db.commit()  # old facts survive every later replacement failure
+        await self._assert_current_plan_generation(db, run_id, expected)
+
+    @staticmethod
+    async def _plan_action_lookup_key(db, key, decision_id) -> str:
+        """Derive exact replay identity without checking mutable steering state."""
+        from huddleroom.services.orchestration_steering import (
+            OrchestrationSteeringService, steering_versions_from_snapshot,
+        )
+        decision = await db.get(OrchestrationDecision, decision_id) if decision_id else None
+        versions = steering_versions_from_snapshot(decision.input_snapshot or {}) if decision else None
+        if versions is not None:
+            suffix = f":steering:{OrchestrationSteeringService.version_digest(versions)}"
+            if not key.endswith(suffix):
+                key = key[:255 - len(suffix)] + suffix
+        return key
+
+    @staticmethod
+    async def _assert_sqlite_replacement_transaction(db: AsyncSession) -> None:
+        transaction = db.sync_session.get_transaction()
+        if (db.new or db.dirty or db.deleted or db.in_nested_transaction()
+                or transaction is None or transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+                or await OrchestrationService._sqlite_transaction_has_writes(db)):
+            raise HTTPException(status_code=409, detail="planning_replacement_transaction_conflict")
+
+    @staticmethod
+    async def _sqlite_transaction_has_writes(db: AsyncSession) -> bool:
+        if db.get_bind().dialect.name != "sqlite" or not db.in_transaction():
+            return False
+        connection = await db.connection()
+        raw = await connection.get_raw_connection()
+        # sqlite3/aiosqlite starts its native transaction at the first DML.
+        # ORM dirty sets alone miss writes that the caller already flushed.
+        return bool(raw.driver_connection.in_transaction)
+
+    async def _sqlite_cli_planning_replacement_session(self, db, run) -> Session | None:
+        if db.get_bind().dialect.name != "sqlite" or run is None:
+            return None
+        state = self._json_object_or_empty(run.plan_state)
+        if state.get("status") not in {"requested", "revision_requested"}:
+            return None
+        task_id = self._optional_uuid(state.get("planning_task_id"), "planning_task_id")
+        if task_id is None:
+            return None
+        return await db.scalar(select(Session).where(
+            Session.task_id == task_id, Session.adapter_type == "cli",
+            Session.status.in_(("pending", "running")),
+        ).order_by(Session.created_at.desc(), Session.id.desc()).limit(1))
+
+    async def _execute_request_plan_action(
         self,
         db: AsyncSession,
         run_id: uuid.UUID,
         request: dict,
         idempotency_key: str,
         decision_id: uuid.UUID | None = None,
+        plan_dispatch_request: dict | None = None,
     ) -> OrchestrationAction:
         gate_run = await db.get(OrchestrationRun, run_id)
         if gate_run is None:
@@ -2186,6 +2333,11 @@ class OrchestrationService:
         )
         if action.status != "reserved":
             return action
+
+        if plan_dispatch_request is not None:
+            contract = dict(action.dispatch_contract or {})
+            contract.setdefault("plan_dispatch_request", deepcopy(plan_dispatch_request))
+            action.dispatch_contract = contract
 
         project_id = await self._project_id_for_run(db, run_id)
         if run is None:
@@ -2270,6 +2422,49 @@ class OrchestrationService:
         return await self._mark_action_completed(db, action, target_type="task", target_id=task.id)
 
     async def execute_request_plan_revision_action(
+        self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
+        decision_id: uuid.UUID | None = None,
+    ) -> OrchestrationAction:
+        with db.no_autoflush:
+            run = await db.get(OrchestrationRun, run_id)
+            lookup_key = await self._plan_action_lookup_key(db, idempotency_key, decision_id)
+            existing = await self._existing_action_for_key(db, run_id, lookup_key)
+            old_session = await self._sqlite_cli_planning_replacement_session(db, run)
+            pending_replan = (self._json_object_or_empty(
+                self._json_object_or_empty(run.plan_state).get("pending_replan"),
+            ) if run else {})
+        if (existing is not None and existing.status != "reserved"
+                and existing.request == self._canonical_plan_revision_request(request)):
+            return existing
+        if old_session is not None and not pending_replan and (existing is None or existing.status == "reserved"):
+            await self._assert_sqlite_replacement_transaction(db)
+            goal_id = run.goal_id
+            expected = _plan_generation_seal(run.id, run.plan_state)
+            async with self._lock_goal_for_baseline_transition(db, goal_id):
+                run = await self._assert_current_plan_generation(db, run_id, expected)
+                await self._ensure_plan_revision_allowed(db, run)
+                canonical = self._canonical_plan_revision_request(request)
+                planning_task = await self._planning_task_for_run(
+                    db, run, self._required_uuid(canonical.get("plan_task_id"), "plan_task_id"),
+                )
+                agent = await db.get(Agent, planning_task.assigned_to) if planning_task.assigned_to else None
+                if agent is None:
+                    raise HTTPException(status_code=409, detail="Roadmap planning agent is invalid")
+                goal = await db.get(OrchestrationGoal, goal_id)
+                authority = await self.roadmap_pre_release_authority(
+                    db, run_id, agent, goal.orchestrator_context if goal else None,
+                )
+                if authority.get("status") in {"pending", "rejected"}:
+                    raise HTTPException(
+                        status_code=409, detail="budget_wait" if authority["status"] == "pending" else "needs_attention",
+                    )
+                await self._terminalize_sqlite_planning_replacement(db, run_id, expected, old_session)
+                return await self._execute_request_plan_revision_action(
+                    db, run_id, request, idempotency_key, decision_id,
+                )
+        return await self._execute_request_plan_revision_action(db, run_id, request, idempotency_key, decision_id)
+
+    async def _execute_request_plan_revision_action(
         self,
         db: AsyncSession,
         run_id: uuid.UUID,
@@ -10852,12 +11047,14 @@ class OrchestrationService:
         )
         return hard_stop_id is not None
 
-    async def _reject_stale_steering_decision(self, db, decision_id: uuid.UUID) -> None:
+    async def _reject_stale_steering_decision(
+        self, db, decision_id: uuid.UUID, *, reason: str = "stale_steering_versions",
+    ) -> None:
         """Durably reject stale work without racing SQLite's sole writer."""
         statement = (
             update(OrchestrationDecision)
             .where(OrchestrationDecision.id == decision_id)
-            .values(validator_status="rejected", rejection_reason="stale_steering_versions")
+            .values(validator_status="rejected", rejection_reason=reason)
         )
         if db.bind is not None and db.bind.dialect.name == "sqlite":
             # SQLite cannot safely use a second writer while the caller owns a
@@ -10910,15 +11107,20 @@ class OrchestrationService:
         except Exception as exc:
             from huddleroom.services.orchestration_steering import SteeringVersionsChanged
 
-            if not isinstance(exc, SteeringVersionsChanged):
+            if not isinstance(exc, (SteeringVersionsChanged, PlanGenerationChanged)):
                 raise
-            await self._reject_stale_steering_decision(db, decision.id)
-            if stale_retry:
-                return None
-            refreshed = await self.request_llm_decision(db, run.id)
-            return await self._dispatch_execution_decision(
-                db, run, refreshed, stale_retry=True,
+            await self._reject_stale_steering_decision(
+                db, decision.id,
+                reason="stale_plan_generation" if isinstance(exc, PlanGenerationChanged) else "stale_steering_versions",
             )
+            if stale_retry:
+                await self._create_noop_waits(db, run, decision)
+                return None
+            else:
+                refreshed = await self.request_llm_decision(db, run.id)
+                return await self._dispatch_execution_decision(
+                    db, run, refreshed, stale_retry=True,
+                )
         if action is not None:
             if action.action_type == "noop" or action.status == "failed":
                 await self._create_noop_waits(db, run, decision)
@@ -11513,8 +11715,19 @@ class OrchestrationService:
             # Bounded: at most one analyzer diagnosis per run per tick, least recently attempted first.
             trigger_id = await next_trigger() if diagnose else None
             if trigger_id is not None:
-                await step(lambda: service.diagnose(db, trigger_id),
-                           on_error=lambda: mark_diagnosis_error(trigger_id))
+                active = _RECOVERY_DIAGNOSES.setdefault(asyncio.get_running_loop(), set())
+                # No await between checking and inserting: a losing tick skips,
+                # rather than queuing another logical analysis behind this one.
+                if trigger_id in active:
+                    return
+                active.add(trigger_id)
+                try:
+                    # Directly await diagnosis so cancellation cannot release
+                    # admission while an analyzer is still unwinding.
+                    await step(lambda: service.diagnose(db, trigger_id),
+                               on_error=lambda: mark_diagnosis_error(trigger_id))
+                finally:
+                    active.discard(trigger_id)
         finally:
             if owns:
                 await db.commit()  # the tick leaves no transaction open behind it
