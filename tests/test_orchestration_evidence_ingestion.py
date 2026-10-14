@@ -505,6 +505,62 @@ async def test_tick_ingests_meeting_decision_evidence_from_concluded_meeting(db_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolution_kind", "expected"),
+    [
+        ("approved", "candidate"),
+        ("approved_with_followups", "candidate"),
+        ("changes_requested", "rejected"),
+        ("verdict_missing", "rejected"),
+        ("rejected", "rejected"),
+    ],
+)
+async def test_review_meeting_evidence_requires_approved_review(
+    db_session, test_project, resolution_kind, expected
+):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, gate_type="meeting_decision_accepted")
+    facilitator = _agent("facilitator", "facilitator", ["meeting"])
+    db_session.add(facilitator)
+    await db_session.flush()
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, facilitator.id, "meeting")
+    meeting = Meeting(
+        project_id=test_project.id,
+        title="Review the change",
+        meeting_type="review",
+        status="concluded",
+        participant_agent_ids=[],
+        participant_user_ids=[],
+        source_task_id=task.id,
+        organizer_agent_id=facilitator.id,
+    )
+    db_session.add(meeting)
+    await db_session.flush()
+    db_session.add(
+        MeetingAgendaItem(
+            meeting_id=meeting.id,
+            order=1,
+            title="Review item",
+            status="resolved" if expected == "candidate" else "unresolved",
+            resolution_kind=resolution_kind,
+        )
+    )
+    await db_session.flush()
+    await emit_event_once(
+        db_session,
+        test_project.id,
+        "meeting.concluded",
+        {"meeting_id": str(meeting.id), "project_id": str(test_project.id)},
+        dedup_key=f"review-meeting-concluded:{meeting.id}",
+    )
+
+    await service.tick(db_session, run.id)
+
+    rows = await _evidence_rows(db_session, run.id)
+    assert [row.verdict for row in rows] == [expected]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mismatch_type", ["different_meeting", "wrong_gate"])
 async def test_tick_ignores_meeting_decision_with_violated_link(db_session, test_project, mismatch_type):
     service, _goal, run = await _make_run(db_session, test_project.id)

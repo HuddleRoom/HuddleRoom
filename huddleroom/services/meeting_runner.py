@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _REF_PATTERN = re.compile(r"\[REF:(knowledge|task|artifact):([0-9a-f-]{36})\]", re.IGNORECASE)
 _REVIEW_SEVERITY_PATTERN = re.compile(r"\[severity:\s*(blocker|major|minor|nit)\]", re.IGNORECASE)
+_REVIEW_VERDICT_PATTERN = re.compile(r"VERDICT:\s*(APPROVE|CHANGES|BLOCK)", re.IGNORECASE)
 _RECOMMENDATION_PATTERN = re.compile(r"^RECOMMENDATION:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _LLM_CALL_TIMEOUT_SECONDS = 120
 _STALL_THRESHOLD = 3  # empty/invalid turns before an agent is skipped in round evaluation
@@ -1855,6 +1856,7 @@ class MeetingRunner:
 
     def _review_outcome(self, turns: list[MeetingTurn], agent_roles: dict[str, str]) -> tuple[str, dict]:
         severities: list[str] = []
+        verdicts: list[str | None] = []
         summary_lines: list[str] = []
         for turn in turns:
             content = (turn.content or "").strip()
@@ -1862,25 +1864,35 @@ class MeetingRunner:
                 continue
             for match in _REVIEW_SEVERITY_PATTERN.finditer(content):
                 severities.append(match.group(1).lower())
+            if agent_roles.get(str(turn.speaker_agent_id), "").lower() in {"security", "reviewer"}:
+                match = _REVIEW_VERDICT_PATTERN.fullmatch(content.splitlines()[-1].strip())
+                verdicts.append(match.group(1).upper() if match else None)
             first_line = content.splitlines()[0].strip()
             if first_line:
                 summary_lines.append(first_line)
 
-        if "blocker" in severities:
-            resolution_kind = "rejected"
-            resolution = "unresolved"
+        # Strictest signal wins; a required reviewer without a final-line verdict never approves.
+        if "BLOCK" in verdicts or "blocker" in severities:
+            resolution_kind, resolution = "rejected", "unresolved"
+        elif "CHANGES" in verdicts or "major" in severities:
+            resolution_kind, resolution = "changes_requested", "unresolved"
+        elif not verdicts or None in verdicts:
+            resolution_kind, resolution = "verdict_missing", "unresolved"
         elif severities:
-            resolution_kind = "approved_with_followups"
-            resolution = "resolved"
+            resolution_kind, resolution = "approved_with_followups", "resolved"
         else:
-            resolution_kind = "approved"
-            resolution = "resolved"
+            resolution_kind, resolution = "approved", "resolved"
 
         summary = "; ".join(summary_lines[:2]) or "Review discussion completed."
         return resolution, {
             "resolution_kind": resolution_kind,
             "resolution_summary": summary,
-            "required_followup": None if resolution_kind == "approved" else "Address the flagged review issues.",
+            "required_followup": (
+                None if resolution_kind == "approved"
+                else "Required reviewer must end the review with an explicit VERDICT line."
+                if resolution_kind == "verdict_missing"
+                else "Address the flagged review issues."
+            ),
             "participants_heard": self._participants_heard(turns),
         }
 

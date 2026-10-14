@@ -28,7 +28,7 @@ from huddleroom.config import settings
 from huddleroom.database import AsyncSessionLocal
 from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
-from huddleroom.models.meeting import Meeting, MeetingDecision
+from huddleroom.models.meeting import Meeting, MeetingAgendaItem, MeetingDecision
 from huddleroom.services.orchestration_meeting_commitments import (
     link_meeting_action_items, meeting_commitments, waive_meeting_action_item, waiver_reason,
 )
@@ -9501,9 +9501,27 @@ class OrchestrationService:
             source_id=decision.id,
             observed_event=event,
             producer_agent_id=meeting.organizer_agent_id or meeting.created_by_agent_id,
-            verdict="rejected" if decision.is_vetoed else "candidate",
+            verdict=(
+                "rejected"
+                if decision.is_vetoed
+                or not await self._meeting_review_approved(db, meeting, decision.agenda_item_id)
+                else "candidate"
+            ),
             evidence_metadata=metadata,
         )
+
+    @staticmethod
+    async def _meeting_review_approved(
+        db: AsyncSession, meeting: Meeting, agenda_item_id: uuid.UUID | None = None
+    ) -> bool:
+        """Non-review meetings pass; review items must all resolve approved (follow-ups allowed)."""
+        if meeting.meeting_type != "review":
+            return True
+        query = select(MeetingAgendaItem).where(MeetingAgendaItem.meeting_id == meeting.id)
+        if agenda_item_id is not None:
+            query = query.where(MeetingAgendaItem.id == agenda_item_id)
+        items = list((await db.execute(query)).scalars().all())
+        return all(i.resolution_kind in {"approved", "approved_with_followups"} for i in items)
 
     async def _ingest_meeting_concluded_evidence(
         self,
@@ -9535,6 +9553,7 @@ class OrchestrationService:
         )
         decisions = list(result.scalars().all())
         producer_agent_id = meeting.organizer_agent_id or meeting.created_by_agent_id
+        verdict = "candidate" if await self._meeting_review_approved(db, meeting) else "rejected"
         if not decisions:
             return await self._record_evidence_once(
                 db,
@@ -9544,7 +9563,7 @@ class OrchestrationService:
                 source_id=meeting.id,
                 observed_event=event,
                 producer_agent_id=producer_agent_id,
-                verdict="candidate",
+                verdict=verdict,
                 evidence_metadata={
                     **self._base_evidence_metadata(event, gate, orchestration, meeting.status),
                     "task_id": str(task.id),
@@ -9563,7 +9582,7 @@ class OrchestrationService:
                 source_id=decision.id,
                 observed_event=event,
                 producer_agent_id=producer_agent_id,
-                verdict="candidate",
+                verdict=verdict,
                 evidence_metadata={
                     **self._base_evidence_metadata(event, gate, orchestration, meeting.status),
                     "task_id": str(task.id),

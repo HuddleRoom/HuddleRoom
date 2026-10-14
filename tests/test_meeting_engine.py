@@ -771,6 +771,72 @@ async def test_review_round_complete_records_structured_rejection(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reviewer_text", "expected_kind", "expected_status", "has_followup"),
+    [
+        ("Do not ship: leaks credentials.", "verdict_missing", "unresolved", True),
+        ("I cannot open the artifact, so the review cannot be completed.", "verdict_missing", "unresolved", True),
+        ("Looks fine.\nVERDICT: APPROVE", "approved", "resolved", False),
+        ("- [severity: nit] naming: rename -> rename\nVERDICT: APPROVE", "approved_with_followups", "resolved", True),
+        ("Needs work.\nVERDICT: CHANGES", "changes_requested", "unresolved", True),
+        ("Unsafe.\nVERDICT: BLOCK", "rejected", "unresolved", True),
+    ],
+)
+async def test_review_round_outcome_requires_explicit_reviewer_verdict(
+    db_session, test_project, test_agent, reviewer_text, expected_kind, expected_status, has_followup
+):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import Meeting, MeetingAgendaItem, MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"security-{uuid.uuid4()}",
+        role="security",
+        provider="openai",
+        model="gpt-4o-mini",
+        adapter_type="api",
+        capabilities=[],
+        config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    meeting = Meeting(
+        project_id=test_project.id,
+        title="Security review",
+        meeting_type="review",
+        participant_agent_ids=[str(reviewer.id), str(test_agent.id)],
+        status="active",
+    )
+    db_session.add(meeting)
+    await db_session.flush()
+    item = MeetingAgendaItem(meeting_id=meeting.id, order=1, title="Review", status="active", max_rounds=1)
+    db_session.add(item)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            MeetingTurn(
+                meeting_id=meeting.id, agenda_item_id=item.id, turn_number=1, round_number=1,
+                speaker_agent_id=reviewer.id, content=reviewer_text, references=[],
+            ),
+            MeetingTurn(
+                meeting_id=meeting.id, agenda_item_id=item.id, turn_number=2, round_number=1,
+                speaker_agent_id=test_agent.id, content="Acknowledged.", references=[],
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    runner = MeetingRunner()
+    with patch.object(runner._svc, "is_round_complete", new_callable=AsyncMock) as mock_complete:
+        mock_complete.return_value = True
+        assert await runner.evaluate_round_if_complete(db=db_session, meeting=meeting, item=item) is True
+
+    assert item.resolution_kind == expected_kind
+    assert item.status == expected_status
+    assert bool(item.required_followup) is has_followup
+
+
+@pytest.mark.asyncio
 async def test_standup_round_complete_advances_without_consensus_check(
     db_session, test_project, test_agent
 ):

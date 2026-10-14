@@ -83,7 +83,9 @@ _TURN_INSTRUCTION_TEMPLATES: dict[str, str] = {
         "invent findings or approval.\n"
         "Structure available feedback as bullet points:\n"
         "- [severity: blocker|major|minor|nit] <location>: <problem> → <fix>\n"
-        "Approve only if no blockers remain. Response limit: 200 words."
+        "Approve only if no blockers remain. Response limit: 200 words.\n"
+        "End with:\n"
+        "VERDICT: APPROVE|CHANGES|BLOCK"
     ),
     "standup": (
         "When the agenda requests a status update, use this format. For missing factual fields, "
