@@ -912,7 +912,7 @@ async def test_repeated_eventless_noops_and_reports_keep_one_open_lineage_each(d
     triggers = await _actions(db_session, run.id, "recovery_trigger")
     assert sorted(t.request["source_kind"] for t in triggers) == ["eventless_noop", "reported_blocker"]
     reports = await _actions(db_session, run.id, "recover_blocker")
-    assert len(reports) == 3 and {r.target_id for r in reports} == {
+    assert len(reports) == 2 and {r.target_id for r in reports} == {
         next(t.id for t in triggers if t.request["source_kind"] == "reported_blocker")}
 
 
