@@ -60,6 +60,9 @@ class CliDisplayUpdate:
     text: str | None = None
     tool_name: str | None = None
     value: JsonValue | None = None
+    message_id: str | None = None
+    message_complete: bool = False
+    outcome: str = "completed"
 
 
 @dataclass(frozen=True)
@@ -94,7 +97,7 @@ class CliStreamDecoder:
         self._claude_message_id: str | None = None
         self._claude_partial_blocks: dict[int, tuple[str | None, int]] = {}
         self._claude_seen_uuids: set[str] = set()
-        self._codex_items: set[str] = set()
+        self._codex_items: set[tuple[str, str]] = set()
 
     def feed_stdout(self, chunk: bytes) -> list[CliDisplayUpdate]:
         """Process stdout chunk and return any readable updates."""
@@ -283,17 +286,49 @@ class CliStreamDecoder:
                 continue
             if not isinstance(record, dict):
                 continue
-            if self.runtime == "codex" and record.get("type") == "item.completed":
-                item = record.get("item")
-                item_id = item.get("id") if isinstance(item, dict) else None
-                if item_id and item_id in self._codex_items:
-                    continue
-                if item_id:
-                    self._codex_items.add(item_id)
+            if self.runtime == "codex":
+                updates.extend(self._codex_updates(record))
+                continue
             text = _json_live_text(record, self.runtime)
             if text:
                 updates.append(CliDisplayUpdate(kind="output", text=text))
         return updates
+
+    def _codex_updates(self, record: dict[str, Any]) -> list[CliDisplayUpdate]:
+        """Read only exec JSON item lifecycle events and intended reasoning summaries."""
+        event = record.get("type")
+        item = record.get("item")
+        if event not in {"item.started", "item.completed"} or not isinstance(item, dict):
+            return []
+        item_id = item.get("id") if isinstance(item.get("id"), str) else None
+        if item_id and len(item_id.encode()) > 256:
+            return []
+        if item_id:
+            key = (event, item_id)
+            if key in self._codex_items or len(self._codex_items) >= 4096:
+                return []
+            self._codex_items.add(key)
+        kind = item.get("type")
+        if event == "item.completed" and kind in {"agent_message", "reasoning"}:
+            text = item.get("text")
+            if isinstance(text, str):
+                return [CliDisplayUpdate(kind="output" if kind == "agent_message" else "reasoning",
+                                         text=text, message_id=item_id, message_complete=True)]
+        if kind not in {"command_execution", "mcp_tool_call", "web_search", "file_change"}:
+            return []
+        name = "mcp_tool_call"
+        if kind == "mcp_tool_call":
+            server, tool = item.get("server"), item.get("tool")
+            if isinstance(server, str) and isinstance(tool, str):
+                name = f"{server[:128]}.{tool[:128]}"
+        else:
+            name = kind
+        keys = ("command", "arguments", "query", "changes") if event == "item.started" else (
+            "aggregated_output", "exit_code", "result", "error", "query", "changes")
+        value = {key: item[key] for key in keys if key in item}
+        return [CliDisplayUpdate(kind="tool_started" if event == "item.started" else "tool_finished",
+                                 tool_name=name, value=value,
+                                 outcome="failed" if item.get("status") == "failed" else "completed")]
 
     def _parse_plain_stderr(self) -> list[CliDisplayUpdate]:
         """Parse plain stderr as text lines."""
@@ -488,11 +523,11 @@ def parse_jsonl_final(raw: str, runtime: str) -> tuple[str, str | None]:
             final_text = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), str) else None
         elif runtime == "pi" and record.get("type") in {"message_end", "turn_end"}:
             final_text = _pi_message_text(record) or final_text
-        elif runtime == "codex" and text:
+        elif runtime == "codex" and text is not None:
             # Earlier agent_messages are narration before tool calls; only the last is the answer.
             final_text = text
 
-    content = final_text or "".join(fragments)
+    content = final_text if final_text is not None else "".join(fragments)
     if not content:
         raise ValueError("no assistant output")
     return content, session_id
@@ -552,6 +587,8 @@ async def collect_cli_process(
         stdout_bytes, stderr_bytes = await proc.communicate()
         returncode = proc.returncode
         decoded = decoder.finish(stdout_bytes, stderr_bytes)
+        if returncode == 0 and decoded.content and hasattr(call, "snapshot_cli_response"):
+            call.snapshot_cli_response(decoded.content)
         return CollectedCliOutput(
             stdout=stdout_bytes,
             stderr=stderr_bytes,
@@ -559,24 +596,28 @@ async def collect_cli_process(
             decoded=decoded,
         )
 
+    async def route(updates: list[CliDisplayUpdate]) -> None:
+        for update in updates:
+            if update.kind in {"output", "reasoning", "stderr"}:
+                if update.message_complete and hasattr(call, "completed_message"):
+                    await call.completed_message(update.kind, update.text or "", update.message_id)
+                else:
+                    await call.output(update.kind, update.text or "")
+            elif update.kind == "tool_started":
+                await call.tool_started(update.tool_name or "unknown", update.value)
+            elif update.kind == "tool_finished":
+                await call.tool_finished(update.tool_name or "unknown", update.outcome, update.value)
+
     async def read_stream(stream: Any, feed_fn) -> bytes:
-        """Read from stream in 4 KiB chunks, route updates through call."""
+        """Read concurrently, retaining exact transport bytes and completed boundaries."""
         accumulated = b""
         while True:
             chunk = await stream.read(4096)
             if not chunk:
                 break
             accumulated += chunk
-            updates = feed_fn(chunk)
-            for update in updates:
-                if update.kind in {"output", "reasoning", "stderr"}:
-                    await call.output(update.kind, update.text or "")
-                elif update.kind == "tool_started":
-                    await call.tool_started(update.tool_name or "unknown", update.value)
-                elif update.kind == "tool_finished":
-                    await call.tool_finished(
-                        update.tool_name or "unknown", "completed", update.value
-                    )
+            await route(feed_fn(chunk))
+        await route(feed_fn(b"\n"))
         return accumulated
 
     # Read both streams concurrently
@@ -595,6 +636,8 @@ async def collect_cli_process(
 
     # Finalize decoder and extract session ID
     decoded = decoder.finish(stdout_bytes, stderr_bytes)
+    if returncode == 0 and decoded.content and hasattr(call, "snapshot_cli_response"):
+        call.snapshot_cli_response(decoded.content)
 
     return CollectedCliOutput(
         stdout=stdout_bytes,

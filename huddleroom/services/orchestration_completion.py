@@ -264,11 +264,20 @@ async def _run(command: tuple[str, ...], stdin: str | None, *, cwd: str | None =
         decoder = decoder_for_runtime(runtime) if observer is not None and runtime else None
         display = DisplayTextBuffer()
         async def emit(updates):
+            owner = getattr(observer, "__self__", None)
+            native_call = owner if isinstance(owner, AgentResponseCall) else None
             for update in updates:
-                if update.kind in {"output", "reasoning", "stderr"} and update.text:
-                    safe = display.feed(update.kind, update.text)
-                    if safe:
-                        await observer(update.kind, safe)
+                if update.kind in {"output", "reasoning", "stderr"}:
+                    if update.message_complete and native_call is not None:
+                        await native_call.completed_message(update.kind, update.text or "", update.message_id)
+                    elif update.text:
+                        safe = display.feed(update.kind, update.text, final=update.message_complete)
+                        if safe:
+                            await observer(update.kind, safe)
+                elif native_call is not None and update.kind == "tool_started":
+                    await native_call.tool_started(update.tool_name or "unknown", update.value)
+                elif native_call is not None and update.kind == "tool_finished":
+                    await native_call.tool_finished(update.tool_name or "unknown", update.outcome, update.value)
         async def read(stream: Any, feed=None) -> bytes:
             output = bytearray()
             while chunk := await stream.read(65536):

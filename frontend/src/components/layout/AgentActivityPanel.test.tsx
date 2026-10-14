@@ -12,6 +12,121 @@ import { isAgentResponseEvent, orderedCalls, AgentResponseEvent, reconcileAgentT
 import { AgentActivityPanel } from './AgentActivityPanel'
 import * as responseHelpers from '@/lib/agentResponse'
 
+describe('SPR189/190 readable followup public contracts', () => {
+  const id = 'fea808f0-ada9-488a-8962-1b1a919255be'
+  beforeEach(() => {
+    useAgentResponseStore.getState().clear()
+    useAgentResponseStore.getState().setProject('proj-123')
+  })
+  const responseNode = (container: Parameters<typeof descendants>[0]) =>
+    descendants(container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+  async function rendered(value: unknown) {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot(JSON.stringify(value)) } }))
+    return mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+  }
+  it.each([
+    ['run_state', 'run state'], ['action', 'action'], ['process', 'process'], ['team_configuration', 'team configuration'],
+    ['task', 'task'], ['gate', 'gate'], ['waits', 'waiting conditions'], ['warning', 'warning'], ['agent_execution', 'agent execution'],
+  ])('summarizes schema-supported %s evidence without Kind/Query/UUID details', async (kind, activity) => {
+    const value = { kind: 'evidence_query', query: { kind, agent_id: id, process_type: 'goal_definition' } }
+    const view = await rendered(value)
+    try {
+      expect(textOf(responseNode(view.container))).toBe(`Requested ${activity} evidence.`)
+      const detail = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-details')!
+      expect(textOf(detail)).toContain(id)
+      expect(textOf(detail)).toContain(kind)
+      expect(detail.getAttribute('open')).toBeNull()
+    } finally { view.cleanup() }
+  })
+  it.each(['delivery', 'implementation'])('renders v1 %s summary/work and resolves dependencies', async (planKind) => {
+    const view = await rendered({ schema_version: 1, plan_kind: planKind, summary: 'Build the readable Calls panel.', plan_items: [
+      { id: 'first', title: 'Discover contracts', work_function: 'research', scope: 'Existing events', deliverable: 'Contract notes',
+        agent_id: id, forbidden_work: ['No new adapter'], success_evidence: ['Recorded fixture'], why_runnable: 'No dependency' },
+      { id: 'second', title: 'Improve rendering', work_function: 'implementation', scope: 'Calls panel', deliverable: 'Readable UI',
+        depends_on: ['plan_item:first'], required_capabilities: ['frontend'], why_runnable: 'Contract established' },
+    ] })
+    try {
+      const response = textOf(responseNode(view.container))
+      for (const text of ['Summary', 'Work', 'Build the readable Calls panel.', 'No new adapter', 'Depends On', 'Discover contracts', 'Recorded fixture']) expect(response).toContain(text)
+      expect(response).not.toContain(id)
+      expect(response).not.toContain('Schema Version')
+      expect(response).not.toContain('plan_item:first')
+    } finally { view.cleanup() }
+  })
+  it('renders roadmap task and child-goal fields with constraints and dependencies', async () => {
+    const view = await rendered({ schema_version: 1, plan_kind: 'roadmap', summary: 'Ship safely.', plan_items: [
+      { item_key: 'task', unit_type: 'task', title: 'Check events', work_function: 'research', scope: 'CLI', deliverable: 'Fixtures', why_runnable: 'Ready' },
+      { item_key: 'goal', unit_type: 'goal', title: 'Readable activity', objective: 'Clear progress',
+        success_criteria: [{ key: 'readable', description: 'No raw metadata' }], constraints: { forbidden: ['Paid model calls'] },
+        allocation: { usd: 0 }, depends_on: ['task'], why_runnable: 'Fixture ready', goal_type: 'outcome' },
+    ] })
+    try {
+      const response = textOf(responseNode(view.container))
+      for (const text of ['Readable activity', 'Clear progress', 'No raw metadata', 'Paid model calls', 'Check events', 'Depends On']) expect(response).toContain(text)
+      expect(response).not.toContain('Schema Version')
+      expect(response).not.toContain('Unit Type')
+    } finally { view.cleanup() }
+  })
+  it.each([
+    { kind: 'transient', diagnosis: 'Artifact still uploading', wake: { expected_result: 'Artifact available', recheck_after_seconds: 30 } },
+    { kind: 'proposal', diagnosis: 'Missing planner', problem: 'No eligible author', general_updates: ['Assign a planner'], expected_effect: 'Planning can resume' },
+    { kind: 'capability_gap', diagnosis: 'No browser capability', missing_capability: 'Browser access', required_human_action: 'Enable browser access', wake_after: { kind: 'human_decision', decision: 'Browser granted' } },
+  ])('keeps terminal recovery $kind fields readable and actionable', async (value) => {
+    const view = await rendered(value)
+    try {
+      const response = textOf(responseNode(view.container))
+      expect(response).toContain(value.diagnosis)
+      if (value.kind === 'transient') expect(response).toContain('Artifact available')
+      if (value.kind === 'proposal') { expect(response).toContain('Assign a planner'); expect(response).toContain('Planning can resume') }
+      if (value.kind === 'capability_gap') { expect(response).toContain('Enable browser access'); expect(response).toContain('Human Action Required') }
+    } finally { view.cleanup() }
+  })
+  it('extracts request title and description, bounded to the preview allowance', () => {
+    const preview = responseHelpers.requestPreview({ kind: 'prompt', content: JSON.stringify({ title: 'Calls panel', description: 'Make progress readable. '.repeat(50) }), truncated: false })
+    expect(preview).toContain('Make progress readable.')
+    expect(preview).not.toContain('"description"')
+    expect(preview.length).toBeLessThanOrEqual(240)
+  })
+  it('separates commentary from final JSON and avoids wrapper-equivalence mismatches', () => {
+    const store = useAgentResponseStore.getState()
+    const value = { schema_version: 1, plan_kind: 'implementation', summary: 'Ready', plan_items: [] }
+    store.ingest(baseEvent())
+    store.ingest(sprOutput(1, 'Checking contracts.', 'output', { message_id: 'c', message_complete: true }))
+    store.ingest(sprOutput(2, JSON.stringify({ content: JSON.stringify(value), tool_calls: [] }), 'output', { message_id: 'f', message_complete: true }))
+    store.ingest(terminalEvent({ sequence: 3, payload: { final_response: finalSnapshot(JSON.stringify(value)) } }))
+    const presentation = responseHelpers.responsePresentation(useAgentResponseStore.getState().calls['call-1'])
+    expect(presentation.value).toEqual(value)
+    expect(presentation.commentary).toBe('Checking contracts.')
+    expect(presentation.mismatch).toBe(false)
+  })
+  it('keeps true divergence distinguishable from ordinary wrapper normalization', () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent()); store.ingest(sprOutput(1, '{"answer":"draft"}', 'output', { message_id: 'f', message_complete: true }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot('{"answer":"corrected"}') } }))
+    expect(responseHelpers.responsePresentation(useAgentResponseStore.getState().calls['call-1']).mismatch).toBe(true)
+  })
+  it.each([['', true], [null, true]])('explains a native tool-only wrapper with %s content', (content, toolOnly) => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent())
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot(JSON.stringify({ content, tool_calls: [{ id: 'tool' }] })) } }))
+    const presentation = responseHelpers.responsePresentation(useAgentResponseStore.getState().calls['call-1'])
+    expect(presentation.toolOnly).toBe(toolOnly)
+    expect(presentation.value).toBeUndefined()
+  })
+  it('keeps an empty native wrapper missing-content notice visible', async () => {
+    const view = await rendered({ content: '', tool_calls: [] })
+    try { expect(textOf(view.container)).toContain('No response text was returned'); expect(descendants(view.container).some((node) => node.getAttribute('data-testid') === 'call-response' && textOf(node).includes('No response text'))).toBe(true) }
+    finally { view.cleanup() }
+  })
+  it.each([{ kind: 'unrecognized', unexpected: '<script>alert(1)</script>' }, '{"schema_version":1,'])('unknown/malformed output stays inert and bounded', async (value) => {
+    const view = await rendered(value)
+    try { expect(descendants(view.container).some((node) => node.tagName === 'SCRIPT')).toBe(false); expect(textOf(responseNode(view.container)).length).toBeLessThan(20_000) }
+    finally { view.cleanup() }
+  })
+})
+
 // Shell test mocks (for mounted Shell tests)
 const shellTestState = vi.hoisted(() => ({
   projects: [] as Project[],

@@ -122,6 +122,8 @@ function eventToItem(event: AgentResponseEvent): AgentCallItem | null {
       type: 'output',
       stream: payload.stream as 'output' | 'reasoning' | 'stderr',
       text: payload.text as string,
+      messageId: typeof payload.message_id === 'string' ? payload.message_id : undefined,
+      messageComplete: payload.message_complete === true,
       sequence: event.sequence,
     }
   }
