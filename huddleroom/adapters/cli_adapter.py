@@ -24,7 +24,9 @@ from huddleroom.services.llm_structured_repair import cli_complete_with_repair
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.secret_redaction import redact_secrets
 from huddleroom.services.agent_response_stream import AgentResponseInvocation, InvocationContext
-from huddleroom.services.cli_streaming import collect_cli_process, is_resume_not_found, terminate_process_group
+from huddleroom.services.cli_streaming import (
+    collect_cli_process, is_resume_not_found, parse_partial_cli, terminate_process_group,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -577,9 +579,11 @@ class CliAdapter:
         )
 
         # 9. Race process completion against the reset fence and timeout.
+        partial_output: dict[str, bytes] = {}
+
         async def collect_task():
             """Collect CLI process output concurrently."""
-            collected = await collect_cli_process(proc, runtime=cli_runtime, call=call)
+            collected = await collect_cli_process(proc, runtime=cli_runtime, call=call, partial=partial_output)
             return collected.stdout, collected.stderr, collected.returncode
 
         # Use the invocation call within async context manager
@@ -592,7 +596,11 @@ class CliAdapter:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if collect_task_obj in done:
-                    stdout_bytes, stderr_bytes, exit_code = collect_task_obj.result()
+                    try:
+                        stdout_bytes, stderr_bytes, exit_code = collect_task_obj.result()
+                    except Exception:
+                        await self._terminate_process_group(proc)
+                        raise
                 else:
                     await self._terminate_process_group(proc)
                     collect_task_obj.cancel()
@@ -642,9 +650,13 @@ class CliAdapter:
                             )
                         return
 
+                    # Keep what the CLI emitted before the deadline; resumable only with a provider id.
+                    partial_text, partial_id = parse_partial_cli(cli_runtime, partial_output.get("stdout", b""))
                     session.status = "failed"
                     session.error = "timeout"
-                    session.resumable = True
+                    session.provider_session_id = partial_id or session.provider_session_id
+                    session.output = partial_text or session.output
+                    session.resumable = session.provider_session_id is not None
                     session.ended_at = datetime.now(timezone.utc)
                     self._store_roadmap_elapsed(session)
                     if not await finish_if_owned():
@@ -654,7 +666,7 @@ class CliAdapter:
                         "session_id": str(session_id),
                         "error": "timeout",
                         "project_id": str(session.project_id),
-                        "resumable": True,
+                        "resumable": session.resumable,
                     })
                     from huddleroom.services.session_sync import sync_task_from_session
                     await sync_task_from_session(db, session)

@@ -564,8 +564,38 @@ def decoder_for_runtime(runtime: str) -> CliStreamDecoder:
     return CliStreamDecoder(runtime)
 
 
+def parse_partial_cli(runtime: str, stdout: bytes) -> tuple[str, str | None]:
+    """Best-effort (output, provider session id) from stdout of a CLI that never finished."""
+    text = stdout.decode("utf-8", errors="ignore")
+    if runtime == "claude_code":
+        session_id, parts = None, []
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if isinstance(record.get("session_id"), str):
+                session_id = session_id or record["session_id"]
+            message = record.get("message")
+            if record.get("type") == "assistant" and isinstance(message, dict) and isinstance(message.get("content"), list):
+                parts.extend(b["text"] for b in message["content"]
+                             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+        return "\n".join(parts), session_id
+    if runtime in {"codex", "copilot", "opencode", "pi"}:
+        try:
+            return parse_jsonl_final(text, runtime)
+        except ValueError:
+            try:
+                return "", parse_jsonl_session_id(text, runtime)
+            except ValueError:
+                return "", None
+    return text, None
+
+
 async def collect_cli_process(
-    proc: Any, *, runtime: str, call: Any
+    proc: Any, *, runtime: str, call: Any, partial: dict[str, bytes] | None = None
 ) -> CollectedCliOutput:
     """Collect CLI subprocess output concurrently, routing updates through call.
 
@@ -573,6 +603,8 @@ async def collect_cli_process(
         proc: asyncio subprocess.Popen-like object with stdout, stderr, wait()
         runtime: CLI runtime identifier (claude_code, codex, aider, custom)
         call: AgentResponseCall to route updates through
+        partial: optional dict kept current with the stdout seen so far (key "stdout"),
+            so a caller that abandons the collection can still recover early output
 
     Returns:
         CollectedCliOutput with exact bytes and decoded content
@@ -616,6 +648,8 @@ async def collect_cli_process(
             if not chunk:
                 break
             accumulated += chunk
+            if partial is not None and feed_fn == decoder.feed_stdout:
+                partial["stdout"] = accumulated
             await route(feed_fn(chunk))
         await route(feed_fn(b"\n"))
         return accumulated

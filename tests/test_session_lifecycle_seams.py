@@ -215,3 +215,142 @@ async def test_cli_reset_watcher_cancel_syncs_linked_task(test_engine, tmp_path,
         assert stored.status == "cancelled"
         assert stored.ended_at is not None
         assert (await _reload(factory, Task, task.id)).status == "failed"
+
+
+async def _set_run_config(factory, session_id, **config):
+    async with factory() as db:
+        row = await db.get(Session, session_id)
+        row.metadata_ = {**(row.metadata_ or {}), "_run_config": config}
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_api_deadline_expiry_after_retryable_error_terminalizes_session(test_engine, tmp_path, monkeypatch):
+    import time
+
+    import litellm
+
+    from huddleroom.adapters import api_adapter
+
+    async def rate_limited(**_kwargs):
+        time.sleep(0.15)  # the claimed deadline passes while the provider call is failing
+        raise litellm.RateLimitError("retry", "openai", "gpt-4o-mini")
+
+    async def no_wait_for(awaitable, timeout=None):
+        return await awaitable  # lets the retryable error reach the retry handler, not a cancel
+
+    # Only wait_for is swapped (module-local); everything else stays asyncio.
+    monkeypatch.setattr(api_adapter, "asyncio", SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in ("get_running_loop", "sleep", "CancelledError")},
+        wait_for=no_wait_for))
+
+    async with _world(test_engine, tmp_path, monkeypatch) as (factory, _project, _agent, task, session):
+        await _set_run_config(factory, session.id, timeout=0.1)
+        with patch("litellm.acompletion", new=rate_limited):
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(session_tasks.execute_api_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed"
+        assert stored.error == "TimeoutError: claimed session timeout exhausted"
+        assert stored.ended_at is not None
+        assert stored.metadata_["attempt"]["result_status"] == "failed"
+        assert (await _reload(factory, Task, task.id)).status == "failed"
+
+
+class _StreamProc:
+    """CLI subprocess with real streams: emits chunks, then hangs (or fails the reader)."""
+    returncode = None
+    pid = 99999
+
+    def __init__(self, chunks=()):
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        for chunk in chunks:
+            self.stdout.feed_data(chunk)
+
+    async def wait(self):
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_cli_collector_failure_kills_process_group_and_terminalizes(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    proc = _StreamProc()
+    terminate = AsyncMock()
+
+    async def broken_collector(*_args, **_kwargs):
+        raise RuntimeError("collector blew up token=sk-abcdefghijklmnopqrstuvwxyz123456")
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=terminate), \
+                patch("huddleroom.adapters.cli_adapter.collect_cli_process", new=broken_collector), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=proc)):
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        terminate.assert_awaited()
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed"
+        assert stored.error.startswith("RuntimeError: collector blew up")
+        assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in stored.error
+        assert stored.metadata_["attempt"]["result_status"] == "failed"
+        assert (await _reload(factory, Task, task.id)).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cli_timeout_keeps_early_provider_id_and_partial_output_for_resume(test_engine, tmp_path, monkeypatch):
+    import json
+
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    lines = [
+        {"type": "system", "subtype": "init", "session_id": "prov-early-1"},
+        {"type": "assistant", "session_id": "prov-early-1",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "partial progress"}]}},
+    ]
+    proc = _StreamProc([(json.dumps(line) + "\n").encode() for line in lines])
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, task, session):
+        await _set_run_config(factory, session.id, timeout=0.5)
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=proc)):
+            await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed" and stored.error == "timeout"
+        assert stored.provider_session_id == "prov-early-1"
+        assert stored.output == "partial progress"
+        assert stored.resumable is True
+
+        async with factory() as db:
+            with patch.object(SessionService, "_schedule_dispatch_after_commit"):
+                await SessionService().resume(db, session.id)
+            await db.commit()
+        runner = (await _reload(factory, Session, session.id)).runner_task_id
+        spawn = AsyncMock(return_value=_OkProc())
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec", new=spawn):
+            await session_tasks.execute_cli_session(str(session.id), runner)
+        assert "prov-early-1" in spawn.await_args.args
+        resumed = await _reload(factory, Session, session.id)
+        assert resumed.status == "completed"
+        assert resumed.metadata_["resume_outcome"] == "resumed"
+
+
+@pytest.mark.asyncio
+async def test_cli_timeout_without_provider_id_is_not_resumable(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        await _set_run_config(factory, session.id, timeout=0.3)
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.error == "timeout"
+        assert stored.provider_session_id is None
+        assert stored.resumable is False

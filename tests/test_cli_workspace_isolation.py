@@ -169,7 +169,7 @@ async def test_timeout_kills_pipe_owning_child_after_group_leader_exits(test_eng
         assert session.status == "failed"
         assert session.error == "timeout"
         assert session.ended_at is not None
-        assert session.resumable is True  # SPR #85: timeout branch is resumable
+        assert session.resumable is False  # no provider session id was captured, so there is nothing to resume
         assert events.count("session.failed") == 1
     finally:
         if launched_proc is not None:
