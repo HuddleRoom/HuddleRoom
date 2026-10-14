@@ -142,6 +142,7 @@ _NON_MUTATING_ACTIONS = frozenset({
     "noop", "suggest_agent", "record_warning", "pause_run", "ask_human", "accept_plan", "recover_blocker",
 })
 ASK_HUMAN_EVENT_TYPE = "orchestration.human_input_required"
+GOAL_RESUMED_EVENT_TYPE = "orchestration.goal_resumed"
 NOOP_WAIT_EVENT_TYPE = "orchestration.waiting"
 AGENT_SUGGESTED_EVENT_TYPE = "orchestration.agent_suggested"
 DELEGATION_TASK_CREATED_EVENT_TYPE = "orchestration.delegation_task_created"
@@ -8315,20 +8316,32 @@ class OrchestrationService:
         project_id: uuid.UUID,
         goal_id: uuid.UUID,
     ) -> tuple[OrchestrationGoal, OrchestrationRun | None]:
-        goal = await self.get_goal(db, project_id, goal_id)
-        if goal is None:
-            raise HTTPException(status_code=404, detail="Orchestration goal not found")
-        await ProjectService().lock_workspace_boundary(db, project_id)
-        await ProjectService().require_runnable_project(db, project_id)
-        if goal.status != "paused":
-            raise HTTPException(status_code=409, detail=f"Cannot resume goal in status '{goal.status}'")
-        goal.status = "active"
-        run = await self.get_active_run_for_goal(db, project_id, goal_id)
-        # ponytail: resume always returns the run to 'running'; blocker re-detection
-        # is the tick loop's job (later phase), not this endpoint's.
-        if run is not None and run.status == "paused":
-            run.status = "running"
-        await db.flush()
+        async with self._lock_goal_for_baseline_transition(db, goal_id):
+            goal = await db.scalar(
+                select(OrchestrationGoal)
+                .where(OrchestrationGoal.id == goal_id, OrchestrationGoal.project_id == project_id)
+                .execution_options(populate_existing=True)
+            )
+            if goal is None:
+                raise HTTPException(status_code=404, detail="Orchestration goal not found")
+            await ProjectService().lock_workspace_boundary(db, project_id)
+            await ProjectService().require_runnable_project(db, project_id)
+            if goal.status != "paused":
+                raise HTTPException(status_code=409, detail=f"Cannot resume goal in status '{goal.status}'")
+            goal.status = "active"
+            run = await self.get_active_run_for_goal(db, project_id, goal_id)
+            # ponytail: resume always returns the run to 'running'; blocker re-detection
+            # is the tick loop's job (later phase), not this endpoint's.
+            if run is not None and run.status == "paused":
+                run.status = "running"
+            await db.flush()
+            # Committed with the status change; the worker ticks after commit, never here.
+            await emit_event_once(
+                db,
+                project_id,
+                GOAL_RESUMED_EVENT_TYPE,
+                {"goal_id": str(goal_id), "run_id": str(run.id) if run is not None else None},
+            )
         return goal, run
 
     async def cancel_goal(
@@ -11679,7 +11692,7 @@ class OrchestrationService:
         transaction is held across the analyzer call. A domain failure (flushed only) is committed; any
         other error rolls that step back and leaves the trigger/proposal for the next tick."""
         from huddleroom.services.orchestration_blocker_recovery import (
-            OrchestrationBlockerRecoveryService, RecoveryDiagnosisFailed, RecoveryProposalStale,
+            OrchestrationBlockerRecoveryService, RecoveryDiagnosisFailed, RecoveryProposalStale, _RunFenced,
         )
 
         transaction = db.sync_session.get_transaction()
@@ -11699,6 +11712,8 @@ class OrchestrationService:
                     await call()
                 except (RecoveryDiagnosisFailed, RecoveryProposalStale):
                     pass
+                except _RunFenced:
+                    await db.rollback()
                 except Exception:  # noqa: BLE001 -- one recovery step never fails the tick
                     await db.rollback()
                     logger.warning("recovery step failed for run %s", run_id, exc_info=True)
@@ -11712,6 +11727,8 @@ class OrchestrationService:
                         await call()
                     except (RecoveryDiagnosisFailed, RecoveryProposalStale):
                         pass
+            except _RunFenced:
+                pass
             except Exception:  # noqa: BLE001
                 logger.warning("recovery step failed for run %s", run_id, exc_info=True)
                 if on_error is not None:
@@ -11777,7 +11794,7 @@ class OrchestrationService:
                 try:
                     # Directly await diagnosis so cancellation cannot release
                     # admission while an analyzer is still unwinding.
-                    await step(lambda: service.diagnose(db, trigger_id),
+                    await step(lambda: service.diagnose(db, trigger_id, tick_owns_transaction=owns),
                                on_error=lambda: mark_diagnosis_error(trigger_id))
                 finally:
                     active.discard(trigger_id)

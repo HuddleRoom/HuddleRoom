@@ -187,7 +187,7 @@ def test_normalize_is_idempotent(monkeypatch):
 
 
 def test_matcher_table_equals_supported_events_minus_orchestration_events():
-    assert set(EVENT_MATCHER_KEYS) == SUPPORTED_EVENTS - {"orchestration.run_completed", "orchestration.steering_changed"}
+    assert set(EVENT_MATCHER_KEYS) == SUPPORTED_EVENTS - {"orchestration.run_completed", "orchestration.steering_changed", "orchestration.goal_resumed"}
 
 
 def test_prompt_table_is_sorted_json_of_matcher_keys():

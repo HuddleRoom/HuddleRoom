@@ -1156,3 +1156,21 @@ async def test_goal_detail_projects_current_unfulfilled_meeting_commitments(clie
     }
     assert commitments[str(open_item.id)]["state"] == "open"
     assert commitments[str(open_item.id)]["task_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_resume_persists_one_goal_resumed_event_and_repeat_resume_adds_none(client, db_session, test_project):
+    from huddleroom.models.event_log import EventLog
+    from huddleroom.services.orchestration_service import GOAL_RESUMED_EVENT_TYPE
+
+    pid = test_project.id
+    goal_id = await _create_goal_id(client, pid)
+    assert (await client.post(f"/api/v1/projects/{pid}/orchestration/goals/{goal_id}/pause")).status_code == 200
+    assert (await client.post(f"/api/v1/projects/{pid}/orchestration/goals/{goal_id}/resume")).status_code == 200
+    assert (await client.post(f"/api/v1/projects/{pid}/orchestration/goals/{goal_id}/resume")).status_code == 409
+
+    rows = (await db_session.scalars(
+        select(EventLog).where(EventLog.event_type == GOAL_RESUMED_EVENT_TYPE)
+    )).all()
+    assert len(rows) == 1
+    assert rows[0].payload["goal_id"] == str(goal_id)

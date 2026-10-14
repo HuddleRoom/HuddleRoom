@@ -36,7 +36,7 @@ SUPPORTED_EVENTS = frozenset({
     "artifact.breaking_change", "meeting.scheduled",
     "meeting.concluded", "graph.run_completed", "graph.run_failed",
     "graph.run_advanced", "orchestration.run_completed",
-    "orchestration.steering_changed",
+    "orchestration.steering_changed", "orchestration.goal_resumed",
 })
 
 

@@ -118,8 +118,10 @@ async def seed_spr180(sessions, tmp_path, *, mode="create", independent=False, e
         agents = [implementer]
         planner = None
         if mode == "update":
-            planner = make_agent(name="release-planner", role="planner", description="", system_prompt="",
-                                 capabilities=["planning"])
+            # Valid at hierarchy time (the eligibility guard rejects ineligible assignments);
+            # degraded to the legacy stale/vague state after the baseline completes below.
+            planner = make_agent(name="release-planner", role="planner", description=PLANNER_DESCRIPTION,
+                                 system_prompt=PLANNER_PROMPT, capabilities=["planning"])
             agents.append(planner)
         inactive = None
         if extra_inactive:
@@ -138,8 +140,12 @@ async def seed_spr180(sessions, tmp_path, *, mode="create", independent=False, e
         if planner is not None:
             await assign(s, project.id, run.id, planner, "planning")
         await complete_baseline_processes(s, goal, run)
-        await s.commit()
         definition = await OrchestrationProcessService().get_current(s, goal.id, "agent_definition_review")
+        if planner is not None:  # legacy stale eligibility (SPR 180 / Mimlo): hierarchy predates the guard
+            planner.description = planner.system_prompt = ""
+            definition.outputs = {**definition.outputs,
+                                  "eligibility": {**definition.outputs["eligibility"], str(planner.id): []}}
+        await s.commit()
         reviews = {review.agent_id: review.id for review in (await s.scalars(select(OrchestrationAgentReview).where(
             OrchestrationAgentReview.goal_id == goal.id,
             OrchestrationAgentReview.source_process_run_id == definition.id))).all()}

@@ -7,6 +7,8 @@ event or human while holding a lock: a wait is stored and the call returns.
 """
 from __future__ import annotations
 
+import inspect
+import json
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -19,6 +21,7 @@ from uuid import UUID
 from fastapi import HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import (
     ACTIVE_RUN_STATUSES, OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun,
@@ -40,7 +43,7 @@ from huddleroom.services.orchestration_goal_definition import goal_objective_wit
 from huddleroom.services.orchestration_llm_decision_adapter import _redact_secrets
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_recovery_analyzer import (
-    MAX_RECOVERY_EVIDENCE_ROUNDS, RecoveryAnalyzer, RecoveryContractRejected,
+    MAX_RECOVERY_EVIDENCE_ROUNDS, RecoveryAnalysisFenced, RecoveryAnalyzer, RecoveryContractRejected,
     RecoveryEvidenceLimitReached, RecoveryEvidenceUnavailable, RecoveryProviderUnavailable,
 )
 from huddleroom.services.orchestration_recovery_configuration import RecoveryConfigurationService
@@ -68,6 +71,7 @@ ANALYSIS_CONTRACT_REJECTED = "analysis_contract_rejected"
 ANALYSIS_EVIDENCE_FAILED = "analysis_evidence_failed"
 ANALYSIS_EVIDENCE_LIMIT = "analysis_evidence_limit"
 ADMISSION_REJECTED = "baseline_repair_admission_rejected"
+_ANALYZER_FAILURES = (ANALYSIS_CONTRACT_REJECTED, ANALYSIS_EVIDENCE_LIMIT)
 _NOT_A_REFUSAL = (ANALYSIS_FAILED, ANALYSIS_PROVIDER_FAILED, ANALYSIS_EVIDENCE_FAILED, ADMISSION_REJECTED)
 _WRAPPER_TYPES = ("recovery_apply", "recovery_verify", "recovery_retry")
 _GAP_KEY_PREFIX = RECOVERY_GAP_DECISION_KEY_PREFIX
@@ -126,8 +130,8 @@ class RecoveryDiagnosisFailed(Exception):
         self.code = code
 
 
-class _RunFenced(HTTPException):
-    """Reset/run-identity fence: always propagates as a 409, never handled as a step failure."""
+class _RunFenced(HTTPException, RecoveryAnalysisFenced):
+    """Lifecycle fence: propagates as a 409, never handled as a step failure."""
 
 
 def _trigger_key(trigger: RecoveryTriggerV1) -> str:
@@ -156,6 +160,14 @@ def _delegations(request: dict) -> set[tuple]:
 
 def _safe_text(value: object, limit: int = 1_000) -> str:
     return _redact_secrets(str(value))[:limit]
+
+
+def _redacted_evidence_json(value: object) -> object:
+    text = _redact_secrets(json.dumps(value, default=str))
+    try:
+        return json.loads(text)
+    except ValueError:  # ponytail: redaction can consume a closing quote; keep a bounded redacted text view
+        return {"redacted": text[:2_000]}
 
 
 def _utcnow() -> datetime:
@@ -188,12 +200,14 @@ class OrchestrationBlockerRecoveryService:
 
     # ---- diagnosis -------------------------------------------------------------------------------
 
-    async def diagnose(self, db: AsyncSession, trigger_action_id: UUID) -> OrchestrationAction:
+    async def diagnose(
+        self, db: AsyncSession, trigger_action_id: UUID, *, tick_owns_transaction: bool = False,
+    ) -> OrchestrationAction:
         trigger_action = await db.get(OrchestrationAction, trigger_action_id, populate_existing=True)
         if trigger_action is None or trigger_action.action_type != "recovery_trigger":
             raise HTTPException(status_code=404, detail="Recovery trigger not found")
         trigger = RecoveryTriggerV1.model_validate(trigger_action.request)
-        require_baseline_available(trigger.goal_id)
+        await self._require_diagnosis_runnable(db, trigger.goal_id, trigger.run_id)
         if trigger_action.status != "reserved":
             return await self._diagnosed_result(db, trigger_action)
         run = await db.get(OrchestrationRun, trigger.run_id)
@@ -204,7 +218,7 @@ class OrchestrationBlockerRecoveryService:
         if await self._blocker_gone(db, run, trigger, trigger_action):
             # The source no longer blocks anything: close the trigger without a card or warning.
             async with self.orchestration._lock_goal_for_baseline_transition(db, goal.id):
-                await self._require_run_current(db, goal.id, run.id)
+                await self._require_diagnosis_runnable(db, goal.id, run.id)
                 if await self._claim(db, trigger_action):
                     trigger_action.dispatch_contract = {**contract, "closed": "blocker_gone"}
                     await self.orchestration._mark_action_completed(
@@ -214,15 +228,29 @@ class OrchestrationBlockerRecoveryService:
         queries: list[dict] = []
         raw_outputs: list[str] = []
         escalation = await self._escalation(db, run, trigger, trigger_action, contract)
+        if isinstance(escalation, str):
+            # Analyzer exhaustion is not a missing human capability: fail the trigger with the concrete error.
+            async with self.orchestration._lock_goal_for_baseline_transition(db, goal.id):
+                await self._require_diagnosis_runnable(db, goal.id, run.id)
+                trigger_action = await db.get(OrchestrationAction, trigger_action.id, populate_existing=True) or trigger_action
+                if trigger_action.status == "reserved":
+                    await self._ensure_warning(db, goal, run, trigger_action, _safe_text(
+                        f"Blocked, recovery analysis failed: {escalation}", 4_000))
+                    await self.orchestration.mark_action_failed(db, trigger_action, escalation[:4_000])
+                    await db.flush()
+            return trigger_action
         if escalation is not None:
             snapshot = {"escalation": escalation.model_dump(mode="json")}
         else:
             snapshot = await RecoveryContextBuilder().build(db, trigger, registry_manifest=self.registry.manifest())
             if contract.get("evidence"):
                 snapshot["lineage_evidence"] = _bounded({"items": contract["evidence"]}, RECOVERY_EVIDENCE_MAX_BYTES)
+            if contract.get("analysis_feedback"):  # latest failed attempt on this same unchanged trigger only
+                snapshot["prior_attempt"] = contract["analysis_feedback"]
         evidence = RecoveryEvidenceService()
 
         async def recorded_query(query):
+            await self._require_diagnosis_runnable(db, goal.id, run.id)
             record = {"query": query.model_dump(mode="json")}
             queries.append(record)
             try:
@@ -250,16 +278,38 @@ class OrchestrationBlockerRecoveryService:
             await db.flush()
             return RecoveryDiagnosisFailed(trigger_action.id, row.id, code)
 
+        async def before_completion() -> None:
+            transaction = db.sync_session.get_transaction()
+            if (tick_owns_transaction and transaction is not None
+                    and transaction.origin == SessionTransactionOrigin.AUTOBEGIN
+                    and not db.in_nested_transaction()
+                    and not (db.new or db.dirty or db.deleted)):
+                # Only this tick's read transaction ends; never commit caller work.
+                await db.commit()
+            # This fresh admission is the final await before the provider starts.
+            await self._require_diagnosis_runnable(db, goal.id, run.id)
+
         if escalation is not None:
             assessment = escalation
         else:
             # The LLM call runs without any lock; the claim below decides which result persists.
+            analyzer_options = {}
+            if isinstance(self.analyzer, RecoveryAnalyzer):
+                parameters = inspect.signature(self.analyzer.analyze).parameters.values()
+                if any(parameter.kind == inspect.Parameter.VAR_KEYWORD or (
+                        parameter.name == "before_completion"
+                        and parameter.kind in {inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+                ) for parameter in parameters):
+                    analyzer_options["before_completion"] = before_completion
             try:
                 assessment = await self.analyzer.analyze(
                     snapshot, project_id=goal.project_id, evidence_query=recorded_query, on_raw=raw_outputs.append,
+                    **analyzer_options,
                 )
+            except _RunFenced:
+                raise
             except Exception as exc:
-                await self._require_run_current(db, goal.id, run.id)
+                await self._require_diagnosis_runnable(db, goal.id, run.id)
                 code = ANALYSIS_FAILED
                 if isinstance(exc, RecoveryProviderUnavailable):
                     code = ANALYSIS_PROVIDER_FAILED
@@ -271,16 +321,24 @@ class OrchestrationBlockerRecoveryService:
                     code = ANALYSIS_EVIDENCE_LIMIT
                 # Contract/limit failures consume the existing logical refusal
                 # allowance. Outages and internal errors retain error backoff.
+                updated = dict(contract)
                 if code in _NOT_A_REFUSAL:
-                    trigger_action.dispatch_contract = {
-                        **contract, "last_diagnosis_error_at": datetime.now(timezone.utc).isoformat(),
+                    updated["last_diagnosis_error_at"] = datetime.now(timezone.utc).isoformat()
+                if code in _ANALYZER_FAILURES:
+                    # Carry only this attempt's successful, redacted, bounded evidence into the next one.
+                    updated["analysis_feedback"] = {
+                        "rejection": _safe_text(code, 200),
+                        "evidence": _bounded({"items": [
+                            _redacted_evidence_json(q["result"]) for q in queries if "result" in q
+                        ]}, RECOVERY_EVIDENCE_MAX_BYTES),
                     }
+                trigger_action.dispatch_contract = updated
                 raise await rejected(None, _redact_secrets(f"{code}: {exc}")[:4_000]) from None
-        # A reset during the provider call discards this result: nothing is written for the old run.
-        await self._require_run_current(db, goal.id, run.id)
+        # Pause or reset during a provider call discards the assessment.
+        await self._require_diagnosis_runnable(db, goal.id, run.id)
 
         async with self.orchestration._lock_goal_for_baseline_transition(db, goal.id):
-            await self._require_run_current(db, goal.id, run.id)
+            await self._require_diagnosis_runnable(db, goal.id, run.id)
             trigger_action = await db.get(OrchestrationAction, trigger_action.id, populate_existing=True)
             if trigger_action is None:
                 raise HTTPException(status_code=409, detail="Baseline operation discarded by reset")
@@ -367,6 +425,20 @@ class OrchestrationBlockerRecoveryService:
         )
         return verdict.verdict == "live"
 
+    async def _require_diagnosis_runnable(self, db: AsyncSession, goal_id: UUID, run_id: UUID) -> None:
+        """Fresh diagnosis admission; paused authority operations keep their broader contract."""
+        with db.no_autoflush:
+            await self._run_status(db, goal_id, run_id)
+            state = (await db.execute(select(OrchestrationGoal.status, OrchestrationRun.status).join(
+                OrchestrationRun, OrchestrationRun.goal_id == OrchestrationGoal.id,
+            ).where(OrchestrationGoal.id == goal_id, OrchestrationRun.id == run_id))).one_or_none()
+        try:
+            require_baseline_available(goal_id)
+        except HTTPException as exc:
+            raise _RunFenced(status_code=exc.status_code, detail=exc.detail) from None
+        if state is None or state[0] not in {"active", "blocked"} or state[1] not in {"running", "blocked"}:
+            raise _RunFenced(status_code=409, detail="Recovery diagnosis is not runnable")
+
     async def _require_run_current(self, db: AsyncSession, goal_id: UUID, run_id: UUID) -> None:
         """Reset fence: no reservation in progress and the original run still exists and is active."""
         if await self._run_status(db, goal_id, run_id) not in ACTIVE_RUN_STATUSES:
@@ -417,7 +489,7 @@ class OrchestrationBlockerRecoveryService:
         return None
 
     async def _escalation(self, db, run, trigger: RecoveryTriggerV1, trigger_action: OrchestrationAction,
-                          contract: dict) -> CapabilityGapAssessmentV1 | None:
+                          contract: dict) -> CapabilityGapAssessmentV1 | str | None:
         """After the attempt cap, one actionable human decision replaces any further proposal.
 
         Two budgets: failed approved attempts in the lineage, and refused diagnoses of this one trigger
@@ -429,6 +501,8 @@ class OrchestrationBlockerRecoveryService:
             # Outages and baseline drift are not refusals of the diagnosis (F3).
             and not (row.rejection_reason or "").startswith(_NOT_A_REFUSAL)]
         if len(refusals) >= MAX_RECOVERY_ATTEMPTS_WITHOUT_PROGRESS:
+            if all((row.rejection_reason or "").startswith(_ANALYZER_FAILURES) for row in refusals):
+                return _safe_text(max(refusals, key=lambda row: row.created_at).rejection_reason, 4_000)
             return self._escalation_gap(trigger, f"{len(refusals)} diagnoses of this blocker were refused", [
                 {"label": "A recovery diagnosis was refused.",
                  "value": {"code": _safe_text(row.rejection_reason or "rejected", 200)},

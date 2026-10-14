@@ -3153,3 +3153,103 @@ async def test_definition_persist_recovery_acceptance_rejects_untyped_payload_wi
         except Exception:  # noqa: BLE001
             await s.rollback()
     assert await cfg_fresh_snapshot(sessions, seeded.goal_id) == before
+
+
+class CountingApprover:
+    def __init__(self):
+        self.calls = 0
+
+    @staticmethod
+    def build_request(agent_snapshot, goal_snapshot, candidate_work_functions, project=None):
+        return {"agent": agent_snapshot, "goal": goal_snapshot,
+                "candidate_work_functions": candidate_work_functions}
+
+    async def review_request(self, request, candidate_work_functions, *, project_id=None):
+        self.calls += 1
+        return SemanticAgentAssessment("approved", (), "ok", tuple(candidate_work_functions))
+
+
+async def _age_policy(db_session, goal):
+    """Simulate a review stored under the removed deterministic rules."""
+    current = await _current_process(db_session, goal)
+    outputs = {**current.outputs, "eligibility": {key: [] for key in current.outputs["eligibility"]}}
+    outputs.pop("deterministic_policy")
+    current.outputs = outputs
+    for review in await db_session.scalars(select(OrchestrationAgentReview).where(
+        OrchestrationAgentReview.source_process_run_id == current.id
+    )):
+        review.approved_for_work_functions = []
+    await db_session.flush()
+    return current
+
+
+@pytest.mark.asyncio
+async def test_old_policy_unchanged_review_repairs_eligibility_without_analyzer(
+    db_session, review_goal, review_run
+):
+    from huddleroom.services.orchestration_agent_definition_review import (
+        DETERMINISTIC_POLICY, AgentDefinitionReviewProcess,
+    )
+
+    agent = await _persist_agent(db_session, description="Writes code.", system_prompt="Implement changes.")
+    await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
+    analyzer = CountingApprover()
+    process = AgentDefinitionReviewProcess(analyzer=analyzer)
+    await process.advance(db_session, review_goal, review_run)
+    current = await _age_policy(db_session, review_goal)
+
+    summary = await process.advance(db_session, review_goal, review_run)
+
+    assert summary["status"] == "completed" and analyzer.calls == 1
+    assert current.outputs["eligibility"] == {str(agent.id): ["implementation"]}
+    assert current.outputs["deterministic_policy"] == DETERMINISTIC_POLICY
+
+
+@pytest.mark.asyncio
+async def test_old_policy_applied_approved_edit_repairs_without_second_analyzer_call(
+    db_session, review_goal, review_run, test_user
+):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    agent = await _persist_agent(db_session, description="Helps with code.", system_prompt="Be useful.")
+    await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
+    analyzer = SequencedSemanticAnalyzer()
+    process = AgentDefinitionReviewProcess(analyzer=analyzer)
+    await process.advance(db_session, review_goal, review_run)
+    decision = (await OrchestrationAuthorityDecisionService().list_decisions(
+        db_session, review_goal.id, status="pending"
+    ))[0]
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option="approve", reason="ok", decided_by_user_id=test_user.id,
+    )
+    await process.advance(db_session, review_goal, review_run)
+    current = await _age_policy(db_session, review_goal)
+
+    await process.advance(db_session, review_goal, review_run)
+
+    assert analyzer.calls == 1
+    assert current.outputs["eligibility"] == {str(agent.id): ["implementation"]}
+
+
+@pytest.mark.asyncio
+async def test_old_policy_unapproved_drift_reruns_semantic_review_once_and_grants_nothing(
+    db_session, review_goal, review_run
+):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    agent = await _persist_agent(db_session, description="Writes code.", system_prompt="Implement changes.")
+    await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
+    analyzer = CountingApprover()
+    process = AgentDefinitionReviewProcess(analyzer=analyzer)
+    await process.advance(db_session, review_goal, review_run)
+    old = await _age_policy(db_session, review_goal)
+    agent.description = "Quietly rewritten out of band."
+    review_run.phase = "authorized"
+    await db_session.flush()
+
+    await process.advance(db_session, review_goal, review_run)
+    assert analyzer.calls == 1 and old.outputs["eligibility"] == {str(agent.id): []}
+    assert "deterministic_policy" not in old.outputs
+
+    await process.advance(db_session, review_goal, review_run, manual=True)
+    assert analyzer.calls == 2

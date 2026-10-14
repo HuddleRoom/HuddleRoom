@@ -110,6 +110,10 @@ def _row(row: Any, *fields: str) -> dict[str, Any]:
     return {field: _json(getattr(row, field)) for field in fields}
 
 
+# Reads the `deterministic_policy` marker written by orchestration_agent_definition_review (read defensively).
+_REVIEW_POLICY_KEYS = ("deterministic_policy",)
+
+
 def _safe_process(row: OrchestrationProcessRun, *, json_safe: bool = True) -> dict[str, Any]:
     outputs = row.outputs if isinstance(row.outputs, dict) else {}
     safe_outputs = {
@@ -118,6 +122,9 @@ def _safe_process(row: OrchestrationProcessRun, *, json_safe: bool = True) -> di
             "team_structure_reviewed", "status", "gates",
         ) if key in outputs
     }
+    if row.process_type == "agent_definition_review":
+        # Accepted eligibility and the deterministic-policy marker only; never review prose or semantic detail.
+        safe_outputs.update({key: outputs[key] for key in ("eligibility", *_REVIEW_POLICY_KEYS) if key in outputs})
     value = {"id": row.id, "process_type": row.process_type, "status": row.status,
              "run_id": row.run_id, "outputs": safe_outputs}
     return _json(value) if json_safe else value

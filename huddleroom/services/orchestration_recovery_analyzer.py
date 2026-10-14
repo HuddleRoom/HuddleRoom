@@ -44,6 +44,10 @@ class RecoveryEvidenceLimitReached(ValueError):
     """The analyzer requested evidence beyond its bounded allowance."""
 
 
+class RecoveryAnalysisFenced(Exception):
+    """Lifecycle admission stopped; bypass provider and evidence error classification."""
+
+
 def _recovery_examples() -> dict[str, dict]:
     """Shape examples only: replace example IDs with authoritative context IDs."""
     source_id = "00000000-0000-0000-0000-000000000001"
@@ -74,11 +78,16 @@ class RecoveryAnalyzer:
         self._completion_fn = get_orchestration_completion(completion_fn)
 
     @staticmethod
-    def _request(snapshot: dict, evidence: list[EvidenceV1]) -> dict[str, Any]:
+    def _request(snapshot: dict, evidence: list[EvidenceV1], *, remaining: int = MAX_RECOVERY_EVIDENCE_ROUNDS,
+                 note: str | None = None) -> dict[str, Any]:
+        if remaining > 0:
+            budget = (f"You may request at most {remaining} more evidence queries with an evidence_query object. "
+                      "Otherwise return one terminal assessment: transient, proposal, or capability_gap. ")
+        else:
+            budget = ("The evidence budget is spent: do NOT return an evidence_query. Return one terminal "
+                      "assessment now: transient, proposal, or capability_gap. ")
         prompt = (
-            "Diagnose the recovery blocker. Return one JSON object only. You may request evidence with "
-            'an evidence_query object. Otherwise return one terminal '
-            "assessment: transient, proposal, or capability_gap. Never author IDs, versions, retry targets, "
+            "Diagnose the recovery blocker. Return one JSON object only. " + budget + "Never author IDs, versions, retry targets, "
             "authority, hashes, registry data, secrets, predicates, queries, or executable code. "
             "Reuse authoritative IDs from the snapshot/evidence for evidence citations and queries. "
             "The schemas below are authoritative; include every required field. "
@@ -92,7 +101,8 @@ class RecoveryAnalyzer:
             "model": settings.orchestration_model,
             "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": _redact_secrets(json.dumps({"snapshot": snapshot, "evidence": [item.model_dump(mode="json") for item in evidence]}, sort_keys=True, default=str))},
+                {"role": "user", "content": _redact_secrets(json.dumps({"snapshot": snapshot, "evidence": [item.model_dump(mode="json") for item in evidence],
+                                                                       "queries_remaining": remaining, **({"note": note} if note else {})}, sort_keys=True, default=str))},
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
@@ -105,11 +115,18 @@ class RecoveryAnalyzer:
         project_id: UUID,
         evidence_query: Callable[[RecoveryEvidenceQueryV1], Awaitable[EvidenceV1]],
         on_raw: Callable[[str], None] | None = None,
+        before_completion: Callable[[], Awaitable[None]] | None = None,
     ) -> RecoveryAssessmentV1:
         """`on_raw` receives each redacted, bounded raw model output (for audit storage)."""
         evidence: list[EvidenceV1] = []
+        seen: set[str] = set()
+        note: str | None = None
+        rounds = 0  # a duplicate query spends a round but repeats no I/O
         for _ in range(MAX_RECOVERY_EVIDENCE_ROUNDS + 1):
-            request = self._request(snapshot, evidence)
+            if before_completion is not None:
+                await before_completion()
+            request = self._request(snapshot, evidence, remaining=MAX_RECOVERY_EVIDENCE_ROUNDS - rounds, note=note)
+            note = None
 
             def parse(raw: str) -> Any:
                 if on_raw is not None:
@@ -130,6 +147,10 @@ class RecoveryAnalyzer:
                         observation_seen = True
                         await observer(stream, text)
                     values = {**values, "observer": observed}
+                # Admission fences are lifecycle stops, not provider failures. Check
+                # every physical call, including structured repairs and fallbacks.
+                if before_completion is not None:
+                    await before_completion()
                 try:
                     response = await self._completion_fn(**values)
                 except Exception as exc:
@@ -168,12 +189,22 @@ class RecoveryAnalyzer:
                 )
             except ValueError as exc:
                 raise RecoveryContractRejected(_redact_secrets(str(exc))) from None
+            if before_completion is not None:
+                await before_completion()
             if getattr(result, "kind", None) not in {"run_state", "action", "process", "team_configuration", "task", "gate", "waits", "warning", "agent_execution"}:
                 return result
-            if len(evidence) == MAX_RECOVERY_EVIDENCE_ROUNDS:
+            if rounds == MAX_RECOVERY_EVIDENCE_ROUNDS:
                 raise RecoveryEvidenceLimitReached("recovery evidence round limit reached")
+            rounds += 1
+            key = json.dumps(result.model_dump(mode="json"), sort_keys=True, default=str)
+            if key in seen:
+                note = "That evidence query was already answered above; use it or return a terminal assessment."
+                continue
+            seen.add(key)
             try:
                 evidence.append(await evidence_query(result))
+            except RecoveryAnalysisFenced:
+                raise
             except Exception as exc:
                 raise RecoveryEvidenceUnavailable(_redact_secrets(f"Recovery evidence failed: {exc}")) from None
-        raise RuntimeError("recovery analysis exhausted")
+        raise RecoveryEvidenceLimitReached("recovery evidence round limit reached")

@@ -118,8 +118,19 @@ async def test_public_ticks_exhaust_three_contract_refusals_without_provider_bac
         assert len(rejected) == 3
         assert all(row.rejection_reason.startswith(
             "analysis_evidence_limit" if evidence_limit else "analysis_contract_rejected") for row in rejected)
-        assert all(len(row.input_snapshot["evidence_queries"]) == (4 if evidence_limit else 0) for row in rejected)
-        assert len([row for row in exchanges if row.validator_status == "accepted"]) == 1
+        assert all(len(row.input_snapshot["evidence_queries"]) == (1 if evidence_limit else 0) for row in rejected)
+        # Analyzer exhaustion is not a capability gap: no escalation exchange, no recovery_gap decision.
+        assert [row for row in exchanges if row.validator_status == "accepted"] == []
+        from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+        gaps = list(await check.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.decision_key.startswith("recovery_gap:"))))
+        assert gaps == []
+        trigger = await check.get(OrchestrationAction, trigger_id)
+        assert trigger.status == "failed"
+        assert trigger.error.startswith("analysis_evidence_limit" if evidence_limit else "analysis_contract_rejected")
+        # Retry feedback carries only the latest attempt, bounded.
+        assert trigger.dispatch_contract["analysis_feedback"]["rejection"] == (
+            "analysis_evidence_limit" if evidence_limit else "analysis_contract_rejected")
 
 
 @pytest.mark.asyncio

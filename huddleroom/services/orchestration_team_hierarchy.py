@@ -528,11 +528,16 @@ class TeamHierarchyProcess:
 
         gaps = self._gaps(proposal, agent_definition_review_skipped)
         routing_gaps = self._routing_gaps(proposal, agent_definition_review_skipped)
+        standard_eligible = goal.weight == "standard" and not (
+            set(routing_gaps) & _STANDARD_TIER_BLOCKING_GAPS
+        )
+        if standard_eligible and await self._park_on_ineligible_assignment(
+            db, goal, run, current, proposal
+        ):
+            return self._summary("waiting_decision")
         warnings = await self._write_warnings(db, goal, run, current, proposal)
         await self._write_memory(db, goal, run, proposal)
-        if goal.weight == "standard" and not (
-            set(routing_gaps) & _STANDARD_TIER_BLOCKING_GAPS
-        ):
+        if standard_eligible:
             await self._complete(
                 db,
                 goal,
@@ -606,6 +611,10 @@ class TeamHierarchyProcess:
                     None,
                 )
                 if selected is not None and isinstance(selected.get("proposal"), dict):
+                    if await self._park_on_ineligible_assignment(
+                        db, goal, run, current, selected["proposal"]
+                    ):
+                        return self._summary("waiting_decision")
                     if current.status == "waiting_decision":
                         await self.process_service.resume_process(db, current)
                     await self._complete(
@@ -873,6 +882,8 @@ class TeamHierarchyProcess:
                         "independent_verification_possible_or_overridden": True,
                     },
                 }
+                if await self._park_on_ineligible_assignment(db, goal, run, current, outputs):
+                    return self._summary("waiting_decision")
                 if current.status == "waiting_decision":
                     await self.process_service.resume_process(db, current)
                 await self.process_service.complete_process(db, current, outputs=outputs)
@@ -928,6 +939,41 @@ class TeamHierarchyProcess:
                 questions_created += 1
         await self.process_service.park_process(db, current)
         return self._summary("waiting_decision", questions_created)
+
+    async def _park_on_ineligible_assignment(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+        current: OrchestrationProcessRun, proposal: dict,
+    ) -> bool:
+        """True (and parked behind the stale-inputs suggestion) when an accepted
+        assignment is not covered by the current agent-definition eligibility."""
+        from huddleroom.services.orchestration_agent_definition_review import accepted_work_functions
+
+        accepted = await accepted_work_functions(db, goal.id)
+        if accepted is None:
+            return False
+        pairs = (
+            [(row["agent_ref"], row["work_function"]) for row in proposal["assignments"]]
+            if "assignments" in proposal
+            else [(agent_id, work_function) for work_function, agent_id in proposal.get("role_to_agent", {}).items()]
+        )
+        review = await self.process_service.get_current(db, goal.id, "agent_definition_review")
+        considered: dict[str, set[str]] = {}  # functions the review actually evaluated, per agent
+        for item in await self.review_service.list_reviews(db, goal.id):
+            if review is not None and item.source_process_run_id == review.id and item.agent_id is not None:
+                considered.setdefault(str(item.agent_id), set()).update(item.proposed_work_functions or [])
+        # ponytail: functions the review never evaluated are not conflicts (select_plan_author still gates them)
+        if not any(
+            work_function in considered.get(str(agent_ref), ())
+            and work_function not in (accepted.get(str(agent_ref)) or [])
+            for agent_ref, work_function in pairs
+        ):
+            return False
+        await self.warning_service.suggest_stale_inputs(
+            db, goal.id, process_type=PROCESS_TYPE, process_run_id=current.id,
+            step_label="agent eligibility", run_id=run.id,
+        )
+        await self.process_service.park_process(db, current)
+        return True
 
     async def _apply_reserved_agents(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, current: OrchestrationProcessRun,

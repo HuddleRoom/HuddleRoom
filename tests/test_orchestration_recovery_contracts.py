@@ -857,6 +857,12 @@ async def test_recovery_analyzer_preserves_failure_classification(failure, expec
     completion = AsyncMock(return_value={"choices": [{"message": {"content": json.dumps(
         {"kind": "proposal"} if failure == "contract" else query,
     )}}]})
+    if failure == "limit":  # four distinct lookups, then a fifth query where only a terminal answer is allowed
+        queries = [{"kind": "waits"}, {"kind": "team_configuration"},
+                   {"kind": "run_state", "run_id": str(uuid4())}, {"kind": "run_state", "run_id": str(uuid4())},
+                   {"kind": "run_state", "run_id": str(uuid4())}]
+        completion.side_effect = [{"choices": [{"message": {"content": json.dumps(
+            {"kind": "evidence_query", "query": q})}}]} for q in queries]
     if failure == "provider":
         completion.side_effect = OSError("provider transport failed")
     evidence = AsyncMock(return_value=EvidenceV1.model_validate(_evidence()))
@@ -1082,3 +1088,83 @@ async def test_recovery_advertised_injection_postobservation_never_falls_back(re
     assert {event.payload["stream"] for event in outputs} == {"output", "reasoning"}
     terminals = [event for event in recovery_call_events if event.event_type == "agent_response.terminal"]
     assert len(terminals) == 1 and terminals[0].payload["status"] == "failed"
+
+
+def _reply(payload):
+    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+
+
+@pytest.mark.asyncio
+async def test_recovery_analyzer_tells_remaining_budget_and_ends_with_terminal_turn():
+    queries = [{"kind": "run_state", "run_id": str(uuid4())} for _ in range(4)]
+    terminal = {"kind": "transient", "diagnosis": "d", "evidence": [_evidence()],
+                "wake": {"events": [], "recheck_after_seconds": 30, "expected_result": "x"}}
+    completion = AsyncMock(side_effect=[_reply({"kind": "evidence_query", "query": q}) for q in queries] + [_reply(terminal)])
+    lookup = AsyncMock(return_value=EvidenceV1.model_validate(_evidence()))
+    result = await RecoveryAnalyzer(completion_fn=completion).analyze({}, project_id=UUID_A, evidence_query=lookup)
+    assert result.kind == "transient"
+    assert lookup.await_count == 4 and completion.await_count == 5
+    remaining = [json.loads(call.kwargs["messages"][1]["content"])["queries_remaining"] for call in completion.await_args_list]
+    assert remaining == [4, 3, 2, 1, 0]
+    assert "do NOT return an evidence_query" in completion.await_args_list[-1].kwargs["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_analyzer_does_not_repeat_io_for_duplicate_query():
+    query = {"kind": "evidence_query", "query": {"kind": "waits"}}
+    terminal = {"kind": "transient", "diagnosis": "d", "evidence": [_evidence()],
+                "wake": {"events": [], "recheck_after_seconds": 30, "expected_result": "x"}}
+    completion = AsyncMock(side_effect=[_reply(query), _reply(query), _reply(terminal)])
+    lookup = AsyncMock(return_value=EvidenceV1.model_validate(_evidence()))
+    await RecoveryAnalyzer(completion_fn=completion).analyze({}, project_id=UUID_A, evidence_query=lookup)
+    assert lookup.await_count == 1
+    second = json.loads(completion.await_args_list[2].kwargs["messages"][1]["content"])
+    assert len(second["evidence"]) == 1 and "already answered" in second["note"]
+
+
+
+
+@pytest.mark.asyncio
+async def test_password_shaped_evidence_does_not_crash_refusal_and_counts_as_rejection(
+    db_session, test_engine, conversation_goal_run, monkeypatch,
+):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService, RecoveryDiagnosisFailed
+    from huddleroom.services.orchestration_recovery_evidence import RecoveryEvidenceService
+    from tests.test_orchestration_recovery_persistence import trigger_for
+
+    async def evidence_query(self, db, trigger, query):
+        # model_construct: the schema forbids secret-shaped text, so bypass validation to reach the redaction path.
+        return EvidenceV1.model_construct(label="Note", value={"note": "password: x"}, source_kind="gate", source_id=UUID_A)
+
+    monkeypatch.setattr(RecoveryEvidenceService, "query", evidence_query)
+    goal, run = conversation_goal_run
+    run.status = "running"
+    completion = AsyncMock(side_effect=[
+        {"choices": [{"message": {"content": json.dumps({"kind": "evidence_query", "query": {"kind": "waits"}})}}]},
+        {"choices": [{"message": {"content": json.dumps({"kind": "proposal"})}}]},
+        {"choices": [{"message": {"content": json.dumps({"kind": "proposal"})}}]},
+        {"choices": [{"message": {"content": json.dumps({"kind": "proposal"})}}]},
+    ])
+    service = OrchestrationBlockerRecoveryService(analyzer=RecoveryAnalyzer(completion_fn=completion))
+    trigger = await service.create_trigger(db_session, trigger_for(goal, run))
+    await db_session.commit()
+
+    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as session:
+        with pytest.raises(RecoveryDiagnosisFailed):
+            await service.diagnose(session, trigger.id)
+        await session.commit()  # the caller commits the flushed refusal, then the failure surfaces
+
+    async with factory() as check:
+        rejected = list(await check.scalars(select(OrchestrationDecision).where(
+            OrchestrationDecision.run_id == run.id, OrchestrationDecision.decision_type == "recovery",
+            OrchestrationDecision.validator_status == "rejected",
+        )))
+        assert len(rejected) == 1
+        assert rejected[0].rejection_reason.startswith("analysis_contract_rejected")
+        refreshed = await check.get(OrchestrationAction, trigger.id)
+        assert refreshed.dispatch_contract["analysis_feedback"]["rejection"] == "analysis_contract_rejected"
+        assert refreshed.dispatch_contract["analysis_feedback"]["evidence"]["items"]

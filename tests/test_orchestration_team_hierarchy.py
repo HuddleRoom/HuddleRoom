@@ -2775,3 +2775,37 @@ async def test_hierarchy_persist_recovery_acceptance_rejects_untyped_payload_wit
         except Exception:  # noqa: BLE001
             await s.rollback()
     assert await cfg_fresh_snapshot(sessions, seeded.goal_id) == before
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_completion_guard_blocks_ineligible_assignment_only(db_session, test_project):
+    goal = OrchestrationGoal(project_id=test_project.id, objective="Ship", success_criteria=[],
+                             constraints={}, weight="standard", authority_model="no_manager")
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    agent = _agent("Dev", "developer", ["implementation"])
+    db_session.add_all([run, agent])
+    await db_session.flush()
+    process = await OrchestrationProcessService().start_process(
+        db_session, goal.id, process_type="agent_definition_review", trigger_reason="t", run_id=run.id,
+    )
+    await OrchestrationAgentReviewService().create_review(
+        db_session, goal.id, agent_id=agent.id, fit_summary="r", run_id=run.id,
+        proposed_work_functions=["implementation", "review"], approved_for_work_functions=["implementation"],
+        source_process_run_id=process.id,
+    )
+    await OrchestrationProcessService().complete_process(
+        db_session, process, outputs={"eligibility": {str(agent.id): ["implementation"]}},
+    )
+    hierarchy = await OrchestrationProcessService().start_process(
+        db_session, goal.id, process_type="team_hierarchy", trigger_reason="t", run_id=run.id,
+    )
+    guard = TeamHierarchyProcess()._park_on_ineligible_assignment
+    ok = {"assignments": [{"work_function": "implementation", "agent_ref": str(agent.id)}]}
+    bad = {"assignments": [{"work_function": "review", "agent_ref": str(agent.id)}]}
+
+    assert await guard(db_session, goal, run, hierarchy, ok) is False
+    assert hierarchy.status == "running"
+    assert await guard(db_session, goal, run, hierarchy, bad) is True
+    assert hierarchy.status == "waiting_decision"

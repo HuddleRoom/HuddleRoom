@@ -49,6 +49,8 @@ CRITICAL_VALIDATION_FUNCTIONS = {"review", "validation"}
 WEAK_REASONING_EFFORTS = {"none", "minimal", "low"}
 PROCESS_TYPE = "agent_definition_review"
 PROCESS_VERSION = 3
+# Bump when assess_agent_definition() rules change; old completed reviews are refreshed without the analyzer.
+DETERMINISTIC_POLICY = 2
 DECISION_KEY_PREFIX = "agent_definition_review:proposal:"
 MEMORY_SECTION_KEY = "agent_definition_review"
 MEMORY_TOC_ORDER = 30
@@ -792,6 +794,13 @@ class AgentDefinitionReviewProcess:
             }
             await db.flush()
             return await self._complete_persisted_review(db, goal, run, current)
+        if (
+            current is not None
+            and current.status == "completed"
+            and (current.outputs or {}).get("semantic_assessments")
+            and (current.outputs or {}).get("deterministic_policy") != DETERMINISTIC_POLICY
+        ):
+            await self._refresh_deterministic_eligibility(db, goal, run, current, proposal_decisions)
         legacy_missing_coverage_fingerprint = (
             current is not None
             and current.status == "completed"
@@ -1061,6 +1070,7 @@ class AgentDefinitionReviewProcess:
             "decision_ids": decision_ids,
             "orchestration_model": settings.orchestration_model,
             "process_version": PROCESS_VERSION,
+            "deterministic_policy": DETERMINISTIC_POLICY,
             "gates": {"agent_definitions_reviewed": True},
         }
 
@@ -1256,6 +1266,7 @@ class AgentDefinitionReviewProcess:
             "semantic_assessments": {},
             "decision_ids": [],
             "process_version": PROCESS_VERSION,
+            "deterministic_policy": DETERMINISTIC_POLICY,
             "gates": {"agent_definitions_reviewed": True},
             "recovery_provenance": {**provenance, "evidence_labels": [item.label for item in evidence]},
         }
@@ -1272,6 +1283,92 @@ class AgentDefinitionReviewProcess:
             toc_order=MEMORY_TOC_ORDER, run_id=run.id, created_by="orchestrator:agent_definition_review",
         )
         return await self.process_service.complete_process(db, current, outputs=outputs)
+
+    def _applied_text(self, current: OrchestrationProcessRun, decisions) -> dict[str, tuple[str, str]]:
+        """Description/persona this process's answered approve/edit decisions applied, by agent id."""
+        applied = {}
+        for decision in decisions:
+            if (
+                decision.source_process_run_id != current.id or decision.status != "answered"
+                or decision.selected_option not in {"approve", "edit"}
+            ):
+                continue
+            context = self._decision_context(decision)
+            description, persona = context.get("proposed_description"), context.get("proposed_persona")
+            if decision.selected_option == "edit":
+                try:
+                    edited = json.loads(decision.reason or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                description, persona = edited.get("description"), edited.get("persona")
+            if isinstance(description, str) and isinstance(persona, str):
+                applied[context.get("agent_id")] = (description.strip(), persona.strip())
+        return applied
+
+    async def _refresh_deterministic_eligibility(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+        current: OrchestrationProcessRun, decisions,
+    ) -> bool:
+        """Re-run only the deterministic rules for an old-policy completed review.
+
+        Trusts the current text only when it matches the review snapshot or the text this
+        process's own answered decision applied; any other drift is left to the normal
+        semantic-rerun path (no eligibility is granted here). No analyzer call.
+        """
+        outputs = dict(current.outputs or {})
+        review_ids = {str(item) for item in outputs.get("review_ids", [])}
+        reviews = [
+            review for review in await self.review_service.list_reviews(db, goal.id)
+            if str(review.id) in review_ids and review.source_process_run_id == current.id
+        ]
+        semantic = outputs.get("semantic_assessments") or {}
+        applied = self._applied_text(current, decisions)
+        plan = []
+        for review in reviews:
+            agent = await db.get(Agent, review.agent_id, populate_existing=True) if review.agent_id else None
+            if agent is None or str(agent.id) not in semantic:
+                return False
+            snapshot, live = review.definition_snapshot or {}, self.review_service._build_snapshot(agent)  # pylint: disable=protected-access
+            text_applied = applied.get(str(agent.id)) == ((agent.description or "").strip(), (agent.system_prompt or "").strip())
+            skipped = {"description", "system_prompt"} if text_applied else set()
+            if any(snapshot.get(f) != live.get(f) for f in FINGERPRINT_SNAPSHOT_FIELDS if f not in skipped):
+                return False
+            plan.append((review, agent, assess_agent_definition(agent, list(review.proposed_work_functions or []))))
+        if not plan:
+            return False
+        # -- writes start here (no awaits that can fail halfway besides warning creation) --
+        eligibility = dict(outputs.get("eligibility") or {})
+        for review, agent, assessment in plan:
+            allowed = set(semantic[str(agent.id)].get("approved_work_functions", []))
+            review.approved_for_work_functions = [
+                name for name in assessment["approved_for_work_functions"] if name in allowed
+            ]
+            review.fit_summary = assessment["fit_summary"]
+            review.strengths, review.risks = assessment["strengths"], assessment["risks"]
+            review.recommended_changes = assessment["recommended_changes"]
+            eligibility[str(agent.id)] = list(review.approved_for_work_functions)
+        plan_ids = {review.id for review, _agent, _assessment in plan}
+        for warning in await self.warning_service.list_warnings(db, goal.id, active_only=True):
+            if warning.source_agent_review_id in plan_ids:
+                await self.warning_service.resolve_warning(
+                    db, warning, resolved_by="orchestrator:agent_definition_review",
+                    reason="deterministic review policy refreshed",
+                )
+        warnings = [
+            await self.warning_service.create_warning(
+                db, goal.id, warning_type=item["warning_type"], severity=item["severity"], message=item["message"],
+                run_id=run.id, source_process_run_id=current.id, related_agent_id=agent.id,
+                source_agent_review_id=review.id,
+            )
+            for review, agent, assessment in plan for item in assessment["warnings"]
+        ]
+        outputs.update(
+            eligibility=eligibility, deterministic_policy=DETERMINISTIC_POLICY,
+            warning_ids=[str(item.id) for item in warnings], warning_count=len(warnings),
+        )
+        current.outputs = outputs
+        await db.flush()
+        return True
 
     def _snapshot_matches(self, snapshot: dict | None, agent: Agent) -> bool:
         """The accepted snapshot still describes the live definition (fingerprint fields)."""

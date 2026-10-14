@@ -546,6 +546,8 @@ async def complete_baseline_processes(db_session, goal, run):
 
     class SafeTeamHierarchyAnalyzer:
         async def review(self, payload, project=None, *, project_id=None):
+            from huddleroom.services.orchestration_agent_definition_review import accepted_work_functions
+            accepted = await accepted_work_functions(db_session, goal.id) or {}
             producer_refs: set[str] = set()
             reviewer_refs: set[str] = set()
             assignments = []
@@ -554,6 +556,7 @@ async def complete_baseline_processes(db_session, goal, run):
                 candidates = (
                     agent for agent in payload["agents"]
                     if work_function in agent["capabilities"]
+                    and work_function in accepted.get(str(agent["id"]), [])
                     and agent["id"] not in (producer_refs if verifier else reviewer_refs)
                 )
                 if agent := next(candidates, None):
@@ -632,6 +635,14 @@ async def complete_baseline_processes(db_session, goal, run):
             raise AssertionError(
                 f"Baseline process {prefix.rstrip(':')} did not converge within 10 iterations"
             )
+    # The hierarchy guard rejects assignments the review did not accept, and blank-definition agents
+    # are never eligible; give fixture agents a concrete definition so the baseline is a valid state.
+    from sqlalchemy import select as _select
+    from huddleroom.models.agent import Agent as _Agent
+    for _agent in (await db_session.scalars(_select(_Agent).where(_Agent.is_active.is_(True)))).all():
+        if not (_agent.description or "").strip() and not (_agent.system_prompt or "").strip():
+            _agent.description = "Test fixture agent with a concrete, scoped definition."
+    await db_session.flush()
     agent_review = await AgentDefinitionReviewProcess(SafeAgentDefinitionAnalyzer()).advance(
         db_session, goal, run
     )

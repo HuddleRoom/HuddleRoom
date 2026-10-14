@@ -363,3 +363,16 @@ async def test_recovery_bounds_preserve_fixed_envelope_and_analyzer_json_size_wi
     assert bounded == _bounded(oversized, RECOVERY_CONTEXT_MAX_BYTES, fixed_keys=sections)
     assert len(json.dumps(bounded, sort_keys=True, default=str).encode()) <= RECOVERY_CONTEXT_MAX_BYTES
     assert len(json.dumps(emoji_evidence, sort_keys=True, default=str).encode()) <= RECOVERY_EVIDENCE_MAX_BYTES
+
+
+async def test_agent_review_process_evidence_exposes_eligibility_and_marker_without_semantics():
+    from types import SimpleNamespace
+    from huddleroom.services.orchestration_recovery_evidence import _safe_process
+    outputs = {"accepted": True, "eligibility": {"agent-1": ["engineering"]}, "deterministic_policy": 2,
+               "assessments": [{"reasoning": "SEMANTIC PROSE"}], "prompt": "PROMPT", "warnings": ["w"]}
+    row = SimpleNamespace(id="p", process_type="agent_definition_review", status="completed", run_id=None, outputs=outputs)
+    safe = _safe_process(row)["outputs"]
+    assert safe["eligibility"] == {"agent-1": ["engineering"]} and safe["deterministic_policy"] == 2
+    assert "SEMANTIC PROSE" not in json.dumps(safe) and "PROMPT" not in json.dumps(safe)
+    other = SimpleNamespace(id="p", process_type="team_configuration", status="completed", run_id=None, outputs=outputs)
+    assert "eligibility" not in _safe_process(other)["outputs"]

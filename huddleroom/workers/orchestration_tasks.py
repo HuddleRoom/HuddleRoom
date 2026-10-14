@@ -51,12 +51,23 @@ async def evaluate_supervision_run_async(run_id) -> int:
 
 
 async def evaluate_supervision_event_async(event_id) -> int:
+    from huddleroom.services.orchestration_service import GOAL_RESUMED_EVENT_TYPE, OrchestrationService
+
     await asyncio.sleep(settings.orchestration_event_coalesce_seconds)
     async with AsyncSessionLocal() as db:
         try:
             event = await db.scalar(select(EventLog).where(EventLog.id == UUID(str(event_id))))
             if event is None or event.event_type not in SUPPORTED_EVENTS:
                 return 0
+            if event.event_type == GOAL_RESUMED_EVENT_TYPE:
+                # Resume needs one decision-capable full tick, not a local judgment sweep.
+                if not event.payload.get("run_id"):
+                    return 0
+                await OrchestrationService().tick(
+                    db, UUID(str(event.payload["run_id"])), local_only=False
+                )
+                await db.commit()
+                return 1
             scheduler = OrchestrationSupervisionScheduler()
             run_ids = await scheduler.record_event(
                 db, event.event_type, event.payload, event_id=event.id,
@@ -99,23 +110,41 @@ async def supervise_orchestration_async() -> int:
 
 async def run_orchestration_event_supervisor() -> None:
     """Consume only committed supported events; the durable sweep is the backstop."""
+    from huddleroom.services.orchestration_service import GOAL_RESUMED_EVENT_TYPE, OrchestrationService
+
     delayed = None
 
     async def evaluate_after_coalesce() -> None:
-        nonlocal pending_run_ids
+        nonlocal pending_run_ids, resumed_run_ids
         await asyncio.sleep(settings.orchestration_event_coalesce_seconds)
         async with AsyncSessionLocal() as db:
             try:
                 run_ids, pending_run_ids = set(pending_run_ids), set()
-                for run_id in run_ids:
+                resumed, resumed_run_ids = set(resumed_run_ids), set()
+                for run_id in resumed:
+                    try:
+                        await OrchestrationService().tick(db, run_id, local_only=False)
+                        await db.commit()
+                    except Exception:
+                        await db.rollback()
+                        logger.exception("Failed to resume orchestration run %s", run_id)
+                for run_id in run_ids - resumed:
                     await OrchestrationSupervisionScheduler().evaluate_run(db, run_id)
                 await db.commit()
             except Exception:
                 await db.rollback()
                 logger.exception("Failed to evaluate coalesced orchestration supervision events")
 
-    pending_run_ids = set()
+    pending_run_ids: set = set()
+    resumed_run_ids: set = set()
     async for event in get_event_bus().subscribe(event_types=list(SUPPORTED_EVENTS)):
+        if event.event_type == GOAL_RESUMED_EVENT_TYPE:
+            # Resume needs one decision-capable full tick, not a local judgment sweep.
+            if event.payload.get("run_id"):
+                resumed_run_ids.add(UUID(str(event.payload["run_id"])))
+                if delayed is None or delayed.done():
+                    delayed = asyncio.create_task(evaluate_after_coalesce())
+            continue
         async with AsyncSessionLocal() as db:
             try:
                 pending_run_ids.update(await OrchestrationSupervisionScheduler().record_event(
