@@ -188,7 +188,11 @@ REVISABLE_REJECTION_REASONS = frozenset(
     {"Rejected evidence from verification", "Rejected evidence from review"}
 )
 GATE_REVISION_CAP = 2
-REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; the owner ask takes over after that
+REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; an answered owner ask re-arms it
+
+
+def _naive_utc(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 # Authorization denials a different agent/decision can resolve for one task; the rest are run-wide.
 TASK_SCOPED_AUTH_DENIALS = frozenset({
     "agent_outside_accepted_team", "model_spend_not_granted", "external_write_not_granted",
@@ -9956,9 +9960,12 @@ class OrchestrationService:
         findings: Mapping[str, Any],
         **extra: Any,
     ) -> int:
-        # An independent re-review of a review-rejected revision records review evidence the gate can require.
+        # An independent re-review of a review-rejected revision records review evidence the gate can require;
+        # outcome/roadmap gates keep the bound verification row their acceptance requires.
         source_type = ("review" if self._is_revision_reverification(run.id, action)
                        and self._json_object_or_empty(action.request).get("work_function") == "review"
+                       and gate.gate_type not in {"roadmap_plan_approval", "roadmap_integration"}
+                       and not await self._is_outcome_plan_item_gate(db, run, gate)
                        else "verification")
         return await self._record_evidence_once(
             db,
@@ -10338,6 +10345,15 @@ class OrchestrationService:
         await db.flush()
         return created
 
+    @staticmethod
+    def _reverification_budget_failure(error: Any) -> bool:
+        """A re-verification dispatch that failed for funding or spend authority, not capability."""
+        # ponytail: classified by the recorded error text; a typed failure code would be sturdier
+        text = str(error or "")
+        return text in {"budget_wait", "needs_attention", "Action budget cannot dispatch"} or (
+            text.startswith("Missing ") and " measurement" in text
+        )
+
     async def _reverification_actions(
         self, db: AsyncSession, run_id: uuid.UUID, revision_task_id: Any,
     ) -> list[OrchestrationAction]:
@@ -10371,42 +10387,60 @@ class OrchestrationService:
             if revision is None or revision.status != "done":
                 continue
             attempts = await self._reverification_actions(db, run.id, revision.id)
-            failed = sum(1 for action in attempts if action.status == "failed")
-            if (any(action.status == "completed" for action in attempts) or failed >= REVERIFICATION_ATTEMPTS
+            failures = [action for action in attempts if action.status == "failed"]
+            if (any(action.status == "completed" for action in attempts)
                     or (await self._effective_report(db, run.id, revision))[1] is None):
                 continue
-            subject = f"gate:{gate.id}:revision"
-            history = [f"revision task {revision.id} finished", *(f"re-verification failed: {a.error}"
-                                                                  for a in attempts if a.status == "failed")]
+            # Only capability failures spend attempts. Each answered owner ask re-arms REVERIFICATION_ATTEMPTS more;
+            # the next ask of a re-armed cycle has its own subject so it can be raised again.
+            spent = [action for action in failures if not self._reverification_budget_failure(action.error)]
+            cycle, subject = 0, f"gate:{gate.id}:revision"
+            while True:
+                ask = await self._existing_action_for_key(
+                    db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:{subject}",
+                )
+                decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
+                if decision is None or decision.status != "answered" or decision.decided_at is None:
+                    break
+                answered_at = _naive_utc(decision.decided_at)
+                spent = [action for action in spent if _naive_utc(action.created_at) > answered_at]
+                cycle += 1
+                subject = f"gate:{gate.id}:revision:reverify:{cycle}"
+            if len(spent) >= REVERIFICATION_ATTEMPTS:
+                continue  # waits for the owner's answer to this cycle's ask
+            history = [f"revision task {revision.id} finished", *(f"re-verification failed: {a.error}" for a in failures)]
             _budget, shortfall = await self._result_correction_budget(goal, run, db, gate.id)
             if shortfall is not None:  # no attempt is spent while funding is short; retried once it returns
-                await self._escalate_owner(db, goal, run, "budget_exhausted", subject, history,
+                await self._escalate_owner(db, goal, run, "budget_exhausted", f"gate:{gate.id}:revision", history,
                                            f"Cannot fund the re-verification for gate {gate.id}: {shortfall}.")
                 continue
             # the gate keeps the kind of judge that first rejected it: a reviewed gate is re-reviewed
             work_function = "review" if entries[0].get("cause") == "review_rejected" else "validation"
-            key = self._gate_revision_reverification_key(run.id, revision.id) + (f":attempt:{failed}" if failed else "")
+            key = self._gate_revision_reverification_key(run.id, revision.id) + (
+                f":attempt:{len(failures)}" if failures else ""
+            )
             try:
                 await self.execute_request_verification_action(db, run.id, {
                     "action_type": "request_verification", "gate_id": str(gate.id), "work_function": work_function,
                 }, key)
             except (HTTPException, BudgetMeasurementError) as exc:
                 # the failed action is the record; the next tick retries under a new attempt key
-                detail = exc.detail if isinstance(exc, HTTPException) else f"missing {exc.dimension} measurement"
-                budget = isinstance(exc, BudgetMeasurementError) or detail in {"budget_wait", "Action budget cannot dispatch"}
-                if budget or failed + 1 >= 2:  # a capability failure is escalated once it persists
+                detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                budget = self._reverification_budget_failure(detail)
+                if budget or len(spent) + 1 >= 2:  # a capability failure is escalated once it persists
                     await self._escalate_owner(
-                        db, goal, run, "budget_exhausted" if budget else "capability_unavailable", subject,
+                        db, goal, run, "budget_exhausted" if budget else "capability_unavailable",
+                        f"gate:{gate.id}:revision" if budget else subject,
                         [*history, f"re-verification failed: {detail}"],
                         f"Cannot re-verify the revision for gate {gate.id}: {detail}.",
                     )
                 continue
             created += 1
-            run.active_blockers = [  # dispatched: the subject's funding or dispatch ask no longer blocks it
+            run.active_blockers = [  # dispatched: the subject's funding or dispatch asks no longer block it
                 item for item in run.active_blockers
                 if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
                         and item.get("category") in {"budget_exhausted", "capability_unavailable"}
-                        and item.get("scope") == subject)
+                        and str(item.get("scope", "")).startswith(f"gate:{gate.id}:revision"))
             ]
         return created
 

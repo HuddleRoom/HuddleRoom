@@ -372,10 +372,9 @@ async def _finish(db, service, run, task, output):
 
 async def _reverifier(db, service, run, revision):
     """The verifier dispatched automatically for a finished revision (None if none was dispatched)."""
-    action = await service._existing_action_for_key(
-        db, run.id, f"run:{run.id}:kind:request_verification:gate_revision:{revision.id}",
-    )
-    return await db.get(Task, action.target_id) if action is not None and action.target_id else None
+    completed = [action for action in await service._reverification_actions(db, run.id, revision.id)
+                 if action.status == "completed" and action.target_id]
+    return await db.get(Task, completed[-1].target_id) if completed else None
 
 
 async def _no_approval_requested(db, run):
@@ -797,3 +796,72 @@ async def test_re_verification_waits_for_funding_and_is_dispatched_when_it_retur
     run.budget_state = {}
     await service.recover_run(db, run.id, baseline_ready=True)
     assert await _reverifier(db, service, run, revision) is not None and _owner_asks(run, "budget_exhausted") == []
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_owner_answer_re_arms_re_verification_after_repeated_failures(db_session, test_project, monkeypatch):
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    db = db_session
+    service, goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [revision] = await _revision_tasks(db, task)
+    real_fit = service._best_recovery_agent
+    unavailable = {"left": 3}
+
+    async def fit(*args, **kwargs):
+        if unavailable["left"]:
+            unavailable["left"] -= 1
+            return None
+        return await real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_best_recovery_agent", fit)
+    await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
+    await service.tick(db, run.id)
+    await service.tick(db, run.id)
+    await service.tick(db, run.id)  # three failures spent: no fourth attempt until the owner answers
+
+    attempts = await service._reverification_actions(db, run.id, revision.id)
+    assert [a.status for a in attempts] == ["failed"] * 3
+    [ask] = _owner_asks(run, "capability_unavailable")
+    decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(ask["decision_id"]))
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option=(decision.options or [{"key": "retry"}])[0]["key"],
+        decided_by_user_id=goal.manager_user_id or uuid.uuid4(),
+    )
+
+    await service.tick(db, run.id)
+    reviewer_task = await _reverifier(db, service, run, revision)
+    assert reviewer_task is not None and reviewer_task.assigned_to == reviewer.id
+    await _finish(db, service, run, reviewer_task, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_spend_authority_wait_inside_dispatch_spends_no_attempt(db_session, test_project, monkeypatch):
+    db = db_session
+    service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [revision] = await _revision_tasks(db, task)
+    real_authority = service.roadmap_pre_release_authority
+    pending = {"left": 3}
+
+    async def authority(*args, **kwargs):
+        if pending["left"]:
+            pending["left"] -= 1
+            return {"status": "pending"}
+        return await real_authority(*args, **kwargs)
+
+    monkeypatch.setattr(service, "roadmap_pre_release_authority", authority)
+    await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
+    await service.tick(db, run.id)
+    await service.tick(db, run.id)
+
+    attempts = await service._reverification_actions(db, run.id, revision.id)
+    assert [a.error for a in attempts] == ["budget_wait"] * 3
+    assert len(_owner_asks(run, "budget_exhausted")) == 1 and _owner_asks(run, "capability_unavailable") == []
+
+    await service.tick(db, run.id)  # spend authority granted: dispatched although three attempts failed
+    reviewer_task = await _reverifier(db, service, run, revision)
+    assert reviewer_task is not None and _owner_asks(run, "budget_exhausted") == []
