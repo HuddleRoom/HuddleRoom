@@ -140,6 +140,9 @@ from huddleroom.services.orchestration_dependencies import (
 
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
+RESULT_CORRECTION_ASK_OPTIONS = (
+    {"key": "retry", "label": "Retry the correction"}, {"key": "dismiss", "label": "Stop correcting"},
+)
 RECOVERY_DIAGNOSIS_ERROR_BACKOFF_SECONDS = 60  # ponytail: fixed backoff; make it exponential if outages run long
 # Actions that hand off to a human or pause: `_act_until_wait` must not keep acting after them.
 # recover_blocker / recovery_trigger: one tick never acts past a newly started recovery lineage.
@@ -7962,21 +7965,36 @@ class OrchestrationService:
         errors: Sequence[str],
         version: dict[str, Any],
     ) -> None:
-        stale = await self._result_correction_stale(db, run, ledger, version)
+        stale = await self._result_correction_stale(db, run)
         if stale is not None:
-            ledger["stale"] = stale  # neither dispatched nor consumed onto a paused/superseded/changed run
+            ledger["stale"] = stale  # neither dispatched nor consumed onto a paused/superseded run
             return
         ledger.pop("stale", None)
+        if ledger.get("status") in {"corrected", "owner_declined"}:
+            return
+        if ledger.get("version", version) != version:
+            self._new_result_correction_cycle(ledger, version)  # a new owner contract or plan version resets the count
         if ledger.get("status") in {"exhausted", "unavailable"}:
             decision_id = self._optional_uuid(ledger.get("decision_id"), "decision_id")
             decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
             if decision is None or decision.status == "pending":
                 return  # ticks and replays never re-arm; only an owner answer does
-            ledger.update(
-                cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
-                previous_attempts=[*ledger.get("previous_attempts", []), *ledger.get("attempts", [])], attempts=[],
-            )
+            if decision.status != "answered" or decision.selected_option == "dismiss":
+                ledger["status"] = "owner_declined"
+                return
+            self._new_result_correction_cycle(ledger, version)
         attempts = list(ledger.get("attempts") or [])
+        if ledger.get("status") == "correcting":
+            correction = await db.get(Task, uuid.UUID(ledger["correction_task_id"]))
+            if correction is not None and correction.status in {"failed", "cancelled"} and not any(
+                item.get("task_id") == str(correction.id) for item in attempts
+            ):  # a failed correction run is a failed attempt with no output to carry
+                attempts.append({
+                    "task_id": str(correction.id), "session_id": None, "task_failed": True,
+                    "fingerprint": f"task_{correction.status}:{correction.id}",
+                    "errors": [f"correction task {correction.status}"],
+                })
+                ledger.update(attempts=attempts, status="exhausted" if len(attempts) > 2 else "pending")
         identity = {"task_id": str(task.id), "session_id": str(session_id) if session_id else None}
         if not any(item.get("task_id") == identity["task_id"] and item.get("session_id") == identity["session_id"]
                    for item in attempts):
@@ -8000,7 +8018,8 @@ class OrchestrationService:
                 ask = await self._escalate_owner(
                     db, goal, run, "result_correction_exhausted", subject, history,
                     f"The result of task {parent.id} still fails validation after {len(attempts) - 1} correction(s). "
-                    "Decide how to proceed.",
+                    "Retry starts a new correction cycle; dismiss stops correcting.",
+                    options=RESULT_CORRECTION_ASK_OPTIONS,
                 )
                 ledger["decision_id"] = str(ask.target_id) if ask.target_id else None
             return
@@ -8011,7 +8030,7 @@ class OrchestrationService:
             return
         if ledger["status"] != "pending":
             return
-        latest = attempts[-1]
+        latest = next(item for item in reversed(attempts) if not item.get("task_failed"))
         source = task if latest["task_id"] == str(task.id) else await db.get(Task, uuid.UUID(latest["task_id"]))
         failed_output, unavailable = await self._stored_result_output(
             db, source, self._optional_uuid(latest["session_id"], "session_id"),
@@ -8019,8 +8038,12 @@ class OrchestrationService:
         if failed_output is None:
             ledger.update(status="unavailable", reason="correction_input_unavailable", detail=unavailable)
             ask = await self._escalate_owner(
-                db, goal, run, "capability_unavailable", f"task:{parent.id}:correction_input_unavailable", history,
-                f"Cannot correct the result of task {parent.id}: {unavailable}.",
+                db, goal, run, "capability_unavailable",
+                f"task:{parent.id}:correction_input_unavailable" + subject.removeprefix(
+                    f"task:{parent.id}:result_correction"
+                ),
+                history, f"Cannot correct the result of task {parent.id}: {unavailable}.",
+                options=RESULT_CORRECTION_ASK_OPTIONS,
             )
             ledger["decision_id"] = str(ask.target_id) if ask.target_id else None
             return
@@ -8033,6 +8056,59 @@ class OrchestrationService:
         await self._dispatch_result_correction(
             db, goal, run, parent, ledger, failed_output, latest, budget, subject, history, version,
         )
+
+    @staticmethod
+    def _new_result_correction_cycle(ledger: dict[str, Any], version: dict[str, Any]) -> None:
+        """Start a fresh bounded cycle; any in-flight correction is unlinked and never consumed."""
+        ledger.update(
+            cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
+            correction_task_id=None, correction_session_id=None,
+            previous_attempts=[*ledger.get("previous_attempts", []), *ledger.get("attempts", [])], attempts=[],
+        )
+
+    async def _sweep_result_corrections(self, db: AsyncSession, run: OrchestrationRun) -> None:
+        """Re-enter open correction ledgers each tick: funding, resume, contract change, owner answer, failed task."""
+        if run.status != "running":
+            return
+        # ponytail: oldest 50 open ledgers per tick; page by cursor if a run ever holds more
+        markers = list(await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+            OrchestrationAction.action_type == "report_consumed",
+            OrchestrationAction.request["result_correction"]["status"].as_string().in_(
+                ("pending", "correcting", "exhausted", "unavailable")
+            ),
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id).limit(50)))
+        for marker in markers:
+            await self._resume_result_correction(db, run, marker)
+
+    async def _resume_result_correction(
+        self, db: AsyncSession, run: OrchestrationRun, marker: OrchestrationAction,
+    ) -> None:
+        ledger = dict(self._json_object_or_empty(self._json_object_or_empty(marker.request).get("result_correction")))
+        parent = await db.get(Task, marker.target_id) if marker.target_id else None
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        if not ledger or parent is None or goal is None:
+            return
+        version = self._result_correction_version(goal, run)
+        if (ledger.get("status") == "correcting" and not ledger.get("correction_session_id")
+                and ledger.get("version") == version):
+            correction = await db.get(Task, uuid.UUID(ledger["correction_task_id"]))
+            if correction is not None and correction.status == "done":  # finished while it could not be consumed
+                await self._consume_result_correction(db, run, correction, None)
+                return
+        latest = next((item for item in reversed(ledger.get("attempts", [])) if not item.get("task_failed")), None)
+        task = None
+        if latest is not None:
+            task = parent if latest["task_id"] == str(parent.id) else await db.get(Task, uuid.UUID(latest["task_id"]))
+        if task is None:
+            return
+        try:
+            await self._advance_result_correction(
+                db, goal, run, parent, marker, ledger, task,
+                self._optional_uuid(latest["session_id"], "session_id"), latest["errors"], version,
+            )
+        finally:
+            marker.request = {**self._json_object_or_empty(marker.request), "result_correction": ledger}
 
     async def _dispatch_result_correction(
         self,
@@ -8158,9 +8234,7 @@ class OrchestrationService:
             "planning_version": OrchestrationService._json_object_or_empty(run.plan_state).get("planning_version"),
         }
 
-    async def _result_correction_stale(
-        self, db: AsyncSession, run: OrchestrationRun, ledger: Mapping[str, Any], version: Mapping[str, Any],
-    ) -> str | None:
+    async def _result_correction_stale(self, db: AsyncSession, run: OrchestrationRun) -> str | None:
         if run.status not in LLM_DECISION_RUN_STATUSES:
             return f"run_{run.status}"
         latest = await db.scalar(select(OrchestrationRun.id).where(
@@ -8168,8 +8242,6 @@ class OrchestrationService:
         ).order_by(OrchestrationRun.started_at.desc(), OrchestrationRun.id.desc()).limit(1))
         if latest != run.id:
             return "run_superseded"
-        if ledger.get("version", version) != version:
-            return "version_changed"
         return None
 
     async def _stored_result_output(
@@ -9184,9 +9256,14 @@ class OrchestrationService:
             session_id = sessions[0] if sessions else None
         session = await db.get(Session, session_id) if session_id is not None else None
         goal = await db.get(OrchestrationGoal, run.goal_id)
-        if (session_id is not None and (session is None or session.task_id != task.id)) or goal is None:
+        if goal is None or (session_id is not None and (
+            session is None or session.task_id != task.id or session.status != "completed"
+        )):
             return
-        stale = await self._result_correction_stale(db, run, ledger, self._result_correction_version(goal, run))
+        if ledger.get("version") != self._result_correction_version(goal, run):
+            await self._resume_result_correction(db, run, marker)  # new contract version: fresh cycle, not this result
+            return
+        stale = await self._result_correction_stale(db, run)
         recorded = {"stale": stale} if stale else {"correction_session_id": str(session_id) if session_id else None}
         marker.request = {**self._json_object_or_empty(marker.request), "result_correction": {
             **{key: value for key, value in ledger.items() if key != "stale"}, **recorded,
@@ -10374,6 +10451,7 @@ class OrchestrationService:
         subject: str,
         history: Sequence[str],
         question: str,
+        options: Sequence[Mapping[str, str]] | None = None,
     ) -> OrchestrationAction:
         """Ask the owner about one subject and block only that subject; the run keeps dispatching other work."""
         if category not in self._ESCALATION_CATEGORIES:
@@ -10385,7 +10463,8 @@ class OrchestrationService:
         action = await self.execute_ask_human_action(
             db,
             run.id,
-            {"question": text, "subject": f"{category}:{subject}", "reason": category},
+            {"question": text, "subject": f"{category}:{subject}", "reason": category,
+             **({"options": [dict(option) for option in options]} if options else {})},
             f"run:{run.id}:kind:ask_human:{category}:{key_subject}",
         )
         decision = await db.get(OrchestrationAuthorityDecision, action.target_id) if action.target_id else None
@@ -11117,17 +11196,20 @@ class OrchestrationService:
     async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
         """(reason, final) unless the done task's consumed report is valid with evidence.
 
-        An unusable report is final (the gate fails) unless a report-clarification repair is still pending."""
+        An unusable report is final (the gate fails) unless a result correction is still pending."""
         from huddleroom.services.orchestration_work_report import persisted_report_validation
 
         task_id = self._optional_uuid(self._json_object_or_empty(gate.required_evidence).get("task_id"), "task_id")
         task = await db.get(Task, task_id) if task_id is not None else None
         if task is None or task.status != "done":
             return "Task is not completed", False
+        own = await self._existing_action_for_key(db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{task.id}")
+        ledger = self._json_object_or_empty(self._json_object_or_empty(own.request if own else {}).get("result_correction"))
         clarification = await self._existing_action_for_key(
             db, gate.run_id, f"run:{gate.run_id}:kind:report_clarification:task:{task.id}"
         )
-        sources = [task.id, clarification.target_id if clarification is not None else None]
+        corrections = [self._optional_uuid(item, "correction_task_id") for item in ledger.get("correction_task_ids", [])]
+        sources = [task.id, *(corrections or [clarification.target_id if clarification is not None else None])]
         markers = [
             await self._existing_action_for_key(db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{source}")
             if source is not None else None
@@ -11140,6 +11222,8 @@ class OrchestrationService:
                 return None if report.candidate_evidence else ("Task report has no evidence", True)
         if markers[0] is None:
             return "Task report is missing", False
+        if ledger:  # the correction ledger decides: final only once correction has stopped
+            return "Task report is invalid", ledger.get("status") not in {"pending", "correcting"}
         repair = await db.get(Task, clarification.target_id) if clarification and clarification.target_id else None
         if repair is not None and repair.status in {"failed", "cancelled"}:
             dispatched = bool(self._json_object_or_empty(markers[0].request).get("clarification_count")) or (
@@ -12445,6 +12529,7 @@ class OrchestrationService:
             new_cursor = new_events[-1].seq if new_events else run.event_cursor
             cursor_token = str(new_cursor) if new_cursor is not None else "genesis"
             evidence_created = await self._ingest_evidence_from_events(db, run, new_events)
+            await self._sweep_result_corrections(db, run)
             await self._reconcile_outcome_gate_acceptance(db, goal, run)
             gates_validated = await self.validate_open_gates(db, run.id)
             # Keep deterministic evidence ingestion above, but stop before any

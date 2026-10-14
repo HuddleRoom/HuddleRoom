@@ -312,7 +312,8 @@ async def test_competing_late_session_cannot_replace_consumed_lineage(
         await service.consume_canonical_report(db_session, run, task, late.id)
 
 
-async def test_cached_invalid_report_retries_after_funding_returns(db_session, test_project, test_agent):
+async def test_cached_invalid_report_retries_after_funding_returns(db_session, test_project, test_agent, stub_decision):
+    stub_decision(lambda _context: {"action_type": "noop"})
     service, run, task, session = await _terminal_task(
         db_session, test_project, test_agent, "not json", contract={"expected_result": "canonical_work_report"},
     )
@@ -325,8 +326,8 @@ async def test_cached_invalid_report_retries_after_funding_returns(db_session, t
     escalated = lambda: [b for b in run.active_blockers if b.get("kind") == "owner_escalation"]  # noqa: E731
     assert [b["category"] for b in escalated()] == ["budget_exhausted"]
     session.metadata_ = {"token_count_in": 0, "token_count_out": 0}
-    for _ in range(2):
-        await service.consume_canonical_report(db_session, run, task, session.id)
+    for _ in range(2):  # the scheduler alone re-enters the pending correction once funding returns
+        await service.tick(db_session, run.id)
     assert escalated() == []
     clarification = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}")
     assert clarification is not None and clarification.status == "completed"

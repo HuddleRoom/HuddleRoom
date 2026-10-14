@@ -1382,12 +1382,19 @@ async def test_dispatched_failed_clarification_is_final(db_session, test_project
     clarification = await service._existing_action_for_key(
         db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}",
     )
-    repair = await db_session.get(Task, clarification.target_id)  # the dispatched correction task
-    repair.status = repair_status
-    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
-    marker.request = {**marker.request, "clarification_count": 1}
-    await db_session.flush()
-    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", True)
+    corrections = [clarification.target_id]
+    # A failed correction run counts as an attempt; the gate stays pending until the bound is reached.
+    for expected_final in (False, True):
+        repair = await db_session.get(Task, corrections[-1])
+        repair.status = repair_status
+        await db_session.flush()
+        await service.tick(db_session, run.id)
+        marker = await service._existing_action_for_key(
+            db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+        )
+        corrections = [uuid.UUID(item) for item in marker.request["result_correction"]["correction_task_ids"]]
+        assert (await service._adhoc_report_failure(db_session, gate))[1] is expected_final
+    assert len(corrections) == 2
 
 
 @pytest.mark.asyncio

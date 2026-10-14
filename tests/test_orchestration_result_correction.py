@@ -9,7 +9,7 @@ from sqlalchemy import select
 from huddleroom.models.agent import Agent
 from huddleroom.models.base import _utcnow
 from huddleroom.models.event_log import EventLog
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationRun
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.event_bus import emit_event_once
@@ -242,31 +242,165 @@ async def test_paused_run_dispatches_no_correction(db_session, test_project):
     assert (await _ledger(service, db_session, run, task))["stale"] == "run_paused"
 
 
-@pytest.mark.parametrize("change", ["paused", "superseded", "constraints"])
-async def test_pending_correction_is_not_consumed_after_run_or_owner_contract_changes(
-    db_session, test_project, change,
-):
+@pytest.mark.parametrize("change", ["paused", "superseded"])
+async def test_pending_correction_is_not_consumed_after_run_pause_or_supersede(db_session, test_project, change):
     service, goal, run, _agent, task = await _setup(db_session, test_project)
     await _complete(db_session, service, run, task, MISSING_FIELDS)
     [correction] = await _corrections(db_session, task)
     if change == "paused":
         run.status = "paused"
-    elif change == "superseded":
+    else:
         run.status = "cancelled"  # one active run per goal: a successor replaces a closed run
         await db_session.flush()
         db_session.add(OrchestrationRun(goal_id=goal.id, status="running", supersedes_run_id=run.id))
-    else:
-        goal.constraints = {**(goal.constraints or {}), "no_network": True}
     await db_session.flush()
 
     await _complete(db_session, service, run, correction, json.dumps(VALID))
 
     ledger = await _ledger(service, db_session, run, task)
-    assert ledger.get("stale") == {"paused": "run_paused", "superseded": None, "constraints": "version_changed"}[change]
+    assert ledger.get("stale") == {"paused": "run_paused", "superseded": None}[change]
     assert ledger["status"] == "correcting" and ledger["correction_session_id"] is None
     assert await service._existing_action_for_key(
         db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{correction.id}",
     ) is None
+
+
+async def test_correction_finished_while_paused_is_consumed_after_resume(db_session, test_project):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [correction] = await _corrections(db_session, task)
+    run.status = "paused"
+    fixed = await _complete(db_session, service, run, correction, json.dumps(VALID))
+    assert (await _ledger(service, db_session, run, task))["stale"] == "run_paused"
+
+    run.status = "running"
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "corrected" and ledger["correction_session_id"] == str(fixed.id)
+    assert "stale" not in ledger
+
+
+async def test_owner_contract_change_starts_a_fresh_cycle_and_drops_the_old_correction(db_session, test_project):
+    service, goal, run, _agent, task = await _setup(db_session, test_project)
+    original = await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [old] = await _corrections(db_session, task)
+    goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await db_session.flush()
+
+    await _complete(db_session, service, run, old, json.dumps(VALID))
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["cycle"] == 2 and ledger["status"] == "correcting"
+    assert [a["session_id"] for a in ledger["attempts"]] == [str(original.id)]
+    new = next(item for item in await _corrections(db_session, task) if item.id != old.id)
+    assert ledger["correction_task_id"] == str(new.id)
+    assert await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{old.id}",
+    ) is None
+    for _ in range(2):  # ticks do not start yet another cycle
+        await service.tick(db_session, run.id)
+    assert len(await _corrections(db_session, task)) == 2
+
+
+async def _answer(db, run, ledger, option, user):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(ledger["decision_id"]))
+    await OrchestrationAuthorityDecisionService().answer_runtime_question(
+        db, decision, option, actor_user_id=user.id, contract_version=decision.contract_version,
+    )
+    await db.refresh(run)
+
+
+async def test_owner_retry_answer_starts_new_cycle_with_cycle_subject(db_session, test_project, test_user):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [first] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, first, MISSING_FIELDS)
+    await _answer(db_session, run, await _ledger(service, db_session, run, task), "retry", test_user)
+
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["cycle"] == 2 and ledger["status"] == "correcting" and len(ledger["previous_attempts"]) == 2
+    second = next(item for item in await _corrections(db_session, task) if item.id != first.id)
+    await _complete(db_session, service, run, second, MISSING_FIELDS)
+    [blocker] = _escalations(run, "result_correction_exhausted")
+    assert blocker["subject"] == f"task:{task.id}:result_correction:cycle:2"
+
+
+async def test_owner_dismiss_answer_closes_the_ledger(db_session, test_project, test_user):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [first] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, first, MISSING_FIELDS)
+    await _answer(db_session, run, await _ledger(service, db_session, run, task), "dismiss", test_user)
+
+    for _ in range(2):
+        await service.tick(db_session, run.id)
+
+    assert (await _ledger(service, db_session, run, task))["status"] == "owner_declined"
+    assert len(await _corrections(db_session, task)) == 1
+
+
+async def test_unavailable_retry_uses_cycle_subject(db_session, test_project, test_user):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    await _complete(db_session, service, run, task, "")
+    await _answer(db_session, run, await _ledger(service, db_session, run, task), "retry", test_user)
+
+    await service.tick(db_session, run.id)
+
+    [blocker] = _escalations(run, "capability_unavailable")
+    assert blocker["subject"] == f"task:{task.id}:correction_input_unavailable:cycle:2"
+    assert await _corrections(db_session, task) == []
+
+
+async def _fail(db, task):
+    task.status = "in_progress"
+    session = Session(project_id=task.project_id, task_id=task.id, agent_id=task.assigned_to, adapter_type="api",
+                      status="failed", input_context={}, error="timeout", origin="orchestrator", ended_at=_utcnow())
+    db.add(session)
+    await db.flush()
+    await sync_task_from_session(db, session)
+
+
+async def test_failed_correction_task_counts_as_an_attempt_and_gate_follows_the_ledger(db_session, test_project):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    gate = await db_session.get(OrchestrationGate, uuid.UUID(task.metadata_["orchestration"]["gate_id"]))
+    await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [first] = await _corrections(db_session, task)
+    await _fail(db_session, first)
+
+    await service.tick(db_session, run.id)
+
+    [second] = [item for item in await _corrections(db_session, task) if item.id != first.id]
+    assert (await service._adhoc_report_failure(db_session, gate))[1] is False
+    await _fail(db_session, second)
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "exhausted" and [a.get("task_failed") for a in ledger["attempts"]] == [None, True, True]
+    assert len(_escalations(run, "result_correction_exhausted")) == 1
+    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", True)
+    assert len(await _corrections(db_session, task)) == 2
+
+
+async def test_adhoc_gate_waits_through_second_correction_and_passes_on_its_report(db_session, test_project):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    gate = await db_session.get(OrchestrationGate, uuid.UUID(task.metadata_["orchestration"]["gate_id"]))
+    await _complete(db_session, service, run, task, json.dumps({**VALID, "status": 1, "next_step": 2, "risks": [3]}))
+    [first] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, first, json.dumps({**VALID, "status": 1}))
+    [second] = [item for item in await _corrections(db_session, task) if item.id != first.id]
+
+    await service.validate_open_gates(db_session, run.id)
+    assert gate.status == "open"
+    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", False)
+
+    await _complete(db_session, service, run, second, json.dumps(VALID))
+    assert await service._adhoc_report_failure(db_session, gate) is None
 
 
 async def test_planning_envelope_failure_dispatches_correction_with_its_own_schema(db_session, test_project):
