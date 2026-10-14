@@ -661,3 +661,23 @@ async def test_sqlite_cli_cancel_task_sync_follows_canceller_ownership(test_engi
         assert "cancel_owner_managed" not in (stored.metadata_ or {})
         assert (await _reload(factory, Task, task.id)).status == ("in_progress" if owner_managed else "failed")
         assert len(failed) == (0 if owner_managed else 1)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_cli_manual_cancel_clears_stale_owner_managed_flag(test_engine, tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    from huddleroom.config import settings
+
+    if not settings.is_sqlite:
+        pytest.skip("worker-driven CLI cancel is the SQLite path")
+    runner = f"runner-{uuid.uuid4()}"
+    async with _world(test_engine, tmp_path, monkeypatch, session_status="running", adapter="cli", runner=runner) as (
+            factory, _project, _agent, _task, session):
+        with patch("huddleroom.workers.task_runner.cancel_task", new=AsyncMock(return_value=False)):
+            for sync_task, expected in ((False, True), (True, False)):
+                async with factory() as db:
+                    with pytest.raises(HTTPException) as exc:
+                        await SessionService().cancel(db, session.id, sync_task=sync_task)
+                assert exc.value.status_code == 409
+                stored = await _reload(factory, Session, session.id)
+                assert bool((stored.metadata_ or {}).get("cancel_owner_managed")) is expected
