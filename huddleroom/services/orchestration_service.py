@@ -70,6 +70,7 @@ from huddleroom.services.orchestration_plan_ingestion import (
     PlanIngestionError,
     ingest,
     ingested_plan_hash,
+    linked_correction_session,
     plan_artifact_id,
 )
 from huddleroom.schemas.task import TaskCreate
@@ -5507,8 +5508,11 @@ class OrchestrationService:
             raise HTTPException(status_code=409, detail="Plan artifact does not match current planning provenance")
         session_id = self._event_uuid(metadata.get("winning_session_id"))
         session = await db.get(Session, session_id) if session_id is not None else None
+        corrected = session is not None and session.task_id != task.id and await linked_correction_session(
+            db, run, task, session, state.get("planning_version"),
+        )
         if (
-            session is None or session.task_id != task.id or session.agent_id != task.assigned_to
+            session is None or (session.task_id != task.id and not corrected) or session.agent_id != task.assigned_to
             or session.project_id != artifact.project_id or session.status != "completed"
         ):
             raise HTTPException(status_code=409, detail="Plan artifact winning session does not match its producer")
@@ -5519,7 +5523,7 @@ class OrchestrationService:
             marker is None or marker.status != "completed"
             or marker.target_type != "artifact" or marker.target_id != artifact.id
             or self._event_uuid(marker.request.get("task_id")) != task.id
-            or self._event_uuid(marker.request.get("session_id")) != session.id
+            or (self._event_uuid(marker.request.get("session_id")) != session.id and not corrected)
         ):
             raise HTTPException(status_code=409, detail="Plan artifact session does not match the consumed planning report")
         return task
@@ -7756,6 +7760,22 @@ class OrchestrationService:
                 return  # a nonwinning session never becomes the plan Artifact
             raise
         marker = await self._existing_action_for_key(db, run.id, key)
+        await self._land_plan_output(db, run, task, marker, task, session_id, output)
+
+    async def _land_plan_output(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun,
+        task: Task,
+        marker: OrchestrationAction,
+        source: Task,
+        session_id: uuid.UUID | None,
+        output: str | None,
+    ) -> None:
+        """Ingest ``output`` as ``task``'s plan; ``source`` produced it (the planning task or its linked correction).
+
+        Correctable rejections start an output-only correction; stale and provenance rejections keep the revision path."""
+        metadata = self._json_object_or_empty(task.metadata_)
         plan_state = self._json_object_or_empty(run.plan_state)
         version = self._json_object_or_empty(metadata.get("orchestration_plan")).get("planning_version")
         if version is None:
@@ -7771,6 +7791,8 @@ class OrchestrationService:
             artifact = await ingest(db, goal, run, task, session_id, version, plan_text)
         except PlanIngestionError as exc:
             marker.request = {**self._json_object_or_empty(marker.request), "plan_ingestion_error": exc.reason}
+            if source is not task and not exc.correctable:  # a linked correction failing a fence ends the correction
+                self._set_result_correction_status(marker, "rejected", reason=exc.reason)
             if exc.code == BUDGET_REQUIRED_CODE:
                 details = {
                     "code": exc.code, "title": "Budget required", "message": BUDGET_REQUIRED_MESSAGE,
@@ -7802,6 +7824,14 @@ class OrchestrationService:
                 Artifact.artifact_type == "plan",
                 Artifact.id != plan_artifact_id(task.id, version),
             ).limit(1))
+            # Planner prose with no JSON object never emitted an envelope: a missing plan, which a revision regenerates.
+            if exc.correctable and manual_plan is None and (source is not task or "{" in (output or "")):
+                marker.request = {**marker.request, "rejected_output": output}
+                await self._mark_action_completed(db, marker, "task", task.id)
+                await self._request_result_correction(
+                    db, run, source, session_id, PLANNING_ENVELOPE, exc.diagnostics or [exc.reason],
+                )
+                return
             if not exc.stale and manual_plan is None:
                 reason = f"planning_output_rejected: {exc.reason}"
                 pending = self._json_object_or_empty(plan_state.get("pending_replan"))
@@ -7814,6 +7844,13 @@ class OrchestrationService:
             await self._mark_action_completed(db, marker, "task", task.id)
             return
         await self._mark_action_completed(db, marker, "artifact", artifact.id)
+        if source is not task:
+            self._set_result_correction_status(marker, "corrected")
+
+    def _set_result_correction_status(self, marker: OrchestrationAction, status: str, **fields: Any) -> None:
+        request = self._json_object_or_empty(marker.request)
+        ledger = self._json_object_or_empty(request.get("result_correction"))
+        marker.request = {**request, "result_correction": {**ledger, "status": status, **fields}}
 
     async def consume_canonical_report(
         self,
@@ -7970,7 +8007,14 @@ class OrchestrationService:
             ledger["stale"] = stale  # neither dispatched nor consumed onto a paused/superseded run
             return
         ledger.pop("stale", None)
-        if ledger.get("status") in {"corrected", "owner_declined"}:
+        if ledger.get("status") in {"corrected", "owner_declined", "superseded", "rejected"}:
+            return
+        if ledger["kind"] == PLANNING_ENVELOPE and self._json_object_or_empty(ledger.get("version")).get(
+            "planning_version", version["planning_version"]
+        ) != version["planning_version"]:
+            # A newer planning version replaces this plan; its revision carries on, not a correction of the old one.
+            await self._new_result_correction_cycle(db, run, parent, ledger, version)
+            ledger["status"] = "superseded"
             return
         if ledger.get("version", version) != version:
             # A new owner contract or plan version resets the count.
@@ -9287,12 +9331,30 @@ class OrchestrationService:
         marker.request = {**self._json_object_or_empty(marker.request), "result_correction": {
             **{key: value for key, value in ledger.items() if key != "stale"}, **recorded,
         }}
-        if stale or ledger.get("kind") != WORK_REPORT:
+        if stale:
+            return
+        if ledger.get("kind") == PLANNING_ENVELOPE:
+            parent = await db.get(Task, parent_id)
+            if session is None or parent is None:  # a plan only lands from a recorded session of the correction
+                self._set_result_correction_status(marker, "rejected", reason="the correction has no recorded session")
+                return
+            await self._land_plan_output(db, run, parent, marker, task, session.id, session.output)
+            return
+        if ledger.get("kind") != WORK_REPORT:
             return  # other kinds land through their own consumers
         _, report = await self.consume_canonical_report(db, run, task, session_id, event_id)
         if report is not None:
-            current = self._json_object_or_empty(self._json_object_or_empty(marker.request).get("result_correction"))
-            marker.request = {**marker.request, "result_correction": {**current, "status": "corrected"}}
+            # The corrected report becomes the original's effective report; the failed candidate stays recorded.
+            from huddleroom.services.orchestration_work_report import work_report_payload
+
+            request = self._json_object_or_empty(marker.request)
+            marker.request = {
+                **request,
+                "original_report": request.get("original_report", request.get("report")),
+                "report": work_report_payload(report),
+                "effective_report": {"task_id": str(task.id), "session_id": str(session_id) if session_id else None},
+            }
+            self._set_result_correction_status(marker, "corrected")
 
     async def _ingest_task_evidence(
         self,
@@ -11234,7 +11296,9 @@ class OrchestrationService:
             if source is not None else None
             for source in sources
         ]
-        for marker in markers:
+        for index, marker in enumerate(markers):
+            if index == 0 and ledger.get("status") in {"pending", "correcting"}:
+                continue  # the original's report is under correction, so it is not the effective one yet
             request = self._json_object_or_empty(marker.request) if marker is not None else {}
             report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
             if report is not None:

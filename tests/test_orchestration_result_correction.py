@@ -59,11 +59,11 @@ async def _setup(db, project, *, caps=None):
     return service, goal, run, agent, await db.get(Task, action.target_id)
 
 
-async def _complete(db, service, run, task, output, *, tokens=0):
+async def _complete(db, service, run, task, output, *, tokens=0, agent_id=None):
     """Finish one attempt the way an adapter does, then ingest its completion event."""
     task.status = "in_progress"
     session = Session(
-        project_id=task.project_id, task_id=task.id, agent_id=task.assigned_to, adapter_type="api",
+        project_id=task.project_id, task_id=task.id, agent_id=agent_id or task.assigned_to, adapter_type="api",
         status="completed", input_context={}, output=output, origin="orchestrator", ended_at=_utcnow(),
         metadata_={"token_count_in": tokens, "token_count_out": 0,
                    "orchestration": {"action_id": task.metadata_["orchestration"]["action_id"]}},
@@ -492,3 +492,230 @@ async def test_contract_change_while_waiting_on_budget_cancels_the_stale_budget_
     assert current["scope"] == f"task:{task.id}:result_correction:cycle:2"
     assert (await _decision(db_session, current["decision_id"])).status == "pending"
     assert await _corrections(db_session, task) == []
+
+
+async def test_wrong_artifact_citation_is_corrected_without_redoing_the_work(db_session, test_project):
+    from huddleroom.models.artifact import Artifact
+    from huddleroom.models.orchestration import OrchestrationEvidence
+
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    gate = await db_session.get(OrchestrationGate, uuid.UUID(task.metadata_["orchestration"]["gate_id"]))
+    notes = Artifact(project_id=test_project.id, name="audit-notes.md", artifact_type="document", status="draft",
+                     linked_task_id=task.id, created_by_agent=task.assigned_to)
+    db_session.add(notes)
+    await db_session.flush()
+    wrong = uuid.uuid4()
+    cited = json.dumps({**VALID, "evidence": [f"artifact:{wrong}", "docs/audit-notes.md"]})
+    original = await _complete(db_session, service, run, task, cited)
+    tasks_before = len(list(await db_session.scalars(select(Task))))
+    error = f"evidence artifact:{wrong} is not registered; docs/audit-notes.md is artifact {notes.id}"
+
+    # A reference check that finds the cited content under another id asks for an output-only correction.
+    await service._request_result_correction(db_session, run, task, original.id, "work_report", [error])
+
+    [correction] = await _corrections(db_session, task)
+    assert len(list(await db_session.scalars(select(Task)))) == tasks_before + 1
+    assert cited in correction.description and error in correction.description
+    assert '"collaboration_need": "str|null"' in correction.description
+    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", False)
+
+    fixed_report = {**VALID, "evidence": [f"artifact:{notes.id}", "docs/audit-notes.md"]}
+    fixed = await _complete(db_session, service, run, correction, json.dumps(fixed_report))
+
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    assert marker.request["result_correction"]["status"] == "corrected"
+    assert marker.request["report"]["evidence"] == fixed_report["evidence"]  # the parent's effective report
+    assert marker.request["effective_report"] == {"task_id": str(correction.id), "session_id": str(fixed.id)}
+    assert marker.request["original_report"]["evidence"] == [f"artifact:{wrong}", "docs/audit-notes.md"]
+    assert marker.request["session_id"] == str(original.id)  # the failed candidate stays recorded
+    _session_id, report = await service.consume_canonical_report(db_session, run, task)
+    assert report.candidate_evidence == fixed_report["evidence"]
+    assert await service._adhoc_report_failure(db_session, gate) is None
+    # Still candidate evidence: nothing is verified by the correction itself.
+    assert f"artifact:{notes.id}" in run.supervision_state["verification_candidates"]
+    assert f"artifact:{notes.id}" not in run.supervision_state.get("verified_progress", [])
+    verdicts = set(await db_session.scalars(select(OrchestrationEvidence.verdict).where(
+        OrchestrationEvidence.gate_id == gate.id)))
+    assert "accepted" not in verdicts
+    # No work redone: the original ran once and only the correction task was created.
+    assert len(list(await db_session.scalars(select(Session).where(Session.task_id == task.id)))) == 1
+    assert len(list(await db_session.scalars(select(Task)))) == tasks_before + 1
+
+
+async def _planning_correction(db, project, output):
+    from tests.test_orchestration_plan_ingestion import _completed, _finish, _planning_run
+
+    service, goal, run, task, session = await _planning_run(db, project.id)
+    await _finish(db, task, session, output)
+    await service._ingest_session_evidence(db, run, _completed(session.id))
+    return service, goal, run, task, session
+
+
+def _plan(keys=("plan",), summary="sum"):
+    from tests.test_orchestration_plan_ingestion import _env, _item
+
+    return json.dumps(_env(items=[_item(success_criterion_keys=list(keys))], summary=summary))
+
+
+async def _plan_artifact_count(db, project):
+    from huddleroom.models.artifact import Artifact
+
+    return len(list(await db.scalars(select(Artifact.id).where(
+        Artifact.project_id == project.id, Artifact.artifact_type == "plan",
+    ))))
+
+
+async def test_unknown_criterion_key_plan_is_corrected_and_ingested_under_the_original_identity(
+    db_session, test_project,
+):
+    from huddleroom.services.orchestration_plan_ingestion import plan_artifact_id
+
+    failed = _plan(keys=("protocol_fallback",))
+    service, _goal, run, task, session = await _planning_correction(db_session, test_project, failed)
+    version = run.plan_state["planning_version"]
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    error = marker.request["plan_ingestion_error"]
+    assert "protocol_fallback" in error and marker.request["rejected_output"] == failed
+    assert run.plan_state["status"] != "revision_required" and "plan_artifact_id" not in run.plan_state
+
+    [correction] = await _corrections(db_session, task)
+    assert failed in correction.description and error in correction.description
+    assert correction.metadata_["orchestration_contract"]["expected_result"] == "planning_envelope"
+
+    fixed = await _complete(db_session, service, run, correction, _plan())
+
+    artifact_id = plan_artifact_id(task.id, version)
+    assert run.plan_state["plan_artifact_id"] == str(artifact_id)
+    assert run.plan_state["planning_task_id"] == str(task.id) and run.plan_state["planning_version"] == version
+    assert run.plan_state["status"] != "revision_required"
+    assert await _plan_artifact_count(db_session, test_project) == 1
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    assert (marker.target_type, marker.target_id) == ("artifact", artifact_id)
+    assert marker.request["session_id"] == str(session.id)
+    assert marker.request["result_correction"]["status"] == "corrected"
+    assert marker.request["result_correction"]["correction_session_id"] == str(fixed.id)
+    from huddleroom.models.artifact import Artifact
+
+    artifact = await db_session.get(Artifact, artifact_id)
+    assert artifact.linked_task_id == task.id and artifact.metadata_["winning_session_id"] == str(fixed.id)
+    action = await service.execute_accept_plan_action(
+        db_session, run_id=run.id, request={"action_type": "accept_plan", "plan_artifact_id": str(artifact_id)},
+        idempotency_key=f"run:{run.id}:kind:accept_plan",
+    )
+    assert action.status == "completed" and run.plan_state["status"] == "accepted"
+    assert len(await _corrections(db_session, task)) == 1
+
+
+async def test_plan_correction_fence_rejects_unlinked_sessions_and_conflicting_output(db_session, test_project):
+    from tests.test_orchestration_plan_delegation_gate import _agent
+    from huddleroom.services.orchestration_plan_ingestion import PlanIngestionError, ingest
+
+    service, goal, run, task, _session = await _planning_correction(
+        db_session, test_project, _plan(keys=("protocol_fallback",)),
+    )
+    version = run.plan_state["planning_version"]
+    [correction] = await _corrections(db_session, task)
+
+    # An unrelated session of the same agent is not the ledger's correction.
+    other = Task(project_id=test_project.id, title="unrelated", assigned_to=task.assigned_to, status="done")
+    db_session.add(other)
+    await db_session.flush()
+    unrelated = Session(project_id=test_project.id, task_id=other.id, agent_id=task.assigned_to,
+                        adapter_type="api", status="completed", output=_plan())
+    db_session.add(unrelated)
+    await db_session.flush()
+    with pytest.raises(PlanIngestionError, match="does not belong"):
+        await ingest(db_session, goal, run, task, unrelated.id, version, _plan())
+    # A correction session the ledger has not recorded is not linked either.
+    early = Session(project_id=test_project.id, task_id=correction.id, agent_id=task.assigned_to,
+                    adapter_type="api", status="completed", output=_plan())
+    db_session.add(early)
+    await db_session.flush()
+    with pytest.raises(PlanIngestionError, match="does not belong"):
+        await ingest(db_session, goal, run, task, early.id, version, _plan())
+    await db_session.delete(early)
+    await db_session.flush()
+
+    fixed = await _complete(db_session, service, run, correction, _plan())
+    assert await _plan_artifact_count(db_session, test_project) == 1
+    with pytest.raises(PlanIngestionError, match="superseded") as exc:
+        await ingest(db_session, goal, run, task, fixed.id, version + 1, _plan())
+    assert exc.value.stale
+    with pytest.raises(PlanIngestionError, match="conflicting plan output"):
+        await ingest(db_session, goal, run, task, fixed.id, version, _plan(summary="other"))
+
+    intruder = _agent("intruder")
+    db_session.add(intruder)
+    await db_session.flush()
+    fixed.agent_id = intruder.id
+    await db_session.flush()
+    with pytest.raises(PlanIngestionError, match="author"):
+        await ingest(db_session, goal, run, task, fixed.id, version, _plan())
+    assert await _plan_artifact_count(db_session, test_project) == 1
+
+
+async def test_plan_correction_by_another_author_is_rejected_and_not_corrected_again(db_session, test_project):
+    from tests.test_orchestration_plan_delegation_gate import _agent
+
+    service, _goal, run, task, _session = await _planning_correction(
+        db_session, test_project, _plan(keys=("protocol_fallback",)),
+    )
+    [correction] = await _corrections(db_session, task)
+    intruder = _agent("intruder")
+    db_session.add(intruder)
+    await db_session.flush()
+
+    await _complete(db_session, service, run, correction, _plan(), agent_id=intruder.id)
+
+    assert "plan_artifact_id" not in run.plan_state and await _plan_artifact_count(db_session, test_project) == 0
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "rejected" and "author" in ledger["reason"]
+    await service.tick(db_session, run.id)
+    assert len(await _corrections(db_session, task)) == 1
+
+
+async def test_superseded_plan_correction_session_is_rejected_once_a_newer_correction_is_current(
+    db_session, test_project,
+):
+    from tests.test_orchestration_plan_ingestion import _env, _item
+    from huddleroom.services.orchestration_plan_ingestion import PlanIngestionError, ingest
+
+    two_errors = json.dumps(_env(items=[_item(success_criterion_keys=["plan"])], extra=1, schema_version=2))
+    service, goal, run, task, _session = await _planning_correction(db_session, test_project, two_errors)
+    version = run.plan_state["planning_version"]
+    [first] = await _corrections(db_session, task)
+    first_session = await _complete(db_session, service, run, first, _plan(keys=("protocol_fallback",)))
+    [second] = [item for item in await _corrections(db_session, task) if item.id != first.id]
+    assert (await _ledger(service, db_session, run, task))["correction_task_id"] == str(second.id)
+
+    with pytest.raises(PlanIngestionError, match="does not belong"):
+        await ingest(db_session, goal, run, task, first_session.id, version, _plan())
+
+    fixed = await _complete(db_session, service, run, second, _plan())
+    assert await _plan_artifact_count(db_session, test_project) == 1
+    assert (await _ledger(service, db_session, run, task))["correction_session_id"] == str(fixed.id)
+
+
+async def test_plan_revision_supersedes_an_in_flight_plan_correction(db_session, test_project):
+    service, _goal, run, task, _session = await _planning_correction(
+        db_session, test_project, _plan(keys=("protocol_fallback",)),
+    )
+    [correction] = await _corrections(db_session, task)
+    await service.execute_request_plan_revision_action(
+        db_session, run_id=run.id,
+        request={"action_type": "request_plan_revision", "plan_task_id": str(task.id), "revision_request": "Redo."},
+        idempotency_key=f"run:{run.id}:kind:request_plan_revision:redo",
+    )
+
+    await _complete(db_session, service, run, correction, _plan())
+    await service.tick(db_session, run.id)
+
+    assert "plan_artifact_id" not in run.plan_state and await _plan_artifact_count(db_session, test_project) == 0
+    assert (await _ledger(service, db_session, run, task))["status"] == "superseded"
+    assert len(await _corrections(db_session, task)) == 1
