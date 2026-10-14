@@ -27,7 +27,9 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_capacity import available_slots, root_goal_id
-from huddleroom.services.orchestration_dependencies import NON_BLOCKING_GATE_TYPES, dependency_ids, gate_satisfies, task_gate_id
+from huddleroom.services.orchestration_dependencies import (
+    NON_BLOCKING_GATE_TYPES, accepted_plan_items, criterion_state, dependency_ids, gate_satisfies, task_gate_id,
+)
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
 
 logger = logging.getLogger(__name__)
@@ -560,6 +562,7 @@ class OrchestrationProgressView:
                     task_links[tag[len("criterion:"):]].add(str(action.target_id))
 
         task_by_id = {str(task.id): task for task in tasks}
+        snapshot_items = accepted_plan_items(run.plan_state)
         entries = []
         for key, description in criteria:
             linked_task_ids = [tid for tid in (str(t.id) for t in tasks) if tid in task_links[key]]
@@ -569,7 +572,7 @@ class OrchestrationProgressView:
                 or key in _string_list((gate.required_evidence or {}).get("success_criterion_keys"))
             ]
             in_flight = any(task_by_id[tid].status in ACTIVE_TASK_STATUSES for tid in linked_task_ids)
-            if linked_gates and all(gate.status == "accepted" for gate in linked_gates):
+            if criterion_state(key, snapshot_items, gates) == "accepted":
                 state = "accepted"
             elif not in_flight and any(gate.status in ("open", "failed") for gate in linked_gates):
                 state = "evidence_pending"

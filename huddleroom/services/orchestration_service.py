@@ -125,8 +125,11 @@ from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATED_WORK_FUNCTIONS,
     RETAINED_GATE_TYPE,
     _uuid,
+    accepted_plan_items,
+    criterion_state,
     evidence_semantics,
     first_unmet_dependency,
+    non_final_gate,
     task_gate_id,
     validate_dependencies,
 )
@@ -1965,7 +1968,8 @@ class OrchestrationService:
             version = await OrchestrationRoadmapService(self).current_version(db, goal.id)
             roadmap_version_id = str(version.id) if version is not None else None
         request_to_store = self._canonical_final_summary_request(
-            existing.request if existing is not None else request, gates, evidence, goal, roadmap_version_id
+            existing.request if existing is not None else request, gates, evidence, goal, roadmap_version_id,
+            accepted_plan_items(run.plan_state),
         )
         fits = await OrchestrationRosterMapper().rank_agents(
             db,
@@ -5345,6 +5349,7 @@ class OrchestrationService:
         evidence: list[OrchestrationEvidence],
         goal: OrchestrationGoal | None = None,
         roadmap_version_id: str | None = None,
+        plan_items: list[dict] | None = None,
     ) -> dict[str, Any]:
         request_obj = self._json_object_or_empty(request)
         work_function = self._required_string(request_obj.get("work_function"), "work_function")
@@ -5357,7 +5362,7 @@ class OrchestrationService:
             "action_type": "request_final_summary",
             "work_function": work_function,
             "criterion_evidence_manifest": self._criterion_evidence_manifest(
-                gates, evidence, goal, roadmap_version_id
+                gates, evidence, goal, roadmap_version_id, plan_items
             ),
         }
 
@@ -6611,7 +6616,7 @@ class OrchestrationService:
         accepted_gate_ids = [str(gate.id) for gate in gates]
         accepted_evidence_ids = [str(item.id) for item in evidence]
         criterion_evidence_manifest = dict(
-            criterion_evidence_manifest or self._criterion_evidence_manifest(gates, evidence)
+            criterion_evidence_manifest or self._criterion_evidence_manifest(gates, evidence, plan_items=accepted_plan_items(run.plan_state))
         )
         return {
             "action_type": "create_delegation_task",
@@ -6655,13 +6660,13 @@ class OrchestrationService:
         evidence: list[OrchestrationEvidence],
         goal: OrchestrationGoal | None = None,
         roadmap_version_id: str | None = None,
+        plan_items: list[dict] | None = None,
     ) -> dict[str, list[str]]:
-        """Map each criterion to accepted verifier evidence from plan-item gates only."""
-        manifest: dict[str, list[str]] = {}
+        """Map each criterion to accepted verifier evidence from plan-item gates only.
 
-        def non_final(gate: OrchestrationGate) -> bool:
-            sem = evidence_semantics(gate.gate_type, gate.required_evidence, "verification", "accepted", None)
-            return sem["evidence_role"] in {"discovery", "readiness"} or sem["review_stage"] == "preliminary"
+        With accepted plan items, a criterion is listed only when the shared acceptance predicate holds."""
+        manifest: dict[str, list[str]] = {}
+        non_final = non_final_gate
 
         if goal is not None and goal.goal_type == "roadmap":
             for gate in gates:
@@ -6691,6 +6696,8 @@ class OrchestrationService:
                 self._json_object_or_empty(gate.required_evidence).get("success_criterion_keys")
             ):
                 manifest.setdefault(key, []).extend(evidence_ids)
+        if plan_items:
+            manifest = {k: v for k, v in manifest.items() if criterion_state(k, plan_items, gates) == "accepted"}
         return manifest
 
     def _set_final_summary_task_metadata(
@@ -6994,7 +7001,9 @@ class OrchestrationService:
                 return False
             raise
         version = await OrchestrationRoadmapService(self).current_version(db, goal.id) if goal.goal_type == "roadmap" else None
-        manifest = self._criterion_evidence_manifest(gates, evidence, goal, str(version.id) if version else None)
+        manifest = self._criterion_evidence_manifest(
+            gates, evidence, goal, str(version.id) if version else None, accepted_plan_items(run.plan_state)
+        )
         return all(manifest.get(key) for key in self._declared_success_criterion_keys(goal))
 
     async def _ensure_final_summary_gate(
