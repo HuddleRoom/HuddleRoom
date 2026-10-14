@@ -134,3 +134,55 @@ def test_legacy_contract_has_no_kind_key_and_still_derives():
     dumped = contract.model_dump(mode="json")
     assert "expected_result" not in dumped
     assert expected_result_kind(dumped, False) == "verification_verdict"
+
+
+@pytest.mark.asyncio
+async def test_gate_bound_planning_role_delegation_with_plan_kind_schema_stamps_work_report(db_session, test_project):
+    agent = _agent("planner", role="planner", capabilities=["planning"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    request = {**_delegation_request(agent.id), "work_function": "planning", "budget": {"max_tokens": 5000},
+               "report_schema": {"plan_kind": "roadmap", "plan_items": "list"}}
+    bound = await service.execute_create_delegation_task_action(
+        db_session, run_id=run.id, request=request,
+        idempotency_key=f"run:{run.id}:kind:create_delegation_task:roadmap_item:r1", gate_bound=True,
+    )
+    unbound = await service.execute_create_delegation_task_action(
+        db_session, run_id=run.id, request={**request, "scope": "another scope"},
+        idempotency_key=f"run:{run.id}:kind:create_delegation_task:roadmap_item:r2",
+    )
+    assert (await db_session.get(Task, bound.id)).metadata_["orchestration_contract"]["expected_result"] == "work_report"
+    assert (await db_session.get(Task, unbound.id)).metadata_["orchestration_contract"]["expected_result"] == "planning_envelope"
+
+
+@pytest.mark.asyncio
+async def test_ungated_planning_role_task_without_plan_kind_is_consumed_as_work_report(db_session, test_project):
+    agent = _agent("planner", role="planner", capabilities=["planning"])
+    db_session.add(agent)
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    action = await service.execute_create_delegation_task_action(
+        db_session, run_id=run.id, request={**_delegation_request(agent.id), "work_function": "planning"},
+        idempotency_key=f"run:{run.id}:kind:create_delegation_task:adhoc-planning",
+    )
+    task = await db_session.get(Task, action.id)
+    assert task.metadata_["orchestration_contract"]["expected_result"] == "work_report"
+    report = {key: ([] if shown.startswith("list") else {} if shown.startswith("dict") else None if "null" in shown else "x")
+              for key, shown in CANONICAL_WORK_REPORT_SCHEMA.items()}
+    report["status"] = "completed"
+    task.metadata_ = {**task.metadata_, "orchestration": {**task.metadata_["orchestration"],
+                                                          "terminal_output": json.dumps(report)}}
+    task.status = "done"
+    task.completed_at = _utcnow()
+    await db_session.flush()
+    await emit_event_once(db_session, test_project.id, "task.status_changed", {
+        "task_id": str(task.id), "status": "done", "previous_status": "in_progress",
+    }, dedup_key=f"ungated-planning-report:{task.id}")
+    event = await db_session.scalar(select(EventLog).where(EventLog.dedup_key == f"ungated-planning-report:{task.id}"))
+    await service._ingest_task_evidence(db_session, run, event)
+    marker = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "report_consumed",
+    ))
+    assert marker is not None and marker.status == "completed"
+    assert "plan_ingestion_error" not in (marker.request or {})

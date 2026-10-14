@@ -1724,6 +1724,7 @@ class OrchestrationService:
         skip_baseline_gate: bool = False,
         ad_hoc: bool = False,
         baseline_repair_admission: BaselineRepairAdmissionV1 | None = None,
+        gate_bound: bool = False,
     ) -> OrchestrationAction:
         gate_run = await db.get(OrchestrationRun, run_id)
         if gate_run is None:
@@ -1833,17 +1834,17 @@ class OrchestrationService:
             raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
         report_schema = self._json_object_or_empty(stored_request.get("report_schema"))
-        # A gate exists at creation only for ad-hoc gated work and plan-item expansion (its gate is
-        # created before this delegation and linked to the task right after).
-        has_gate = (ad_hoc and self._required_string(stored_request.get("work_function"), "work_function")
-                    in ADHOC_GATED_WORK_FUNCTIONS) or ":plan_item:" in idempotency_key
+        # The caller says when it created the gate (plan-item/roadmap expansion links it right after);
+        # ad-hoc gated work functions get their gate below.
+        work_function = self._required_string(stored_request.get("work_function"), "work_function")
+        has_gate = gate_bound or (ad_hoc and work_function in ADHOC_GATED_WORK_FUNCTIONS)
         contract = OrchestrationDelegationContract(
             goal_id=goal.id,
             run_id=run.id,
             action_id=action.id,
             agent_id=agent_id,
             expected_result=expected_result_kind({"report_schema": report_schema}, has_gate),
-            work_function=self._required_string(stored_request.get("work_function"), "work_function"),
+            work_function=work_function,
             scope=self._required_string(stored_request.get("scope"), "scope"),
             inputs=self._string_list(stored_request.get("inputs")),
             deliverable=self._required_string(stored_request.get("deliverable"), "deliverable"),
@@ -3013,6 +3014,7 @@ class OrchestrationService:
             request=delegation_request,
             idempotency_key=self._plan_item_delegation_idempotency_key(run.id, item.id),
             decision_id=decision_id,
+            gate_bound=True,
         )
         if delegation_action.status != "completed" or delegation_action.target_id is None:
             await self._fail_reserved_action_for_current_flow(db, action, "Plan item delegation did not complete")
@@ -8976,6 +8978,21 @@ class OrchestrationService:
             return await self._ingest_meeting_evidence(db, run, event)
         return 0
 
+    async def _ingest_ungated_output(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task, session_id: uuid.UUID | None,
+        event_id: uuid.UUID | None = None,
+    ) -> None:
+        """Route an ungated planning-role task's terminal output by the result kind its contract expects."""
+        metadata = self._json_object_or_empty(task.metadata_)
+        orchestration = self._json_object_or_empty(metadata.get("orchestration"))
+        if orchestration.get("work_function") != PLAN_WORK_FUNCTION or orchestration.get("run_id") != str(run.id):
+            return
+        kind = expected_result_kind(self._json_object_or_empty(metadata.get("orchestration_contract")), False)
+        if kind == PLANNING_ENVELOPE:
+            await self._ingest_planning_output(db, run, task, session_id)
+        elif kind == WORK_REPORT and task.status == "done":
+            await self.consume_canonical_report(db, run, task, session_id, event_id)
+
     async def _ingest_task_evidence(
         self,
         db: AsyncSession,
@@ -8995,7 +9012,7 @@ class OrchestrationService:
         gate_ref = await self._task_gate_for_run(db, run.id, task)
         if gate_ref is None:
             if status == "done":
-                await self._ingest_planning_output(db, run, task, None)
+                await self._ingest_ungated_output(db, run, task, None, event.id)
             return 0
         gate, orchestration = gate_ref
         if await self._is_outcome_verification_task(db, run, gate, task, orchestration):
@@ -9052,7 +9069,7 @@ class OrchestrationService:
         gate_ref = await self._task_gate_for_run(db, run.id, task)
         if gate_ref is None:
             if event.event_type == "session.completed" and task.status == "done":
-                await self._ingest_planning_output(db, run, task, session.id)
+                await self._ingest_ungated_output(db, run, task, session.id)
             return 0
 
         gate, orchestration = gate_ref

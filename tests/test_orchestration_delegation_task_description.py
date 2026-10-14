@@ -203,3 +203,10 @@ def test_strict_id_instruction_differs_for_planning():
     assert "plan item ids/item_keys and their depends_on references are yours to define" in plan
     assert "Use only IDs given" not in plan
     assert "Use only IDs given in this task" in other
+
+
+def test_unstamped_planning_contract_without_plan_kind_renders_work_report_prompt():
+    text = OrchestrationService._delegation_task_description(
+        _goal(), _contract(work_function="planning", report_schema={"artifact_id": "uuid"}))
+    assert "Planning rules:" not in text
+    assert '"criterion_progress"' in text and "Use only IDs given in this task" in text

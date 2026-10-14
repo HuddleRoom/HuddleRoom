@@ -1089,6 +1089,7 @@ class OrchestrationRoadmapService:
                 db, run.id,
                 delegation_request,
                 f"run:{run.id}:kind:create_delegation_task:roadmap_item:{item.item_key}",
+                gate_bound=True,
             )
             task = await db.get(Task, delegation.target_id)
         original_metadata = task.metadata_
