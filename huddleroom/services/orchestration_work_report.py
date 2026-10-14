@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -56,7 +56,7 @@ def validate_work_report(output: str | None) -> ReportValidation:
     except ValueError:
         pass  # ambiguous or malformed: the strict parse below reports the precise error
     result = _validate_report_text(text)
-    return ReportValidation(result.report, result.errors, how) if result.report else result
+    return replace(result, normalized=how) if result.report else result
 
 
 def _validate_report_text(output: str) -> ReportValidation:

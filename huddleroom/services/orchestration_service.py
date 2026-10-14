@@ -7865,7 +7865,7 @@ class OrchestrationService:
         marker.request = {
             **self._json_object_or_empty(marker.request),
             "report_validation_errors": list(validation.errors),
-            "normalized": validation.normalized,
+            **({"normalized": validation.normalized} if validation.normalized else {}),
             "clarification_count": 0,
             "report": work_report_payload(validation.report),
         }
@@ -9192,22 +9192,24 @@ class OrchestrationService:
         return action
 
     @staticmethod
-    def _verification_report(output: str | None) -> str | None:
+    def _verification_report(output: str | None) -> tuple[str | None, str | None]:
+        """Return (verdict, how the output was normalized); verdict is None when the report is invalid."""
         try:
-            report = json.loads(normalize_result_output(output or "")[0])
+            text, how = normalize_result_output(output or "")
+            report = json.loads(text)
         except (TypeError, ValueError):
-            return None
+            return None, None
         if not isinstance(report, Mapping) or report.get("status") != "done":
-            return None
+            return None, None
         verdict = report.get("verdict")
         if verdict not in {"accepted", "rejected"}:
-            return None
+            return None, None
         evidence = report.get("evidence")
         if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
-            return None
+            return None, None
         if verdict == "accepted" and not any(item.strip() for item in evidence):
-            return None
-        return verdict
+            return None, None
+        return verdict, how
 
     async def _bound_outcome_verification_binding(
         self,
@@ -9302,7 +9304,7 @@ class OrchestrationService:
         if event.event_type != "session.completed" or binding is None:
             return 0
         action, source_task = binding
-        verdict = self._verification_report(session.output)
+        verdict, how = self._verification_report(session.output)
         if verdict is None:
             return 0
         return await self._record_evidence_once(
@@ -9322,6 +9324,7 @@ class OrchestrationService:
                 "verification_action_id": str(action.id),
                 "source_task_id": str(source_task.id),
                 "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
+                **({"normalized": how} if how else {}),
             },
         )
 
@@ -9345,7 +9348,7 @@ class OrchestrationService:
             )
             if (
                 binding is None
-                or self._verification_report(session.output) != "accepted"
+                or self._verification_report(session.output)[0] != "accepted"
             ):
                 continue
             action, source_task = binding
@@ -10701,9 +10704,17 @@ class OrchestrationService:
             return None, "Final summary session attribution is invalid"
 
         try:
-            payload = json.loads(normalize_result_output(session.output)[0])
+            try:
+                text, how = normalize_result_output(session.output)
+            except ValueError:
+                text, how = session.output, None  # strict parse below reports the precise error
+            payload = json.loads(text)
         except (TypeError, ValueError):
             return None, "Final summary output must be valid JSON"
+        if how and self._json_object_or_empty(summary_evidence.evidence_metadata).get("normalized") != how:
+            summary_evidence.evidence_metadata = {
+                **self._json_object_or_empty(summary_evidence.evidence_metadata), "normalized": how,
+            }
         if not isinstance(payload, Mapping):
             return None, "Final summary output must be a JSON object"
         raw_summary = payload.get("summary")
