@@ -4792,6 +4792,15 @@ class OrchestrationService:
         source_task = await self._source_task_for_gate(db, project_id, gate)
         run = await db.get(OrchestrationRun, run_id)
         goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
+        if (
+            gate.gate_type == PLAN_GATE_TYPE and run is not None
+            and self._json_object_or_empty(run.plan_state).get("plan_artifact_id")
+        ):
+            try:
+                source_task = await self._ingested_planning_task_for_gate(db, run, gate)
+            except HTTPException as exc:
+                await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
+                raise
         if gate.gate_type == "roadmap_plan_approval" and run is not None:
             source_task = await self._planning_task_for_gate(db, run, gate)
         if goal is not None and goal.goal_type in {"outcome", "roadmap"} and gate.gate_type == PLAN_ITEM_GATE_TYPE:
@@ -4806,6 +4815,8 @@ class OrchestrationService:
             "roadmap_version_id": self._json_object_or_empty(gate.required_evidence).get("roadmap_version_id"),
         }
         excluded_agent_ids = await self._producer_agent_ids_for_gate(db, gate)
+        if source_task is not None and source_task.assigned_to is not None:
+            excluded_agent_ids.add(source_task.assigned_to)
         source_contract = self._json_object_or_empty(
             self._json_object_or_empty(source_task.metadata_ if source_task else {}).get("orchestration_contract")
         )
@@ -5449,6 +5460,48 @@ class OrchestrationService:
             or pending.get("gate_id") != str(gate.id)
         ):
             raise HTTPException(status_code=409, detail="Planning task does not match current pending Roadmap replan")
+        return task
+
+    async def _ingested_planning_task_for_gate(
+        self, db: AsyncSession, run: OrchestrationRun, gate: OrchestrationGate
+    ) -> Task:
+        """Resolve pre-acceptance verification from the current ingested plan's lineage."""
+        state = self._json_object_or_empty(run.plan_state)
+        if gate.run_id != run.id or state.get("plan_gate_id") != str(gate.id):
+            raise HTTPException(status_code=409, detail="Plan gate does not match the current planning request")
+        artifact = await self._plan_artifact_for_run(
+            db, run, self._required_uuid(state.get("plan_artifact_id"), "plan_artifact_id")
+        )
+        task = await self._planning_task_for_run(db, run, artifact.linked_task_id)
+        metadata = self._json_object_or_empty(artifact.metadata_)
+        task_plan = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration_plan"))
+        if (
+            metadata.get("source") != INGESTION_SOURCE
+            or metadata.get("planning_task_id") != str(task.id)
+            or metadata.get("planning_version") != state.get("planning_version")
+            or task_plan.get("planning_version") != state.get("planning_version")
+            or metadata.get("plan_author_agent_id") != str(task.assigned_to)
+            or state.get("plan_author_agent_id") != str(task.assigned_to)
+            or task.status != "done"
+        ):
+            raise HTTPException(status_code=409, detail="Plan artifact does not match current planning provenance")
+        session_id = self._event_uuid(metadata.get("winning_session_id"))
+        session = await db.get(Session, session_id) if session_id is not None else None
+        if (
+            session is None or session.task_id != task.id or session.agent_id != task.assigned_to
+            or session.project_id != artifact.project_id or session.status != "completed"
+        ):
+            raise HTTPException(status_code=409, detail="Plan artifact winning session does not match its producer")
+        marker = await self._existing_action_for_key(
+            db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}"
+        )
+        if (
+            marker is None or marker.status != "completed"
+            or marker.target_type != "artifact" or marker.target_id != artifact.id
+            or self._event_uuid(marker.request.get("task_id")) != task.id
+            or self._event_uuid(marker.request.get("session_id")) != session.id
+        ):
+            raise HTTPException(status_code=409, detail="Plan artifact session does not match the consumed planning report")
         return task
 
     async def _plan_artifact_for_run(
