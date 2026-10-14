@@ -58,9 +58,57 @@ def test_unreadable_is_uninspectable(tmp_path):
     assert (result.state, result.reason) == (UNINSPECTABLE, "artifact_identity_unavailable")
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
 def test_unreadable_workspace_is_uninspectable(tmp_path):
-    result = classify_input(art(path="a"), str(tmp_path / "missing_root"))
+    root = tmp_path / "ws"
+    root.mkdir()
+    root.chmod(0)
+    try:
+        result = classify_input(art(path="a"), str(root))
+    finally:
+        root.chmod(0o700)
     assert result.state == UNINSPECTABLE
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_unreadable_subdirectory_is_uninspectable(tmp_path):
+    (tmp_path / "d" / "sub").mkdir(parents=True)
+    (tmp_path / "d" / "sub" / "f").write_text("x")
+    (tmp_path / "d" / "sub").chmod(0)
+    try:
+        result = classify_input(art(path="d"), str(tmp_path))
+    finally:
+        (tmp_path / "d" / "sub").chmod(0o700)
+    assert result.state == UNINSPECTABLE
+
+
+def test_symlinked_dir_escaping_workspace_is_uninspectable(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "ws"
+    (root / "d").mkdir(parents=True)
+    (root / "d" / "link").symlink_to(outside, target_is_directory=True)
+    assert classify_input(art(path="d"), str(root)).state == UNINSPECTABLE
+
+
+def test_nul_byte_path_is_uninspectable(tmp_path):
+    assert classify_input(art(path="a\0b"), str(tmp_path)).state == UNINSPECTABLE
+
+
+def test_fifo_is_uninspectable(tmp_path):
+    os.mkfifo(tmp_path / "pipe")
+    assert classify_input(art(path="pipe"), str(tmp_path)).state == UNINSPECTABLE
+
+
+def test_file_vanishing_mid_walk_is_uninspectable(tmp_path, monkeypatch):
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "a").write_text("a")
+
+    def gone(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(mod, "_hash_file", gone)
+    assert classify_input(art(path="d"), str(tmp_path)).state == UNINSPECTABLE
 
 
 def test_symlink_escape_is_uninspectable(tmp_path):

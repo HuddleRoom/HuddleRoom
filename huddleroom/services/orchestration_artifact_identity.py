@@ -52,16 +52,33 @@ def _within(root: Path, path: Path) -> bool:
 def _hash_dir(root: Path, directory: Path) -> str:
     pairs: list[tuple[str, str]] = []
     total = 0
-    for base, _dirs, files in os.walk(directory):  # followlinks=False
+
+    def _raise(error: OSError) -> None:
+        raise error
+
+    for base, dirs, files in os.walk(directory, onerror=_raise):  # followlinks=False
+        for name in dirs:
+            full = Path(base) / name
+            if full.is_symlink() and not _within(root, full.resolve()):
+                raise PermissionError("path escapes workspace")
         for name in files:
             full = Path(base) / name
             real = full.resolve()
             if not _within(root, real):
                 raise PermissionError("path escapes workspace")
-            total += real.stat().st_size
+            try:
+                if not real.is_file():
+                    raise PermissionError("not a regular file")
+                total += real.stat().st_size
+            except FileNotFoundError as exc:  # vanished mid-walk: not a confirmed absence
+                raise RuntimeError("file vanished during hashing") from exc
             if len(pairs) + 1 > MAX_DIR_FILES or total > MAX_DIR_BYTES:
                 raise OverflowError("directory over cap")
-            pairs.append((full.relative_to(directory).as_posix(), _hash_file(str(real))))
+            try:
+                file_hash = _hash_file(str(real))
+            except FileNotFoundError as exc:
+                raise RuntimeError("file vanished during hashing") from exc
+            pairs.append((full.relative_to(directory).as_posix(), file_hash))
     digest = hashlib.sha256()
     for rel, file_hash in sorted(pairs):
         digest.update(f"{rel}\0{file_hash}\n".encode())
@@ -83,10 +100,12 @@ def _classify_path(path: str, workspace_root: str) -> InputAvailability:
             return _missing()
         if target.is_dir():
             return InputAvailability(PRESENT, _hash_dir(root, target))
+        if not target.is_file():
+            return _unavailable()  # FIFO, device, ...
         return InputAvailability(PRESENT, _hash_file(str(target)))
     except FileNotFoundError:
-        return _missing()  # vanished while hashing
-    except (OSError, OverflowError, RuntimeError):
+        return _missing()  # top-level target vanished while hashing
+    except (OSError, OverflowError, RuntimeError, ValueError):
         return _unavailable()
 
 
@@ -102,9 +121,11 @@ def _local_commit(metadata: dict, workspace_root: str) -> str | None:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "cat-file", "-e", f"{commit}^{{commit}}"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
+            env={k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")},
             timeout=GIT_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return commit.lower() if result.returncode == 0 else None
 

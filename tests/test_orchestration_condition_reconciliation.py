@@ -37,3 +37,17 @@ def test_invalid_condition_rejected(raw):
 def test_owner_decisions_never_reconcilable(kind):
     raw = {"condition": "session_running", "subject": "t1", "kind": kind}
     assert not is_reconcilable(raw)
+
+
+@pytest.mark.parametrize("subject", ["budget", " Permission ", "provider"])
+def test_owner_decision_subject_rejected(subject):
+    with pytest.raises(ConditionError):
+        validate_condition({"condition": "session_running", "subject": subject})
+
+
+@pytest.mark.parametrize("kw", [{"action_kind": "budget"}, {"category": "permission_required"}])
+def test_reconcile_time_action_context_blocks_owner_decisions(kw):
+    stored = validate_condition({"condition": "valid_result_missing", "subject": "t1"})
+    assert is_reconcilable(stored)
+    assert not is_reconcilable(stored, **kw)
+    assert is_reconcilable(stored, action_kind="record_warning", category="other")
