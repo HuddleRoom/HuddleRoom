@@ -494,13 +494,21 @@ class OrchestrationRoadmapService:
         return approval
 
     async def _verdict_correction_open(self, db, run, task) -> bool:
-        """The verifier's verdict is still being corrected, so it remains the active verifier."""
+        """The verifier's verdict is still being corrected, or its blocked/failed report awaits the owner, so it
+        remains the active verifier."""
         marker = await self.orchestration._existing_action_for_key(
             db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
         )
         ledger = self.orchestration._json_object_or_empty(
             self.orchestration._json_object_or_empty(marker.request if marker else {}).get("result_correction")
         )
+        for status in ("blocked", "failed"):  # the verifier could not verify: wait for the owner's answer
+            ask = await self.orchestration._existing_action_for_key(
+                db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:task:{task.id}:verifier_{status}",
+            )
+            decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
+            if decision is not None and decision.status == "pending":
+                return True
         if ledger.get("kind") != "verification_verdict":
             return False
         if ledger.get("status") in {"pending", "correcting"}:

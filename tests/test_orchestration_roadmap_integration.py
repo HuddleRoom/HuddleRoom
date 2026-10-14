@@ -1165,3 +1165,46 @@ async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
     await ingest()
     # an exhausted correction with a pending owner ask still holds the verifier slot: the roadmap waits for the owner
     assert await roadmap.has_active_bound_verifier(db_session, run) is not fixed
+
+
+async def test_blocked_verifier_awaiting_the_owner_holds_the_verifier_slot(
+    db_session, test_project, test_user, monkeypatch, safe_effectiveness_review_continue,
+):
+    builder = _agent("blocked-verifier-builder", ["implementation"])
+    verifier = _agent("blocked-verifier-verifier", ["validation"])
+    db_session.add_all([builder, verifier])
+    await db_session.flush()
+    roadmap, parent, run, _version = await accepted_goal_roadmap(db_session, test_project, [
+        {**roadmap_task("only", mutates_shared_state=False), "agent_id": str(builder.id)},
+    ])
+    service = roadmap.orchestration
+    _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await service.tick(db_session, run.id)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    task = await db_session.get(Task, row.task_id)
+    await _record_measured_completion(db_session, test_project.id, run, task, task.assigned_to, PRODUCER_REPORT)
+    verification = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(row.gate_id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:roadmap_item:{row.item_key}",
+    )
+    verifier_task = await db_session.get(Task, verification.target_id)
+    await _record_measured_completion(
+        db_session, test_project.id, run, verifier_task, verifier.id,
+        json.dumps({"status": "blocked", "notes": "No access to the staging environment."}),
+    )
+    events = await service._new_events(db_session, test_project.id, run.event_cursor)
+    await service._ingest_evidence_from_events(db_session, run, events)
+
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True
+    tick = await service.tick(db_session, run.id)
+    assert tick["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
+    assert len([a for a in await _run_actions(db_session, run.id) if a.action_type == "request_verification"]) == 1
+
+    [blocker] = [b for b in run.active_blockers if b.get("scope") == f"task:{verifier_task.id}:verifier_blocked"]
+    decision = await db_session.get(OrchestrationAuthorityDecision, uuid.UUID(blocker["decision_id"]))
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option=decision.options[0] if isinstance(decision.options[0], str)
+        else decision.options[0]["key"], reason=None, decided_by_user_id=test_user.id,
+    )
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False
