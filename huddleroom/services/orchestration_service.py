@@ -119,6 +119,7 @@ from huddleroom.services.project_service import ProjectService
 from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_decision_validator import SELF_GRANT_ERROR, independent_work_rejection
+from huddleroom.services.orchestration_result_contract import PLANNING_ENVELOPE, WORK_REPORT, expected_result_kind
 from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
     NON_BLOCKING_GATE_TYPES,
@@ -159,8 +160,6 @@ PLAN_GATE_TYPE = "plan_accepted"
 ACCEPTED_PLAN_SNAPSHOT_VERSION = 1
 PLAN_WORK_FUNCTION = "planning"
 PLAN_KINDS = ("roadmap", "delivery", "implementation")
-# ponytail: a new non-canonical report consumer = add its key here
-SPECIAL_REPORT_KEYS = frozenset({"verdict", "criteria", "candidates", "selected_option"})
 
 
 def plan_kind_for(goal, run=None) -> str:
@@ -1833,11 +1832,17 @@ class OrchestrationService:
         if goal is None:
             raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
+        report_schema = self._json_object_or_empty(stored_request.get("report_schema"))
+        # A gate exists at creation only for ad-hoc gated work and plan-item expansion (its gate is
+        # created before this delegation and linked to the task right after).
+        has_gate = (ad_hoc and self._required_string(stored_request.get("work_function"), "work_function")
+                    in ADHOC_GATED_WORK_FUNCTIONS) or ":plan_item:" in idempotency_key
         contract = OrchestrationDelegationContract(
             goal_id=goal.id,
             run_id=run.id,
             action_id=action.id,
             agent_id=agent_id,
+            expected_result=expected_result_kind({"report_schema": report_schema}, has_gate),
             work_function=self._required_string(stored_request.get("work_function"), "work_function"),
             scope=self._required_string(stored_request.get("scope"), "scope"),
             inputs=self._string_list(stored_request.get("inputs")),
@@ -1845,7 +1850,7 @@ class OrchestrationService:
             forbidden_work=self._string_list(stored_request.get("forbidden_work")),
             success_evidence=self._string_list(stored_request.get("success_evidence")),
             budget=self._json_object_or_empty(stored_request.get("budget")),
-            report_schema=self._json_object_or_empty(stored_request.get("report_schema")),
+            report_schema=report_schema,
             parent_task_id=parent_task_id,
             orchestrator_context=self._json_object_or_empty(stored_request.get("orchestrator_context")),
             title=stored_request.get("title") or "",
@@ -6597,6 +6602,7 @@ class OrchestrationService:
             ],
             budget=self._json_object_or_empty(goal.budget),
             report_schema=planning_envelope_report_schema(plan_kind_for(goal, run)),
+            expected_result=PLANNING_ENVELOPE,
             artifact_ids=[uuid.UUID(a) for a in artifact_ids],
             parent_task_id=None,
             orchestrator_context=delegable_context(goal.orchestrator_context),
@@ -7309,6 +7315,18 @@ class OrchestrationService:
         return shorten(title, width=80, placeholder="...")
 
     @staticmethod
+    def _render_criterion_input(goal: OrchestrationGoal, item: str) -> str:
+        """Append the goal's criterion description to a ``criterion:<key>`` input."""
+        if item.startswith("criterion:"):
+            criteria = getattr(goal, "success_criteria", None)
+            for criterion in criteria if isinstance(criteria, list) else []:
+                if isinstance(criterion, dict) and criterion.get("key") == item[len("criterion:"):]:
+                    description = criterion.get("description")
+                    if isinstance(description, str) and description.strip():
+                        return f"{item} — {description.strip()}"
+        return item
+
+    @staticmethod
     def _delegation_task_description(goal: OrchestrationGoal, contract: OrchestrationDelegationContract) -> str:
         from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 
@@ -7322,22 +7340,9 @@ class OrchestrationService:
         if contract.decision_use:
             sections.append(f"Decision use: {contract.decision_use}")
         if contract.inputs:
-            criterion_descriptions: dict[str, str] = {}
-            criteria = getattr(goal, "success_criteria", None)
-            for criterion in criteria if isinstance(criteria, list) else []:
-                if isinstance(criterion, dict) and isinstance(criterion.get("key"), str):
-                    description = criterion.get("description")
-                    if isinstance(description, str) and description.strip():
-                        criterion_descriptions.setdefault(criterion["key"], description.strip())
-
-            def _render_input(item: str) -> str:
-                if item.startswith("criterion:"):
-                    description = criterion_descriptions.get(item[len("criterion:"):])
-                    if description:
-                        return f"{item} — {description}"
-                return item
-
-            sections.append("Inputs:\n" + "\n".join(f"- {_render_input(item)}" for item in contract.inputs))
+            sections.append("Inputs:\n" + "\n".join(
+                f"- {OrchestrationService._render_criterion_input(goal, item)}" for item in contract.inputs
+            ))
         if contract.depends_on:
             sections.append(
                 "Dependencies (accepted predecessor task IDs; use their reports as inputs):\n"
@@ -7357,9 +7362,10 @@ class OrchestrationService:
             sections.append("Roadmap execution policy:\n" + json.dumps(roadmap, sort_keys=True))
         report_schema = contract.report_schema or {}
         strict = True
-        if contract.work_function == PLAN_WORK_FUNCTION:
-            kind = report_schema.get("plan_kind")
-            schema = planning_envelope_report_schema(kind if kind in PLAN_KINDS else plan_kind_for(goal))
+        kind = expected_result_kind({"expected_result": contract.expected_result, "report_schema": report_schema}, False)
+        if kind == PLANNING_ENVELOPE:
+            plan_kind = report_schema.get("plan_kind")
+            schema = planning_envelope_report_schema(plan_kind if plan_kind in PLAN_KINDS else plan_kind_for(goal))
             rules = [
                 "Planning rules:",
                 "Adoption: use only a supplied existing task ID from the same run, in one item only, with a "
@@ -7424,13 +7430,13 @@ class OrchestrationService:
                 "plan_items": [task_example],
             }, sort_keys=True))
             sections.append("\n".join(rules))
-        elif report_schema.keys() & SPECIAL_REPORT_KEYS:
-            schema, strict = report_schema, False
-        else:
+        elif kind == WORK_REPORT:
             schema = CANONICAL_WORK_REPORT_SCHEMA
+        else:
+            schema, strict = report_schema, False
         field_instruction = (
             "include required fields and omit unused optional/default fields; no extra keys (values show types). "
-            if contract.work_function == PLAN_WORK_FUNCTION
+            if kind == PLANNING_ENVELOPE
             else "no missing or extra keys (values show types). "
         )
         output = (
@@ -7442,7 +7448,7 @@ class OrchestrationService:
             output += (
                 "\nNever invent task, agent, or Artifact UUIDs; plan item ids/item_keys and their depends_on "
                 "references are yours to define; do not register Artifacts for this output."
-                if contract.work_function == PLAN_WORK_FUNCTION
+                if kind == PLANNING_ENVELOPE
                 else "\nUse only IDs given in this task; never invent IDs, and do not register Artifacts for this output."
             )
         sections.append(output)

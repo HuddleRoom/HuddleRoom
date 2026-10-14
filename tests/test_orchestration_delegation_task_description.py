@@ -110,7 +110,8 @@ def test_planning_contract_renders_envelope_for_goal_kind():
     for goal_type, kind in (("outcome", "implementation"), ("roadmap", "roadmap")):
         goal = SimpleNamespace(**{**_goal().__dict__, "goal_type": goal_type})
         text = OrchestrationService._delegation_task_description(
-            goal, _contract(work_function="planning", report_schema={"artifact_id": "uuid"}),
+            goal, _contract(work_function="planning", report_schema={"artifact_id": "uuid"},
+                               expected_result="planning_envelope"),
         )
         assert f'"plan_kind": "{kind}"' in text
         assert '"artifact_id"' not in text
@@ -197,7 +198,7 @@ def test_long_single_token_title_is_truncated_not_ellipsis_only():
 
 def test_strict_id_instruction_differs_for_planning():
     plan = OrchestrationService._delegation_task_description(
-        _goal(), _contract(work_function="planning", report_schema={}))
+        _goal(), _contract(work_function="planning", report_schema={}, expected_result="planning_envelope"))
     other = OrchestrationService._delegation_task_description(_goal(), _contract())
     assert "plan item ids/item_keys and their depends_on references are yours to define" in plan
     assert "Use only IDs given" not in plan

@@ -698,6 +698,7 @@ class AuthorizationResult(BaseModel):
 _CONTRACT_NEW_DEFAULTS: dict[str, Any] = {
     "title": "", "depends_on": [], "artifact_ids": [], "why_runnable": "",
     "priority": 50, "decision_use": None, "authorization_scope": None,
+    "expected_result": None,
 }
 _ITEM_NEW_DEFAULTS: dict[str, Any] = {
     "adopt_task_id": None, "artifact_ids": [], "priority": 50, "why_runnable": "",
@@ -733,6 +734,7 @@ class OrchestrationDelegationContract(BaseModel):
     priority: StrictInt = Field(50, ge=0, le=100)
     decision_use: str | None = None
     authorization_scope: AuthorizationScope | None = None  # None = not declared
+    expected_result: str | None = None  # result kind; None on legacy contracts
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler) -> dict[str, Any]:

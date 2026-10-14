@@ -23,7 +23,7 @@ def expected_result_kind(contract: dict | None, has_gate: bool) -> str:
     """Stored valid kind wins (legacy value mapped); otherwise derive from the report schema keys."""
     contract = contract or {}
     stored = contract.get("expected_result")
-    stored = _LEGACY_KINDS.get(stored, stored)
+    stored = _LEGACY_KINDS.get(stored, stored) if isinstance(stored, str) else None
     if stored in RESULT_KINDS:
         return stored
     schema = contract.get("report_schema")

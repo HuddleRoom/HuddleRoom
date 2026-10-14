@@ -163,7 +163,10 @@ def _metadata(goal_id: uuid.UUID, run_id: uuid.UUID, action_id: uuid.UUID, reque
             "action_id": str(action_id),
             "work_function": request["work_function"],
         },
-        "orchestration_contract": _contract(goal_id, run_id, action_id, request).model_dump(mode="json"),
+        "orchestration_contract": {
+            **_contract(goal_id, run_id, action_id, request).model_dump(mode="json"),
+            "expected_result": "work_report",
+        },
     }
 
 
