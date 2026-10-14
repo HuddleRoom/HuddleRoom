@@ -1215,11 +1215,20 @@ async def test_lifespan_logs_conversation_recovery_failure_and_starts(monkeypatc
     monkeypatch.setattr(relay, "close_agent_response_relay", lambda: asyncio.sleep(0))
     async def idle():
         await asyncio.Future()
+    async def idle_supervisor(*, ready=None, execution_ready=None):
+        if ready is not None:
+            ready.set()
+        await asyncio.Future()
+    async def idle_bootstrap(_scheduler, _ready_at, runtime_ready, *, execution_ready=None):
+        await runtime_ready.wait()
+        if execution_ready is not None:
+            execution_ready.set()
     consumer_tasks = {}
-    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda: object())
+    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda **_kwargs: object())
     monkeypatch.setattr("huddleroom.workers.scheduler.stop_scheduler", lambda: None)
+    monkeypatch.setattr("huddleroom.workers.scheduler.bootstrap_orchestration_async", idle_bootstrap)
     monkeypatch.setattr("huddleroom.workers.consumers.get_consumer_tasks", lambda: consumer_tasks)
-    monkeypatch.setattr("huddleroom.workers.orchestration_tasks.run_orchestration_event_supervisor", idle)
+    monkeypatch.setattr("huddleroom.workers.orchestration_tasks.run_orchestration_event_supervisor", idle_supervisor)
     for module in ("ws_hub", "rule_engine", "graph_engine", "meeting_engine", "optimizer"):
         monkeypatch.setattr(f"huddleroom.workers.consumers.{module}.run_{module}", idle)
 

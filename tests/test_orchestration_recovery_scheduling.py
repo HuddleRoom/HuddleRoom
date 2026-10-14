@@ -176,6 +176,243 @@ def test_apscheduler_recovery_runs_at_the_configured_interval():
     assert scheduler.get_job("recover_orchestration").trigger.interval.total_seconds() == scheduler_module.settings.orchestration_reconcile_interval_seconds
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["recovery", "runtime"])
+async def test_spr213_bootstrap_orders_recovery_readiness_and_first_pass(monkeypatch, first):
+    ready_at = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+    recovery_entered, recovery_release = asyncio.Event(), asyncio.Event()
+    pass_entered, pass_release = asyncio.Event(), asyncio.Event()
+    runtime_ready, execution_ready = asyncio.Event(), asyncio.Event()
+    calls = []
+    trigger = object()
+
+    class Job:
+        def __init__(self):
+            self.trigger = trigger
+
+    class Scheduler:
+        def __init__(self):
+            self.jobs = {name: Job() for name in (
+                "reconcile_orchestration_runs", "supervise_orchestration", "recover_orchestration"
+            )}
+            self.resumed = []
+
+        def get_job(self, name):
+            return self.jobs[name]
+
+        def resume_job(self, name):
+            self.resumed.append(name)
+
+    async def recover(captured_at):
+        calls.append(("recover", captured_at))
+        recovery_entered.set()
+        await recovery_release.wait()
+
+    async def initial_pass():
+        calls.append(("reconcile", None))
+        pass_entered.set()
+        await pass_release.wait()
+
+    scheduler = Scheduler()
+    monkeypatch.setattr(scheduler_module, "recover_orchestration_job", recover)
+    monkeypatch.setattr(scheduler_module, "reconcile_orchestration_runs_job", initial_pass)
+    bootstrap = asyncio.create_task(scheduler_module.bootstrap_orchestration_async(
+        scheduler, ready_at, runtime_ready, execution_ready=execution_ready,
+    ))
+    try:
+        await asyncio.wait_for(recovery_entered.wait(), 1)
+        if first == "recovery":
+            recovery_release.set()
+        else:
+            runtime_ready.set()
+        await asyncio.wait_for(asyncio.sleep(0), 1)
+        assert calls == [("recover", ready_at)]
+        assert not execution_ready.is_set()
+        assert scheduler.resumed == []
+
+        if first == "recovery":
+            runtime_ready.set()
+        else:
+            recovery_release.set()
+        await asyncio.wait_for(pass_entered.wait(), 1)
+        assert execution_ready.is_set()
+        assert calls == [("recover", ready_at), ("reconcile", None)]
+        assert scheduler.resumed == []
+        pass_release.set()
+        await asyncio.wait_for(bootstrap, 1)
+        assert set(scheduler.resumed) == set(scheduler.jobs)
+        assert all(job.trigger is trigger for job in scheduler.jobs.values())
+    finally:
+        bootstrap.cancel()
+        await asyncio.gather(bootstrap, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_spr213_bootstrap_failure_after_barriers_rearms_periodic_backstop(monkeypatch):
+    ready_at = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    runtime_ready, execution_ready = asyncio.Event(), asyncio.Event()
+    runtime_ready.set()
+    resumed = []
+
+    async def recover(captured_at):
+        assert captured_at == ready_at
+
+    async def broken_pass():
+        raise RuntimeError("initial pass failed")
+
+    monkeypatch.setattr(scheduler_module, "recover_orchestration_job", recover)
+    monkeypatch.setattr(scheduler_module, "reconcile_orchestration_runs_job", broken_pass)
+    scheduler = SimpleNamespace(resume_job=resumed.append)
+    await scheduler_module.bootstrap_orchestration_async(
+        scheduler, ready_at, runtime_ready, execution_ready=execution_ready,
+    )
+    assert execution_ready.is_set()
+    assert set(resumed) == {"reconcile_orchestration_runs", "supervise_orchestration", "recover_orchestration"}
+
+
+@pytest.mark.asyncio
+async def test_spr213_recovery_failure_does_not_open_execution_gate(monkeypatch):
+    ready_at = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    runtime_ready, execution_ready = asyncio.Event(), asyncio.Event()
+    runtime_ready.set()
+    initial_passes, resumed = [], []
+
+    async def failed_recovery(captured_at):
+        assert captured_at == ready_at
+        raise RuntimeError("recovery failed")
+
+    async def reconcile():
+        initial_passes.append(True)
+
+    monkeypatch.setattr(scheduler_module, "recover_orchestration_job", failed_recovery)
+    monkeypatch.setattr(scheduler_module, "reconcile_orchestration_runs_job", reconcile)
+    scheduler = SimpleNamespace(resume_job=resumed.append)
+    try:
+        await scheduler_module.bootstrap_orchestration_async(
+            scheduler, ready_at, runtime_ready, execution_ready=execution_ready,
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "recovery failed"
+    assert not execution_ready.is_set()
+    assert initial_passes == []
+    assert resumed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["recovery", "runtime"])
+@pytest.mark.parametrize("cancel_before_second", [False, True])
+@pytest.mark.parametrize("ordinary_type", ["session.completed", "graph.run_advanced"])
+async def test_spr213_supported_events_wait_for_recovery_and_runtime_readiness(
+    monkeypatch, first, cancel_before_second, ordinary_type,
+):
+    from huddleroom.services.event_bus import BusEvent, EventBusService
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from huddleroom.services.orchestration_supervision_scheduler import OrchestrationSupervisionScheduler
+    from huddleroom.workers import orchestration_tasks
+
+    class TrackingEvent(asyncio.Event):
+        def __init__(self):
+            super().__init__()
+            self.waiting = asyncio.Event()
+
+        async def wait(self):
+            self.waiting.set()
+            await super().wait()
+
+    class Db:
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    class Session:
+        async def __aenter__(self):
+            return Db()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    bus = EventBusService()
+    subscription_ready, runtime_ready, execution_ready = asyncio.Event(), asyncio.Event(), TrackingEvent()
+    recovery_entered, recovery_release = asyncio.Event(), asyncio.Event()
+    recorded, ticks, evaluations, initial_passes = asyncio.Queue(), [], [], []
+    project_id, resumed_id, ordinary_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def recover(_ready_at):
+        recovery_entered.set()
+        await recovery_release.wait()
+
+    async def reconcile():
+        initial_passes.append(True)
+
+    async def record(self, db, event_type, payload, **_kwargs):
+        recorded.put_nowait(event_type)
+        return [ordinary_id]
+
+    async def tick(self, db, run_id, *, local_only=False):
+        ticks.append((run_id, local_only))
+
+    async def evaluate(self, db, run_id, **_kwargs):
+        evaluations.append(run_id)
+
+    monkeypatch.setattr(scheduler_module, "recover_orchestration_job", recover)
+    monkeypatch.setattr(scheduler_module, "reconcile_orchestration_runs_job", reconcile)
+    monkeypatch.setattr(orchestration_tasks, "get_event_bus", lambda: bus)
+    monkeypatch.setattr(orchestration_tasks, "AsyncSessionLocal", Session)
+    monkeypatch.setattr(orchestration_tasks.settings, "orchestration_event_coalesce_seconds", 0)
+    monkeypatch.setattr(OrchestrationSupervisionScheduler, "record_event", record)
+    monkeypatch.setattr(OrchestrationSupervisionScheduler, "evaluate_run", evaluate)
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
+    resumed_jobs = []
+    sched = SimpleNamespace(resume_job=resumed_jobs.append)
+    bootstrap = asyncio.create_task(scheduler_module.bootstrap_orchestration_async(
+        sched, datetime(2026, 10, 14, tzinfo=timezone.utc), runtime_ready,
+        execution_ready=execution_ready,
+    ))
+    supervisor = asyncio.create_task(orchestration_tasks.run_orchestration_event_supervisor(
+        ready=subscription_ready, execution_ready=execution_ready,
+    ))
+    try:
+        await asyncio.wait_for(recovery_entered.wait(), 1)
+        await asyncio.wait_for(subscription_ready.wait(), 1)
+        bus.put(BusEvent(uuid.uuid4(), project_id, "orchestration.goal_resumed", {"run_id": str(resumed_id)}, "test"))
+        bus.put(BusEvent(uuid.uuid4(), project_id, ordinary_type, {"run_id": str(ordinary_id)}, "test"))
+        assert await asyncio.wait_for(recorded.get(), 1) == ordinary_type
+        await asyncio.wait_for(execution_ready.waiting.wait(), 1)
+        assert ticks == evaluations == initial_passes == []
+        if first == "recovery":
+            recovery_release.set()
+        else:
+            runtime_ready.set()
+        await asyncio.sleep(0)
+        assert not execution_ready.is_set()
+        assert ticks == evaluations == initial_passes == []
+        if cancel_before_second:
+            return
+        if first == "recovery":
+            runtime_ready.set()
+        else:
+            recovery_release.set()
+        await asyncio.wait_for(bootstrap, 1)
+        async def dispatched():
+            while len(ticks) != 1 or len(evaluations) != 1:
+                await asyncio.sleep(0)
+        await asyncio.wait_for(dispatched(), 1)
+        assert ticks == [(resumed_id, False)]
+        assert evaluations == [ordinary_id]
+        assert initial_passes == [True]
+    finally:
+        bootstrap.cancel()
+        supervisor.cancel()
+        await asyncio.gather(bootstrap, supervisor, return_exceptions=True)
+        if cancel_before_second:
+            assert not execution_ready.is_set()
+            assert ticks == evaluations == initial_passes == []
+            assert resumed_jobs == []
+        assert bus._subscribers == []
+
+
 @pytest.mark.unsupported_mode
 def test_celery_worker_ready_runs_immediately_and_beat_runs_every_r(monkeypatch):
     from huddleroom.workers import celery_app

@@ -49,12 +49,16 @@ class EventBusService:
         project_id: uuid.UUID | None = None,
         event_types: list[str] | None = None,
         maxsize: int = 1000,
+        *,
+        ready: asyncio.Event | None = None,
     ) -> AsyncGenerator[BusEvent, None]:
         """Async generator — yields events matching the filter until cancelled."""
         queue: asyncio.Queue[BusEvent] = asyncio.Queue(maxsize=maxsize)
         type_set = set(event_types) if event_types else None
         entry = (queue, project_id, type_set)
         self._subscribers.append(entry)
+        if ready is not None:
+            ready.set()
         try:
             while True:
                 event = await queue.get()

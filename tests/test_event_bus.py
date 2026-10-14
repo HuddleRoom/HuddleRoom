@@ -10,6 +10,54 @@ from huddleroom.schemas.event import EventEmit, EventResponse
 from huddleroom.services.event_bus import EventBusService, BusEvent, get_event_bus, emit_event
 
 
+@pytest.mark.asyncio
+async def test_spr213_subscription_ready_means_registered():
+    bus = EventBusService()
+    ready = asyncio.Event()
+    project_id = uuid.uuid4()
+    received = []
+
+    async def consume():
+        subscription = bus.subscribe(project_id, ["task.created"], 4, ready=ready)
+        try:
+            received.append(await anext(subscription))
+        finally:
+            await subscription.aclose()
+
+    task = asyncio.create_task(consume())
+    ready_task = asyncio.create_task(ready.wait())
+    try:
+        done, _ = await asyncio.wait({ready_task, task}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        assert done
+        if task in done:
+            await task
+    finally:
+        ready_task.cancel()
+    assert len(bus._subscribers) == 1
+    bus.put(BusEvent(uuid.uuid4(), uuid.uuid4(), "task.created", {}, "test"))
+    bus.put(BusEvent(uuid.uuid4(), project_id, "task.updated", {}, "test"))
+    assert not received
+    event = BusEvent(uuid.uuid4(), project_id, "task.created", {}, "test")
+    bus.put(event)
+    await asyncio.wait_for(task, 1)
+    assert received == [event]
+    assert bus._subscribers == []
+
+    cancel_ready = asyncio.Event()
+
+    async def wait_for_event():
+        async for _ in bus.subscribe(project_id, ["task.created"], 4, ready=cancel_ready):
+            pass
+
+    cancelled = asyncio.create_task(wait_for_event())
+    await asyncio.wait_for(cancel_ready.wait(), 1)
+    assert len(bus._subscribers) == 1
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert bus._subscribers == []
+
+
 
 @pytest.mark.asyncio
 async def test_event_bus_subscribe_receives_event():

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -135,15 +136,29 @@ async def lifespan(_app: FastAPI):
         _logger.warning("Authentication is DISABLED. Set HUDDLEROOM_AUTH_ENABLED=true for production.")
 
     scheduler = None
+    bootstrap = None
+    subscription_ready = asyncio.Event()
+    runtime_ready = asyncio.Event()
+    execution_ready = asyncio.Event()
     if settings.is_sqlite:
-        from huddleroom.workers.scheduler import start_scheduler
-        scheduler = start_scheduler()
+        from huddleroom.workers.scheduler import bootstrap_orchestration_async, start_scheduler
+        scheduler = start_scheduler(defer_orchestration_startup=True)
+        scheduler_ready_at = datetime.now(timezone.utc)
+        bootstrap = asyncio.create_task(
+            bootstrap_orchestration_async(
+                scheduler, scheduler_ready_at, runtime_ready, execution_ready=execution_ready,
+            ),
+            name="startup:orchestration",
+        )
 
     supervision_events = None
     if settings.is_sqlite:
         from huddleroom.workers.orchestration_tasks import run_orchestration_event_supervisor
         supervision_events = asyncio.create_task(
-            run_orchestration_event_supervisor(), name="consumer:orchestration_supervision"
+            run_orchestration_event_supervisor(
+                ready=subscription_ready, execution_ready=execution_ready,
+            ),
+            name="consumer:orchestration_supervision",
         )
 
     from huddleroom.services.agent_response_relay import (
@@ -172,94 +187,104 @@ async def lifespan(_app: FastAPI):
             await asyncio.sleep(_RESPONSE_HUB_RESTART_DELAY)
 
     response_hub = asyncio.create_task(supervise_response_hub(), name="consumer:agent_response_hub")
-    ready_wait = asyncio.create_task(response_hub_ready.wait())
+    ready_wait = asyncio.create_task(response_hub_ready.wait(), name="startup:response_hub_ready")
+    subscription_wait = (
+        asyncio.create_task(subscription_ready.wait(), name="startup:subscription_ready")
+        if settings.is_sqlite else None
+    )
     try:
-        done, _ = await asyncio.wait((response_hub, ready_wait), return_when=asyncio.FIRST_COMPLETED)
-        if ready_wait not in done:
-            await response_hub
-    except BaseException:
-        for task in (response_hub, ready_wait):
-            task.cancel()
-        await asyncio.gather(response_hub, ready_wait, return_exceptions=True)
-        try:
-            unsubscribe_agent_responses()
-        finally:
-            try:
-                await close_agent_response_relay()
-            finally:
-                if scheduler:
-                    from huddleroom.workers.scheduler import stop_scheduler
+        pending = {response_hub, ready_wait}
+        if supervision_events is not None:
+            pending.add(supervision_events)
+        if subscription_wait is not None:
+            pending.add(subscription_wait)
+        while not ready_wait.done() or (subscription_wait is not None and not subscription_wait.done()):
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                pending.discard(task)
+                if task is response_hub or task is supervision_events:
+                    await task
+                    raise RuntimeError(f"Required startup consumer {task.get_name()} exited before readiness")
 
-                    stop_scheduler()
-        raise
+        # Required consumers must still be running when the readiness barriers release.
+        for task in (response_hub, supervision_events):
+            if task is not None and task.done():
+                await task
+                raise RuntimeError(f"Required startup consumer {task.get_name()} exited before readiness")
 
-    # Start consumer asyncio tasks (SQLite/in-process mode)
-    if settings.is_sqlite:
-        from huddleroom.workers.consumers import get_consumer_tasks
-        from huddleroom.workers.consumers.ws_hub import run_ws_hub
-        from huddleroom.workers.consumers.rule_engine import run_rule_engine
-        from huddleroom.workers.consumers.graph_engine import run_graph_engine
-        from huddleroom.workers.consumers.meeting_engine import run_meeting_engine
-        from huddleroom.workers.consumers.optimizer import run_optimizer
+        # Start consumer asyncio tasks (SQLite/in-process mode)
+        if settings.is_sqlite:
+            from huddleroom.workers.consumers import get_consumer_tasks
+            from huddleroom.workers.consumers.ws_hub import run_ws_hub
+            from huddleroom.workers.consumers.rule_engine import run_rule_engine
+            from huddleroom.workers.consumers.graph_engine import run_graph_engine
+            from huddleroom.workers.consumers.meeting_engine import run_meeting_engine
+            from huddleroom.workers.consumers.optimizer import run_optimizer
 
-        consumer_fns = {
-            "ws_hub": run_ws_hub,
-            "rule_engine": run_rule_engine,
-            "graph_engine": run_graph_engine,
-            "meeting_engine": run_meeting_engine,
-            "optimizer": run_optimizer,
-        }
-        consumer_tasks = get_consumer_tasks()
+            consumer_fns = {
+                "ws_hub": run_ws_hub,
+                "rule_engine": run_rule_engine,
+                "graph_engine": run_graph_engine,
+                "meeting_engine": run_meeting_engine,
+                "optimizer": run_optimizer,
+            }
+            consumer_tasks = get_consumer_tasks()
 
-        def _make_done_callback(cname, cfn):
-            def _on_done(t: asyncio.Task) -> None:
-                if t.cancelled():
-                    return
-                exc = t.exception()
-                if exc:
-                    _logger.error("Consumer '%s' crashed: %s — restarting", cname, exc)
-                    new_task = asyncio.create_task(cfn(), name=f"consumer:{cname}")
-                    new_task.add_done_callback(_make_done_callback(cname, cfn))
-                    consumer_tasks[cname] = new_task
-            return _on_done
+            def _make_done_callback(cname, cfn):
+                def _on_done(t: asyncio.Task) -> None:
+                    if t.cancelled():
+                        return
+                    exc = t.exception()
+                    if exc:
+                        _logger.error("Consumer '%s' crashed: %s — restarting", cname, exc)
+                        new_task = asyncio.create_task(cfn(), name=f"consumer:{cname}")
+                        new_task.add_done_callback(_make_done_callback(cname, cfn))
+                        consumer_tasks[cname] = new_task
+                return _on_done
 
-        for name, fn in consumer_fns.items():
-            task = asyncio.create_task(fn(), name=f"consumer:{name}")
-            task.add_done_callback(_make_done_callback(name, fn))
-            consumer_tasks[name] = task
-        _logger.info("Started %d consumer tasks", len(consumer_tasks))
+            for name, fn in consumer_fns.items():
+                task = asyncio.create_task(fn(), name=f"consumer:{name}")
+                task.add_done_callback(_make_done_callback(name, fn))
+                consumer_tasks[name] = task
+            _logger.info("Started %d consumer tasks", len(consumer_tasks))
 
-    try:
+        runtime_ready.set()
         yield
     finally:
         try:
-            unsubscribe_agent_responses()
+            if scheduler:
+                from huddleroom.workers.scheduler import stop_scheduler
+
+                stop_scheduler()
         finally:
             try:
-                response_hub.cancel()
-                await asyncio.gather(response_hub, return_exceptions=True)
+                startup_tasks = [task for task in (
+                    bootstrap, ready_wait, subscription_wait, supervision_events,
+                ) if task is not None]
+                for task in startup_tasks:
+                    task.cancel()
+                if startup_tasks:
+                    await asyncio.gather(*startup_tasks, return_exceptions=True)
             finally:
                 try:
-                    await close_agent_response_relay()
+                    unsubscribe_agent_responses()
                 finally:
                     try:
-                        if supervision_events:
-                            supervision_events.cancel()
-                            await asyncio.gather(supervision_events, return_exceptions=True)
-                        if settings.is_sqlite:
-                            from huddleroom.workers.consumers import get_consumer_tasks
-
-                            consumer_tasks = get_consumer_tasks()
-                            for task in consumer_tasks.values():
-                                task.cancel()
-                            if consumer_tasks:
-                                await asyncio.gather(*consumer_tasks.values(), return_exceptions=True)
-                            consumer_tasks.clear()
+                        response_hub.cancel()
+                        await asyncio.gather(response_hub, return_exceptions=True)
                     finally:
-                        if scheduler:
-                            from huddleroom.workers.scheduler import stop_scheduler
+                        try:
+                            await close_agent_response_relay()
+                        finally:
+                            if settings.is_sqlite:
+                                from huddleroom.workers.consumers import get_consumer_tasks
 
-                            stop_scheduler()
+                                consumer_tasks = get_consumer_tasks()
+                                for task in consumer_tasks.values():
+                                    task.cancel()
+                                if consumer_tasks:
+                                    await asyncio.gather(*consumer_tasks.values(), return_exceptions=True)
+                                consumer_tasks.clear()
 
 
 def create_app() -> FastAPI:

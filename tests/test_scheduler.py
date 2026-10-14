@@ -1,9 +1,65 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from apscheduler.triggers.interval import IntervalTrigger
+
+
+def test_spr213_deferred_scheduler_has_no_competing_initial_job(monkeypatch):
+    from huddleroom.workers import scheduler as scheduler_module
+
+    names = ("reconcile_orchestration_runs", "supervise_orchestration", "recover_orchestration")
+    interval = object()
+
+    class FakeScheduler:
+        def __init__(self):
+            self.jobs = {name: SimpleNamespace(trigger=interval, paused=False) for name in names}
+            self.jobs["process_graph_timeouts"] = SimpleNamespace(trigger=object(), paused=False)
+            self.added = []
+            self.started = False
+            self.fired = []
+
+        def pause_job(self, name):
+            assert not self.started
+            self.jobs[name].paused = True
+
+        def start(self):
+            self.started = True
+
+        def add_job(self, _func, **kwargs):
+            self.added.append(kwargs["id"])
+
+        def advance_interval(self):
+            self.fired.extend(name for name, job in self.jobs.items() if not job.paused)
+
+    deferred = FakeScheduler()
+    monkeypatch.setattr(scheduler_module, "create_scheduler", lambda: deferred)
+    monkeypatch.setattr(scheduler_module, "_utcnow", lambda: datetime(2026, 10, 14, tzinfo=timezone.utc))
+    assert scheduler_module.start_scheduler(defer_orchestration_startup=True) is deferred
+    assert all(deferred.jobs[name].paused for name in names)
+    assert not deferred.jobs["process_graph_timeouts"].paused
+    assert "recover_orchestration_immediate" not in deferred.added
+    deferred.advance_interval()
+    assert deferred.fired == ["process_graph_timeouts"]
+
+    ordinary = FakeScheduler()
+    monkeypatch.setattr(scheduler_module, "create_scheduler", lambda: ordinary)
+    assert scheduler_module.start_scheduler() is ordinary
+    assert all(not ordinary.jobs[name].paused for name in names)
+    assert ordinary.added == ["recover_orchestration_immediate"]
+
+
+def test_spr213_reconciliation_interval_keeps_single_coalesced_instance():
+    from huddleroom.workers import scheduler as scheduler_module
+
+    sched = scheduler_module.create_scheduler()
+    job = sched.get_job("reconcile_orchestration_runs")
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.max_instances == 1
+    assert job.coalesce is True
 
 
 @pytest.mark.asyncio

@@ -214,11 +214,22 @@ def _stub_sqlite_lifespan_runtime(monkeypatch):
     async def idle():
         await asyncio.Future()
 
+    async def idle_supervisor(*, ready=None, execution_ready=None):
+        if ready is not None:
+            ready.set()
+        await asyncio.Future()
+
+    async def idle_bootstrap(_scheduler, _ready_at, runtime_ready, *, execution_ready=None):
+        await runtime_ready.wait()
+        if execution_ready is not None:
+            execution_ready.set()
+
     consumer_tasks = {}
-    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda: object())
+    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda **_kwargs: object())
     monkeypatch.setattr("huddleroom.workers.scheduler.stop_scheduler", lambda: None)
+    monkeypatch.setattr("huddleroom.workers.scheduler.bootstrap_orchestration_async", idle_bootstrap, raising=False)
     monkeypatch.setattr("huddleroom.workers.consumers.get_consumer_tasks", lambda: consumer_tasks)
-    monkeypatch.setattr("huddleroom.workers.orchestration_tasks.run_orchestration_event_supervisor", idle)
+    monkeypatch.setattr("huddleroom.workers.orchestration_tasks.run_orchestration_event_supervisor", idle_supervisor)
     for module in ("ws_hub", "rule_engine", "graph_engine", "meeting_engine", "optimizer"):
         monkeypatch.setattr(f"huddleroom.workers.consumers.{module}.run_{module}", idle)
     return consumer_tasks
@@ -1689,7 +1700,7 @@ async def test_sqlite_lifespan_waits_for_response_hub_and_shuts_down(monkeypatch
     monkeypatch.setattr(main, "init_db", lambda: asyncio.sleep(0))
     monkeypatch.setattr(main, "register_litellm_debug_logger", lambda: None)
     monkeypatch.setattr(sqlalchemy.ext.asyncio, "AsyncSession", DbCheck)
-    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda: scheduler)
+    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda **_kwargs: scheduler)
     monkeypatch.setattr("huddleroom.workers.scheduler.stop_scheduler", lambda: None)
     monkeypatch.setattr("huddleroom.workers.consumers.get_consumer_tasks", lambda: consumer_tasks)
     monkeypatch.setattr(
@@ -1742,7 +1753,7 @@ async def test_lifespan_cancellation_before_hub_ready_cleans_startup_resources(m
     monkeypatch.setattr(relay, "subscribe_agent_responses", subscribe)
     monkeypatch.setattr(relay, "run_agent_response_hub", blocked_hub)
     monkeypatch.setattr(relay, "close_agent_response_relay", close_relay)
-    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda: object())
+    monkeypatch.setattr("huddleroom.workers.scheduler.start_scheduler", lambda **_kwargs: object())
     monkeypatch.setattr("huddleroom.workers.scheduler.stop_scheduler", lambda: scheduler_stops.append(True))
 
     startup = asyncio.create_task(main.lifespan(None).__aenter__())
@@ -1756,6 +1767,177 @@ async def test_lifespan_cancellation_before_hub_ready_cleans_startup_resources(m
     assert subscribers == []
     assert client_closed == [True]
     assert scheduler_stops == [True]
+
+
+def _spr213_lifespan_harness(monkeypatch):
+    import sqlalchemy.ext.asyncio
+    import huddleroom.main as main
+    import huddleroom.services.agent_response_relay as relay
+    from huddleroom.workers import orchestration_tasks, scheduler as scheduler_module
+
+    bootstrap_fn = getattr(scheduler_module, "bootstrap_orchestration_async", None)
+    consumer_tasks = _stub_sqlite_lifespan_runtime(monkeypatch)
+
+    class DbCheck:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def begin(self):
+            return self
+
+        async def execute(self, *_args, **_kwargs):
+            return None
+
+    state = SimpleNamespace(
+        hub_entered=asyncio.Event(), hub_release=asyncio.Event(), hub_cancelled=asyncio.Event(),
+        subscription_entered=asyncio.Event(), subscription_release=asyncio.Event(),
+        supervisor_cancelled=asyncio.Event(), recovery_entered=asyncio.Event(),
+        recovery_release=asyncio.Event(), recovery_cancelled=asyncio.Event(),
+        pass_entered=asyncio.Event(), pass_release=asyncio.Event(), pass_cancelled=asyncio.Event(),
+        hub_exit=None, subscription_exit=None, initial_calls=0, stops=[], subscriptions=[], closed=[],
+        scheduler=SimpleNamespace(resume_job=lambda _name: None),
+    )
+
+    async def hub(ready):
+        state.hub_entered.set()
+        try:
+            await state.hub_release.wait()
+            if state.hub_exit == "fail":
+                raise RuntimeError("response failed")
+            if state.hub_exit == "exit":
+                return
+            ready.set()
+            await asyncio.Future()
+        finally:
+            state.hub_cancelled.set()
+
+    async def supervisor(*, ready=None, execution_ready=None):
+        assert ready is not None and execution_ready is not None
+        state.subscription_entered.set()
+        try:
+            await state.subscription_release.wait()
+            if state.subscription_exit == "fail":
+                raise RuntimeError("subscription failed")
+            if state.subscription_exit == "exit":
+                return
+            ready.set()
+            await asyncio.Future()
+        finally:
+            state.supervisor_cancelled.set()
+
+    async def recover(_ready_at):
+        state.recovery_entered.set()
+        try:
+            await state.recovery_release.wait()
+        finally:
+            state.recovery_cancelled.set()
+
+    async def initial_pass():
+        state.initial_calls += 1
+        state.pass_entered.set()
+        try:
+            await state.pass_release.wait()
+        finally:
+            state.pass_cancelled.set()
+
+    def subscribe(callback):
+        state.subscriptions.append(callback)
+        return lambda: state.subscriptions.remove(callback)
+
+    async def close():
+        state.closed.append(True)
+
+    monkeypatch.setattr(main, "settings", SimpleNamespace(
+        auth_enabled=False, is_sqlite=True, jwt_secret="safe", cors_origins=["https://example.test"],
+    ))
+    monkeypatch.setattr(relay, "settings", SimpleNamespace(is_sqlite=True))
+    monkeypatch.setattr(main, "validate_supported_settings", lambda _settings: None)
+    monkeypatch.setattr(main, "init_db", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(main, "register_litellm_debug_logger", lambda: None)
+    monkeypatch.setattr(sqlalchemy.ext.asyncio, "AsyncSession", DbCheck)
+    monkeypatch.setattr(relay, "subscribe_agent_responses", subscribe)
+    monkeypatch.setattr(relay, "run_agent_response_hub", hub)
+    monkeypatch.setattr(relay, "close_agent_response_relay", close)
+    monkeypatch.setattr(orchestration_tasks, "run_orchestration_event_supervisor", supervisor)
+    monkeypatch.setattr(scheduler_module, "start_scheduler", lambda **kwargs: (
+        state.scheduler if kwargs == {"defer_orchestration_startup": True} else
+        (_ for _ in ()).throw(AssertionError(f"scheduler was not deferred: {kwargs}"))
+    ))
+    monkeypatch.setattr(scheduler_module, "stop_scheduler", lambda: state.stops.append(True))
+    monkeypatch.setattr(scheduler_module, "recover_orchestration_job", recover)
+    monkeypatch.setattr(scheduler_module, "reconcile_orchestration_runs_job", initial_pass)
+    monkeypatch.setattr(scheduler_module, "bootstrap_orchestration_async", bootstrap_fn, raising=False)
+    state.consumer_tasks = consumer_tasks
+    return main, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing,exit_kind", [
+    ("response", "fail"), ("response", "exit"),
+    ("subscription", "fail"), ("subscription", "exit"),
+])
+async def test_spr213_lifespan_requires_both_readiness_signals(monkeypatch, missing, exit_kind):
+    main, state = _spr213_lifespan_harness(monkeypatch)
+    if missing == "response":
+        state.subscription_release.set()
+        state.hub_release.set()
+        state.hub_exit = exit_kind
+    else:
+        state.hub_release.set()
+        state.subscription_release.set()
+        state.subscription_exit = exit_kind
+
+    with pytest.raises(RuntimeError):
+        async with asyncio.timeout(1):
+            async with main.lifespan(None):
+                raise AssertionError("lifespan yielded before both required subscriptions")
+    assert state.initial_calls == 0
+    assert state.recovery_cancelled.is_set()
+    assert state.supervisor_cancelled.is_set()
+    assert state.hub_cancelled.is_set()
+    assert state.subscriptions == [] and state.closed == [True] and state.stops == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["readiness", "recovery", "first_pass"])
+async def test_spr213_lifespan_owns_bootstrap_cleanup(monkeypatch, stage):
+    main, state = _spr213_lifespan_harness(monkeypatch)
+    if stage != "readiness":
+        state.hub_release.set()
+        state.subscription_release.set()
+    if stage == "first_pass":
+        state.recovery_release.set()
+
+    if stage == "readiness":
+        startup = asyncio.create_task(main.lifespan(None).__aenter__())
+        await asyncio.wait_for(state.subscription_entered.wait(), 1)
+        await asyncio.wait_for(state.hub_entered.wait(), 1)
+        await asyncio.wait_for(state.recovery_entered.wait(), 1)
+        startup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(startup, 1)
+    else:
+        async with asyncio.timeout(1):
+            async with main.lifespan(None):
+                if stage == "recovery":
+                    await state.recovery_entered.wait()
+                    assert state.initial_calls == 0
+                else:
+                    await state.pass_entered.wait()
+                    assert state.initial_calls == 1
+                # A model-capable initial pass must not hold the lifespan yield.
+    assert state.recovery_cancelled.is_set()
+    if stage == "first_pass":
+        assert state.pass_cancelled.is_set()
+    assert state.supervisor_cancelled.is_set() and state.hub_cancelled.is_set()
+    assert state.subscriptions == [] and state.closed == [True] and state.stops == [True]
+    assert state.consumer_tasks == {}
 
 
 @pytest.mark.unsupported_mode

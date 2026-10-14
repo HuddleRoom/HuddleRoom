@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from collections import deque
 from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -314,6 +315,8 @@ def create_scheduler() -> AsyncIOScheduler:
         seconds=settings.orchestration_reconcile_interval_seconds,
         id="reconcile_orchestration_runs",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         supervise_orchestration_job,
@@ -336,11 +339,53 @@ def create_scheduler() -> AsyncIOScheduler:
     return scheduler
 
 
-def start_scheduler() -> AsyncIOScheduler:
+_ORCHESTRATION_INTERVAL_JOBS = (
+    "reconcile_orchestration_runs",
+    "supervise_orchestration",
+    "recover_orchestration",
+)
+
+
+async def bootstrap_orchestration_async(
+    sched: AsyncIOScheduler,
+    scheduler_ready_at: datetime,
+    runtime_ready: asyncio.Event,
+    *,
+    execution_ready: asyncio.Event | None = None,
+) -> None:
+    """Own the initial recovery and reconciliation before enabling interval work."""
+    try:
+        await recover_orchestration_job(scheduler_ready_at)
+    except Exception:
+        logger.exception("Initial orchestration recovery failed")
+        return
+
+    await runtime_ready.wait()
+    if execution_ready is not None:
+        execution_ready.set()
+
+    try:
+        await reconcile_orchestration_runs_job()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Initial orchestration reconciliation failed")
+    for job_id in _ORCHESTRATION_INTERVAL_JOBS:
+        try:
+            sched.resume_job(job_id)
+        except Exception:
+            logger.exception("Could not resume orchestration interval job %s", job_id)
+
+
+def start_scheduler(*, defer_orchestration_startup: bool = False) -> AsyncIOScheduler:
     sched = create_scheduler()
+    if defer_orchestration_startup:
+        for job_id in _ORCHESTRATION_INTERVAL_JOBS:
+            sched.pause_job(job_id)
     sched.start()
-    scheduler_ready_at = _utcnow()
-    sched.add_job(recover_orchestration_job, args=[scheduler_ready_at], id="recover_orchestration_immediate", replace_existing=True)
+    if not defer_orchestration_startup:
+        scheduler_ready_at = _utcnow()
+        sched.add_job(recover_orchestration_job, args=[scheduler_ready_at], id="recover_orchestration_immediate", replace_existing=True)
     logger.info("APScheduler started — cron trigger evaluation every 60s")
     return sched
 
