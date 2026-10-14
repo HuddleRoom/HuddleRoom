@@ -1089,8 +1089,8 @@ async def test_engine_session_metadata_takes_precedence_over_linked_task_metadat
 @pytest.mark.parametrize(
     ("output", "expected_verdict"),
     [
-        ("APPROVE", "approved"),
-        ("CHANGES_REQUESTED", "changes_requested"),
+        ("VERDICT: APPROVE", "approved"),
+        ("VERDICT: REQUEST_CHANGES", "changes_requested"),
         ("Looks mostly fine, but I left comments.", "commented"),
         ("DO NOT APPROVE", "commented"),
     ],
@@ -1166,23 +1166,25 @@ async def test_engine_enriches_graph_review_session_completed(db_session, test_p
     assert captured["payload"]["review_outcome"] == {
         "verdict": expected_verdict,
         "raw_output": output,
+        "reason": None if output.startswith("VERDICT:") else "verdict_missing",
     }
 
 
 @pytest.mark.parametrize(
     ("raw_output", "expected_verdict"),
     [
-        ("APPROVED", "approved"),
-        ("REQUEST CHANGES", "changes_requested"),
-        ("REQUESTED CHANGES", "changes_requested"),
+        ("verdict: approve", "approved"),
+        ("Notes.\n\n  Verdict: Request_Changes  \n\n", "changes_requested"),
+        ("VERDICT: COMMENT", "commented"),
     ],
 )
-def test_engine_review_outcome_parser_recognizes_conservative_variants(raw_output, expected_verdict):
+def test_engine_review_outcome_parser_reads_final_line_verdict(raw_output, expected_verdict):
     from huddleroom.services.graph_engine import GraphEngineService
 
     assert GraphEngineService()._parse_review_outcome(raw_output) == {
         "verdict": expected_verdict,
         "raw_output": raw_output,
+        "reason": None,
     }
 
 
@@ -1231,7 +1233,7 @@ async def test_engine_does_not_enrich_non_code_review_session_completed_with_rev
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -1303,7 +1305,7 @@ async def test_engine_does_not_enrich_non_graph_origin_code_review_session_compl
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="api",
     )
@@ -1392,7 +1394,7 @@ async def test_engine_does_not_enrich_or_auto_emit_review_for_wrong_assigned_act
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVED",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -1488,7 +1490,7 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_run(db
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -1572,7 +1574,7 @@ async def test_engine_auto_emits_review_changes_requested_and_advances_code_revi
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="CHANGES_REQUESTED",
+        output="VERDICT: REQUEST_CHANGES",
         metadata_={},
         origin="graph",
     )
@@ -1652,7 +1654,7 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -1831,7 +1833,7 @@ async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessio
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin=origin,
     )

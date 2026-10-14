@@ -9352,6 +9352,8 @@ class OrchestrationService:
             return 0
         review_outcome = self._json_object_or_empty(event.payload.get("review_outcome"))
         review_verdict = self._optional_string(review_outcome.get("verdict"))
+        if review_verdict == "commented":
+            return 0
         metadata = {
             **self._base_evidence_metadata(event, gate, orchestration, review_verdict),
             "task_id": str(task.id),
@@ -9369,7 +9371,11 @@ class OrchestrationService:
             source_id=session.id,
             observed_event=event,
             producer_agent_id=session.agent_id,
-            verdict="candidate" if event.event_type == "review.approved" else "rejected",
+            verdict=(
+                "candidate"
+                if event.event_type == "review.approved" and review_verdict in (None, "approved")
+                else "rejected"
+            ),
             evidence_metadata=metadata,
         )
 

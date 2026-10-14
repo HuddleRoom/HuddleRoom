@@ -556,7 +556,7 @@ async def _complete_task_session(
         )
     payload = {"session_id": str(session.id), "task_id": str(task.id)}
     if event_type == "review.approved":
-        payload["review_outcome"] = {"verdict": "accepted"}
+        payload["review_outcome"] = {"verdict": "approved"}
     await emit_event_once(
         db_session,
         project_id,

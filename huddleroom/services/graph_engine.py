@@ -642,17 +642,24 @@ class GraphEngineService:
         except ValueError:
             return None
 
+    _REVIEW_VERDICTS = {
+        "APPROVE": "approved",
+        "REQUEST_CHANGES": "changes_requested",
+        "COMMENT": "commented",
+    }
+
     def _parse_review_outcome(self, raw_output: str | None) -> dict:
-        normalized_output = (raw_output or "").upper()
-        if self._is_changes_requested_review_output(normalized_output):
-            verdict = "changes_requested"
-        elif self._is_approved_review_output(normalized_output):
-            verdict = "approved"
-        else:
-            verdict = "commented"
+        lines = [line.strip() for line in (raw_output or "").splitlines() if line.strip()]
+        match = re.fullmatch(
+            r"VERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)",
+            lines[-1] if lines else "",
+            re.IGNORECASE,
+        )
+        verdict = self._REVIEW_VERDICTS[match.group(1).upper()] if match else "commented"
         return {
             "verdict": verdict,
             "raw_output": raw_output,
+            "reason": None if match else "verdict_missing",
         }
 
     def _should_enrich_review_session(
@@ -674,20 +681,6 @@ class GraphEngineService:
             and graph.name == "code_review"
             and self._session_matches_assigned_review_actor(run, session)
         )
-
-    def _is_approved_review_output(self, normalized_output: str) -> bool:
-        if not normalized_output:
-            return False
-        if re.search(r"\b(?:DO\s+NOT|NOT)\s+APPROVE(?:D)?\b", normalized_output):
-            return False
-        if re.search(r"\bDISAPPROVE\b", normalized_output):
-            return False
-        return re.search(r"\bAPPROVE(?:D)?\b", normalized_output) is not None
-
-    def _is_changes_requested_review_output(self, normalized_output: str) -> bool:
-        if not normalized_output:
-            return False
-        return re.search(r"\b(?:CHANGES[_\s]+REQUESTED|REQUEST(?:ED)?\s+CHANGES)\b", normalized_output) is not None
 
     def _session_matches_assigned_review_actor(self, run: GraphRun, session: Session) -> bool:
         reviewer_assignment = (run.actor_assignments or {}).get("reviewer") or {}
