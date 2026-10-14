@@ -315,6 +315,7 @@ export function answerOrchestrationDecision(
   reason: string,
   editedAgent?: AgentCreatePayload,
   contractVersion?: string | null,
+  runtimeIdentity?: string | null,
 ) {
   return apiFetch<OrchestrationDecisionAnswerResult>(
     `${root(projectId)}/${goalId}/decisions/${decisionId}/answer`,
@@ -322,7 +323,7 @@ export function answerOrchestrationDecision(
       method: 'POST',
       body: JSON.stringify({
         selected_option: selectedOption,
-        reason: reason.trim() || null,
+        reason: runtimeIdentity ? reason || null : reason.trim() || null,
         ...(editedAgent ? { edited_agent: editedAgent } : {}),
         ...(contractVersion ? { contract_version: contractVersion } : {}),
       }),
@@ -651,15 +652,16 @@ export function useResolveOrchestrationWarning(projectId: string | null) {
 export function useAnswerOrchestrationDecision(projectId: string | null) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ goalId, decisionId, selectedOption, reason, editedAgent, contractVersion }: {
+    mutationFn: ({ goalId, decisionId, selectedOption, reason, editedAgent, contractVersion, runtimeIdentity }: {
       goalId: string
       decisionId: string
       selectedOption: string
       reason: string
       editedAgent?: AgentCreatePayload
       contractVersion?: string | null
+      runtimeIdentity?: string | null
     }) => answerOrchestrationDecision(
-      projectId!, goalId, decisionId, selectedOption, reason, editedAgent, contractVersion,
+      projectId!, goalId, decisionId, selectedOption, reason, editedAgent, contractVersion, runtimeIdentity,
     ),
     onSuccess: (data, { goalId }) => {
       syncAnsweredDecisionCache(queryClient, projectId, goalId, data)

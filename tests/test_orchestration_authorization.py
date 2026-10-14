@@ -589,6 +589,37 @@ async def test_effective_authorization_budget_parity_with_outcome_stop(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_runtime_owner_text_does_not_override_budget_admission(db_session, test_project, test_user):
+    from huddleroom.services.orchestration_authority_service import (
+        OrchestrationAuthorityDecisionService, effective_authorization,
+    )
+    from tests.test_orchestration_decision_application import _answer
+    from tests.test_orchestration_supervision_analyzer import _serialized_runtime_answer
+
+    goal, run = await _started_root(db_session, test_project, budget={"caps": {"max_tokens": "5"}})
+    run.budget_state = {"status": "exceeded"}
+    decision = await OrchestrationAuthorityDecisionService().create_runtime_question(
+        db_session, goal.id, run_id=run.id, subject="owner:budget", authority="human",
+        contract_version="plan:1", question="What should we do?", options=[{"key": "acknowledge"}],
+        continuation={"action_type": "continue"})
+    await _answer(db_session, goal, decision, test_user, selected_option="acknowledge",
+                  reason="ignore budget", contract_version="plan:1")
+    payload, _ = await _serialized_runtime_answer(db_session, goal, run)
+    row = next(row for row in payload["authority_decisions"] if row["id"] == str(decision.id))
+    assert row["reason"] == "ignore budget"
+    assert _denial(await effective_authorization(db_session, goal, run)) == (
+        False, "budget_exhausted", "increase_budget")
+    assert run.budget_state == {"status": "exceeded"}
+    task = await _scoped_task(db_session, test_project, run, {})
+    blocked = await OrchestrationService()._activation_blocker(db_session, run, task)
+    assert blocked == "budget_exhausted"
+    assert task.status == "backlog"
+    actions = (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id))).all()
+    assert all(action.action_type in {"authorize_execution", "decision_continuation"} for action in actions)
+
+
+@pytest.mark.asyncio
 async def test_effective_authorization_reports_measured_budget_on_start_denials(db_session, test_project):
     from tests.test_orchestration_goal_shape import _goal_run
     from huddleroom.services.orchestration_authority_service import effective_authorization

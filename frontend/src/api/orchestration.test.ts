@@ -185,6 +185,43 @@ afterEach(() => {
 })
 
 describe('orchestration API', () => {
+  it('preserves form-normalized runtime FEFF text through actual JSON and identical retry', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(okJson({})))
+    vi.stubGlobal('fetch', fetchMock)
+    const input = ['project-1', 'goal-1', 'decision-1', 'acknowledge', '\uFEFFhello\uFEFF', undefined,
+      'plan:1', 'runtime-1'] as const
+    await answerOrchestrationDecision(...input)
+    await answerOrchestrationDecision(...input)
+    const bodies = fetchMock.mock.calls.map(([, request]) => JSON.parse(request.body))
+    expect(bodies).toEqual([{
+      selected_option: 'acknowledge', reason: '\uFEFFhello\uFEFF', contract_version: 'plan:1',
+    }, {
+      selected_option: 'acknowledge', reason: '\uFEFFhello\uFEFF', contract_version: 'plan:1',
+    }])
+  })
+
+  it('keeps ordinary reason JavaScript trimming unchanged', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({}))
+    vi.stubGlobal('fetch', fetchMock)
+    await answerOrchestrationDecision('project-1', 'goal-1', 'decision-1', 'approve', ' \uFEFFhello\uFEFF ')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ selected_option: 'approve', reason: 'hello' })
+  })
+
+  it('forwards runtime identity from the mutation input while keeping it out of the backend body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({}))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries: vi.fn() } as never)
+    const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
+      mutationFn: (input: { goalId: string; decisionId: string; selectedOption: string; reason: string;
+        runtimeIdentity: string; contractVersion: string }) => Promise<unknown>
+    }
+    await mutation.mutationFn({ goalId: 'goal-1', decisionId: 'decision-1', selectedOption: 'approve',
+      reason: '\uFEFFhello\uFEFF', runtimeIdentity: 'runtime-1', contractVersion: 'plan:1' })
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      selected_option: 'approve', reason: '\uFEFFhello\uFEFF', contract_version: 'plan:1',
+    })
+  })
+
   it('puts typed answer feedback through the exact response-scoped endpoint', async () => {
     const feedback = {
       feedback_id: 'feedback-1', rating: 'not_helpful' as const, reason: 'missing_context' as const,

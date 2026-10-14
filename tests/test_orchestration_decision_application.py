@@ -15,6 +15,8 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.services import orchestration_decision_application as application
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from tests.test_orchestration_supervision_authority import _runtime_decision
+from tests.test_orchestration_supervision_authority import _text_runtime_decision
+from huddleroom.models.event_log import EventLog
 from tests.test_orchestration_recovery_authority import actions_of, diagnosed, fail_on_effect, goal_run
 from tests.test_orchestration_agent_definition_review import _three_pending_proposals, review_goal, review_run
 from tests.test_orchestration_roster_mutation import (
@@ -29,6 +31,129 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("safe_goal_analysis")
 async def _answer(db, goal, decision, user, **data):
     return await application.answer_decision(db, goal.project_id, goal.id, decision.id,
                                             OrchestrationDecisionAnswerRequest(**data), user)
+
+
+@pytest.mark.parametrize("text", ["a\n😀" * 1333 + "z", "\uFEFFhello\uFEFF", "a\n😀" * 1333 + "zz"],
+                         ids=["4000-multiline-astral", "feff", "4001-multiline-astral"])
+async def test_runtime_text_answer_persists_normalized_reason_and_bounds_codepoints(
+    db_session, sessions, test_project, test_user, text
+):
+    from httpx import ASGITransport, AsyncClient
+    from huddleroom.main import create_app
+    from huddleroom.database import get_db
+    from huddleroom.dependencies import get_current_user
+
+    _, goal, _, decision = await _text_runtime_decision(db_session, test_project)
+    decision_id = decision.id
+    url = f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/decisions/{decision.id}/answer"
+    await db_session.commit()
+    app = create_app()
+
+    async def request_db():
+        async with sessions() as db:
+            yield db
+            await db.commit()
+
+    async def actor():
+        return test_user
+
+    app.dependency_overrides[get_db] = request_db
+    app.dependency_overrides[get_current_user] = actor
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        stale = await client.post(url, json={"selected_option": "acknowledge", "reason": "stale answer",
+                                            "contract_version": "old"})
+        assert stale.status_code == 200 and stale.json()["continuation_applied"] is False
+        async with sessions() as fresh:
+            saved = await fresh.get(OrchestrationAuthorityDecision, decision_id)
+            assert (saved.status, saved.selected_option, saved.reason) == ("pending", None, None)
+        answer = await client.post(url, json={
+            "selected_option": "acknowledge", "reason": " \u0085" + text + " \n", "contract_version": "plan:1"})
+    if len(text) > 4000:
+        assert answer.status_code == 409, answer.text
+        async with sessions() as fresh:
+            saved = await fresh.get(OrchestrationAuthorityDecision, decision_id)
+            assert (saved.status, saved.selected_option, saved.reason) == ("pending", None, None)
+        return
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["decision"]["reason"] == text
+    async with sessions() as fresh:
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision_id)
+        assert (saved.status, saved.selected_option, saved.reason) == ("answered", "acknowledge", text)
+
+
+async def _seed_committed_text(sessions, project, user):
+    async with sessions() as db:
+        _, goal, run, decision = await _text_runtime_decision(db, project)
+        ids = (goal.id, run.id, decision.id, user.id, project.id)
+        await db.commit()
+        return ids
+
+
+async def _fresh_text_answer(db, ids, reason):
+    goal_id, _, decision_id, user_id, project_id = ids
+    return await application.answer_decision(db, project_id, goal_id, decision_id,
+        OrchestrationDecisionAnswerRequest(selected_option="acknowledge", reason=reason, contract_version="plan:1"),
+        await db.get(User, user_id))
+
+
+async def test_runtime_answer_precommit_failure_rolls_back_in_fresh_session(
+    db_session, sessions, test_project, test_user, monkeypatch
+):
+    await db_session.commit()
+    ids = await _seed_committed_text(sessions, test_project, test_user)
+    from huddleroom.services import orchestration_authority_service as authority
+    original = authority.emit_event_once
+
+    async def fail_after_answer(*args, **kwargs):
+        if args[2] == "authority.decision_resolved":
+            raise RuntimeError("precommit injected failure")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(authority, "emit_event_once", fail_after_answer)
+    async with sessions() as db:
+        with pytest.raises(RuntimeError, match="precommit injected"):
+            await _fresh_text_answer(db, ids, "Keep the exact answer")
+        await db.rollback()
+    async with sessions() as fresh:
+        saved = await fresh.get(OrchestrationAuthorityDecision, ids[2])
+        assert (saved.status, saved.selected_option, saved.reason, saved.continuation_action_id) == (
+            "pending", None, None, None)
+        assert await fresh.scalar(select(func.count()).select_from(EventLog).where(
+            EventLog.dedup_key == f"authority.decision_resolved:{ids[2]}")) == 0
+
+
+@pytest.mark.parametrize("changed", [False, True])
+async def test_runtime_answer_response_loss_replays_exact_payload_once(
+    db_session, sessions, test_project, test_user, changed
+):
+    await db_session.commit()
+    ids = await _seed_committed_text(sessions, test_project, test_user)
+    async with sessions() as db:
+        text = "a\n😀" * 1333 + "z"
+        result = await _fresh_text_answer(db, ids, "  " + text + "  ")
+        await db.commit()
+        timestamp = result.decision.decided_at
+        # The response is deliberately discarded after the real commit.
+    async with sessions() as fresh:
+        if changed:
+            with pytest.raises(HTTPException) as error:
+                await _fresh_text_answer(fresh, ids, "Changed answer")
+            assert error.value.status_code == 409
+            await fresh.rollback()
+        else:
+            replay = await _fresh_text_answer(fresh, ids, text)
+            assert replay.continuation_applied is False
+            await fresh.commit()
+    async with sessions() as fresh:
+        saved = await fresh.get(OrchestrationAuthorityDecision, ids[2])
+        assert saved.reason == text
+        assert saved.decided_at == timestamp
+        assert await fresh.scalar(select(func.count()).select_from(EventLog).where(
+            EventLog.dedup_key == f"authority.decision_resolved:{ids[2]}")) == 1
+        actions = (await fresh.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.idempotency_key == f"run:{ids[1]}:kind:decision_continuation:decision:{ids[2]}"))).all()
+        assert len(actions) == 1 and actions[0].status == "completed"
+        assert saved.continuation_action_id == actions[0].id
 
 
 async def test_ordinary_human_answer_preserves_options_and_audit(db_session, conversation_goal_run, test_user):

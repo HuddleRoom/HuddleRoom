@@ -275,6 +275,7 @@ class OrchestrationAuthorityDecisionService:
         *,
         actor_user_id: uuid.UUID | None,
         contract_version: str,
+        reason: str | None = None,
     ) -> RuntimeAnswerResult:
         """Answer one versioned runtime question and reserve its marker once."""
         if actor_user_id is None or decision.authority != "human":
@@ -298,9 +299,15 @@ class OrchestrationAuthorityDecisionService:
                 return RuntimeAnswerResult(decision=current, continuation_applied=False)
             if current.runtime_identity != current.decision_key.removeprefix("runtime:"):
                 raise ValueError("runtime decision identity is invalid")
+            normalized_reason = reason.strip() if reason is not None else None
+            if normalized_reason is not None and len(normalized_reason) > 4000:
+                raise ValueError("runtime answer reason must not exceed 4000 codepoints")
+            if len(current.options or []) == 1 and _option_keys(current.options) == {"acknowledge"}:
+                if not normalized_reason:
+                    raise ValueError("runtime text answers require a non-blank reason")
             run = await db.get(OrchestrationRun, current.run_id, populate_existing=True)
             if current.status == "answered":
-                if current.selected_option != selected_option:
+                if current.selected_option != selected_option or current.reason != normalized_reason:
                     raise ValueError("conflicting duplicate runtime answer")
             elif current.status != "pending":
                 raise ValueError(f"cannot answer decision in status {current.status!r}")
@@ -309,12 +316,13 @@ class OrchestrationAuthorityDecisionService:
                     OrchestrationAuthorityDecision.id == current.id,
                     OrchestrationAuthorityDecision.status == "pending",
                 ).values(
-                    status="answered", selected_option=selected_option,
+                    status="answered", selected_option=selected_option, reason=normalized_reason,
                     decided_by_user_id=actor_user_id, decided_at=_utcnow(),
                 ))
                 if result.rowcount != 1:
                     await db.refresh(current)
-                    if current.status == "answered" and current.selected_option == selected_option:
+                    if (current.status == "answered" and current.selected_option == selected_option
+                            and current.reason == normalized_reason):
                         return RuntimeAnswerResult(decision=current, continuation_applied=False)
                     raise ValueError("conflicting duplicate runtime answer")
                 await db.refresh(current)

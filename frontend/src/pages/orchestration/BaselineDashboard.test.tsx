@@ -1383,7 +1383,7 @@ describe('Baseline dashboard D3 composition', () => {
       expect(() => getButton(view.container, 'Submit answer')).toThrow()
       await act(async () => getButton(view.container, 'Accept: approve').click())
       expect(api.answer.mutate).toHaveBeenCalledWith(
-        { goalId: 'goal-00000000-0000-4000-8000-000000000001', decisionId: 'decision-1', selectedOption: 'approve', reason: '', contractVersion: 'plan:1' },
+        { goalId: 'goal-00000000-0000-4000-8000-000000000001', decisionId: 'decision-1', selectedOption: 'approve', reason: '', contractVersion: 'plan:1', runtimeIdentity: 'runtime-1' },
         expect.any(Object),
       )
       expect(() => getButton(view.container, 'Submit answer')).toThrow()
@@ -1649,16 +1649,47 @@ describe('Baseline dashboard D3 composition', () => {
 })
 
 describe('Baseline action form regressions', () => {
+  it('submits normalized runtime text with sentinel and contract, retaining it after response loss', async () => {
+    const runtime = decision({ id: 'runtime-question', recommendation: null, options: [{ key: 'acknowledge' }],
+      runtime_identity: 'runtime-1', contract_version: 'plan:1' })
+    api.dashboard = dashboardData({ decisions: query([runtime]), checkpoint: query({
+      goal_id: goal().id, items: [runtime], deferred_count: 0, max_questions: 5,
+    }) })
+    api.answer.mutate.mockImplementation((_variables, callbacks) => {
+      callbacks.onError?.(new Error('Response lost'))
+      callbacks.onSettled?.()
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(view.container, 'Answer').click())
+      const answerField = () => getByLabel(view.container, 'Answer', 'textarea')
+      const submitButton = () => getButton(descendants(view.container).find((node) => node.tagName === 'FORM')!, 'Answer')
+      expect(view.document.activeElement === answerField()).toBe(true)
+      expect(submitButton().disabled).toBe(true)
+      const entered = ' \u0085\uFEFFhello\n😀\uFEFF \n'
+      await act(async () => changeControl(answerField(), entered))
+      await act(async () => submitButton().click())
+      expect(api.answer.mutate).toHaveBeenCalledWith({ goalId: goal().id, decisionId: runtime.id,
+        selectedOption: 'acknowledge', reason: '\uFEFFhello\n😀\uFEFF', contractVersion: 'plan:1',
+        runtimeIdentity: 'runtime-1' }, expect.any(Object))
+      expect(answerField().value).toBe(entered)
+      await act(async () => submitButton().click())
+      expect(api.answer.mutate).toHaveBeenCalledTimes(2)
+      expect(api.answer.mutate.mock.calls[1][0]).toEqual(api.answer.mutate.mock.calls[0][0])
+    } finally { view.cleanup() }
+  })
+
   function form(
     options: OrchestrationDecisionOption[],
     selectedOption: string | null,
     recommendation: string | null,
     overrides: Partial<OrchestrationAuthorityDecisionRecord> = {},
+    reason = '',
   ) {
     return renderToStaticMarkup(
       <BaselineActionForm
         target={{ kind: 'answer', action: { kind: 'answer', id: 'decision-1' }, decision: decision({ options, recommendation, ...overrides }) }}
-        mutationBusy={false} submitting={false} selectedOption={selectedOption} reason="" error={null}
+        mutationBusy={false} submitting={false} selectedOption={selectedOption} reason={reason} error={null}
         firstOptionRef={React.createRef<HTMLInputElement>()} reasonRef={React.createRef<HTMLTextAreaElement>()}
         submitRef={React.createRef<HTMLButtonElement>()} onAnswer={() => undefined} onSkip={() => undefined}
         onAcknowledge={() => undefined} onResolve={() => undefined} onSelectedOptionChange={() => undefined}
@@ -1673,6 +1704,46 @@ describe('Baseline action form regressions', () => {
     expect(recommended).toContain('Reason (required when overriding the recommendation)')
     expect(recommended).not.toMatch(/<textarea[^>]*required=""/)
     expect(override).toMatch(/<textarea[^>]*required=""/)
+  })
+
+  it.each([
+    ['blank', ' \n\u0085', true],
+    ['4000 multiline astral', 'a\n😀'.repeat(1333) + 'z', false],
+    ['4001 multiline astral', 'a\n😀'.repeat(1333) + 'zz', true],
+    ['0085 strips to4000', '\u0085' + 'x'.repeat(4000), false],
+    ['FEFF remains4001', '\uFEFF' + 'x'.repeat(4000), true],
+    ['accepted FEFF ends', '\uFEFFhello\uFEFF', false],
+  ])('runtime sentinel renders one Answer control and enforces %s', (_name, reason, disabled) => {
+    const markup = form([{ key: 'acknowledge' }], null, null,
+      { runtime_identity: 'runtime-1', contract_version: 'plan:1' }, reason)
+    expect(markup.match(/<textarea\b/g)).toHaveLength(1)
+    expect(markup).toContain('>Answer</label>')
+    expect(markup).not.toContain('type="radio"')
+    expect(markup.match(/>Answer<\/button>/g)).toHaveLength(1)
+    expect(/<button[^>]*disabled=""[^>]*>Answer<\/button>/.test(markup)).toBe(disabled)
+    if (reason.includes('zz') || reason.startsWith('\uFEFFx')) expect(markup).toContain('4,000')
+  })
+
+  it.each([
+    ['ordinary acknowledge', [{ key: 'acknowledge' }], {}],
+    ['meaningful singleton', [{ key: 'approve' }], { runtime_identity: 'runtime-1' }],
+    ['multi choice', [{ key: 'acknowledge' }, { key: 'reject' }], { runtime_identity: 'runtime-1' }],
+    ['invalid sibling', [{ key: 'acknowledge' }, { label: 'invalid' }], { runtime_identity: 'runtime-1' }],
+  ])('keeps %s as choices', (_name, options, overrides) => {
+    const markup = form(options as OrchestrationDecisionOption[], null, null, overrides)
+    expect(markup).toContain('type="radio"')
+    expect(markup).toContain('Reason (optional)')
+    expect(markup).not.toContain('>Answer</label>')
+  })
+
+  it('caps optional reasons on genuine runtime choices without requiring them', () => {
+    const runtime = { runtime_identity: 'runtime-1' }
+    const empty = form(['approve'], 'approve', null, runtime)
+    expect(empty).not.toMatch(/<button[^>]*disabled=""[^>]*>Submit answer<\/button>/)
+    const boundary = form(['approve'], 'approve', null, runtime, '😀'.repeat(4000))
+    expect(boundary).not.toMatch(/<button[^>]*disabled=""[^>]*>Submit answer<\/button>/)
+    const over = form(['approve'], 'approve', null, runtime, '😀'.repeat(4001))
+    expect(over).toMatch(/<button[^>]*disabled=""[^>]*>Submit answer<\/button>/)
   })
 
   it('keeps optionless decisions as required free-text answers', () => {

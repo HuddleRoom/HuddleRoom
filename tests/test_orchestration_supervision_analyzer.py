@@ -35,6 +35,46 @@ def _system_text(request):
     return next(m["content"] for m in request["messages"] if m["role"] == "system")
 
 
+async def _serialized_runtime_answer(db, goal, run):
+    from huddleroom.services.orchestration_supervision_context import OrchestrationSupervisionContextBuilder
+    captured = []
+
+    async def completion_fn(**request):
+        captured.append(request)
+        return {"choices": [{"message": {"content": json.dumps(_assessment({"action_type": "pause"}))}}]}
+
+    payload = await OrchestrationSupervisionContextBuilder().build_for_provider(db, goal, run)
+    await OrchestrationSupervisionAnalyzer(completion_fn=completion_fn).assess(payload)
+    assert len(captured) == 1
+    content = next(message["content"] for message in captured[0]["messages"] if message["role"] == "user")
+    return json.loads(content), content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,secret", [
+    ("a\n😀" * 1333 + "z", False), ("\uFEFFhello\uFEFF", False),
+    ("api_key=sk-" + "a" * 40, True),
+], ids=["4000-multiline-astral", "feff", "secret"])
+async def test_assess_serializes_boundary_runtime_answer_and_redacts_secrets(
+    db_session, test_project, client, auth_headers, text, secret
+):
+    from tests.test_orchestration_supervision_authority import _text_runtime_decision
+    _, goal, run, decision = await _text_runtime_decision(db_session, test_project)
+    response = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/decisions/{decision.id}/answer",
+        headers=auth_headers, json={"selected_option": "acknowledge", "reason": " \n" + text + " \n",
+                                   "contract_version": "plan:1"})
+    assert response.status_code == 200, response.text
+    assert response.json()["decision"]["reason"] == text
+    payload, serialized = await _serialized_runtime_answer(db_session, goal, run)
+    rows = [row for row in payload["authority_decisions"] if row["id"] == str(decision.id)]
+    assert len(rows) == 1
+    if secret:
+        assert text not in serialized and rows[0]["reason"] != text
+    else:
+        assert rows[0]["reason"] == text
+
+
 def test_build_request_prepends_preamble_and_progress_contract():
     from huddleroom.services.orchestration_llm_decision_adapter import PROGRESS_CONTRACT
 

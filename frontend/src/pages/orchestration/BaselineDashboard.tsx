@@ -186,28 +186,35 @@ export function BaselineActionForm({
   const disabled = mutationBusy || submitting
   const options = target.kind === 'answer' ? target.decision.options.map((option) => ({ option, key: decisionOptionKey(option) })) : []
   const freeText = target.kind === 'answer' && options.length === 0
+  const runtimeDecision = target.kind === 'answer' && Boolean(target.decision.runtime_identity)
+  const textAnswer = runtimeDecision && options.length === 1 && options[0].key === 'acknowledge'
+  // Match Python str.strip(): JavaScript trim removes FEFF and misses U+0085.
+  const normalizedReason = runtimeDecision
+    ? reason.replace(/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, '')
+    : reason
+  const reasonTooLong = runtimeDecision && [...normalizedReason].length > 4000
   const reviewContext = target.kind === 'answer' ? parseReviewContext(target.decision.context) : null
   const managerComparison = target.kind === 'answer' && isManagerSelectionDecision(target.decision.decision_key) ? parseManagerComparison(target.decision.context) : null
   const answerRef = useRef<HTMLTextAreaElement>(null)
   const firstAnswerOption = options.findIndex((option) => option.key !== null)
-  const requiresReason = target.kind === 'skip' || target.kind === 'answer' && decisionRequiresReason(selectedOption, target.decision.recommendation)
+  const requiresReason = textAnswer || target.kind === 'skip' || target.kind === 'answer' && decisionRequiresReason(selectedOption, target.decision.recommendation)
   const canSubmit = target.kind === 'answer'
-    ? canSubmitDecision(selectedOption, target.decision.recommendation, reason)
+    ? !reasonTooLong && (textAnswer ? normalizedReason.length > 0 : Boolean(selectedOption?.trim()) && (!requiresReason || (runtimeDecision ? normalizedReason.length > 0 : canSubmitReason(reason))))
     : target.kind === 'skip' ? canSubmitReason(reason) : true
-  const label = target.kind === 'answer' ? 'Submit answer' : target.kind === 'skip' ? 'Skip process' : target.kind === 'acknowledge' ? 'Acknowledge risk' : 'Resolve risk'
+  const label = target.kind === 'answer' ? textAnswer ? 'Answer' : 'Submit answer' : target.kind === 'skip' ? 'Skip process' : target.kind === 'acknowledge' ? 'Acknowledge risk' : 'Resolve risk'
   const { announceError } = useGoalAnnouncer()
 
   useEffect(() => { if (error) announceError(error) }, [error, announceError])
   useEffect(() => {
     if (target.kind === 'answer' && freeText && answerRef.current) answerRef.current.focus()
-    else if (target.kind === 'answer' && firstOptionRef.current) firstOptionRef.current.focus()
+    else if (target.kind === 'answer' && !textAnswer && firstOptionRef.current) firstOptionRef.current.focus()
     else reasonRef.current?.focus()
-  }, [target.kind, target.action.id, freeText, firstOptionRef, reasonRef])
+  }, [target.kind, target.action.id, freeText, textAnswer, firstOptionRef, reasonRef])
 
   function submit(event: FormEvent) {
     event.preventDefault()
     if (target.kind === 'answer') {
-      if (canSubmit) onAnswer(target.decision, selectedOption!, reason)
+      if (canSubmit) onAnswer(target.decision, textAnswer ? 'acknowledge' : selectedOption!, normalizedReason)
       return
     }
     if (target.kind === 'skip' && !canSubmitReason(reason)) return
@@ -254,7 +261,7 @@ export function BaselineActionForm({
               </div>}
             </div>
           })()}
-          {freeText ? <Textarea ref={answerRef} label="Answer" value={selectedOption ?? ''} onChange={(event) => onSelectedOptionChange(event.target.value)} rows={3} /> : (
+          {textAnswer ? <Textarea ref={reasonRef} label="Answer" value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required /> : freeText ? <Textarea ref={answerRef} label="Answer" value={selectedOption ?? ''} onChange={(event) => onSelectedOptionChange(event.target.value)} rows={3} /> : (
             <div className="mt-2 space-y-2">
               {options.map(({ option, key }, index) => key === null ? <p key={index} className="text-sm text-huddleroom-text-secondary">Unavailable option</p> : (
                 <label key={key} className="flex min-h-11 items-center gap-2 text-sm text-huddleroom-text-primary">
@@ -265,8 +272,9 @@ export function BaselineActionForm({
             </div>
           )}
         </>}
-        {target.kind === 'answer' && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
+        {target.kind === 'answer' && !textAnswer && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
         {target.kind !== 'answer' && <Textarea ref={reasonRef} label={target.kind === 'skip' ? 'Reason (required)' : 'Reason (optional)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
+        {reasonTooLong && <p role="alert" className="mt-2 text-xs text-huddleroom-status-red">Answer or reason must be at most 4,000 Unicode characters.</p>}
         {error && <p className="mt-2 text-xs text-huddleroom-status-red">{error}</p>}
         <div className="mt-3 flex flex-wrap justify-end gap-2">
           <Button type="button" variant="secondary" className="min-h-11" disabled={disabled} onClick={onCancel}>Cancel</Button>
@@ -715,7 +723,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
       onAnswer={(decision, option, submitReason) => runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
         goalId,
         decisionId: decision.id,
-        contractVersion: decision.contract_version,
+        contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity,
         selectedOption: option,
         reason: submitReason,
       }, callbacks), 'Answer received.', onSuccessFocus)}
@@ -736,7 +744,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
       goalId,
       decisionId: decision.id,
-      contractVersion: decision.contract_version,
+      contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity,
       selectedOption: decision.recommendation!,
       reason: '',
     }, callbacks), 'Answer received.', onSuccessFocus)
@@ -757,7 +765,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     if (!isCurrent) return
     setFormError(null)
     setFormErrorSource(null)
-    answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, selectedOption: answerText, reason: '' }, {
+    answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity, selectedOption: answerText, reason: '' }, {
       onSuccess: () => {
         if (!isCurrent()) return
         onMessage('Answer received.')
@@ -788,7 +796,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     if (!isCurrent) { callbacks.onSettled(); return }
     setFormError(null)
     setFormErrorSource(null)
-    answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, selectedOption: option, reason }, {
+    answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity, selectedOption: option, reason }, {
       onSuccess: () => {
         if (!isCurrent()) return
         onMessage(option === 'approve_fix' ? 'Fix approved.' : option === 'reject' ? 'Fix rejected.' : 'Marked as provided. Re-diagnosing the blocker…')
@@ -835,7 +843,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
 
   function answerTeamProposal(decision: OrchestrationAuthorityDecisionRecord, selectedOption: string, editedAgent: AgentCreatePayload | undefined, onSuccess?: () => void) {
     const action: BaselineFocusAction = { kind: 'answer', id: decision.id }
-    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, selectedOption, reason: '', editedAgent }, callbacks), 'Proposal decision received.', onSuccess)
+    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity, selectedOption, reason: '', editedAgent }, callbacks), 'Proposal decision received.', onSuccess)
   }
 
   function mutateChain(processType: OrchestrationBaselineProcessType, action: 'run' | 'rerun', trigger: HTMLButtonElement | null) {

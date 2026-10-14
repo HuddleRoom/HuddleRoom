@@ -88,7 +88,7 @@ async def test_roadmap_missing_budget_requires_attention(db_session, test_projec
     assert decision.title == "Budget required"
     await OrchestrationAuthorityDecisionService().answer_runtime_question(
         db_session, decision, "acknowledge", actor_user_id=test_user.id,
-        contract_version=decision.contract_version,
+        contract_version=decision.contract_version, reason="Keep blocked until a new goal has limits",
     )
     await assert_blocked_replay()
     assert run.status == "blocked" and not provider_calls

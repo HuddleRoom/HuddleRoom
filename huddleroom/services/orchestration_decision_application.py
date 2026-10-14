@@ -270,7 +270,7 @@ async def answer_decision(
                     await validation_callback(db)
                 result = await decision_service.answer_runtime_question(
                     db, decision, data.selected_option, actor_user_id=user.id,
-                    contract_version=data.contract_version,
+                    contract_version=data.contract_version, reason=data.reason,
                 )
                 response = OrchestrationDecisionAnswerResponse(
                     decision=await _present_one(db, result.decision), process=None, continuation_applied=result.continuation_applied

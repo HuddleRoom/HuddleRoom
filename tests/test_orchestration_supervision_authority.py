@@ -37,6 +37,59 @@ async def _runtime_decision(db_session, test_project):
     return service, goal, run, decision
 
 
+async def _text_runtime_decision(db, project):
+    service, goal, run, _ = await _runtime_decision(db, project)
+    action = await OrchestrationService().execute_ask_human_action(
+        db, run.id, {"action_type": "ask_human", "question": "What counts as success?",
+                     "subject": "owner:success", "contract_version": "plan:1",
+                     "continuation": {"action_type": "continue"}},
+        f"run:{run.id}:kind:ask_human:owner-success",
+    )
+    return service, goal, run, await db.get(OrchestrationAuthorityDecision, action.target_id)
+
+
+@pytest.mark.parametrize("reason", [None, "", " \n\u0085 ", "x" * 4001, "\uFEFF" + "x" * 4000],
+                         ids=["missing", "empty", "blank", "4001", "feff-4001"])
+async def test_runtime_text_answer_rejects_blank_and_over_limit_without_mutation(
+    db_session, test_project, test_user, reason
+):
+    service, _, _, decision = await _text_runtime_decision(db_session, test_project)
+    with pytest.raises(ValueError):
+        await service.answer_runtime_question(db_session, decision, "acknowledge", reason=reason,
+                                             actor_user_id=test_user.id, contract_version="plan:1")
+    await db_session.refresh(decision)
+    assert (decision.status, decision.selected_option, decision.reason, decision.decided_at) == (
+        "pending", None, None, None)
+
+
+@pytest.mark.parametrize("reason", ["  optional rationale \n", None, "x" * 4000, "x" * 4001],
+                         ids=["normalized", "missing", "4000", "4001"])
+async def test_runtime_meaningful_choice_reason_is_optional_and_bounded(
+    db_session, test_project, test_user, reason
+):
+    service, _, _, decision = await _runtime_decision(db_session, test_project)
+    if reason and len(reason.strip()) > 4000:
+        with pytest.raises(ValueError):
+            await service.answer_runtime_question(db_session, decision, "approve", reason=reason,
+                                                 actor_user_id=test_user.id, contract_version="plan:1")
+        assert decision.status == "pending"
+    else:
+        result = await service.answer_runtime_question(db_session, decision, "approve", reason=reason,
+                                                      actor_user_id=test_user.id, contract_version="plan:1")
+        assert result.decision.reason == (reason.strip() if reason is not None else None)
+
+
+async def test_runtime_text_stale_contract_and_invalid_choice_are_inert(db_session, test_project, test_user):
+    service, _, _, decision = await _text_runtime_decision(db_session, test_project)
+    await service.answer_runtime_question(db_session, decision, "acknowledge", reason="stale text",
+                                         actor_user_id=test_user.id, contract_version="old")
+    with pytest.raises(ValueError):
+        await service.answer_runtime_question(db_session, decision, "invented", reason="valid text",
+                                             actor_user_id=test_user.id, contract_version="plan:1")
+    await db_session.refresh(decision)
+    assert (decision.status, decision.selected_option, decision.reason) == ("pending", None, None)
+
+
 async def test_runtime_question_replays_pending_and_answered_identity(db_session, test_project, test_user):
     service, goal, run, first = await _runtime_decision(db_session, test_project)
     replay = await service.create_runtime_question(
