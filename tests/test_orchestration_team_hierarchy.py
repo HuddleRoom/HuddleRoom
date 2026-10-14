@@ -1341,6 +1341,90 @@ async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposin
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_status", ["completed", "skipped", "waiting_decision"])
+@pytest.mark.parametrize("drift_after_analysis", [False, True])
+async def test_baseline_hierarchy_rerun_uses_fresh_inputs_and_preserves_drift_guard(
+    client, db_session, test_project, test_user, monkeypatch, source_status, drift_after_analysis
+):
+    """A semantic rerun replaces the inherited seed; later real drift still conflicts."""
+    goal, run, _agents, _review = await _lifecycle_goal(
+        db_session, test_project, test_user,
+        weight="substantial" if source_status == "waiting_decision" else "trivial",
+    )
+    run.baseline_authorized = True
+    payloads = []
+
+    async def review(_self, payload, project=None, *, project_id=None):
+        payloads.append(payload)
+        return _analysis_for(payload, proposals=(_proposed_agent(),))
+
+    monkeypatch.setattr(TeamHierarchyAnalyzer, "review", review)
+    process = TeamHierarchyProcess()
+    service = OrchestrationProcessService()
+    if source_status == "skipped":
+        await service.skip_process(
+            db_session, goal.id, process_type="team_hierarchy", run_id=run.id,
+            skipped_by=f"human:{test_user.id}", reason="Accept initial hierarchy risk",
+        )
+    else:
+        assert (await process.advance(db_session, goal, run))["status"] == source_status
+    original = await service.get_current(db_session, goal.id, "team_hierarchy")
+    inherited_snapshot = dict(original.input_snapshot)
+    old_pending = [
+        item for item in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
+        if item.source_process_run_id == original.id and item.status == "pending"
+    ]
+    goal.weight = "substantial"
+    goal.objective = "Launch auth migration, then billing, then mobile app"
+    await db_session.flush()
+
+    response = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/baseline/rerun",
+        json={"process_type": "team_hierarchy"},
+    )
+    assert response.status_code == 200, response.text
+    fresh = await service.get_current(db_session, goal.id, "team_hierarchy")
+    assert fresh.id != original.id
+    assert original.superseded_by_id is not None
+    rows = [item for item in await service.list_process_runs(db_session, goal.id)
+            if item.process_type == "team_hierarchy"]
+    assert [item.id for item in rows if item.superseded_by_id is None] == [fresh.id]
+    assert original.input_snapshot == inherited_snapshot
+    assert fresh.status == "waiting_decision"
+    assert all(item.status == "cancelled" for item in old_pending)
+    pending = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id, status="pending")
+    assert pending and all(item.source_process_run_id == fresh.id for item in pending)
+    assert payloads[-1]["goal"]["weight"] == "substantial"
+    expected = process._semantic_fingerprint(process._strip_volatile(payloads[-1]))
+    decision = next(
+        item for item in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
+        if item.source_process_run_id == fresh.id and item.decision_key.startswith("team_hierarchy:agent:")
+    )
+    analyzed_snapshot = dict(fresh.input_snapshot)
+    if drift_after_analysis:
+        goal.objective += " with a new security requirement"
+        await db_session.flush()
+    response = await client.post(
+        _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"},
+    )
+    assert response.status_code == (409 if drift_after_analysis else 200), response.text
+    if drift_after_analysis:
+        assert response.json()["detail"] == "team hierarchy proposal inputs changed"
+        assert decision.status == "pending"
+    assert analyzed_snapshot.get("fingerprint") == expected
+    if not drift_after_analysis:
+        approval = next(
+            item for item in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
+            if item.source_process_run_id == fresh.id and item.decision_key == "team_hierarchy:approval"
+        )
+        response = await client.post(
+            _answer_url(test_project.id, goal.id, approval.id), json={"selected_option": "approve"},
+        )
+        assert response.status_code == 200, response.text
+        assert (await service.get_current(db_session, goal.id, "team_hierarchy")).status == "completed"
+
+
+@pytest.mark.asyncio
 async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_same_process(
     client, db_session, test_project, test_user, monkeypatch
 ):

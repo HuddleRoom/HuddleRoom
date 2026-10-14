@@ -759,6 +759,7 @@ class TeamHierarchyProcess:
                 run_id=run.id, input_snapshot={"fingerprint": input_fingerprint},
                 process_version=PROCESS_VERSION,
                 supersede_waiting=True,
+                supersede_running=True,
             )
         if current.status not in {"running", "waiting_decision"}:
             return self._summary(current.status)
