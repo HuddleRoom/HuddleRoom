@@ -394,8 +394,11 @@ async def test_task_run_rejects_staged_adapter_override_before_mutating_task(
     assert task.status == before
 
 
+DONE_REPORT = json.dumps({"status": "done", "changes": ["Delivered."], "evidence": ["Delivered."], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None})  # a complete work report: no correction holds the verifier
+
+
 async def _complete_producer(db_session, test_project, service, run, task):
-    await _complete_task_session(db_session, test_project.id, task, task.assigned_to, json.dumps({"status": "done"}))
+    await _complete_task_session(db_session, test_project.id, task, task.assigned_to, DONE_REPORT)
     return await service.tick(db_session, run.id)
 
 
@@ -488,7 +491,7 @@ async def test_terminal_roadmap_decision_commits_authority_wait(
     ))
     task = await db_session.get(Task, item.task_id)
     await _complete_task_session(
-        db_session, test_project.id, task, task.assigned_to, json.dumps({"status": "done"}),
+        db_session, test_project.id, task, task.assigned_to, DONE_REPORT,
     )
     _local_decisions(monkeypatch, service, lambda _: {
         "action_type": "request_verification", "gate_id": str(item.gate_id),

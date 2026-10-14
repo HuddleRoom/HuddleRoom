@@ -65,7 +65,7 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
 from huddleroom.services.orchestration_artifact_identity import (
-    CONFIRMED_MISSING, UNINSPECTABLE, bind_artifacts, recheck_binding,
+    CONFIRMED_MISSING, PERMISSION_DENIED, UNINSPECTABLE, bind_artifacts, cited_artifact_ids, one_line, recheck_binding,
 )
 from huddleroom.services.orchestration_review_brief import (
     MAX_ARTIFACTS, STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief,
@@ -197,6 +197,9 @@ IDENTITY_MISSING_REASON = "Reviewed deliverable is missing"
 REVIEW_INPUT_MISSING = "review_input_missing"
 IDENTITY_KEY_MARK = ":identity:"
 IDENTITY_CACHE_KEY = "orchestration_identity_cache"  # db.info slot: one recomputation per artifact per pass
+MAX_LISTED_ARTIFACTS = 10  # artifacts named in a citation error
+PRODUCER_REPORT_UNREADABLE = "producer_report_unreadable"
+REVIEW_INPUT_WAIT_SECONDS = 60  # ponytail: fixed backoff for a re-verification held by funding or its inputs
 REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; an answered owner ask re-arms it
 
 
@@ -4776,17 +4779,18 @@ class OrchestrationService:
         )))
 
     async def verification_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any) -> str:
-        """Key suffix that makes a verification retryable: one attempt per prior FAILED
+        """Key suffix that makes a verification retryable: one attempt per prior FAILED or input-routed
         request_verification for the gate, plus one per automatic gate revision. Attempt 0 with no revision has no
         suffix (legacy keys unchanged)."""
         rows = (await db.execute(
-            select(OrchestrationAction.request).where(
+            select(OrchestrationAction.status, OrchestrationAction.request).where(
                 OrchestrationAction.run_id == run_id,
                 OrchestrationAction.action_type == "request_verification",
-                OrchestrationAction.status == "failed",
+                OrchestrationAction.status.in_(("failed", "completed")),
             )
-        )).scalars().all()
-        failed = sum(1 for req in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id))
+        )).all()
+        failed = sum(1 for status, req in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id)
+                     and (status == "failed" or req.get("routed")))
         # each automatic revision is re-verified under a fresh key
         revisions = len(await self._gate_revision_entries(db, run_id, gate_id))
         # so is content that changed after its review (the reserved request counts itself)
@@ -4878,6 +4882,13 @@ class OrchestrationService:
             "producer_agent_id": str(source_task.assigned_to) if source_task is not None else None,
             "roadmap_version_id": self._json_object_or_empty(gate.required_evidence).get("roadmap_version_id"),
         }
+        found = await self._classify_review_inputs(db, run, gate, source_task) if goal is not None else None
+        if found is not None:
+            # No verifier judges work it cannot see: the request is settled on the gate, never as a failure, so
+            # retries and verification-exhaustion counts are not spent on it.
+            action.request = {**action.request, "routed": dict(found)}
+            await self._route_review_input(db, goal, run, gate, found)
+            return await self._mark_action_completed(db, action, target_type="gate", target_id=gate.id)
         excluded_agent_ids = await self._producer_agent_ids_for_gate(db, gate)
         if source_task is not None and source_task.assigned_to is not None:
             excluded_agent_ids.add(source_task.assigned_to)
@@ -5020,6 +5031,8 @@ class OrchestrationService:
             if report is not None:
                 payload = {key: value for key, value in work_report_payload(report).items() if value not in (None, [], {})}
                 excerpt = json.dumps(payload, indent=2, ensure_ascii=False)
+            elif marker is None:
+                excerpt = "[no producer report: the work finished without a completed agent session]"
             artifact_ids = []
             for value in source_contract.get("artifact_ids") or []:
                 try:
@@ -8001,6 +8014,7 @@ class OrchestrationService:
     ) -> tuple[uuid.UUID | None, "WorkReport | None"]:
         """Consume the one terminal report selected by task/session lineage."""
         from huddleroom.services.orchestration_work_report import (
+            ReportValidation,
             WorkReport,
             curate_report_memory,
             persisted_report_validation,
@@ -8045,6 +8059,8 @@ class OrchestrationService:
             expected_session_id = sessions[0].id if sessions else None
         session_id, output = await self.consume_terminal_task_output(db, run, task, expected_session_id)
         validation = validate_work_report(output)
+        if validation.report is not None and (errors := await self._report_reference_errors(db, task, validation.report)):
+            validation = ReportValidation(None, tuple(errors))  # a citation error is corrected like a schema error
         if marker is not None and marker.status == "completed":
             return session_id, validation.report
 
@@ -8079,6 +8095,36 @@ class OrchestrationService:
         if validation.report is None:
             await self._request_result_correction(db, run, task, session_id, WORK_REPORT, list(validation.errors))
         return session_id, validation.report
+
+    async def _report_reference_errors(self, db: AsyncSession, task: Task, report: Any) -> list[str]:
+        """One error per `artifact:<id>` the report cites that is not an artifact of this project. Each names the
+        artifacts registered for the task, so an output-only correction can cite the existing content. A cited
+        artifact that exists but was deleted is no citation error: it is a missing deliverable."""
+        cited = cited_artifact_ids([*report.changes, *report.candidate_evidence])
+        if not cited:
+            return []
+        known = set(await db.scalars(select(Artifact.id).where(
+            Artifact.id.in_(cited), Artifact.project_id == task.project_id,
+        )))
+        unknown = [value for value in cited if value not in known]
+        if not unknown:
+            return []
+        owner = self._optional_uuid(
+            self._json_object_or_empty(task.metadata_).get("result_correction_parent_task_id"),
+            "result_correction_parent_task_id",
+        ) or task.id
+        registered = list(await db.scalars(select(Artifact).where(
+            Artifact.project_id == task.project_id, Artifact.status != "deleted",
+            Artifact.linked_task_id.in_({task.id, owner}),
+        ).order_by(Artifact.created_at, Artifact.id).limit(MAX_LISTED_ARTIFACTS)))
+        listing = "; ".join(
+            f"artifact:{row.id} ({one_line(row.path or row.url or row.name, 100)})" for row in registered
+        ) or "none"
+        return [
+            f"cited artifact:{value} is not a registered artifact of this project; "
+            f"artifacts registered for this task: {listing}"
+            for value in unknown
+        ]
 
     async def _request_result_correction(
         self,
@@ -10400,6 +10446,22 @@ class OrchestrationService:
             text.startswith("Missing ") and " measurement" in text
         )
 
+    @staticmethod
+    def _routed(action: OrchestrationAction) -> bool:
+        """A verification request settled on its gate because an input was missing or uninspectable."""
+        return action.status == "completed" and bool((action.request or {}).get("routed"))
+
+    def _held_reverification(self, attempts: Sequence[OrchestrationAction]) -> bool:
+        """The newest attempt waited on funding or on its inputs moments ago: wait out the backoff rather than
+        record one more waiting action every tick."""
+        latest = attempts[-1] if attempts else None
+        waited = latest is not None and (self._routed(latest) or (
+            latest.status == "failed" and self._reverification_budget_failure(latest.error)
+        ))
+        return waited and _naive_utc(latest.created_at) > _naive_utc(_utcnow()) - timedelta(
+            seconds=REVIEW_INPUT_WAIT_SECONDS,
+        )
+
     async def _reverification_actions(
         self, db: AsyncSession, run_id: uuid.UUID, revision_task_id: Any,
     ) -> list[OrchestrationAction]:
@@ -10429,6 +10491,113 @@ class OrchestrationService:
         if state == UNINSPECTABLE:
             return f"{REVIEW_INPUT_MISSING}: {current.get('reason')}", False
         return (IDENTITY_MISSING_REASON if state == CONFIRMED_MISSING else IDENTITY_CHANGED_REASON), False
+
+    async def _classify_review_inputs(
+        self, db: AsyncSession, run: OrchestrationRun | None, gate: OrchestrationGate, source_task: Task | None,
+    ) -> dict[str, Any] | None:
+        """Classify every input a judgement of this gate needs, before a verifier is dispatched or a revision is
+        requested: the producer's effective work report, then each required artifact (the contract's artifact ids,
+        artifacts the report cites, artifacts linked to the producer or its latest finished revision).
+
+        None when all are present. Otherwise the first problem, as {"state", "reason", "item", "detail",
+        "source_id", "category"}: a confirmed-missing artifact first (its producer can restore it), then anything
+        uninspectable. ``category`` is the owner escalation, None while HuddleRoom restores the input itself (a
+        result correction in flight) or has already asked about it (a stopped correction)."""
+        if source_task is None or run is None:
+            return None
+        revisions = await self._finished_gate_revisions(db, run.id, gate.id)
+        report_task = revisions[-1][1] if revisions else source_task
+        contract = self._json_object_or_empty(self._json_object_or_empty(source_task.metadata_).get(
+            "orchestration_contract"
+        ))
+        cited: list[uuid.UUID] = []
+        if (
+            contract and gate.gate_type not in {PLAN_GATE_TYPE, "roadmap_plan_approval"}
+            and expected_result_kind(contract, True) == WORK_REPORT
+        ):
+            _marker, report, (ledger, clarification, markers) = await self._effective_report(db, run.id, report_task)
+            # finished with no completed agent session (by hand, by a child goal): no report exists to read
+            sessionless = report is None and markers[0] is None and report_task.status == "done" and await db.scalar(
+                select(Session.id).where(Session.task_id == report_task.id, Session.status == "completed").limit(1)
+            ) is None
+            if report is None and markers[0] is None and report_task.status == "done" and not sessionless:
+                try:  # finished but not consumed yet: HuddleRoom restores the report through the normal consumer
+                    await self.consume_canonical_report(db, run, report_task)
+                except HTTPException:
+                    pass  # no canonical session to consume: unreadable
+                _marker, report, (ledger, clarification, markers) = await self._effective_report(
+                    db, run.id, report_task,
+                )
+            if report is None and not sessionless:
+                restoring = bool(ledger) or clarification is not None or report_task.status != "done"
+                return {
+                    "state": UNINSPECTABLE, "reason": PRODUCER_REPORT_UNREADABLE, "item": f"report:{report_task.id}",
+                    "detail": f"the report of task {report_task.id} cannot be read",
+                    "category": None if restoring else "capability_unavailable",
+                }
+            if report is not None:
+                cited = cited_artifact_ids([*report.changes, *report.candidate_evidence])
+        required = [value for value in map(self._event_uuid, contract.get("artifact_ids") or []) if value]
+        rows = list(await db.scalars(select(Artifact).where(
+            Artifact.project_id == source_task.project_id,
+            or_(Artifact.id.in_([*required, *cited]), and_(
+                Artifact.status != "deleted", Artifact.linked_task_id.in_({source_task.id, report_task.id}),
+            )),
+        ).order_by(Artifact.created_at, Artifact.id)))
+        found = {row.id for row in rows}
+        records = [
+            *({"artifact_id": str(value), "state": CONFIRMED_MISSING, "reason": None}
+              for value in required if value not in found),
+            *await bind_artifacts(db, source_task.project_id, rows),
+        ]
+        for state in (CONFIRMED_MISSING, UNINSPECTABLE):
+            record = next((item for item in records if item["state"] == state), None)
+            if record is None:
+                continue
+            artifact_id = record["artifact_id"]
+            if state == CONFIRMED_MISSING:
+                # stable per artifact and per work it belongs to: replays never add a revision, a later loss can
+                return {
+                    "state": state, "reason": None, "item": f"artifact:{artifact_id}",
+                    "detail": f"Required artifact {artifact_id} is missing.",
+                    "source_id": f"input:artifact:{artifact_id}:after:{report_task.id}", "category": None,
+                }
+            return {
+                "state": state, "reason": record["reason"], "item": f"artifact:{artifact_id}",
+                "detail": f"artifact {artifact_id} cannot be inspected",
+                "category": self._input_escalation_category(record["reason"]),
+            }
+        return None
+
+    @staticmethod
+    def _input_escalation_category(reason: Any) -> str:
+        return "permission_required" if reason == PERMISSION_DENIED else "capability_unavailable"
+
+    async def _route_review_input(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, gate: OrchestrationGate,
+        found: Mapping[str, Any],
+    ) -> int:
+        """A confirmed-missing deliverable goes back to its producer (the gate's revision ledger and cap); an
+        uninspectable input blocks the gate with no revision and no approval, asking the owner only when
+        HuddleRoom cannot restore it. Returns 1 when a revision or a new owner ask was created."""
+        if found["state"] == CONFIRMED_MISSING:
+            return await self._request_gate_revision(
+                db, goal, run, gate, "deliverable_missing", reason=found["detail"], source_id=found["source_id"],
+            )
+        if not found.get("category"):
+            return 0
+        subject = f"gate:{gate.id}:{found['item']}"
+        existed = await self._existing_action_for_key(
+            db, run.id, f"run:{run.id}:kind:ask_human:{found['category']}:{subject}",
+        ) is not None
+        await self._escalate_owner(
+            db, goal, run, found["category"], subject, [f"{REVIEW_INPUT_MISSING}: {found['reason']}"],
+            f"HuddleRoom cannot review the work for gate {gate.id}: {found['detail']} ({found['reason']}). "
+            + ("Restore read access to it" if found["category"] == "permission_required" else
+               "Pin it to an immutable revision (a commit URL, or repo_path and commit metadata) or make it readable")
+            + "; the gate stays open until then.",
+        )
+        return int(not existed)
 
     async def _rebind_reviewed_identities(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Route each open gate whose approval was dropped because its content identity no longer holds: changed
@@ -10465,13 +10634,11 @@ class OrchestrationService:
                     source_id=f"identity:{item.id}:{artifact_id}",
                 )
             elif state == UNINSPECTABLE:
-                await self._escalate_owner(
-                    db, goal, run, REVIEW_INPUT_MISSING, f"gate:{gate.id}:artifact:{artifact_id}",
-                    [f"approval {item.id} cannot apply: {current.get('reason')}"],
-                    f"HuddleRoom cannot identify the reviewed content of artifact {artifact_id} "
-                    f"({current.get('reason')}). Pin it to an immutable revision (a commit URL, or repo_path and "
-                    "commit metadata) or restore read access; the gate stays open until then.",
-                )
+                await self._route_review_input(db, goal, run, gate, {
+                    "state": state, "reason": current.get("reason"), "item": f"artifact:{artifact_id}",
+                    "detail": f"approval {item.id} cannot apply to artifact {artifact_id}",
+                    "category": self._input_escalation_category(current.get("reason")),
+                })
             else:
                 created += await self._reverify_changed_content(db, goal, run, gate, item)
         return created
@@ -10513,12 +10680,15 @@ class OrchestrationService:
             or_(OrchestrationAction.idempotency_key == key,
                 OrchestrationAction.idempotency_key.startswith(f"{key}:attempt:", autoescape=True)),
         )))
-        if any(action.status != "failed" for action in attempts):
+        if any(action.status != "failed" and not self._routed(action) for action in attempts) or (
+            self._held_reverification(attempts)
+        ):
             return 0
-        if len(attempts) >= REVERIFICATION_ATTEMPTS:
+        spent = [a for a in attempts if a.status == "failed" and not self._reverification_budget_failure(a.error)]
+        if len(spent) >= REVERIFICATION_ATTEMPTS:
             await self._escalate_owner(
                 db, goal, run, "capability_unavailable", f"gate:{gate.id}:reverify:{item.id}",
-                [f"verification failed: {action.error}" for action in attempts],
+                [f"verification failed: {action.error}" for action in spent],
                 f"Cannot verify gate {gate.id} again after its reviewed content changed.",
             )
             return 0
@@ -10553,8 +10723,9 @@ class OrchestrationService:
                 continue
             attempts = await self._reverification_actions(db, run.id, revision.id)
             failures = [action for action in attempts if action.status == "failed"]
-            if (any(action.status == "completed" for action in attempts)
-                    or (await self._effective_report(db, run.id, revision))[1] is None):
+            if (any(action.status == "completed" and not self._routed(action) for action in attempts)
+                    or (await self._effective_report(db, run.id, revision))[1] is None
+                    or self._held_reverification(attempts)):
                 continue
             # Only capability failures spend attempts. Each answered owner ask re-arms REVERIFICATION_ATTEMPTS more;
             # the next ask of a re-armed cycle has its own subject so it can be raised again.
@@ -10582,7 +10753,7 @@ class OrchestrationService:
             # the gate keeps the kind of judge that first rejected it: a reviewed gate is re-reviewed
             work_function = "review" if entries[0].get("cause") == "review_rejected" else "validation"
             key = self._gate_revision_reverification_key(run.id, revision.id) + (
-                f":attempt:{len(failures)}" if failures else ""
+                f":attempt:{len(attempts)}" if attempts else ""
             )
             try:
                 await self.execute_request_verification_action(db, run.id, {
@@ -11259,6 +11430,12 @@ class OrchestrationService:
             in_flight = await db.get(Task, self._event_uuid(revisions[-1].get("revision_task_id")))
             if in_flight is not None and in_flight.status not in {"done", "failed", "cancelled"}:
                 return 0  # one revision at a time: its re-verification judges the latest work
+        source = await self._gate_revision_source(db, goal, gate)
+        if cause != "deliverable_missing":  # the missing-deliverable caller has classified the inputs already
+            found = await self._classify_review_inputs(db, run, gate, source)
+            if found is not None and found["state"] == UNINSPECTABLE:
+                # nobody can inspect what a revision would change: the gate waits for the input, not the producer
+                return await self._route_review_input(db, goal, run, gate, found)
         findings = self._json_object_or_empty(
             self._json_object_or_empty(evidence.evidence_metadata if evidence is not None else {}).get("findings")
         ) or {"evidence": [], "notes": reason}
@@ -11289,7 +11466,6 @@ class OrchestrationService:
                 f"The work for gate {gate.id} is still rejected after {len(revisions)} automatic revision(s)"
                 + (" and the findings did not change." if len(revisions) < GATE_REVISION_CAP else ".")
             ))
-        source = await self._gate_revision_source(db, goal, gate)
         if source is None or source.assigned_to is None:
             return await ask(
                 "capability_unavailable", f"No producer task or assignee can revise the work for gate {gate.id}.",
@@ -12087,8 +12263,10 @@ class OrchestrationService:
             for source in sources
         ]
         for index, marker in enumerate(markers):
-            if index == 0 and ledger.get("status") in {"pending", "correcting"}:
-                continue  # the original's report is under correction, so it is not the effective one yet
+            if index == 0 and ledger and ledger.get("status") != "corrected":
+                # Under correction, or the correction stopped: a rejected original (including a valid-looking one
+                # rejected for its references) never becomes effective again. Corrected content lands on this marker.
+                continue
             request = self._json_object_or_empty(marker.request) if marker is not None else {}
             report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
             if report is not None:

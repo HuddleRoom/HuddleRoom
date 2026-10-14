@@ -29,6 +29,9 @@ from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadm
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
+DONE_REPORT = json.dumps({"status": "done", "changes": ["Delivered."], "evidence": ["Delivered."], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None})  # a complete work report: no correction holds the verifier
+
+
 @pytest.fixture(autouse=True)
 def _manual_task_start(monkeypatch):
     # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
@@ -159,7 +162,7 @@ async def test_integration_decision_commits_authority_wait(db_session, test_proj
     service = roadmap.orchestration
     task = await db_session.get(Task, row.task_id)
     await _record_measured_completion(
-        db_session, test_project.id, run, task, task.assigned_to, json.dumps({"status": "done"}),
+        db_session, test_project.id, run, task, task.assigned_to, DONE_REPORT,
     )
     verification = await service.execute_request_verification_action(
         db_session, run.id,
@@ -207,7 +210,7 @@ async def _complete_child(db, project, roadmap, row, planner, producer, verifier
     work_gate = await db.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
     producer_session = await _record_measured_completion(
         db, project.id, child_run, work_task, producer.id,
-        json.dumps({"status": "done", "changes": ["child delivered"]}),
+        json.dumps({"status": "done", "changes": ["child delivered"], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     verification = await service.execute_request_verification_action(
         db, child_run.id,
@@ -405,7 +408,7 @@ async def test_terminal_child_without_completed_outcome_does_not_unlock_parent(d
                 if roadmap.orchestration._task_work_function(task) == "implementation")
     await _record_measured_completion(
         db_session, test_project.id, child_run, task, producer.id,
-        json.dumps({"status": "done", "changes": ["terminal task only"]}),
+        json.dumps({"status": "done", "changes": ["terminal task only"], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     assert child.status == "active"
@@ -748,7 +751,7 @@ async def test_integration_gate_waits_for_every_current_item_gate(db_session, te
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "two",
     ))
     task = await db_session.get(Task, two.task_id)
-    await _record_measured_completion(db_session, test_project.id, run, task, builder.id, json.dumps({"status": "done"}))
+    await _record_measured_completion(db_session, test_project.id, run, task, builder.id, DONE_REPORT)
     await service.tick(db_session, run.id)
     assert await _integration_gate(db_session, roadmap, parent, run, version) is None
 

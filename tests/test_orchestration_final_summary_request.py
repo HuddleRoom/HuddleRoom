@@ -252,7 +252,11 @@ async def _real_planning_expansion_run(db_session, project_id, planner: Agent, d
         project_id=project_id,
         adapter_type="api",
         status="completed",
-        output=json.dumps({"status": "done", "changes": ["Implemented the accepted plan item."]}),
+        output=json.dumps({  # a complete work report: no correction holds the verifier
+            "status": "done", "changes": ["Implemented the accepted plan item."], "evidence": [],
+            "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify",
+            "collaboration_need": None,
+        }),
         metadata_={"orchestration": dict(expanded_task.metadata_["orchestration"])},
         origin="auto",
     )

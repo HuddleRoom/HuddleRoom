@@ -1329,7 +1329,7 @@ async def test_outcome_goal_golden_path_reaches_completed_phase(
         test_project.id,
         work_task,
         producer.id,
-        json.dumps({"status": "done", "changes": ["Implemented the requested change."]}),
+        json.dumps({"status": "done", "changes": ["Implemented the requested change."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     stub_decision(
         lambda _ctx: {
@@ -1510,11 +1510,11 @@ async def test_outcome_two_criterion_plan_requires_criterion_scoped_verification
 
     await _complete_task_session(
         db_session, test_project.id, work_tasks["implement"], producer_a.id,
-        json.dumps({"status": "done", "changes": ["Delivered implementation."]}),
+        json.dumps({"status": "done", "changes": ["Delivered implementation."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     await _complete_task_session(
         db_session, test_project.id, work_tasks["validate"], producer_b.id,
-        json.dumps({"status": "done", "changes": ["Delivered validation."]}),
+        json.dumps({"status": "done", "changes": ["Delivered validation."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     for item_id in ("implement", "validate"):
         stub_decision(
@@ -1792,7 +1792,7 @@ async def test_outcome_plan_item_gate_requires_authoritative_producer_and_indepe
 
     producer_session = await _complete_task_session(
         db_session, test_project.id, work_task, producer.id,
-        json.dumps({"status": "done", "changes": ["Delivered work."]}),
+        json.dumps({"status": "done", "changes": ["Delivered work."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     stub_decision(lambda _ctx: {"action_type": "noop"})
     await service.tick(db_session, run.id)
@@ -2066,7 +2066,7 @@ async def test_outcome_verification_rejects_unbound_or_invalid_sessions(
                      if service._task_work_function(task) == "implementation")
     gate = await db_session.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
     await _complete_task_session(db_session, test_project.id, work_task, producer.id,
-                                 json.dumps({"status": "done", "changes": ["Delivered work."]}))
+                                 json.dumps({"status": "done", "changes": ["Delivered work."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}))
     action = await service.execute_request_verification_action(
         db_session, run.id,
         {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
@@ -2183,11 +2183,11 @@ async def test_outcome_plan_item_gate_ignores_generic_same_agent_review(
     )
     await _complete_task_session(
         db_session, test_project.id, work_task, producer.id,
-        json.dumps({"status": "done", "changes": ["Delivered work."]}),
+        json.dumps({"status": "done", "changes": ["Delivered work."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     await _complete_task_session(
         db_session, test_project.id, work_task, producer.id,
-        json.dumps({"status": "done", "changes": ["Self-reviewed work."]}),
+        json.dumps({"status": "done", "changes": ["Self-reviewed work."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
         emit_task_event=False,
         event_type="review.approved",
     )
@@ -2386,7 +2386,7 @@ async def test_exhausted_budget_still_ingests_terminal_work_without_dispatch(
     assert [b["category"] for b in run.active_blockers if b.get("kind") == "owner_escalation"] == ["budget_exhausted"]
 
 
-async def test_malformed_report_curates_nothing_and_verifier_alone_accepts(
+async def test_malformed_report_curates_nothing_and_verifier_waits_for_its_correction(
     db_session, test_project, stub_decision, safe_effectiveness_review_continue
 ):
     producer = _agent("malformed-producer", ["implementation"])
@@ -2433,11 +2433,21 @@ async def test_malformed_report_curates_nothing_and_verifier_alone_accepts(
     assert not [section for section in sections if section.section_key.startswith("report_")]
     assert any(action.action_type == "report_consumed" for action in await _run_actions(db_session, run.id))
 
+    verify = {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"}
+    held = await service.execute_request_verification_action(
+        db_session, run.id, verify, f"run:{run.id}:kind:malformed-report-verification",
+    )
+    # no verifier judges an unreadable report: it waits for the output-only correction
+    assert held.target_type == "gate" and held.request["routed"]["reason"] == "producer_report_unreadable"
+    correction = next(row for row in await _tasks_for_run(db_session, run.id)
+                      if (row.metadata_ or {}).get("result_correction_parent_task_id") == str(task.id))
+    await _complete_task_session(db_session, test_project.id, correction, producer.id, json.dumps({
+        "status": "done", "changes": ["Delivered."], "evidence": [], "criterion_progress": {}, "decisions": [],
+        "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None,
+    }))
+    await service.tick(db_session, run.id)
     request = await service.execute_request_verification_action(
-        db_session,
-        run.id,
-        {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
-        f"run:{run.id}:kind:malformed-report-verification",
+        db_session, run.id, verify, f"run:{run.id}:kind:malformed-report-verification:corrected",
     )
     verification_task = await db_session.get(Task, request.target_id)
     assert verification_task is not None and verification_task.assigned_to == verifier.id
@@ -2491,7 +2501,7 @@ async def test_pause_retains_active_work_and_resume_reconciles_it(
         test_project.id,
         task,
         worker.id,
-        json.dumps({"status": "done", "changes": ["Completed after resume."]}),
+        json.dumps({"status": "done", "changes": ["Completed after resume."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     stub_decision(lambda _ctx: {"action_type": "noop"})
     resumed_tick = await service.tick(db_session, run.id)
@@ -2695,7 +2705,7 @@ async def test_reconciliation_repairs_weak_accepted_outcome_gate_once_then_bound
 
     await _complete_task_session(
         db_session, test_project.id, work_task, producer.id,
-        json.dumps({"status": "done", "changes": ["Delivered work."]}),
+        json.dumps({"status": "done", "changes": ["Delivered work."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     action = await service.execute_request_verification_action(
         db_session,

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -55,7 +56,7 @@ def test_unreadable_is_uninspectable(tmp_path):
         result = classify_input(art(path="secret.txt"), str(tmp_path))
     finally:
         f.chmod(0o600)
-    assert (result.state, result.reason) == (UNINSPECTABLE, "artifact_identity_unavailable")
+    assert (result.state, result.reason) == (UNINSPECTABLE, "artifact_permission_denied")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
@@ -67,7 +68,7 @@ def test_unreadable_workspace_is_uninspectable(tmp_path):
         result = classify_input(art(path="a"), str(root))
     finally:
         root.chmod(0o700)
-    assert result.state == UNINSPECTABLE
+    assert (result.state, result.reason) == (UNINSPECTABLE, "artifact_permission_denied")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
@@ -268,3 +269,19 @@ def test_pinned_reference_is_one_bounded_line():
         assert char not in mod.pinned_reference(art(path=f"a{char}b.py"), found), repr(char)
     long = mod.pinned_reference(art(path="p" * 1000), found)
     assert len(long) == mod.MAX_REFERENCE_CHARS + 1 and long.endswith("…")
+
+
+def test_directory_escaping_the_workspace_is_not_a_permission_problem(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    (tmp_path / "ws" / "d").mkdir(parents=True)
+    (tmp_path / "ws" / "d" / "link").symlink_to(outside)
+    result = classify_input(art(path="d"), str(tmp_path / "ws"))
+    assert (result.state, result.reason) == (UNINSPECTABLE, "artifact_identity_unavailable")
+
+
+def test_cited_artifact_ids_are_parsed_once_in_order():
+    from huddleroom.services.orchestration_artifact_identity import cited_artifact_ids
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    assert cited_artifact_ids([f"see artifact:{b}", f"artifact:{a} and artifact:{b}", "artifact:notes"]) == [b, a]

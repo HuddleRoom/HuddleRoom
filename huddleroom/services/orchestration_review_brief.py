@@ -2,6 +2,7 @@
 and asks for a judgement against its own conditions only."""
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 MAX_SCOPE_CHARS = 1500
@@ -90,6 +91,16 @@ def bound_findings(evidence: Iterable[Any], notes: Any, label: str) -> dict[str,
     }
 
 
+# A fence marker (`<<<TAG` / `TAG>>>`) inside fenced agent text is broken up so it cannot close or open a fence.
+_FENCE_MARK = re.compile(r"<<<(?=[A-Z_])|(?<=[A-Z_])>>>")
+
+
+def fenced(tag: str, body: str) -> str:
+    """Untrusted agent text between `<<<TAG` and `TAG>>>`; the only way briefs embed it."""
+    body = _FENCE_MARK.sub(lambda m: m.group(0)[0] + "\\" + m.group(0)[1:], body)
+    return f"<<<{tag}\n{body}\n{tag}>>>"
+
+
 def _section(title: str, lines: list[str], note: str | None) -> str:
     return "\n".join([title, *lines, *([note] if note else [])])
 
@@ -130,7 +141,7 @@ def build_review_inputs(
         _section("Conditions to judge against:", [f"- {clip_text(c, MAX_CRITERION_CHARS, 'Criterion')}" for c in criteria]
                  or ["- none linked"], criteria_note),
         f"Producer report{f' (marker {ref})' if ref else ''}. {UNTRUSTED_REPORT_NOTE}\n"
-        f"<<<PRODUCER_REPORT\n{excerpt or '[no report content]'}\nPRODUCER_REPORT>>>",
+        + fenced("PRODUCER_REPORT", excerpt or "[no report content]"),
         _section("Artifacts:", [f"- {render_artifact(a)}" for a in arts] or ["- none"], arts_note),
     ]
     return {
@@ -151,7 +162,7 @@ def build_revision_brief(cause: str, findings: dict[str, Any], original_brief: s
     body = "\n".join(lines) or "[no findings recorded]"
     return "\n\n".join([
         f"Revision requested ({cause}). {REVISION_INSTRUCTION}",
-        f"Findings. {UNTRUSTED_FINDINGS_NOTE}\n<<<FINDINGS\n{body}\nFINDINGS>>>",
+        f"Findings. {UNTRUSTED_FINDINGS_NOTE}\n{fenced('FINDINGS', body)}",
         _section("Current artifacts:", [f"- {render_artifact(a)}" for a in arts] or ["- none"], arts_note),
         f"Original brief:\n{clip_text(original_brief, MAX_REPORT_EXCERPT_CHARS, 'Original brief')}",
     ])

@@ -506,15 +506,18 @@ async def test_wrong_artifact_citation_is_corrected_without_redoing_the_work(db_
     await db_session.flush()
     wrong = uuid.uuid4()
     cited = json.dumps({**VALID, "evidence": [f"artifact:{wrong}", "docs/audit-notes.md"]})
-    original = await _complete(db_session, service, run, task, cited)
     tasks_before = len(list(await db_session.scalars(select(Task))))
-    error = f"evidence artifact:{wrong} is not registered; docs/audit-notes.md is artifact {notes.id}"
 
-    # A reference check that finds the cited content under another id asks for an output-only correction.
-    await service._request_result_correction(db_session, run, task, original.id, "work_report", [error])
+    # Consumption checks the cited artifact ids: present content under another id gets an output-only correction.
+    original = await _complete(db_session, service, run, task, cited)
 
     [correction] = await _corrections(db_session, task)
     assert len(list(await db_session.scalars(select(Task)))) == tasks_before + 1
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    [error] = marker.request["report_validation_errors"]
+    assert f"artifact:{wrong}" in error and f"artifact:{notes.id} (audit-notes.md)" in error
     assert cited in correction.description and error in correction.description
     assert '"collaboration_need": "str|null"' in correction.description
     assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", False)
@@ -528,7 +531,7 @@ async def test_wrong_artifact_citation_is_corrected_without_redoing_the_work(db_
     assert marker.request["result_correction"]["status"] == "corrected"
     assert marker.request["report"]["evidence"] == fixed_report["evidence"]  # the parent's effective report
     assert marker.request["effective_report"] == {"task_id": str(correction.id), "session_id": str(fixed.id)}
-    assert marker.request["original_report"]["evidence"] == [f"artifact:{wrong}", "docs/audit-notes.md"]
+    assert marker.request["original_report"] is None  # the rejected original is never an effective report
     assert marker.request["session_id"] == str(original.id)  # the failed candidate stays recorded
     _session_id, report = await service.consume_canonical_report(db_session, run, task)
     assert report.candidate_evidence == fixed_report["evidence"]
@@ -542,6 +545,23 @@ async def test_wrong_artifact_citation_is_corrected_without_redoing_the_work(db_
     # No work redone: the original ran once and only the correction task was created.
     assert len(list(await db_session.scalars(select(Session).where(Session.task_id == task.id)))) == 1
     assert len(list(await db_session.scalars(select(Task)))) == tasks_before + 1
+
+
+async def test_original_report_stays_ineffective_after_its_correction_stops(db_session, test_project):
+    service, _goal, run, _agent, task = await _setup(db_session, test_project)
+    gate = await db_session.get(OrchestrationGate, uuid.UUID(task.metadata_["orchestration"]["gate_id"]))
+    original = await _complete(db_session, service, run, task, json.dumps(VALID))
+    # a valid-looking report rejected for its references (legacy marker or another reference check)
+    await service._request_result_correction(db_session, run, task, original.id, "work_report", ["bad reference"])
+    [correction] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, correction, MISSING_FIELDS)  # no fewer errors: correction stops
+
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    assert marker.request["result_correction"]["status"] == "exhausted"
+    assert (await service._effective_report(db_session, run.id, task))[1] is None
+    assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", True)
 
 
 async def _planning_correction(db, project, output):

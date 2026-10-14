@@ -1349,6 +1349,8 @@ async def test_verification_request_scope_states_final_evidence_fit(db_session, 
     service, run, agent = await _adhoc_run(db_session, test_project.id)
     agent.capabilities = ["investigation", "review", "validation"]
     task = await _delegate_adhoc(db_session, service, run, agent, "v1", work_function="review")
+    await _finish(db_session, test_project.id, task)  # a verifier only judges a finished report
+    await service.consume_canonical_report(db_session, run, task, None)
     gate = await _adhoc_gate(db_session, task)
     async def _ready(*args, **kwargs):
         return None

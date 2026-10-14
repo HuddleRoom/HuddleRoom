@@ -694,7 +694,7 @@ async def test_tick_reconciles_terminal_roadmap_task_by_dispatching_one_verifier
     producer_task = await db_session.get(Task, row.task_id)
     await _complete_task_session(
         db_session, test_project.id, producer_task, producer_task.assigned_to,
-        json.dumps({"status": "done", "changes": ["terminal work"]}),
+        json.dumps({"status": "done", "changes": ["terminal work"], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     stub_decision(lambda _: {
         "action_type": "request_verification", "gate_id": str(row.gate_id),
@@ -782,7 +782,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
     v1_task = await db_session.get(Task, v1_row.task_id)
     await _complete_task_session(
         db_session, test_project.id, v1_task, v1_task.assigned_to,
-        json.dumps({"status": "done", "changes": ["V1 delivered"]}),
+        json.dumps({"status": "done", "changes": ["V1 delivered"], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     stub_decision(lambda _: {
         "action_type": "request_verification", "gate_id": str(v1_row.gate_id),

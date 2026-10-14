@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import re
@@ -21,6 +22,7 @@ UNINSPECTABLE = "uninspectable"
 
 UNAVAILABLE = "artifact_identity_unavailable"
 UNPINNED = "artifact_identity_unpinned"
+PERMISSION_DENIED = "artifact_permission_denied"  # the OS refused access: the owner can grant it
 
 # Directory hashing caps: above either, the directory is uninspectable.
 MAX_DIR_FILES = 2000
@@ -29,6 +31,7 @@ GIT_TIMEOUT_SECONDS = 10
 
 _PINNED_URL = re.compile(r"/(?:commit|blob)/([0-9a-fA-F]{40})(?:/|$)")
 _SHA = re.compile(r"[0-9a-fA-F]{40}")
+_ARTIFACT_REF = re.compile(r"artifact:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 
 
 @dataclass(frozen=True)
@@ -89,8 +92,10 @@ def _hash_dir(root: Path, directory: Path) -> str:
 def _classify_path(path: str, workspace_root: str) -> InputAvailability:
     try:
         root = Path(workspace_root).resolve()
-        if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
+        if not root.is_dir():
             return _unavailable()
+        if not os.access(root, os.R_OK | os.X_OK):
+            return _unavailable(PERMISSION_DENIED)
         candidate = Path(path)
         target = (candidate if candidate.is_absolute() else root / candidate).resolve()
         if not _within(root, target):
@@ -106,6 +111,8 @@ def _classify_path(path: str, workspace_root: str) -> InputAvailability:
         return InputAvailability(PRESENT, _hash_file(str(target)))
     except FileNotFoundError:
         return _missing()  # top-level target vanished while hashing
+    except PermissionError as exc:  # an OS refusal carries errno; a workspace escape raised here does not
+        return _unavailable(PERMISSION_DENIED if exc.errno in (errno.EACCES, errno.EPERM) else UNAVAILABLE)
     except (OSError, OverflowError, RuntimeError, ValueError):
         return _unavailable()
 
@@ -160,6 +167,17 @@ def classify_input(artifact, workspace_root: str) -> InputAvailability:
     return _unavailable()
 
 
+def cited_artifact_ids(texts) -> list[uuid.UUID]:
+    """Artifact ids a report cites as `artifact:<uuid>`, first mention first."""
+    found: list[uuid.UUID] = []
+    for text in texts or []:
+        for match in _ARTIFACT_REF.finditer(str(text)):
+            value = uuid.UUID(match.group(1))
+            if value not in found:
+                found.append(value)
+    return found
+
+
 async def classify_input_async(artifact, workspace_root: str) -> InputAvailability:
     return await asyncio.to_thread(classify_input, artifact, workspace_root)
 
@@ -184,8 +202,13 @@ def pinned_reference(artifact, found: InputAvailability) -> str | None:
         reference = f"{(artifact.metadata_ or {}).get('repo_path')} at commit {found.identity.removeprefix('commit:')}"
     else:
         reference = f"stored {artifact.artifact_type} content (sha256 {found.identity})"
-    reference = _CONTROL.sub(" ", reference)  # producer-controlled text lands in briefs and messages: one line
-    return reference if len(reference) <= MAX_REFERENCE_CHARS else f"{reference[:MAX_REFERENCE_CHARS]}…"
+    return one_line(reference)  # producer-controlled text lands in briefs and messages: one line
+
+
+def one_line(text, limit: int = MAX_REFERENCE_CHARS) -> str:
+    """Producer-controlled text as one bounded line: controls and separators become spaces."""
+    text = _CONTROL.sub(" ", str(text))
+    return text if len(text) <= limit else f"{text[:limit]}…"
 
 
 async def _workspace_root(db, project_id) -> str | None:
