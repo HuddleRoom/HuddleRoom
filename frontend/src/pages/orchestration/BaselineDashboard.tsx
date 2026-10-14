@@ -28,6 +28,7 @@ import type {
   OrchestrationGate,
   OrchestrationGoal,
   OrchestrationMeetingCommitment,
+  NeedsYouReference,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
   OrchestrationWarningRecord,
@@ -38,6 +39,13 @@ import { ProcessFocus } from './ProcessFocus'
 import { NeedsYouQueue, type RecoveryAnswerOption } from './NeedsYouQueue'
 import { useGoalAnnouncer } from './goalAnnouncer'
 import { hierarchyAgentResolver } from './hierarchyAgentNames'
+import {
+  safeNeedsYouText,
+  validateNeedsYouEdit,
+  validateRuntimeAnswerReceipt,
+  type NeedsYouEditSnapshot,
+  type NeedsYouSourceTarget,
+} from './needsYouPresentation'
 
 export type BaselineMutationOwner =
   `baseline:${'answer' | 'skip' | 'acknowledge' | 'resolve' | 'run' | 'rerun' | 'retry' | 'authorize'}:${string}`
@@ -61,6 +69,8 @@ export interface BaselineDashboardProps {
   // Fetched by the goal-detail query (not useBaselineDashboard) — threaded in
   // so the Needs-you queue can rank failed gates without a duplicate fetch.
   meetingCommitments?: readonly OrchestrationMeetingCommitment[]
+  needsYouReferences?: readonly NeedsYouReference[]
+  sourceActionIds?: readonly string[]
   gates: readonly OrchestrationGate[]
   mutationBusy: boolean
   acquireMutation: (owner: BaselineMutationOwner) => boolean
@@ -75,6 +85,7 @@ export interface BaselineDashboardProps {
   // Switches the Details tabs to Activity, scoped to this step (threaded from
   // ProcessFocus's "View activity for this step" control).
   onViewActivity?: () => void
+  onRevealSource?: (target: NeedsYouSourceTarget) => void
   suppressQueueAnnouncement?: boolean
   // The goal_definition_clarification_limit recovery action (Proceed / Ask
   // another round) is owned by the page (shares its mutation-owner
@@ -165,6 +176,10 @@ export function BaselineActionForm({
   onSelectedOptionChange,
   onReasonChange,
   onCancel,
+  displayQuestion,
+  displayReferences = [],
+  editState = 'current',
+  onReleaseEdit,
 }: {
   target: ActionTarget
   mutationBusy: boolean
@@ -182,8 +197,13 @@ export function BaselineActionForm({
   onSelectedOptionChange: (option: string) => void
   onReasonChange: (reason: string) => void
   onCancel: () => void
+  displayQuestion?: string
+  displayReferences?: readonly NeedsYouReference[]
+  editState?: 'current' | 'terminal' | 'stale' | 'unavailable'
+  onReleaseEdit?: () => void
 }) {
   const disabled = mutationBusy || submitting
+  const reviewLocked = editState !== 'current'
   const options = target.kind === 'answer' ? target.decision.options.map((option) => ({ option, key: decisionOptionKey(option) })) : []
   const freeText = target.kind === 'answer' && options.length === 0
   const runtimeDecision = target.kind === 'answer' && Boolean(target.decision.runtime_identity)
@@ -203,6 +223,7 @@ export function BaselineActionForm({
     : target.kind === 'skip' ? canSubmitReason(reason) : true
   const label = target.kind === 'answer' ? textAnswer ? 'Answer' : 'Submit answer' : target.kind === 'skip' ? 'Skip process' : target.kind === 'acknowledge' ? 'Acknowledge risk' : 'Resolve risk'
   const { announceError } = useGoalAnnouncer()
+  const display = (value: string) => safeNeedsYouText(value, displayReferences)
 
   useEffect(() => { if (error) announceError(error) }, [error, announceError])
   useEffect(() => {
@@ -213,6 +234,7 @@ export function BaselineActionForm({
 
   function submit(event: FormEvent) {
     event.preventDefault()
+    if (reviewLocked) return
     if (target.kind === 'answer') {
       if (canSubmit) onAnswer(target.decision, textAnswer ? 'acknowledge' : selectedOption!, normalizedReason)
       return
@@ -225,12 +247,13 @@ export function BaselineActionForm({
   }
 
   return (
-    <form onSubmit={submit} aria-busy={submitting} className="mt-3 border-t border-huddleroom-border pt-3">
+    <form onSubmit={submit} aria-busy={submitting} aria-disabled={reviewLocked || undefined} className="mt-3 border-t border-huddleroom-border pt-3">
       <fieldset disabled={disabled}>
         {target.kind === 'answer' && <>
           <legend className="text-xs font-medium text-huddleroom-text-muted">Answer decision</legend>
-          {target.decision.recommendation !== null && <p className="mt-2 text-xs text-huddleroom-text-secondary">Recommendation: {target.decision.recommendation}</p>}
-          {managerComparison && <dl className="mt-2 grid gap-1 rounded border border-huddleroom-border p-2 text-xs text-huddleroom-text-secondary"><div><dt className="inline font-medium text-huddleroom-text-muted">Deterministic: </dt><dd className="inline">{managerComparison.deterministic}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">LLM: </dt><dd className="inline">{managerComparison.llm}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">Rationale: </dt><dd className="inline">{managerComparison.rationale}</dd></div></dl>}
+          <p className="mt-2 text-sm font-medium text-huddleroom-text-primary">{displayQuestion ?? target.decision.question}</p>
+          {target.decision.recommendation !== null && <p className="mt-2 text-xs text-huddleroom-text-secondary">Recommendation: {display(target.decision.recommendation)}</p>}
+          {managerComparison && <dl className="mt-2 grid gap-1 rounded border border-huddleroom-border p-2 text-xs text-huddleroom-text-secondary"><div><dt className="inline font-medium text-huddleroom-text-muted">Deterministic: </dt><dd className="inline">{display(managerComparison.deterministic)}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">LLM: </dt><dd className="inline">{display(managerComparison.llm)}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">Rationale: </dt><dd className="inline">{display(managerComparison.rationale)}</dd></div></dl>}
           {(() => {
             if (!reviewContext) return null
             const reason = typeof reviewContext.reason === 'string' && reviewContext.reason.trim() ? reviewContext.reason : null
@@ -242,43 +265,43 @@ export function BaselineActionForm({
             const hasContent = reason || (description && proposedDescription) || (persona && proposedPersona) || problems.length > 0
             if (!hasContent) return null
             return <div className="mt-2 border-t border-huddleroom-border pt-2">
-              {reason && <p className="text-sm text-huddleroom-text-secondary">{reason}</p>}
+              {reason && <p className="text-sm text-huddleroom-text-secondary">{display(reason)}</p>}
               {description && proposedDescription && <div className="mt-2">
                 <p className="text-xs font-medium text-huddleroom-text-muted">Description</p>
-                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Original: {description}</p>
-                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {proposedDescription}</p>
+                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Original: {display(description)}</p>
+                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {display(proposedDescription)}</p>
               </div>}
               {persona && proposedPersona && <div className="mt-2">
                 <p className="text-xs font-medium text-huddleroom-text-muted">Persona</p>
-                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Original: {persona}</p>
-                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {proposedPersona}</p>
+                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Original: {display(persona)}</p>
+                <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {display(proposedPersona)}</p>
               </div>}
               {problems.length > 0 && <div className="mt-2">
                 <p className="text-xs font-medium text-huddleroom-text-muted">Problems</p>
                 <ul className="mt-1 space-y-1">
-                  {problems.map((problem, index) => <li key={index} className="text-xs text-huddleroom-text-secondary">• {problem}</li>)}
+                  {problems.map((problem, index) => <li key={index} className="text-xs text-huddleroom-text-secondary">• {display(problem)}</li>)}
                 </ul>
               </div>}
             </div>
           })()}
-          {textAnswer ? <Textarea ref={reasonRef} label="Answer" value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required /> : freeText ? <Textarea ref={answerRef} label="Answer" value={selectedOption ?? ''} onChange={(event) => onSelectedOptionChange(event.target.value)} rows={3} /> : (
+          {textAnswer ? <Textarea ref={reasonRef} label="Answer" value={reason} readOnly={reviewLocked} onChange={(event) => onReasonChange(event.target.value)} rows={3} required /> : freeText ? <Textarea ref={answerRef} label="Answer" value={selectedOption ?? ''} readOnly={reviewLocked} onChange={(event) => onSelectedOptionChange(event.target.value)} rows={3} /> : (
             <div className="mt-2 space-y-2">
               {options.map(({ option, key }, index) => key === null ? <p key={index} className="text-sm text-huddleroom-text-secondary">Unavailable option</p> : (
                 <label key={key} className="flex min-h-11 items-center gap-2 text-sm text-huddleroom-text-primary">
-                  <input ref={index === firstAnswerOption ? firstOptionRef : undefined} type="radio" name={`decision-${target.decision.id}`} value={key} checked={selectedOption === key} onChange={() => onSelectedOptionChange(key)} />
-                  {normalizeDecisionOption(option)?.label ?? key}
+                  <input ref={index === firstAnswerOption ? firstOptionRef : undefined} type="radio" name={`decision-${target.decision.id}`} value={key} checked={selectedOption === key} disabled={reviewLocked} onChange={() => onSelectedOptionChange(key)} />
+                  {display(normalizeDecisionOption(option)?.label ?? key)}
                 </label>
               ))}
             </div>
           )}
         </>}
-        {target.kind === 'answer' && !textAnswer && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
+        {target.kind === 'answer' && !textAnswer && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} readOnly={reviewLocked} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
         {target.kind !== 'answer' && <Textarea ref={reasonRef} label={target.kind === 'skip' ? 'Reason (required)' : 'Reason (optional)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
         {reasonTooLong && <p role="alert" className="mt-2 text-xs text-huddleroom-status-red">Answer or reason must be at most 4,000 Unicode characters.</p>}
         {error && <p className="mt-2 text-xs text-huddleroom-status-red">{error}</p>}
         <div className="mt-3 flex flex-wrap justify-end gap-2">
-          <Button type="button" variant="secondary" className="min-h-11" disabled={disabled} onClick={onCancel}>Cancel</Button>
-          <Button ref={submitRef} type="submit" className="min-h-11" disabled={disabled || !canSubmit}>{submitting ? 'Submitting…' : label}</Button>
+          <Button type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || submitting} onClick={() => { onReleaseEdit?.(); onCancel() }}>Cancel</Button>
+          <Button ref={submitRef} type="submit" className="min-h-11" disabled={disabled || reviewLocked || !canSubmit}>{submitting ? 'Submitting…' : label}</Button>
         </div>
       </fieldset>
     </form>
@@ -315,13 +338,23 @@ function AgentDefinitionReviewBatchForm({
   submitting,
   error,
   onSubmit,
+  displayReferences,
+  reviewLocked = false,
 }: {
   decisions: readonly OrchestrationAuthorityDecisionRecord[]
   mutationBusy: boolean
   submitting: boolean
   error: string | null
   onSubmit: (answers: AgentDefinitionReviewBatchAnswerInput[]) => void
+  displayReferences: readonly NeedsYouReference[]
+  reviewLocked?: boolean
 }) {
+  const [order] = useState(() => decisions.map((decision) => decision.id))
+  const currentById = new Map(decisions.map((decision) => [decision.id, decision] as const))
+  const orderedDecisions = [
+    ...order.flatMap((id) => currentById.get(id) ? [currentById.get(id)!] : []),
+    ...decisions.filter((decision) => !order.includes(decision.id)),
+  ]
   const [answers, setAnswers] = useState<Record<string, AgentDefinitionReviewAnswerState>>(() => Object.fromEntries(
     decisions.map((decision) => {
       const context = parseReviewContext(decision.context)
@@ -337,25 +370,27 @@ function AgentDefinitionReviewBatchForm({
   const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const formRef = useRef<HTMLDivElement>(null)
   const disabled = mutationBusy || submitting
+  const display = (value: string) => safeNeedsYouText(value, displayReferences)
   const { announceError } = useGoalAnnouncer()
   useEffect(() => { if (error) announceError(error) }, [error, announceError])
   const update = (decisionId: string, changes: Partial<AgentDefinitionReviewAnswerState>) => {
+    if (reviewLocked) return
     setAnswers((current) => ({ ...current, [decisionId]: { ...current[decisionId], ...changes } }))
   }
-  const canSubmit = (candidate: Record<string, AgentDefinitionReviewAnswerState>) => decisions.every((decision) => {
+  const canSubmit = (candidate: Record<string, AgentDefinitionReviewAnswerState>) => orderedDecisions.every((decision) => {
     const answer = candidate[decision.id]
     return answer?.selectedOption && (answer.selectedOption !== 'edit'
       || (answer.editedDescription.trim() && answer.editedPersona.trim()))
   })
   const submitIfComplete = (candidate: Record<string, AgentDefinitionReviewAnswerState>) => {
-    if (!canSubmit(candidate)) return
-    onSubmit(decisions.map((decision) => {
+    if (reviewLocked || !canSubmit(candidate)) return
+    onSubmit(orderedDecisions.map((decision) => {
       const { selectedOption, reason, editedDescription, editedPersona } = candidate[decision.id]
       return { decisionId: decision.id, selectedOption: selectedOption!, reason, editedDescription, editedPersona }
     }))
   }
   const focusNextControl = (nextState: Record<string, AgentDefinitionReviewAnswerState>, decisionIdToSkip?: string) => {
-    const nextRow = decisions.find((d) => d.id !== decisionIdToSkip && nextState[d.id]?.selectedOption === null)
+    const nextRow = orderedDecisions.find((d) => d.id !== decisionIdToSkip && nextState[d.id]?.selectedOption === null)
     if (nextRow) {
       queueMicrotask(() => rowRefs.current[nextRow.id]?.focus())
     } else {
@@ -365,31 +400,33 @@ function AgentDefinitionReviewBatchForm({
   // Records one row's decision and, once every row in the batch has one,
   // submits — this is the only place a row actually finalizes.
   const decideAndMaybeSubmit = (decisionId: string, changes: Partial<AgentDefinitionReviewAnswerState>) => {
+    if (reviewLocked) return
     const next = { ...answers, [decisionId]: { ...answers[decisionId], ...changes } }
     setAnswers(next)
     focusNextControl(next, decisionId)
     submitIfComplete(next)
   }
   const approveAllRemaining = () => {
+    if (reviewLocked) return
     const next = { ...answers }
-    for (const decision of decisions) {
+    for (const decision of orderedDecisions) {
       if (next[decision.id].selectedOption === null) next[decision.id] = { ...next[decision.id], selectedOption: agentDefinitionApproveOption(decision) }
     }
     setAnswers(next)
     focusNextControl(next)
     submitIfComplete(next)
   }
-  const remaining = decisions.filter((decision) => answers[decision.id]?.selectedOption === null)
+  const remaining = orderedDecisions.filter((decision) => answers[decision.id]?.selectedOption === null)
   const allComplete = remaining.length === 0
 
-  return <div ref={formRef} aria-busy={submitting} className="mt-2 divide-y divide-huddleroom-border">
+  return <div ref={formRef} aria-busy={submitting} aria-disabled={reviewLocked || undefined} className="mt-2 divide-y divide-huddleroom-border">
     <fieldset disabled={disabled} className="contents">
       {remaining.length > 1 && <div className="flex justify-end py-2">
-        <Button type="button" variant="secondary" className="min-h-11" disabled={disabled} onClick={approveAllRemaining}>
+        <Button type="button" variant="secondary" className="min-h-11" disabled={disabled || reviewLocked} onClick={approveAllRemaining}>
           Approve all remaining ({remaining.length})
         </Button>
       </div>}
-      {decisions.map((decision) => {
+      {orderedDecisions.map((decision) => {
         const answer = answers[decision.id]
         const context = parseReviewContext(decision.context)
         const hasDescription = context !== null && Object.prototype.hasOwnProperty.call(context, 'original_description')
@@ -401,37 +438,37 @@ function AgentDefinitionReviewBatchForm({
         const decided = answer?.selectedOption !== null
         const decidedLabel = answer?.selectedOption === 'approve' ? 'Approved' : answer?.selectedOption === 'reject' ? 'Rejected' : answer?.selectedOption === 'edit' ? 'Edited' : null
         return <article key={decision.id} className="py-3 first:pt-0">
-          <p className="text-sm font-medium text-huddleroom-text-primary">{decision.title || decision.question}</p>
-          {decision.title && <p className="mt-1 text-sm text-huddleroom-text-secondary">{decision.question}</p>}
+          <p className="text-sm font-medium text-huddleroom-text-primary">{display(decision.title || decision.question)}</p>
+          {decision.title && <p className="mt-1 text-sm text-huddleroom-text-secondary">{display(decision.question)}</p>}
           {hasDescription && proposedDescription !== null && <div className="mt-2">
             <p className="text-xs font-medium text-huddleroom-text-muted">Description</p>
-            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Current: {description || '(empty)'}</p>
-            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {proposedDescription || '(empty)'}</p>
+            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Current: {description ? display(description) : '(empty)'}</p>
+            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {proposedDescription ? display(proposedDescription) : '(empty)'}</p>
           </div>}
           {hasPersona && proposedPersona !== null && <div className="mt-2">
             <p className="text-xs font-medium text-huddleroom-text-muted">System prompt</p>
-            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Current: {persona || '(empty)'}</p>
-            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {proposedPersona || '(empty)'}</p>
+            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Current: {persona ? display(persona) : '(empty)'}</p>
+            <p className="mt-1 whitespace-pre-wrap text-xs text-huddleroom-text-secondary">Proposed: {proposedPersona ? display(proposedPersona) : '(empty)'}</p>
           </div>}
           {decided ? (
             <p className="mt-2 text-sm font-medium text-huddleroom-text-secondary">{decidedLabel}{submitting ? ' — submitting…' : ''}</p>
           ) : <>
             <div className="mt-2 flex flex-wrap gap-2">
-              <Button ref={(el) => { rowRefs.current[decision.id] = el }} type="button" className="min-h-11" disabled={disabled} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: agentDefinitionApproveOption(decision) })}>Approve</Button>
-              <Button type="button" variant="secondary" className="min-h-11" aria-pressed={answer.choice === 'reject'} disabled={disabled} onClick={() => update(decision.id, { choice: answer.choice === 'reject' ? null : 'reject' })}>Reject</Button>
-              <Button type="button" variant="secondary" className="min-h-11" aria-pressed={answer.choice === 'edit'} disabled={disabled} onClick={() => update(decision.id, { choice: answer.choice === 'edit' ? null : 'edit' })}>Edit</Button>
+              <Button ref={(el) => { rowRefs.current[decision.id] = el }} data-needs-you-primary type="button" className="min-h-11" disabled={disabled || reviewLocked} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: agentDefinitionApproveOption(decision) })}>Approve</Button>
+              <Button type="button" variant="secondary" className="min-h-11" aria-pressed={answer.choice === 'reject'} disabled={disabled || reviewLocked} onClick={() => update(decision.id, { choice: answer.choice === 'reject' ? null : 'reject' })}>Reject</Button>
+              <Button type="button" variant="secondary" className="min-h-11" aria-pressed={answer.choice === 'edit'} disabled={disabled || reviewLocked} onClick={() => update(decision.id, { choice: answer.choice === 'edit' ? null : 'edit' })}>Edit</Button>
             </div>
             {answer.choice === 'reject' && <div className="mt-2">
-              <Textarea label="Reason (required)" value={answer.reason} onChange={(event) => update(decision.id, { reason: event.target.value })} rows={2} required />
+              <Textarea label="Reason (required)" value={answer.reason} readOnly={reviewLocked} onChange={(event) => update(decision.id, { reason: event.target.value })} rows={2} required />
               <div className="mt-2 flex justify-end">
-                <Button type="button" className="min-h-11" disabled={disabled || !canSubmitReason(answer.reason)} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: 'reject' })}>Confirm reject</Button>
+                <Button type="button" className="min-h-11" disabled={disabled || reviewLocked || !canSubmitReason(answer.reason)} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: 'reject' })}>Confirm reject</Button>
               </div>
             </div>}
             {answer.choice === 'edit' && <div className="mt-2">
-              <Textarea label="Description" value={answer.editedDescription} onChange={(event) => update(decision.id, { editedDescription: event.target.value })} rows={3} required />
-              <Textarea label="Persona" value={answer.editedPersona} onChange={(event) => update(decision.id, { editedPersona: event.target.value })} rows={3} required />
+              <Textarea label="Description" value={answer.editedDescription} readOnly={reviewLocked} onChange={(event) => update(decision.id, { editedDescription: event.target.value })} rows={3} required />
+              <Textarea label="Persona" value={answer.editedPersona} readOnly={reviewLocked} onChange={(event) => update(decision.id, { editedPersona: event.target.value })} rows={3} required />
               <div className="mt-2 flex justify-end">
-                <Button type="button" className="min-h-11" disabled={disabled || !answer.editedDescription.trim() || !answer.editedPersona.trim()} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: 'edit' })}>Confirm edit</Button>
+                <Button type="button" className="min-h-11" disabled={disabled || reviewLocked || !answer.editedDescription.trim() || !answer.editedPersona.trim()} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: 'edit' })}>Confirm edit</Button>
               </div>
             </div>}
           </>}
@@ -439,7 +476,7 @@ function AgentDefinitionReviewBatchForm({
       })}
       {error && <div className="mt-2">
         <p className="text-xs text-huddleroom-status-red">{error}</p>
-        {allComplete && <Button type="button" className="mt-2 min-h-11" disabled={disabled} onClick={() => submitIfComplete(answers)}>Retry submit</Button>}
+        {allComplete && <Button type="button" className="mt-2 min-h-11" disabled={disabled || reviewLocked} onClick={() => submitIfComplete(answers)}>Retry submit</Button>}
       </div>}
     </fieldset>
   </div>
@@ -466,13 +503,17 @@ function proposalDefinition(decision: OrchestrationAuthorityDecisionRecord): Age
   return definition && typeof definition === 'object' ? definition as AgentCreatePayload : null
 }
 
-function TeamHierarchyProposalForm({ decision, disabled, submitting, error, onSubmit, primaryRef }: {
+function TeamHierarchyProposalForm({ decision, disabled, reviewLocked = false, submitting, error, onSubmit, onCancelEdit, onBeginEdit, primaryRef, displayReferences }: {
   decision: OrchestrationAuthorityDecisionRecord
   disabled: boolean
+  reviewLocked?: boolean
   submitting: boolean
   error: string | null
   onSubmit: (option: string, editedAgent?: AgentCreatePayload) => void
+  onCancelEdit?: () => boolean
+  onBeginEdit?: () => void
   primaryRef?: (element: HTMLButtonElement | null) => void
+  displayReferences: readonly NeedsYouReference[]
 }) {
   const definition = proposalDefinition(decision)
   const [editing, setEditing] = useState(false)
@@ -481,6 +522,7 @@ function TeamHierarchyProposalForm({ decision, disabled, submitting, error, onSu
   const [validation, setValidation] = useState<string | null>(null)
   const editRef = useRef<HTMLButtonElement>(null)
   const { announceError } = useGoalAnnouncer()
+  const display = (value: string) => safeNeedsYouText(value, displayReferences)
   useEffect(() => {
     if (!definition) { announceError('This proposal is missing its agent definition.'); return }
     const message = editing ? (validation || error) : error
@@ -490,6 +532,7 @@ function TeamHierarchyProposalForm({ decision, disabled, submitting, error, onSu
 
   function submitEdit(event: FormEvent) {
     event.preventDefault()
+    if (reviewLocked) return
     let parsed: unknown
     try { parsed = JSON.parse(config) } catch { setValidation('Config must be valid JSON.'); return }
     if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') { setValidation('Config must be a JSON object.'); return }
@@ -498,40 +541,40 @@ function TeamHierarchyProposalForm({ decision, disabled, submitting, error, onSu
   }
 
   const field = (label: string, key: keyof AgentCreatePayload, required = false) => <label className="block text-xs text-huddleroom-text-secondary">{label}
-    <input className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2 text-sm text-huddleroom-text-primary" required={required} value={String(draft[key] ?? '')} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))} />
+    <input className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2 text-sm text-huddleroom-text-primary" required={required} readOnly={reviewLocked} value={String(draft[key] ?? '')} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))} />
   </label>
   const capabilities = Array.isArray(definition.capabilities)
     ? definition.capabilities.filter((capability): capability is string => typeof capability === 'string' && capability.trim().length > 0)
     : []
-  return <div className="mt-2" aria-busy={submitting}>
+  return <div className="mt-2" aria-busy={submitting} aria-disabled={reviewLocked || undefined}>
     <Record keyWidth={84} rows={[
-      { key: 'Role', value: definition.role ? <span className="font-semibold">{definition.role}</span> : null },
-      { key: 'Name', value: definition.name || null },
-      { key: 'Model', value: definition.model || null },
-      { key: 'Provider', value: definition.provider || null },
-      { key: 'Adapter', value: definition.adapter_type || null },
-      { key: 'Description', value: definition.description ? <span className="block truncate" title={definition.description}>{definition.description}</span> : null },
+      { key: 'Role', value: definition.role ? <span className="font-semibold">{display(definition.role)}</span> : null },
+      { key: 'Name', value: definition.name ? display(definition.name) : null },
+      { key: 'Model', value: definition.model ? display(definition.model) : null },
+      { key: 'Provider', value: definition.provider ? display(definition.provider) : null },
+      { key: 'Adapter', value: definition.adapter_type ? display(definition.adapter_type) : null },
+      { key: 'Description', value: definition.description ? <span className="block truncate" title={display(definition.description)}>{display(definition.description)}</span> : null },
     ]} />
     {capabilities.length > 0 && <div className="mt-2 flex flex-wrap gap-1">
-      {capabilities.map((capability) => <Tag key={capability}>{capability}</Tag>)}
+      {capabilities.map((capability) => <Tag key={capability}>{display(capability)}</Tag>)}
     </div>}
     {definition.system_prompt && <details className="mt-2">
       <summary className="cursor-pointer text-xs font-medium text-huddleroom-text-muted hover:text-huddleroom-text-secondary">Show prompt</summary>
-      <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-huddleroom-text-secondary">{definition.system_prompt}</pre>
+      <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-huddleroom-text-secondary">{display(definition.system_prompt)}</pre>
     </details>}
     {!editing ? <div className="mt-3 flex flex-wrap gap-2">
-      <Button ref={primaryRef} type="button" disabled={disabled} onClick={() => onSubmit('approve')}>Approve</Button>
-      <Button ref={editRef} type="button" variant="secondary" disabled={disabled} onClick={() => setEditing(true)}>Edit</Button>
-      <Button type="button" variant="secondary" disabled={disabled} onClick={() => onSubmit('reject')}>Reject</Button>
+      <Button ref={primaryRef} data-needs-you-primary type="button" disabled={disabled || reviewLocked} onClick={() => onSubmit('approve')}>Approve</Button>
+      <Button ref={editRef} type="button" variant="secondary" disabled={disabled || reviewLocked} onClick={() => { onBeginEdit?.(); setEditing(true) }}>Edit</Button>
+      <Button type="button" variant="secondary" disabled={disabled || reviewLocked} onClick={() => onSubmit('reject')}>Reject</Button>
     </div> : <form className="mt-3 grid gap-2" onSubmit={submitEdit}>
       {field('Name', 'name', true)}{field('Role', 'role', true)}{field('Description', 'description')}{field('Provider', 'provider', true)}{field('Model', 'model', true)}
-      <label className="block text-xs text-huddleroom-text-secondary">Adapter type<select className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2" value={draft.adapter_type ?? 'api'} onChange={(event) => setDraft((current) => ({ ...current, adapter_type: event.target.value as AgentCreatePayload['adapter_type'] }))}><option value="api">api</option><option value="cli">cli</option><option value="routine">routine</option></select></label>
+      <label className="block text-xs text-huddleroom-text-secondary">Adapter type<select className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2" disabled={reviewLocked} value={draft.adapter_type ?? 'api'} onChange={(event) => setDraft((current) => ({ ...current, adapter_type: event.target.value as AgentCreatePayload['adapter_type'] }))}><option value="api">api</option><option value="cli">cli</option><option value="routine">routine</option></select></label>
       {field('CLI runtime', 'cli_runtime')}
-      <Textarea label="Capabilities (one per line)" value={(draft.capabilities ?? []).join('\n')} onChange={(event) => setDraft((current) => ({ ...current, capabilities: event.target.value.split('\n').filter(Boolean) }))} rows={3} />
-      <Textarea label="System prompt" value={draft.system_prompt ?? ''} onChange={(event) => setDraft((current) => ({ ...current, system_prompt: event.target.value }))} rows={8} />
-      <Textarea label="Config (JSON object)" value={config} onChange={(event) => setConfig(event.target.value)} rows={5} />
+      <Textarea label="Capabilities (one per line)" value={(draft.capabilities ?? []).join('\n')} readOnly={reviewLocked} onChange={(event) => setDraft((current) => ({ ...current, capabilities: event.target.value.split('\n').filter(Boolean) }))} rows={3} />
+      <Textarea label="System prompt" value={draft.system_prompt ?? ''} readOnly={reviewLocked} onChange={(event) => setDraft((current) => ({ ...current, system_prompt: event.target.value }))} rows={8} />
+      <Textarea label="Config (JSON object)" value={config} readOnly={reviewLocked} onChange={(event) => setConfig(event.target.value)} rows={5} />
       {(validation || error) && <p className="text-xs text-huddleroom-status-red">{validation || error}</p>}
-      <div className="flex justify-end gap-2"><Button type="button" variant="secondary" disabled={disabled} onClick={() => { setEditing(false); queueMicrotask(() => editRef.current?.focus()) }}>Cancel</Button><Button type="submit" disabled={disabled}>{submitting ? 'Submitting…' : 'Submit edit'}</Button></div>
+      <div className="flex justify-end gap-2"><Button type="button" variant="secondary" disabled={disabled} onClick={() => { setEditing(false); setDraft({ ...definition, capabilities: definition.capabilities ?? [], config: definition.config ?? {} }); setConfig(JSON.stringify(definition.config ?? {}, null, 2)); setValidation(null); if (!onCancelEdit?.()) queueMicrotask(() => editRef.current?.focus()) }}>Cancel</Button><Button type="submit" disabled={disabled || reviewLocked}>{submitting ? 'Submitting…' : 'Submit edit'}</Button></div>
     </form>}
     {!editing && error && <p className="mt-2 text-xs text-huddleroom-status-red">{error}</p>}
   </div>
@@ -563,7 +606,7 @@ function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: rea
   </section>
 }
 
-export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, renderBlockerRecovery, suppressQueueAnnouncement, getMutationGeneration }: BaselineDashboardProps) {
+export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], needsYouReferences = [], sourceActionIds = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, onRevealSource, renderBlockerRecovery, suppressQueueAnnouncement, getMutationGeneration }: BaselineDashboardProps) {
   const health = useOrchestrationHealth()
   const answer = useAnswerOrchestrationDecision(projectId)
   const answerAgentDefinitionBatch = useAnswerAgentDefinitionReviewBatch(projectId)
@@ -593,10 +636,13 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   const [reason, setReason] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
   const [formErrorSource, setFormErrorSource] = useState<'action' | 'batch' | null>(null)
+  const [invalidatedDecisions, setInvalidatedDecisions] = useState<Record<string, 'terminal' | 'stale' | 'unavailable'>>({})
   const [runRerunError, setRunRerunError] = useState<string | null>(null)
   const [retryError, setRetryError] = useState<string | null>(null)
   const [authorizeError, setAuthorizeError] = useState<string | null>(null)
   const selectedGoal = useRef<string | null>(null)
+  const currentGoalId = useRef(goalId)
+  currentGoalId.current = goalId
   const actionTriggers = useRef<Record<string, HTMLButtonElement | null>>({})
   const focusHeadingRef = useRef<HTMLHeadingElement>(null)
   const firstOptionRef = useRef<HTMLInputElement>(null)
@@ -615,6 +661,23 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   const queueQueries = [dashboard.decisions, dashboard.warnings, dashboard.checkpoint]
   const queueQueriesErrored = queueQueries.some((query) => query.isError)
   const queueQueriesUnready = queueQueries.some((query) => query.isLoading || query.data === undefined)
+  const authorityReady = !dashboard.decisions.isLoading && !dashboard.decisions.isError
+    && dashboard.decisions.data !== undefined && !dashboard.decisions.isFetching
+
+  useEffect(() => {
+    if (!authorityReady) return
+    setInvalidatedDecisions((current) => {
+      const next = { ...current }
+      let changed = false
+      for (const [decisionId, state] of Object.entries(current)) {
+        if (state === 'unavailable' && decisions.some((decision) => decision.id === decisionId)) {
+          delete next[decisionId]
+          changed = true
+        }
+      }
+      return changed ? next : current
+    })
+  }, [authorityReady, dashboard.decisions.data])
   const effectiveProcessType = selectedProcessType ?? preferredProcessType(processes)
   const selectedProcess = processes.find((process) => process.process_type === effectiveProcessType)
   const debug = health.data?.debug_enabled === true
@@ -657,7 +720,10 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
 
   function closeForm(action: BaselineFocusAction) {
     setOpenAction(null)
-    guardedMicrotask(() => actionTriggers.current[`${action.kind}:${action.id}`]?.focus())
+    guardedMicrotask(() => {
+      const trigger = actionTriggers.current[`${action.kind}:${action.id}`]
+      if (trigger && trigger.isConnected !== false) trigger.focus()
+    })
   }
 
   function restoreSuccessFocus(action: BaselineFocusAction) {
@@ -673,7 +739,63 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     })
   }
 
-  function runMutation<T>(action: BaselineFocusAction, mutate: (callbacks: { onSuccess: (data: T) => void; onError: (error: unknown) => void; onSettled: () => void }) => void, success: string, onSuccessFocus?: () => void) {
+  function setReviewState(decisionIds: readonly string[], state: 'terminal' | 'stale' | 'unavailable') {
+    setInvalidatedDecisions((current) => ({
+      ...current,
+      ...Object.fromEntries(decisionIds.map((decisionId) => [decisionId, state])),
+    }))
+  }
+
+  function clearReviewState(decisionIds: readonly string[]) {
+    setInvalidatedDecisions((current) => {
+      const next = { ...current }
+      for (const decisionId of decisionIds) delete next[decisionId]
+      return next
+    })
+  }
+
+  async function preflightDecisions(reviewed: readonly OrchestrationAuthorityDecisionRecord[], isRelevant: () => boolean = () => true) {
+    const snapshot: NeedsYouEditSnapshot = {
+      rowKey: reviewed.map((decision) => decision.id).join(':'),
+      decisionIds: reviewed.map((decision) => decision.id),
+      decisions: reviewed,
+    }
+    let authoritative: readonly OrchestrationAuthorityDecisionRecord[] | undefined
+    try {
+      const result = await dashboard.decisions.refetch()
+      authoritative = result.isSuccess === true && !result.isError ? result.data : undefined
+    } catch {
+      authoritative = undefined
+    }
+    const state = validateNeedsYouEdit(snapshot, authoritative)
+    if (!isRelevant()) return false
+    if (state === 'current') {
+      clearReviewState(snapshot.decisionIds)
+      return true
+    }
+    setReviewState(snapshot.decisionIds, state)
+    const message = state === 'terminal'
+      ? 'This decision was answered elsewhere. Review the authoritative outcome.'
+      : state === 'stale'
+        ? 'The decision changed. Review the refreshed decision before answering.'
+        : 'The current decision could not be confirmed. Refresh and review it before answering.'
+    setFormError(message)
+    setFormErrorSource('action')
+    onMessage(message)
+    return false
+  }
+
+  function refreshAfterAcceptedRuntimeAnswer(result: OrchestrationDecisionAnswerResult) {
+    void answer.acceptRuntimeResult(goalId, result)
+    void Promise.all([
+      dashboard.decisions.refetch(),
+      dashboard.checkpoint.refetch(),
+      dashboard.processes.refetch(),
+      dashboard.warnings.refetch(),
+    ])
+  }
+
+  function runMutation<T>(action: BaselineFocusAction, mutate: (callbacks: { onSuccess: (data: T) => void; onError: (error: unknown) => void; onSettled: () => void }) => void, success: string, onSuccessFocus?: () => void, acceptResult?: (data: T) => boolean) {
     const owner = actionOwner(action)
     const isCurrent = beginMutation(owner)
     if (!isCurrent) return
@@ -685,8 +807,9 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     const targetsOpenForm = openAction !== null && openAction.kind === action.kind && openAction.id === action.id
     if (targetsOpenForm) { setFormError(null); setFormErrorSource(null) }
     mutate({
-      onSuccess: () => {
+      onSuccess: (data) => {
         if (!isCurrent()) return
+        if (acceptResult && !acceptResult(data)) return
         if (targetsOpenForm) setOpenAction(null)
         onMessage(success)
         ;(onSuccessFocus ?? (() => restoreSuccessFocus(action)))()
@@ -705,32 +828,77 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     })
   }
 
+  async function submitDecision(
+    decision: OrchestrationAuthorityDecisionRecord,
+    selectedOption: string,
+    submitReason: string,
+    success: string,
+    onSuccessFocus?: () => void,
+    editedAgent?: AgentCreatePayload,
+  ) {
+    const preflightGeneration = generation()
+    const preflightGoalId = goalId
+    const reviewed = decision
+    const submitted = { selectedOption, reason: reviewed.runtime_identity ? submitReason || null : submitReason.trim() || null }
+    if (!await preflightDecisions([reviewed], () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
+      || generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) return
+    const action: BaselineFocusAction = { kind: 'answer', id: reviewed.id }
+    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
+      goalId,
+      decisionId: reviewed.id,
+      contractVersion: reviewed.contract_version,
+      runtimeIdentity: reviewed.runtime_identity,
+      selectedOption,
+      reason: submitReason,
+      editedAgent,
+    }, callbacks), success, onSuccessFocus, reviewed.runtime_identity ? (result) => {
+      if (validateRuntimeAnswerReceipt(reviewed, submitted, result) === 'accepted') {
+        refreshAfterAcceptedRuntimeAnswer(result)
+        return true
+      }
+      setReviewState([reviewed.id], 'stale')
+      void dashboard.decisions.refetch()
+      const message = 'The decision changed while the answer was being recorded. Review the refreshed decision before answering.'
+      setFormError(message)
+      setFormErrorSource('action')
+      onMessage(message)
+      return false
+    } : undefined)
+  }
+
   // onSuccessFocus lets a caller other than ProcessFocus (the Needs-you queue)
   // override where focus lands after a successful submit — ProcessFocus's Skip
   // keeps the default (same trigger, else the process heading); queue rows move
   // focus to the next queue row instead (see NeedsYouQueue).
-  function renderActionForm(action: BaselineFocusAction, record: OrchestrationAuthorityDecisionRecord | OrchestrationWarningRecord | OrchestrationProcessRunRecord, onSuccessFocus?: () => void) {
+  function renderActionForm(
+    action: BaselineFocusAction,
+    record: OrchestrationAuthorityDecisionRecord | OrchestrationWarningRecord | OrchestrationProcessRunRecord,
+    onSuccessFocus?: () => void,
+    displayQuestion?: string,
+    displayReferences?: readonly NeedsYouReference[],
+    editState: 'current' | 'terminal' | 'stale' | 'unavailable' = 'current',
+    onReleaseEdit?: () => void,
+    formKey?: string,
+  ) {
     let target: ActionTarget | null = null
     if (action.kind === 'answer') target = { kind: 'answer', action, decision: record as OrchestrationAuthorityDecisionRecord }
     else if (action.kind === 'skip') target = { kind: 'skip', action, process: record as OrchestrationProcessRunRecord }
     else if (action.kind === 'acknowledge' || action.kind === 'resolve') target = { kind: action.kind, action, warning: record as OrchestrationWarningRecord }
     if (!target) return null
-    return <BaselineActionForm
+    return <BaselineActionForm key={formKey ?? (target.kind === 'answer' ? `${target.decision.id}:${target.decision.contract_version ?? target.decision.runtime_identity ?? 'legacy'}` : `${target.kind}:${target.action.id}`)}
       target={target} mutationBusy={mutationBusy}
       submitting={action.kind === 'answer' ? answer.isPending : action.kind === 'skip' ? skip.isPending : action.kind === 'acknowledge' ? acknowledge.isPending : resolve.isPending}
       selectedOption={selectedOption} reason={reason} error={formErrorSource === 'action' ? formError : null}
       firstOptionRef={firstOptionRef} reasonRef={reasonRef} submitRef={submitRef}
-      onAnswer={(decision, option, submitReason) => runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
-        goalId,
-        decisionId: decision.id,
-        contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity,
-        selectedOption: option,
-        reason: submitReason,
-      }, callbacks), 'Answer received.', onSuccessFocus)}
+      onAnswer={(decision, option, submitReason) => { void submitDecision(decision, option, submitReason, 'Answer received.', onSuccessFocus) }}
       onSkip={(process, submitReason) => runMutation(action, (callbacks) => skip.mutate({ goalId, processType: process.process_type, reason: submitReason }, callbacks), 'Process skipped.', onSuccessFocus)}
       onAcknowledge={(warning, submitReason) => runMutation(action, (callbacks) => acknowledge.mutate({ goalId, warningId: warning.id, reason: submitReason }, callbacks), 'Risk acknowledged.', onSuccessFocus)}
       onResolve={(warning, submitReason) => runMutation(action, (callbacks) => resolve.mutate({ goalId, warningId: warning.id, reason: submitReason }, callbacks), 'Risk resolved.', onSuccessFocus)}
       onSelectedOptionChange={setSelectedOption} onReasonChange={setReason} onCancel={() => closeForm(action)}
+      displayQuestion={displayQuestion}
+      displayReferences={displayReferences}
+      editState={editState}
+      onReleaseEdit={onReleaseEdit}
     />
   }
 
@@ -740,14 +908,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   // full answer form.
   function acceptRecommendation(decision: OrchestrationAuthorityDecisionRecord, onSuccessFocus?: () => void) {
     if (decision.recommendation === null) return
-    const action: BaselineFocusAction = { kind: 'answer', id: decision.id }
-    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({
-      goalId,
-      decisionId: decision.id,
-      contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity,
-      selectedOption: decision.recommendation!,
-      reason: '',
-    }, callbacks), 'Answer received.', onSuccessFocus)
+    void submitDecision(decision, decision.recommendation, '', 'Answer received.', onSuccessFocus)
   }
 
   // Goal-definition step-through card (spec D): submits one adaptive
@@ -755,19 +916,42 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   // runMutation/openAction — the card lives entirely in the Needs-you queue
   // and manages its own local question index, so this only needs to own the
   // mutation-owner lock and error surfacing.
-  function answerGoalDefinitionQuestion(
+  async function answerGoalDefinitionQuestion(
     decision: OrchestrationAuthorityDecisionRecord,
     answerText: string,
     callbacks: { onSuccess: () => void; onError: (error: unknown) => void; onSettled: () => void },
   ) {
+    const preflightGeneration = generation()
+    const preflightGoalId = goalId
+    const reviewed = decision
+    const submitted = { selectedOption: answerText, reason: reviewed.runtime_identity ? null : '' }
+    const preflightCurrent = await preflightDecisions([reviewed], () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
+    if (generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) {
+      callbacks.onSettled()
+      return
+    }
+    if (!preflightCurrent) {
+      callbacks.onError(new Error('The decision changed. Review the refreshed decision before answering.'))
+      callbacks.onSettled()
+      return
+    }
     const owner: BaselineMutationOwner = `baseline:answer:${decision.id}`
     const isCurrent = beginMutation(owner)
     if (!isCurrent) return
     setFormError(null)
     setFormErrorSource(null)
     answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity, selectedOption: answerText, reason: '' }, {
-      onSuccess: () => {
+      onSuccess: (result) => {
         if (!isCurrent()) return
+        if (reviewed.runtime_identity && validateRuntimeAnswerReceipt(reviewed, submitted, result) !== 'accepted') {
+          setReviewState([reviewed.id], 'stale')
+          void dashboard.decisions.refetch()
+          const staleError = new Error('The decision changed. Review the refreshed decision before answering.')
+          callbacks.onError(staleError)
+          onMessage(staleError.message)
+          return
+        }
+      if (reviewed.runtime_identity) refreshAfterAcceptedRuntimeAnswer(result)
         onMessage('Answer received.')
         callbacks.onSuccess()
       },
@@ -785,20 +969,43 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     })
   }
 
-  function answerRecoveryProposal(
+  async function answerRecoveryProposal(
     decision: OrchestrationAuthorityDecisionRecord,
     option: RecoveryAnswerOption,
     reason: string,
     callbacks: { onSuccess: () => void; onError: (error: unknown) => void; onSettled: () => void },
   ) {
+    const preflightGeneration = generation()
+    const preflightGoalId = goalId
+    const reviewed = decision
+    const submitted = { selectedOption: option, reason: reviewed.runtime_identity ? reason || null : reason.trim() || null }
+    const preflightCurrent = await preflightDecisions([reviewed], () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
+    if (generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) {
+      callbacks.onSettled()
+      return
+    }
+    if (!preflightCurrent) {
+      callbacks.onError(new Error('The decision changed. Review the refreshed decision before answering.'))
+      callbacks.onSettled()
+      return
+    }
     const owner: BaselineMutationOwner = `baseline:answer:${decision.id}`
     const isCurrent = beginMutation(owner)
     if (!isCurrent) { callbacks.onSettled(); return }
     setFormError(null)
     setFormErrorSource(null)
     answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity, selectedOption: option, reason }, {
-      onSuccess: () => {
+      onSuccess: (result) => {
         if (!isCurrent()) return
+        if (reviewed.runtime_identity && validateRuntimeAnswerReceipt(reviewed, submitted, result) !== 'accepted') {
+          setReviewState([reviewed.id], 'stale')
+          void dashboard.decisions.refetch()
+          const staleError = new Error('The decision changed. Review the refreshed decision before answering.')
+          callbacks.onError(staleError)
+          onMessage(staleError.message)
+          return
+        }
+      if (reviewed.runtime_identity) refreshAfterAcceptedRuntimeAnswer(result)
         onMessage(option === 'approve_fix' ? 'Fix approved.' : option === 'reject' ? 'Fix rejected.' : 'Marked as provided. Re-diagnosing the blocker…')
         callbacks.onSuccess()
       },
@@ -813,7 +1020,11 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     })
   }
 
-  function submitAgentDefinitionReviewBatch(answers: AgentDefinitionReviewBatchAnswerInput[], onSuccessFocus?: () => void) {
+  async function submitAgentDefinitionReviewBatch(reviewed: readonly OrchestrationAuthorityDecisionRecord[], answers: AgentDefinitionReviewBatchAnswerInput[], onSuccessFocus?: () => void) {
+    const preflightGeneration = generation()
+    const preflightGoalId = goalId
+    if (!await preflightDecisions(reviewed, () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
+      || generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) return
     const owner: BaselineMutationOwner = 'baseline:answer:agent-definition-review-batch'
     const isCurrent = beginMutation(owner)
     if (!isCurrent) return
@@ -842,8 +1053,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   }
 
   function answerTeamProposal(decision: OrchestrationAuthorityDecisionRecord, selectedOption: string, editedAgent: AgentCreatePayload | undefined, onSuccess?: () => void) {
-    const action: BaselineFocusAction = { kind: 'answer', id: decision.id }
-    runMutation<OrchestrationDecisionAnswerResult>(action, (callbacks) => answer.mutate({ goalId, decisionId: decision.id, contractVersion: decision.contract_version, runtimeIdentity: decision.runtime_identity, selectedOption, reason: '', editedAgent }, callbacks), 'Proposal decision received.', onSuccess)
+    void submitDecision(decision, selectedOption, '', 'Proposal decision received.', onSuccess, editedAgent)
   }
 
   function mutateChain(processType: OrchestrationBaselineProcessType, action: 'run' | 'rerun', trigger: HTMLButtonElement | null) {
@@ -994,22 +1204,32 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
     {processState === 'ready' && <>
       <NeedsYouQueue
-        goal={goal} run={run} processes={processes} warnings={warnings} gates={gates} meetingCommitments={meetingCommitments}
-        checkpointItems={checkpointItems} recoveryDecisions={decisions} onAnswerRecoveryProposal={answerRecoveryProposal} checkpointLoaded={dashboard.checkpoint.isSuccess}
+        goal={goal} run={run} processes={processes} sourceProcesses={dashboard.processes.data ?? []} warnings={warnings} gates={gates} meetingCommitments={meetingCommitments}
+        checkpointItems={checkpointItems} allDecisions={decisions} authorityReady={authorityReady} invalidatedDecisions={invalidatedDecisions} needsYouReferences={needsYouReferences} sourceActionIds={sourceActionIds}
+        recoveryDecisions={decisions} onAnswerRecoveryProposal={answerRecoveryProposal} checkpointLoaded={dashboard.checkpoint.isSuccess}
         queriesErrored={queueQueriesErrored} queriesUnready={queueQueriesUnready}
         deferredCount={deferredCount} isWorking={isWorking}
         mutationBusy={mutationBusy} onSelectProcess={setSelectedProcessType}
+        onRevealSource={onRevealSource}
         openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }}
         renderActionForm={renderActionForm}
-        renderAgentDefinitionReviewBatch={(batchDecisions, onSuccessFocus) => <AgentDefinitionReviewBatchForm key={batchDecisions.map((decision) => decision.id).sort().join(',')} decisions={batchDecisions} mutationBusy={mutationBusy} submitting={answerAgentDefinitionBatch.isPending} error={formErrorSource === 'batch' ? formError : null} onSubmit={(answers) => submitAgentDefinitionReviewBatch(answers, onSuccessFocus)} />}
-        renderTeamHierarchyProposal={(decision, onSuccess, registerPrimary) => {
+        renderAgentDefinitionReviewBatch={(batchDecisions, onSuccessFocus, batchKey, displayReferences, editState = 'current') => <AgentDefinitionReviewBatchForm key={batchKey} decisions={batchDecisions} mutationBusy={mutationBusy} reviewLocked={editState !== 'current'} submitting={answerAgentDefinitionBatch.isPending} error={formErrorSource === 'batch' ? formError : null} onSubmit={(answers) => { void submitAgentDefinitionReviewBatch(batchDecisions, answers, onSuccessFocus) }} displayReferences={displayReferences} />}
+        renderTeamHierarchyProposal={(decision, onSuccess, registerPrimary, displayReferences, editState = 'current', formKey, onReleaseEdit, onBeginEdit) => {
           const isActive = openAction?.kind === 'answer' && openAction?.id === decision.id
-          return <TeamHierarchyProposalForm decision={decision} disabled={mutationBusy} submitting={answer.isPending} error={isActive && formErrorSource === 'action' ? formError : null} onSubmit={(option, editedAgent) => answerTeamProposal(decision, option, editedAgent, onSuccess)} primaryRef={registerPrimary} />
+          return <TeamHierarchyProposalForm key={formKey} decision={decision} disabled={mutationBusy} reviewLocked={editState !== 'current'} submitting={answer.isPending} error={isActive && formErrorSource === 'action' ? formError : null} onSubmit={(option, editedAgent) => answerTeamProposal(decision, option, editedAgent, onSuccess)} onCancelEdit={onReleaseEdit} onBeginEdit={onBeginEdit} primaryRef={registerPrimary} displayReferences={displayReferences} />
         }}
         onAcceptDecision={acceptRecommendation} onAnswerGoalDefinitionQuestion={answerGoalDefinitionQuestion}
         retryPending={retry.isPending} retryError={retryError} onRetryProcess={retryProcess}
         onApproveStaleInputs={approveStaleInputs} onDismissStaleInputs={dismissStaleInputs}
         onAcknowledgeWarning={(warningRecord, onSuccessFocus) => runMutation({ kind: 'acknowledge', id: warningRecord.id }, (callbacks) => resolve.mutate({ goalId, warningId: warningRecord.id, reason: 'Acknowledged by operator' }, callbacks), 'Risk acknowledged.', onSuccessFocus)}
+        onReleaseRetainedEdit={(decisionIds, mode) => {
+          clearReviewState(decisionIds)
+          setSelectedOption(null)
+          setReason('')
+          setFormError(null)
+          setFormErrorSource(null)
+          if (mode === 'dismiss') setOpenAction(null)
+        }}
         renderBlockerRecovery={renderBlockerRecovery} suppressAnnouncement={suppressQueueAnnouncement}
       />
       <ProcessFocus selectedProcessType={effectiveProcessType} process={selectedProcess} goal={goal} decisions={decisions} decisionsUnready={dashboard.decisions.isLoading || dashboard.decisions.isError} warnings={warnings} reviews={dashboard.agentReviews.data ?? []} debug={debug} canSkip={!!selectedProcess && goal.status !== 'completed' && goal.status !== 'cancelled' && (selectedProcess.status === 'running' || selectedProcess.status === 'waiting_decision')} mutationBusy={mutationBusy} canRun={canRunSelected} canRerun={canRerunSelected} runPending={runStep.isPending} rerunPending={rerun.isPending} runRerunError={runRerunError} onRun={(trigger) => mutateChain(effectiveProcessType, 'run', trigger)} onRerun={(trigger) => mutateChain(effectiveProcessType, 'rerun', trigger)} retryPending={retry.isPending} retryError={retryError} onRetry={(trigger) => retryProcess(effectiveProcessType, trigger)} openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }} headingRef={focusHeadingRef} renderActionForm={renderActionForm} onViewActivity={onViewActivity} />

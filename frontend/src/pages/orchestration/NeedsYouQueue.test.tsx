@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
 import type {
+  NeedsYouReference,
   OrchestrationAuthorityDecisionRecord,
   OrchestrationGate,
   OrchestrationGoal,
@@ -23,6 +24,7 @@ vi.mock('@/api/meetings', () => ({ useUpdateActionItem: () => meetingMutation })
 import { buildQueueRows, NeedsYouQueue, type NeedsYouQueueProps } from './NeedsYouQueue'
 import type { BaselineFocusAction } from './BaselineDashboard'
 import { GoalAnnouncerProvider } from './goalAnnouncer'
+import { queueOccurrence } from './needsYouPresentation'
 
 const ISO = { started: '2026-08-05T08:00:00Z' }
 
@@ -110,7 +112,20 @@ function question(index: number, overrides: Partial<OrchestrationAuthorityDecisi
 describe('buildQueueRows', () => {
   const criteriaByKey = new Map([['ship-it', 'Ship it.']])
 
-  it('ranks all five types in order: blockers, LM retries, checkpoint decisions, failed gates, warnings', () => {
+  it('SPR212 globally sorts dated rows newest-first instead of preserving type priority', () => {
+    const rows = buildQueueRows({
+      run: run(),
+      processes: [],
+      checkpointItems: [decision({ id: 'older-decision', asked_at: '2026-08-05T08:00:00Z' })],
+      gates: [],
+      warnings: [warning({ id: 'newer-warning', created_at: '2026-08-05T10:00:00Z' })],
+      criteriaByKey,
+    })
+
+    expect(rows.map((row) => row.key)).toEqual(['warning:newer-warning', 'answer:older-decision'])
+  })
+
+  it('SPR212 sorts the original five types by occurrence and puts an undated blocker last', () => {
     const retryProcess = process({ id: 'retry-process', status: 'running', outputs: { lm_retry: { available: true, kind: 'provider_error', warning_id: null } } })
     const rows = buildQueueRows({
       run: run({ active_blockers: [{ kind: 'evidence_gap', reason: 'Missing evidence.' }] }),
@@ -120,10 +135,10 @@ describe('buildQueueRows', () => {
       warnings: [warning()],
       criteriaByKey,
     })
-    expect(rows.map((row) => row.kind)).toEqual(['blocker', 'lm-retry', 'answer', 'gate', 'warning'])
+    expect(rows.map((row) => row.kind)).toEqual(['answer', 'gate', 'lm-retry', 'warning', 'blocker'])
   })
 
-  it('preserves checkpoint server order and collapses one process\'s agent-definition-review proposals into a single batch row', () => {
+  it('SPR212 collapses one process\'s agent-definition-review proposals and globally sorts the resulting rows', () => {
     const reviewProcess = process({ id: 'review-process', process_type: 'agent_definition_review' })
     const rows = buildQueueRows({
       run: run(),
@@ -137,9 +152,134 @@ describe('buildQueueRows', () => {
       gates: [], warnings: [], criteriaByKey,
     })
     expect(rows.map((row) => row.kind)).toEqual(['answer', 'answer-batch', 'answer'])
-    expect(rows[0].kind === 'answer' && rows[0].decision.id).toBe('first')
+    expect(rows[0].kind === 'answer' && rows[0].decision.id).toBe('last')
     expect(rows[1].kind === 'answer-batch' && rows[1].decisions.map((d) => d.id)).toEqual(['review-a', 'review-b'])
-    expect(rows[2].kind === 'answer' && rows[2].decision.id).toBe('last')
+    expect(rows[2].kind === 'answer' && rows[2].decision.id).toBe('first')
+  })
+
+  it('SPR212 emits all nine kinds with exact stable keys in global newest-first order', () => {
+    const retryWarning = warning({ id: 'retry-warning', created_at: '2026-08-05T09:20:00Z' })
+    const retryProcess = process({
+      id: 'retry-process', created_at: '2026-08-05T06:00:00Z', updated_at: '2026-08-05T12:00:00Z',
+      outputs: { lm_retry: { available: true, kind: 'provider_error', warning_id: retryWarning.id } },
+    })
+    const reviewProcess = process({ id: 'review-process', process_type: 'agent_definition_review' })
+    const questionProcess = process({ id: 'question-process', process_type: 'goal_definition' })
+    const reviewA = decision({ id: 'review-a', source_process_run_id: reviewProcess.id, decision_key: 'agent_definition_review:proposal:agent-a', asked_at: '2026-08-05T08:40:00Z' })
+    const reviewB = decision({ id: 'review-b', source_process_run_id: reviewProcess.id, decision_key: 'agent_definition_review:proposal:agent-b', asked_at: '2026-08-05T08:39:00Z' })
+    const clarification = decision({ id: 'question-a', source_process_run_id: questionProcess.id, decision_key: 'goal_definition:adaptive:7:0:objective', asked_at: '2026-08-05T08:30:00Z' })
+    const recovery = recoveryDecision('recovery-a', 'pending_approval', {}, { asked_at: '2026-08-05T08:20:00Z' })
+    const rows = buildQueueRows({
+      run: run({ active_blockers: [{ kind: 'evidence_gap', task_id: 'task-blocked', reason: 'Blocked task', created_at: '2026-08-05T09:10:00Z' }] }),
+      processes: [retryProcess, reviewProcess, questionProcess],
+      checkpointItems: [
+        decision({ id: 'answer-a', source_process_run_id: null, asked_at: '2026-08-05T08:50:00Z' }),
+        reviewB, clarification, recovery, reviewA,
+      ],
+      allDecisions: [reviewA, reviewB, clarification, recovery],
+      recoveryDecisions: [recovery],
+      gates: [gate({ id: 'gate-a', failed_at: '2026-08-05T09:05:00Z' })],
+      meetingCommitments: [{ ...meetingObligation, id: 'meeting-item-a', created_at: '2026-08-05T08:00:00Z' }],
+      warnings: [retryWarning, warning({ id: 'warning-a', created_at: '2026-08-05T09:00:00Z' })],
+      criteriaByKey,
+    })
+
+    expect(rows.map((row) => `${row.kind}|${row.key}`)).toEqual([
+      'lm-retry|lm-retry:retry-process:warning:retry-warning',
+      'gate|gate:gate-a',
+      'warning|warning:warning-a',
+      'answer|answer:answer-a',
+      'answer-batch|answer-batch:review-process:review-a,review-b',
+      'goal-definition-questions|goal-definition-questions:question-process:round:7',
+      'recovery-proposal|recovery-proposal:recovery-a',
+      'meeting-commitment|meeting-commitment:meeting-item-a',
+      'blocker|blocker:evidence_gap:task_id:task-blocked',
+    ])
+  })
+
+  it('SPR212 keeps blocker identities stable across input permutations and mutable progress changes', () => {
+    const first = buildQueueRows({
+      run: run({ active_blockers: [
+        { kind: 'task_wait', task_id: 'task-a', reason: 'Task A', status: 'waiting', progress: 1, updated_at: '2026-08-05T08:00:00Z' },
+        { kind: 'gate_wait', gate_id: 'gate-b', reason: 'Gate B' },
+      ] }),
+      processes: [], checkpointItems: [], gates: [], warnings: [], criteriaByKey,
+    })
+    const second = buildQueueRows({
+      run: run({ active_blockers: [
+        { reason: 'Gate B', gate_id: 'gate-b', kind: 'gate_wait' },
+        { updated_at: '2026-08-05T12:00:00Z', progress: 99, status: 'retrying', reason: 'Task A', task_id: 'task-a', kind: 'task_wait' },
+      ] }),
+      processes: [], checkpointItems: [], gates: [], warnings: [], criteriaByKey,
+    })
+
+    expect(first.map((row) => row.key)).toEqual([
+      'blocker:gate_wait:gate_id:gate-b',
+      'blocker:task_wait:task_id:task-a',
+    ])
+    expect(second.map((row) => row.key)).toEqual(first.map((row) => row.key))
+    expect(second.every((row) => !row.key.includes(':0:') && !row.key.includes(':1:'))).toBe(true)
+  })
+
+  it('SPR212 keys a retry to its linked failure warning, not mutable process updates', () => {
+    const buildRetry = (warningId: string, updatedAt: string) => buildQueueRows({
+      run: run(),
+      processes: [process({
+        id: 'retry-process', updated_at: updatedAt,
+        outputs: { lm_retry: { available: true, kind: 'provider_error', warning_id: warningId } },
+      })],
+      checkpointItems: [], gates: [],
+      warnings: [warning({ id: warningId, created_at: warningId === 'failure-a' ? '2026-08-05T08:00:00Z' : '2026-08-05T09:00:00Z' })],
+      criteriaByKey,
+    })[0]
+
+    expect(buildRetry('failure-a', '2026-08-05T10:00:00Z').key).toBe('lm-retry:retry-process:warning:failure-a')
+    expect(buildRetry('failure-a', '2026-08-05T11:00:00Z').key).toBe('lm-retry:retry-process:warning:failure-a')
+    expect(buildRetry('failure-b', '2026-08-05T11:00:00Z').key).toBe('lm-retry:retry-process:warning:failure-b')
+  })
+
+  it('SPR212 preserves the original clarification round identity, time, and pending-member order from full history', () => {
+    const goalProcess = process({ id: 'goal-definition-process', process_type: 'goal_definition' })
+    const answered = question(0, { status: 'answered', source_process_run_id: goalProcess.id, asked_at: '2026-08-05T10:00:00Z', selected_option: 'Already answered' })
+    const second = question(1, { source_process_run_id: goalProcess.id, asked_at: '2026-08-05T09:50:00Z' })
+    const third = question(2, { source_process_run_id: goalProcess.id, asked_at: '2026-08-05T09:40:00Z' })
+    const build = (pending: OrchestrationAuthorityDecisionRecord[], history: OrchestrationAuthorityDecisionRecord[]) => buildQueueRows({
+      run: run(), processes: [goalProcess], checkpointItems: pending, allDecisions: history,
+      gates: [], warnings: [], criteriaByKey,
+    })[0]
+
+    const before = build([second, third], [answered, second, third])
+    const after = build(
+      [{ ...third, updated_at: '2026-08-05T13:00:00Z' }, { ...second, updated_at: '2026-08-05T14:00:00Z' }],
+      [
+        { ...answered, needs_you_references: [{ kind: 'agent', id: 'agent-a', project_id: 'project-1', goal_id: 'goal-1', label: 'Named agent' }] },
+        second, third,
+      ],
+    )
+
+    expect(before.kind).toBe('goal-definition-questions')
+    expect(after.kind).toBe('goal-definition-questions')
+    expect(after.key).toBe(before.key)
+    expect(queueOccurrence(after, [answered, second, third]).occurredAt).toBe('2026-08-05T10:00:00.000Z')
+    expect(after.kind === 'goal-definition-questions' && after.decisions.map((item) => item.id)).toEqual(['question-1', 'question-2'])
+
+    const nextRound = question(0, { id: 'round-two', source_process_run_id: goalProcess.id, decision_key: 'goal_definition:adaptive:2:0:objective' })
+    expect(build([nextRound], [nextRound]).key).not.toBe(before.key)
+  })
+
+  it('SPR212 keeps an atomic proposal batch intact and gives a new membership a new identity', () => {
+    const reviewProcess = process({ id: 'review-process', process_type: 'agent_definition_review' })
+    const first = decision({ id: 'proposal-a', source_process_run_id: reviewProcess.id, decision_key: 'agent_definition_review:proposal:agent-a' })
+    const second = decision({ id: 'proposal-b', source_process_run_id: reviewProcess.id, decision_key: 'agent_definition_review:proposal:agent-b' })
+    const build = (items: OrchestrationAuthorityDecisionRecord[]) => buildQueueRows({
+      run: run(), processes: [reviewProcess], checkpointItems: [...items].reverse(), allDecisions: items,
+      gates: [], warnings: [], criteriaByKey,
+    })[0]
+
+    const batch = build([first, second])
+    expect(batch.kind === 'answer-batch' && batch.decisions.map((item) => item.id)).toEqual(['proposal-a', 'proposal-b'])
+    expect(batch.key).toBe('answer-batch:review-process:proposal-a,proposal-b')
+    expect(build([first, second, decision({ id: 'proposal-c', source_process_run_id: reviewProcess.id, decision_key: 'agent_definition_review:proposal:agent-c' })]).key).not.toBe(batch.key)
   })
 
   it('does not batch a process whose checkpoint items include a non-proposal decision', () => {
@@ -198,7 +338,9 @@ function QueueHarness(props: Partial<NeedsYouQueueProps> & { onSelectProcess?: (
   const [openAction, setOpenAction] = useState<BaselineFocusAction | null>(null)
   const defaults: NeedsYouQueueProps = {
     goal: goal(), run: run(), processes: [], warnings: [], gates: [],
-    checkpointItems: [], checkpointLoaded: true, queriesErrored: false, queriesUnready: false, deferredCount: 0, isWorking: false, mutationBusy: false,
+    checkpointItems: [], allDecisions: props.allDecisions ?? props.checkpointItems ?? [], authorityReady: true,
+    needsYouReferences: [], sourceActionIds: [],
+    checkpointLoaded: true, queriesErrored: false, queriesUnready: false, deferredCount: 0, isWorking: false, mutationBusy: false,
     onSelectProcess: () => undefined,
     openAction, onOpenAction: setOpenAction, onActionTrigger: () => undefined,
     renderActionForm: fakeRenderActionForm,
@@ -218,6 +360,17 @@ async function mountQueue(props: Partial<ComponentProps<typeof QueueHarness>> = 
   const render = (nextProps: Partial<ComponentProps<typeof QueueHarness>> = props) => <MemoryRouter><GoalAnnouncerProvider><QueueHarness {...nextProps} /></GoalAnnouncerProvider></MemoryRouter>
   const view = await mountWithTestDom(() => render(), act)
   return { ...view, rerender: (nextProps: Partial<ComponentProps<typeof QueueHarness>> = props) => view.rerender(() => render(nextProps)) }
+}
+
+function textOutsideDetails(root: Parameters<typeof descendants>[0]) {
+  const pieces: string[] = []
+  const visit = (node: Parameters<typeof descendants>[0]) => {
+    if ('tagName' in node && node.closest('details') !== null) return
+    if (node.nodeType === 3) pieces.push(node.textContent)
+    else node.childNodes.forEach((child) => visit(child))
+  }
+  visit(root)
+  return pieces.join(' ').replace(/\s+/g, ' ').trim()
 }
 
 beforeEach(() => {
@@ -539,7 +692,7 @@ describe('NeedsYouQueue', () => {
     const retryProcess = process({ id: 'retry-process', status: 'running', outputs: { lm_retry: { available: true, kind: 'x', warning_id: null } } })
     const view = await mountQueue({ processes: [retryProcess], warnings: [warning({ id: 'unrelated' })] })
     try {
-      expect(textOf(view.container)).toContain('language model request failed')
+      expect(textOf(view.container)).toContain('Model request failed')
       await act(async () => getButton(view.container, 'Retry').click())
       // The resolved row's ErrorRecord already announced its message into the
       // shared assertive region before it unmounted — that sr-only text is by
@@ -554,21 +707,20 @@ describe('NeedsYouQueue', () => {
     }
   })
 
-  // Wiring check for the ErrorRecord-backed lm-retry row (Phase 1 "errors are
-  // sentences"): a classified (auth) provider error string renders one ErrorRecord
-  // with Retry as its action, and the raw provider text stays inside the
-  // Details disclosure until opened.
-  it('renders a 401-classified lm-retry warning as one ErrorRecord with Retry as its action, raw text behind Details', async () => {
+  // Needs You classification is driven by structured kind/code evidence. An
+  // auth-looking free-text message remains available in Details, but cannot
+  // turn the primary retry copy into an inferred diagnosis.
+  it('keeps an auth-looking lm-retry message neutral outside Details and exposes the raw source only in Details', async () => {
     const linkedWarning = warning({ id: 'linked-warning', message: 'Provider rejected the request: invalid api key for account 42' })
     const retryProcess = process({ id: 'retry-process', status: 'running', outputs: { lm_retry: { available: true, kind: 'x', warning_id: 'linked-warning' } } })
     const view = await mountQueue({ processes: [retryProcess], warnings: [linkedWarning] })
     try {
-      const text = () => textOf(view.container)
-      expect(text()).toContain("The orchestrator's language-model key was rejected.")
+      const primary = textOutsideDetails(view.container)
+      expect(primary).toContain('The last model request did not complete.')
+      expect(primary).not.toContain("The orchestrator's language-model key was rejected.")
+      expect(primary).not.toContain('invalid api key')
       expect(getButton(view.container, 'Retry')).toBeDefined()
-
-      // Verify error classification (string-based regex matching works)
-      expect(text()).toMatch(/Provider rejected|orchestrator/)
+      expect(textOf(descendants(view.container).find((node) => node.tagName === 'DETAILS')!)).toContain('invalid api key')
     } finally {
       view.cleanup()
     }
@@ -616,9 +768,9 @@ describe('NeedsYouQueue', () => {
     ]
     const view = await mountQueue({ processes: [reviewProcess], checkpointItems: items })
     try {
-      expect(textOf(view.container)).toContain('2 agent definitions need review.')
+      expect(textOf(view.container)).toContain('2 agent definitions are ready for review.')
       await act(async () => getButton(view.container, 'Submit all decisions (2)').click())
-      expect(textOf(view.container)).not.toContain('2 agent definitions need review.')
+      expect(textOf(view.container)).not.toContain('2 agent definitions are ready for review.')
       expect(view.container.ownerDocument.activeElement?.id).toBe('needs-you-queue-heading')
     } finally {
       view.cleanup()
@@ -632,7 +784,178 @@ describe('NeedsYouQueue', () => {
     })] })
     try {
       expect(textOf(view.container)).toContain('Approve deployment?')
-      expect(textOf(view.container)).not.toContain('run:raw-run-id')
+      expect(textOutsideDetails(view.container)).not.toContain('run:raw-run-id')
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 presents one concise ordinary question with distinct rationale, consequence, next actor/action, and complete keyboard Details', async () => {
+    const record = decision({
+      id: 'decision-source-id',
+      title: 'Release approval',
+      question: 'Should the release proceed?',
+      context: 'The final verification sample is incomplete.',
+      consequences: 'Approving ships now; waiting delays the release.',
+    })
+    const renderActionForm: NeedsYouQueueProps['renderActionForm'] = (_action, source) => (
+      <form><p>{'question' in source ? source.question : ''}</p><button type="button">Submit answer</button></form>
+    )
+    const view = await mountQueue({ checkpointItems: [record], allDecisions: [record], renderActionForm })
+    try {
+      const outsideBefore = textOutsideDetails(view.container)
+      expect(outsideBefore.match(/Should the release proceed\?/g)).toHaveLength(1)
+      expect(outsideBefore).toContain('The final verification sample is incomplete.')
+      expect(outsideBefore).toContain('Approving ships now; waiting delays the release.')
+      expect(outsideBefore).toContain('Owner')
+      expect(outsideBefore).toContain('Choose an answer.')
+
+      const details = descendants(view.container).find((node) => node.tagName === 'DETAILS')!
+      const summary = descendants(details).find((node) => node.tagName === 'SUMMARY')!
+      const source = descendants(details).find((node) => node.tagName === 'PRE')!
+      expect(textOf(summary)).toBe('Details')
+      expect(summary.getAttribute('class')).toContain('min-h-11')
+      expect(source.getAttribute('tabindex')).toBe('0')
+      expect(source.getAttribute('role')).toBe('region')
+      expect(textOf(source)).toContain('decision-source-id')
+      expect(textOf(source)).toContain('Should the release proceed?')
+
+      await act(async () => getButton(view.container, 'Answer').click())
+      expect(textOutsideDetails(view.container).match(/Should the release proceed\?/g)).toHaveLength(1)
+      expect(getButton(view.container, 'Submit answer')).toBeDefined()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 keeps a multiline substantive question exactly once when closed or open without dropping context or consequences', async () => {
+    const questionText = 'Which release path should we use?\nChoose the verified fallback if the primary path is unsafe.'
+    const normalizedQuestion = questionText.replace('\n', ' ')
+    const context = 'The primary path has incomplete verification evidence.'
+    const consequences = 'Choosing the fallback delays release but preserves the verification boundary.'
+    const record = decision({
+      id: 'multiline-question', recommendation: null, title: 'Release path decision',
+      question: questionText, context, consequences,
+    })
+    const renderActionForm: NeedsYouQueueProps['renderActionForm'] = (_action, _source, _onSuccess, displayQuestion) => (
+      <form><p className="whitespace-pre-line">{displayQuestion}</p><button type="button">Submit answer</button></form>
+    )
+    const view = await mountQueue({ checkpointItems: [record], allDecisions: [record], renderActionForm })
+    try {
+      const visible = () => textOutsideDetails(view.container)
+      expect(visible().split(normalizedQuestion)).toHaveLength(2)
+      expect(visible()).toContain(context)
+      expect(visible()).toContain(consequences)
+
+      await act(async () => getButton(view.container, 'Answer').click())
+      expect(visible().split(normalizedQuestion)).toHaveLength(2)
+      expect(visible()).toContain(context)
+      expect(visible()).toContain(consequences)
+      expect(getButton(view.container, 'Submit answer')).toBeDefined()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR211 renders verified record routes and exact source reveal controls while keeping unavailable labels and IDs out of normal copy', async () => {
+    const ids = {
+      task: '10000000-0000-4000-8000-000000000001',
+      meeting: '20000000-0000-4000-8000-000000000002',
+      agent: '30000000-0000-4000-8000-000000000003',
+      goal: '40000000-0000-4000-8000-000000000004',
+      gate: '50000000-0000-4000-8000-000000000005',
+      process: '60000000-0000-4000-8000-000000000006',
+      action: '70000000-0000-4000-8000-000000000007',
+      unavailable: '80000000-0000-4000-8000-000000000008',
+    }
+    const refs: NeedsYouReference[] = [
+      { kind: 'task', id: ids.task, project_id: 'project-1', goal_id: 'goal-1', label: 'Release task' },
+      { kind: 'meeting', id: ids.meeting, project_id: 'project-1', goal_id: 'goal-1', label: 'Release meeting' },
+      { kind: 'agent', id: ids.agent, project_id: 'project-1', goal_id: 'goal-1', label: 'Reviewer' },
+      { kind: 'goal', id: ids.goal, project_id: 'project-1', goal_id: ids.goal, label: 'Follow-up goal' },
+      { kind: 'gate', id: ids.gate, project_id: 'project-1', goal_id: 'goal-1', label: 'Verification gate' },
+      { kind: 'process', id: ids.process, project_id: 'project-1', goal_id: 'goal-1', label: 'Verification step' },
+      { kind: 'action', id: ids.action, project_id: 'project-1', goal_id: 'goal-1', label: 'Deployment action' },
+      { kind: 'task', id: ids.unavailable, project_id: 'project-1', goal_id: 'goal-1', label: null },
+    ]
+    const sourceDecision = decision({
+      id: 'referenced-decision', title: 'Review linked work',
+      question: `Review ${Object.values(ids).join(' ')}.`, needs_you_references: refs,
+    })
+    const onRevealSource = vi.fn()
+    const view = await mountQueue({
+      checkpointItems: [sourceDecision], allDecisions: [sourceDecision], needsYouReferences: refs,
+      processes: [process({ id: ids.process })],
+      gates: [gate({ id: ids.gate, failed_at: '2026-08-05T07:00:00Z' })],
+      sourceActionIds: [ids.action], onRevealSource,
+    })
+    try {
+      const links = new Map(descendants(view.container)
+        .filter((node) => node.tagName === 'A')
+        .map((node) => [textOf(node), node.getAttribute('href')]))
+      expect(links.get('Release task')).toBe(`/tasks?task=${encodeURIComponent(ids.task)}`)
+      expect(links.get('Release meeting')).toBe(`/meetings/${ids.meeting}`)
+      expect(links.get('Reviewer')).toBe(`/agents/${ids.agent}`)
+      expect(links.get('Follow-up goal')).toBe(`/orchestration/${ids.goal}`)
+
+      for (const [label, kind, id] of [
+        ['Verification gate', 'gate', ids.gate],
+        ['Verification step', 'process', ids.process],
+        ['Deployment action', 'action', ids.action],
+      ] as const) {
+        await act(async () => getButton(view.container, label).click())
+        expect(onRevealSource).toHaveBeenLastCalledWith({ kind, id, goalId: 'goal-1' })
+      }
+
+      const normalCopy = textOutsideDetails(view.container)
+      expect(normalCopy).toContain('Task unavailable')
+      expect(normalCopy).not.toContain(ids.unavailable)
+      for (const id of Object.values(ids)) expect(normalCopy).not.toContain(id)
+      expect(descendants(view.container).some((node) => node.tagName === 'A' && textOf(node) === 'Task unavailable')).toBe(false)
+      expect(descendants(view.container).some((node) => node.tagName === 'BUTTON' && textOf(node) === 'Task unavailable')).toBe(false)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR211 gives a long unbroken named reference explicit narrow-card wrapping classes', async () => {
+    const taskId = '90000000-0000-4000-8000-000000000009'
+    const longLabel = 'ReleaseChecklist'.repeat(20)
+    const ref: NeedsYouReference = {
+      kind: 'task', id: taskId, project_id: 'project-1', goal_id: 'goal-1', label: longLabel,
+    }
+    const record = decision({
+      id: 'long-reference', title: 'Review linked task', question: `Review ${taskId}.`,
+      needs_you_references: [ref],
+    })
+    const view = await mountQueue({ checkpointItems: [record], allDecisions: [record], needsYouReferences: [ref] })
+    try {
+      const link = descendants(view.container).find((node) => node.tagName === 'A' && textOf(node) === longLabel)!
+      const classes = link.getAttribute('class') ?? ''
+      expect(classes).toContain('max-w-full')
+      expect(classes).toContain('break-words')
+      expect(classes).toContain('[overflow-wrap:anywhere]')
+      expect(textOutsideDetails(view.container)).not.toContain(taskId)
+    } finally { view.cleanup() }
+  })
+
+  it.each([
+    ['loading', { queriesUnready: true }],
+    ['error', { queriesErrored: true }],
+  ] as const)('SPR212 incomplete %s data never announces the queue is clear', async (_label, props) => {
+    vi.useFakeTimers()
+    try {
+      const view = await mountQueue(props)
+      try {
+        await act(async () => { vi.advanceTimersByTime(500) })
+        const live = descendants(view.container).find((node) => node.getAttribute('role') === 'status' && node.getAttribute('aria-live') === 'polite')!
+        expect(textOf(live)).not.toContain('Queue clear.')
+      } finally { view.cleanup() }
+    } finally { vi.useRealTimers() }
+  })
+
+  it('SPR212 a newly inserted newer row does not steal focus from the current control', async () => {
+    const existing = warning({ id: 'existing-warning', created_at: '2026-08-05T08:00:00Z' })
+    const inserted = decision({ id: 'new-decision', asked_at: '2026-08-05T09:00:00Z' })
+    const view = await mountQueue({ warnings: [existing] })
+    try {
+      const acknowledge = getButton(view.container, 'Acknowledge')
+      acknowledge.focus()
+      await act(async () => view.rerender({ warnings: [existing], checkpointItems: [inserted], allDecisions: [inserted] }))
+      expect(view.document.activeElement).toBe(acknowledge)
+      expect(textOutsideDetails(view.container).indexOf('Release approval')).toBeLessThan(textOutsideDetails(view.container).indexOf('Coverage evidence is incomplete.'))
     } finally { view.cleanup() }
   })
 
@@ -669,6 +992,68 @@ describe('NeedsYouQueue', () => {
     }
   })
 
+  it('SPR211 does not infer a product/provider diagnosis from an unknown blocker\'s free text', async () => {
+    const raw = 'timeout while parsing malformed invariant output'
+    const view = await mountQueue({ run: run({ active_blockers: [{ kind: 'unrecognized_failure', reason: raw }] }) })
+    try {
+      const normalCopy = textOutsideDetails(view.container)
+      expect(normalCopy).toContain('cause could not be determined')
+      expect(normalCopy).toContain('maintainer')
+      expect(normalCopy).not.toContain('language-model service did not respond')
+      expect(normalCopy).not.toContain(raw)
+      const details = descendants(view.container).find((node) => node.tagName === 'DETAILS')!
+      expect(textOf(details)).toContain(raw)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR211 limits blocker references to declared task and gate ids and neutralizes arbitrary ids', async () => {
+    const taskId = '10000000-0000-4000-8000-000000000001'
+    const gateId = '20000000-0000-4000-8000-000000000002'
+    const processId = '30000000-0000-4000-8000-000000000003'
+    const actionId = '40000000-0000-4000-8000-000000000004'
+    const blocker = {
+      kind: 'external_wait', task_id: taskId, gate_id: gateId,
+      process_id: processId, source_action_id: actionId, created_at: '2030-01-01T00:00:00Z',
+      reason: `Task ${taskId} is waiting on gate ${gateId}; unrelated ${processId} and ${actionId}.`,
+    }
+    const refs: NeedsYouReference[] = [
+      { kind: 'task', id: taskId, project_id: 'project-1', goal_id: 'goal-1', label: 'Release task' },
+      { kind: 'gate', id: gateId, project_id: 'project-1', goal_id: 'goal-1', label: 'Release gate' },
+      { kind: 'process', id: processId, project_id: 'project-1', goal_id: 'goal-1', label: 'Unrelated process' },
+      { kind: 'action', id: actionId, project_id: 'project-1', goal_id: 'goal-1', label: 'Unrelated action' },
+    ]
+    const view = await mountQueue({
+      run: run({ active_blockers: [blocker] }), needsYouReferences: refs,
+    })
+    try {
+      const normalCopy = textOutsideDetails(view.container)
+      expect(normalCopy).toContain('Release task')
+      expect(normalCopy).toContain('Release gate')
+      expect(normalCopy).toContain('Reference unavailable')
+      expect(normalCopy).not.toContain('Unrelated process')
+      expect(normalCopy).not.toContain('Unrelated action')
+      for (const id of [taskId, gateId, processId, actionId]) expect(normalCopy).not.toContain(id)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR211 a malformed-output retry keeps its limited Retry action without free-text auth diagnosis', async () => {
+    const raw = 'invalid api key parser invariant malformed output'
+    const linked = warning({ id: 'malformed-warning', message: raw })
+    const retry = process({
+      id: 'malformed-process', status: 'running',
+      outputs: { lm_retry: { available: true, kind: 'malformed_output', warning_id: linked.id } },
+    })
+    const view = await mountQueue({ processes: [retry], warnings: [linked] })
+    try {
+      const normalCopy = textOutsideDetails(view.container)
+      expect(normalCopy).toContain('Model request failed')
+      expect(normalCopy).not.toContain('key was rejected')
+      expect(getButton(view.container, 'Retry')).toBeDefined()
+      const details = descendants(view.container).find((node) => node.tagName === 'DETAILS')!
+      expect(textOf(details)).toContain(raw)
+    } finally { view.cleanup() }
+  })
+
   it('renders the goal_definition_clarification_limit recovery action as the blocker row\'s primary action and moves focus onward on success', async () => {
     const renderBlockerRecovery: NeedsYouQueueProps['renderBlockerRecovery'] = (blocker, register, onSuccessFocus) => (
       <button type="button" ref={register} onClick={() => onSuccessFocus?.()}>Proceed: {blocker.kind}</button>
@@ -682,7 +1067,7 @@ describe('NeedsYouQueue', () => {
       expect(textOf(view.container)).toContain('Two rounds did not resolve this goal.')
       await act(async () => getButton(view.container, 'Proceed: goal_definition_clarification_limit').click())
       const active = view.container.ownerDocument.activeElement
-      expect(active && textOf(active)).toBe('Acknowledge')
+      expect(active?.id).toBe('needs-you-queue-heading')
     } finally {
       view.cleanup()
     }
@@ -737,7 +1122,7 @@ describe('NeedsYouQueue', () => {
       const onAnswerGoalDefinitionQuestion: NeedsYouQueueProps['onAnswerGoalDefinitionQuestion'] = (_decision, _answerText, callbacks) => { callbacks.onSuccess(); callbacks.onSettled() }
       const view = await mountQueue({ processes: [goalDefinitionProcess], checkpointItems: questions, onAnswerGoalDefinitionQuestion })
       try {
-        expect(textOf(view.container)).toContain('The orchestrator needs 3 answers.')
+        expect(textOf(view.container)).toContain('3 goal clarification questions need an answer.')
         expect(textOf(view.container)).toContain('Question 1 of 3')
         expect(textOf(view.container)).toContain('Question 0?')
         expect(textOf(view.container)).toContain('Rationale 0.')
@@ -754,6 +1139,61 @@ describe('NeedsYouQueue', () => {
       } finally {
         view.cleanup()
       }
+    })
+
+    it('SPR212 partial answers preserve the original group key, frozen order, draft input node, and focus', async () => {
+      const original = [
+        question(0, { asked_at: '2026-08-05T10:00:00Z' }),
+        question(1, { asked_at: '2026-08-05T09:50:00Z' }),
+        question(2, { asked_at: '2026-08-05T09:40:00Z' }),
+      ]
+      const onAnswerGoalDefinitionQuestion: NeedsYouQueueProps['onAnswerGoalDefinitionQuestion'] = (_decision, _answerText, callbacks) => { callbacks.onSuccess(); callbacks.onSettled() }
+      const view = await mountQueue({
+        processes: [goalDefinitionProcess], checkpointItems: original, allDecisions: original,
+        onAnswerGoalDefinitionQuestion,
+      })
+      try {
+        await act(async () => changeControl(getByLabel(view.container, 'Answer', 'textarea'), 'First answer'))
+        await act(async () => getButton(view.container, 'Next').click())
+        const activeDraft = getByLabel(view.container, 'Answer', 'textarea')
+        await act(async () => changeControl(activeDraft, 'Keep this draft'))
+        activeDraft.focus()
+
+        const answered = { ...original[0], status: 'answered' as const, selected_option: 'First answer', updated_at: '2026-08-05T13:00:00Z' }
+        const second = { ...original[1], updated_at: '2026-08-05T14:00:00Z', needs_you_references: [{ kind: 'agent' as const, id: 'agent-1', project_id: 'project-1', goal_id: 'goal-1', label: 'Reviewer' }] }
+        const third = { ...original[2], updated_at: '2026-08-05T15:00:00Z' }
+        await act(async () => view.rerender({
+          processes: [goalDefinitionProcess], checkpointItems: [third, second], allDecisions: [answered, second, third],
+          needsYouReferences: second.needs_you_references, onAnswerGoalDefinitionQuestion,
+        }))
+
+        const retained = getByLabel(view.container, 'Answer', 'textarea')
+        expect(retained).toBe(activeDraft)
+        expect(retained.value).toBe('Keep this draft')
+        expect(view.document.activeElement).toBe(retained)
+        expect(textOf(view.container)).toContain('Question 2 of 3')
+        expect(textOf(view.container)).toContain('Question 1?')
+      } finally { view.cleanup() }
+    })
+
+    it('SPR212 a new clarification round remounts with a fresh draft and focused input', async () => {
+      const firstRound = [question(0)]
+      const view = await mountQueue({ processes: [goalDefinitionProcess], checkpointItems: firstRound, allDecisions: firstRound })
+      try {
+        const firstInput = getByLabel(view.container, 'Answer', 'textarea')
+        await act(async () => changeControl(firstInput, 'Old round draft'))
+        const secondRound = [question(0, {
+          id: 'round-two-question', decision_key: 'goal_definition:adaptive:2:0:orchestrator_context.notes',
+          question: 'New round question?',
+        })]
+        await act(async () => view.rerender({ processes: [goalDefinitionProcess], checkpointItems: secondRound, allDecisions: secondRound }))
+
+        const nextInput = getByLabel(view.container, 'Answer', 'textarea')
+        expect(nextInput).not.toBe(firstInput)
+        expect(nextInput.value).toBe('')
+        expect(view.document.activeElement).toBe(nextInput)
+        expect(textOf(view.container)).toContain('New round question?')
+      } finally { view.cleanup() }
     })
 
     it('submits the last question with Submit and the card disappears', async () => {
@@ -778,10 +1218,10 @@ describe('NeedsYouQueue', () => {
     it('does not crash when new questions arrive mid-round', async () => {
       const view = await mountQueue({ processes: [goalDefinitionProcess], checkpointItems: [question(0), question(1)] })
       try {
-        expect(textOf(view.container)).toContain('The orchestrator needs 2 answers.')
+        expect(textOf(view.container)).toContain('2 goal clarification questions need an answer.')
         await view.rerender({ processes: [goalDefinitionProcess], checkpointItems: [question(0), question(1), question(2)] })
-        expect(textOf(view.container)).toContain('The orchestrator needs 3 answers.')
-        expect(textOf(view.container)).toContain('Question 1 of 3')
+        expect(textOf(view.container)).toContain('3 goal clarification questions need an answer.')
+        expect(textOf(view.container)).toContain('Question 1 of 2')
       } finally {
         view.cleanup()
       }
@@ -861,12 +1301,12 @@ describe('buildQueueRows recovery proposals', () => {
     expect(build([pending], [pending]).map((row) => row.kind)).toEqual(['recovery-proposal'])
   })
 
-  it('keeps a pending recovery card in checkpoint server order among other decisions', () => {
+  it('globally sorts a pending recovery card among other decisions', () => {
     const a = decision({ id: 'a', source_process_run_id: null })
     const b = decision({ id: 'b', source_process_run_id: null })
     const rec = recoveryDecision('rec-1')
     const rows = build([a, rec, b], [a, rec, b])
-    expect(rows.map((row) => row.kind)).toEqual(['answer', 'recovery-proposal', 'answer'])
+    expect(rows.map((row) => row.kind)).toEqual(['answer', 'answer', 'recovery-proposal'])
   })
 
   it('shows only the newest recovery decision per source_blocker_id', () => {
@@ -894,6 +1334,33 @@ describe('buildQueueRows recovery proposals', () => {
 })
 
 describe('NeedsYouQueue recovery FIX PROPOSAL card', () => {
+  it.each([
+    ['recovery proposal', 'pending_approval', { status: 'pending', options: ['approve_fix', 'reject'] }],
+    ['capability gap', 'unsupported', { status: 'pending', options: ['capability_provided'] }],
+  ] as const)('SPR211 keeps verified/unknown IDs out of specialized %s copy while Details preserves the safe source', async (_label, recoveryStatus, decisionOverrides) => {
+    const taskId = 'a0000000-0000-4000-8000-00000000000a'
+    const unknownId = 'b0000000-0000-4000-8000-00000000000b'
+    const ref: NeedsYouReference = {
+      kind: 'task', id: taskId, project_id: 'project-1', goal_id: 'goal-1', label: 'Verification task',
+    }
+    const item = recoveryDecision('safe-source', recoveryStatus, {
+      problem: `Task ${taskId} is blocked by ${unknownId}.`,
+      general_updates: [`Update ${taskId}`],
+      after_approval: `Resume ${taskId} after checking ${unknownId}.`,
+    }, { ...decisionOverrides, needs_you_references: [ref] })
+    const view = await mountQueue(recoveryProps([item], { needsYouReferences: [ref] }))
+    try {
+      const sourceCard = card(view.container)
+      const normalCopy = textOutsideDetails(sourceCard)
+      expect(normalCopy).toContain('Verification task')
+      expect(normalCopy).toContain('Reference unavailable')
+      expect(normalCopy).not.toContain(taskId)
+      expect(normalCopy).not.toContain(unknownId)
+      const details = descendants(sourceCard).filter((node) => node.tagName === 'DETAILS')
+      expect(details.some((node) => textOf(node).includes(taskId) && textOf(node).includes(unknownId))).toBe(true)
+    } finally { view.cleanup() }
+  })
+
   it('renders heading, Problem / Proposed updates / After approval from server fields, Approve fix and Reject', async () => {
     const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
     try {
@@ -1004,7 +1471,7 @@ describe('NeedsYouQueue recovery FIX PROPOSAL card', () => {
       await act(async () => view.rerender(recoveryProps([recoveryDecision('rec-1', 'applying')])))
       const heading = descendants(card(view.container)).find((node) => node.tagName === 'H3')!
       expect(heading.getAttribute('tabindex')).toBe('-1')
-      expect(view.document.activeElement === heading).toBe(true)
+      expect(view.document.activeElement).toBe(heading)
     } finally { view.cleanup() }
   })
 
@@ -1027,13 +1494,13 @@ describe('NeedsYouQueue recovery FIX PROPOSAL card', () => {
       } finally { view.cleanup() }
     })
 
-    it('omits the disclosure entirely when exact_details and evidence are both null', async () => {
+    it('keeps the general source Details when exact_details and evidence are both null', async () => {
       const view = await mountQueue(recoveryProps([recoveryDecision('rec-1')]))
       try {
         const li = card(view.container)
-        expect(descendants(li).some((node) => node.tagName === 'DETAILS')).toBe(false)
+        expect(descendants(li).filter((node) => node.tagName === 'DETAILS')).toHaveLength(1)
         expect(textOf(li)).not.toContain('Show exact details')
-        expect(descendants(li).some((node) => node.tagName === 'PRE')).toBe(false)
+        expect(descendants(li).some((node) => node.tagName === 'PRE')).toBe(true)
       } finally { view.cleanup() }
     })
 
@@ -1197,9 +1664,13 @@ describe('NeedsYouQueue recovery card follow-up', () => {
     try { expect(textOf(card(view.container))).toContain('After approval') } finally { view.cleanup() }
   })
 
-  it('omits the disclosure for an empty evidence array', async () => {
+  it('keeps only the general source Details for an empty evidence array', async () => {
     const view = await mountQueue(recoveryProps([recoveryDecision('rec-1', 'pending_approval', { evidence: [] })]))
-    try { expect(descendants(card(view.container)).some((node) => node.tagName === 'DETAILS')).toBe(false) } finally { view.cleanup() }
+    try {
+      const details = descendants(card(view.container)).filter((node) => node.tagName === 'DETAILS')
+      expect(details).toHaveLength(1)
+      expect(textOf(details[0])).not.toContain('Show exact details')
+    } finally { view.cleanup() }
   })
 })
 
@@ -1278,19 +1749,19 @@ describe('meeting waiver result and focus', () => {
       expect(toastMock.success.mock.calls.flat().join(' ')).not.toContain('Meeting obligation waived')
       await act(async () => view.rerender({ ...props, meetingCommitments: [] }))
       expect(textOf(view.container)).not.toContain('Document deployment')
-      expect(view.document.activeElement).toBe(getButton(view.container, 'Acknowledge'))
+      expect(view.document.activeElement?.id).toBe('needs-you-queue-heading')
     } finally { view.cleanup() }
   })
 })
 
 
-it('orders meeting obligations after failed gates and before warnings without stealing background focus', async () => {
+it('globally orders dated gate and warning rows before an undated meeting item without stealing background focus', async () => {
   const props = { meetingCommitments: [meetingObligation], gates: [gate()], warnings: [warning({ message: 'Next risk' })] }
   const view = await mountQueue(props)
   try {
     const content = textOf(view.container)
-    expect(content.indexOf('Document deployment')).toBeGreaterThan(content.indexOf('No evidence submitted.'))
-    expect(content.indexOf('Next risk')).toBeGreaterThan(content.indexOf('Document deployment'))
+    expect(content.indexOf('Next risk')).toBeGreaterThan(content.indexOf('No evidence submitted.'))
+    expect(content.indexOf('Document deployment')).toBeGreaterThan(content.indexOf('Next risk'))
     const acknowledge = getButton(view.container, 'Acknowledge')
     acknowledge.focus()
     await act(async () => view.rerender({ ...props, meetingCommitments: [] }))

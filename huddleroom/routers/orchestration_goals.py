@@ -79,6 +79,12 @@ from huddleroom.schemas.orchestration import (
 )
 from huddleroom.services.orchestration_authority_service import effective_authorization
 from huddleroom.services.orchestration_recovery_presenter import present_decision_response
+from huddleroom.services.orchestration_needs_you_presenter import (
+    NeedsYouReferenceRequest,
+    attach_decision_references,
+    resolve_needs_you_references,
+    typed_blocker_reference_requests,
+)
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
 from huddleroom.services.orchestration_dependencies import evidence_semantics
 from huddleroom.services.orchestration_progress_view import plan_item_state, queued_authorization_wait, queued_capacity_wait
@@ -525,6 +531,9 @@ async def _detail(
     agent_suggestions = []
     supervision = None
     roadmap_summary = None
+    direction = None
+    pending_direction = None
+    gate_models = []
     if run is not None:
         decision_rows = await db.execute(
             select(OrchestrationDecision)
@@ -743,8 +752,11 @@ async def _detail(
                     "id": str(accepted.id), "key": f"evidence:{accepted.id}:accepted", "kind": "accepted_evidence",
                     "message": accepted.source_type, "occurred_at": accepted.created_at,
                 }
-        pending_direction = (await present_decision_response(db, direction)
-                             if condition == "needs_you" and direction else None)
+        if condition == "needs_you" and direction:
+            safe_direction = await present_decision_response(db, direction)
+            pending_direction = (await attach_decision_references(
+                db, project_id=goal.project_id, decisions=[direction], responses=[safe_direction],
+            ))[0]
         supervision = OrchestrationSupervisionResponse(
             condition=condition, operation=operation, next_action=next_action, rationale=rationale,
             criterion=criterion, verified_progress=verified_progress, useful_learning=[],
@@ -781,6 +793,34 @@ async def _detail(
              "condition": service.run_condition(goal, run)}
         )
 
+    commitments = await meeting_commitments(db, run) if run is not None else []
+    open_commitments = [item for item in commitments if not item["fulfilled"]]
+    reference_requests = [NeedsYouReferenceRequest("goal", goal.id, goal.id)]
+    if direction is not None:
+        if direction.source_process_run_id is not None:
+            reference_requests.append(NeedsYouReferenceRequest("process", direction.source_process_run_id, goal.id))
+        if direction.related_gate_id is not None:
+            reference_requests.append(NeedsYouReferenceRequest("gate", direction.related_gate_id, goal.id))
+        if direction.related_action_id is not None:
+            reference_requests.append(NeedsYouReferenceRequest("action", direction.related_action_id, goal.id))
+        if direction.authority_agent_id is not None:
+            reference_requests.append(NeedsYouReferenceRequest("agent", direction.authority_agent_id, goal.id))
+    if run is not None:
+        reference_requests.extend(typed_blocker_reference_requests(run.active_blockers or [], goal_id=goal.id))
+        reference_requests.extend(
+            NeedsYouReferenceRequest("gate", gate.id, goal.id) for gate in gate_models if gate.status == "failed"
+        )
+        reference_requests.extend(
+            NeedsYouReferenceRequest("action", action.id, goal.id) for action in actions if action.status == "failed"
+        )
+        for item in open_commitments:
+            reference_requests.append(NeedsYouReferenceRequest("meeting", uuid.UUID(item["meeting_id"]), goal.id))
+            if item["task_id"] is not None:
+                reference_requests.append(NeedsYouReferenceRequest("task", uuid.UUID(item["task_id"]), goal.id))
+    needs_you_references = await resolve_needs_you_references(
+        db, project_id=goal.project_id, requests=reference_requests,
+    )
+
     return OrchestrationGoalDetailResponse(
         goal=OrchestrationGoalResponse.model_validate(goal),
         run=run_response,
@@ -805,8 +845,7 @@ async def _detail(
         task_reports=_task_reports(actions),
         meeting_commitments=[
             OrchestrationMeetingCommitmentResponse.model_validate(item)
-            for item in await meeting_commitments(db, run)
-            if not item["fulfilled"]
+            for item in open_commitments
         ] if run is not None else [],
         plan=await _plan_view(db, goal, run, version) if run is not None else None,
         effective_authorization=(
@@ -818,6 +857,7 @@ async def _detail(
             if run is not None and (wait := await queued_authorization_wait(db, goal, run)) else None
         ),
         capacity_wait=await queued_capacity_wait(db, goal, run) if run is not None else None,
+        needs_you_references=needs_you_references,
     )
 
 

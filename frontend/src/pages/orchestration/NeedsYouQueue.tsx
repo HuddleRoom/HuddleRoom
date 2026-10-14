@@ -4,7 +4,6 @@ import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { useUpdateActionItem } from '@/api/meetings'
 import { Button, Textarea } from '@/components/common/uiPrimitives'
-import { ErrorRecord } from '@/components/common/ErrorRecord'
 import { STATUS_COLORS } from '@/lib/statusColors'
 import type {
   OrchestrationAuthorityDecisionRecord,
@@ -16,13 +15,25 @@ import type {
   OrchestrationProcessRunRecord,
   OrchestrationRun,
   OrchestrationWarningRecord,
+  NeedsYouReference,
   RecoveryProposalStatus,
 } from '@/lib/types'
-import { BASELINE_PROCESS_TYPES, stepActivityVerb, stepDisplayLabel, warningMessage, warningSeverityLabel, warningTypeLabel } from './humanize'
+import { BASELINE_PROCESS_TYPES, stepActivityVerb, stepDisplayLabel, warningMessage } from './humanize'
 import { RetryControl } from './ProcessFocus'
 import { decisionOptionKey, isManagerSelectionDecision, normalizeDecisionOption, parseManagerComparison, type BaselineFocusAction } from './BaselineDashboard'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { useGoalAnnouncer } from './goalAnnouncer'
+import {
+  compareQueueOccurrences,
+  needsYouReferencePath,
+  presentNeedsYouRow,
+  queueOccurrence,
+  safeNeedsYouText,
+  validateNeedsYouEdit,
+  type NeedsYouEditSnapshot,
+  type NeedsYouSourceTarget,
+  type QueueRow,
+} from './needsYouPresentation'
 
 // Debounce window for the net-queue-change announcer (spec: motion item 5) —
 // coalesces a burst of individual row resolutions/arrivals (e.g. a batch
@@ -45,26 +56,19 @@ function staleInputsProcessType(warningType: string): OrchestrationBaselineProce
   return isBaselineProcessType(processType) ? processType : null
 }
 
-type QueueRow =
-  | { kind: 'blocker'; key: string; blocker: OrchestrationBlocker }
-  | { kind: 'lm-retry'; key: string; process: OrchestrationProcessRunRecord; message: string }
-  | { kind: 'answer'; key: string; decision: OrchestrationAuthorityDecisionRecord; process: OrchestrationProcessRunRecord | undefined }
-  | { kind: 'answer-batch'; key: string; decisions: OrchestrationAuthorityDecisionRecord[]; process: OrchestrationProcessRunRecord | undefined }
-  | { kind: 'goal-definition-questions'; key: string; decisions: OrchestrationAuthorityDecisionRecord[]; process: OrchestrationProcessRunRecord | undefined }
-  | { kind: 'recovery-proposal'; key: string; decision: OrchestrationAuthorityDecisionRecord }
-  | { kind: 'gate'; key: string; gate: OrchestrationGate; description: string | undefined }
-  | { kind: 'meeting-commitment'; key: string; commitment: OrchestrationMeetingCommitment }
-  | { kind: 'warning'; key: string; warning: OrchestrationWarningRecord; process: OrchestrationProcessRunRecord | undefined; canAcknowledge: boolean }
-
 function agentDefinitionReviewBatchDecisions(
   processId: string,
   checkpointItems: readonly OrchestrationAuthorityDecisionRecord[],
+  allDecisions: readonly OrchestrationAuthorityDecisionRecord[],
   processesById: Map<string, OrchestrationProcessRunRecord>,
 ) {
   if (processesById.get(processId)?.process_type !== 'agent_definition_review') return null
   const forProcess = checkpointItems.filter((item) => item.source_process_run_id === processId)
   if (forProcess.length === 0) return null
-  return forProcess.every((item) => item.decision_key.startsWith('agent_definition_review:proposal:')) ? forProcess : null
+  if (!forProcess.every((item) => item.decision_key.startsWith('agent_definition_review:proposal:'))) return null
+  const pendingIds = new Set(forProcess.map((item) => item.id))
+  const ordered = allDecisions.filter((item) => pendingIds.has(item.id))
+  return [...ordered, ...forProcess.filter((item) => !ordered.some((candidate) => candidate.id === item.id))]
 }
 
 // Goal-definition's adaptive clarification questions (backend key format
@@ -77,11 +81,20 @@ function agentDefinitionReviewBatchDecisions(
 function goalDefinitionQuestionDecisions(
   processId: string,
   checkpointItems: readonly OrchestrationAuthorityDecisionRecord[],
+  allDecisions: readonly OrchestrationAuthorityDecisionRecord[],
   processesById: Map<string, OrchestrationProcessRunRecord>,
 ) {
   if (processesById.get(processId)?.process_type !== 'goal_definition') return null
   const forProcess = checkpointItems.filter((item) => item.source_process_run_id === processId && item.decision_key.startsWith('goal_definition:adaptive:'))
-  return forProcess.length > 0 ? forProcess : null
+  if (forProcess.length === 0) return null
+  const round = /^goal_definition:adaptive:([^:]+):/.exec(forProcess[0].decision_key)?.[1]
+  const pendingIds = new Set(forProcess.map((item) => item.id))
+  const ordered = round
+    ? allDecisions.filter((item) => item.source_process_run_id === processId
+      && item.decision_key.startsWith(`goal_definition:adaptive:${round}:`)
+      && pendingIds.has(item.id))
+    : []
+  return [...ordered, ...forProcess.filter((item) => !ordered.some((candidate) => candidate.id === item.id))]
 }
 
 // Newest recovery decision per source blocker, minus resolved ones.
@@ -107,6 +120,7 @@ export function buildQueueRows({
   run,
   processes,
   checkpointItems,
+  allDecisions = [],
   recoveryDecisions = [],
   gates,
   warnings,
@@ -116,17 +130,19 @@ export function buildQueueRows({
   run: OrchestrationRun | null
   processes: readonly OrchestrationProcessRunRecord[]
   checkpointItems: readonly OrchestrationAuthorityDecisionRecord[]
+  allDecisions?: readonly OrchestrationAuthorityDecisionRecord[]
   recoveryDecisions?: readonly OrchestrationAuthorityDecisionRecord[]
   gates: readonly OrchestrationGate[]
   warnings: readonly OrchestrationWarningRecord[]
   meetingCommitments?: readonly OrchestrationMeetingCommitment[]
   criteriaByKey: Map<string, string | undefined>
 }): QueueRow[] {
+  const decisionHistory = allDecisions.length > 0 ? allDecisions : checkpointItems
   const processesById = new Map(processes.map((process) => [process.id, process] as const))
   const rows: QueueRow[] = []
 
-  ;(run?.active_blockers ?? []).forEach((blocker, index) => {
-    rows.push({ kind: 'blocker', key: `blocker:${index}:${blocker.kind ?? 'unknown'}`, blocker })
+  ;(run?.active_blockers ?? []).forEach((blocker) => {
+    rows.push({ kind: 'blocker', key: '', blocker })
   })
 
   const lmRetryProcesses = processes.filter((process) => process.status === 'running' && process.outputs.lm_retry?.available === true)
@@ -141,8 +157,9 @@ export function buildQueueRows({
       // across retries — process.id alone can't tell a resolved failure from a
       // fresh one), so justResolvedIds doesn't permanently hide a later failure
       // on the same process.
-      key: `lm-retry:${process.id}:${process.updated_at}`,
+      key: '',
       process,
+      warning: linkedWarning,
       message: linkedWarning ? warningMessage(linkedWarning.message) : 'The last language model request failed and can be retried.',
     })
   }
@@ -158,25 +175,23 @@ export function buildQueueRows({
       continue
     }
     const processId = item.source_process_run_id
-    const questions = processId ? goalDefinitionQuestionDecisions(processId, checkpointItems, processesById) : null
+    const questions = processId ? goalDefinitionQuestionDecisions(processId, checkpointItems, decisionHistory, processesById) : null
     if (questions) {
       for (const decision of questions) handledDecisionIds.add(decision.id)
       // Sorted decision ids scope the key to this exact set of pending
       // questions, so a later round (a disjoint id set once every question
       // in this round is answered) mounts a fresh card instead of reusing
       // stale local step-through state.
-      const instanceKey = questions.map((decision) => decision.id).sort().join(',')
-      rows.push({ kind: 'goal-definition-questions', key: `goal-definition-questions:${processId}:${instanceKey}`, decisions: questions, process: processesById.get(processId!) })
+      rows.push({ kind: 'goal-definition-questions', key: '', decisions: questions, process: processesById.get(processId!) })
       continue
     }
-    const batch = processId ? agentDefinitionReviewBatchDecisions(processId, checkpointItems, processesById) : null
+    const batch = processId ? agentDefinitionReviewBatchDecisions(processId, checkpointItems, decisionHistory, processesById) : null
     if (batch) {
       for (const decision of batch) handledDecisionIds.add(decision.id)
       // Decision ids (not just processId) scope the key to this specific batch
       // instance, so a fresh set of proposals for the same process isn't hidden
       // by a stale justResolvedIds entry from an earlier, already-submitted batch.
-      const instanceKey = batch.map((decision) => decision.id).sort().join(',')
-      rows.push({ kind: 'answer-batch', key: `answer-batch:${processId}:${instanceKey}`, decisions: batch, process: processesById.get(processId!) })
+      rows.push({ kind: 'answer-batch', key: '', decisions: batch, process: processesById.get(processId!) })
       continue
     }
     handledDecisionIds.add(item.id)
@@ -205,7 +220,11 @@ export function buildQueueRows({
     })
   }
 
-  return rows
+  for (const row of rows) row.key = queueOccurrence(row, decisionHistory).key
+  return rows.sort((left, right) => compareQueueOccurrences(
+    queueOccurrence(left, decisionHistory),
+    queueOccurrence(right, decisionHistory),
+  ))
 }
 
 function lowerFirst(text: string) {
@@ -248,10 +267,16 @@ export interface NeedsYouQueueProps {
   goal: OrchestrationGoal
   run: OrchestrationRun | null
   processes: readonly OrchestrationProcessRunRecord[]
+  sourceProcesses?: readonly OrchestrationProcessRunRecord[]
   warnings: readonly OrchestrationWarningRecord[]
   gates: readonly OrchestrationGate[]
   meetingCommitments?: readonly OrchestrationMeetingCommitment[]
   checkpointItems: readonly OrchestrationAuthorityDecisionRecord[]
+  allDecisions?: readonly OrchestrationAuthorityDecisionRecord[]
+  authorityReady?: boolean
+  invalidatedDecisions?: Readonly<Record<string, 'terminal' | 'stale' | 'unavailable'>>
+  needsYouReferences?: readonly NeedsYouReference[]
+  sourceActionIds?: readonly string[]
   // Every decision of the goal (any status); the source of non-pending
   // recovery proposals shown as FIX PROPOSAL cards.
   recoveryDecisions?: readonly OrchestrationAuthorityDecisionRecord[]
@@ -276,12 +301,13 @@ export interface NeedsYouQueueProps {
   isWorking: boolean
   mutationBusy: boolean
   onSelectProcess: (type: OrchestrationBaselineProcessType) => void
+  onRevealSource?: (target: NeedsYouSourceTarget) => void
   openAction: BaselineFocusAction | null
   onOpenAction: (action: BaselineFocusAction) => void
   onActionTrigger: (action: BaselineFocusAction, element: HTMLButtonElement | null) => void
-  renderActionForm: (action: BaselineFocusAction, record: OrchestrationAuthorityDecisionRecord | OrchestrationWarningRecord, onSuccessFocus?: () => void) => ReactNode
-  renderAgentDefinitionReviewBatch: (decisions: readonly OrchestrationAuthorityDecisionRecord[], onSuccessFocus?: () => void) => ReactNode
-  renderTeamHierarchyProposal: (decision: OrchestrationAuthorityDecisionRecord, onSuccess: () => void, registerPrimary: (element: HTMLButtonElement | null) => void) => ReactNode
+  renderActionForm: (action: BaselineFocusAction, record: OrchestrationAuthorityDecisionRecord | OrchestrationWarningRecord, onSuccessFocus?: () => void, displayQuestion?: string, displayReferences?: readonly NeedsYouReference[], editState?: 'current' | 'terminal' | 'stale' | 'unavailable', onReleaseEdit?: () => void, formKey?: string) => ReactNode
+  renderAgentDefinitionReviewBatch: (decisions: readonly OrchestrationAuthorityDecisionRecord[], onSuccessFocus: (() => void) | undefined, batchKey: string, displayReferences: readonly NeedsYouReference[], editState?: 'current' | 'terminal' | 'stale' | 'unavailable') => ReactNode
+  renderTeamHierarchyProposal: (decision: OrchestrationAuthorityDecisionRecord, onSuccess: () => void, registerPrimary: (element: HTMLButtonElement | null) => void, displayReferences: readonly NeedsYouReference[], editState?: 'current' | 'terminal' | 'stale' | 'unavailable', formKey?: string, onReleaseEdit?: () => boolean, onBeginEdit?: () => void) => ReactNode
   // Accept-recommendation fast path (spec C): submits decision.recommendation
   // immediately with no form and no reason. Only offered when the decision
   // carries a non-null recommendation; "Choose differently…" still opens
@@ -310,7 +336,57 @@ export interface NeedsYouQueueProps {
   // Owned by the page (see BaselineDashboardProps); absent for other blocker
   // kinds, which stay reference-only (no recovery UI exists for them yet).
   renderBlockerRecovery?: (blocker: OrchestrationBlocker, register: (element: HTMLButtonElement | null) => void, onSuccessFocus?: () => void) => ReactNode
+  onReleaseRetainedEdit?: (decisionIds: readonly string[], mode: 'dismiss' | 'review') => void
   suppressAnnouncement?: boolean
+}
+
+type RetainedQueueEdit = {
+  row: QueueRow
+  snapshot: NeedsYouEditSnapshot
+  activeDecisionId: string
+  reviewEpoch: number
+}
+
+function decisionsForRow(row: QueueRow): readonly OrchestrationAuthorityDecisionRecord[] {
+  if (row.kind === 'answer' || row.kind === 'recovery-proposal') return [row.decision]
+  if (row.kind === 'answer-batch' || row.kind === 'goal-definition-questions') return row.decisions
+  return []
+}
+
+function frozenEdit(row: QueueRow): RetainedQueueEdit | null {
+  const decisions = decisionsForRow(row)
+  if (decisions.length === 0) return null
+  const frozenRow = structuredClone(row)
+  const frozenDecisions = decisionsForRow(frozenRow)
+  return {
+    row: frozenRow,
+    snapshot: { rowKey: row.key, decisionIds: frozenDecisions.map((decision) => decision.id), decisions: frozenDecisions },
+    activeDecisionId: frozenDecisions[0].id,
+    reviewEpoch: 0,
+  }
+}
+
+function hasInlineDecisionForm(row: QueueRow) {
+  return row.kind === 'answer-batch'
+    || row.kind === 'goal-definition-questions'
+    || row.kind === 'recovery-proposal'
+    || row.kind === 'answer' && row.decision.decision_key.startsWith('team_hierarchy:agent:')
+}
+
+type FormAncestorNode = {
+  tagName?: string
+  parentElement?: FormAncestorNode | null
+  parentNode?: FormAncestorNode | null
+}
+
+function targetIsInsideForm(target: EventTarget | null, boundary: EventTarget | null) {
+  let node = target as FormAncestorNode | null
+  const boundaryNode = boundary as FormAncestorNode | null
+  while (node && node !== boundaryNode) {
+    if (node.tagName === 'FORM') return true
+    node = node.parentElement ?? node.parentNode ?? null
+  }
+  return false
 }
 
 const EYEBROW: Record<QueueRow['kind'], { text: string; color: string; icon: typeof Ban }> = {
@@ -323,6 +399,69 @@ const EYEBROW: Record<QueueRow['kind'], { text: string; color: string; icon: typ
   gate: { text: 'GATE FAILED', color: STATUS_COLORS.red, icon: ShieldAlert },
   'meeting-commitment': { text: 'MEETING ITEM', color: STATUS_COLORS.amber, icon: HelpCircle },
   warning: { text: 'WARNING', color: STATUS_COLORS.amber, icon: AlertTriangle },
+}
+
+function NeedsYouDetails({ details }: { details: string }) {
+  return <details className="mt-2">
+    <summary className="inline-flex min-h-11 cursor-pointer items-center text-xs font-medium text-huddleroom-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-huddleroom-primary">Details</summary>
+    <pre tabIndex={0} role="region" aria-label="Needs-you source details" className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-huddleroom-border p-3 font-mono text-xs">{details}</pre>
+  </details>
+}
+
+function NamedReferences({
+  references, activeProjectId, activeGoalId, gates, processes, sourceActionIds, onRevealSource,
+}: {
+  references: readonly NeedsYouReference[]
+  activeProjectId: string
+  activeGoalId: string
+  gates: readonly OrchestrationGate[]
+  processes: readonly OrchestrationProcessRunRecord[]
+  sourceActionIds: readonly string[]
+  onRevealSource?: (target: NeedsYouSourceTarget) => void
+}) {
+  const controls = references.flatMap((reference) => {
+    if (reference.label === null || reference.project_id !== activeProjectId) return []
+    const path = needsYouReferencePath(reference, activeProjectId)
+    if (path) return [<Link key={`${reference.kind}:${reference.id}`} to={path} className="inline-flex min-h-11 min-w-0 max-w-full items-center break-words [overflow-wrap:anywhere] text-xs font-medium text-huddleroom-primary hover:underline">{reference.label}</Link>]
+    if (!onRevealSource || reference.goal_id !== activeGoalId) return []
+    const available = reference.kind === 'gate'
+      ? gates.some((gate) => gate.id === reference.id)
+      : reference.kind === 'process'
+        ? processes.some((process) => process.id === reference.id)
+        : reference.kind === 'action' && sourceActionIds.includes(reference.id)
+    if (!available || (reference.kind !== 'gate' && reference.kind !== 'process' && reference.kind !== 'action')) return []
+    const target: NeedsYouSourceTarget = { kind: reference.kind, id: reference.id, goalId: reference.goal_id }
+    return [<button key={`${reference.kind}:${reference.id}`} type="button" className="inline-flex min-h-11 min-w-0 max-w-full items-center break-words [overflow-wrap:anywhere] text-left text-xs font-medium text-huddleroom-primary underline-offset-2 hover:underline" onClick={() => onRevealSource(target)}>{reference.label}</button>]
+  })
+  return controls.length > 0 ? <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1" aria-label="Related records">{controls}</div> : null
+}
+
+function referencesForRow(row: QueueRow, references: readonly NeedsYouReference[]) {
+  const ids = new Set<string>()
+  if (row.kind === 'blocker') {
+    if (typeof row.blocker.task_id === 'string') ids.add(row.blocker.task_id)
+    if (typeof row.blocker.gate_id === 'string') ids.add(row.blocker.gate_id)
+  } else if (row.kind === 'gate') ids.add(row.gate.id)
+  else if (row.kind === 'meeting-commitment') {
+    ids.add(row.commitment.meeting_id)
+    if (row.commitment.task_id) ids.add(row.commitment.task_id)
+  } else if (row.kind === 'lm-retry') {
+    ids.add(row.process.id)
+    if (row.warning) ids.add(row.warning.id)
+  } else if (row.kind === 'warning') {
+    for (const id of [row.warning.source_process_run_id, row.warning.related_gate_id, row.warning.related_action_id, row.warning.related_agent_id]) {
+      if (id) ids.add(id)
+    }
+  } else {
+    const decisions = row.kind === 'answer' || row.kind === 'recovery-proposal' ? [row.decision] : row.decisions
+    for (const decision of decisions) {
+      for (const id of [decision.source_process_run_id, decision.related_gate_id, decision.related_action_id, decision.authority_agent_id]) {
+        if (id) ids.add(id)
+      }
+      for (const reference of decision.needs_you_references ?? []) ids.add(reference.id)
+    }
+  }
+  return references.filter((reference) => ids.has(reference.id))
 }
 
 // Short label for a decision's recommended option, used by the accept-
@@ -351,18 +490,29 @@ function parseAdaptiveQuestionContext(context: string | null) {
 // reconcile a changing question set mid-round.
 function GoalDefinitionQuestionCard({
   decisions,
+  activeDecisionId,
   mutationBusy,
+  reviewLocked = false,
   onAnswer,
   onAllAnswered,
+  onActiveDecisionChange,
+  displayReferences,
 }: {
   decisions: readonly OrchestrationAuthorityDecisionRecord[]
+  activeDecisionId?: string
   mutationBusy: boolean
+  reviewLocked?: boolean
   onAnswer: NeedsYouQueueProps['onAnswerGoalDefinitionQuestion']
   onAllAnswered: () => void
+  onActiveDecisionChange?: (decisionId: string) => void
+  displayReferences: readonly NeedsYouReference[]
 }) {
   const [order] = useState(() => decisions.map((decision) => decision.id))
-  const [answeredCount, setAnsweredCount] = useState(0)
-  const [value, setValue] = useState('')
+  const [answeredCount, setAnsweredCount] = useState(() => {
+    const activeIndex = activeDecisionId ? decisions.findIndex((decision) => decision.id === activeDecisionId) : 0
+    return activeIndex >= 0 ? activeIndex : 0
+  })
+  const [values, setValues] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -378,33 +528,39 @@ function GoalDefinitionQuestionCard({
   // Guards a stale/out-of-range index (e.g. the decisions prop shrank
   // unexpectedly) instead of crashing — Z4/queue cards must never throw.
   if (!current) return null
+  const value = values[currentId] ?? ''
   const isLast = answeredCount === total - 1
   const { rationale, destination } = parseAdaptiveQuestionContext(current.context)
+  const displayedQuestion = safeNeedsYouText(current.question, displayReferences)
+  const displayedRationale = rationale ? safeNeedsYouText(rationale, displayReferences) : null
+  const displayedDestination = destination ? safeNeedsYouText(destination, displayReferences) : null
   const disabled = mutationBusy || submitting
   const canSubmit = value.trim().length > 0
 
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (!canSubmit || disabled) return
+    if (!canSubmit || disabled || reviewLocked) return
     setSubmitting(true)
     setError(null)
     onAnswer(current!, value.trim(), {
       onSuccess: () => {
-        setValue('')
         if (isLast) onAllAnswered()
-        else setAnsweredCount((count) => count + 1)
+        else {
+          onActiveDecisionChange?.(order[answeredCount + 1])
+          setAnsweredCount((count) => count + 1)
+        }
       },
       onError: (submitError) => setError(submitError instanceof Error ? submitError.message : 'The request failed. Check your connection and try again.'),
       onSettled: () => setSubmitting(false),
     })
   }
 
-  return <form onSubmit={submit} aria-busy={submitting}>
+  return <form onSubmit={submit} aria-busy={submitting} aria-disabled={reviewLocked || undefined}>
     <p className="text-xs font-medium text-huddleroom-text-muted">Question {answeredCount + 1} of {total}</p>
-    <p className="mt-1 text-sm font-medium text-huddleroom-text-primary">{current.question}</p>
-    {rationale && <p className="mt-1 text-xs text-huddleroom-text-secondary">{rationale}</p>}
-    {destination && <p className="mt-1 text-xs text-huddleroom-text-muted">→ {destination}</p>}
-    <Textarea ref={textareaRef} label="Answer" value={value} onChange={(event) => setValue(event.target.value)} rows={3} disabled={disabled} />
+    <p className="mt-1 text-sm font-medium text-huddleroom-text-primary">{displayedQuestion}</p>
+    {displayedRationale && <p className="mt-1 text-xs text-huddleroom-text-secondary">{displayedRationale}</p>}
+    {displayedDestination && <p className="mt-1 text-xs text-huddleroom-text-muted">→ {displayedDestination}</p>}
+    <Textarea ref={textareaRef} label="Answer" value={value} readOnly={reviewLocked} onChange={(event) => setValues((currentValues) => ({ ...currentValues, [currentId]: event.target.value }))} rows={3} disabled={disabled} />
     <div className="mt-1 flex gap-1" aria-hidden="true">
       {order.map((id, index) => (
         <span key={id} className={`h-1.5 w-1.5 rounded-full ${index === answeredCount ? 'bg-huddleroom-primary' : 'bg-huddleroom-border'}`} />
@@ -412,7 +568,7 @@ function GoalDefinitionQuestionCard({
     </div>
     {error && <p className="mt-2 text-xs text-huddleroom-status-red">{error}</p>}
     <div className="mt-3 flex justify-end">
-      <Button type="submit" className="min-h-11" disabled={disabled || !canSubmit}>{submitting ? 'Submitting…' : isLast ? 'Submit' : 'Next'}</Button>
+      <Button type="submit" className="min-h-11" disabled={disabled || reviewLocked || !canSubmit}>{submitting ? 'Submitting…' : isLast ? 'Submit' : 'Next'}</Button>
     </div>
   </form>
 }
@@ -438,18 +594,24 @@ function isPendingGap(decision: OrchestrationAuthorityDecisionRecord) {
 // Simple FIX PROPOSAL card: Problem / Proposed updates / After approval, all
 // server-supplied; one Approve fix or a Reject with required reason.
 function RecoveryProposalCard({
-  decision, mutationBusy, onAnswer, registerPrimary, onLeftQueue,
+  decision, mutationBusy, reviewLocked = false, accepted = false, onAnswer, registerPrimary, onAccepted, onBeginEdit, onCancel, onLeftQueue, displayReferences,
 }: {
   decision: OrchestrationAuthorityDecisionRecord
   mutationBusy: boolean
+  reviewLocked?: boolean
+  accepted?: boolean
   onAnswer: NeedsYouQueueProps['onAnswerRecoveryProposal']
   registerPrimary: (element: HTMLButtonElement | null) => void
+  onAccepted: () => void
+  onBeginEdit: () => void
+  onCancel: () => boolean
   onLeftQueue: (quiet: boolean) => void
+  displayReferences: readonly NeedsYouReference[]
 }) {
   const recovery = decision.recovery!
   const { status } = recovery
   const [busy, setBusy] = useState(false)
-  const [answered, setAnswered] = useState(false)
+  const [answered, setAnswered] = useState(accepted)
   const [rejecting, setRejecting] = useState(false)
   const [reason, setReason] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -457,7 +619,7 @@ function RecoveryProposalCard({
   const rejectRef = useRef<HTMLButtonElement>(null)
   const reasonRef = useRef<HTMLTextAreaElement>(null)
   const inFlight = useRef(false)
-  const answeredRef = useRef(false)
+  const answeredRef = useRef(accepted)
   const leftRef = useRef(onLeftQueue)
   leftRef.current = onLeftQueue
   const gapRef = useRef(false)
@@ -472,6 +634,11 @@ function RecoveryProposalCard({
   const disabled = mutationBusy || busy || (answered && (pending || pendingGap))
 
   useEffect(() => { if (rejecting) reasonRef.current?.focus() }, [rejecting])
+  useEffect(() => {
+    if (!accepted) return
+    answeredRef.current = true
+    setAnswered(true)
+  }, [accepted])
   useEffect(() => { if (error) announceError(error) }, [error, announceError])
   // The card stays after approve (applying/verifying/retrying): keep focus on it.
   useEffect(() => { if (answered && !pending) headingRef.current?.focus() }, [answered, pending])
@@ -485,12 +652,12 @@ function RecoveryProposalCard({
   }, [])
 
   function submit(option: RecoveryAnswerOption, text: string) {
-    if (disabled || inFlight.current || !onAnswer) { if (disabled) headingRef.current?.focus(); return }
+    if (disabled || reviewLocked || inFlight.current || !onAnswer) { if (disabled || reviewLocked) headingRef.current?.focus(); return }
     inFlight.current = true
     setBusy(true)
     setError(null)
     onAnswer(decision, option, text, {
-      onSuccess: () => { answeredRef.current = true; setAnswered(true) },
+      onSuccess: () => { answeredRef.current = true; setAnswered(true); onAccepted() },
       onError: (submitError) => setError(submitError instanceof Error ? submitError.message : 'The request failed. Check your connection and try again.'),
       onSettled: () => { inFlight.current = false; setBusy(false) },
     })
@@ -499,6 +666,10 @@ function RecoveryProposalCard({
   const copy = pendingGap && answered ? 'Marked as provided. Re-diagnosing the blocker…' : RECOVERY_STATUS_COPY[status]
   const showAfter = pending || pendingGap || status === 'applying' || status === 'verifying' || status === 'retrying'
   const detail = status === 'rejected' ? decision.reason : status === 'failed' ? recovery.error : null
+  const displayedDetail = detail ? safeNeedsYouText(detail, displayReferences) : null
+  const displayedProblem = safeNeedsYouText(recovery.problem, displayReferences)
+  const displayedUpdates = recovery.general_updates.map((update) => safeNeedsYouText(update, displayReferences))
+  const displayedAfter = safeNeedsYouText(recovery.after_approval, displayReferences)
   const hasEvidence = (recovery.evidence?.length ?? 0) > 0
   const details = recovery.exact_details !== null || hasEvidence
     ? JSON.stringify({ ...(recovery.exact_details !== null && { exact_details: recovery.exact_details }), ...(hasEvidence && { evidence: recovery.evidence }) }, null, 2)
@@ -510,12 +681,12 @@ function RecoveryProposalCard({
       <h3 ref={headingRef} tabIndex={-1} className="text-xs font-semibold uppercase tracking-[0.1em]" style={{ color: STATUS_COLORS.amber }}>{pendingGap ? 'CAPABILITY NEEDED' : 'FIX PROPOSAL'}</h3>
     </div>
     <div className="mt-2 flex flex-col gap-3 text-sm text-huddleroom-text-primary">
-      <section className="flex flex-col gap-1"><h4 className={RECOVERY_LABEL_CLASS}>Problem</h4><p id={`${idBase}-problem`}>{recovery.problem}</p></section>
+      <section className="flex flex-col gap-1"><h4 className={RECOVERY_LABEL_CLASS}>Problem</h4><p id={`${idBase}-problem`}>{displayedProblem}</p></section>
       {!pendingGap && recovery.general_updates.length > 0 && <section className="flex flex-col gap-1">
         <h4 className={RECOVERY_LABEL_CLASS}>Proposed updates</h4>
-        <ul className="flex list-disc flex-col gap-1 pl-5">{recovery.general_updates.map((update, index) => <li key={index}>{update}</li>)}</ul>
+        <ul className="flex list-disc flex-col gap-1 pl-5">{displayedUpdates.map((update, index) => <li key={index}>{update}</li>)}</ul>
       </section>}
-      {showAfter && <section className="flex flex-col gap-1"><h4 className={RECOVERY_LABEL_CLASS}>{pendingGap ? "After you've provided it" : 'After approval'}</h4><p id={`${idBase}-after`}>{recovery.after_approval}</p></section>}
+      {showAfter && <section className="flex flex-col gap-1"><h4 className={RECOVERY_LABEL_CLASS}>{pendingGap ? "After you've provided it" : 'After approval'}</h4><p id={`${idBase}-after`}>{displayedAfter}</p></section>}
       {recovery.global_effect && <p role="note" className="flex items-start gap-2 text-sm text-huddleroom-text-primary">
         <ShieldAlert aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: STATUS_COLORS.amber }} />
         This affects the global agent roster, so it applies to every project and goal.
@@ -525,23 +696,23 @@ function RecoveryProposalCard({
         <pre tabIndex={0} role="region" aria-label="Exact details" className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-huddleroom-border p-3 font-mono text-xs">{details}</pre>
       </details>}
       <div role="status" aria-live="polite" aria-atomic="true" className={copy ? 'text-sm text-huddleroom-text-secondary' : 'sr-only'}>
-        {copy}{status === 'rejected' && detail ? ` ${detail}` : ''}
-        {status === 'failed' && detail && <p className="mt-1 text-huddleroom-status-red">{detail}</p>}
+        {copy}{status === 'rejected' && displayedDetail ? ` ${displayedDetail}` : ''}
+        {status === 'failed' && displayedDetail && <p className="mt-1 text-huddleroom-status-red">{displayedDetail}</p>}
       </div>
     </div>
     {pendingGap && <div className="mt-3 flex flex-wrap justify-end gap-3">
-      <Button ref={registerPrimary} type="button" variant="secondary" className="min-h-11 min-w-11" disabled={disabled} aria-describedby={`${idBase}-problem ${idBase}-after`} onClick={() => submit('capability_provided', '')}>I've provided it</Button>
+      <Button ref={registerPrimary} data-needs-you-primary type="button" variant="secondary" className="min-h-11 min-w-11" disabled={disabled || reviewLocked} aria-describedby={`${idBase}-problem ${idBase}-after`} onClick={() => submit('capability_provided', '')}>I've provided it</Button>
     </div>}
     {pending && <>
       <div className="mt-3 flex flex-wrap justify-end gap-3">
-        <Button ref={registerPrimary} type="button" className="min-h-11 min-w-11" disabled={disabled} onClick={() => submit('approve_fix', '')}>Approve fix</Button>
-        <Button ref={rejectRef} type="button" variant="secondary" className="min-h-11 min-w-11" disabled={disabled} onClick={() => setRejecting(true)}>Reject</Button>
+        <Button ref={registerPrimary} data-needs-you-primary type="button" className="min-h-11 min-w-11" disabled={disabled || reviewLocked} onClick={() => submit('approve_fix', '')}>Approve fix</Button>
+        <Button ref={rejectRef} type="button" variant="secondary" className="min-h-11 min-w-11" disabled={disabled || reviewLocked} onClick={() => { onBeginEdit(); setRejecting(true) }}>Reject</Button>
       </div>
       {rejecting && <form className="mt-3 flex flex-col gap-3" onSubmit={(event) => { event.preventDefault(); if (reason.trim()) submit('reject', reason.trim()) }}>
-        <Textarea ref={reasonRef} label="Reason" aria-required="true" value={reason} onChange={(event) => setReason(event.target.value)} rows={3} disabled={disabled} />
+        <Textarea ref={reasonRef} label="Reason" aria-required="true" value={reason} readOnly={reviewLocked} onChange={(event) => setReason(event.target.value)} rows={3} disabled={disabled} />
         <div className="flex flex-wrap justify-end gap-3">
-          <Button type="submit" className="min-h-11 min-w-11" disabled={disabled || !reason.trim()}>Confirm reject</Button>
-          <Button type="button" variant="secondary" className="min-h-11 min-w-11" disabled={disabled} onClick={() => { setRejecting(false); rejectRef.current?.focus() }}>Cancel</Button>
+          <Button type="submit" className="min-h-11 min-w-11" disabled={disabled || reviewLocked || !reason.trim()}>Confirm reject</Button>
+          <Button type="button" variant="secondary" className="min-h-11 min-w-11" disabled={disabled} onClick={() => { setRejecting(false); setReason(''); if (!onCancel()) queueMicrotask(() => rejectRef.current?.focus()) }}>Cancel</Button>
         </div>
       </form>}
     </>}
@@ -565,12 +736,17 @@ const COMMITMENT_STATES: Record<string, string> = {
   done_unverified: 'Linked task done — awaiting verification',
 }
 
-function MeetingCommitmentRow({ commitment, projectId, mutationBusy, registerPrimary, onRemoved }: {
+function MeetingCommitmentRow({ commitment, projectId, mutationBusy, registerPrimary, onRemoved, title, explanation, nextStep, details, relatedRecords }: {
   commitment: OrchestrationMeetingCommitment
   projectId: string
   mutationBusy: boolean
   registerPrimary: (element: HTMLButtonElement | null) => void
   onRemoved: () => void
+  title: string
+  explanation: string
+  nextStep: string
+  details: string
+  relatedRecords: ReactNode
 }) {
   const update = useUpdateActionItem(projectId, commitment.meeting_id)
   const [expanded, setExpanded] = useState(false)
@@ -626,9 +802,13 @@ function MeetingCommitmentRow({ commitment, projectId, mutationBusy, registerPri
       <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 sm:flex-nowrap">
         <p className="w-[104px] shrink-0 text-label font-semibold uppercase tracking-[0.1em]" style={{ color: STATUS_COLORS.amber }}>MEETING ITEM</p>
         <div className="min-w-0 flex-1">
-          <p className="text-sm text-huddleroom-text-primary">{commitment.description}</p>
-          <Link to={`/meetings/${commitment.meeting_id}`} className="inline-flex min-h-11 items-center text-xs font-medium text-huddleroom-primary hover:underline">{commitment.meeting_title}</Link>
+          <h3 className="break-words text-sm font-medium text-huddleroom-text-primary">{title}</h3>
+          {explanation !== title && <p className="mt-1 break-words text-sm text-huddleroom-text-secondary">{explanation}</p>}
+          <p className="mt-1 text-xs text-huddleroom-text-muted">{nextStep}</p>
+          <Link to={`/meetings/${commitment.meeting_id}`} className="inline-flex min-h-11 min-w-0 max-w-full items-center break-words [overflow-wrap:anywhere] text-xs font-medium text-huddleroom-primary hover:underline">{commitment.meeting_title}</Link>
           <p className="text-xs text-huddleroom-text-secondary">{COMMITMENT_STATES[commitment.state] ?? commitment.state.replace(/_/g, ' ')}</p>
+          {relatedRecords}
+          <NeedsYouDetails details={details} />
         </div>
       </div>
       <Button ref={(element) => { triggerRef.current = element; registerPrimary(element) }} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || pending} aria-expanded={expanded} aria-controls={`${id}-form`} onClick={() => setExpanded(true)}>Waive</Button>
@@ -647,29 +827,64 @@ function MeetingCommitmentRow({ commitment, projectId, mutationBusy, registerPri
 }
 
 export function NeedsYouQueue({
-  goal, run, processes, warnings, gates, meetingCommitments = [], checkpointItems, recoveryDecisions = [], onAnswerRecoveryProposal, checkpointLoaded, queriesErrored, queriesUnready, deferredCount, isWorking, mutationBusy,
-  onSelectProcess, openAction, onOpenAction, onActionTrigger, renderActionForm, renderAgentDefinitionReviewBatch, renderTeamHierarchyProposal,
+  goal, run, processes, sourceProcesses, warnings, gates, meetingCommitments = [], checkpointItems, allDecisions = [], authorityReady = true, invalidatedDecisions = {}, needsYouReferences = [], sourceActionIds = [], recoveryDecisions = [], onAnswerRecoveryProposal, checkpointLoaded, queriesErrored, queriesUnready, deferredCount, isWorking, mutationBusy,
+  onSelectProcess, onRevealSource, openAction, onOpenAction, onActionTrigger, renderActionForm, renderAgentDefinitionReviewBatch, renderTeamHierarchyProposal,
   onAcceptDecision, onAnswerGoalDefinitionQuestion,
   retryPending, retryError, onRetryProcess, onApproveStaleInputs, onDismissStaleInputs, onAcknowledgeWarning,
-  renderBlockerRecovery, suppressAnnouncement = false,
+  renderBlockerRecovery, onReleaseRetainedEdit, suppressAnnouncement = false,
 }: NeedsYouQueueProps) {
   const [justResolvedIds, setJustResolvedIds] = useState<Set<string>>(new Set())
+  const [retainedEdit, setRetainedEdit] = useState<RetainedQueueEdit | null>(null)
+  const [acceptedRecoveryKeys, setAcceptedRecoveryKeys] = useState<Set<string>>(new Set())
+  const retainedEditRef = useRef<RetainedQueueEdit | null>(retainedEdit)
+  retainedEditRef.current = retainedEdit
+  const releasedFormEpochs = useRef<Record<string, number>>({})
+  const cancelledEditKeys = useRef<Set<string>>(new Set())
   const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({})
+  const rowContainers = useRef<Record<string, HTMLLIElement | null>>({})
   const rowOrderRef = useRef<string[]>([])
   const headingRef = useRef<HTMLHeadingElement>(null)
   const { announceQueue } = useGoalAnnouncer()
 
   const criteriaByKey = new Map(goal.success_criteria.filter((criterion) => criterion.key).map((criterion) => [criterion.key as string, criterion.description]))
-  const allRows = buildQueueRows({ run, processes, checkpointItems, recoveryDecisions, gates, warnings, criteriaByKey, meetingCommitments })
+  const referenceMetadata = Array.isArray(needsYouReferences) ? needsYouReferences : []
+  const selectedRows = buildQueueRows({ run, processes, checkpointItems, allDecisions, recoveryDecisions, gates, warnings, criteriaByKey, meetingCommitments })
+  const allRows = retainedEdit
+    ? [...selectedRows.filter((row) => row.key !== retainedEdit.snapshot.rowKey), retainedEdit.row].sort((left, right) => compareQueueOccurrences(
+      queueOccurrence(left, allDecisions), queueOccurrence(right, allDecisions),
+    ))
+    : selectedRows
   const rows = allRows.filter((row) => !justResolvedIds.has(row.key))
   rowOrderRef.current = rows.map((row) => row.key)
   // Terminal read-only recovery history needs no action, so it isn't announced as "needs you".
-  const actionableCount = rows.filter((row) => !(row.kind === 'recovery-proposal' && !isPendingGap(row.decision) && ['rejected', 'failed', 'unsupported'].includes(row.decision.recovery!.status))).length
+  const actionableCount = rows.filter((row) => editState(row) !== 'terminal'
+    && !(row.kind === 'recovery-proposal' && !isPendingGap(row.decision) && ['rejected', 'failed', 'unsupported'].includes(row.decision.recovery!.status))).length
   const runningProcess = processes.find((process) => process.status === 'running')
   const runningStep = runningProcess && isBaselineProcessType(runningProcess.process_type) ? runningProcess.process_type : null
 
   const [announcement, setAnnouncement] = useState('')
   const checkpointCountRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (!retainedEdit || retainedEdit.reviewEpoch === 0) return
+    const row = rowContainers.current[retainedEdit.snapshot.rowKey]
+    queueMicrotask(() => {
+      const registeredPrimary = rowRefs.current[retainedEdit.snapshot.rowKey]
+      const prefersRegisteredPrimary = retainedEdit.row.kind === 'recovery-proposal'
+        || retainedEdit.row.kind === 'answer-batch'
+        || retainedEdit.row.kind === 'answer' && retainedEdit.row.decision.decision_key.startsWith('team_hierarchy:agent:')
+      if (prefersRegisteredPrimary && registeredPrimary && registeredPrimary.isConnected !== false) {
+        registeredPrimary.focus()
+        return
+      }
+      if (!row || typeof row.querySelector !== 'function') return
+      const formTarget = row?.querySelector<HTMLElement>(
+        'form textarea:not([readonly]):not([disabled]), form input:not([readonly]):not([disabled]), form select:not([disabled]), form button:not([disabled])',
+      )
+      const fallback = row.querySelector<HTMLElement>('[data-needs-you-primary]:not([disabled])')
+      ;(formTarget ?? fallback)?.focus()
+    })
+  }, [retainedEdit?.reviewEpoch, retainedEdit?.snapshot.rowKey])
 
   // Earned toast (spec: motion item 5) — fires once when checkpoint questions
   // arrive while the page is open. checkpointItems already refreshes on any
@@ -692,12 +907,12 @@ export function NeedsYouQueue({
   // separate from the existing per-action aria-live regions (BaselineActionForm
   // errors, header lifecycle message), which stay authoritative/immediate.
   useEffect(() => {
-    if (suppressAnnouncement) return
+    if (suppressAnnouncement || queriesUnready || queriesErrored) return
     const timer = setTimeout(() => {
       setAnnouncement(actionableCount === 0 ? 'Queue clear.' : `${actionableCount} item${actionableCount === 1 ? '' : 's'} need${actionableCount === 1 ? 's' : ''} you.`)
     }, QUEUE_ANNOUNCE_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [actionableCount, suppressAnnouncement])
+  }, [actionableCount, queriesErrored, queriesUnready, suppressAnnouncement])
 
   // Flow announcement through the shared goal announcer's queue region.
   useEffect(() => {
@@ -710,6 +925,79 @@ export function NeedsYouQueue({
       next.add(key)
       return next
     })
+  }
+
+  function retainRow(row: QueueRow) {
+    if (acceptedRecoveryKeys.has(row.key) || cancelledEditKeys.current.has(row.key)) return
+    if (retainedEditRef.current?.snapshot.rowKey === row.key) return
+    const next = frozenEdit(row)
+    if (next) next.reviewEpoch = releasedFormEpochs.current[row.key] ?? 0
+    retainedEditRef.current = next
+    setRetainedEdit(next)
+  }
+
+  function beginEdit(row: QueueRow) {
+    cancelledEditKeys.current.delete(row.key)
+    retainRow(row)
+  }
+
+  function releaseRetained(rowKey: string) {
+    const current = retainedEditRef.current
+    if (!current || current.snapshot.rowKey !== rowKey) return
+    const decisionIds = current.snapshot.decisionIds
+    if (current.reviewEpoch > 0) {
+      releasedFormEpochs.current[rowKey] = current.reviewEpoch
+    }
+    cancelledEditKeys.current.add(rowKey)
+    retainedEditRef.current = null
+    setRetainedEdit(null)
+    onReleaseRetainedEdit?.(decisionIds, 'dismiss')
+  }
+
+  function reviewRetained(rowKey: string) {
+    if (!retainedEdit || retainedEdit.snapshot.rowKey !== rowKey) return
+    const authoritativeById = new Map(allDecisions.map((decision) => [decision.id, decision] as const))
+    const replace = (decision: OrchestrationAuthorityDecisionRecord) => authoritativeById.get(decision.id) ?? decision
+    let refreshed: QueueRow = retainedEdit.row
+    if (refreshed.kind === 'answer' || refreshed.kind === 'recovery-proposal') refreshed = { ...refreshed, decision: replace(refreshed.decision) }
+    else if (refreshed.kind === 'answer-batch' || refreshed.kind === 'goal-definition-questions') refreshed = { ...refreshed, decisions: refreshed.decisions.map(replace) }
+    const next = frozenEdit(refreshed)
+    if (!next) return
+    setRetainedEdit({
+      ...next,
+      activeDecisionId: next.snapshot.decisionIds.includes(retainedEdit.activeDecisionId)
+        ? retainedEdit.activeDecisionId
+        : next.activeDecisionId,
+      reviewEpoch: retainedEdit.reviewEpoch + 1,
+    })
+    onReleaseRetainedEdit?.(retainedEdit.snapshot.decisionIds, 'review')
+  }
+
+  function retainedValidationSnapshot(row: QueueRow) {
+    if (!retainedEdit || retainedEdit.snapshot.rowKey !== row.key) return null
+    return row.kind === 'goal-definition-questions'
+      ? {
+          rowKey: retainedEdit.snapshot.rowKey,
+          decisionIds: [retainedEdit.activeDecisionId],
+          decisions: retainedEdit.snapshot.decisions.filter((decision) => decision.id === retainedEdit.activeDecisionId),
+        }
+      : retainedEdit.snapshot
+  }
+
+  function editState(row: QueueRow) {
+    const validationSnapshot = retainedValidationSnapshot(row)
+    if (!validationSnapshot) return 'current' as const
+    const authoritativeState = validateNeedsYouEdit(validationSnapshot, authorityReady ? allDecisions : undefined)
+    if (authoritativeState === 'terminal') return authoritativeState
+    for (const decisionId of validationSnapshot.decisionIds) {
+      const invalidated = invalidatedDecisions[decisionId]
+      if (invalidated) return invalidated
+    }
+    return authoritativeState
+  }
+
+  function setActiveDecision(rowKey: string, decisionId: string) {
+    setRetainedEdit((current) => current?.snapshot.rowKey === rowKey ? { ...current, activeDecisionId: decisionId } : current)
   }
 
   // Moves focus to the next row's primary action after a row resolves (skipping
@@ -759,17 +1047,81 @@ export function NeedsYouQueue({
     <h2 ref={headingRef} id="needs-you-queue-heading" tabIndex={-1} className={ZONE_TITLE_CLASS}>Needs you</h2>
     <ul className="mt-2 divide-y divide-huddleroom-border">
       {rows.map((row) => {
+        const presentation = presentNeedsYouRow(row, referencesForRow(row, referenceMetadata))
+        const lifecycle = editState(row)
+        const retainedDisplaced = retainedEdit?.snapshot.rowKey === row.key
+          && !selectedRows.some((selected) => selected.key === row.key)
+        const reviewEpoch = retainedEdit?.snapshot.rowKey === row.key
+          ? retainedEdit.reviewEpoch
+          : releasedFormEpochs.current[row.key] ?? 0
+        const inlineContract = row.kind === 'recovery-proposal' || row.kind === 'answer' && row.decision.decision_key.startsWith('team_hierarchy:agent:')
+          ? `:${row.decision.contract_version}:${row.decision.runtime_identity ?? ''}`
+          : ''
+        const formKey = `${row.key}:review:${reviewEpoch}${inlineContract}`
+        const editBlocked = lifecycle !== 'current'
+        const releaseEdit = () => releaseRetained(row.key)
+        const activeDecisionId = retainedEdit?.snapshot.rowKey === row.key ? retainedEdit.activeDecisionId : undefined
+        const authoritativeDecision = activeDecisionId
+          ? allDecisions.find((candidate) => candidate.id === activeDecisionId)
+          : decisionsForRow(row).map((decision) => allDecisions.find((candidate) => candidate.id === decision.id))
+            .find((decision) => decision?.status !== 'pending')
+        const retainedSnapshot = retainedValidationSnapshot(row)
+        const refreshedReviewAvailable = lifecycle === 'stale' && authorityReady && retainedSnapshot !== null
+          && retainedSnapshot.decisionIds.every((decisionId) => allDecisions.some((decision) => decision.id === decisionId && decision.status === 'pending'))
+        const reviewStatus = lifecycle === 'current' ? null : <div role="status" aria-live="polite" aria-atomic="true" className="mt-3 rounded border border-huddleroom-border p-3 text-sm text-huddleroom-text-secondary">
+          {lifecycle === 'terminal' ? <>
+            <p className="font-medium text-huddleroom-text-primary">{authoritativeDecision?.status === 'answered' ? 'Answered elsewhere' : 'Decision closed elsewhere'}</p>
+            <p>Authoritative status: {authoritativeDecision?.status ?? 'completed'}.</p>
+            {authoritativeDecision?.selected_option !== null && authoritativeDecision?.selected_option !== undefined && <p>Selected answer: {safeNeedsYouText(authoritativeDecision.selected_option, presentation.references)}</p>}
+            {authoritativeDecision?.reason && <p>Reason: {safeNeedsYouText(authoritativeDecision.reason, presentation.references)}</p>}
+            <Button type="button" variant="secondary" className="mt-2 min-h-11" onClick={() => { releaseEdit(); focusNextRow(row.key) }}>Dismiss</Button>
+          </> : <>
+            <p>{lifecycle === 'stale'
+              ? 'The decision changed. Review the refreshed decision before answering.'
+              : 'The current decision could not be confirmed. Refresh and review it before answering.'}</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {refreshedReviewAvailable && <Button type="button" variant="secondary" className="min-h-11" onClick={() => reviewRetained(row.key)}>Review refreshed decision</Button>}
+              <Button type="button" variant="secondary" className="min-h-11" onClick={() => { releaseEdit(); focusNextRow(row.key) }}>Dismiss</Button>
+            </div>
+          </>}
+        </div>
         if (row.kind === 'meeting-commitment') {
           const priorOrder = rows.map((candidate) => candidate.key)
-          return <MeetingCommitmentRow key={row.key} commitment={row.commitment} projectId={goal.project_id} mutationBusy={mutationBusy} registerPrimary={(element) => registerRowRef(row.key, element)} onRemoved={() => focusNextRow(row.key, priorOrder)} />
+          return <MeetingCommitmentRow key={row.key} commitment={row.commitment} projectId={goal.project_id} mutationBusy={mutationBusy} registerPrimary={(element) => registerRowRef(row.key, element)} onRemoved={() => focusNextRow(row.key, priorOrder)} title={presentation.title} explanation={presentation.explanation} nextStep={presentation.nextStep} details={presentation.details} relatedRecords={<NamedReferences references={presentation.references} activeProjectId={goal.project_id} activeGoalId={goal.id} gates={gates} processes={processes} sourceActionIds={sourceActionIds} onRevealSource={onRevealSource} />} />
         }
         if (row.kind === 'recovery-proposal') {
-          return <li key={row.key} className="py-3 first:pt-0 last:pb-0 motion-safe:animate-[queue-row-in_180ms_ease-out]">
-            <RecoveryProposalCard
-              decision={row.decision} mutationBusy={mutationBusy} onAnswer={onAnswerRecoveryProposal}
+          return <li key={row.key} ref={(element) => { rowContainers.current[row.key] = element }} className="py-3 first:pt-0 last:pb-0 motion-safe:animate-[queue-row-in_180ms_ease-out]" onClickCapture={() => retainRow(row)} onFocusCapture={(event) => {
+            if (targetIsInsideForm(event.target, event.currentTarget)) retainRow(row)
+          }}>
+            <RecoveryProposalCard key={formKey}
+              decision={row.decision} mutationBusy={mutationBusy} reviewLocked={editBlocked} accepted={acceptedRecoveryKeys.has(row.key)} onAnswer={onAnswerRecoveryProposal}
+              displayReferences={presentation.references}
               registerPrimary={(element) => registerRowRef(row.key, element)}
-              onLeftQueue={(quiet) => { markResolved(row.key); if (!quiet) successToast('Blocked work is moving again.'); focusNextRow(row.key) }}
+              onAccepted={() => { setAcceptedRecoveryKeys((current) => new Set(current).add(row.key)); releaseEdit() }}
+              onBeginEdit={() => beginEdit(row)}
+              onCancel={() => {
+                if (retainedDisplaced) {
+                  releaseEdit()
+                  focusNextRow(row.key)
+                  return true
+                }
+                releaseEdit()
+                return false
+              }}
+              onLeftQueue={(quiet) => {
+                if (rowOrderRef.current.includes(row.key)) return
+                setAcceptedRecoveryKeys((current) => { const next = new Set(current); next.delete(row.key); return next })
+                delete releasedFormEpochs.current[row.key]
+                cancelledEditKeys.current.delete(row.key)
+                releaseEdit()
+                markResolved(row.key)
+                if (!quiet) successToast('Blocked work is moving again.')
+                focusNextRow(row.key)
+              }}
             />
+            <NamedReferences references={presentation.references} activeProjectId={goal.project_id} activeGoalId={goal.id} gates={gates} processes={sourceProcesses ?? processes} sourceActionIds={sourceActionIds} onRevealSource={onRevealSource} />
+            <NeedsYouDetails details={presentation.details} />
+            {reviewStatus}
           </li>
         }
         const eyebrow = EYEBROW[row.kind]
@@ -779,45 +1131,48 @@ export function NeedsYouQueue({
         // stacked below). `below` holds content too big for that slot (the
         // opened accordion form, the batch form, or the multi-button blocker
         // recovery UI) and always renders full-width under the row.
-        let message: ReactNode
+        let message: ReactNode = <>
+          <h3 className="break-words text-sm font-medium text-huddleroom-text-primary">{presentation.title}</h3>
+          {presentation.explanation !== presentation.title && (() => {
+            let explanation = presentation.explanation
+            if (row.kind === 'answer' && openAction?.kind === 'answer' && openAction.id === row.decision.id) {
+              const question = safeNeedsYouText(row.decision.question, presentation.references)
+              if (explanation === question) explanation = ''
+              else if (explanation.startsWith(`${question}\n`)) explanation = explanation.slice(question.length + 1)
+            }
+            return explanation ? <p className="mt-1 whitespace-pre-line break-words text-sm text-huddleroom-text-secondary">{explanation}</p> : null
+          })()}
+          <p className="mt-1 text-xs text-huddleroom-text-muted"><span className="font-medium">{presentation.actionOwner === 'owner' ? 'Owner' : presentation.actionOwner === 'maintainer' ? 'Maintainer' : 'Owner or maintainer'}:</span> {presentation.nextStep}</p>
+        </>
         let tag: ReactNode = null
         let action: ReactNode = null
         let below: ReactNode = null
 
         if (row.kind === 'blocker') {
-          message = row.blocker.reason ?? row.blocker.kind ?? 'A blocker needs recovery.'
           const canRecover = row.blocker.kind === 'goal_definition_clarification_limit' && renderBlockerRecovery
-          below = <div className="mt-2">
-            <ErrorRecord
-              error={row.blocker.reason ?? row.blocker.kind ?? 'unknown'}
-              action={canRecover ? renderBlockerRecovery(row.blocker, (element) => registerRowRef(row.key, element), () => focusNextRow(row.key)) : undefined}
-            />
-          </div>
+          if (canRecover) below = <div className="mt-2">{renderBlockerRecovery(row.blocker, (element) => registerRowRef(row.key, element), () => focusNextRow(row.key))}</div>
         } else if (row.kind === 'lm-retry') {
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
-          below = <div className="mt-2">
-            <ErrorRecord
-              error={row.message}
-              action={<RetryControl
+          below = <div className="mt-2 flex justify-end">
+            <RetryControl
                 buttonRef={(element) => registerRowRef(row.key, element)}
                 onRetry={(trigger) => onRetryProcess(row.process.process_type as OrchestrationBaselineProcessType, trigger, () => { markResolved(row.key); successToast('Retry succeeded.'); focusNextRow(row.key) })}
                 retryPending={retryPending} retryError={retryError} disabled={mutationBusy || retryPending}
-              />}
             />
           </div>
         } else if (row.kind === 'answer' && row.decision.decision_key.startsWith('team_hierarchy:agent:')) {
-          message = row.decision.title || row.decision.question
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
-          below = renderTeamHierarchyProposal(row.decision, () => { markResolved(row.key); successToast('Proposal decision received.'); focusNextRow(row.key) }, (element) => registerRowRef(row.key, element))
+          below = renderTeamHierarchyProposal(row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Proposal decision received.'); focusNextRow(row.key) }, (element) => registerRowRef(row.key, element), presentation.references, lifecycle, formKey, () => {
+            if (retainedDisplaced) {
+              releaseEdit()
+              focusNextRow(row.key)
+              return true
+            }
+            releaseEdit()
+            return false
+          }, () => beginEdit(row))
         } else if (row.kind === 'answer') {
           const focusAction: BaselineFocusAction = { kind: 'answer', id: row.decision.id }
-          const title = row.decision.title.startsWith('Runtime decision: run:')
-            ? row.decision.question
-            : row.decision.title || row.decision.question
-          message = <>
-            {title}
-            {row.decision.title && title !== row.decision.question && <span className="mt-1 block text-sm text-huddleroom-text-secondary">{row.decision.question}</span>}
-          </>
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
           // Accept-recommendation fast path (spec C): a non-null recommendation
           // gets a primary Accept button (submits immediately, no form, no
@@ -825,43 +1180,38 @@ export function NeedsYouQueue({
           // full form. A null recommendation keeps the single Answer button.
           const managerComparison = isManagerSelectionDecision(row.decision.decision_key) ? parseManagerComparison(row.decision.context) : null
           if (managerComparison) {
-            below = <dl className="mt-2 grid gap-1 rounded border border-huddleroom-border p-2 text-xs text-huddleroom-text-secondary"><div><dt className="inline font-medium text-huddleroom-text-muted">Deterministic: </dt><dd className="inline">{managerComparison.deterministic}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">LLM: </dt><dd className="inline">{managerComparison.llm}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">Rationale: </dt><dd className="inline">{managerComparison.rationale}</dd></div></dl>
-            action = <div className="flex shrink-0 items-center gap-2"><Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy} onClick={() => onAcceptDecision(row.decision, () => { markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>Accept: {recommendationLabel(row.decision)}</Button><Button ref={(element) => onActionTrigger(focusAction, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy} onClick={() => onOpenAction(focusAction)}>Choose differently…</Button></div>
+            below = <dl className="mt-2 grid gap-1 rounded border border-huddleroom-border p-2 text-xs text-huddleroom-text-secondary"><div><dt className="inline font-medium text-huddleroom-text-muted">Deterministic: </dt><dd className="inline">{safeNeedsYouText(managerComparison.deterministic, presentation.references)}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">LLM: </dt><dd className="inline">{safeNeedsYouText(managerComparison.llm, presentation.references)}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">Rationale: </dt><dd className="inline">{safeNeedsYouText(managerComparison.rationale, presentation.references)}</dd></div></dl>
+            action = <div className="flex shrink-0 items-center gap-2"><Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => onAcceptDecision(row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>Accept: {safeNeedsYouText(recommendationLabel(row.decision), presentation.references)}</Button><Button ref={(element) => onActionTrigger(focusAction, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => { beginEdit(row); onOpenAction(focusAction) }}>Choose differently…</Button></div>
           } else if (row.decision.recommendation !== null) {
             action = <div className="flex shrink-0 items-center gap-2">
-              <Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy} onClick={() => onAcceptDecision(row.decision, () => { markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>
-                Accept: {recommendationLabel(row.decision)}
+              <Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => onAcceptDecision(row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>
+                Accept: {safeNeedsYouText(recommendationLabel(row.decision), presentation.references)}
               </Button>
-              <Button ref={(element) => onActionTrigger(focusAction, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy} onClick={() => onOpenAction(focusAction)}>Choose differently…</Button>
+              <Button ref={(element) => onActionTrigger(focusAction, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => { beginEdit(row); onOpenAction(focusAction) }}>Choose differently…</Button>
             </div>
           } else {
-            action = <Button ref={(element) => registerRow(focusAction, row.key, element)} type="button" className="min-h-11" disabled={mutationBusy} onClick={() => onOpenAction(focusAction)}>Answer</Button>
+            action = <Button ref={(element) => registerRow(focusAction, row.key, element)} type="button" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => { beginEdit(row); onOpenAction(focusAction) }}>Answer</Button>
           }
           if (openAction?.kind === 'answer' && openAction.id === row.decision.id) {
-            below = <div className="mt-1">{renderActionForm(focusAction, row.decision, () => { markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}</div>
+            below = <div className="mt-1">{renderActionForm(focusAction, row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) }, safeNeedsYouText(row.decision.question, presentation.references), presentation.references, lifecycle, () => { releaseEdit(); focusNextRow(row.key) }, formKey)}</div>
           }
         } else if (row.kind === 'answer-batch') {
-          message = `${row.decisions.length} agent definitions need review.`
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
-          below = <div className="mt-2">{renderAgentDefinitionReviewBatch(row.decisions, () => { markResolved(row.key); successToast('Agent-definition review completed.'); focusNextRow(row.key) })}</div>
+          below = <div className="mt-2">{renderAgentDefinitionReviewBatch(row.decisions, () => { releaseEdit(); markResolved(row.key); successToast('Agent-definition review completed.'); focusNextRow(row.key) }, formKey, presentation.references, lifecycle)}</div>
         } else if (row.kind === 'goal-definition-questions') {
-          message = `The orchestrator needs ${row.decisions.length} answer${row.decisions.length === 1 ? '' : 's'}.`
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
           below = <div className="mt-2">
-            <GoalDefinitionQuestionCard
-              decisions={row.decisions} mutationBusy={mutationBusy} onAnswer={onAnswerGoalDefinitionQuestion}
-              onAllAnswered={() => { markResolved(row.key); successToast('Answers received.'); focusNextRow(row.key) }}
+            <GoalDefinitionQuestionCard key={formKey}
+              decisions={row.decisions} activeDecisionId={activeDecisionId} mutationBusy={mutationBusy} reviewLocked={editBlocked} onAnswer={onAnswerGoalDefinitionQuestion}
+              displayReferences={presentation.references}
+              onActiveDecisionChange={(decisionId) => setActiveDecision(row.key, decisionId)}
+              onAllAnswered={() => { releaseEdit(); markResolved(row.key); successToast('Answers received.'); focusNextRow(row.key) }}
             />
           </div>
         } else if (row.kind === 'gate') {
-          message = row.description ?? row.gate.success_criterion_key
-          if (row.gate.failure_reason) below = <p className="mt-1 text-sm text-huddleroom-text-secondary">{row.gate.failure_reason}</p>
+          // Presentation copy already carries the failed criterion and reason.
         } else if (staleInputsProcessType(row.warning.warning_type)) {
           const processType = staleInputsProcessType(row.warning.warning_type)!
-          message = <>
-            <span className="mr-1.5 text-xs text-huddleroom-text-muted">{stepDisplayLabel(processType)} · {warningSeverityLabel(row.warning.severity)}</span>
-            {warningMessage(row.warning.message)}
-          </>
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
           action = <div className="flex shrink-0 items-center gap-2">
             <Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy} onClick={() => onApproveStaleInputs(row.warning, processType, () => { markResolved(row.key); focusNextRow(row.key) })}>Approve</Button>
@@ -871,10 +1221,6 @@ export function NeedsYouQueue({
           const focusAction: BaselineFocusAction = row.canAcknowledge ? { kind: 'acknowledge', id: row.warning.id } : { kind: 'resolve', id: row.warning.id }
           const label = row.canAcknowledge ? 'Acknowledge' : 'Resolve'
           const successFocus = () => { markResolved(row.key); successToast(row.canAcknowledge ? 'Risk acknowledged.' : 'Risk resolved.'); focusNextRow(row.key) }
-          message = <>
-            <span className="mr-1.5 text-xs text-huddleroom-text-muted">{warningTypeLabel(row.warning.warning_type)} · {warningSeverityLabel(row.warning.severity)}</span>
-            {warningMessage(row.warning.message)}
-          </>
           tag = row.warning.warning_type === 'start_text_conflict'
             ? <Link to={{ pathname: '/settings', hash: '#project-details' }} className="inline-flex min-h-11 items-center text-xs font-medium text-huddleroom-primary underline-offset-2 hover:underline">Edit project description</Link>
             : <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
@@ -884,7 +1230,11 @@ export function NeedsYouQueue({
           }
         }
 
-        return <li key={row.key} className="py-3 first:pt-0 last:pb-0 motion-safe:animate-[queue-row-in_180ms_ease-out]">
+        return <li key={row.key} ref={(element) => { rowContainers.current[row.key] = element }} className="py-3 first:pt-0 last:pb-0 motion-safe:animate-[queue-row-in_180ms_ease-out]" onClickCapture={() => {
+          if (hasInlineDecisionForm(row)) retainRow(row)
+        }} onFocusCapture={(event) => {
+          if (targetIsInsideForm(event.target, event.currentTarget)) retainRow(row)
+        }}>
           <div className="flex flex-wrap items-start gap-3 sm:flex-nowrap">
             <Icon aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" style={{ color: eyebrow.color }} />
             {/* Eyebrow reads as the row's key column (Record style: 11px
@@ -894,13 +1244,16 @@ export function NeedsYouQueue({
             <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5 sm:flex-nowrap">
               <p className="w-[104px] shrink-0 text-label font-semibold uppercase tracking-[0.1em]" style={{ color: eyebrow.color }}>{eyebrow.text}</p>
               <div className="min-w-0 flex-1">
-                <p className="text-sm text-huddleroom-text-primary">{message}</p>
+                <div className="text-sm text-huddleroom-text-primary">{message}</div>
                 {tag && <div className="mt-0.5">{tag}</div>}
               </div>
             </div>
             {action && <div className="flex shrink-0 items-center">{action}</div>}
           </div>
           {below}
+          {reviewStatus}
+          <NamedReferences references={presentation.references} activeProjectId={goal.project_id} activeGoalId={goal.id} gates={gates} processes={sourceProcesses ?? processes} sourceActionIds={sourceActionIds} onRevealSource={onRevealSource} />
+          <NeedsYouDetails details={presentation.details} />
         </li>
       })}
     </ul>

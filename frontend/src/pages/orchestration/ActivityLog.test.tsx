@@ -315,6 +315,75 @@ describe('ActivityLog steering anchors', () => {
     }
   })
 
+  it('SPR210 reveals and focuses an older source action despite filters and the count cap', async () => {
+    const actions = Array.from({ length: 51 }, (_, index) => action(index, {
+      created_at: new Date(new Date(ISO).getTime() + index * 1000).toISOString(),
+    }))
+    const detail = goalDetail({ actions, decisions: [decision(99)] })
+    const focus = vi.fn()
+    const scrollIntoView = vi.fn()
+    const focusProps = {
+      detail,
+      focusSource: { kind: 'action' as const, id: 'action-0' },
+      focusSourcePending: true,
+    } as Partial<ActivityLogProps> & Record<string, unknown>
+    const view = await mount({ detail })
+    try {
+      ;(view.document as unknown as { getElementById: (id: string) => HTMLElement | null }).getElementById = (id) => {
+        const target = descendants(view.container).find((node) => node.getAttribute('id') === id)
+        if (target) Object.assign(target, { focus, scrollIntoView })
+        return target as unknown as HTMLElement ?? null
+      }
+      await act(async () => getButton(view.container, 'Decision').click())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'action-action-0')).toBeUndefined()
+
+      await view.rerender(() => <ActivityLog {...makeProps(focusProps)} />)
+      const target = descendants(view.container).find((node) => node.getAttribute('id') === 'action-action-0')
+      expect(target).toBeDefined()
+      expect(target?.getAttribute('tabindex')).toBe('-1')
+      expect(focus).toHaveBeenCalledTimes(1)
+      expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 fixround1 reveals the exact completed release action while preserving normal paired-action dedup', async () => {
+    const expand = action(1, {
+      id: 'action-expand', action_type: 'expand_plan_item', status: 'completed',
+      request: { plan_item_id: 'plan-item-1' }, created_at: '2026-08-05T08:01:00Z',
+    })
+    const release = action(2, {
+      id: 'action-release', action_type: 'release_item', status: 'completed',
+      request: { plan_item_id: 'plan-item-1' }, created_at: '2026-08-05T08:02:00Z',
+    })
+    const detail = goalDetail({ actions: [expand, release] })
+
+    expect(buildActivityEntries({ processes: [], decisions: [], warnings: [], detail })
+      .map((entry) => entry.anchorId)).toEqual(['action-action-expand'])
+
+    const focus = vi.fn()
+    const scrollIntoView = vi.fn()
+    const props = {
+      detail,
+      focusSource: { kind: 'action' as const, id: release.id },
+      focusSourcePending: true,
+    } as Partial<ActivityLogProps>
+    const view = await mount({ detail })
+    try {
+      ;(view.document as unknown as { getElementById: (id: string) => HTMLElement | null }).getElementById = (id) => {
+        const target = descendants(view.container).find((node) => node.getAttribute('id') === id)
+        if (target) Object.assign(target, { focus, scrollIntoView })
+        return target as unknown as HTMLElement ?? null
+      }
+      await view.rerender(() => <ActivityLog {...makeProps(props)} />)
+
+      const target = descendants(view.container).find((node) => node.getAttribute('id') === 'action-action-release')
+      expect(target).toBeDefined()
+      expect(target?.getAttribute('tabindex')).toBe('-1')
+      expect(focus).toHaveBeenCalledTimes(1)
+      expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
   it('anchors an unscoped answered authority decision that lacks decided_at', () => {
     const authority = authorityDecision({ decided_at: null, source_process_run_id: null })
     const entries = buildActivityEntries({

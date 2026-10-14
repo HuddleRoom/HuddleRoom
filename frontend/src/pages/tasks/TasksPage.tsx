@@ -445,7 +445,7 @@ function TaskDetailPanel({
   onFocusBoard: () => void
   isNarrow?: boolean
 }) {
-  const { data: task, isLoading: taskLoading } = useTask(projectId, taskId)
+  const { data: task, isLoading: taskLoading, isError: taskError } = useTask(projectId, taskId)
   const { data: subtasksData } = useTaskSubtasks(projectId, taskId)
   const { data: sessionsData, isLoading: sessionsLoading, isFetching: sessionsFetching } = useTaskSessions(projectId, taskId)
   const runTask = useRunTask(projectId)
@@ -574,6 +574,10 @@ function TaskDetailPanel({
       <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 18, flex: 1 }}>
         {taskLoading ? (
           <SkeletonTable count={4} />
+        ) : taskError || !task ? (
+          <p role="status" className="text-sm text-huddleroom-text-secondary">
+            Task unavailable in this project.
+          </p>
         ) : (
           <>
         {task && quickMoves.length > 0 && (
@@ -886,7 +890,7 @@ export function TasksPage() {
   const pid = useUIStore((s) => s.activeProjectId)
   const setCreateProjectOpen = useUIStore((s) => s.setCreateProjectOpen)
   const [activeDragTask, setActiveDragTask] = useState<Task | null>(null)
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const selectedTaskId = searchParams.get('task')
   const [detailFocusRequest, setDetailFocusRequest] = useState(0)
   const [showCreate, setShowCreate] = useState(false)
   const [isNarrow, setIsNarrow] = useState(false)
@@ -1054,7 +1058,11 @@ export function TasksPage() {
   }
 
   function openTask(taskId: string, options?: { focusDetail?: boolean }) {
-    setSelectedTaskId(taskId)
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      next.set('task', taskId)
+      return next
+    })
     focusReturnTaskIdRef.current = taskId
 
     const task = tasks.find((candidate) => candidate.id === taskId)
@@ -1089,7 +1097,11 @@ export function TasksPage() {
 
   function closeInspectPanel() {
     const returnTaskId = focusReturnTaskIdRef.current ?? selectedTaskId
-    setSelectedTaskId(null)
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      next.delete('task')
+      return next
+    })
     if (!returnTaskId) return
 
     requestAnimationFrame(() => {
@@ -1324,7 +1336,12 @@ export function TasksPage() {
 	                    onTaskClick={(id) => {
 	                      const cardIndex = (tasksByStatus[col.status] ?? []).findIndex((task) => task.id === id)
 	                      setBoardTarget(columnIndex, cardIndex, false)
-	                      setSelectedTaskId((current) => current === id ? null : id)
+	                      setSearchParams((current) => {
+	                        const next = new URLSearchParams(current)
+	                        if (selectedTaskId === id) next.delete('task')
+	                        else next.set('task', id)
+	                        return next
+	                      })
 	                      focusReturnTaskIdRef.current = id
 	                    }}
 	                    isBoardHeaderFocused={boardCursor.columnIndex === columnIndex && boardCursor.cardIndex === -1}

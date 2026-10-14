@@ -2,7 +2,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
-import type { OrchestrationGoalDetail, Task } from '@/lib/types'
+import type { OrchestrationGoalDetail, OrchestrationProcessRunRecord, Task } from '@/lib/types'
 
 const state = vi.hoisted(() => ({
   activeProjectId: null as string | null,
@@ -31,6 +31,7 @@ const state = vi.hoisted(() => ({
   meetingsById: new Map<string, Record<string, unknown>>(),
   meetingDecisions: undefined as Array<Record<string, unknown>> | undefined,
   baselineLoading: false,
+  baselineProcesses: [] as OrchestrationProcessRunRecord[],
   location: { hash: '', pathname: '', search: '', state: null, key: 'default' },
 }))
 
@@ -101,7 +102,7 @@ vi.mock('@/api/orchestration', () => ({
   useRecoverGoalDefinition: () => ({ isPending: false, mutate: vi.fn() }),
   useBaselineDashboard: () => ({
     memory: { data: undefined, isLoading: false, isError: false },
-    processes: { data: undefined, isLoading: state.baselineLoading, isError: false },
+    processes: { data: state.baselineProcesses, isLoading: state.baselineLoading, isError: false },
     agentReviews: { data: undefined, isLoading: false, isError: false },
     warnings: { data: undefined, isLoading: state.baselineLoading, isError: false },
     decisions: { data: undefined, isLoading: state.baselineLoading, isError: false },
@@ -168,8 +169,8 @@ vi.mock('@tanstack/react-query', () => ({
 // Gates, Delegations, Suggestions) is owned by GoalDetailView itself and is
 // exercised directly by these tests, same as before this phase's restructure.
 vi.mock('./BaselineDashboard', () => ({
-  BaselineDashboard: ({ goalId, run, acquireMutation }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean }) => (
-    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => acquireMutation("baseline:run:goal_definition")}>Mock run</button><button onClick={() => acquireMutation("baseline:answer:decision-1")}>Mock answer</button></div>
+  BaselineDashboard: ({ goalId, run, acquireMutation, onRevealSource, onSelectedProcessTypeChange, onViewActivity }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean; onRevealSource?: (target: { kind: 'gate' | 'process' | 'action'; id: string; goalId: string }) => void; onSelectedProcessTypeChange?: (type: 'team_hierarchy') => void; onViewActivity?: () => void }) => (
+    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => acquireMutation("baseline:run:goal_definition")}>Mock run</button><button onClick={() => acquireMutation("baseline:answer:decision-1")}>Mock answer</button><button onClick={() => onRevealSource?.({ kind: 'gate', id: 'gate-1', goalId })}>Reveal source gate</button><button onClick={() => onRevealSource?.({ kind: 'process', id: 'process-old', goalId })}>Reveal superseded process</button><button onClick={() => { onSelectedProcessTypeChange?.('team_hierarchy'); onViewActivity?.() }}>View current step activity</button></div>
   ),
   currentProcesses: (processes: unknown[] | null | undefined) => (processes ?? []).filter((process) => (process as { superseded_by_id: string | null }).superseded_by_id === null),
 }))
@@ -352,6 +353,7 @@ beforeEach(() => {
   state.meetingsById = new Map()
   state.meetingDecisions = undefined
   state.baselineLoading = false
+  state.baselineProcesses = []
   state.location = { hash: '', pathname: '', search: '', state: null, key: 'default' }
 })
 
@@ -517,6 +519,70 @@ describe('OrchestrationPage', () => {
       await view.rerender()
       expect(focus).toHaveBeenCalledTimes(1)
       expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 wires source navigation to the actual record in the active goal', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = richDetail
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Reveal source gate').click())
+      const gatePanel = descendants(view.container).find((node) => node.getAttribute('id') === 'details-panel-gates')
+      expect(gatePanel?.getAttribute('hidden')).toBeNull()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'gate-gate-1')).toBeDefined()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 fixround2 keeps ordinary step activity current while revealing an exact superseded source', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = richDetail
+    const processRecord = (id: string, supersededById: string | null): OrchestrationProcessRunRecord => ({
+      id, goal_id: 'goal-1', run_id: 'run-1', process_type: 'team_hierarchy', process_version: 1,
+      status: 'completed', trigger_reason: 'test', input_snapshot: {}, outputs: {}, skipped_by: null,
+      override_reason: null, superseded_by_id: supersededById, started_at: '2026-07-15T09:00:00Z',
+      completed_at: '2026-07-15T09:05:00Z', created_at: '2026-07-15T09:00:00Z', updated_at: '2026-07-15T09:05:00Z',
+    })
+    state.baselineProcesses = [processRecord('process-old', 'process-new'), processRecord('process-new', null)]
+
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      const focus = vi.fn()
+      const scrollIntoView = vi.fn()
+      ;(view.document as unknown as { getElementById: (id: string) => HTMLElement | null }).getElementById = (id) => {
+        const target = descendants(view.container).find((node) => node.getAttribute('id') === id)
+        if (target) Object.assign(target, { focus, scrollIntoView })
+        return target as unknown as HTMLElement ?? null
+      }
+
+      await React.act(async () => getButton(view.container, 'View current step activity').click())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-new')).toBeDefined()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-old')).toBeUndefined()
+
+      await React.act(async () => getButton(view.container, 'Reveal superseded process').click())
+
+      const target = descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-old')
+      expect(target).toBeDefined()
+      expect(target?.getAttribute('tabindex')).toBe('-1')
+      expect(focus).toHaveBeenCalledTimes(1)
+      expect(scrollIntoView).toHaveBeenCalledTimes(1)
+
+      await React.act(async () => getButton(view.container, 'Whole goal').click())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-new')).toBeDefined()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-old')).toBeUndefined()
+
+      await React.act(async () => getButton(view.container, 'Reveal superseded process').click())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-old')).toBeDefined()
+      expect(focus).toHaveBeenCalledTimes(2)
+      expect(scrollIntoView).toHaveBeenCalledTimes(2)
+
+      await React.act(async () => getButton(view.container, 'View current step activity').click())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-new')).toBeDefined()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-old')).toBeUndefined()
     } finally { view.cleanup() }
   })
 

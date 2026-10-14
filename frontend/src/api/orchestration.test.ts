@@ -846,6 +846,64 @@ describe('orchestration API', () => {
     expect(setQueryData).toHaveBeenCalled()
   })
 
+  it('SPR212 leaves runtime answer cache untouched until the component validates the receipt', async () => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    const setQueryData = vi.fn()
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
+    const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
+      onSuccess: (data: unknown, variables: {
+        goalId: string
+        decisionId: string
+        selectedOption: string
+        reason: string
+        runtimeIdentity: string
+      }) => Promise<void> | void
+    }
+
+    await mutation.onSuccess(
+      {
+        decision: {
+          id: 'unrelated-or-malformed-runtime-receipt',
+          source_process_run_id: null,
+          status: 'answered',
+        },
+        process: null,
+        continuation_applied: false,
+      },
+      {
+        goalId: 'goal-1',
+        decisionId: 'runtime-q1',
+        selectedOption: 'approve',
+        reason: 'reviewed reason',
+        runtimeIdentity: 'runtime-q1:v1',
+      },
+    )
+
+    expect(setQueryData).not.toHaveBeenCalled()
+    expect(invalidateQueries).not.toHaveBeenCalled()
+  })
+
+  it('SPR212 commits an accepted runtime receipt through the normal goal and Baseline cache boundary', async () => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    const setQueryData = vi.fn()
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
+    const answer = useAnswerOrchestrationDecision('project-1') as unknown as {
+      acceptRuntimeResult: (goalId: string, result: unknown) => Promise<void>
+    }
+    const accepted = { decision: { id: 'runtime-q1', source_process_run_id: null }, process: null, continuation_applied: false }
+
+    await answer.acceptRuntimeResult('goal-1', accepted)
+
+    expect(setQueryData).toHaveBeenCalledTimes(2)
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
+      exact: true,
+    })
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: orchestrationBaselineKey('project-1', 'goal-1'),
+    })
+  })
+
   it('replaces exact detail state and invalidates the project list after a control', async () => {
     const queryClient = new QueryClient()
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue()

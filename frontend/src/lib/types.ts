@@ -876,6 +876,7 @@ export interface OrchestrationAgentReviewRecord {
 }
 
 export interface OrchestrationWarningRecord {
+  needs_you_references?: NeedsYouReference[] | null
   id: string
   goal_id: string
   run_id: string | null
@@ -922,6 +923,7 @@ export interface RecoveryProposalRecord {
 
 export interface OrchestrationAuthorityDecisionRecord {
   recovery?: RecoveryProposalRecord | null
+  needs_you_references?: NeedsYouReference[] | null
   id: string
   goal_id: string
   run_id: string | null
@@ -1031,6 +1033,7 @@ export interface OrchestrationMeetingCommitment {
   id: string
   meeting_id: string
   meeting_title: string
+  created_at?: string | null
   description: string
   state: string
   task_id: string | null
@@ -1038,8 +1041,19 @@ export interface OrchestrationMeetingCommitment {
   reason: string | null
 }
 
+export type NeedsYouReferenceKind = 'task' | 'meeting' | 'agent' | 'goal' | 'gate' | 'process' | 'action'
+
+export interface NeedsYouReference {
+  kind: NeedsYouReferenceKind
+  id: string
+  project_id: string
+  goal_id: string | null
+  label: string | null
+}
+
 export interface OrchestrationGoalDetail {
   meeting_commitments?: OrchestrationMeetingCommitment[]
+  needs_you_references?: NeedsYouReference[] | null
   goal: OrchestrationGoal
   run: OrchestrationRun | null
   decisions_count: number

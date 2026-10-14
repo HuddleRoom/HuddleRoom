@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
 
 OPEN_QUESTIONS_SECTION_KEY = "open_questions"
 OPEN_QUESTIONS_TOC_ORDER = 90
+
+
+def _newest_first_key(decision: OrchestrationAuthorityDecision) -> tuple[float, str]:
+    occurred_at: datetime = decision.asked_at or decision.created_at
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    else:
+        occurred_at = occurred_at.astimezone(timezone.utc)
+    return (-occurred_at.timestamp(), str(decision.id))
 
 
 def build_checkpoint(
@@ -21,14 +32,12 @@ def build_checkpoint(
     `OrchestrationService._sync_agent_authority_decisions`, never shown to
     the human as a question to answer directly.
 
-    Non-proposal questions are ordered oldest-asked-first (FIFO) before the
-    cap is applied — a deterministic placeholder for spec 6.4's "highest-value
-    first as ranked by the LLM" (Phase 9 has no LLM ranking hook). Upgrade
-    path: rank the non-proposal questions by an LLM-scored value before
-    slicing, keeping the same (checkpoint, deferred) contract.
+    Non-proposal questions are ordered newest-first before the cap is applied.
+    Naive SQLite timestamps are interpreted as UTC, and equal timestamps use
+    the immutable decision id as a deterministic tie break.
 
     Exception: `agent_definition_review:proposal:` decisions are pinned to the
-    front of the checkpoint ahead of the FIFO questions and are never deferred,
+    front of the checkpoint ahead of the independent questions and are never deferred,
     because they are answered as one atomic all-or-nothing batch (see below).
     This assumes a single review batch is pending at a time — the invariant the
     review's cancel-on-rerun logic maintains.
@@ -36,8 +45,8 @@ def build_checkpoint(
     if max_questions < 1:
         raise ValueError(f"max_questions must be >= 1, got {max_questions}")
     human_pending = sorted(
-        (d for d in pending if d.authority == "human"),
-        key=lambda d: (d.asked_at, d.created_at, d.id),
+        (d for d in pending if d.authority == "human" and d.status == "pending"),
+        key=_newest_first_key,
     )
     # agent_definition_review proposals are answered as one atomic batch by a
     # dedicated all-or-nothing endpoint; splitting them across the max_questions

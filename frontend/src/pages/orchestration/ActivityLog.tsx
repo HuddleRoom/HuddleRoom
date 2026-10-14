@@ -14,6 +14,7 @@ import type {
 } from '@/lib/types'
 import { acceptanceVerdictLabel, errorRecord, evidenceLabel, evidenceVerdict, goalTypeLabel, goalTypeSourceLabel, requiredDecisionLabel, stepDisplayLabel, warningMessage, warningTypeLabel } from './humanize'
 import { scoped } from './ProcessFocus'
+import type { NeedsYouSourceTarget } from './needsYouPresentation'
 
 // Goal-wide orchestrator decision/action ledger (run-scoped, not attributable
 // to any one baseline process step — distinct from the baseline
@@ -134,7 +135,7 @@ function perStepEvents(
   const processType = isBaselineProcessType(process.process_type) ? process.process_type : null
   const label = processType ? stepDisplayLabel(processType) : process.process_type
   const events: ActivityEntry[] = [{
-    id: `${process.id}:started`, kind: 'process-started', timestamp: process.started_at,
+    id: `${process.id}:started`, anchorId: `process-${process.id}`, kind: 'process-started', timestamp: process.started_at,
     message: `${label} started`, processType,
   }]
   if (process.status === 'completed' && process.completed_at) events.push({
@@ -221,14 +222,16 @@ function ledgerKind(item: TimelineItem): string | undefined {
   return KIND_BY_TYPE[item.label]
 }
 
-function goalLedgerEntries(detail: OrchestrationGoalDetail): ActivityEntry[] {
+function goalLedgerEntries(detail: OrchestrationGoalDetail, retainActionId?: string): ActivityEntry[] {
   const expanded = new Set(detail.actions.filter((action) => action.action_type === 'expand_plan_item'
     && action.status === 'completed' && typeof action.request?.plan_item_id === 'string')
     .map((action) => `${action.run_id}:${action.request!.plan_item_id}`))
   const duplicateReleaseIds = new Set(detail.actions.filter((action) => action.action_type === 'release_item'
     && action.status === 'completed' && typeof action.request?.plan_item_id === 'string'
     && expanded.has(`${action.run_id}:${action.request.plan_item_id}`)).map((action) => action.id))
-  return buildOrchestrationTimeline(detail).filter((item) => item.kind !== 'action' || !duplicateReleaseIds.has(item.id))
+  return buildOrchestrationTimeline(detail).filter((item) => (
+    item.kind !== 'action' || !duplicateReleaseIds.has(item.id) || item.id === retainActionId
+  ))
     .map((item) => {
     const mapped = ledgerKind(item)
     return {
@@ -303,18 +306,19 @@ function sanitizedDetail(value: unknown, debug: boolean) {
 }
 
 export function buildActivityEntries({
-  processes, decisions, warnings, detail,
+  processes, decisions, warnings, detail, retainActionId,
 }: {
   processes: readonly OrchestrationProcessRunRecord[]
   decisions: readonly OrchestrationAuthorityDecisionRecord[]
   warnings: readonly OrchestrationWarningRecord[]
   detail: OrchestrationGoalDetail
+  retainActionId?: string
 }): ActivityEntry[] {
   const perStep = processes.flatMap((process) => perStepEvents(process, decisions, warnings))
   const unscoped = decisions.flatMap((decision) => decision.source_process_run_id === null
     ? [answeredAuthorityDecisionEvent(decision, null)].filter((entry): entry is ActivityEntry => entry !== null)
     : [])
-  return [...perStep, ...unscoped, ...goalLedgerEntries(detail), ...derivedGoalEntries(detail)].sort((left, right) =>
+  return [...perStep, ...unscoped, ...goalLedgerEntries(detail, retainActionId), ...derivedGoalEntries(detail)].sort((left, right) =>
     right.timestamp.localeCompare(left.timestamp) || right.id.localeCompare(left.id))
 }
 
@@ -338,17 +342,27 @@ export interface ActivityLogProps {
   focusDecisionId?: string | null
   focusDecisionPending?: boolean
   onDecisionFocused?: () => void
+  focusSource?: Extract<NeedsYouSourceTarget, { kind: 'process' | 'action' }> | null
+  focusSourcePending?: boolean
+  onSourceFocused?: () => void
 }
 
 const LEDGER_PAGE_SIZE = 50
 
-export function ActivityLog({ processes, decisions, warnings, detail, selectedStepType, scope, onScopeChange, debug, focusDecisionId = null, focusDecisionPending = false, onDecisionFocused }: ActivityLogProps) {
+export function ActivityLog({ processes, decisions, warnings, detail, selectedStepType, scope, onScopeChange, debug, focusDecisionId = null, focusDecisionPending = false, onDecisionFocused, focusSource = null, focusSourcePending = false, onSourceFocused }: ActivityLogProps) {
   const [activeKinds, setActiveKinds] = useState<Set<string>>(new Set())
   const [visibleCount, setVisibleCount] = useState(LEDGER_PAGE_SIZE)
   const scheduledFocusId = useRef<string | null>(null)
-  const focusPendingRef = useRef(focusDecisionPending)
-  focusPendingRef.current = focusDecisionPending
-  const allEntries = buildActivityEntries({ processes, decisions, warnings, detail })
+  const focusTargets = useRef<Record<string, HTMLElement | null>>({})
+  const focusPendingRef = useRef(focusDecisionPending || focusSourcePending)
+  focusPendingRef.current = focusDecisionPending || focusSourcePending
+  const allEntries = buildActivityEntries({
+    processes,
+    decisions,
+    warnings,
+    detail,
+    retainActionId: focusSource?.kind === 'action' ? focusSource.id : undefined,
+  })
   const scopedEntries = scope === 'step' && selectedStepType
     ? allEntries.filter((entry) => entry.processType === selectedStepType)
     : allEntries
@@ -365,29 +379,43 @@ export function ActivityLog({ processes, decisions, warnings, detail, selectedSt
     setVisibleCount(LEDGER_PAGE_SIZE)
   }, [scope, selectedStepType])
 
-  useLayoutEffect(() => {
-    if (!focusDecisionId || !focusDecisionPending) return
-    setActiveKinds(new Set())
-    setVisibleCount(scopedEntries.length)
-  }, [focusDecisionId, focusDecisionPending, scopedEntries.length])
+  const selectedFocusAnchorId = focusDecisionId
+    ? `decision-${focusDecisionId}`
+    : focusSource
+      ? `${focusSource.kind}-${focusSource.id}`
+      : null
+  const pendingFocusAnchorId = focusDecisionPending && focusDecisionId
+    ? `decision-${focusDecisionId}`
+    : focusSourcePending && focusSource
+      ? `${focusSource.kind}-${focusSource.id}`
+      : null
 
   useLayoutEffect(() => {
-    if (!focusDecisionPending || !focusDecisionId) {
+    if (!pendingFocusAnchorId) return
+    setActiveKinds(new Set())
+    setVisibleCount(scopedEntries.length)
+  }, [pendingFocusAnchorId, scopedEntries.length])
+
+  useLayoutEffect(() => {
+    if (!pendingFocusAnchorId) {
       scheduledFocusId.current = null
       return
     }
-    if (scheduledFocusId.current === focusDecisionId || activeKinds.size > 0 || visibleCount !== scopedEntries.length) return
-    const target = document.getElementById?.(`decision-${focusDecisionId}`)
+    if (scheduledFocusId.current === pendingFocusAnchorId || activeKinds.size > 0 || visibleCount !== scopedEntries.length) return
+    const registeredTarget = focusTargets.current[pendingFocusAnchorId]
+    const documentTarget = document.getElementById?.(pendingFocusAnchorId)
+    const target = documentTarget === registeredTarget ? documentTarget : registeredTarget
     if (!target) return
-    scheduledFocusId.current = focusDecisionId
+    scheduledFocusId.current = pendingFocusAnchorId
     const focus = () => {
       target.scrollIntoView?.({ block: 'center' })
       target.focus()
-      onDecisionFocused?.()
+      if (focusDecisionPending) onDecisionFocused?.()
+      else onSourceFocused?.()
     }
     if (typeof requestAnimationFrame === 'function') requestAnimationFrame(focus)
     else focus()
-  }, [focusDecisionId, focusDecisionPending, onDecisionFocused, activeKinds.size, scopedEntries.length, visibleCount])
+  }, [pendingFocusAnchorId, focusDecisionPending, onDecisionFocused, onSourceFocused, activeKinds.size, scopedEntries.length, visibleCount])
 
   function toggleKind(kind: string) {
     setActiveKinds((current) => {
@@ -434,7 +462,13 @@ export function ActivityLog({ processes, decisions, warnings, detail, selectedSt
             const heading = dateHeading(entry.timestamp)
             const boundary = index === 0 || heading !== dateHeading(entries[index - 1].timestamp)
             return (
-              <li key={entry.id} id={entry.anchorId} tabIndex={entry.anchorId === `decision-${focusDecisionId}` ? -1 : undefined} className="py-3 first:pt-0 last:pb-0">
+              <li
+                key={entry.id}
+                id={entry.anchorId}
+                ref={(element) => { if (entry.anchorId) focusTargets.current[entry.anchorId] = element }}
+                tabIndex={entry.anchorId === selectedFocusAnchorId ? -1 : undefined}
+                className="py-3 first:pt-0 last:pb-0"
+              >
                 {boundary && (
                   <div role="separator" aria-label={heading} className="mb-2 text-xs font-semibold text-huddleroom-text-muted">
                     {heading}

@@ -127,6 +127,7 @@ async def meeting_commitments(db: AsyncSession, run: OrchestrationRun) -> list[d
             "id": str(item.id),
             "meeting_id": str(item.meeting_id),
             "meeting_title": meetings[item.meeting_id].title,
+            "created_at": item.created_at.isoformat() if item.created_at is not None else None,
             "graph_run_id": str(item.graph_run_id) if item.graph_run_id else None,
             "description": item.description,
             "state": state,

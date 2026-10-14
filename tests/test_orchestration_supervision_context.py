@@ -1,3 +1,4 @@
+import json
 import uuid
 from types import SimpleNamespace
 
@@ -281,10 +282,12 @@ async def test_context_exposes_meeting_commitments(db_session, test_project):
 
     assert context["meeting_commitments"] == [{
         "id": str(item.id), "meeting_id": str(meeting.id), "meeting_title": "Sync", "graph_run_id": None,
+        "created_at": item.created_at.isoformat(),
         "description": "Follow up", "state": "open",
         "task_id": None, "reason": "no task or resolution", "fulfilled": False,
         "suggested_actions": ["create_delegation_task", "ask_human", "resolve_meeting_action_item"],
     }]
+    json.dumps(context["meeting_commitments"])
 
 
 async def test_context_includes_roster_snapshot(db_session, test_project):

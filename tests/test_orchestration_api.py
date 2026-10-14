@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func, inspect as sa_inspect, select
 
+from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.orchestration import (
     OrchestrationAction,
@@ -1126,18 +1127,36 @@ async def test_ordinary_decisions_stay_backward_compatible_with_null_recovery(
 
 
 @pytest.mark.asyncio
-async def test_goal_detail_projects_current_unfulfilled_meeting_commitments(client, db_session, test_project):
+async def test_spr210_goal_detail_projects_current_unfulfilled_meeting_commitments(client, db_session, test_project):
     from tests.test_orchestration_delegation_contracts import _make_run
     from tests.test_orchestration_progress_view import _task, _meeting, _action_item
     _, goal, run = await _make_run(db_session, test_project.id)
     source = await _task(db_session, test_project, run)
     meeting = await _meeting(db_session, test_project, source)
+    blocker_only_meeting = await _meeting(
+        db_session, test_project, source, title="BLOCKER-ONLY MEETING MUST STAY HIDDEN",
+    )
+    blocker_only_agent = Agent(
+        name=f"BLOCKER-ONLY AGENT MUST STAY HIDDEN {uuid.uuid4()}", role="manager",
+        provider="openai", model="gpt-4o-mini", adapter_type="api",
+        capabilities=["coordination"], config={}, is_active=True,
+    )
+    db_session.add(blocker_only_agent)
+    await db_session.flush()
     live = await _task(db_session, test_project, run, status="in_progress")
     tracked = await _action_item(db_session, meeting, description="Live obligation", task_id=live.id, status="task_created")
     open_item = await _action_item(db_session, meeting, description="Open obligation")
     await _action_item(db_session, meeting, description="Waived", status="dismissed")
     done = await _task(db_session, test_project, run, status="done")
-    await _action_item(db_session, meeting, description="Fulfilled", task_id=done.id, status="task_created")
+    fulfilled_only_meeting = await _meeting(db_session, test_project, source, title="Fulfilled only")
+    await _action_item(
+        db_session, fulfilled_only_meeting, description="Fulfilled", task_id=done.id, status="task_created",
+    )
+    run.active_blockers = [{
+        "kind": "task_blocked", "reason": "Only typed blocker fields are references", "task_id": str(live.id),
+        "agent_id": str(blocker_only_agent.id), "meeting_id": str(blocker_only_meeting.id),
+        "goal_id": str(goal.id), "action_id": str(uuid.uuid4()), "process_run_id": str(uuid.uuid4()),
+    }]
     # A historical run of this same goal must not bleed into the current projection.
     from datetime import timedelta
     historical = OrchestrationRun(goal_id=goal.id, status="cancelled", phase="completed", started_at=run.started_at - timedelta(days=1))
@@ -1152,10 +1171,23 @@ async def test_goal_detail_projects_current_unfulfilled_meeting_commitments(clie
     assert commitments[str(tracked.id)] == {
         "id": str(tracked.id), "meeting_id": str(meeting.id), "meeting_title": meeting.title,
         "description": "Live obligation", "state": "task_in_flight", "task_id": str(live.id),
-        "graph_run_id": None, "reason": "linked task still in flight",
+        "graph_run_id": None, "reason": "linked task still in flight", "created_at": tracked.created_at.isoformat(),
     }
     assert commitments[str(open_item.id)]["state"] == "open"
     assert commitments[str(open_item.id)]["task_id"] is None
+    references = {
+        (reference["kind"], reference["id"]): reference
+        for reference in response.json()["needs_you_references"]
+    }
+    assert references[("goal", str(goal.id))]["label"] == goal.objective
+    assert references[("meeting", str(meeting.id))]["label"] == meeting.title
+    assert references[("task", str(live.id))]["label"] == live.title
+    assert ("meeting", str(blocker_only_meeting.id)) not in references
+    assert ("agent", str(blocker_only_agent.id)) not in references
+    assert ("meeting", str(fulfilled_only_meeting.id)) not in references
+    assert ("task", str(done.id)) not in references
+    assert blocker_only_meeting.title not in response.text
+    assert blocker_only_agent.name not in response.text
 
 
 @pytest.mark.asyncio

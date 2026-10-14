@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 import pytest
 
@@ -34,6 +35,17 @@ async def test_assigned_without_completion_and_open(db_session, test_project):
     await _action_item(db_session, meeting, description="Other")
     states = {e["description"]: e["state"] for e in await meeting_commitments(db_session, run)}
     assert states["Other"] == "open"
+
+
+async def test_spr212_meeting_occurrence_uses_action_item_creation(db_session, test_project):
+    run, meeting = await _setup(db_session, test_project)
+    occurred_at = datetime(2026, 10, 14, 9, 30, 15)
+    item = await _action_item(db_session, meeting, created_at=occurred_at)
+
+    entry = await _one(db_session, run)
+
+    assert entry["id"] == str(item.id)
+    assert entry["created_at"] == occurred_at.isoformat()
 
 
 @pytest.mark.parametrize("status", ["failed", "blocked", "cancelled"])

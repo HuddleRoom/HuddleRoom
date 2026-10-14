@@ -1237,6 +1237,7 @@ class OrchestrationMeetingCommitmentResponse(BaseModel):
     id: uuid.UUID
     meeting_id: uuid.UUID
     meeting_title: str
+    created_at: datetime | None = None
     description: str
     state: str
     task_id: uuid.UUID | None
@@ -1279,6 +1280,7 @@ class OrchestrationGoalDetailResponse(BaseModel):
     effective_authorization: AuthorizationResult | None = None
     authorization_wait: OrchestrationAuthorizationWaitResponse | None = None
     capacity_wait: OrchestrationCapacityWaitResponse | None = None
+    needs_you_references: list["NeedsYouReference"] | None = None
 
 
 class OrchestrationProcessRunResponse(BaseModel):
@@ -1359,6 +1361,7 @@ class OrchestrationWarningResponse(BaseModel):
     resolved_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    needs_you_references: list["NeedsYouReference"] | None = None
 
     @computed_field  # type: ignore[misc]
     @property
@@ -1377,6 +1380,17 @@ class OrchestrationWarningReasonRequest(BaseModel):
     @classmethod
     def _validate_reason(cls, value: str) -> str:
         return _require_nonblank_reason(value)
+
+
+NeedsYouReferenceKind = Literal["task", "meeting", "agent", "goal", "gate", "process", "action"]
+
+
+class NeedsYouReference(BaseModel):
+    kind: NeedsYouReferenceKind
+    id: uuid.UUID
+    project_id: uuid.UUID
+    goal_id: uuid.UUID | None = None
+    label: str | None = None
 
 
 class OrchestrationAuthorityDecisionResponse(BaseModel):
@@ -1414,6 +1428,7 @@ class OrchestrationAuthorityDecisionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     recovery: RecoveryProposalResponse | None = None
+    needs_you_references: list[NeedsYouReference] | None = None
 
 
 class OrchestrationDecisionAnswerResponse(BaseModel):

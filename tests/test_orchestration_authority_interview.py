@@ -127,28 +127,68 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.services.orchestration_authority_interview import build_checkpoint
 
 
-def _decision(*, authority="human", asked_at=None) -> OrchestrationAuthorityDecision:
+def _decision(
+    *, authority="human", asked_at=None, created_at=None, decision_id=None,
+    decision_key=None, status="pending",
+) -> OrchestrationAuthorityDecision:
     return OrchestrationAuthorityDecision(
-        id=uuid.uuid4(),
+        id=decision_id or uuid.uuid4(),
         goal_id=uuid.uuid4(),
-        decision_key=str(uuid.uuid4()),
+        decision_key=decision_key or str(uuid.uuid4()),
         title="t",
+        status=status,
         authority=authority,
         question="q",
         options=[],
         asked_at=asked_at or datetime.now(timezone.utc),
-        created_at=asked_at or datetime.now(timezone.utc),
+        created_at=created_at or asked_at or datetime.now(timezone.utc),
     )
 
 
-def test_build_checkpoint_caps_at_max_questions_oldest_first():
-    base = datetime.now(timezone.utc)
-    decisions = [_decision(asked_at=base + timedelta(seconds=i)) for i in range(7)]
+@pytest.mark.parametrize("naive", [False, True], ids=["utc", "sqlite-naive-utc"])
+@pytest.mark.parametrize(
+    "insertion_order",
+    [tuple(range(17)), tuple(reversed(range(17))), (8, 2, 14, 0, 16, 5, 10, 1, 13, 7, 3, 15, 4, 12, 6, 11, 9)],
+    ids=["forward", "reverse", "shuffled"],
+)
+def test_spr212_checkpoint_selects_newest_before_cap(naive, insertion_order):
+    base = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
 
-    checkpoint, deferred = build_checkpoint(decisions, max_questions=5)
+    def at(second):
+        value = base + timedelta(seconds=second)
+        return value.replace(tzinfo=None) if naive else value
 
-    assert [d.id for d in checkpoint] == [d.id for d in decisions[:5]]
-    assert [d.id for d in deferred] == [d.id for d in decisions[5:]]
+    # Equal-time rows prove the UUID tie break; seven proposals prove that an
+    # atomic proposal batch is never split by the independent-question cap.
+    regular = [
+        _decision(
+            asked_at=at(second), created_at=at(second), decision_id=uuid.UUID(int=100 + index),
+            decision_key=f"clarification:{index}",
+        )
+        for index, second in enumerate((1, 2, 3, 4, 5, 6, 7, 7))
+    ]
+    proposals = [
+        _decision(
+            asked_at=at(10 + index), created_at=at(10 + index), decision_id=uuid.UUID(int=10 + index),
+            decision_key=f"agent_definition_review:proposal:{index}",
+        )
+        for index in range(7)
+    ]
+    nonhuman = _decision(
+        authority="manager", asked_at=at(30), created_at=at(30), decision_id=uuid.UUID(int=900),
+        decision_key="manager-only",
+    )
+    superseded = _decision(
+        asked_at=at(40), created_at=at(40), decision_id=uuid.UUID(int=901),
+        decision_key="superseded", status="cancelled",
+    )
+    candidates = regular + proposals + [nonhuman, superseded]
+
+    checkpoint, deferred = build_checkpoint([candidates[index] for index in insertion_order], max_questions=5)
+
+    expected_checkpoint = list(reversed(proposals)) + [regular[6], regular[7], regular[5], regular[4], regular[3]]
+    assert [row.id for row in checkpoint] == [row.id for row in expected_checkpoint]
+    assert [row.id for row in deferred] == [regular[2].id, regular[1].id, regular[0].id]
 
 
 def test_build_checkpoint_excludes_non_human_authority():
@@ -177,6 +217,7 @@ def test_build_checkpoint_never_defers_agent_definition_review_proposals():
             goal_id=uuid.uuid4(),
             decision_key=f"agent_definition_review:proposal:{uuid.uuid4()}",
             title=f"Agent {i}",
+            status="pending",
             authority="human",
             question=f"Approve agent {i}?",
             options=[],
@@ -194,7 +235,7 @@ def test_build_checkpoint_never_defers_agent_definition_review_proposals():
     assert deferred == []
 
 
-def test_build_checkpoint_caps_non_proposals_but_keeps_all_proposals():
+def test_spr212_checkpoint_caps_non_proposals_but_keeps_all_proposals():
     """Mixed: some proposal decisions + some non-proposal human decisions,
     with non-proposal count > max_questions: ALL proposal decisions are in
     checkpoint, and the non-proposal ones are capped at max_questions."""
@@ -206,6 +247,7 @@ def test_build_checkpoint_caps_non_proposals_but_keeps_all_proposals():
             goal_id=uuid.uuid4(),
             decision_key=f"agent_definition_review:proposal:{uuid.uuid4()}",
             title=f"Agent {i}",
+            status="pending",
             authority="human",
             question=f"Approve agent {i}?",
             options=[],
@@ -221,6 +263,7 @@ def test_build_checkpoint_caps_non_proposals_but_keeps_all_proposals():
             goal_id=uuid.uuid4(),
             decision_key=f"clarification:{i}",
             title=f"Question {i}",
+            status="pending",
             authority="human",
             question=f"What about {i}?",
             options=[],
@@ -233,26 +276,14 @@ def test_build_checkpoint_caps_non_proposals_but_keeps_all_proposals():
 
     checkpoint, deferred = build_checkpoint(all_decisions, max_questions=5)
 
-    # All 3 proposals + first 5 regular questions = 8 in checkpoint
+    # All 3 proposals + newest 5 regular questions = 8 in checkpoint
     assert len(checkpoint) == 8
     proposals_in_checkpoint = [d for d in checkpoint if d.decision_key.startswith("agent_definition_review:proposal:")]
     regulars_in_checkpoint = [d for d in checkpoint if not d.decision_key.startswith("agent_definition_review:proposal:")]
     assert len(proposals_in_checkpoint) == 3
     assert len(regulars_in_checkpoint) == 5
-    # Remaining 3 regular questions are deferred
-    assert len(deferred) == 3
-    assert all(not d.decision_key.startswith("agent_definition_review:proposal:") for d in deferred)
-
-
-def test_build_checkpoint_preserves_pure_non_proposal_capping():
-    """Preserve existing behavior for pure non-proposal case: cap still applies."""
-    base = datetime.now(timezone.utc)
-    decisions = [_decision(asked_at=base + timedelta(seconds=i)) for i in range(7)]
-
-    checkpoint, deferred = build_checkpoint(decisions, max_questions=5)
-
-    assert [d.id for d in checkpoint] == [d.id for d in decisions[:5]]
-    assert [d.id for d in deferred] == [d.id for d in decisions[5:]]
+    assert [d.id for d in regulars_in_checkpoint] == [d.id for d in reversed(regular[-5:])]
+    assert [d.id for d in deferred] == [d.id for d in reversed(regular[:3])]
 
 
 @pytest.mark.asyncio
@@ -288,7 +319,10 @@ async def test_build_checkpoint_after_rerun_excludes_superseded_process_question
     assert deferred == []
 
 
-from huddleroom.services.orchestration_authority_interview import sync_deferred_questions_memory
+from huddleroom.services.orchestration_authority_interview import (
+    OPEN_QUESTIONS_SECTION_KEY,
+    sync_deferred_questions_memory,
+)
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
 
 
@@ -349,6 +383,48 @@ async def test_sync_deferred_questions_memory_skips_write_when_empty_and_no_sect
 
     section = await OrchestrationMemoryService().get_section(db_session, goal.project_id, goal.id, "open_questions")
     assert section is None
+
+
+@pytest.mark.asyncio
+async def test_spr212_deferred_memory_matches_selection(db_session, make_goal, make_run):
+    goal = make_goal()
+    run = make_run(goal)
+    db_session.add_all([goal, run])
+    await db_session.flush()
+    base = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+    decisions = [
+        OrchestrationAuthorityDecision(
+            id=uuid.UUID(int=1_000 + index), goal_id=goal.id, decision_key=f"deferred-order:{index}",
+            title=f"Question {index}", status="pending", authority="human", question=f"Body {index}", options=[],
+            asked_at=base + timedelta(seconds=index), created_at=base + timedelta(seconds=index),
+        )
+        for index in range(7)
+    ]
+    _checkpoint, deferred = build_checkpoint(decisions, max_questions=3)
+
+    await sync_deferred_questions_memory(db_session, goal, run, deferred)
+
+    section = await OrchestrationMemoryService().get_section(
+        db_session, goal.project_id, goal.id, OPEN_QUESTIONS_SECTION_KEY,
+    )
+    assert section is not None
+    assert section.body.splitlines() == [
+        "- Question 3: Body 3", "- Question 2: Body 2", "- Question 1: Body 1", "- Question 0: Body 0",
+    ]
+    assert section.summary == "4 question(s) deferred from the kickoff checkpoint."
+
+    await sync_deferred_questions_memory(db_session, goal, run, [])
+    await db_session.refresh(section)
+    assert section.body == "No open questions are currently deferred from the kickoff checkpoint."
+
+    untouched_goal = make_goal()
+    untouched_run = make_run(untouched_goal)
+    db_session.add_all([untouched_goal, untouched_run])
+    await db_session.flush()
+    await sync_deferred_questions_memory(db_session, untouched_goal, untouched_run, [])
+    assert await OrchestrationMemoryService().get_section(
+        db_session, untouched_goal.project_id, untouched_goal.id, OPEN_QUESTIONS_SECTION_KEY,
+    ) is None
 
 
 from huddleroom.schemas.orchestration import (
@@ -737,7 +813,7 @@ async def test_answer_decision_endpoint_guards_nulled_authority_agent(client, db
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_endpoint_caps_and_reports_deferred_count(client, db_session, test_project):
+async def test_spr212_checkpoint_endpoint_matches_builder_after_newest_first_cap(client, db_session, test_project):
     service = OrchestrationService()
     goal, run = await service.create_goal(
         db_session,
@@ -749,11 +825,22 @@ async def test_checkpoint_endpoint_caps_and_reports_deferred_count(client, db_se
         created_by_user_id=None,
     )
     decision_service = OrchestrationAuthorityDecisionService()
+    base = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+    decisions = []
     for i in range(7):
-        await decision_service.create_pending(
+        decision = await decision_service.create_pending(
             db_session, goal.id, decision_key=f"test:checkpoint-{i}", title=f"Q{i}",
             question=f"Question {i}?", authority="human", run_id=run.id,
         )
+        decision.asked_at = base + timedelta(seconds=i)
+        decision.created_at = base + timedelta(seconds=i)
+        decisions.append(decision)
+    stale = await decision_service.create_pending(
+        db_session, goal.id, decision_key="test:checkpoint-superseded", title="Superseded",
+        question="Old question?", authority="human", run_id=run.id,
+    )
+    stale.asked_at = base + timedelta(seconds=30)
+    await decision_service.cancel_decision(db_session, stale, reason="superseded")
     await db_session.flush()
 
     resp = await client.get(
@@ -762,8 +849,13 @@ async def test_checkpoint_endpoint_caps_and_reports_deferred_count(client, db_se
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert len(body["items"]) == 5
+    pending = await decision_service.list_decisions(db_session, goal.id, status="pending")
+    expected, deferred = build_checkpoint(pending, max_questions=body["max_questions"])
+    expected_ids = [str(decision.id) for decision in reversed(decisions[-5:])]
+    assert [item["id"] for item in body["items"]] == expected_ids
+    assert [item["id"] for item in body["items"]] == [str(decision.id) for decision in expected]
     assert body["deferred_count"] == 2
+    assert body["deferred_count"] == len(deferred)
     assert body["max_questions"] == 5
 
 

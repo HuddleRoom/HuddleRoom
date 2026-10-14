@@ -14,6 +14,7 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+from huddleroom.services.orchestration_needs_you_presenter import attach_warning_references
 
 router = APIRouter()
 orchestration_service = OrchestrationService()
@@ -47,7 +48,8 @@ async def list_warnings(
     db: AsyncSession = Depends(get_db),
 ):
     await _goal_or_404(db, project_id, goal_id)
-    return await warning_service.list_warnings(db, goal_id, active_only=active_only)
+    warnings = await warning_service.list_warnings(db, goal_id, active_only=active_only)
+    return await attach_warning_references(db, project_id=project_id, warnings=warnings)
 
 
 @router.post("/warnings/{warning_id}/acknowledge", response_model=OrchestrationWarningResponse)

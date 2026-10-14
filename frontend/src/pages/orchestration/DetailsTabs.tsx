@@ -21,6 +21,7 @@ import { ActivityLog, type ActivityScope } from './ActivityLog'
 import { BASELINE_PROCESS_TYPES, errorRecord, processLabel } from './humanize'
 import { useGoalAnnouncer } from './goalAnnouncer'
 import { PlanTab } from './PlanTab'
+import type { NeedsYouSourceTarget } from './needsYouPresentation'
 
 export { ChildGoalList, PlanItemList, PlanOverview, PlanTab } from './PlanTab'
 
@@ -173,6 +174,7 @@ export interface DetailsTabsHandle {
   // Shows a cited decision even when the operator was viewing another tab or
   // had narrowed the ledger to a step or event kind.
   showDecisionActivity: (decisionId: string) => void
+  showSourceRecord: (target: NeedsYouSourceTarget) => void
   // Switches to the Debug tab. Threaded down to the action row's "Danger
   // zone" text link. No-op when the Debug tab isn't rendered (!debug).
   showDebugTab: () => void
@@ -183,6 +185,7 @@ export interface DetailsTabsProps {
   goalId: string
   detail: OrchestrationGoalDetail
   processes: readonly OrchestrationProcessRunRecord[]
+  sourceProcesses?: readonly OrchestrationProcessRunRecord[]
   decisions: readonly OrchestrationAuthorityDecisionRecord[]
   warnings: readonly OrchestrationWarningRecord[]
   selectedStepType: OrchestrationBaselineProcessType | null
@@ -209,7 +212,7 @@ const BASE_TABS: { key: DetailsTabKey; label: string }[] = [
 ]
 
 export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(function DetailsTabs({
-  projectId, goalId, detail, processes, decisions, warnings, selectedStepType, memory, debug,
+  projectId, goalId, detail, processes, sourceProcesses = processes, decisions, warnings, selectedStepType, memory, debug,
   goalPlanContent, taskTitles, agentRoles, gatesContent, delegationsContent, suggestionsContent, debugContent, decisionFocusId = null, decisionNavigation = null,
 }, ref) {
   const tabs = debug ? [...BASE_TABS, { key: 'debug' as const, label: 'Debug' }] : BASE_TABS
@@ -217,16 +220,71 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
   const [activityScope, setActivityScope] = useState<ActivityScope>('goal')
   const [focusDecisionId, setFocusDecisionId] = useState<string | null>(null)
   const [focusDecisionPending, setFocusDecisionPending] = useState(false)
+  const [focusSource, setFocusSource] = useState<Extract<NeedsYouSourceTarget, { kind: 'process' | 'action' }> | null>(null)
+  const [focusSourcePending, setFocusSourcePending] = useState(false)
+  const [focusedProcessType, setFocusedProcessType] = useState<OrchestrationBaselineProcessType | null>(null)
+  const [focusGateId, setFocusGateId] = useState<string | null>(null)
   const [focusDangerZonePending, setFocusDangerZonePending] = useState(false)
   const sectionRef = useRef<HTMLElement | null>(null)
   const handledDecisionNavigation = useRef<string | null>(null)
 
   function showDecisionActivity(decisionId: string) {
+    setFocusSource(null)
+    setFocusSourcePending(false)
     setActiveTab('ledger')
     setActivityScope('goal')
     setFocusDecisionId(decisionId)
     setFocusDecisionPending(true)
   }
+
+  function showSourceRecord(target: NeedsYouSourceTarget) {
+    if (target.goalId !== goalId) return
+    if (target.kind === 'gate') {
+      if (!detail.gates.some((gate) => gate.id === target.id)) return
+      setFocusDecisionId(null)
+      setFocusDecisionPending(false)
+      setFocusSource(null)
+      setFocusSourcePending(false)
+      setActiveTab('gates')
+      setFocusGateId(target.id)
+      return
+    }
+    if (target.kind === 'action') {
+      if (!detail.actions.some((action) => action.id === target.id)) return
+      setFocusDecisionId(null)
+      setFocusDecisionPending(false)
+      setActiveTab('ledger')
+      setActivityScope('goal')
+      setFocusSource(target)
+      setFocusSourcePending(true)
+      return
+    }
+
+    const process = sourceProcesses.find((candidate) => candidate.id === target.id)
+    if (!process || !BASELINE_PROCESS_TYPES.includes(process.process_type as OrchestrationBaselineProcessType)) return
+    setFocusDecisionId(null)
+    setFocusDecisionPending(false)
+    const processType = process.process_type as OrchestrationBaselineProcessType
+    setFocusedProcessType(processType)
+    setActiveTab('ledger')
+    setActivityScope('step')
+    setFocusSource(target)
+    setFocusSourcePending(true)
+  }
+
+  useLayoutEffect(() => {
+    if (activeTab !== 'gates' || !focusGateId) return
+    afterLayout(() => {
+      const targetId = `gate-${focusGateId}`
+      const scopedTarget = findDescendantById(sectionRef.current, targetId)
+      const documentTarget = document.getElementById?.(targetId)
+      const target = documentTarget === scopedTarget ? documentTarget : scopedTarget
+      target?.setAttribute('tabindex', '-1')
+      target?.scrollIntoView?.({ block: 'center' })
+      target?.focus({ preventScroll: true })
+    })
+    setFocusGateId(null)
+  }, [activeTab, focusGateId])
 
   useLayoutEffect(() => {
     if (activeTab !== 'debug' || !focusDangerZonePending) return
@@ -252,6 +310,9 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
     showStepActivity: () => {
       setFocusDecisionId(null)
       setFocusDecisionPending(false)
+      setFocusSource(null)
+      setFocusSourcePending(false)
+      setFocusedProcessType(null)
       setActiveTab('ledger')
       setActivityScope('step')
       afterLayout(() => {
@@ -263,12 +324,20 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
       })
     },
     showDecisionActivity,
+    showSourceRecord,
     showDebugTab: () => {
       if (!debug) return
       setActiveTab('debug')
       setFocusDangerZonePending(true)
     },
   }))
+
+  const focusedHistoricalProcess = focusSource?.kind === 'process'
+    ? sourceProcesses.find((process) => process.id === focusSource.id)
+    : undefined
+  const activityProcesses = focusedHistoricalProcess && !processes.some((process) => process.id === focusedHistoricalProcess.id)
+    ? [...processes, focusedHistoricalProcess]
+    : processes
 
   return (
     <section ref={sectionRef} aria-labelledby="details-tabs-heading" className="overflow-hidden rounded-md border border-huddleroom-border bg-huddleroom-surface">
@@ -294,13 +363,24 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
           <div className="flex flex-col gap-4">
             <Button type="button" variant="secondary" onClick={() => window.dispatchEvent?.(new CustomEvent('orchestration-open-chat', { detail: { projectId, goalId } }))}>Open conversation</Button>
             <ActivityLog
-              processes={processes} decisions={decisions} warnings={warnings} detail={detail} selectedStepType={selectedStepType}
+              processes={activityProcesses} decisions={decisions} warnings={warnings} detail={detail}
+              selectedStepType={focusSource?.kind === 'process' ? focusedProcessType : selectedStepType}
               scope={activityScope}
-              onScopeChange={(scope) => { setFocusDecisionId(null); setFocusDecisionPending(false); setActivityScope(scope) }}
+              onScopeChange={(scope) => {
+                setFocusDecisionId(null)
+                setFocusDecisionPending(false)
+                setFocusSource(null)
+                setFocusSourcePending(false)
+                setFocusedProcessType(null)
+                setActivityScope(scope)
+              }}
               debug={debug}
               focusDecisionId={focusDecisionId}
               focusDecisionPending={focusDecisionPending}
               onDecisionFocused={() => setFocusDecisionPending(false)}
+              focusSource={focusSource}
+              focusSourcePending={focusSourcePending}
+              onSourceFocused={() => setFocusSourcePending(false)}
             />
           </div>
         </Panel>

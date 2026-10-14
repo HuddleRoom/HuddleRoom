@@ -13,8 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationRun
-from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.models.agent import Agent
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationRun
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
+from huddleroom.models.task import Task
 from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
 from huddleroom.services.orchestration_service import OrchestrationService
 
@@ -102,6 +104,95 @@ async def test_checkpoint_route_projects_recovery_too(client, db_session, auth_h
     _, _, _, decision = await diagnosed(db_session, goal, run, test_agent)
     item, _ = await get_decision(client, auth_headers, goal, decision, "/checkpoint")
     assert item["recovery"]["status"] == "pending_approval"
+
+
+@pytest.mark.asyncio
+async def test_spr210_projection_preserves_safe_source_and_contract(
+    client, db_session, auth_headers, goal_run, test_agent, monkeypatch,
+):
+    goal, run = goal_run
+    _, _, proposal, decision = await diagnosed(db_session, goal, run, test_agent)
+    expected_source_id = proposal.request["source"]["id"]
+    evidence_task = Task(
+        project_id=goal.project_id, title="Validated recovery evidence task", status="blocked", metadata_={},
+    )
+    evidence_gate = OrchestrationGate(
+        run_id=run.id, success_criterion_key="validated-evidence", gate_type="work_completed",
+        required_evidence={},
+    )
+    evidence_process = OrchestrationProcessRun(
+        goal_id=goal.id, run_id=run.id, process_type="authority_interview", status="waiting_decision",
+        trigger_reason="validated recovery evidence", input_snapshot={}, outputs={},
+    )
+    evidence_action = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"spr210:evidence:{uuid.uuid4()}", action_type="request_plan",
+        request={},
+    )
+    raw_agent = Agent(
+        name=f"RAW RECOVERY AGENT MUST STAY HIDDEN {uuid.uuid4()}", role="manager",
+        provider="openai", model="gpt-4o-mini", adapter_type="api",
+        capabilities=["coordination"], config={}, is_active=True,
+    )
+    db_session.add_all([raw_agent, evidence_task, evidence_gate, evidence_process, evidence_action])
+    await db_session.flush()
+    proposal.request = {
+        **proposal.request,
+        "source": {"kind": "agent", "id": str(raw_agent.id), "agent_id": str(raw_agent.id)},
+    }
+    proposal.dispatch_contract = {
+        **(proposal.dispatch_contract or {}),
+        "tool_receipt_v1": {"target_refs": [{"kind": "agent", "id": str(raw_agent.id)}]},
+    }
+    flag_modified(proposal, "request")
+    flag_modified(proposal, "dispatch_contract")
+    unbound_receipt = await wrapper(
+        db_session, run, proposal, "recovery_apply", "unbound-reference", "reserved",
+    )
+    unbound_receipt.dispatch_contract = {
+        "tool_receipt_v1": {"target_refs": [{"kind": "agent", "id": str(raw_agent.id)}]},
+    }
+    flag_modified(unbound_receipt, "dispatch_contract")
+    recovery_context = json.loads(decision.context)
+    recovery_context["problem"] = f"Planning cannot start. {SECRET}"
+    recovery_context["evidence"] = [
+        {"label": kind, "value": {}, "source_kind": kind, "source_id": str(record_id)}
+        for kind, record_id in (
+            ("action", evidence_action.id), ("task", evidence_task.id), ("gate", evidence_gate.id),
+            ("process", evidence_process.id), ("agent", test_agent.id),
+        )
+    ]
+    decision.context = json.dumps(recovery_context)
+    await db_session.flush()
+    provider_call = AsyncMock(side_effect=AssertionError("read-only projection must not call a provider"))
+    monkeypatch.setattr("litellm.acompletion", provider_call)
+    source_snapshot = {
+        "id": str(decision.id), "decision_key": decision.decision_key, "title": decision.title,
+        "question": decision.question, "options": decision.options, "recommendation": decision.recommendation,
+        "consequences": decision.consequences, "related_action_id": str(decision.related_action_id),
+    }
+    session_state = (set(db_session.new), set(db_session.dirty), set(db_session.deleted))
+
+    item, _ = await get_decision(client, auth_headers, goal, decision)
+
+    assert item["context"] is None
+    assert {key: item[key] for key in (
+        "id", "decision_key", "title", "question", "options", "recommendation", "consequences",
+        "related_action_id",
+    )} == source_snapshot
+    assert item["recovery"]["proposal_id"] == proposal.request["proposal_id"]
+    assert item["recovery"]["source_blocker_id"] == expected_source_id
+    assert SECRET not in json.dumps(item)
+    provider_call.assert_not_awaited()
+    assert (set(db_session.new), set(db_session.dirty), set(db_session.deleted)) == session_state
+    assert "needs_you_references" in item, "safe recovery projection must append typed source references"
+    references = {(reference["kind"], reference["id"]): reference for reference in item["needs_you_references"]}
+    assert references[("action", str(evidence_action.id))]["label"] == evidence_action.action_type
+    assert references[("task", str(evidence_task.id))]["label"] == evidence_task.title
+    assert references[("gate", str(evidence_gate.id))]["label"] == evidence_gate.success_criterion_key
+    assert references[("process", str(evidence_process.id))]["label"] == evidence_process.process_type
+    assert references[("agent", str(test_agent.id))]["label"] == test_agent.name
+    assert ("agent", str(raw_agent.id)) not in references
+    assert raw_agent.name not in json.dumps(item)
 
 
 @pytest.mark.asyncio

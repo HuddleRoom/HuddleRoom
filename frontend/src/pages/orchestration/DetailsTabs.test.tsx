@@ -330,6 +330,137 @@ describe('DetailsTabs', () => {
     } finally { view.cleanup() }
   })
 
+  it('SPR210 source navigation reveals the actual gate process and action', async () => {
+    const ref = createRef<DetailsTabsHandle>()
+    const actions = Array.from({ length: 51 }, (_, index) => ({
+      id: `action-${index}`, run_id: 'run-1', decision_id: null, action_type: 'delegate', status: 'completed' as const,
+      request: { reason: `Action ${index}` }, target_type: null, target_id: null, error: null,
+      created_at: `2026-08-05T${String(index % 24).padStart(2, '0')}:00:00Z`,
+    }))
+    const targetProcess = process({ id: 'process-target', process_type: 'manager_selection' })
+    const onSelectProcessType = vi.fn()
+    const view = await mount({
+      handleRef: ref,
+      processes: [targetProcess],
+      selectedStepType: 'goal_definition',
+      detail: goalDetail({ actions, gates: [{ id: 'gate-target' }] as never }),
+      gatesContent: <article id="gate-gate-target">Target gate</article>,
+      onSelectProcessType,
+    })
+    try {
+      const focusedIds: string[] = []
+      const scrolledIds: string[] = []
+      ;(view.document as unknown as { getElementById: (id: string) => HTMLElement | null }).getElementById = (id) => {
+        const target = descendants(view.container).find((node) => node.getAttribute('id') === id)
+        if (target) Object.assign(target, {
+          focus: () => focusedIds.push(id),
+          scrollIntoView: () => scrolledIds.push(id),
+        })
+        return target as unknown as HTMLElement ?? null
+      }
+      const handle = ref.current as DetailsTabsHandle & {
+        showSourceRecord?: (target: { kind: 'gate' | 'process' | 'action'; id: string; goalId: string }) => void
+      }
+      await act(async () => handle.showSourceRecord?.({ kind: 'gate', id: 'gate-target', goalId: 'goal-1' }))
+      expect(tabPanel(view.container, 'gates').getAttribute('hidden')).toBeNull()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'gate-gate-target')?.getAttribute('tabindex')).toBe('-1')
+      expect(focusedIds).toContain('gate-gate-target')
+
+      await act(async () => handle.showSourceRecord?.({ kind: 'action', id: 'action-0', goalId: 'goal-1' }))
+      expect(tabPanel(view.container, 'ledger').getAttribute('hidden')).toBeNull()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'action-action-0')).toBeDefined()
+      expect(focusedIds).toContain('action-action-0')
+
+      await act(async () => handle.showSourceRecord?.({ kind: 'process', id: 'process-target', goalId: 'goal-1' }))
+      expect(getButton(view.container, 'This step').getAttribute('aria-pressed')).toBe('true')
+      expect(onSelectProcessType).not.toHaveBeenCalled()
+      expect(focusedIds).toContain('process-process-target')
+      expect(scrolledIds).toEqual(expect.arrayContaining(['gate-gate-target', 'action-action-0', 'process-process-target']))
+
+      await act(async () => getButton(view.container, 'Plan').click())
+      const focusCount = focusedIds.length
+      await act(async () => handle.showSourceRecord?.({ kind: 'gate', id: 'missing-gate', goalId: 'goal-1' }))
+      await act(async () => handle.showSourceRecord?.({ kind: 'gate', id: 'gate-target', goalId: 'other-goal' }))
+      expect(tabPanel(view.container, 'plan').getAttribute('hidden')).toBeNull()
+      expect(focusedIds).toHaveLength(focusCount)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 fixround1 leaves the selected decision focused when a same-goal source is missing', async () => {
+    const ref = createRef<DetailsTabsHandle>()
+    const view = await mount({ handleRef: ref })
+    try {
+      const focus = vi.fn()
+      const scrollIntoView = vi.fn()
+      ;(view.document as unknown as { getElementById: (id: string) => HTMLElement | null }).getElementById = (id) => {
+        const target = descendants(view.container).find((node) => node.getAttribute('id') === id)
+        if (target) Object.assign(target, { focus, scrollIntoView })
+        return target as unknown as HTMLElement ?? null
+      }
+
+      await act(async () => ref.current?.showDecisionActivity('ledger-decision-1'))
+      const target = descendants(view.container).find((node) => node.getAttribute('id') === 'decision-ledger-decision-1')
+      expect(target?.getAttribute('tabindex')).toBe('-1')
+      expect(focus).toHaveBeenCalledTimes(1)
+
+      await act(async () => ref.current?.showSourceRecord({ kind: 'action', id: 'missing-action', goalId: 'goal-1' }))
+
+      expect(tabPanel(view.container, 'ledger').getAttribute('hidden')).toBeNull()
+      expect(target?.getAttribute('tabindex')).toBe('-1')
+      expect(focus).toHaveBeenCalledTimes(1)
+      expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 fixround3 keeps a differing-type historical process mounted after focus settles', async () => {
+    const ref = createRef<DetailsTabsHandle>()
+    const current = process({ id: 'process-current', process_type: 'goal_definition' })
+    const historical = process({
+      id: 'process-historical', process_type: 'manager_selection', superseded_by_id: 'process-current',
+    })
+    const view = await mount({
+      handleRef: ref,
+      processes: [current],
+      sourceProcesses: [current, historical],
+      selectedStepType: 'goal_definition',
+    })
+    try {
+      const focus = vi.fn()
+      const scrollIntoView = vi.fn()
+      ;(view.document as unknown as { getElementById: (id: string) => HTMLElement | null }).getElementById = (id) => {
+        const target = descendants(view.container).find((node) => node.getAttribute('id') === id)
+        if (target) Object.assign(target, { focus, scrollIntoView })
+        return target as unknown as HTMLElement ?? null
+      }
+
+      await act(async () => ref.current?.showStepActivity())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-current')).toBeDefined()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-historical')).toBeUndefined()
+
+      await act(async () => ref.current?.showSourceRecord({
+        kind: 'process', id: 'process-historical', goalId: 'goal-1',
+      }))
+      const target = descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-historical')
+      expect(target).toBeDefined()
+      expect(target?.getAttribute('tabindex')).toBe('-1')
+      expect(focus).toHaveBeenCalledTimes(1)
+      expect(scrollIntoView).toHaveBeenCalledTimes(1)
+
+      await view.rerender({
+        handleRef: ref,
+        processes: [current],
+        sourceProcesses: [current, historical],
+        selectedStepType: 'goal_definition',
+      })
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-historical')).toBeDefined()
+      expect(focus).toHaveBeenCalledTimes(1)
+
+      await act(async () => getButton(view.container, 'Whole goal').click())
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-current')).toBeDefined()
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'process-process-historical')).toBeUndefined()
+    } finally { view.cleanup() }
+  })
+
   it('handles the same decision again after navigating through a non-decision hash', async () => {
     const decisionNavigation = 'decision-link:/orchestration/goal-1#decision-ledger-decision-1'
     const view = await mount()

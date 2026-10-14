@@ -2,10 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import React, { act, type ComponentProps } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router-dom'
-import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf, type TestElement } from '../../../tests/support/dom'
+import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf, TestEvent, type TestElement } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
 import { toast } from 'sonner'
 import type {
+  NeedsYouReference,
   OrchestrationAgentReviewRecord,
   OrchestrationAuthorityDecisionRecord,
   OrchestrationDecisionOption,
@@ -19,7 +20,7 @@ const api = vi.hoisted(() => ({
   dashboard: null as unknown,
   health: { data: { debug_enabled: false } } as unknown,
   memorySection: { data: undefined, isLoading: false, isError: false, refetch: vi.fn() },
-  answer: { isPending: false, mutate: vi.fn() },
+  answer: { isPending: false, mutate: vi.fn(), acceptRuntimeResult: vi.fn() },
   answerAgentDefinitionBatch: { isPending: false, mutate: vi.fn() },
   skip: { isPending: false, mutate: vi.fn() },
   acknowledge: { isPending: false, mutate: vi.fn() },
@@ -33,7 +34,7 @@ const api = vi.hoisted(() => ({
 }))
 
 vi.mock('sonner', () => ({
-  toast: { success: vi.fn(), error: vi.fn() },
+  toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn() }),
 }))
 
 // HierarchyGraph (Phase 12: lazy-loaded) renders reactflow, which needs real browser
@@ -79,9 +80,15 @@ const ISO = {
   completed: '2026-08-05T09:00:00Z',
 }
 
-function query<T>(data: T | undefined, overrides: Partial<{ isLoading: boolean; isError: boolean }> = {}) {
-  const merged = { isLoading: false, isError: false, ...overrides }
-  return { data, refetch: vi.fn(), ...merged, isSuccess: !merged.isLoading && !merged.isError && data !== undefined }
+function query<T>(data: T | undefined, overrides: Partial<{ isLoading: boolean; isError: boolean; isFetching: boolean }> = {}) {
+  const merged = { isLoading: false, isError: false, isFetching: false, ...overrides }
+  const isSuccess = !merged.isLoading && !merged.isError && data !== undefined
+  return {
+    data,
+    refetch: vi.fn().mockResolvedValue({ data, isSuccess, isError: merged.isError }),
+    ...merged,
+    isSuccess,
+  }
 }
 
 function goal(overrides: Partial<OrchestrationGoal> = {}): OrchestrationGoal {
@@ -160,10 +167,66 @@ function review(overrides: Partial<OrchestrationAgentReviewRecord> = {}): Orches
   }
 }
 
+function task4RuntimeQuestion(
+  number: number,
+  overrides: Partial<OrchestrationAuthorityDecisionRecord> = {},
+) {
+  const minute = String(number).padStart(2, '0')
+  const askedAt = `2026-08-05T08:${minute}:00Z`
+  return decision({
+    id: `runtime-q${number}`,
+    decision_key: `runtime:question:${number}`,
+    title: `Runtime question Q${number}`,
+    question: `Explain the choice for Q${number}.`,
+    options: [{ key: 'acknowledge' }],
+    recommendation: null,
+    runtime_identity: `runtime-identity-q${number}`,
+    contract_version: `contract-q${number}:v1`,
+    asked_at: askedAt,
+    created_at: askedAt,
+    updated_at: askedAt,
+    ...overrides,
+  })
+}
+
+function queueRow(root: TestElement, title: string) {
+  const row = descendants(root).find((node) => node.tagName === 'LI' && textOf(node).includes(title))
+  if (!row) throw new Error(`Queue row not found: ${title}`)
+  return row
+}
+
+function formSubmit(root: TestElement, label = 'Answer') {
+  const form = descendants(root).find((node) => node.tagName === 'FORM')
+  if (!form) throw new Error(`Form not found under ${textOf(root)}`)
+  return getButton(form, label)
+}
+
+function formFieldset(root: TestElement) {
+  const fieldset = descendants(root).find((node) => node.tagName === 'FIELDSET')
+  if (!fieldset) throw new Error(`Fieldset not found under ${textOf(root)}`)
+  return fieldset
+}
+
+function focusControl(element: TestElement) {
+  Object.assign(element, {
+    attachEvent: () => {},
+    detachEvent: () => {},
+  })
+  element.focus()
+  element.dispatchEvent(new TestEvent('focusin'))
+}
+
+function currentReactProp(element: TestElement, name: string) {
+  const entry = Object.entries(element).filter(([key]) => key.startsWith('__reactProps$')).at(-1)
+  return (entry?.[1] as Record<string, unknown> | undefined)?.[name]
+}
+
 function dashboardData(overrides: Partial<Record<string, unknown>> = {}) {
+  const overriddenCheckpoint = overrides.checkpoint as { data?: { items?: OrchestrationAuthorityDecisionRecord[] } } | undefined
+  const defaultDecisions = overriddenCheckpoint?.data?.items ?? []
   return {
     processes: query<OrchestrationProcessRunRecord[]>([]),
-    decisions: query<OrchestrationAuthorityDecisionRecord[]>([]),
+    decisions: query<OrchestrationAuthorityDecisionRecord[]>(defaultDecisions),
     checkpoint: query({ goal_id: 'goal-00000000-0000-4000-8000-000000000001', items: [], deferred_count: 0, max_questions: 3 }),
     warnings: query<OrchestrationWarningRecord[]>([]),
     agentReviews: query([]),
@@ -203,16 +266,175 @@ function controlElement(root: Parameters<typeof descendants>[0], label: string) 
   return element
 }
 
+function visibleLeafText(root: Parameters<typeof descendants>[0]) {
+  const pieces: string[] = []
+  const visit = (node: Parameters<typeof descendants>[0]) => {
+    if ('tagName' in node && node.closest('details') !== null) return
+    if (node.nodeType === 3) pieces.push(node.textContent)
+    else node.childNodes.forEach((child) => visit(child))
+  }
+  visit(root)
+  return pieces.join(' ').replace(/\s+/g, ' ').trim()
+}
+
+function withoutDetails(markup: string) {
+  return markup.replace(/<details\b[\s\S]*?<\/details>/g, '')
+}
+
 beforeEach(() => {
   api.dashboard = dashboardData()
   api.health = { data: { debug_enabled: false } }
+  vi.mocked(toast).mockReset()
+  vi.mocked(toast.success).mockReset()
+  vi.mocked(toast.error).mockReset()
   for (const mutation of [api.answer, api.answerAgentDefinitionBatch, api.skip, api.acknowledge, api.resolve, api.run, api.rerun, api.retry, api.authorize, api.debugStep, api.debugRerun]) {
     mutation.isPending = false
     mutation.mutate.mockReset()
   }
+  api.answer.acceptRuntimeResult.mockReset()
 })
 
 describe('Baseline dashboard D3 composition', () => {
+  it('SPR211 threads full-history reference metadata and exact source callbacks into Needs You', async () => {
+    const sourceProcess = process({ id: '60000000-0000-4000-8000-000000000006' })
+    const reference: NeedsYouReference = {
+      kind: 'process', id: sourceProcess.id, project_id: 'project-1',
+      goal_id: 'goal-00000000-0000-4000-8000-000000000001', label: 'Goal definition source',
+    }
+    const record = decision({
+      id: 'referenced-decision', recommendation: null,
+      question: `Review ${sourceProcess.id}.`, needs_you_references: [reference],
+    })
+    api.dashboard = dashboardData({
+      processes: query([sourceProcess]),
+      decisions: query([record]),
+      checkpoint: query({ goal_id: record.goal_id, items: [record], deferred_count: 0, max_questions: 3 }),
+    })
+    const onRevealSource = vi.fn()
+    const view = await mountDashboard({ needsYouReferences: [reference], onRevealSource })
+    try {
+      expect(visibleLeafText(view.container)).not.toContain(sourceProcess.id)
+      await act(async () => getButton(view.container, 'Goal definition source').click())
+      expect(onRevealSource).toHaveBeenCalledWith({
+        kind: 'process', id: sourceProcess.id,
+        goalId: 'goal-00000000-0000-4000-8000-000000000001',
+      })
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 reveals a warning source from superseded process history without resurfacing that process as current', async () => {
+    const superseded = process({
+      id: 'superseded-source-process',
+      process_type: 'goal_definition',
+      status: 'completed',
+      superseded_by_id: 'current-source-process',
+    })
+    const current = process({
+      id: 'current-source-process',
+      process_type: 'goal_definition',
+      status: 'running',
+    })
+    const sourceWarning = warning({
+      id: 'warning-with-superseded-source',
+      source_process_run_id: superseded.id,
+    })
+    const reference: NeedsYouReference = {
+      kind: 'process', id: superseded.id, project_id: 'project-1',
+      goal_id: goal().id, label: 'Original goal definition attempt',
+    }
+    api.dashboard = dashboardData({
+      processes: query([superseded, current]),
+      warnings: query([sourceWarning]),
+    })
+    const onRevealSource = vi.fn()
+    const view = await mountDashboard({ needsYouReferences: [reference], onRevealSource })
+    try {
+      const warningRow = queueRow(view.container, sourceWarning.message)
+      await act(async () => getButton(warningRow, reference.label!).click())
+      expect(onRevealSource).toHaveBeenCalledWith({
+        kind: 'process', id: superseded.id, goalId: goal().id,
+      })
+      expect(descendants(view.container).filter((node) => node.tagName === 'BUTTON'
+        && node.getAttribute('aria-label') === 'Run Goal definition')).toHaveLength(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR210 the queue-use answer form keeps the full multiline question visible exactly once with context and consequences', async () => {
+    const question = 'Should the release proceed?\nUse the verified fallback if the primary path is unsafe.'
+    const normalizedQuestion = question.replace('\n', ' ')
+    const context = 'Review the final evidence.'
+    const consequences = 'The fallback delays release but preserves verification.'
+    const record = decision({
+      id: 'queue-question', recommendation: null, title: 'Release approval',
+      question, context, consequences,
+    })
+    api.dashboard = dashboardData({
+      decisions: query([record]),
+      checkpoint: query({ goal_id: record.goal_id, items: [record], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      expect(visibleLeafText(view.container).split(normalizedQuestion)).toHaveLength(2)
+      expect(visibleLeafText(view.container)).toContain(context)
+      expect(visibleLeafText(view.container)).toContain(consequences)
+      await act(async () => getButton(view.container, 'Answer').click())
+      expect(visibleLeafText(view.container).split(normalizedQuestion)).toHaveLength(2)
+      expect(visibleLeafText(view.container)).toContain(context)
+      expect(visibleLeafText(view.container)).toContain(consequences)
+      expect(getButton(view.container, 'Submit answer')).toBeDefined()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR211 sanitizes recommendation, radio, button, and manager copy while submitting original option and reason values', async () => {
+    const knownId = '10000000-0000-4000-8000-000000000001'
+    const unknownId = '20000000-0000-4000-8000-000000000002'
+    const reference: NeedsYouReference = {
+      kind: 'agent', id: knownId, project_id: 'project-1', goal_id: goal().id, label: 'Named manager',
+    }
+    const record = decision({
+      id: 'safe-manager-controls', decision_key: 'manager_selection:choose',
+      title: 'Choose a manager', question: `Choose ${knownId} or ${unknownId}.`,
+      context: `Deterministic: ${knownId}\nLLM: ${unknownId}\nRationale: Compare ${knownId} with ${unknownId}.`,
+      options: [
+        { key: knownId, label: `Assign ${knownId}` },
+        { key: unknownId, label: `Assign ${unknownId}` },
+      ],
+      recommendation: knownId, needs_you_references: [reference],
+    })
+    api.dashboard = dashboardData({
+      decisions: query([record]),
+      checkpoint: query({ goal_id: record.goal_id, items: [record], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard({ needsYouReferences: [reference] })
+    try {
+      const closedCopy = visibleLeafText(view.container)
+      expect(closedCopy).toContain('Named manager')
+      expect(closedCopy).toContain('Reference unavailable')
+      expect(closedCopy).not.toContain(knownId)
+      expect(closedCopy).not.toContain(unknownId)
+      expect(getButton(view.container, 'Accept: Assign Named manager')).toBeDefined()
+
+      await act(async () => getButton(view.container, 'Choose differently…').click())
+      const openCopy = visibleLeafText(view.container)
+      expect(openCopy).toContain('Recommendation: Named manager')
+      expect(openCopy).toContain('Assign Named manager')
+      expect(openCopy).toContain('Assign Reference unavailable')
+      expect(openCopy).not.toContain(knownId)
+      expect(openCopy).not.toContain(unknownId)
+
+      const unknownOption = descendants(view.container).find((node) => node.tagName === 'INPUT' && node.value === unknownId)!
+      expect(unknownOption.value).toBe(unknownId)
+      await act(async () => changeControl(unknownOption, unknownId))
+      const originalReason = `Prefer ${unknownId} after checking ${knownId}.`
+      await act(async () => changeControl(getByLabel(view.container, 'Reason (required when overriding the recommendation)', 'textarea'), originalReason))
+      await act(async () => getButton(view.container, 'Submit answer').click())
+
+      expect(api.answer.mutate).toHaveBeenCalledWith(expect.objectContaining({
+        decisionId: record.id, selectedOption: unknownId, reason: originalReason,
+      }), expect.any(Object))
+    } finally { view.cleanup() }
+  })
+
   it.each(['recommendation', 'warning'] as const)('resolves %s warnings in one click and removes the row', async (severity) => {
     api.dashboard = dashboardData({ warnings: query([warning({ severity, message: 'Review this risk.' })]) })
     api.resolve.mutate.mockImplementation((_variables, options) => { options.onSuccess?.({}); options.onSettled?.() })
@@ -821,7 +1043,7 @@ describe('Baseline dashboard D3 composition', () => {
       warnings: query([warning({ source_process_run_id: focused.id, message: rawMessage })]),
     })
 
-    const standard = renderDashboard()
+    const standard = withoutDetails(renderDashboard())
     expect(standard).toContain('Goal definition was skipped: Operator chose a manual manager.')
     for (const raw of ['goal_definition', 'human:user-123', rawMessage]) expect(standard).not.toContain(raw)
   })
@@ -1179,6 +1401,107 @@ describe('Baseline dashboard D3 composition', () => {
     }
   })
 
+  it('SPR212 partial agent-definition answers preserve batch identity, frozen order, draft inputs, and focus', async () => {
+    const focused = process({ id: 'review-process', process_type: 'agent_definition_review', status: 'waiting_decision' })
+    const original = [
+      decision({ id: 'decision-a', decision_key: 'agent_definition_review:proposal:agent-1', source_process_run_id: focused.id, title: 'Review A', options: ['approve', 'reject', 'edit'] }),
+      decision({ id: 'decision-b', decision_key: 'agent_definition_review:proposal:agent-2', source_process_run_id: focused.id, title: 'Review B', options: ['approve', 'reject', 'edit'], context: JSON.stringify({ original_description: '', proposed_description: 'Initial description', original_persona: '', proposed_persona: 'Initial persona' }) }),
+      decision({ id: 'decision-c', decision_key: 'agent_definition_review:proposal:agent-3', source_process_run_id: focused.id, title: 'Review C', options: ['approve', 'reject', 'edit'] }),
+    ]
+    api.dashboard = dashboardData({
+      processes: query([focused]),
+      decisions: query(original),
+      checkpoint: query({ goal_id: goal().id, items: original, deferred_count: 0, max_questions: 5 }),
+    })
+
+    const view = await mountDashboard()
+    try {
+      const reviewB = descendants(view.container).find((node) => node.tagName === 'ARTICLE' && textOf(node).includes('Review B'))!
+      await act(async () => getButton(reviewB, 'Edit').click())
+      const description = getByLabel(reviewB, 'Description', 'textarea')
+      const persona = getByLabel(reviewB, 'Persona', 'textarea')
+      await act(async () => changeControl(description, 'Keep this description'))
+      await act(async () => changeControl(persona, 'Keep this persona'))
+      persona.focus()
+
+      const answered = { ...original[0], status: 'answered' as const, selected_option: 'approve', updated_at: '2026-08-05T12:00:00Z' }
+      const second = { ...original[1], updated_at: '2026-08-05T13:00:00Z' }
+      const third = { ...original[2], updated_at: '2026-08-05T14:00:00Z' }
+      api.dashboard = dashboardData({
+        processes: query([focused]),
+        decisions: query([answered, second, third]),
+        checkpoint: query({ goal_id: goal().id, items: [third, second], deferred_count: 0, max_questions: 5 }),
+      })
+      await view.rerender()
+
+      const articles = descendants(view.container).filter((node) => node.tagName === 'ARTICLE')
+      expect(articles.map((node) => textOf(node).match(/Review [ABC]/)?.[0])).toEqual(['Review A', 'Review B', 'Review C'])
+      const retainedDescription = getByLabel(articles[1], 'Description', 'textarea')
+      const retainedPersona = getByLabel(articles[1], 'Persona', 'textarea')
+      expect(retainedDescription).toBe(description)
+      expect(retainedPersona).toBe(persona)
+      expect(retainedDescription.value).toBe('Keep this description')
+      expect(retainedPersona.value).toBe('Keep this persona')
+      expect(view.document.activeElement).toBe(retainedPersona)
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('SPR211 sanitizes agent-review previews while editable values and submitted payloads stay exact', async () => {
+    const knownId = '30000000-0000-4000-8000-000000000003'
+    const unknownId = '40000000-0000-4000-8000-000000000004'
+    const reference: NeedsYouReference = {
+      kind: 'agent', id: knownId, project_id: 'project-1', goal_id: goal().id, label: 'Named reviewer',
+    }
+    const focused = process({ id: 'safe-review-process', process_type: 'agent_definition_review', status: 'waiting_decision' })
+    const runtimeKey = 'run:raw-runtime-12345678'
+    const proposedDescription = `Description for ${knownId} with ${unknownId} from ${runtimeKey}`
+    const proposedPersona = `Persona for ${unknownId} reviewed by ${knownId}`
+    const item = decision({
+      id: 'safe-agent-review', decision_key: 'agent_definition_review:proposal:agent-1',
+      source_process_run_id: focused.id, title: `Review ${knownId}`,
+      question: `Approve ${knownId} after checking ${unknownId}?`,
+      options: ['approve', 'reject', 'edit'], recommendation: 'approve',
+      context: JSON.stringify({
+        original_description: `Current ${knownId}`, proposed_description: proposedDescription,
+        original_persona: `Current ${unknownId}`, proposed_persona: proposedPersona,
+      }),
+      needs_you_references: [reference],
+    })
+    api.dashboard = dashboardData({
+      processes: query([focused]), decisions: query([item]),
+      checkpoint: query({ goal_id: item.goal_id, items: [item], deferred_count: 0, max_questions: 5 }),
+    })
+    const view = await mountDashboard({ needsYouReferences: [reference] })
+    try {
+      const primary = visibleLeafText(view.container)
+      expect(primary).toContain('Named reviewer')
+      expect(primary).toContain('Reference unavailable')
+      expect(primary).not.toContain(knownId)
+      expect(primary).not.toContain(unknownId)
+      expect(primary).not.toContain(runtimeKey)
+
+      const article = descendants(view.container).find((node) => node.tagName === 'ARTICLE')!
+      await act(async () => getButton(article, 'Edit').click())
+      const description = getByLabel(article, 'Description', 'textarea')
+      const persona = getByLabel(article, 'Persona', 'textarea')
+      expect(description.value).toBe(proposedDescription)
+      expect(persona.value).toBe(proposedPersona)
+      const changedDescription = `${proposedDescription}!`
+      await act(async () => changeControl(description, changedDescription))
+      await act(async () => getButton(article, 'Confirm edit').click())
+
+      expect(api.answerAgentDefinitionBatch.mutate).toHaveBeenCalledWith({
+        goalId: goal().id,
+        answers: [{
+          decisionId: item.id, selectedOption: 'edit', reason: '',
+          editedDescription: changedDescription, editedPersona: proposedPersona,
+        }],
+      }, expect.any(Object))
+    } finally { view.cleanup() }
+  })
+
   it('approves every remaining agent-definition proposal with one click', async () => {
     const focused = process({ id: 'review-process', process_type: 'agent_definition_review', status: 'waiting_decision' })
     const reviewDecisions = [
@@ -1307,11 +1630,12 @@ describe('Baseline dashboard D3 composition', () => {
       ]),
     })
     const markup = renderDashboard()
+    const visibleMarkup = withoutDetails(markup)
     expect(markup).toContain('build: Ada Builder')
     expect(markup).toContain('Ada Builder reports to Grace Manager')
     expect(markup).toContain('Linus Reviewer, Unknown agent')
-    for (const id of [implementerId, managerId, unusedId, unknownId]) expect(markup).not.toContain(id)
-    expect(markup).not.toContain('{')
+    for (const id of [implementerId, managerId, unusedId, unknownId]) expect(visibleMarkup).not.toContain(id)
+    expect(visibleMarkup).not.toContain('{')
   })
 
   it('shows manager comparison in the collapsed queue row without a second action', async () => {
@@ -1470,7 +1794,7 @@ describe('Baseline dashboard D3 composition', () => {
     api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(); callbacks.onSettled?.() })
     const view = await mountDashboard()
     try {
-      expect(textOf(view.container)).toContain('The orchestrator needs 2 answers.')
+      expect(textOf(view.container)).toContain('2 goal clarification questions need an answer.')
       await act(async () => changeControl(getByLabel(view.container, 'Answer', 'textarea'), 'First answer'))
       await act(async () => getButton(view.container, 'Next').click())
       expect(api.answer.mutate).toHaveBeenCalledWith(
@@ -1649,6 +1973,1269 @@ describe('Baseline dashboard D3 composition', () => {
 })
 
 describe('Baseline action form regressions', () => {
+  it('SPR212 full checkpoint retains oldest edited draft after a new arrival; SPR212 runtime contract race returns inert 200 and retains draft', async () => {
+    const runtimeQuestion = (number: number, askedAt: string) => decision({
+      id: `runtime-q${number}`,
+      decision_key: `runtime:question:${number}`,
+      title: `Runtime question Q${number}`,
+      question: `Explain the choice for Q${number}.`,
+      options: [{ key: 'acknowledge' }],
+      recommendation: null,
+      runtime_identity: `runtime-identity-q${number}`,
+      contract_version: `contract-q${number}:v1`,
+      asked_at: askedAt,
+      created_at: askedAt,
+      updated_at: askedAt,
+    })
+    const q1 = runtimeQuestion(1, '2026-08-05T08:01:00Z')
+    const q2 = runtimeQuestion(2, '2026-08-05T08:02:00Z')
+    const q3 = runtimeQuestion(3, '2026-08-05T08:03:00Z')
+    const q4 = runtimeQuestion(4, '2026-08-05T08:04:00Z')
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    let answerCallbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, callbacks) => { answerCallbacks = callbacks })
+    const onMessage = vi.fn()
+    const view = await mountDashboard({ onMessage })
+    try {
+      const q1Row = descendants(view.container).find((node) => node.tagName === 'LI' && textOf(node).includes(q1.title))!
+      await act(async () => getButton(q1Row, 'Answer').click())
+      const draft = getByLabel(q1Row, 'Answer', 'textarea')
+      const substantiveDraft = 'Keep the reviewed Q1 contract and this substantive explanation.'
+      await act(async () => changeControl(draft, substantiveDraft))
+      draft.focus()
+
+      const authoritative = query([q4, q3, q2, q1])
+      authoritative.refetch.mockResolvedValue({ data: [q4, q3, q2, q1], isSuccess: true, isError: false })
+      api.dashboard = dashboardData({
+        decisions: authoritative,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const retainedQ1Row = descendants(view.container).find((node) => node.tagName === 'LI' && textOf(node).includes(q1.title))!
+      const retainedDraft = getByLabel(retainedQ1Row, 'Answer', 'textarea')
+      expect(retainedDraft).toBe(draft)
+      expect(retainedDraft.value).toBe(substantiveDraft)
+      expect(view.document.activeElement).toBe(draft)
+      const visibleRuntimeRows = descendants(view.container)
+        .filter((node) => node.tagName === 'LI' && /Runtime question Q[1-4]/.test(textOf(node)))
+        .map((node) => textOf(node).match(/Runtime question Q[1-4]/)?.[0])
+      expect(visibleRuntimeRows).toEqual([
+        'Runtime question Q4', 'Runtime question Q3', 'Runtime question Q2', 'Runtime question Q1',
+      ])
+      expect(textOf(view.container).match(/1 more queued/g)).toHaveLength(1)
+
+      const submit = getButton(descendants(retainedQ1Row).find((node) => node.tagName === 'FORM')!, 'Answer')
+      await act(async () => { submit.click(); await Promise.resolve() })
+      expect(authoritative.refetch).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledWith({
+        goalId: goal().id,
+        decisionId: q1.id,
+        selectedOption: 'acknowledge',
+        reason: substantiveDraft,
+        contractVersion: q1.contract_version,
+        runtimeIdentity: q1.runtime_identity,
+      }, expect.any(Object))
+
+      const changedContract = {
+        ...q1,
+        contract_version: 'contract-q1:v2',
+        runtime_identity: 'runtime-identity-q1-v2',
+        updated_at: '2026-08-05T08:05:00Z',
+      }
+      await act(async () => {
+        answerCallbacks?.onSuccess?.({ decision: changedContract, process: null, continuation_applied: false })
+        answerCallbacks?.onSettled?.()
+      })
+
+      const staleDraft = getByLabel(view.container, 'Answer', 'textarea')
+      expect(staleDraft).toBe(draft)
+      expect(staleDraft.value).toBe(substantiveDraft)
+      expect(view.document.activeElement).toBe(draft)
+      expect(formFieldset(queueRow(view.container, q1.title)).disabled).toBe(false)
+      expect(getButton(queueRow(view.container, q1.title), 'Cancel').disabled).toBe(false)
+      expect(textOf(view.container)).toMatch(/review.*refresh|refresh.*review/i)
+      expect(textOf(view.container)).toContain('1 more queued')
+      expect(onMessage).not.toHaveBeenCalledWith('Answer received.')
+      expect(toast.success).not.toHaveBeenCalledWith('Answer received.')
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      expect(api.answer.acceptRuntimeResult).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it.each(['validated success', 'explicit cancel'] as const)(
+    'SPR212 retained edit releases only after %s and uses displayed-order focus fallback',
+    async (branch) => {
+      const q1 = task4RuntimeQuestion(1)
+      const q2 = task4RuntimeQuestion(2)
+      const q3 = task4RuntimeQuestion(3)
+      const q4 = task4RuntimeQuestion(4)
+      api.dashboard = dashboardData({
+        decisions: query([q3, q2, q1]),
+        checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+      })
+      let answerCallbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+      api.answer.mutate.mockImplementation((_variables, callbacks) => { answerCallbacks = callbacks })
+      const onMessage = vi.fn()
+      const view = await mountDashboard({ onMessage })
+      try {
+        await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+        const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+        await act(async () => changeControl(draft, 'Original reviewed answer'))
+        draft.focus()
+
+        const authoritative = query([q4, q3, q2, q1])
+        authoritative.refetch.mockResolvedValue({ data: [q4, q3, q2, q1], isSuccess: true, isError: false })
+        api.dashboard = dashboardData({
+          decisions: authoritative,
+          checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+        })
+        await view.rerender()
+
+        const retained = queueRow(view.container, q1.title)
+        expect(getByLabel(retained, 'Answer', 'textarea')).toBe(draft)
+        if (branch === 'explicit cancel') {
+          await act(async () => getButton(retained, 'Cancel').click())
+          expect(api.answer.mutate).not.toHaveBeenCalled()
+        } else {
+          await act(async () => { formSubmit(retained).click(); await Promise.resolve() })
+          expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+          expect(api.answer.mutate.mock.calls[0][0]).toEqual({
+            goalId: goal().id,
+            decisionId: q1.id,
+            selectedOption: 'acknowledge',
+            reason: 'Original reviewed answer',
+            contractVersion: q1.contract_version,
+            runtimeIdentity: q1.runtime_identity,
+          })
+          const matchingAnswer = {
+            ...q1,
+            status: 'answered' as const,
+            selected_option: 'acknowledge',
+            reason: 'Original reviewed answer',
+            decided_at: '2026-08-05T08:05:00Z',
+          }
+          await act(async () => {
+            answerCallbacks?.onSuccess?.({
+              decision: matchingAnswer, process: null, continuation_applied: false,
+            })
+            answerCallbacks?.onSettled?.()
+          })
+          expect(onMessage).toHaveBeenCalledTimes(1)
+          expect(onMessage).toHaveBeenCalledWith('Answer received.')
+          expect(toast.success).toHaveBeenCalledTimes(1)
+          expect(toast.success).toHaveBeenCalledWith('Answer received.')
+        }
+
+        expect(() => queueRow(view.container, q1.title)).toThrow()
+        expect(textOf(view.container)).toContain('1 more queued')
+        expect(view.document.activeElement?.tagName).toBe('H2')
+        expect(textOf(view.document.activeElement as TestElement)).toBe('Needs you')
+      } finally { view.cleanup() }
+    },
+  )
+
+  it.each([
+    ['Answer', null],
+    ['Choose differently…', 'acknowledge'],
+  ] as const)(
+    'SPR212 cancelled %s can reopen and preserve its new draft through later checkpoint eviction',
+    async (openLabel, recommendation) => {
+      const q1 = task4RuntimeQuestion(1, { recommendation })
+      const q2 = task4RuntimeQuestion(2)
+      const q3 = task4RuntimeQuestion(3)
+      const q4 = task4RuntimeQuestion(4)
+      api.dashboard = dashboardData({
+        decisions: query([q3, q2, q1]),
+        checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+      })
+      const view = await mountDashboard()
+      try {
+        await act(async () => getButton(queueRow(view.container, q1.title), openLabel).click())
+        await act(async () => getButton(queueRow(view.container, q1.title), 'Cancel').click())
+        expect(() => getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')).toThrow()
+
+        await act(async () => getButton(queueRow(view.container, q1.title), openLabel).click())
+        const reopenedDraft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+        await act(async () => changeControl(reopenedDraft, 'This second edit must survive displacement'))
+        reopenedDraft.focus()
+
+        api.dashboard = dashboardData({
+          decisions: query([q4, q3, q2, q1]),
+          checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+        })
+        await view.rerender()
+
+        const retained = queueRow(view.container, q1.title)
+        expect(getByLabel(retained, 'Answer', 'textarea')).toBe(reopenedDraft)
+        expect(getByLabel(retained, 'Answer', 'textarea').value).toBe('This second edit must survive displacement')
+        expect(view.document.activeElement).toBe(reopenedDraft)
+      } finally { view.cleanup() }
+    },
+  )
+
+  it('SPR212 retained adaptive round keeps its frozen question order and active draft when displaced', async () => {
+    const goalProcess = process({
+      id: 'goal-definition-round-process', process_type: 'goal_definition', status: 'waiting_decision',
+    })
+    const first = decision({
+      id: 'adaptive-round-q1', source_process_run_id: goalProcess.id,
+      decision_key: 'goal_definition:adaptive:5:0:objective',
+      title: 'Clarify objective', question: 'What outcome matters most?',
+      options: [], recommendation: null,
+    })
+    const second = decision({
+      id: 'adaptive-round-q2', source_process_run_id: goalProcess.id,
+      decision_key: 'goal_definition:adaptive:5:1:constraints',
+      title: 'Clarify constraints', question: 'Which constraint is fixed?',
+      options: [], recommendation: null,
+    })
+    const arrivals = [task4RuntimeQuestion(4), task4RuntimeQuestion(3), task4RuntimeQuestion(2)]
+    api.dashboard = dashboardData({
+      processes: query([goalProcess]),
+      decisions: query([first, second]),
+      checkpoint: query({ goal_id: goal().id, items: [first, second], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      const draft = getByLabel(view.container, 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'The verified shipped outcome.'))
+      await act(async () => focusControl(draft))
+
+      api.dashboard = dashboardData({
+        processes: query([goalProcess]),
+        decisions: query([...arrivals, first, second]),
+        checkpoint: query({ goal_id: goal().id, items: arrivals, deferred_count: 2, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const retainedDraft = getByLabel(view.container, 'Answer', 'textarea')
+      expect(retainedDraft).toBe(draft)
+      expect(retainedDraft.value).toBe('The verified shipped outcome.')
+      expect(view.document.activeElement).toBe(draft)
+      expect(textOf(view.container)).toContain('Question 1 of 2')
+      expect(textOf(view.container)).toContain('What outcome matters most?')
+      expect(textOf(view.container)).not.toContain('Question 1 of 1')
+      expect(textOf(view.container)).toContain('2 more queued')
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 repeated arrivals keep one retained node and an interrupted edit transfers retention once', async () => {
+    const questions = [1, 2, 3, 4, 5, 6].map((number) => task4RuntimeQuestion(number))
+    const [q1, q2, q3, q4, q5, q6] = questions
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const q1Draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(q1Draft, 'Q1 draft across repeated arrivals'))
+      q1Draft.focus()
+
+      for (const [checkpoint, deferred] of [
+        [[q4, q3, q2], 1],
+        [[q5, q4, q3], 2],
+      ] as const) {
+        api.dashboard = dashboardData({
+          decisions: query([q5, q4, q3, q2, q1]),
+          checkpoint: query({ goal_id: goal().id, items: checkpoint, deferred_count: deferred, max_questions: 3 }),
+        })
+        await view.rerender()
+        const retained = queueRow(view.container, q1.title)
+        expect(getByLabel(retained, 'Answer', 'textarea')).toBe(q1Draft)
+        expect(getByLabel(retained, 'Answer', 'textarea').value).toBe('Q1 draft across repeated arrivals')
+        expect(view.document.activeElement).toBe(q1Draft)
+        expect(descendants(view.container).filter((node) => node.tagName === 'LI' && textOf(node).includes(q1.title))).toHaveLength(1)
+      }
+
+      await act(async () => getButton(queueRow(view.container, q5.title), 'Answer').click())
+      const q5Draft = getByLabel(queueRow(view.container, q5.title), 'Answer', 'textarea')
+      await act(async () => changeControl(q5Draft, 'Q5 became the one active edit'))
+      q5Draft.focus()
+      expect(() => queueRow(view.container, q1.title)).toThrow()
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+
+      api.dashboard = dashboardData({
+        decisions: query([q6, q5, q4, q3, q2, q1]),
+        checkpoint: query({ goal_id: goal().id, items: [q6, q5, q4], deferred_count: 3, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retainedQ5 = queueRow(view.container, q5.title)
+      expect(getByLabel(retainedQ5, 'Answer', 'textarea')).toBe(q5Draft)
+      expect(getByLabel(retainedQ5, 'Answer', 'textarea').value).toBe('Q5 became the one active edit')
+      expect(view.document.activeElement).toBe(q5Draft)
+      expect(descendants(view.container).filter((node) => node.tagName === 'LI' && textOf(node).includes(q5.title))).toHaveLength(1)
+      expect(textOf(view.container)).toContain('3 more queued')
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 retained terminal question keeps read-only draft and cannot answer', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    const onMessage = vi.fn()
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard({ onMessage })
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'My still-visible draft'))
+      draft.focus()
+      const externallyAnswered = {
+        ...q1,
+        status: 'answered' as const,
+        selected_option: 'acknowledge',
+        reason: 'The other operator recorded this answer.',
+        decided_at: '2026-08-05T08:05:00Z',
+        updated_at: '2026-08-05T08:05:00Z',
+      }
+      api.dashboard = dashboardData({
+        decisions: query([q4, q3, q2, externallyAnswered]),
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 0, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const retained = queueRow(view.container, q1.title)
+      const readOnlyDraft = getByLabel(retained, 'Answer', 'textarea')
+      expect(readOnlyDraft).toBe(draft)
+      expect(readOnlyDraft.value).toBe('My still-visible draft')
+      expect(formFieldset(retained).disabled).toBe(false)
+      expect(formSubmit(retained).disabled).toBe(true)
+      expect(readOnlyDraft.disabled).toBe(false)
+      expect(currentReactProp(readOnlyDraft, 'readOnly')).toBe(true)
+      readOnlyDraft.focus()
+      expect(view.document.activeElement).toBe(readOnlyDraft)
+      expect(textOf(retained)).toContain('Answered elsewhere')
+      expect(textOf(retained)).toContain('acknowledge')
+      expect(textOf(retained)).toContain('The other operator recorded this answer.')
+      expect(descendants(retained).some((node) => node.getAttribute('aria-live') === 'polite')).toBe(true)
+      expect(textOf(view.container)).not.toContain('Queue clear.')
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(externallyAnswered.selected_option).toBe('acknowledge')
+      expect(externallyAnswered.reason).toBe('The other operator recorded this answer.')
+
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Dismiss').click())
+      expect(() => queueRow(view.container, q1.title)).toThrow()
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(onMessage).not.toHaveBeenCalledWith('Queue clear.')
+      expect(view.document.activeElement?.tagName).toBe('H2')
+    } finally { view.cleanup() }
+  })
+
+  it.each([
+    ['contract version changed', (q1: OrchestrationAuthorityDecisionRecord) => query([{ ...q1, contract_version: 'contract-q1:v2' }])],
+    ['runtime identity changed', (q1: OrchestrationAuthorityDecisionRecord) => query([{ ...q1, runtime_identity: 'runtime-identity-q1-v2' }])],
+    ['authority record missing', (_q1: OrchestrationAuthorityDecisionRecord) => query<OrchestrationAuthorityDecisionRecord[]>([])],
+    ['authority query loading', (_q1: OrchestrationAuthorityDecisionRecord) => query<OrchestrationAuthorityDecisionRecord[]>(undefined, { isLoading: true, isFetching: true })],
+    ['authority query failed', (_q1: OrchestrationAuthorityDecisionRecord) => query<OrchestrationAuthorityDecisionRecord[]>(undefined, { isError: true })],
+  ] as const)(
+    'SPR212 retained contract change or authority failure blocks stale submission: %s',
+    async (name, authorityQuery) => {
+      const q1 = task4RuntimeQuestion(1)
+      const q2 = task4RuntimeQuestion(2)
+      const q3 = task4RuntimeQuestion(3)
+      const q4 = task4RuntimeQuestion(4)
+      api.dashboard = dashboardData({
+        decisions: query([q3, q2, q1]),
+        checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+      })
+      const view = await mountDashboard()
+      try {
+        await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+        const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+        await act(async () => changeControl(draft, 'Do not bind this to a new contract.'))
+        draft.focus()
+
+        api.dashboard = dashboardData({
+          decisions: authorityQuery(q1),
+          checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+        })
+        await view.rerender()
+
+        const retained = queueRow(view.container, q1.title)
+        const blockedDraft = getByLabel(retained, 'Answer', 'textarea')
+        expect(blockedDraft).toBe(draft)
+        expect(blockedDraft.value).toBe('Do not bind this to a new contract.')
+        expect(formFieldset(retained).disabled).toBe(false)
+        expect(formSubmit(retained).disabled).toBe(true)
+        expect(getButton(retained, 'Cancel').disabled).toBe(false)
+        expect(currentReactProp(blockedDraft, 'readOnly')).toBe(true)
+        expect(textOf(retained)).toMatch(/review.*refresh|refresh.*review/i)
+        if (name === 'contract version changed' || name === 'runtime identity changed') {
+          expect(getButton(retained, 'Review refreshed decision')).toBeDefined()
+        } else {
+          expect(() => getButton(retained, 'Review refreshed decision')).toThrow()
+        }
+        await act(async () => formSubmit(retained).click())
+        expect(api.answer.mutate).not.toHaveBeenCalled()
+      } finally { view.cleanup() }
+    },
+  )
+
+  it('SPR212 unchanged authority after uncertainty restores the same retained draft submission', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Recover this exact draft'))
+      api.dashboard = dashboardData({
+        decisions: query<OrchestrationAuthorityDecisionRecord[]>(undefined, { isLoading: true, isFetching: true }),
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      expect(formSubmit(queueRow(view.container, q1.title)).disabled).toBe(true)
+
+      const restoredAuthority = query([q4, q3, q2, q1])
+      restoredAuthority.refetch.mockResolvedValue({ data: [q4, q3, q2, q1], isSuccess: true, isError: false })
+      api.dashboard = dashboardData({
+        decisions: restoredAuthority,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const restored = queueRow(view.container, q1.title)
+      expect(getByLabel(restored, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(restored, 'Answer', 'textarea').value).toBe('Recover this exact draft')
+      expect(formSubmit(restored).disabled).toBe(false)
+      await act(async () => { formSubmit(restored).click(); await Promise.resolve() })
+      expect(restoredAuthority.refetch).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 retained legacy answer-contract change blocks the frozen free-text submission', async () => {
+    const legacy = task4RuntimeQuestion(1, {
+      runtime_identity: null,
+      contract_version: null,
+      options: [],
+      question: 'What exact legacy answer should be recorded?',
+    })
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, legacy]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, legacy], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, legacy.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, legacy.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Frozen legacy answer'))
+      api.dashboard = dashboardData({
+        decisions: query([q4, q3, q2, {
+          ...legacy,
+          question: 'A replacement legacy question that was never reviewed',
+          options: ['replacement-option'],
+        }]),
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const retained = queueRow(view.container, legacy.title)
+      expect(getByLabel(retained, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(retained, 'Answer', 'textarea').value).toBe('Frozen legacy answer')
+      expect(formFieldset(retained).disabled).toBe(false)
+      expect(formSubmit(retained, 'Submit answer').disabled).toBe(true)
+      expect(getButton(retained, 'Cancel').disabled).toBe(false)
+      expect(textOf(retained)).toMatch(/review.*refresh|refresh.*review/i)
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 submit preflight contract change blocks mutation and preserves the reviewed draft', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    const currentAuthority = query([q4, q3, q2, q1])
+    currentAuthority.refetch.mockResolvedValue({ data: [q4, q3, q2, {
+      ...q1,
+      contract_version: 'contract-q1:v2',
+      runtime_identity: 'runtime-identity-q1-v2',
+    }], isSuccess: true, isError: false })
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Submit only against v1'))
+      draft.focus()
+      api.dashboard = dashboardData({
+        decisions: currentAuthority,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const retained = queueRow(view.container, q1.title)
+      await act(async () => { formSubmit(retained).click(); await Promise.resolve() })
+
+      expect(currentAuthority.refetch).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(getByLabel(retained, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(retained, 'Answer', 'textarea').value).toBe('Submit only against v1')
+      expect(formFieldset(retained).disabled).toBe(false)
+      expect(formSubmit(retained).disabled).toBe(true)
+      expect(textOf(retained)).toMatch(/review.*refresh|refresh.*review/i)
+      expect(view.document.activeElement).toBe(draft)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 submit preflight rejects cached pending data when the refetch result is an error', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const authority = query([q1])
+    authority.refetch.mockResolvedValue({
+      data: [q1],
+      isError: true,
+      isSuccess: false,
+      error: new Error('authority refresh failed'),
+    })
+    api.dashboard = dashboardData({
+      decisions: authority,
+      checkpoint: query({ goal_id: goal().id, items: [q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Do not trust cached data after a failed refetch'))
+
+      await act(async () => { formSubmit(queueRow(view.container, q1.title)).click(); await Promise.resolve() })
+
+      expect(authority.refetch).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      const retained = queueRow(view.container, q1.title)
+      expect(getByLabel(retained, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(retained, 'Answer', 'textarea').value).toBe('Do not trust cached data after a failed refetch')
+      expect(formFieldset(retained).disabled).toBe(false)
+      expect(formSubmit(retained).disabled).toBe(true)
+      expect(textOf(retained)).toMatch(/refresh.*review|review.*refresh/i)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 review refreshed decision explicitly remounts a fresh form on the authoritative contract', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    const refreshedQ1 = {
+      ...q1,
+      contract_version: 'contract-q1:v2',
+      runtime_identity: 'runtime-identity-q1-v2',
+      question: 'Explain the refreshed Q1 contract.',
+      updated_at: '2026-08-05T08:05:00Z',
+    }
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const staleDraft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(staleDraft, 'Draft tied only to v1'))
+      api.dashboard = dashboardData({
+        decisions: query([q4, q3, q2, refreshedQ1]),
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = queueRow(view.container, q1.title)
+      expect(getByLabel(retained, 'Answer', 'textarea')).toBe(staleDraft)
+      expect(formFieldset(retained).disabled).toBe(false)
+      expect(formSubmit(retained).disabled).toBe(true)
+
+      await act(async () => getButton(retained, 'Review refreshed decision').click())
+
+      const refreshed = queueRow(view.container, q1.title)
+      const freshDraft = getByLabel(refreshed, 'Answer', 'textarea')
+      expect(freshDraft).not.toBe(staleDraft)
+      expect(freshDraft.value).toBe('')
+      expect(freshDraft.disabled).toBe(false)
+      expect(textOf(refreshed)).toContain('Explain the refreshed Q1 contract.')
+      expect(textOf(refreshed)).not.toContain('Draft tied only to v1')
+      expect(formSubmit(refreshed).disabled).toBe(true)
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 reviewing a refreshed hierarchy proposal focuses its proposal control', async () => {
+    const hierarchy = process({ id: 'task4-hierarchy', process_type: 'team_hierarchy', status: 'waiting_decision' })
+    const definition = {
+      name: 'Alpha', role: 'worker', description: 'Alpha description', provider: 'openai', model: 'gpt-5',
+      system_prompt: 'Review the hierarchy.', adapter_type: 'api', cli_runtime: null, capabilities: ['build'], config: {},
+    }
+    const original = decision({
+      id: 'task4-hierarchy-proposal', decision_key: 'team_hierarchy:agent:alpha', title: 'Review Alpha',
+      source_process_run_id: hierarchy.id, options: ['approve', 'edit', 'reject'], contract_version: 'hierarchy:v1',
+      context: JSON.stringify({ proposal: { proposal_id: 'alpha', definition } }),
+    })
+    api.dashboard = dashboardData({
+      processes: query([hierarchy]), decisions: query([original]),
+      checkpoint: query({ goal_id: goal().id, items: [original], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      const originalRow = queueRow(view.container, original.title)
+      await act(async () => getButton(originalRow, 'Edit').click())
+      const originalName = getByLabel(originalRow, 'Name', 'input')
+      originalName.focus()
+
+      const refreshed = { ...original, contract_version: 'hierarchy:v2', updated_at: '2026-08-05T08:05:00Z' }
+      const arrival = task4RuntimeQuestion(9)
+      api.dashboard = dashboardData({
+        processes: query([hierarchy]), decisions: query([arrival, refreshed]),
+        checkpoint: query({ goal_id: goal().id, items: [arrival], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = queueRow(view.container, original.title)
+      await act(async () => getButton(retained, 'Review refreshed decision').click())
+      await act(async () => { await Promise.resolve() })
+
+      const reviewedRow = queueRow(view.container, original.title)
+      const proposalFocus = view.document.activeElement as TestElement
+      expect(proposalFocus.tagName).toBe('BUTTON')
+      expect(textOf(proposalFocus)).toBe('Approve')
+      expect(descendants(reviewedRow).some((node) => node === proposalFocus)).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 cancelling a still-selected reviewed hierarchy editor releases retention and restores local focus', async () => {
+    const hierarchy = process({ id: 'task4-selected-hierarchy', process_type: 'team_hierarchy', status: 'waiting_decision' })
+    const definition = {
+      name: 'Selected Alpha', role: 'worker', description: 'Original proposal', provider: 'openai', model: 'gpt-5',
+      system_prompt: 'Review the hierarchy.', adapter_type: 'api', cli_runtime: null, capabilities: ['build'], config: {},
+    }
+    const original = decision({
+      id: 'task4-selected-hierarchy-proposal', decision_key: 'team_hierarchy:agent:selected-alpha', title: 'Review Selected Alpha',
+      source_process_run_id: hierarchy.id, options: ['approve', 'edit', 'reject'], contract_version: 'selected-hierarchy:v1',
+      context: JSON.stringify({ proposal: { proposal_id: 'selected-alpha', definition } }),
+    })
+    api.dashboard = dashboardData({
+      processes: query([hierarchy]), decisions: query([original]),
+      checkpoint: query({ goal_id: goal().id, items: [original], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, original.title), 'Edit').click())
+      const refreshed = {
+        ...original,
+        contract_version: 'selected-hierarchy:v2',
+        context: JSON.stringify({ proposal: { proposal_id: 'selected-alpha', definition: { ...definition, name: 'Selected Alpha v2' } } }),
+        updated_at: '2026-08-05T08:15:00Z',
+      }
+      api.dashboard = dashboardData({
+        processes: query([hierarchy]), decisions: query([refreshed]),
+        checkpoint: query({ goal_id: goal().id, items: [refreshed], deferred_count: 0, max_questions: 3 }),
+      })
+      await view.rerender()
+      await act(async () => getButton(queueRow(view.container, original.title), 'Review refreshed decision').click())
+
+      const reviewed = queueRow(view.container, original.title)
+      await act(async () => getButton(reviewed, 'Edit').click())
+      expect(getByLabel(reviewed, 'Name', 'input').value).toBe('Selected Alpha v2')
+      await act(async () => getButton(reviewed, 'Cancel').click())
+      const surviving = queueRow(view.container, original.title)
+      expect(() => getByLabel(surviving, 'Name', 'input')).toThrow()
+      expect(view.document.activeElement === getButton(surviving, 'Edit')).toBe(true)
+
+      await act(async () => getButton(surviving, 'Edit').click())
+      expect(getByLabel(surviving, 'Name', 'input').value).toBe('Selected Alpha v2')
+      await act(async () => getButton(surviving, 'Cancel').click())
+
+      const nextContract = {
+        ...refreshed,
+        contract_version: 'selected-hierarchy:v3',
+        context: JSON.stringify({ proposal: { proposal_id: 'selected-alpha', definition: { ...definition, name: 'Selected Alpha v3' } } }),
+        updated_at: '2026-08-05T08:16:00Z',
+      }
+      api.dashboard = dashboardData({
+        processes: query([hierarchy]), decisions: query([nextContract]),
+        checkpoint: query({ goal_id: goal().id, items: [nextContract], deferred_count: 0, max_questions: 3 }),
+      })
+      await view.rerender()
+      expect(textOf(queueRow(view.container, original.title))).toContain('Selected Alpha v3')
+      expect(() => getButton(queueRow(view.container, original.title), 'Review refreshed decision')).toThrow()
+      await act(async () => getButton(queueRow(view.container, original.title), 'Edit').click())
+      expect(getByLabel(queueRow(view.container, original.title), 'Name', 'input').value).toBe('Selected Alpha v3')
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 cancelling a displaced hierarchy editor releases the retained card and focuses the next displayed row', async () => {
+    const hierarchy = process({ id: 'task4-hierarchy-cancel', process_type: 'team_hierarchy', status: 'waiting_decision' })
+    const definition = {
+      name: 'Cancel Alpha', role: 'worker', description: 'Cancel this edit', provider: 'openai', model: 'gpt-5',
+      system_prompt: 'Review the hierarchy.', adapter_type: 'api', cli_runtime: null, capabilities: ['build'], config: {},
+    }
+    const proposal = decision({
+      id: 'task4-hierarchy-cancel-proposal', decision_key: 'team_hierarchy:agent:cancel-alpha', title: 'Review Cancel Alpha',
+      source_process_run_id: hierarchy.id, options: ['approve', 'edit', 'reject'], contract_version: 'hierarchy:cancel:v1',
+      context: JSON.stringify({ proposal: { proposal_id: 'cancel-alpha', definition } }),
+    })
+    api.dashboard = dashboardData({
+      processes: query([hierarchy]), decisions: query([proposal]),
+      checkpoint: query({ goal_id: goal().id, items: [proposal], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      const originalRow = queueRow(view.container, proposal.title)
+      await act(async () => getButton(originalRow, 'Edit').click())
+      expect(getByLabel(originalRow, 'Name', 'input')).toBeDefined()
+
+      const arrival = task4RuntimeQuestion(9)
+      api.dashboard = dashboardData({
+        processes: query([hierarchy]), decisions: query([arrival, proposal]),
+        checkpoint: query({ goal_id: goal().id, items: [arrival], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = queueRow(view.container, proposal.title)
+      await act(async () => { getButton(retained, 'Cancel').click(); await Promise.resolve() })
+
+      expect(() => queueRow(view.container, proposal.title)).toThrow()
+      expect(view.document.activeElement === getButton(queueRow(view.container, arrival.title), 'Answer')).toBe(true)
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 pending submit preflight keeps the same focused draft until authority resolves', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    let resolveRefetch!: (value: { data: OrchestrationAuthorityDecisionRecord[]; isSuccess: true; isError: false }) => void
+    const refetchResult = new Promise<{ data: OrchestrationAuthorityDecisionRecord[]; isSuccess: true; isError: false }>((resolve) => { resolveRefetch = resolve })
+    const currentAuthority = query([q4, q3, q2, q1])
+    currentAuthority.refetch.mockReturnValue(refetchResult)
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Wait for current authority'))
+      draft.focus()
+      api.dashboard = dashboardData({
+        decisions: currentAuthority,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = queueRow(view.container, q1.title)
+
+      await act(async () => { formSubmit(retained).click(); await Promise.resolve() })
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(getByLabel(retained, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(retained, 'Answer', 'textarea').value).toBe('Wait for current authority')
+      expect(view.document.activeElement).toBe(draft)
+
+      await act(async () => { resolveRefetch({ data: [q4, q3, q2, q1], isSuccess: true, isError: false }); await refetchResult })
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate.mock.calls[0][0]).toEqual(expect.objectContaining({
+        decisionId: q1.id,
+        contractVersion: q1.contract_version,
+        runtimeIdentity: q1.runtime_identity,
+      }))
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 pending preflight cannot dispatch an old-goal mutation after the goal generation changes', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    let generation = 1
+    let resolveRefetch!: (value: { data: OrchestrationAuthorityDecisionRecord[]; isSuccess: true; isError: false }) => void
+    const refetchResult = new Promise<{ data: OrchestrationAuthorityDecisionRecord[]; isSuccess: true; isError: false }>((resolve) => { resolveRefetch = resolve })
+    const authority = query([q1])
+    authority.refetch.mockReturnValue(refetchResult)
+    api.dashboard = dashboardData({
+      decisions: authority,
+      checkpoint: query({ goal_id: goal().id, items: [q1], deferred_count: 0, max_questions: 3 }),
+    })
+    const view = await mountDashboard({ getMutationGeneration: () => generation })
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Must stay with the original goal'))
+      draft.focus()
+
+      await act(async () => { formSubmit(queueRow(view.container, q1.title)).click(); await Promise.resolve() })
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      generation += 1
+      await act(async () => { resolveRefetch({ data: [q1], isSuccess: true, isError: false }); await refetchResult })
+
+      expect(api.answer.mutate).not.toHaveBeenCalled()
+      expect(getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea').value).toBe('Must stay with the original goal')
+      expect(view.document.activeElement).toBe(draft)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 non-retained adaptive group validates Q2 directly when no retained active-member callback exists', async () => {
+    const goalProcess = process({ id: 'adaptive-callback-process', process_type: 'goal_definition', status: 'waiting_decision' })
+    const adaptive = (number: number) => decision({
+      id: `callback-q${number}`,
+      source_process_run_id: goalProcess.id,
+      decision_key: `goal_definition:adaptive:8:${number - 1}:question-${number}`,
+      title: `Callback question ${number}`,
+      question: `Callback question ${number}?`,
+      options: [],
+      recommendation: null,
+      runtime_identity: null,
+      contract_version: `callback:q${number}:v1`,
+    })
+    const [first, second] = [adaptive(1), adaptive(2)]
+    const authority = query([first, second])
+    const firstAnswered = { ...first, status: 'answered' as const, selected_option: 'First answer', reason: '' }
+    authority.refetch
+      .mockResolvedValueOnce({ data: [first, second], isSuccess: true, isError: false })
+      .mockResolvedValueOnce({ data: [firstAnswered, second], isSuccess: true, isError: false })
+    api.dashboard = dashboardData({
+      processes: query([goalProcess]),
+      decisions: authority,
+      checkpoint: query({ goal_id: goal().id, items: [first, second], deferred_count: 0, max_questions: 3 }),
+    })
+    const callbacks: Array<{ onSuccess?: (result: unknown) => void; onSettled?: () => void }> = []
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks.push(nextCallbacks) })
+    const view = await mountDashboard()
+    try {
+      const firstDraft = getByLabel(view.container, 'Answer', 'textarea')
+      await act(async () => changeControl(firstDraft, 'First answer'))
+      await act(async () => { getButton(view.container, 'Next').click(); await Promise.resolve() })
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      await act(async () => {
+        callbacks[0]?.onSuccess?.({ decision: firstAnswered, process: null, continuation_applied: false })
+        callbacks[0]?.onSettled?.()
+      })
+
+      expect(textOf(view.container)).toContain('Question 2 of 2')
+      const secondDraft = getByLabel(view.container, 'Answer', 'textarea')
+      await act(async () => changeControl(secondDraft, 'Second answer'))
+      await act(async () => { getButton(view.container, 'Submit').click(); await Promise.resolve() })
+
+      expect(authority.refetch).toHaveBeenCalledTimes(2)
+      expect(api.answer.mutate).toHaveBeenCalledTimes(2)
+      expect(api.answer.mutate.mock.calls[1][0]).toEqual(expect.objectContaining({
+        decisionId: second.id,
+        contractVersion: second.contract_version,
+        selectedOption: 'Second answer',
+      }))
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 retained three-question round advances after its own success but stops on external terminalization', async () => {
+    const goalProcess = process({
+      id: 'goal-definition-round-process', process_type: 'goal_definition', status: 'waiting_decision',
+    })
+    const adaptive = (number: number, field: string) => decision({
+      id: `adaptive-round-q${number}`,
+      source_process_run_id: goalProcess.id,
+      decision_key: `goal_definition:adaptive:7:${number - 1}:${field}`,
+      title: `Clarification ${number}`,
+      question: `Adaptive question ${number}?`,
+      options: [],
+      recommendation: null,
+      runtime_identity: `adaptive-runtime-${number}`,
+      contract_version: `adaptive:7:q${number}:v1`,
+    })
+    const [first, second, third] = [adaptive(1, 'objective'), adaptive(2, 'constraints'), adaptive(3, 'success')]
+    const arrivals = [task4RuntimeQuestion(6), task4RuntimeQuestion(5), task4RuntimeQuestion(4)]
+    api.dashboard = dashboardData({
+      processes: query([goalProcess]),
+      decisions: query([first, second, third]),
+      checkpoint: query({ goal_id: goal().id, items: [first, second, third], deferred_count: 0, max_questions: 3 }),
+    })
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const view = await mountDashboard()
+    try {
+      const groupRow = queueRow(view.container, 'Adaptive question 1?')
+      const answer = getByLabel(groupRow, 'Answer', 'textarea')
+      await act(async () => changeControl(answer, 'Confirmed first answer'))
+      await act(async () => focusControl(answer))
+
+      const fullAuthority = query([...arrivals, first, second, third])
+      fullAuthority.refetch.mockResolvedValue({ data: [...arrivals, first, second, third], isSuccess: true, isError: false })
+      api.dashboard = dashboardData({
+        processes: query([goalProcess]),
+        decisions: fullAuthority,
+        checkpoint: query({ goal_id: goal().id, items: arrivals, deferred_count: 3, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retainedGroup = queueRow(view.container, 'Adaptive question 1?')
+      expect(getByLabel(retainedGroup, 'Answer', 'textarea')).toBe(answer)
+      expect(textOf(retainedGroup)).toContain('Question 1 of 3')
+
+      await act(async () => { getButton(retainedGroup, 'Next').click(); await Promise.resolve() })
+      expect(fullAuthority.refetch).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledWith(expect.objectContaining({
+        decisionId: first.id,
+        contractVersion: first.contract_version,
+        runtimeIdentity: first.runtime_identity,
+        selectedOption: 'Confirmed first answer',
+      }), expect.any(Object))
+      const firstAnswered = {
+        ...first,
+        status: 'answered' as const,
+        selected_option: 'Confirmed first answer',
+        reason: null,
+        decided_at: '2026-08-05T08:10:00Z',
+      }
+      await act(async () => {
+        callbacks?.onSuccess?.({ decision: firstAnswered, process: null, continuation_applied: false })
+        callbacks?.onSettled?.()
+      })
+      api.dashboard = dashboardData({
+        processes: query([goalProcess]),
+        decisions: query([...arrivals, firstAnswered, second, third]),
+        checkpoint: query({ goal_id: goal().id, items: arrivals, deferred_count: 2, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const secondStep = queueRow(view.container, 'Adaptive question 2?')
+      const secondDraft = getByLabel(secondStep, 'Answer', 'textarea')
+      expect(secondStep).toBe(retainedGroup)
+      expect(secondDraft).toBe(answer)
+      expect(secondDraft.disabled).toBe(false)
+      expect(textOf(secondStep)).toContain('Question 2 of 3')
+      expect(textOf(secondStep)).toContain('Adaptive question 2?')
+      expect(textOf(secondStep)).not.toContain('Answered elsewhere')
+      // The custom TestElement keeps a stale raw textarea value across a
+      // controlled same-node update. The disabled action reflects Q2's empty
+      // controlled draft and catches accidental Q1-to-Q2 state reuse.
+      expect(getButton(secondStep, 'Next').disabled).toBe(true)
+      await act(async () => changeControl(secondDraft, 'Q2 stale-contract draft'))
+      const refreshedSecond = {
+        ...second,
+        contract_version: 'adaptive:7:q2:v2',
+        runtime_identity: 'adaptive-runtime-2-v2',
+        question: 'Adaptive question 2 refreshed?',
+      }
+      api.dashboard = dashboardData({
+        processes: query([goalProcess]),
+        decisions: query([...arrivals, firstAnswered, refreshedSecond, third]),
+        checkpoint: query({ goal_id: goal().id, items: arrivals, deferred_count: 2, max_questions: 3 }),
+      })
+      await view.rerender()
+      const staleSecondStep = queueRow(view.container, 'Adaptive question 2?')
+      expect(getByLabel(staleSecondStep, 'Answer', 'textarea')).toBe(secondDraft)
+      await act(async () => getButton(staleSecondStep, 'Review refreshed decision').click())
+      const reviewedSecondStep = queueRow(view.container, 'Adaptive question 2 refreshed?')
+      const reviewedSecondDraft = getByLabel(reviewedSecondStep, 'Answer', 'textarea')
+      expect(textOf(reviewedSecondStep)).toContain('Question 2 of 3')
+      expect(visibleLeafText(reviewedSecondStep)).not.toContain('Adaptive question 1?')
+      expect(reviewedSecondDraft).not.toBe(secondDraft)
+      expect(reviewedSecondDraft.value).toBe('')
+      expect(view.document.activeElement).toBe(reviewedSecondDraft)
+      await act(async () => changeControl(reviewedSecondDraft, 'Q2 draft must not advance'))
+      await act(async () => focusControl(reviewedSecondDraft))
+
+      const externallyAnsweredSecond = {
+        ...refreshedSecond,
+        status: 'answered' as const,
+        selected_option: 'External Q2 answer',
+        reason: 'Recorded by another operator.',
+        decided_at: '2026-08-05T08:11:00Z',
+      }
+      api.dashboard = dashboardData({
+        processes: query([goalProcess]),
+        decisions: query([...arrivals, firstAnswered, externallyAnsweredSecond, third]),
+        checkpoint: query({ goal_id: goal().id, items: arrivals, deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const terminalStep = queueRow(view.container, 'Adaptive question 2 refreshed?')
+      expect(getByLabel(terminalStep, 'Answer', 'textarea')).toBe(reviewedSecondDraft)
+      expect(getByLabel(terminalStep, 'Answer', 'textarea').value).toBe('Q2 draft must not advance')
+      expect(getByLabel(terminalStep, 'Answer', 'textarea').disabled).toBe(false)
+      expect(currentReactProp(getByLabel(terminalStep, 'Answer', 'textarea'), 'readOnly')).toBe(true)
+      expect(getButton(terminalStep, 'Next').disabled).toBe(true)
+      expect(textOf(terminalStep)).toContain('Answered elsewhere')
+      expect(textOf(terminalStep)).toContain('External Q2 answer')
+      expect(visibleLeafText(terminalStep)).not.toContain('Adaptive question 3?')
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 actual mutation error preserves retained draft and source identity', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    const authoritative = query([q4, q3, q2, q1])
+    authoritative.refetch.mockResolvedValue({ data: [q4, q3, q2, q1], isSuccess: true, isError: false })
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    let callbacks: { onError?: (error: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Retry this after the transport recovers'))
+      api.dashboard = dashboardData({
+        decisions: authoritative,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = queueRow(view.container, q1.title)
+      await act(async () => { formSubmit(retained).click(); await Promise.resolve() })
+      await act(async () => {
+        callbacks?.onError?.(new Error('The answer request failed.'))
+        callbacks?.onSettled?.()
+      })
+
+      const afterError = queueRow(view.container, q1.title)
+      expect(getByLabel(afterError, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(afterError, 'Answer', 'textarea').value).toBe('Retry this after the transport recovers')
+      expect(textOf(afterError)).toContain('The answer request failed.')
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 missing runtime receipt stays locked on the reviewed draft until explicit review', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const authority = query([q1])
+    authority.refetch.mockResolvedValue({ data: [q1], isSuccess: true, isError: false })
+    api.dashboard = dashboardData({
+      decisions: authority,
+      checkpoint: query({ goal_id: goal().id, items: [q1], deferred_count: 0, max_questions: 3 }),
+    })
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const onMessage = vi.fn()
+    const view = await mountDashboard({ onMessage })
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Keep after malformed HTTP 200'))
+      await act(async () => { formSubmit(queueRow(view.container, q1.title)).click(); await Promise.resolve() })
+      await act(async () => {
+        callbacks?.onSuccess?.({ decision: null, process: null, continuation_applied: false })
+        callbacks?.onSettled?.()
+      })
+
+      const locked = queueRow(view.container, q1.title)
+      expect(getByLabel(locked, 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(locked, 'Answer', 'textarea').value).toBe('Keep after malformed HTTP 200')
+      expect(formSubmit(locked).disabled).toBe(true)
+      expect(onMessage).not.toHaveBeenCalledWith('Answer received.')
+      expect(toast.success).not.toHaveBeenCalled()
+
+      await view.rerender()
+      const stillLocked = queueRow(view.container, q1.title)
+      expect(getByLabel(stillLocked, 'Answer', 'textarea')).toBe(draft)
+      expect(formSubmit(stillLocked).disabled).toBe(true)
+      await act(async () => getButton(stillLocked, 'Review refreshed decision').click())
+      const reviewedAgain = queueRow(view.container, q1.title)
+      const freshDraft = getByLabel(reviewedAgain, 'Answer', 'textarea')
+      expect(freshDraft).not.toBe(draft)
+      expect(freshDraft.value).toBe('')
+      expect(currentReactProp(freshDraft, 'readOnly')).toBe(false)
+      expect(view.document.activeElement === freshDraft).toBe(true)
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it.each([
+    ['answered', 'Answered elsewhere', 'acknowledge', 'Recorded by another operator.'],
+    ['cancelled', 'Decision closed elsewhere', null, null],
+  ] as const)(
+    'SPR212 authoritative %s outcome overrides a sticky stale receipt and leaves one actionable item',
+    async (status, heading, selectedOption, authoritativeReason) => {
+      const q1 = task4RuntimeQuestion(1)
+      const q2 = task4RuntimeQuestion(2)
+      const authority = query([q2, q1])
+      authority.refetch.mockResolvedValue({ data: [q2, q1], isSuccess: true, isError: false })
+      api.dashboard = dashboardData({
+        decisions: authority,
+        checkpoint: query({ goal_id: goal().id, items: [q2, q1], deferred_count: 0, max_questions: 3 }),
+      })
+      let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+      api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+      const view = await mountDashboard()
+      try {
+        await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+        const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+        await act(async () => changeControl(draft, 'Keep this draft beside the authoritative outcome'))
+        await act(async () => { formSubmit(queueRow(view.container, q1.title)).click(); await Promise.resolve() })
+        await act(async () => {
+          callbacks?.onSuccess?.({ decision: null, process: null, continuation_applied: false })
+          callbacks?.onSettled?.()
+        })
+        expect(getButton(queueRow(view.container, q1.title), 'Review refreshed decision')).toBeDefined()
+
+        const terminal = {
+          ...q1,
+          status,
+          selected_option: selectedOption,
+          reason: authoritativeReason,
+          decided_at: '2026-08-05T08:30:00Z',
+          updated_at: '2026-08-05T08:30:00Z',
+        }
+        api.dashboard = dashboardData({
+          decisions: query([q2, terminal]),
+          checkpoint: query({ goal_id: goal().id, items: [q2], deferred_count: 0, max_questions: 3 }),
+        })
+        await view.rerender()
+
+        const retained = queueRow(view.container, q1.title)
+        expect(getByLabel(retained, 'Answer', 'textarea')).toBe(draft)
+        expect(currentReactProp(draft, 'readOnly')).toBe(true)
+        expect(formSubmit(retained).disabled).toBe(true)
+        expect(textOf(retained)).toContain(heading)
+        expect(textOf(retained)).toContain(`Authoritative status: ${status}.`)
+        if (selectedOption) expect(textOf(retained)).toContain(`Selected answer: ${selectedOption}`)
+        if (authoritativeReason) expect(textOf(retained)).toContain(`Reason: ${authoritativeReason}`)
+        expect(() => getButton(retained, 'Review refreshed decision')).toThrow()
+        expect(getButton(retained, 'Dismiss')).toBeDefined()
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 550)) })
+        expect(textOf(view.container)).toContain('1 item needs you.')
+      } finally { view.cleanup() }
+    },
+  )
+
+  it('SPR212 identical runtime replay with false continuation confirms persisted answer', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const onMessage = vi.fn()
+    const view = await mountDashboard({ onMessage })
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, '  original attempt survived response loss\n'))
+
+      const pendingPreflight = query([q4, q3, q2, q1])
+      pendingPreflight.refetch.mockResolvedValue({ data: [q4, q3, q2, q1], isSuccess: true, isError: false })
+      const acceptedDashboard = dashboardData({
+        decisions: pendingPreflight,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      api.dashboard = acceptedDashboard
+      await view.rerender()
+      const retained = queueRow(view.container, q1.title)
+      await act(async () => { formSubmit(retained).click(); await Promise.resolve() })
+
+      expect(pendingPreflight.refetch).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+      expect(api.answer.mutate.mock.calls[0][0]).toEqual(expect.objectContaining({
+        decisionId: q1.id,
+        contractVersion: q1.contract_version,
+        runtimeIdentity: q1.runtime_identity,
+        selectedOption: 'acknowledge',
+        reason: 'original attempt survived response loss',
+      }))
+      const matchingAnswered = {
+        ...q1,
+        status: 'answered' as const,
+        selected_option: 'acknowledge',
+        reason: 'original attempt survived response loss',
+        decided_at: '2026-08-05T08:05:00Z',
+      }
+      await act(async () => {
+        callbacks?.onSuccess?.({
+          decision: matchingAnswered,
+          process: null,
+          continuation_applied: false,
+        })
+        callbacks?.onSettled?.()
+      })
+
+      expect(() => queueRow(view.container, q1.title)).toThrow()
+      expect(onMessage).toHaveBeenCalledTimes(1)
+      expect(onMessage).toHaveBeenCalledWith('Answer received.')
+      expect(toast.success).toHaveBeenCalledTimes(1)
+      expect(toast.success).toHaveBeenCalledWith('Answer received.')
+      expect(view.document.activeElement?.tagName).toBe('H2')
+      expect(api.answer.acceptRuntimeResult).toHaveBeenCalledWith(goal().id, {
+        decision: matchingAnswered,
+        process: null,
+        continuation_applied: false,
+      })
+      expect(pendingPreflight.refetch).toHaveBeenCalledTimes(2)
+      expect(acceptedDashboard.checkpoint.refetch).toHaveBeenCalledTimes(1)
+      expect(acceptedDashboard.processes.refetch).toHaveBeenCalledTimes(1)
+      expect(acceptedDashboard.warnings.refetch).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 cross-goal late answer receipt cannot clear or move the retained draft', async () => {
+    const q1 = task4RuntimeQuestion(1)
+    const q2 = task4RuntimeQuestion(2)
+    const q3 = task4RuntimeQuestion(3)
+    const q4 = task4RuntimeQuestion(4)
+    let generation = 1
+    const authoritative = query([q4, q3, q2, q1])
+    authoritative.refetch.mockResolvedValue({ data: [q4, q3, q2, q1], isSuccess: true, isError: false })
+    api.dashboard = dashboardData({
+      decisions: query([q3, q2, q1]),
+      checkpoint: query({ goal_id: goal().id, items: [q3, q2, q1], deferred_count: 0, max_questions: 3 }),
+    })
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const onMessage = vi.fn()
+    const view = await mountDashboard({ onMessage, getMutationGeneration: () => generation })
+    try {
+      await act(async () => getButton(queueRow(view.container, q1.title), 'Answer').click())
+      const draft = getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')
+      await act(async () => changeControl(draft, 'Belongs to the original goal generation'))
+      draft.focus()
+      api.dashboard = dashboardData({
+        decisions: authoritative,
+        checkpoint: query({ goal_id: goal().id, items: [q4, q3, q2], deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = queueRow(view.container, q1.title)
+      await act(async () => { formSubmit(retained).click(); await Promise.resolve() })
+      generation++
+      await act(async () => {
+        callbacks?.onSuccess?.({
+          decision: {
+            ...q1, status: 'answered', selected_option: 'acknowledge',
+            reason: 'Belongs to the original goal generation',
+          },
+          process: null,
+          continuation_applied: true,
+        })
+        callbacks?.onSettled?.()
+      })
+
+      expect(getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea')).toBe(draft)
+      expect(getByLabel(queueRow(view.container, q1.title), 'Answer', 'textarea').value).toBe('Belongs to the original goal generation')
+      expect(view.document.activeElement).toBe(draft)
+      expect(onMessage).not.toHaveBeenCalledWith('Answer received.')
+      expect(toast.success).not.toHaveBeenCalledWith('Answer received.')
+      expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+    } finally { view.cleanup() }
+  })
+
   it('submits normalized runtime text with sentinel and contract, retaining it after response loss', async () => {
     const runtime = decision({ id: 'runtime-question', recommendation: null, options: [{ key: 'acknowledge' }],
       runtime_identity: 'runtime-1', contract_version: 'plan:1' })
@@ -1899,6 +3486,122 @@ describe('Baseline dashboard recovery FIX PROPOSAL card', () => {
     } finally { view.cleanup() }
   })
 
+  it('SPR212 refreshed retained recovery approval keeps focus on the same applying card heading', async () => {
+    const original = recoveryDecision('rec-refreshed-focus', 'pending_approval', {}, {
+      runtime_identity: 'recovery-runtime-v1',
+      contract_version: 'recovery-contract-v1',
+    })
+    const refreshed = recoveryDecision('rec-refreshed-focus', 'pending_approval', {}, {
+      runtime_identity: 'recovery-runtime-v2',
+      contract_version: 'recovery-contract-v2',
+      updated_at: '2026-08-05T08:15:00Z',
+    })
+    const arrivals = [task4RuntimeQuestion(4), task4RuntimeQuestion(3), task4RuntimeQuestion(2)]
+    api.dashboard = withDecisions([original])
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(cardOf(view.container), 'Reject').click())
+      api.dashboard = dashboardData({
+        decisions: query([...arrivals, refreshed]),
+        checkpoint: query({ goal_id: GOAL_ID, items: arrivals, deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = cardOf(view.container)
+      expect(getByLabel(retained, 'Reason', 'textarea')).toBeDefined()
+      await act(async () => getButton(retained, 'Review refreshed decision').click())
+
+      const reviewed = cardOf(view.container)
+      expect(() => getByLabel(reviewed, 'Reason', 'textarea')).toThrow()
+      await act(async () => { getButton(reviewed, 'Approve fix').click(); await Promise.resolve() })
+      expect(api.answer.mutate).toHaveBeenCalledWith(expect.objectContaining({
+        decisionId: refreshed.id,
+        contractVersion: refreshed.contract_version,
+        runtimeIdentity: refreshed.runtime_identity,
+        selectedOption: 'approve_fix',
+      }), expect.any(Object))
+
+      const applying = recoveryDecision('rec-refreshed-focus', 'applying', {}, {
+        runtime_identity: refreshed.runtime_identity,
+        contract_version: refreshed.contract_version,
+        selected_option: 'approve_fix',
+        reason: null,
+        decided_at: '2026-08-05T08:16:00Z',
+        updated_at: '2026-08-05T08:16:00Z',
+      })
+      await act(async () => {
+        callbacks?.onSuccess?.({ decision: applying, process: null, continuation_applied: false })
+        callbacks?.onSettled?.()
+      })
+      api.dashboard = dashboardData({
+        decisions: query([...arrivals, applying]),
+        checkpoint: query({ goal_id: GOAL_ID, items: arrivals, deferred_count: 0, max_questions: 3 }),
+      })
+      await view.rerender()
+
+      const applyingCard = cardOf(view.container)
+      expect(textOf(applyingCard)).toContain('Applying approved fix…')
+      const heading = descendants(applyingCard).find((node) => node.tagName === 'H3' && textOf(node) === 'FIX PROPOSAL')!
+      expect(view.document.activeElement).toBe(heading)
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 reviewed capability-gap acceptance stays visible while re-diagnosis is pending', async () => {
+    const original = recoveryDecision('gap-reviewed-acceptance', 'unsupported', {}, {
+      status: 'pending',
+      options: ['capability_provided'],
+      runtime_identity: 'gap-reviewed-runtime-v1',
+      contract_version: 'gap-reviewed-contract-v1',
+    })
+    const refreshed = recoveryDecision('gap-reviewed-acceptance', 'unsupported', {}, {
+      status: 'pending',
+      options: ['capability_provided'],
+      runtime_identity: 'gap-reviewed-runtime-v2',
+      contract_version: 'gap-reviewed-contract-v2',
+      updated_at: '2026-08-05T08:15:00Z',
+    })
+    api.dashboard = withDecisions([original])
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, nextCallbacks) => { callbacks = nextCallbacks })
+    const view = await mountDashboard()
+    try {
+      await act(async () => cardOf(view.container).click())
+      api.dashboard = withDecisions([refreshed])
+      await view.rerender()
+      await act(async () => getButton(cardOf(view.container), 'Review refreshed decision').click())
+      await act(async () => { getButton(cardOf(view.container), "I've provided it").click(); await Promise.resolve() })
+      expect(api.answer.mutate).toHaveBeenCalledWith(expect.objectContaining({
+        decisionId: refreshed.id,
+        contractVersion: refreshed.contract_version,
+        runtimeIdentity: refreshed.runtime_identity,
+        selectedOption: 'capability_provided',
+      }), expect.any(Object))
+
+      const answered = {
+        ...refreshed,
+        status: 'answered' as const,
+        selected_option: 'capability_provided',
+        reason: null,
+        decided_at: '2026-08-05T08:16:00Z',
+        updated_at: '2026-08-05T08:16:00Z',
+      }
+      await act(async () => {
+        callbacks?.onSuccess?.({ decision: answered, process: null, continuation_applied: false })
+        callbacks?.onSettled?.()
+      })
+
+      const pendingRediagnosis = cardOf(view.container)
+      expect(textOf(pendingRediagnosis)).toContain('Marked as provided. Re-diagnosing the blocker…')
+      expect(getButton(pendingRediagnosis, "I've provided it").disabled).toBe(true)
+      expect(toast.success).not.toHaveBeenCalledWith('Blocked work is moving again.')
+      const details = descendants(pendingRediagnosis).find((node) => node.tagName === 'SUMMARY' && textOf(node) === 'Details')!
+      await act(async () => details.click())
+      expect(textOf(cardOf(view.container))).toContain('Marked as provided. Re-diagnosing the blocker…')
+      expect(getButton(cardOf(view.container), "I've provided it").disabled).toBe(true)
+    } finally { view.cleanup() }
+  })
+
   it('marks a pending capability gap done through the answer mutation (capability_provided)', async () => {
     api.dashboard = withDecisions([recoveryDecision('gap-1', 'unsupported', {}, { status: 'pending', options: ['capability_provided'] } as Partial<OrchestrationAuthorityDecisionRecord>)])
     const view = await mountDashboard()
@@ -1938,6 +3641,46 @@ describe('Baseline dashboard recovery FIX PROPOSAL card', () => {
         expect.objectContaining({ decisionId: 'rec-1', selectedOption: 'reject', reason: 'Too broad.' }),
         expect.any(Object),
       )
+    } finally { view.cleanup() }
+  })
+
+  it('SPR212 cancelling a displaced recovery rejection releases retention and focuses the surviving card', async () => {
+    const recovery = recoveryDecision('rec-cancel-displaced', 'pending_approval')
+    const arrivals = [task4RuntimeQuestion(4), task4RuntimeQuestion(3), task4RuntimeQuestion(2)]
+    api.dashboard = withDecisions([recovery])
+    const view = await mountDashboard()
+    try {
+      await act(async () => getButton(cardOf(view.container), 'Reject').click())
+      const reason = getByLabel(cardOf(view.container), 'Reason', 'textarea')
+      await act(async () => changeControl(reason, 'Do not keep this abandoned rejection draft'))
+
+      api.dashboard = dashboardData({
+        decisions: query([...arrivals, recovery]),
+        checkpoint: query({ goal_id: GOAL_ID, items: arrivals, deferred_count: 1, max_questions: 3 }),
+      })
+      await view.rerender()
+      const retained = cardOf(view.container)
+      expect(getByLabel(retained, 'Reason', 'textarea')).toBe(reason)
+      await act(async () => { getButton(retained, 'Cancel').click(); await Promise.resolve() })
+
+      expect(descendants(cardOf(view.container)).some((node) => node.tagName === 'TEXTAREA')).toBe(false)
+      expect(view.document.activeElement === getButton(cardOf(view.container), 'Reject')).toBe(true)
+      await act(async () => getButton(cardOf(view.container), 'Reject').click())
+      expect(getByLabel(cardOf(view.container), 'Reason', 'textarea').value).toBe('')
+      await act(async () => getButton(cardOf(view.container), 'Cancel').click())
+      const refreshed = recoveryDecision('rec-cancel-displaced', 'pending_approval', {
+        problem: 'Use the authoritative proposal after the abandoned rejection.',
+      }, { contract_version: 'recovery-cancel:v2' })
+      api.dashboard = dashboardData({
+        decisions: query([...arrivals, refreshed]),
+        checkpoint: query({ goal_id: GOAL_ID, items: arrivals, deferred_count: 0, max_questions: 3 }),
+      })
+      await view.rerender()
+      expect(textOf(cardOf(view.container))).toContain('Use the authoritative proposal after the abandoned rejection.')
+      expect(textOf(cardOf(view.container))).not.toContain('Do not keep this abandoned rejection draft')
+      await act(async () => getButton(cardOf(view.container), 'Reject').click())
+      expect(getByLabel(cardOf(view.container), 'Reason', 'textarea').value).toBe('')
+      expect(api.answer.mutate).not.toHaveBeenCalled()
     } finally { view.cleanup() }
   })
 

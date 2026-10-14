@@ -651,7 +651,7 @@ export function useResolveOrchestrationWarning(projectId: string | null) {
 
 export function useAnswerOrchestrationDecision(projectId: string | null) {
   const queryClient = useQueryClient()
-  return useMutation({
+  const mutation = useMutation({
     mutationFn: ({ goalId, decisionId, selectedOption, reason, editedAgent, contractVersion, runtimeIdentity }: {
       goalId: string
       decisionId: string
@@ -663,11 +663,21 @@ export function useAnswerOrchestrationDecision(projectId: string | null) {
     }) => answerOrchestrationDecision(
       projectId!, goalId, decisionId, selectedOption, reason, editedAgent, contractVersion, runtimeIdentity,
     ),
-    onSuccess: (data, { goalId }) => {
+    onSuccess: (data, { goalId, runtimeIdentity }) => {
+      // Runtime HTTP 200 may be an inert stale-contract receipt. Its caller
+      // validates the exact persisted answer before refreshing any cache.
+      if (runtimeIdentity) return
       syncAnsweredDecisionCache(queryClient, projectId, goalId, data)
       return invalidateGoalAndBaseline(queryClient, projectId, goalId)
     },
   })
+  return {
+    ...mutation,
+    acceptRuntimeResult: (goalId: string, result: OrchestrationDecisionAnswerResult) => {
+      syncAnsweredDecisionCache(queryClient, projectId, goalId, result)
+      return invalidateGoalAndBaseline(queryClient, projectId, goalId)
+    },
+  }
 }
 
 export function useAnswerAgentDefinitionReviewBatch(projectId: string | null) {

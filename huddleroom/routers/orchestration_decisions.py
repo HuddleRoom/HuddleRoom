@@ -18,6 +18,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationDecisionCancelRequest,
 )
 from huddleroom.services.orchestration_recovery_presenter import present_decision_response, present_decision_responses
+from huddleroom.services.orchestration_needs_you_presenter import attach_decision_references
 from huddleroom.services.orchestration_authority_interview import build_checkpoint
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_service import OrchestrationService
@@ -56,7 +57,10 @@ async def list_decisions(
     db: AsyncSession = Depends(get_db),
 ):
     await _goal_or_404(db, project_id, goal_id)
-    return await _present(db, await decision_service.list_decisions(db, goal_id, status=status))
+    decisions = await decision_service.list_decisions(db, goal_id, status=status)
+    return await attach_decision_references(
+        db, project_id=project_id, decisions=decisions, responses=await _present(db, decisions),
+    )
 
 
 @router.get("/goals/{goal_id}/decisions/checkpoint", response_model=OrchestrationCheckpointResponse)
@@ -70,9 +74,12 @@ async def get_checkpoint(
     pending = await decision_service.list_decisions(db, goal_id, status="pending")
     max_questions = settings.orchestration_checkpoint_max_questions
     checkpoint, deferred = build_checkpoint(pending, max_questions=max_questions)
+    responses = await _present(db, list(checkpoint))
     return OrchestrationCheckpointResponse(
         goal_id=goal_id,
-        items=await _present(db, list(checkpoint)),
+        items=await attach_decision_references(
+            db, project_id=project_id, decisions=checkpoint, responses=responses,
+        ),
         deferred_count=len(deferred),
         max_questions=max_questions,
     )

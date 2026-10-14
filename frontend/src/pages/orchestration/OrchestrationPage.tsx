@@ -1067,7 +1067,14 @@ function GatesPanel({
               key: gate.success_criterion_key,
               id: gate.id,
               value: (
-              <article key={gate.id} data-testid={`gate-${gate.success_criterion_key}`} className="min-w-0" aria-busy={gateIsBusy}>
+              <article
+                key={gate.id}
+                id={`gate-${gate.id}`}
+                data-testid={`gate-${gate.success_criterion_key}`}
+                tabIndex={-1}
+                className="min-w-0"
+                aria-busy={gateIsBusy}
+              >
                 {humanDescription && (
                   <p className="break-words text-sm text-huddleroom-text-primary" title={`${gate.success_criterion_key} · ${gate.gate_type}`}>
                     {humanDescription}
@@ -1715,6 +1722,8 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         run={run}
         gates={detail.gates}
         meetingCommitments={detail.meeting_commitments ?? []}
+        needsYouReferences={detail.needs_you_references ?? []}
+        sourceActionIds={detail.actions.map((action) => action.id)}
         mutationBusy={baselineBusy}
         acquireMutation={acquireMutation}
         releaseMutation={releaseMutation}
@@ -1722,6 +1731,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         onMessage={(msg) => { setMessage(msg); setLastMessageOwner(null) }}
         onSelectedProcessTypeChange={setActivityStepType}
         onViewActivity={() => detailsTabsRef.current?.showStepActivity()}
+        onRevealSource={(target) => detailsTabsRef.current?.showSourceRecord(target)}
         renderBlockerRecovery={renderBlockerRecovery}
         suppressQueueAnnouncement
       />
@@ -1732,6 +1742,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           goalId={goalId}
           detail={detail}
           processes={currentProcesses(baseline.processes.data)}
+          sourceProcesses={baseline.processes.data ?? []}
           decisions={baseline.decisions.data ?? []}
           warnings={baseline.warnings.data ?? []}
           selectedStepType={activityStepType}
