@@ -630,9 +630,9 @@ class CliAdapter:
                         if session.status == "failed":
                             payload["resumable"] = True
                         await emit_event(db, session.project_id, event_type, payload)
+                        from huddleroom.services.session_sync import sync_task_from_session
+                        await sync_task_from_session(db, session)
                         if session.status == "failed":
-                            from huddleroom.services.session_sync import sync_task_from_session
-                            await sync_task_from_session(db, session)
                             log_cli_exchange(
                                 prompt=task_content,
                                 session_id=session.provider_session_id,

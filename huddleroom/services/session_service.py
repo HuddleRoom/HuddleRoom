@@ -972,6 +972,8 @@ class SessionService:
 
         # Refresh session to get updated values from the atomic UPDATE
         session = await self.get_or_404(db, session_id)
+        if task is not None:
+            await db.refresh(task)
         if task is not None and task.status == "failed":
             task.status = "in_progress"
             await db.flush()

@@ -186,3 +186,32 @@ async def test_cli_cancel_syncs_linked_task(test_engine, tmp_path, monkeypatch):
         assert stored.status == "cancelled"
         assert stored.ended_at is not None
         assert (await _reload(factory, Task, task.id)).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cli_reset_watcher_cancel_syncs_linked_task(test_engine, tmp_path, monkeypatch):
+    class HangingProc:
+        returncode = None
+        pid = 99999
+
+        async def communicate(self):
+            await asyncio.Event().wait()
+
+    async def resetting(*_args, **_kwargs):
+        return "resetting"
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli", session_status="running") as (
+            factory, _project, _agent, task, session):
+        from huddleroom.adapters.cli_adapter import CliAdapter
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_watch_project_status", new=resetting), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=HangingProc())):
+            async with factory() as db:
+                await asyncio.wait_for(CliAdapter().run(session.id, db), timeout=10)
+                await db.commit()
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "cancelled"
+        assert stored.ended_at is not None
+        assert (await _reload(factory, Task, task.id)).status == "failed"
