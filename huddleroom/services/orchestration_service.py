@@ -10490,8 +10490,20 @@ class OrchestrationService:
         source = await db.get(OrchestrationAction, action_id) if action_id else None
         if source is None:
             graph_run = await db.get(GraphRun, graph_run_id) if graph_run_id else None
-            if graph_run is not None:
-                await GraphEngineService().return_changed_approval_to_review(db, graph_run)
+            if graph_run is not None and graph_run.status == "active" and graph_run.current_node == "ready_for_review":
+                return 0  # the graph is already reviewing again
+            if graph_run is not None and await GraphEngineService().return_changed_approval_to_review(db, graph_run):
+                return 0
+            if graph_run is None or graph_run.status != "active" or graph_run.current_node != "approved":
+                # its review graph can no longer review the changed content: the owner decides
+                await self._escalate_owner(
+                    db, goal, run, "capability_unavailable", f"gate:{gate.id}:review:{graph_run_id}",
+                    [f"approval {item.id} no longer applies: the reviewed content changed",
+                     f"review graph run {graph_run_id} is "
+                     + (f"{graph_run.status} at {graph_run.current_node}" if graph_run else "missing")],
+                    f"The reviewed content for gate {gate.id} changed after its approval, and its review graph "
+                    "cannot review it again. Start a new review or decide the gate.",
+                )
             return 0
         root = source.idempotency_key.split(IDENTITY_KEY_MARK, 1)[0]
         work_function = self._json_object_or_empty(source.request).get("work_function") or "validation"

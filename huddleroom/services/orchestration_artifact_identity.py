@@ -168,7 +168,8 @@ async def classify_input_async(artifact, workspace_root: str) -> InputAvailabili
 
 CHANGED = "changed"
 MAX_REFERENCE_CHARS = 300
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+# C0/C1 controls, line/paragraph separators and bidi controls
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]+")
 
 
 def pinned_reference(artifact, found: InputAvailability) -> str | None:

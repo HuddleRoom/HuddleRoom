@@ -136,6 +136,10 @@ class TaskService:
             for key in ("orchestration", "orchestration_contract"):
                 if key in (task.metadata_ or {}):
                     metadata[key] = task.metadata_[key]
+            # a review session's binding is system-owned: it can be neither replaced, removed nor injected
+            metadata.pop("review_identity", None)
+            if "review_identity" in (task.metadata_ or {}):
+                metadata["review_identity"] = task.metadata_["review_identity"]
             task.metadata_ = metadata
         if data.due_at is not None:
             task.due_at = data.due_at

@@ -395,18 +395,27 @@ async def _redeliver(db, project, session, *, with_outcome=False):
 async def test_redelivered_approval_of_a_superseded_review_session_never_applies(db_session, test_project):
     workspace = Path(test_project.workspace_path)
     (workspace / "app.py").write_text("v1")
+    service, orchestration_run, gate = await _review_gate(db_session, test_project)
     run, artifact, _merger = await _open_review(db_session, test_project, path="app.py")
-    first = await _answer(db_session, test_project, run)  # approves v1
+    [first] = await _review_sessions(db_session, run)
+    await _link_review(db_session, first, orchestration_run, gate)
+    await _answer(db_session, test_project, run)  # approves v1
     (workspace / "app.py").write_text("v2")
     await _event(db_session, test_project, "code.pr_updated", artifact)  # back to review: a new session binds v2
     await db_session.refresh(run)
     assert run.current_node == "ready_for_review" and len(await _review_sessions(db_session, run)) == 2
 
     await _redeliver(db_session, test_project, first)
+    await service.tick(db_session, orchestration_run.id)  # the v1 approval reaches the gate only now
 
     await db_session.refresh(run)
+    await db_session.refresh(gate)
     assert run.current_node == "ready_for_review"  # nobody approved v2
     assert len(await _approvals(db_session, test_project)) == 1
+    [evidence] = [row for row in (await db_session.execute(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == gate.id))).scalars() if row.source_type == "review"]
+    assert evidence.evidence_metadata["artifact_identity"][0]["identity"] == _sha("v1")  # bound to what S1 saw
+    assert gate.status == "open" and gate.failure_reason == "Reviewed content changed after its review"
 
 
 @pytest.mark.asyncio
@@ -494,3 +503,50 @@ async def test_direct_edit_after_graph_approval_sends_the_graph_back_to_review(d
     await service.tick(db_session, orchestration_run.id)
     await db_session.refresh(gate)
     assert gate.status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_changed_graph_approval_asks_the_owner_when_its_graph_already_ended(db_session, test_project):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    service, orchestration_run, gate = await _review_gate(db_session, test_project)
+    run, artifact, _merger = await _open_review(db_session, test_project, path="app.py")
+    [first] = await _review_sessions(db_session, run)
+    await _link_review(db_session, first, orchestration_run, gate)
+    await _answer(db_session, test_project, run)
+    await _event(db_session, test_project, "code.pr_merged", artifact)  # merged on v1
+    await db_session.refresh(run)
+    assert run.status == "completed"
+    (workspace / "app.py").write_text("v2")  # edited before the gate consumed the approval
+
+    await service.tick(db_session, orchestration_run.id)
+    for _ in range(2):  # repeated passes ask once
+        await service.recover_run(db_session, orchestration_run.id, baseline_ready=True)
+
+    await db_session.refresh(gate)
+    assert gate.status == "open"
+    asks = [item for item in orchestration_run.active_blockers
+            if item.get("kind") == "owner_escalation" and item.get("category") == "capability_unavailable"]
+    assert [item["scope"] for item in asks] == [f"gate:{gate.id}:review:{run.id}"]
+
+
+@pytest.mark.asyncio
+async def test_task_update_cannot_replace_remove_or_inject_a_review_binding(db_session, test_project):
+    from huddleroom.schemas.task import TaskUpdate
+    from huddleroom.services.task_service import TaskService
+
+    (Path(test_project.workspace_path) / "app.py").write_text("v1")
+    run, _artifact, _merger = await _open_review(db_session, test_project, path="app.py")
+    [session] = await _review_sessions(db_session, run)
+    task = await db_session.get(Task, session.task_id)
+    bound = task.metadata_["review_identity"]
+
+    for metadata in ({"review_identity": {**bound, "identity": "0" * 64}, "note": "x"}, {"note": "y"}):
+        await TaskService().update(db_session, test_project.id, task.id, TaskUpdate(metadata=metadata))
+        assert task.metadata_["review_identity"] == bound and task.metadata_["note"] == metadata["note"]
+
+    plain = Task(project_id=test_project.id, title="Plain", status="ready")
+    db_session.add(plain)
+    await db_session.flush()
+    await TaskService().update(db_session, test_project.id, plain.id, TaskUpdate(metadata={"review_identity": bound}))
+    assert "review_identity" not in plain.metadata_
