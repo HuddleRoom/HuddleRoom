@@ -12,9 +12,21 @@ MAX_CRITERIA = 20
 MAX_CRITERION_CHARS = 800
 MAX_REPORT_EXCERPT_CHARS = 4000
 MAX_ARTIFACTS = 20
+MAX_MARKER_REF_CHARS = 100
+MAX_ARTIFACT_ID_CHARS = 100
+MAX_HASH_CHARS = 128
+
+# The gate failure reason recorded when gate evidence predates the work it covers.
+STALE_EVIDENCE_REASON = "Evidence is stale"
 
 JUDGE_INSTRUCTION = "Judge this deliverable against these conditions only, not the overall goal."
 FRESH_EVIDENCE_REASON = "Verify the latest work for the stale orchestration gate. Report fresh evidence only."
+FINAL_EVIDENCE_GUIDANCE = (
+    "Final evidence must fit each criterion: live observation where the criterion "
+    "requires it; otherwise deterministic unit tests, document review, static "
+    "analysis, or another accepted method. Preliminary readiness reports never "
+    "satisfy a final criterion."
+)
 
 
 def _clip(text: Any, limit: int, label: str) -> str:
@@ -24,11 +36,21 @@ def _clip(text: Any, limit: int, label: str) -> str:
     return f"{text[:limit].rstrip()}\n[{label} truncated: showing {limit} of {len(text)} characters]"
 
 
+def _short(text: Any, limit: int) -> str:
+    """Clip a one-line identifier: at most `limit` characters, then an ellipsis."""
+    text = str(text if text is not None else "").strip()
+    return text if len(text) <= limit else f"{text[:limit]}…"
+
+
 def _limit(items: Iterable[Any], limit: int, label: str) -> tuple[list[Any], str | None]:
     items = list(items or [])
     if len(items) <= limit:
         return items, None
     return items[:limit], f"[{label} truncated: showing {limit} of {len(items)}]"
+
+
+def _texts(items: Iterable[Any]) -> list[str]:
+    return [text for item in items or [] if (text := str(item if item is not None else "").strip())]
 
 
 def _field(artifact: Any, name: str) -> Any:
@@ -39,10 +61,14 @@ def render_artifact(artifact: Any) -> str:
     """Artifact is a dict or object with `id` and `version` and/or `content_hash` (or `hash`)."""
     version = _field(artifact, "version")
     digest = _field(artifact, "content_hash") or _field(artifact, "hash")
-    parts = [f"Artifact {_field(artifact, 'id')}"]
+    parts = [f"Artifact {_short(_field(artifact, 'id'), MAX_ARTIFACT_ID_CHARS)}"]
     parts.append(f"version {version}" if version is not None else "version unknown")
-    parts.append(f"hash {digest}" if digest else "hash unknown")
+    parts.append(f"hash {_short(digest, MAX_HASH_CHARS)}" if digest else "hash unknown")
     return ", ".join(parts)
+
+
+def _section(title: str, lines: list[str], note: str | None) -> str:
+    return "\n".join([title, *lines, *([note] if note else [])])
 
 
 def build_review_inputs(
@@ -54,38 +80,37 @@ def build_review_inputs(
     marker_ref: str | None,
     artifacts: Iterable[Any],
     *,
-    stale_evidence: bool = False,
+    failure_reason: str | None = None,
 ) -> dict[str, Any]:
     """Return {"scope": str, "deliverable": str, "inputs": list[str]} with every section bounded.
 
-    `stale_evidence` is True only when the gate failed because its evidence went
-    stale; only then does the brief mention the stale orchestration gate.
+    Each input is one section. Only a gate that failed because its evidence went
+    stale (`failure_reason`) makes the brief mention the stale orchestration gate.
     """
+    instruction = f"{JUDGE_INSTRUCTION} {FINAL_EVIDENCE_GUIDANCE}"
+    if failure_reason == STALE_EVIDENCE_REASON:
+        instruction = f"{FRESH_EVIDENCE_REASON} {instruction}"
     scope_text = _clip(scope, MAX_SCOPE_CHARS, "Scope")
-    full_scope = f"{FRESH_EVIDENCE_REASON} {JUDGE_INSTRUCTION}" if stale_evidence else JUDGE_INSTRUCTION
-    full_scope = f"{full_scope}\n\n{scope_text}" if scope_text else full_scope
+    full_scope = f"{instruction}\n\nScope under review:\n{scope_text}" if scope_text else instruction
+    deliverable_text = _clip(deliverable, MAX_DELIVERABLE_CHARS, "Deliverable")
 
-    evidence, evidence_note = _limit(success_evidence, MAX_EVIDENCE_ITEMS, "Success evidence")
-    criteria, criteria_note = _limit(criterion_lines, MAX_CRITERIA, "Criteria")
-    arts, arts_note = _limit(artifacts, MAX_ARTIFACTS, "Artifacts")
-
-    inputs = ["Success evidence:"] + [f"- {_clip(e, MAX_EVIDENCE_ITEM_CHARS, 'Item')}" for e in evidence]
-    if evidence_note:
-        inputs.append(evidence_note)
-    inputs.append("Conditions to judge against:")
-    inputs += [f"- {_clip(c, MAX_CRITERION_CHARS, 'Criterion')}" for c in criteria]
-    if criteria_note:
-        inputs.append(criteria_note)
+    evidence, evidence_note = _limit(_texts(success_evidence), MAX_EVIDENCE_ITEMS, "Success evidence")
+    criteria, criteria_note = _limit(_texts(criterion_lines), MAX_CRITERIA, "Criteria")
+    arts, arts_note = _limit(
+        [a for a in artifacts or [] if str(_field(a, "id") or "").strip()], MAX_ARTIFACTS, "Artifacts",
+    )
     excerpt = _clip(report_excerpt, MAX_REPORT_EXCERPT_CHARS, "Producer report")
-    ref = f" (marker {marker_ref})" if marker_ref else ""
-    inputs.append(f"Producer report{ref}:\n{excerpt or '[no report content]'}")
-    inputs.append("Artifacts:")
-    inputs += [f"- {render_artifact(a)}" for a in arts] or ["- none"]
-    if arts_note:
-        inputs.append(arts_note)
-
+    ref = _short(marker_ref, MAX_MARKER_REF_CHARS)
+    inputs = [
+        _section("Success evidence:", [f"- {_clip(e, MAX_EVIDENCE_ITEM_CHARS, 'Item')}" for e in evidence]
+                 or ["- none stated"], evidence_note),
+        _section("Conditions to judge against:", [f"- {_clip(c, MAX_CRITERION_CHARS, 'Criterion')}" for c in criteria]
+                 or ["- none linked"], criteria_note),
+        f"Producer report{f' (marker {ref})' if ref else ''}:\n{excerpt or '[no report content]'}",
+        _section("Artifacts:", [f"- {render_artifact(a)}" for a in arts] or ["- none"], arts_note),
+    ]
     return {
         "scope": full_scope,
-        "deliverable": _clip(deliverable, MAX_DELIVERABLE_CHARS, "Deliverable"),
+        "deliverable": f"Verification verdict on: {deliverable_text}" if deliverable_text else "Verification verdict.",
         "inputs": inputs,
     }

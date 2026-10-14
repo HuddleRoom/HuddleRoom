@@ -64,6 +64,7 @@ from huddleroom.schemas.orchestration import (
 )
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
+from huddleroom.services.orchestration_review_brief import STALE_EVIDENCE_REASON, _clip, build_review_inputs
 from huddleroom.services.orchestration_plan_ingestion import (
     BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
     INGESTION_SOURCE,
@@ -141,6 +142,7 @@ from huddleroom.services.orchestration_dependencies import (
 
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
+MAX_REVIEW_FINDINGS_CHARS = 4000  # reviewer prose kept on rejected review evidence
 RESULT_CORRECTION_ASK_OPTIONS = (
     {"key": "retry", "label": "Retry the correction"}, {"key": "dismiss", "label": "Stop correcting"},
 )
@@ -167,6 +169,10 @@ PLAN_GATE_TYPE = "plan_accepted"
 ACCEPTED_PLAN_SNAPSHOT_VERSION = 1
 PLAN_WORK_FUNCTION = "planning"
 PLAN_KINDS = ("roadmap", "delivery", "implementation")
+
+
+def _clip_review_findings(text: Any) -> str:
+    return _clip(text, MAX_REVIEW_FINDINGS_CHARS, "Review findings")
 
 
 def plan_kind_for(goal, run=None) -> str:
@@ -4862,6 +4868,7 @@ class OrchestrationService:
         if fit is None:
             await self._fail_reserved_action_for_current_flow(db, action, "No strong verification agent fit")
             raise HTTPException(status_code=409, detail="No strong verification agent fit")
+        brief = await self._verification_brief(db, run, goal, gate, source_task, source_contract)
 
         try:
             from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
@@ -4874,19 +4881,13 @@ class OrchestrationService:
                     "action_type": "create_delegation_task",
                     "agent_id": str(fit.agent_id),
                     "work_function": work_function,
-                    "scope": (
-                        "Verify the latest work for the stale orchestration gate. "
-                        "Report fresh evidence only; do not edit artifacts. "
-                        "Final evidence must fit each criterion: live observation where the criterion "
-                        "requires it; otherwise deterministic unit tests, document review, static "
-                        "analysis, or another accepted method. Preliminary readiness reports never "
-                        "satisfy a final criterion."
-                    ),
+                    "scope": brief["scope"],
                     "inputs": [
                         f"Gate: {gate.id}",
                         f"Failure reason: {gate.failure_reason}",
+                        *brief["inputs"],
                     ],
-                    "deliverable": "Fresh verification evidence for the stale gate.",
+                    "deliverable": brief["deliverable"],
                     "forbidden_work": [
                         "Do not edit project artifacts.",
                         "Do not mark orchestration gates complete.",
@@ -4951,6 +4952,69 @@ class OrchestrationService:
             dedup_key=f"{RECOVERY_VERIFICATION_REQUESTED_EVENT_TYPE}:action:{action.id}",
         )
         return await self._mark_action_completed(db, action, target_type="task", target_id=delegation_action.target_id)
+
+    async def _verification_brief(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun | None,
+        goal: OrchestrationGoal | None,
+        gate: OrchestrationGate,
+        source_task: Task | None,
+        source_contract: dict,
+    ) -> dict[str, Any]:
+        """Verifier brief from the producer: its scope, deliverable, success evidence, linked criteria,
+        effective consumed report and artifacts with their current version/hash."""
+        from huddleroom.services.orchestration_work_report import persisted_report_validation, work_report_payload
+
+        criterion_inputs = [
+            f"criterion:{key}"
+            for key in self._json_object_or_empty(gate.required_evidence).get("success_criterion_keys") or []
+            if isinstance(key, str)
+        ]
+        criterion_inputs += [
+            item for item in self._string_list(source_contract.get("inputs"))
+            if item.startswith("criterion:") and item not in criterion_inputs
+        ]
+        criteria = [self._render_criterion_input(goal, item) if goal else item for item in criterion_inputs]
+
+        excerpt, marker_ref, artifacts = "", None, []
+        if source_task is not None and run is not None:
+            own = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{source_task.id}")
+            ledger = self._json_object_or_empty(self._json_object_or_empty(own.request if own else {}).get("result_correction"))
+            marker_ref = str(own.id) if own is not None else None
+            # newest correction first: a corrected report supersedes the original one
+            for task_id in [*reversed(ledger.get("correction_task_ids") or []), str(source_task.id)]:
+                marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{task_id}")
+                request = self._json_object_or_empty(marker.request if marker else {})
+                report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
+                if report is not None:
+                    payload = {key: value for key, value in work_report_payload(report).items() if value not in (None, [], {})}
+                    excerpt, marker_ref = json.dumps(payload, indent=2, ensure_ascii=False), str(marker.id)
+                    break
+            artifact_ids = []
+            for value in source_contract.get("artifact_ids") or []:
+                try:
+                    artifact_ids.append(uuid.UUID(str(value)))
+                except ValueError:
+                    continue
+            artifacts = list(await db.scalars(
+                select(Artifact)
+                .where(
+                    Artifact.project_id == source_task.project_id,
+                    or_(Artifact.id.in_(artifact_ids), Artifact.linked_task_id == source_task.id),
+                )
+                .order_by(Artifact.created_at, Artifact.id)
+            ))
+        return build_review_inputs(
+            str(source_contract.get("scope") or ""),
+            str(source_contract.get("deliverable") or ""),
+            self._string_list(source_contract.get("success_evidence")),
+            criteria,
+            excerpt,
+            marker_ref,
+            artifacts,
+            failure_reason=gate.failure_reason,
+        )
 
     async def execute_pause_run_action(
         self,
@@ -9890,6 +9954,8 @@ class OrchestrationService:
                 "source_task_id": str(source_task.id),
                 "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
                 **({"normalized": findings["normalized"]} if findings.get("normalized") else {}),
+                **({"findings": {"evidence": findings.get("evidence") or [], "notes": findings.get("notes")}}
+                   if verdict == "rejected" else {}),
                 **extra,
             },
         )
@@ -9973,6 +10039,16 @@ class OrchestrationService:
             "review_verdict": review_verdict,
             "review_outcome": review_outcome,
         }
+        verdict = (
+            "candidate"
+            if event.event_type == "review.approved" and review_verdict in (None, "approved")
+            else "rejected"
+        )
+        if verdict == "rejected":
+            metadata["findings"] = {
+                "evidence": [],
+                "notes": _clip_review_findings(review_outcome.get("raw_output") or session.output),
+            }
         return await self._record_evidence_once(
             db,
             run_id=run.id,
@@ -9981,11 +10057,7 @@ class OrchestrationService:
             source_id=session.id,
             observed_event=event,
             producer_agent_id=session.agent_id,
-            verdict=(
-                "candidate"
-                if event.event_type == "review.approved" and review_verdict in (None, "approved")
-                else "rejected"
-            ),
+            verdict=verdict,
             evidence_metadata=metadata,
         )
 
@@ -10542,7 +10614,7 @@ class OrchestrationService:
                     link={"kind": "final_summary", "gate_id": str(gate.id), "final_summary": final_summary_metadata},
                 )
                 continue
-            if gate.failure_reason == "Evidence is stale":
+            if gate.failure_reason == STALE_EVIDENCE_REASON:
                 if not baseline_ready:
                     continue
                 created += await self._request_stale_gate_verification(db, goal, run, gate)
@@ -11645,10 +11717,10 @@ class OrchestrationService:
             seq = self._evidence_event_seq(item)
             if work_seq is not None and seq is not None:
                 if seq <= work_seq:
-                    return "Evidence is stale"
+                    return STALE_EVIDENCE_REASON
                 continue
             if work_created_at is not None and item.created_at <= work_created_at:
-                return "Evidence is stale"
+                return STALE_EVIDENCE_REASON
         return None
 
     def _latest_evidence_by_source(self, evidence: list[OrchestrationEvidence]) -> list[OrchestrationEvidence]:
