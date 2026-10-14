@@ -9746,10 +9746,14 @@ class OrchestrationService:
         gate: OrchestrationGate,
         task: Task,
     ) -> OrchestrationAction | None:
-        if not (
+        # Any gate's automatic-revision re-verification is a bound verifier too: its verdict decides the gate.
+        typed = (
             await self._is_outcome_plan_item_gate(db, run, gate)
             or gate.gate_type in {"roadmap_plan_approval", "roadmap_integration"}
-        ):
+        )
+        if not typed and await self._existing_action_for_key(
+            db, run.id, self._gate_revision_ledger_key(run.id, gate.id),
+        ) is None:
             return None
         verifier_task_id = task.id
         parent_id = self._event_uuid(self._json_object_or_empty(task.metadata_).get("result_correction_parent_task_id"))
@@ -9776,7 +9780,17 @@ class OrchestrationService:
         )
         if action is None or self._event_uuid(action.request.get("gate_id")) != gate.id:
             return None
+        if not typed and not self._is_revision_reverification(run.id, action):
+            return None
         return action
+
+    @staticmethod
+    def _gate_revision_reverification_key(run_id: uuid.UUID, revision_task_id: Any) -> str:
+        return f"run:{run_id}:kind:request_verification:gate_revision:{revision_task_id}"
+
+    @staticmethod
+    def _is_revision_reverification(run_id: uuid.UUID, action: OrchestrationAction) -> bool:
+        return action.idempotency_key.startswith(f"run:{run_id}:kind:request_verification:gate_revision:")
 
     @staticmethod
     def _verification_report(output: str | None) -> tuple[str | None, list[str], dict[str, Any] | None]:
@@ -9828,7 +9842,10 @@ class OrchestrationService:
     ) -> tuple[OrchestrationAction, Task] | None:
         """Return Phase-A's durable verifier binding, or reject the proof."""
         action = await self._outcome_verification_action_for_task(db, run, gate, task)
-        if gate.gate_type == "roadmap_plan_approval":
+        if action is not None and self._is_revision_reverification(run.id, action):
+            source_task_id = self._event_uuid(action.request.get("source_task_id"))
+            source_task = await db.get(Task, source_task_id) if source_task_id else None
+        elif gate.gate_type == "roadmap_plan_approval":
             try:
                 source_task = await self._planning_task_for_gate(db, run, gate)
             except HTTPException:
@@ -10311,7 +10328,46 @@ class OrchestrationService:
             created += await self._recover_blocked_tasks(db, goal, run)
         if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
             created += await self._recover_failed_gates(db, goal, run, baseline_ready=baseline_ready)
+        if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
+            created += await self._reverify_gate_revisions(db, goal, run)
         await db.flush()
+        return created
+
+    async def _reverify_gate_revisions(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
+        """Each finished revision with a valid report gets one independent re-verification of its gate (only the
+        producer is excluded). A revision whose report is under result correction waits for it to land."""
+        if await self._result_correction_stale(db, run) is not None:
+            return 0
+        created = 0
+        markers = await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "gate_revision_ledger",
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id))
+        for marker in list(markers):
+            gate = await db.get(OrchestrationGate, marker.target_id) if marker.target_id else None
+            entries = await self._gate_revision_entries(db, run.id, gate.id) if gate is not None else []
+            if gate is None or gate.status == "accepted" or not entries:
+                continue
+            revision = await db.get(Task, self._event_uuid(entries[-1].get("revision_task_id")))
+            key = self._gate_revision_reverification_key(run.id, revision.id if revision else None)
+            if (revision is None or revision.status != "done"
+                    or await self._existing_action_for_key(db, run.id, key) is not None
+                    or (await self._effective_report(db, run.id, revision))[1] is None):
+                continue
+            # the gate keeps the kind of judge that first rejected it: a reviewed gate is re-reviewed
+            work_function = "review" if entries[0].get("cause") == "review_rejected" else "validation"
+            try:
+                await self.execute_request_verification_action(db, run.id, {
+                    "action_type": "request_verification", "gate_id": str(gate.id), "work_function": work_function,
+                }, key)
+                created += 1
+            except HTTPException as exc:
+                if not 400 <= exc.status_code < 500:
+                    raise
+                await self._escalate_owner(
+                    db, goal, run, "capability_unavailable", f"gate:{gate.id}:revision",
+                    [f"revision task {revision.id} finished"],
+                    f"Cannot re-verify the revision for gate {gate.id}: {exc.detail}.",
+                )
         return created
 
     async def _recover_failed_tasks(
@@ -10934,11 +10990,14 @@ class OrchestrationService:
         evidence: OrchestrationEvidence | None = None,
         *,
         reason: str | None = None,
+        source_id: str | None = None,
     ) -> int:
         """Send a rejection back to the producer as one revision task: automatic, within the original task's
         authority and normal budget admission. At most two per gate, the second only when the findings changed,
         counted on one durable ledger shared by every cause; then the owner is asked. Returns 1 when a revision
-        or a new owner ask was created."""
+        or a new owner ask was created.
+
+        ``evidence`` is the rejected evidence; a cause without one passes ``reason`` and a stable ``source_id``."""
         if await self._result_correction_stale(db, run) is not None:
             return 0  # nothing is dispatched onto a paused or superseded run
         key = self._gate_revision_ledger_key(run.id, gate.id)
@@ -10951,11 +11010,16 @@ class OrchestrationService:
         ledger = dict(self._json_object_or_empty(marker.request))
         revisions = await self._gate_revision_entries(db, run.id, gate.id)
         source_evidence_id = str(evidence.id) if evidence is not None else None
+        source_id = source_evidence_id or source_id
         stopped = self._json_object_or_empty(ledger.get("exhausted"))
-        if source_evidence_id is not None and source_evidence_id in {
-            stopped.get("source_evidence_id"), *(item.get("source_evidence_id") for item in revisions),
+        if source_id is not None and source_id in {
+            stopped.get("source_id"), *(item.get("source_id") or item.get("source_evidence_id") for item in revisions),
         }:
             return 0  # a replayed rejection never adds a revision
+        if revisions:
+            in_flight = await db.get(Task, self._event_uuid(revisions[-1].get("revision_task_id")))
+            if in_flight is not None and in_flight.status not in {"done", "failed", "cancelled"}:
+                return 0  # one revision at a time: its re-verification judges the latest work
         findings = self._json_object_or_empty(
             self._json_object_or_empty(evidence.evidence_metadata if evidence is not None else {}).get("findings")
         ) or {"evidence": [], "notes": reason}
@@ -10963,10 +11027,11 @@ class OrchestrationService:
         subject = f"gate:{gate.id}:revision"
         history = []
         for item in revisions:
-            prior = await db.get(OrchestrationEvidence, self._event_uuid(item.get("source_evidence_id")))
+            prior_id = self._event_uuid(item.get("source_evidence_id"))
+            prior = await db.get(OrchestrationEvidence, prior_id) if prior_id else None
             history.append(self._findings_line(item.get("cause", "rejected"), self._json_object_or_empty(
                 self._json_object_or_empty(prior.evidence_metadata if prior else {}).get("findings")
-            )))
+            ) or {"notes": item.get("reason")}))
         history.append(self._findings_line(cause, findings))
         ask_key = f"run:{run.id}:kind:ask_human:{{category}}:{subject}"
 
@@ -10975,7 +11040,7 @@ class OrchestrationService:
             action = await self._escalate_owner(db, goal, run, category, subject, history, question)
             if category == "revision_exhausted":
                 marker.request = {**ledger, "exhausted": {
-                    "source_evidence_id": source_evidence_id, "findings_hash": findings_hash,
+                    "source_evidence_id": source_evidence_id, "source_id": source_id, "findings_hash": findings_hash,
                     "decision_id": str(action.target_id) if action.target_id else None,
                 }}
             return int(created)
@@ -10993,6 +11058,19 @@ class OrchestrationService:
         if self._budget_is_exhausted(run):
             return await ask("budget_exhausted", "Cannot fund a revision: budget capacity is exhausted.")
         contract = self._json_object_or_empty(self._json_object_or_empty(source.metadata_).get("orchestration_contract"))
+        budget = self._json_object_or_empty(contract.get("budget"))
+        if not budget:
+            from huddleroom.services.orchestration_budget_service import (
+                BudgetMeasurementError, OrchestrationBudgetService, parent_caps,
+            )
+
+            if parent_caps(goal):  # a capped goal funds an unbudgeted original's revision like its verifier
+                try:
+                    budget = await OrchestrationBudgetService().protected_action_allocation(db, goal, run)
+                except BudgetMeasurementError as exc:
+                    return await ask("budget_exhausted", f"Cannot fund a revision: missing {exc.dimension} measurement.")
+                if not any(Decimal(amount) for amount in budget.values()):
+                    return await ask("budget_exhausted", "Cannot fund a revision: budget capacity is exhausted.")
         request = {
             "action_type": "create_delegation_task", "agent_id": str(source.assigned_to),
             "work_function": self._task_work_function(source),
@@ -11007,7 +11085,7 @@ class OrchestrationService:
                 *self._string_list(contract.get("forbidden_work")), "Do not mark orchestration gates complete.",
             ],
             "success_evidence": self._string_list(contract.get("success_evidence")),
-            "budget": self._json_object_or_empty(contract.get("budget")),
+            "budget": budget,
             "report_schema": self._json_object_or_empty(contract.get("report_schema")),
             "parent_task_id": str(source.id),
             **{name: contract[name] for name in ("orchestrator_context", "authorization_scope") if contract.get(name)},
@@ -11047,12 +11125,14 @@ class OrchestrationService:
             task.description = f"{task.description or ''}\n\n{brief}"
         marker.request = {**ledger, "revisions": [*revisions, {
             "cause": cause, "findings_hash": findings_hash, "source_evidence_id": source_evidence_id,
-            "revision_task_id": str(task.id), "at": _utcnow().isoformat(),
+            "source_id": source_id, "revision_task_id": str(task.id), "at": _utcnow().isoformat(),
+            **({"reason": reason} if evidence is None and reason else {}),
         }]}
-        run.active_blockers = [  # funding returned: the subject's budget ask no longer blocks it
+        run.active_blockers = [  # dispatched: the subject's funding or dispatch ask no longer blocks it
             item for item in run.active_blockers
             if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
-                    and item.get("category") == "budget_exhausted" and item.get("scope") == subject)
+                    and item.get("category") in {"budget_exhausted", "capability_unavailable"}
+                    and item.get("scope") == subject)
         ]
         await db.flush()
         return 1
@@ -11657,17 +11737,27 @@ class OrchestrationService:
             return [], None
         evidence = await self._evidence_for_gate(db, gate)
         latest_evidence = self._latest_evidence_by_source(evidence)
-        # A rejection whose automatic revision finished is answered by that revision; re-verification judges it.
+        # A rejection holds until a later review/verification judges the work. Once its automatic revision
+        # finished, the gate waits (open) for that independent re-verification instead of failing again.
         revised = {item.get("source_evidence_id") for item, _task in await self._finished_gate_revisions(
             db, gate.run_id, gate.id,
         )}
-        rejected = next(
-            (item for item in latest_evidence if item.verdict == "rejected" and str(item.id) not in revised
-             and not self._superseded_attempt(item, evidence)),
-            None,
-        )
+        judgements = [self._evidence_order_key(item) for item in evidence
+                      if item.source_type in {"verification", "review"} and item.verdict in {"candidate", "accepted"}]
+        rejected, reverification_pending = None, False
+        for item in latest_evidence:
+            if item.verdict != "rejected" or self._superseded_attempt(item, evidence):
+                continue
+            if str(item.id) in revised:
+                order = self._evidence_order_key(item)
+                reverification_pending |= not any(key > order for key in judgements)
+                continue
+            rejected = item
+            break
         if rejected is not None:
             return [], (f"Rejected evidence from {rejected.source_type}", True)
+        if reverification_pending:
+            return [], ("Re-verification of the revision is pending", False)
 
         required_evidence = await self._required_evidence_for_gate(db, gate, update=update_required_evidence)
         configured_source_types = required_evidence.get("required_source_types", [])
