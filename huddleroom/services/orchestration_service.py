@@ -64,7 +64,7 @@ from huddleroom.schemas.orchestration import (
 )
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
-from huddleroom.services.orchestration_review_brief import STALE_EVIDENCE_REASON, _clip, build_review_inputs
+from huddleroom.services.orchestration_review_brief import STALE_EVIDENCE_REASON, bound_findings, build_review_inputs
 from huddleroom.services.orchestration_plan_ingestion import (
     BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
     INGESTION_SOURCE,
@@ -142,7 +142,6 @@ from huddleroom.services.orchestration_dependencies import (
 
 
 LLM_DECISION_RUN_STATUSES = frozenset({"running", "blocked"})
-MAX_REVIEW_FINDINGS_CHARS = 4000  # reviewer prose kept on rejected review evidence
 RESULT_CORRECTION_ASK_OPTIONS = (
     {"key": "retry", "label": "Retry the correction"}, {"key": "dismiss", "label": "Stop correcting"},
 )
@@ -169,10 +168,6 @@ PLAN_GATE_TYPE = "plan_accepted"
 ACCEPTED_PLAN_SNAPSHOT_VERSION = 1
 PLAN_WORK_FUNCTION = "planning"
 PLAN_KINDS = ("roadmap", "delivery", "implementation")
-
-
-def _clip_review_findings(text: Any) -> str:
-    return _clip(text, MAX_REVIEW_FINDINGS_CHARS, "Review findings")
 
 
 def plan_kind_for(goal, run=None) -> str:
@@ -4868,10 +4863,10 @@ class OrchestrationService:
         if fit is None:
             await self._fail_reserved_action_for_current_flow(db, action, "No strong verification agent fit")
             raise HTTPException(status_code=409, detail="No strong verification agent fit")
-        brief = await self._verification_brief(db, run, goal, gate, source_task, source_contract)
-
         try:
             from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
+
+            brief = await self._verification_brief(db, run, goal, gate, source_task, source_contract)
 
             verification_budget = await OrchestrationBudgetService().protected_action_allocation(db, goal, run)
             delegation_action = await self.execute_create_delegation_task_action(
@@ -4964,7 +4959,7 @@ class OrchestrationService:
     ) -> dict[str, Any]:
         """Verifier brief from the producer: its scope, deliverable, success evidence, linked criteria,
         effective consumed report and artifacts with their current version/hash."""
-        from huddleroom.services.orchestration_work_report import persisted_report_validation, work_report_payload
+        from huddleroom.services.orchestration_work_report import work_report_payload
 
         criterion_inputs = [
             f"criterion:{key}"
@@ -4979,18 +4974,11 @@ class OrchestrationService:
 
         excerpt, marker_ref, artifacts = "", None, []
         if source_task is not None and run is not None:
-            own = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{source_task.id}")
-            ledger = self._json_object_or_empty(self._json_object_or_empty(own.request if own else {}).get("result_correction"))
-            marker_ref = str(own.id) if own is not None else None
-            # newest correction first: a corrected report supersedes the original one
-            for task_id in [*reversed(ledger.get("correction_task_ids") or []), str(source_task.id)]:
-                marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{task_id}")
-                request = self._json_object_or_empty(marker.request if marker else {})
-                report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
-                if report is not None:
-                    payload = {key: value for key, value in work_report_payload(report).items() if value not in (None, [], {})}
-                    excerpt, marker_ref = json.dumps(payload, indent=2, ensure_ascii=False), str(marker.id)
-                    break
+            marker, report, _sources = await self._effective_report(db, run.id, source_task)
+            marker_ref = str(marker.id) if marker is not None else None
+            if report is not None:
+                payload = {key: value for key, value in work_report_payload(report).items() if value not in (None, [], {})}
+                excerpt = json.dumps(payload, indent=2, ensure_ascii=False)
             artifact_ids = []
             for value in source_contract.get("artifact_ids") or []:
                 try:
@@ -9954,7 +9942,7 @@ class OrchestrationService:
                 "source_task_id": str(source_task.id),
                 "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
                 **({"normalized": findings["normalized"]} if findings.get("normalized") else {}),
-                **({"findings": {"evidence": findings.get("evidence") or [], "notes": findings.get("notes")}}
+                **({"findings": bound_findings(findings.get("evidence") or [], findings.get("notes"), "Verification")}
                    if verdict == "rejected" else {}),
                 **extra,
             },
@@ -10045,10 +10033,7 @@ class OrchestrationService:
             else "rejected"
         )
         if verdict == "rejected":
-            metadata["findings"] = {
-                "evidence": [],
-                "notes": _clip_review_findings(review_outcome.get("raw_output") or session.output),
-            }
+            metadata["findings"] = bound_findings([], review_outcome.get("raw_output") or session.output, "Review")
         return await self._record_evidence_once(
             db,
             run_id=run.id,
@@ -11602,25 +11587,22 @@ class OrchestrationService:
 
         return selected, None
 
-    async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
-        """(reason, final) unless the done task's consumed report is valid with evidence.
+    async def _effective_report(self, db: AsyncSession, run_id: uuid.UUID, task: Task) -> tuple[Any, Any, tuple]:
+        """(marker, report, (ledger, clarification, markers)) for the task's effective consumed report.
 
-        An unusable report is final (the gate fails) unless a result correction is still pending."""
+        Original first unless it is under correction, then the ledger's corrections in order (or the legacy
+        report clarification). With no usable report: the original marker (or None) and no report."""
         from huddleroom.services.orchestration_work_report import persisted_report_validation
 
-        task_id = self._optional_uuid(self._json_object_or_empty(gate.required_evidence).get("task_id"), "task_id")
-        task = await db.get(Task, task_id) if task_id is not None else None
-        if task is None or task.status != "done":
-            return "Task is not completed", False
-        own = await self._existing_action_for_key(db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{task.id}")
+        own = await self._existing_action_for_key(db, run_id, f"run:{run_id}:kind:report_consumed:task:{task.id}")
         ledger = self._json_object_or_empty(self._json_object_or_empty(own.request if own else {}).get("result_correction"))
         clarification = await self._existing_action_for_key(
-            db, gate.run_id, f"run:{gate.run_id}:kind:report_clarification:task:{task.id}"
+            db, run_id, f"run:{run_id}:kind:report_clarification:task:{task.id}"
         )
         corrections = [self._optional_uuid(item, "correction_task_id") for item in ledger.get("correction_task_ids", [])]
         sources = [task.id, *(corrections or [clarification.target_id if clarification is not None else None])]
         markers = [
-            await self._existing_action_for_key(db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{source}")
+            await self._existing_action_for_key(db, run_id, f"run:{run_id}:kind:report_consumed:task:{source}")
             if source is not None else None
             for source in sources
         ]
@@ -11630,7 +11612,20 @@ class OrchestrationService:
             request = self._json_object_or_empty(marker.request) if marker is not None else {}
             report = persisted_report_validation(request.get("report"), request.get("report_validation_errors", [])).report
             if report is not None:
-                return None if report.candidate_evidence else ("Task report has no evidence", True)
+                return marker, report, (ledger, clarification, markers)
+        return own, None, (ledger, clarification, markers)
+
+    async def _adhoc_report_failure(self, db: AsyncSession, gate: OrchestrationGate) -> tuple[str, bool] | None:
+        """(reason, final) unless the done task's consumed report is valid with evidence.
+
+        An unusable report is final (the gate fails) unless a result correction is still pending."""
+        task_id = self._optional_uuid(self._json_object_or_empty(gate.required_evidence).get("task_id"), "task_id")
+        task = await db.get(Task, task_id) if task_id is not None else None
+        if task is None or task.status != "done":
+            return "Task is not completed", False
+        _marker, report, (ledger, clarification, markers) = await self._effective_report(db, gate.run_id, task)
+        if report is not None:
+            return None if report.candidate_evidence else ("Task report has no evidence", True)
         if markers[0] is None:
             return "Task report is missing", False
         if ledger:  # the correction ledger decides: final only once correction has stopped
