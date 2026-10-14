@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import object_session
 
@@ -155,16 +156,16 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
     output_hash = plan_output_hash(normalized)
     artifact = await db.get(Artifact, artifact_id)
     if artifact is None:
-        artifact = Artifact(
-            id=artifact_id,
-            project_id=goal.project_id,
-            name=f"plan-{task.id}-v{plan_version}",
-            artifact_type="plan",
-            status="draft",
-            linked_task_id=task.id,
-            created_by_agent=author,
-            content_hash=output_hash,
-            metadata_={
+        artifact_values = {
+            "id": artifact_id,
+            "project_id": goal.project_id,
+            "name": f"plan-{task.id}-v{plan_version}",
+            "artifact_type": "plan",
+            "status": "draft",
+            "linked_task_id": task.id,
+            "created_by_agent": author,
+            "content_hash": output_hash,
+            "metadata_": {
                 "kind": f"{kind}_plan",
                 "source": INGESTION_SOURCE,
                 **normalized,
@@ -174,18 +175,29 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
                 "planning_version": plan_version,
                 "plan_author_agent_id": str(author),
             },
-        )
-        nested = await db.begin_nested()
-        try:
-            db.add(artifact)
-            await db.flush()
-        except IntegrityError:
-            await nested.rollback()
-            if object_session(artifact) is not None:
-                db.expunge(artifact)
-            artifact = await db.get(Artifact, artifact_id)
-            if artifact is None:
-                raise
+        }
+        if db.get_bind().dialect.name == "sqlite":
+            # Ordinary DML keeps the write in the caller's transaction. Releasing
+            # a first-write SAVEPOINT can commit independently on legacy SQLite.
+            await db.execute(
+                sqlite_insert(Artifact).values(**artifact_values).on_conflict_do_nothing(index_elements=[Artifact.id])
+            )
+            artifact = (await db.execute(select(Artifact).where(Artifact.id == artifact_id))).scalar_one()
+        else:
+            artifact = Artifact(**artifact_values)
+            nested = await db.begin_nested()
+            try:
+                db.add(artifact)
+                await db.flush()
+            except IntegrityError:
+                await nested.rollback()
+                if object_session(artifact) is not None:
+                    db.expunge(artifact)
+                artifact = await db.get(Artifact, artifact_id)
+                if artifact is None:
+                    raise
+            else:
+                await nested.commit()
     if (artifact.metadata_ or {}).get("output_hash") != output_hash:
         raise PlanIngestionError("conflicting plan output for task/version")
     run.plan_state = {**state, "plan_artifact_id": str(artifact_id), "plan_output_hash": output_hash}
