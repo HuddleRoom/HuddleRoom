@@ -663,7 +663,7 @@ async def test_tick_reports_recoveries_created(db_session, test_project):
 
 
 @pytest.mark.asyncio
-async def test_recover_run_escalates_review_fix_when_source_unresolvable(db_session, test_project):
+async def test_recover_run_asks_the_owner_when_a_rejected_review_has_no_producer(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     reviewer = _agent("reviewer", "reviewer", ["review"])
     db_session.add_all([developer, reviewer])
@@ -685,11 +685,13 @@ async def test_recover_run_escalates_review_fix_when_source_unresolvable(db_sess
     ask_actions = await _actions(db_session, run.id, "ask_human")
 
     assert created == 1
-    assert run.status == "blocked"
-    assert goal.status == "blocked"
-    assert run.active_blockers[0]["kind"] == "review_fix_required"
+    # only the gate's revision subject is blocked; the run keeps dispatching other work
+    assert run.status == "running" and goal.status == "active"
+    assert [(b["kind"], b["category"], b["scope"]) for b in run.active_blockers] == [
+        ("owner_escalation", "capability_unavailable", f"gate:{gate.id}:revision"),
+    ]
     assert len(ask_actions) == 1
-    assert ask_actions[0].request["question"].startswith("Rejected review needs a fix")
+    assert "No producer task or assignee can revise" in ask_actions[0].request["question"]
 
     replay_created = await service.recover_run(db_session, run.id, baseline_ready=True)
     assert replay_created == 0
@@ -1504,7 +1506,7 @@ async def test_legacy_recover_run_cannot_reassign_failed_task_without_approval(d
 
 
 @pytest.mark.asyncio
-async def test_legacy_rejected_review_fix_creates_trigger_not_replacement_task(db_session, test_project):
+async def test_rejected_review_revises_the_producer_without_a_recovery_trigger(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     reviewer = _agent("reviewer", "reviewer", ["review"])
     db_session.add_all([developer, reviewer])
@@ -1527,9 +1529,11 @@ async def test_legacy_rejected_review_fix_creates_trigger_not_replacement_task(d
     await service.recover_run(db_session, run.id, baseline_ready=True)
     await service.recover_run(db_session, run.id, baseline_ready=True)
 
-    assert await _actions(db_session, run.id, "create_delegation_task") == []
-    assert await db_session.scalar(select(count(Task.id))) == tasks_before
-    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+    [revision_action] = await _actions(db_session, run.id, "create_delegation_task")
+    revision = await db_session.get(Task, revision_action.target_id)
+    assert await db_session.scalar(select(count(Task.id))) == tasks_before + 1
+    assert revision.assigned_to == developer.id and revision.parent_id == task.id
+    assert await _actions(db_session, run.id, "recovery_trigger") == []
     assert gate.status == "failed"
 
 

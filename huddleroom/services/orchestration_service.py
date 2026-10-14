@@ -64,7 +64,9 @@ from huddleroom.schemas.orchestration import (
 )
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
-from huddleroom.services.orchestration_review_brief import STALE_EVIDENCE_REASON, bound_findings, build_review_inputs
+from huddleroom.services.orchestration_review_brief import (
+    STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief,
+)
 from huddleroom.services.orchestration_plan_ingestion import (
     BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
     INGESTION_SOURCE,
@@ -181,6 +183,11 @@ ATTEMPT_SOURCE_TYPES = frozenset({"task", "session"})
 ATTEMPT_REJECTION_REASONS = frozenset(
     {"Rejected evidence from task", "Rejected evidence from session"}
 )
+# Semantic rejections that go back to the producer as an automatic revision, at most GATE_REVISION_CAP per gate.
+REVISABLE_REJECTION_REASONS = frozenset(
+    {"Rejected evidence from verification", "Rejected evidence from review"}
+)
+GATE_REVISION_CAP = 2
 # Authorization denials a different agent/decision can resolve for one task; the rest are run-wide.
 TASK_SCOPED_AUTH_DENIALS = frozenset({
     "agent_outside_accepted_team", "model_spend_not_granted", "external_write_not_granted",
@@ -4749,7 +4756,8 @@ class OrchestrationService:
 
     async def verification_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any) -> str:
         """Key suffix that makes a verification retryable: one attempt per prior FAILED
-        request_verification for the gate. Attempt 0 has no suffix (legacy keys unchanged)."""
+        request_verification for the gate, plus one per automatic gate revision. Attempt 0 with no revision has no
+        suffix (legacy keys unchanged)."""
         rows = (await db.execute(
             select(OrchestrationAction.request).where(
                 OrchestrationAction.run_id == run_id,
@@ -4758,7 +4766,9 @@ class OrchestrationService:
             )
         )).scalars().all()
         failed = sum(1 for req in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id))
-        return f":attempt:{failed}" if failed else ""
+        # each automatic revision is re-verified under a fresh key
+        revisions = len(await self._gate_revision_entries(db, run_id, gate_id))
+        return (f":attempt:{failed}" if failed else "") + (f":revision:{revisions}" if revisions else "")
 
     async def _task_has_active_session(self, db: AsyncSession, task_id: uuid.UUID) -> bool:
         result = await db.execute(
@@ -4974,7 +4984,10 @@ class OrchestrationService:
 
         excerpt, marker_ref, artifacts = "", None, []
         if source_task is not None and run is not None:
-            marker, report, _sources = await self._effective_report(db, run.id, source_task)
+            # After an automatic revision the verifier judges the revision's report and artifacts.
+            revisions = await self._finished_gate_revisions(db, run.id, gate.id)
+            report_task = revisions[-1][1] if revisions else source_task
+            marker, report, _sources = await self._effective_report(db, run.id, report_task)
             marker_ref = str(marker.id) if marker is not None else None
             if report is not None:
                 payload = {key: value for key, value in work_report_payload(report).items() if value not in (None, [], {})}
@@ -4989,7 +5002,7 @@ class OrchestrationService:
                 select(Artifact)
                 .where(
                     Artifact.project_id == source_task.project_id,
-                    or_(Artifact.id.in_(artifact_ids), Artifact.linked_task_id == source_task.id),
+                    or_(Artifact.id.in_(artifact_ids), Artifact.linked_task_id.in_({source_task.id, report_task.id})),
                 )
                 .order_by(Artifact.created_at, Artifact.id)
             ))
@@ -9605,7 +9618,7 @@ class OrchestrationService:
             created
             and status == "done"
             and gate.status == "failed"
-            and gate.failure_reason in ATTEMPT_REJECTION_REASONS
+            and (gate.failure_reason in ATTEMPT_REJECTION_REASONS or self._gate_revision_finished(gate, task))
         ):
             self._reopen_gate(gate)
         if created and status == "done":
@@ -9672,6 +9685,7 @@ class OrchestrationService:
             and (
                 gate.gate_type == FINAL_SUMMARY_GATE_TYPE
                 or gate.failure_reason in ATTEMPT_REJECTION_REASONS
+                or (task.status == "done" and self._gate_revision_finished(gate, task))
             )
         ):
             self._reopen_gate(gate)
@@ -10607,8 +10621,10 @@ class OrchestrationService:
             if not baseline_ready:
                 continue
             latest_rejected = await self._latest_rejected_evidence_for_gate(db, gate)
-            if latest_rejected is not None and latest_rejected.source_type == "review":
-                created += await self._create_rejected_review_fix_task(db, goal, run, gate, latest_rejected)
+            if latest_rejected is not None and latest_rejected.source_type in {"verification", "review"}:
+                created += await self._request_gate_revision(
+                    db, goal, run, gate, f"{latest_rejected.source_type}_rejected", latest_rejected,
+                )
         return created
 
     async def _final_summary_correction_open(
@@ -10858,72 +10874,188 @@ class OrchestrationService:
         await db.flush()
         return action
 
-    async def _create_rejected_review_fix_task(
+    @staticmethod
+    def _gate_revision_ledger_key(run_id: uuid.UUID, gate_id: Any) -> str:
+        return f"run:{run_id}:kind:gate_revision_ledger:gate:{gate_id}"
+
+    async def _gate_revision_entries(self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any) -> list[dict[str, Any]]:
+        marker = await self._existing_action_for_key(db, run_id, self._gate_revision_ledger_key(run_id, gate_id))
+        entries = self._json_object_or_empty(marker.request if marker else {}).get("revisions") or []
+        return [dict(item) for item in entries if isinstance(item, Mapping)]
+
+    async def _finished_gate_revisions(
+        self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any,
+    ) -> list[tuple[dict, Task]]:
+        """(ledger entry, revision task) for every revision that finished its work, oldest first."""
+        finished = []
+        for item in await self._gate_revision_entries(db, run_id, gate_id):
+            task = await db.get(Task, self._event_uuid(item.get("revision_task_id")))
+            if task is not None and task.status == "done":
+                finished.append((item, task))
+        return finished
+
+    @staticmethod
+    def _gate_revision_finished(gate: OrchestrationGate, task: Task) -> bool:
+        """A finished revision reopens the gate its rejection failed, ready for re-verification."""
+        orchestration = OrchestrationService._json_object_or_empty(
+            OrchestrationService._json_object_or_empty(task.metadata_).get("orchestration")
+        )
+        return (gate.status == "failed" and gate.failure_reason in REVISABLE_REJECTION_REASONS
+                and orchestration.get("recovery_kind") == "gate_revision")
+
+    async def _gate_revision_source(
+        self, db: AsyncSession, goal: OrchestrationGoal, gate: OrchestrationGate,
+    ) -> Task | None:
+        """The producer task a revision revises: the plan item's producer, else the gate's latest work task."""
+        source = await self._plan_item_producer_task(db, gate) or await self._source_task_for_gate(
+            db, goal.project_id, gate,
+        )
+        orchestration = self._json_object_or_empty(self._json_object_or_empty(
+            source.metadata_ if source is not None else {}
+        ).get("orchestration"))
+        if source is not None and orchestration.get("recovery_kind") == "gate_revision" and source.parent_id:
+            source = await db.get(Task, source.parent_id)
+        return source
+
+    @staticmethod
+    def _findings_line(cause: str, findings: Mapping[str, Any]) -> str:
+        parts = [str(item) for item in findings.get("evidence") or []]
+        if findings.get("notes"):
+            parts.append(str(findings["notes"]))
+        return f"{cause}: " + ("; ".join(parts) or "no findings recorded")
+
+    async def _request_gate_revision(
         self,
         db: AsyncSession,
         goal: OrchestrationGoal,
         run: OrchestrationRun,
         gate: OrchestrationGate,
-        rejected: OrchestrationEvidence,
+        cause: str,
+        evidence: OrchestrationEvidence | None = None,
+        *,
+        reason: str | None = None,
     ) -> int:
-        key = f"run:{run.id}:kind:create_delegation_task:review_fix:gate:{gate.id}"
-        if await self._existing_action_for_key(db, run.id, key) is not None:
-            return 0
-        source_task = await self._source_task_for_gate(db, goal.project_id, gate)
-        if source_task is None or source_task.assigned_to is None:
-            ask_key = f"run:{run.id}:kind:ask_human:review_fix:gate:{gate.id}"
-            ask = await self._existing_action_for_key(db, run.id, ask_key)
-            if ask is not None:
-                return 0
-            ask = await self.execute_ask_human_action(
-                db,
-                run_id=run.id,
-                request={
-                    "action_type": "ask_human",
-                    "question": f"Rejected review needs a fix but no source task or assignee was found for gate: {gate.id}",
-                    "work_function": "implementation",
-                    "required_capabilities": ["implementation"],
-                    "candidate_agent_ids": [],
-                    "gate_id": str(gate.id),
-                    "reason": "Rejected-review fix has no resolvable source task.",
-                },
-                idempotency_key=ask_key,
+        """Send a rejection back to the producer as one revision task: automatic, within the original task's
+        authority and normal budget admission. At most two per gate, the second only when the findings changed,
+        counted on one durable ledger shared by every cause; then the owner is asked. Returns 1 when a revision
+        or a new owner ask was created."""
+        if await self._result_correction_stale(db, run) is not None:
+            return 0  # nothing is dispatched onto a paused or superseded run
+        key = self._gate_revision_ledger_key(run.id, gate.id)
+        marker = await self._existing_action_for_key(db, run.id, key)
+        if marker is None:
+            marker = await self.reserve_action(db, run.id, key, "gate_revision_ledger", {
+                "gate_id": str(gate.id), "revisions": [],
+            })
+            await self._mark_action_completed(db, marker, "gate", gate.id)
+        ledger = dict(self._json_object_or_empty(marker.request))
+        revisions = await self._gate_revision_entries(db, run.id, gate.id)
+        source_evidence_id = str(evidence.id) if evidence is not None else None
+        stopped = self._json_object_or_empty(ledger.get("exhausted"))
+        if source_evidence_id is not None and source_evidence_id in {
+            stopped.get("source_evidence_id"), *(item.get("source_evidence_id") for item in revisions),
+        }:
+            return 0  # a replayed rejection never adds a revision
+        findings = self._json_object_or_empty(
+            self._json_object_or_empty(evidence.evidence_metadata if evidence is not None else {}).get("findings")
+        ) or {"evidence": [], "notes": reason}
+        findings_hash = stable_hash({"evidence": list(findings.get("evidence") or []), "notes": findings.get("notes")})
+        subject = f"gate:{gate.id}:revision"
+        history = []
+        for item in revisions:
+            prior = await db.get(OrchestrationEvidence, self._event_uuid(item.get("source_evidence_id")))
+            history.append(self._findings_line(item.get("cause", "rejected"), self._json_object_or_empty(
+                self._json_object_or_empty(prior.evidence_metadata if prior else {}).get("findings")
+            )))
+        history.append(self._findings_line(cause, findings))
+        ask_key = f"run:{run.id}:kind:ask_human:{{category}}:{subject}"
+
+        async def ask(category: str, question: str) -> int:
+            created = await self._existing_action_for_key(db, run.id, ask_key.format(category=category)) is None
+            action = await self._escalate_owner(db, goal, run, category, subject, history, question)
+            if category == "revision_exhausted":
+                marker.request = {**ledger, "exhausted": {
+                    "source_evidence_id": source_evidence_id, "findings_hash": findings_hash,
+                    "decision_id": str(action.target_id) if action.target_id else None,
+                }}
+            return int(created)
+
+        if len(revisions) >= GATE_REVISION_CAP or (revisions and revisions[0].get("findings_hash") == findings_hash):
+            return await ask("revision_exhausted", (
+                f"The work for gate {gate.id} is still rejected after {len(revisions)} automatic revision(s)"
+                + (" and the findings did not change." if len(revisions) < GATE_REVISION_CAP else ".")
+            ))
+        source = await self._gate_revision_source(db, goal, gate)
+        if source is None or source.assigned_to is None:
+            return await ask(
+                "capability_unavailable", f"No producer task or assignee can revise the work for gate {gate.id}.",
             )
-            self._mark_run_blocked(goal, run)
-            self._upsert_active_blocker(
-                run,
-                {
-                    "kind": "review_fix_required",
-                    "gate_id": str(gate.id),
-                    "reason": "Rejected review needs a fix task but its source task could not be resolved.",
-                    "decision_id": str(ask.target_id),
-                },
-            )
-            return 1
-        # A fix task for rejected review is a corrective fix: one recovery lineage per rejected review; the
-        # gate-linked fix task is sealed as its approved retry.
+        if self._budget_is_exhausted(run):
+            return await ask("budget_exhausted", "Cannot fund a revision: budget capacity is exhausted.")
+        contract = self._json_object_or_empty(self._json_object_or_empty(source.metadata_).get("orchestration_contract"))
         request = {
-            "action_type": "create_delegation_task",
-            "agent_id": str(source_task.assigned_to),
-            "work_function": self._task_work_function(source_task),
-            "scope": (
-                "Fix the rejected review findings for the linked orchestration gate. "
-                "Keep the change scoped to the parent task deliverable."
-            ),
-            "inputs": [f"Parent task: {source_task.id}", f"Gate: {gate.id}", f"Rejected review evidence: {rejected.id}"],
-            "deliverable": "A corrected work item ready for fresh review.",
-            "forbidden_work": ["Do not mark orchestration gates complete.", "Do not edit unrelated artifacts."],
-            "success_evidence": ["Complete the fix task and provide concrete evidence for a new review."],
-            "budget": {},
-            "report_schema": {"status": "done|blocked|failed", "changes": "list[str]", "evidence": "list[str]", "notes": "str"},
-            "parent_task_id": str(source_task.id),
+            "action_type": "create_delegation_task", "agent_id": str(source.assigned_to),
+            "work_function": self._task_work_function(source),
+            "title": f"Revise: {source.title}",
+            "scope": contract.get("scope") or source.title,
+            "inputs": [
+                *self._string_list(contract.get("inputs")), f"Original task: {source.id}", f"Gate: {gate.id}",
+                *([f"Rejected evidence: {source_evidence_id}"] if source_evidence_id else []),
+            ],
+            "deliverable": contract.get("deliverable") or source.title,
+            "forbidden_work": [
+                *self._string_list(contract.get("forbidden_work")), "Do not mark orchestration gates complete.",
+            ],
+            "success_evidence": self._string_list(contract.get("success_evidence")),
+            "budget": self._json_object_or_empty(contract.get("budget")),
+            "report_schema": self._json_object_or_empty(contract.get("report_schema")),
+            "parent_task_id": str(source.id),
+            **{name: contract[name] for name in ("orchestrator_context", "authorization_scope") if contract.get(name)},
         }
-        return await self._gate_recovery_trigger(
-            db, run, gate, rejected.id, blocker_code="review_rejected",
-            summary=f'Review rejected the work of task "{source_task.title}"; a fix task needs approval.',
-            retry_action={"action_type": "create_delegation_task", "request": request},
-            link={"kind": "review_fix", "gate_id": str(gate.id)},
-        )
+        try:
+            # Recovery runs only once the baseline is ready; the revision reuses the original task's authority.
+            action = await self.execute_create_delegation_task_action(
+                db, run.id, request,
+                f"run:{run.id}:kind:create_delegation_task:gate_revision:gate:{gate.id}:revision:{len(revisions) + 1}",
+                skip_baseline_gate=True, gate_bound=True,
+            )
+        except HTTPException as exc:
+            if not 400 <= exc.status_code < 500:
+                raise
+            budget = exc.detail in {"budget_wait", "Action budget cannot dispatch"}
+            return await ask("budget_exhausted" if budget else "capability_unavailable",
+                             f"Cannot dispatch a revision: {exc.detail}.")
+        task = await db.get(Task, action.target_id) if action.status == "completed" and action.target_id else None
+        if task is None:
+            return 0
+        metadata = self._json_object_or_empty(task.metadata_)
+        orchestration = self._json_object_or_empty(metadata.get("orchestration"))
+        if orchestration.get("recovery_kind") != "gate_revision":
+            task.metadata_ = {**metadata, "orchestration": {
+                **orchestration, "plan_item_gate_id": str(gate.id), "recovery_kind": "gate_revision",
+            }}
+            finished = await self._finished_gate_revisions(db, run.id, gate.id)
+            linked = {source.id, *(revision.id for _item, revision in finished)}
+            artifact_ids = [value for value in map(self._event_uuid, contract.get("artifact_ids") or []) if value]
+            artifacts = list(await db.scalars(
+                select(Artifact).where(
+                    Artifact.project_id == source.project_id, Artifact.status != "deleted",
+                    or_(Artifact.id.in_(artifact_ids), Artifact.linked_task_id.in_(linked)),
+                ).order_by(Artifact.created_at, Artifact.id)
+            ))
+            brief = build_revision_brief(cause, findings, source.description or "", artifacts)
+            task.description = f"{task.description or ''}\n\n{brief}"
+        marker.request = {**ledger, "revisions": [*revisions, {
+            "cause": cause, "findings_hash": findings_hash, "source_evidence_id": source_evidence_id,
+            "revision_task_id": str(task.id), "at": _utcnow().isoformat(),
+        }]}
+        run.active_blockers = [  # funding returned: the subject's budget ask no longer blocks it
+            item for item in run.active_blockers
+            if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
+                    and item.get("category") == "budget_exhausted" and item.get("scope") == subject)
+        ]
+        await db.flush()
+        return 1
 
     async def _pre_plan_lines(self, db: AsyncSession, run: OrchestrationRun, tasks: Sequence[Task]) -> list[str]:
         """One planner-facing line per pre-plan task: id | function | status | gate | title [| report: status: next step]."""
@@ -11122,7 +11254,9 @@ class OrchestrationService:
         gate: OrchestrationGate,
     ) -> set[uuid.UUID]:
         evidence = await self._evidence_for_gate(db, gate)
-        producers = {row.producer_agent_id for row in evidence if row.producer_agent_id is not None}
+        # Verifiers and reviewers are not producers: a previous verifier may verify a revision.
+        producers = {row.producer_agent_id for row in evidence
+                     if row.producer_agent_id is not None and row.source_type not in {"verification", "review"}}
         configured = self._event_uuid(
             self._json_object_or_empty(gate.required_evidence).get("work_producer_agent_id")
         )
@@ -11523,8 +11657,13 @@ class OrchestrationService:
             return [], None
         evidence = await self._evidence_for_gate(db, gate)
         latest_evidence = self._latest_evidence_by_source(evidence)
+        # A rejection whose automatic revision finished is answered by that revision; re-verification judges it.
+        revised = {item.get("source_evidence_id") for item, _task in await self._finished_gate_revisions(
+            db, gate.run_id, gate.id,
+        )}
         rejected = next(
-            (item for item in latest_evidence if item.verdict == "rejected" and not self._superseded_attempt(item, evidence)),
+            (item for item in latest_evidence if item.verdict == "rejected" and str(item.id) not in revised
+             and not self._superseded_attempt(item, evidence)),
             None,
         )
         if rejected is not None:
