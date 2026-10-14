@@ -621,11 +621,42 @@ async def test_gate_requiring_review_gets_an_automatic_re_verification_after_the
     await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
 
     await db.refresh(gate)
-    assert gate.status != "accepted" and await _reverifier(db, service, run, revision) is not None
+    reviewer_task = await _reverifier(db, service, run, revision)
+    assert gate.status != "accepted" and reviewer_task is not None and reviewer_task.assigned_to == reviewer.id
+
+    await _finish(db, service, run, reviewer_task, ACCEPTED)  # the independent re-review is review evidence
+    await db.refresh(gate)
+    assert gate.status == "accepted"
 
 
 @pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
-async def test_review_and_verification_rejections_share_one_gate_cap(db_session, test_project):
+async def test_every_cause_shares_one_gate_cap(db_session, test_project):
+    db = db_session
+    service, goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [first] = await _revision_tasks(db, task)
+    await _finish(db, service, run, first, json.dumps(VALID_REPORT))
+    # a confirmed-missing deliverable has no producing path yet: it enters through the one entry point
+    assert await service._request_gate_revision(
+        db, goal, run, gate, "deliverable_missing", reason="The handler file was deleted.",
+        source_id=f"artifact:{uuid.uuid4()}:deleted",
+    ) == 1
+    [*_, second] = await _revision_tasks(db, task)
+    await _finish(db, service, run, second, json.dumps(VALID_REPORT))
+    await _finish(db, service, run, await _reverifier(db, service, run, second), _rejection("Still swallowed."))
+
+    assert [item["cause"] for item in await _revisions(service, db, run, gate)] == [
+        "review_rejected", "deliverable_missing",
+    ]
+    [ask] = _owner_asks(run, "revision_exhausted")
+    history = " ".join(ask["history"])
+    assert all(text in history for text in ("The handler swallows errors.", "The handler file was deleted.",
+                                            "Still swallowed."))
+    assert len(await _revision_tasks(db, task)) == 2
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_re_reviews_of_a_review_rejected_gate_record_review_evidence_and_share_its_cap(db_session, test_project):
     db = db_session
     service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
     await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
@@ -634,9 +665,7 @@ async def test_review_and_verification_rejections_share_one_gate_cap(db_session,
         await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
         await _finish(db, service, run, await _reverifier(db, service, run, revision), _rejection(finding))
 
-    assert [item["cause"] for item in await _revisions(service, db, run, gate)] == [
-        "review_rejected", "verification_rejected",
-    ]
+    assert [item["cause"] for item in await _revisions(service, db, run, gate)] == ["review_rejected"] * 2
     assert len(await _revision_tasks(db, task)) == 2 and len(_owner_asks(run, "revision_exhausted")) == 1
 
 
@@ -677,3 +706,94 @@ async def test_evidence_less_rejection_dedupes_on_its_stable_source(db_session, 
         db, goal, run, gate, "deliverable_missing", reason="The login form file was deleted.", source_id=source,
     ) == 0
     assert len(await _revisions(service, db, run, gate)) == 1
+
+
+async def _review_approves(db, service, run, task, reviewer):
+    from huddleroom.services.event_bus import emit_event_once
+    from huddleroom.services.graph_engine import GraphEngineService
+
+    output = "Looks good.\nVERDICT: APPROVE"
+    session = Session(project_id=task.project_id, task_id=task.id, agent_id=reviewer.id, adapter_type="api",
+                      status="completed", input_context={}, output=output, metadata_={}, origin="graph")
+    db.add(session)
+    await db.flush()
+    await emit_event_once(db, task.project_id, "review.approved", {
+        "session_id": str(session.id), "task_id": str(task.id),
+        "review_outcome": GraphEngineService()._parse_review_outcome(output),
+    }, dedup_key=f"approved:{session.id}")
+    await service.tick(db, run.id)
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_only_the_revisions_own_re_verification_clears_its_rejection(db_session, test_project):
+    db = db_session
+    service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [first] = await _revision_tasks(db, task)
+    await _finish(db, service, run, first, json.dumps(VALID_REPORT))
+    first_reviewer = await _reverifier(db, service, run, first)
+
+    # a second review approving the original work is not the revision's re-verification
+    await _review_approves(db, service, run, task, reviewer)
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Re-verification of the revision is pending"
+
+    # a newer rejection is revised; the older re-verifier's late approval does not clear it
+    await _review_rejects(db, service, run, task, reviewer, "And it drops the request.")
+    [_, second] = await _revision_tasks(db, task)
+    await _finish(db, service, run, second, json.dumps(VALID_REPORT))
+    await _finish(db, service, run, first_reviewer, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Re-verification of the revision is pending"
+
+    await _finish(db, service, run, await _reverifier(db, service, run, second), ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_a_failed_re_verification_dispatch_is_retried_on_a_later_tick(db_session, test_project, monkeypatch):
+    db = db_session
+    service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [revision] = await _revision_tasks(db, task)
+    real_fit = service._best_recovery_agent
+    calls = []
+
+    async def unavailable_once(*args, **kwargs):
+        calls.append(1)
+        return None if len(calls) == 1 else await real_fit(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_best_recovery_agent", unavailable_once)
+    await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
+
+    [failed] = await service._reverification_actions(db, run.id, revision.id)
+    assert failed.status == "failed" and await _reverifier(db, service, run, revision) is None
+    assert _owner_asks(run, "capability_unavailable") == []  # one failure is not yet persistent
+
+    await service.tick(db, run.id)
+    attempts = await service._reverification_actions(db, run.id, revision.id)
+    assert [a.status for a in attempts] == ["failed", "completed"] and attempts[1].idempotency_key.endswith(":attempt:1")
+    assert (await db.get(Task, attempts[1].target_id)).assigned_to == reviewer.id
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_re_verification_waits_for_funding_and_is_dispatched_when_it_returns(db_session, test_project):
+    from tests.test_orchestration_result_correction import _complete
+
+    db = db_session
+    service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [revision] = await _revision_tasks(db, task)
+    await _complete(db, service, run, revision, json.dumps(VALID_REPORT))
+    run.budget_state = {"status": "exceeded"}
+
+    await service.recover_run(db, run.id, baseline_ready=True)
+
+    assert await service._reverification_actions(db, run.id, revision.id) == []
+    [ask] = _owner_asks(run, "budget_exhausted")
+    assert ask["scope"] == f"gate:{gate.id}:revision"
+
+    run.budget_state = {}
+    await service.recover_run(db, run.id, baseline_ready=True)
+    assert await _reverifier(db, service, run, revision) is not None and _owner_asks(run, "budget_exhausted") == []

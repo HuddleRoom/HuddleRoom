@@ -188,6 +188,7 @@ REVISABLE_REJECTION_REASONS = frozenset(
     {"Rejected evidence from verification", "Rejected evidence from review"}
 )
 GATE_REVISION_CAP = 2
+REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; the owner ask takes over after that
 # Authorization denials a different agent/decision can resolve for one task; the rest are run-wide.
 TASK_SCOPED_AUTH_DENIALS = frozenset({
     "agent_outside_accepted_team", "model_spend_not_granted", "external_write_not_granted",
@@ -9955,11 +9956,15 @@ class OrchestrationService:
         findings: Mapping[str, Any],
         **extra: Any,
     ) -> int:
+        # An independent re-review of a review-rejected revision records review evidence the gate can require.
+        source_type = ("review" if self._is_revision_reverification(run.id, action)
+                       and self._json_object_or_empty(action.request).get("work_function") == "review"
+                       else "verification")
         return await self._record_evidence_once(
             db,
             run_id=run.id,
             gate_id=gate.id,
-            source_type="verification",
+            source_type=source_type,
             source_id=session.id,
             observed_event=event,
             producer_agent_id=session.agent_id,
@@ -10333,9 +10338,24 @@ class OrchestrationService:
         await db.flush()
         return created
 
+    async def _reverification_actions(
+        self, db: AsyncSession, run_id: uuid.UUID, revision_task_id: Any,
+    ) -> list[OrchestrationAction]:
+        """Every re-verification attempt dispatched for one revision, oldest first."""
+        base = self._gate_revision_reverification_key(run_id, revision_task_id)
+        return list(await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id,
+            or_(OrchestrationAction.idempotency_key == base,
+                OrchestrationAction.idempotency_key.startswith(base + ":", autoescape=True)),
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id)))
+
     async def _reverify_gate_revisions(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Each finished revision with a valid report gets one independent re-verification of its gate (only the
-        producer is excluded). A revision whose report is under result correction waits for it to land."""
+        producer is excluded). A revision whose report is under result correction waits for it to land. A failed
+        dispatch is retried on later ticks under a new attempt key, up to REVERIFICATION_ATTEMPTS; the owner is
+        asked once funding is short or the dispatch keeps failing."""
+        from huddleroom.services.orchestration_budget_service import BudgetMeasurementError
+
         if await self._result_correction_stale(db, run) is not None:
             return 0
         created = 0
@@ -10348,26 +10368,46 @@ class OrchestrationService:
             if gate is None or gate.status == "accepted" or not entries:
                 continue
             revision = await db.get(Task, self._event_uuid(entries[-1].get("revision_task_id")))
-            key = self._gate_revision_reverification_key(run.id, revision.id if revision else None)
-            if (revision is None or revision.status != "done"
-                    or await self._existing_action_for_key(db, run.id, key) is not None
+            if revision is None or revision.status != "done":
+                continue
+            attempts = await self._reverification_actions(db, run.id, revision.id)
+            failed = sum(1 for action in attempts if action.status == "failed")
+            if (any(action.status == "completed" for action in attempts) or failed >= REVERIFICATION_ATTEMPTS
                     or (await self._effective_report(db, run.id, revision))[1] is None):
+                continue
+            subject = f"gate:{gate.id}:revision"
+            history = [f"revision task {revision.id} finished", *(f"re-verification failed: {a.error}"
+                                                                  for a in attempts if a.status == "failed")]
+            _budget, shortfall = await self._result_correction_budget(goal, run, db, gate.id)
+            if shortfall is not None:  # no attempt is spent while funding is short; retried once it returns
+                await self._escalate_owner(db, goal, run, "budget_exhausted", subject, history,
+                                           f"Cannot fund the re-verification for gate {gate.id}: {shortfall}.")
                 continue
             # the gate keeps the kind of judge that first rejected it: a reviewed gate is re-reviewed
             work_function = "review" if entries[0].get("cause") == "review_rejected" else "validation"
+            key = self._gate_revision_reverification_key(run.id, revision.id) + (f":attempt:{failed}" if failed else "")
             try:
                 await self.execute_request_verification_action(db, run.id, {
                     "action_type": "request_verification", "gate_id": str(gate.id), "work_function": work_function,
                 }, key)
-                created += 1
-            except HTTPException as exc:
-                if not 400 <= exc.status_code < 500:
-                    raise
-                await self._escalate_owner(
-                    db, goal, run, "capability_unavailable", f"gate:{gate.id}:revision",
-                    [f"revision task {revision.id} finished"],
-                    f"Cannot re-verify the revision for gate {gate.id}: {exc.detail}.",
-                )
+            except (HTTPException, BudgetMeasurementError) as exc:
+                # the failed action is the record; the next tick retries under a new attempt key
+                detail = exc.detail if isinstance(exc, HTTPException) else f"missing {exc.dimension} measurement"
+                budget = isinstance(exc, BudgetMeasurementError) or detail in {"budget_wait", "Action budget cannot dispatch"}
+                if budget or failed + 1 >= 2:  # a capability failure is escalated once it persists
+                    await self._escalate_owner(
+                        db, goal, run, "budget_exhausted" if budget else "capability_unavailable", subject,
+                        [*history, f"re-verification failed: {detail}"],
+                        f"Cannot re-verify the revision for gate {gate.id}: {detail}.",
+                    )
+                continue
+            created += 1
+            run.active_blockers = [  # dispatched: the subject's funding or dispatch ask no longer blocks it
+                item for item in run.active_blockers
+                if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
+                        and item.get("category") in {"budget_exhausted", "capability_unavailable"}
+                        and item.get("scope") == subject)
+            ]
         return created
 
     async def _recover_failed_tasks(
@@ -11316,6 +11356,8 @@ class OrchestrationService:
     ) -> Task | None:
         evidence = await self._evidence_for_gate(db, gate)
         for row in reversed(evidence):
+            if self._json_object_or_empty(row.evidence_metadata).get("verification_action_id"):
+                continue  # a bound verifier's verdict (incl. an independent re-review) is not the producer's work
             if row.source_type == "task" and row.source_id is not None:
                 task = await TaskService().get(db, project_id, row.source_id)
                 if task is not None:
@@ -11737,20 +11779,21 @@ class OrchestrationService:
             return [], None
         evidence = await self._evidence_for_gate(db, gate)
         latest_evidence = self._latest_evidence_by_source(evidence)
-        # A rejection holds until a later review/verification judges the work. Once its automatic revision
-        # finished, the gate waits (open) for that independent re-verification instead of failing again.
-        revised = {item.get("source_evidence_id") for item, _task in await self._finished_gate_revisions(
+        # A rejection holds until its revision's own re-verification approves the work. Once the automatic
+        # revision finished, the gate waits (open) for that re-verification instead of failing again; no other
+        # review or verification (an approval of the original work, an older re-verifier) clears it.
+        revised = {item.get("source_evidence_id"): task for item, task in await self._finished_gate_revisions(
             db, gate.run_id, gate.id,
         )}
-        judgements = [self._evidence_order_key(item) for item in evidence
-                      if item.source_type in {"verification", "review"} and item.verdict in {"candidate", "accepted"}]
+        approved_by = {self._json_object_or_empty(item.evidence_metadata).get("verification_action_id")
+                       for item in evidence if item.verdict in {"candidate", "accepted"}} - {None}
         rejected, reverification_pending = None, False
         for item in latest_evidence:
             if item.verdict != "rejected" or self._superseded_attempt(item, evidence):
                 continue
             if str(item.id) in revised:
-                order = self._evidence_order_key(item)
-                reverification_pending |= not any(key > order for key in judgements)
+                reverifications = await self._reverification_actions(db, gate.run_id, revised[str(item.id)].id)
+                reverification_pending |= not any(str(action.id) in approved_by for action in reverifications)
                 continue
             rejected = item
             break
