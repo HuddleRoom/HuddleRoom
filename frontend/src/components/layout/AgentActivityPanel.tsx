@@ -8,6 +8,56 @@ import { orderedCalls, reconcileAgentTabs, AgentCallRecord, friendlyOperation, r
 import { Tabs } from '@/components/common/Tabs'
 import { StatusBadge } from '@/components/common/uiPrimitives'
 
+const evidenceActivities: Record<string, string> = {
+  run_state: 'run state', action: 'action', process: 'process', team_configuration: 'team configuration',
+  task: 'task', gate: 'gate', waits: 'waiting conditions', warning: 'warning', agent_execution: 'agent execution',
+}
+const hiddenFields = /^(schema_version|plan_kind|kind|unit_type|id|.*_id|.*_ids|fingerprint|source_fingerprint|tool_version)$/
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** Build a bounded, inert reading view; the original payload remains in Details. */
+function readingView(value: unknown): unknown {
+  let remaining = 512
+  const visit = (current: unknown, depth: number): unknown => {
+    if (--remaining < 0 || depth > 8) return 'Further content is available in Details.'
+    if (typeof current === 'string') return uuidPattern.test(current) ? 'Referenced record (see Details)' : current.slice(0, 16384)
+    if (!current || typeof current !== 'object') return current
+    if (Array.isArray(current)) return current.slice(0, 128).map((item) => visit(item, depth + 1))
+    const object = current as Record<string, unknown>
+    if (object.kind === 'evidence_query' && object.query && typeof object.query === 'object') {
+      const query = object.query as Record<string, unknown>
+      const activity = evidenceActivities[String(query.kind)]
+      if (activity) return `Requested ${activity} evidence.`
+    }
+    const result: Record<string, unknown> = {}
+    if (object.schema_version === 1 && ['delivery', 'implementation', 'roadmap'].includes(String(object.plan_kind)) && Array.isArray(object.plan_items)) {
+      const items = object.plan_items.slice(0, 128)
+      const titles = new Map(items.filter((item) => item && typeof item === 'object').map((item) => {
+        const fields = item as Record<string, unknown>
+        return [String(fields.id ?? fields.item_key), String(fields.title ?? fields.work_function ?? fields.objective ?? 'Work item')]
+      }))
+      result.Summary = visit(object.summary, depth + 1)
+      result.Work = items.map((item) => {
+        if (!item || typeof item !== 'object') return visit(item, depth + 1)
+        const fields = item as Record<string, unknown>
+        const readable = visit(fields, depth + 1) as Record<string, unknown>
+        if (Array.isArray(fields.depends_on) && fields.depends_on.length) readable['Depends On'] = fields.depends_on.slice(0, 128).map((key) => titles.get(String(key).replace(/^plan_item:/, '')) ?? visit(key, depth + 1))
+        return readable
+      })
+      return result
+    }
+    if (object.kind === 'capability_gap') result['Human action required'] = object.required_human_action
+    for (const [key, item] of Object.entries(object).slice(0, 128)) {
+      if (hiddenFields.test(key) || key === 'required_human_action' && object.kind === 'capability_gap') continue
+      if (item === null || item === '' || Array.isArray(item) && !item.length) continue
+      const label = key === 'plan_items' ? 'Work' : key === 'general_updates' ? 'Proposed changes' : key === 'wake_after' || key === 'wake' ? 'Resume when' : friendlyOperation(key)
+      result[label] = visit(item, depth + 1)
+    }
+    return Object.keys(result).length ? result : 'Structured response available in Details.'
+  }
+  return visit(value, 0)
+}
+
 // Bound structured rendering separately from the captured original in Details.
 function ReadableValue({ value }: { value: unknown }) {
   const budget = { remaining: 512 }
@@ -15,7 +65,7 @@ function ReadableValue({ value }: { value: unknown }) {
     if (--budget.remaining < 0 || depth > 12) return <span>Further content is available in Details.</span>
     if (current === null) return <span>null</span>
     if (current === undefined) return <span>Unavailable</span>
-    if (typeof current !== 'object') return <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{String(current)}</p>
+    if (typeof current !== 'object') return <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{String(current).slice(0, 16384)}</p>
     if (Array.isArray(current)) {
       if (!current.length) return <span>Empty list</span>
       return <ul style={{ margin: '8px 0', paddingLeft: 20 }}>{current.slice(0, 128).map((item, index) => (
@@ -26,7 +76,7 @@ function ReadableValue({ value }: { value: unknown }) {
     if (!entries.length) return <span>Empty object</span>
     return <dl style={{ margin: '8px 0' }}>{entries.slice(0, 128).map(([key, item]) => (
       <React.Fragment key={key}>
-        <dt className="font-semibold" style={{ marginTop: 8 }}>{friendlyOperation(key)}</dt>
+        <dt className={key === 'Human action required' ? 'font-semibold text-huddleroom-danger' : 'font-semibold'} style={{ marginTop: 8 }}>{friendlyOperation(key)}</dt>
         <dd style={{ margin: '4px 0 0 12px' }}>{render(item, depth + 1)}</dd>
       </React.Fragment>
     ))}{entries.length > 128 && <dd>Further content is available in Details.</dd>}</dl>
@@ -145,7 +195,7 @@ function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibl
 
   // Native disclosure changes themselves never count as new stream content.
   const visibleSignature = JSON.stringify([
-    response.value, explanation, call.sequenceGap, call.outputEvicted, response.finalLimited,
+    response.value, response.commentary, explanation, call.sequenceGap, call.outputEvicted, response.finalLimited,
     reasoningOpen ? reasoning : null,
   ])
   useEffect(() => {
@@ -178,14 +228,22 @@ function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibl
           // Prevent a native toggle from racing the running-to-terminal state change.
           event.preventDefault()
           const nextOpen = !reasoningOpen
-          previousVisible.current = JSON.stringify([response.value, explanation, call.sequenceGap, call.outputEvicted, response.finalLimited, nextOpen ? reasoning : null])
+          previousVisible.current = JSON.stringify([response.value, response.commentary, explanation, call.sequenceGap, call.outputEvicted, response.finalLimited, nextOpen ? reasoning : null])
           setReasoningOpen(nextOpen)
         }}>Thinking</summary>
         <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{reasoning}</div>
       </details>}
-      {response.value !== undefined && <div data-testid="call-response" style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', marginBottom: 12 }}>{decisionSummary || <ReadableValue value={response.value} />}</div>}
-      {response.mismatch && <p className="text-xs text-huddleroom-text-muted">The final response differs from the provisional stream; the final response is shown. The provisional response is in Details.</p>}
-      {response.finalLimited && <p className="text-xs text-huddleroom-text-muted">The captured final response was truncated; available streamed text is retained.</p>}
+      {tools.length > 0 && <div data-testid="call-tool-progress" style={{ fontSize: 13, marginBottom: 12 }}>
+        <div className="font-semibold text-xs">Tool activity</div>
+        <ul style={{ margin: '4px 0', paddingLeft: 20 }}>{tools.slice(-8).map((item) => <li key={item.sequence}>
+          {item.name}: {item.type === 'tool_started' ? 'started' : item.outcome || 'finished'}
+        </li>)}</ul>
+        {tools.length > 8 && <p className="text-xs text-huddleroom-text-muted">Earlier tool activity is available in Details.</p>}
+      </div>}
+      {response.commentary && <div data-testid="call-commentary" style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', marginBottom: 12 }}><div className="font-semibold text-xs">Commentary</div>{response.commentary}</div>}
+      {!isTerminal && response.value !== undefined && <p className="text-xs text-huddleroom-text-muted">Observed response (not final)</p>}
+      {response.value !== undefined && <div data-testid="call-response" style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', marginBottom: 12 }}>{decisionSummary || <ReadableValue value={readingView(response.value)} />}</div>}
+      {response.finalLimited && <p className="text-xs text-huddleroom-text-muted">The captured final response was truncated. Observed response text is available in Details.</p>}
       {response.toolOnly && <p data-testid="call-response" className="text-[13px] text-huddleroom-text-secondary">This call returned tool calls without response text. See Details.</p>}
       {response.empty && <p data-testid="call-response" className="text-[13px] text-huddleroom-text-secondary">No response text was returned by this call.</p>}
       {!isTerminal && response.value === undefined && <p className="text-xs text-huddleroom-text-muted">Waiting for response text…</p>}
@@ -197,6 +255,7 @@ function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibl
           </dl>
           <div className="font-semibold">Full captured request</div><div>Request kind: {call.requestDisplay.kind}</div><ReadableValue value={call.requestDisplay.content} /><div className="font-semibold" style={{ marginTop: 8 }}>Captured original request</div><OriginalValue value={call.requestDisplay.content} /><div>Request truncated: {String(call.requestDisplay.truncated)}</div>
           {response.value !== undefined && <><div className="font-semibold">Captured original response</div><OriginalValue value={call.finalResponse?.content ?? response.value} /></>}
+          {response.mismatch && <p>The final response differs from the observed response; the captured final response is shown.</p>}
           {(response.mismatch || response.finalLimited) && <><div className="font-semibold">Provisional response</div><OriginalValue value={response.provisional} /></>}
           {stderr && <><div className="font-semibold">Stderr diagnostics</div><pre style={{ whiteSpace: 'pre-wrap', margin: '4px 0 12px' }}>{stderr}</pre></>}
           {tools.map((item) => <div key={item.sequence} style={{ marginBottom: 12 }}>

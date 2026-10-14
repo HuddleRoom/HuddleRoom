@@ -50,6 +50,8 @@ class OutputPayload(StrictWireModel):
     stream: OutputStream
     text: str
     observation_truncated: bool = False
+    message_id: str | None = None
+    message_complete: bool = False
 
 
 class FinalResponseSnapshot(StrictWireModel):
@@ -119,6 +121,9 @@ class AgentResponseEvent(StrictWireModel):
         self.payload = model.model_validate(self.payload).model_dump(mode="json")
         if not self.payload.get("observation_truncated"):
             self.payload.pop("observation_truncated", None)
+        for key in ("message_id", "message_complete"):
+            if not self.payload.get(key):
+                self.payload.pop(key, None)
         if self.payload.get("final_response") is None:
             self.payload.pop("final_response", None)
         return self
@@ -662,13 +667,32 @@ class AgentResponseCall:
             return
         await self._output.feed(stream, text)
 
+    async def completed_message(self, stream: OutputStream, text: str, message_id: str | None = None) -> None:
+        """Preserve a completed CLI message boundary with safe bounded display."""
+        if self._closing:
+            return
+        await self._output.flush()
+        safe = DisplayTextBuffer().feed(stream, text, final=True)
+        safe, truncated = _prefix(safe, _CAP)
+        self.observation_truncated |= truncated
+        await self._event("agent_response.output", {
+            "stream": stream, "text": safe,
+            "message_id": _prefix(redact_secrets(message_id), 256)[0] if message_id else None,
+            "message_complete": True,
+        })
+
+    def snapshot_cli_response(self, content: str) -> None:
+        """Attach validated native final output before the terminal event."""
+        self._snapshot_response({"choices": [{"message": {"content": content}}]})
+
     async def tool_started(self, name: str, arguments: JsonValue | None) -> None:
         if self._closing:
             return
         value, truncated = _bounded(arguments, _CAP)
         await self._event(
             "agent_response.tool_started",
-            {"name": name, "arguments": value, "truncated": truncated},
+            {"name": _prefix(DisplayTextBuffer().feed("output", name, final=True), 256)[0],
+             "arguments": value, "truncated": truncated},
         )
 
     async def tool_finished(
@@ -679,7 +703,8 @@ class AgentResponseCall:
         value, truncated = _bounded(result, _CAP)
         await self._event(
             "agent_response.tool_finished",
-            {"name": name, "outcome": outcome, "result": value, "truncated": truncated},
+            {"name": _prefix(DisplayTextBuffer().feed("output", name, final=True), 256)[0],
+             "outcome": outcome, "result": value, "truncated": truncated},
         )
 
     async def terminal(

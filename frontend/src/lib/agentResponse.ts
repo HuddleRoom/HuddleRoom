@@ -47,6 +47,8 @@ export interface OutputItem {
   stream: 'output' | 'reasoning' | 'stderr'
   text: string
   sequence: number
+  messageId?: string
+  messageComplete?: boolean
 }
 
 export interface ToolStartedItem {
@@ -124,16 +126,21 @@ function stableJson(value: unknown): string {
   try { return JSON.stringify(value) ?? String(value) } catch { return String(value) }
 }
 
-function principalText(value: unknown): string | null {
+function principalText(value: unknown, depth = 0): string | null {
+  if (depth > 8) return null
+  if (typeof value === 'string') {
+    const parsed = parseStructuredText(value)
+    if (parsed.parsed && typeof parsed.value === 'object' && parsed.value !== null) return principalText(parsed.value, depth + 1)
+  }
   if (typeof value === 'string') return value
   if (Array.isArray(value)) {
-    const parts = value.map(principalText).filter((part): part is string => !!part)
+    const parts = value.slice(0, 128).map((item) => principalText(item, depth + 1)).filter((part): part is string => !!part)
     return parts.length ? parts.join(' ') : null
   }
   if (!value || typeof value !== 'object') return null
   const object = value as Record<string, unknown>
-  for (const key of ['text', 'content', 'message', 'task', 'query']) {
-    const result = principalText(object[key])
+  for (const key of ['description', 'title', 'text', 'content', 'message', 'task', 'query']) {
+    const result = principalText(object[key], depth + 1)
     if (result) return result
   }
   return null
@@ -152,7 +159,7 @@ export function assembleStream(items: AgentCallItem[], stream: OutputItem['strea
   return items
     .filter((item): item is OutputItem => item.type === 'output' && item.stream === stream)
     .sort((a, b) => a.sequence - b.sequence)
-    .map((item) => item.text)
+    .map((item) => item.text + (item.messageComplete && stream === 'reasoning' ? '\n\n' : ''))
     .join('')
 }
 
@@ -163,6 +170,7 @@ export interface ResponsePresentation {
   finalLimited: boolean
   empty: boolean
   toolOnly: boolean
+  commentary: string
 }
 
 type StructuredTextParse = { parsed: true; value: JsonValue } | { parsed: false }
@@ -186,42 +194,46 @@ function parseStructuredText(text: string): StructuredTextParse {
   return { parsed: false }
 }
 
+/** Unwrap only the documented native response wrapper. */
+export function normalizeResponse(value: JsonValue): JsonValue {
+  if (typeof value === 'string') {
+    const parsed = parseStructuredText(value)
+    if (parsed.parsed && typeof parsed.value !== 'string') return normalizeResponse(parsed.value)
+    return value
+  }
+  if (value && !Array.isArray(value) && typeof value === 'object' &&
+    'content' in value && 'tool_calls' in value &&
+    Object.keys(value).every((key) => ['content', 'tool_calls', 'usage'].includes(key))) {
+    return normalizeResponse((value.content ?? null) as JsonValue)
+  }
+  return value
+}
+
 export function responsePresentation(call: AgentCallRecord): ResponsePresentation {
-  const provisional = assembleStream(call.items)
+  const outputs = call.items.filter((item): item is OutputItem => item.type === 'output' && item.stream === 'output')
+    .sort((a, b) => a.sequence - b.sequence)
+  const completed = outputs.filter((item) => item.messageComplete)
+  const lastMessage = completed[completed.length - 1]
+  const provisional = lastMessage ? lastMessage.text : assembleStream(call.items)
+  const commentary = lastMessage ? outputs.filter((item) => item.sequence < lastMessage.sequence).map((item) => item.text).join('\n\n') : ''
   const terminal = call.terminal !== null
   const snapshot = terminal ? call.finalResponse : null
   const finalLimited = !!snapshot?.content_truncated
-  const parsedProvisional = terminal ? parseStructuredText(provisional) : { parsed: false as const }
-  const toolCount = snapshot?.tool_count ?? call.items.filter((item) => item.type !== 'output').length
-  const hasToolCalls = toolCount > 0
-  const toolOnly = terminal && hasToolCalls &&
-    (snapshot
-      ? !snapshot.text_present && (snapshot.content === null || snapshot.content === '')
-      : !provisional)
+  const captured = snapshot?.content ?? provisional
+  const parsedCaptured = typeof captured === 'string' ? parseStructuredText(captured) : { parsed: true as const, value: captured }
+  const wrapper = parsedCaptured.parsed && parsedCaptured.value && typeof parsedCaptured.value === 'object' && !Array.isArray(parsedCaptured.value) ? parsedCaptured.value : null
+  const wrapperToolCount = wrapper && 'content' in wrapper && Array.isArray(wrapper.tool_calls) ? wrapper.tool_calls.length : 0
+  const toolCount = Math.max(snapshot?.tool_count ?? call.items.filter((item) => item.type !== 'output').length, wrapperToolCount)
   let value: JsonValue | undefined
   if (snapshot) {
-    if (finalLimited && provisional) {
-      value = parsedProvisional.parsed ? parsedProvisional.value : provisional
-    } else if (snapshot.content !== null && snapshot.content !== '') {
-      if (typeof snapshot.content === 'string') {
-        const parsedSnapshot = parseStructuredText(snapshot.content)
-        value = parsedSnapshot.parsed ? parsedSnapshot.value : snapshot.content
-      } else {
-        value = snapshot.content
-      }
-    }
-  } else if (parsedProvisional.parsed) {
-    value = parsedProvisional.value
-  } else if (provisional) {
-    value = provisional
-  }
-  const normalizedProvisional = parsedProvisional.parsed ? parsedProvisional.value : provisional
-  const mismatch = terminal && !finalLimited && !!provisional &&
-    (snapshot !== null
-      ? value === undefined || stableJson(value) !== stableJson(normalizedProvisional)
-      : false)
+    if (snapshot.content !== null && snapshot.content !== '') value = normalizeResponse(snapshot.content)
+  } else if (provisional) value = normalizeResponse(provisional)
+  if (value === null || value === '') value = undefined
+  const toolOnly = terminal && toolCount > 0 && value === undefined
+  const mismatch = terminal && !finalLimited && !!provisional && snapshot !== null &&
+    stableJson(normalizeResponse(snapshot.content)) !== stableJson(normalizeResponse(provisional))
   const empty = terminal && !toolOnly && value === undefined
-  return { value, provisional, mismatch, finalLimited, empty, toolOnly }
+  return { value, provisional, commentary, mismatch, finalLimited, empty, toolOnly }
 }
 
 /**

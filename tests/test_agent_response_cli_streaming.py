@@ -342,7 +342,7 @@ def test_parse_claude_final_raises_on_no_envelope():
                 '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"hi"}}',
                 '{"type":"turn.completed","usage":{"input_tokens":18746,"cached_input_tokens":13184,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}',
             )),
-            [CliDisplayUpdate(kind="output", text="hi")],
+            [CliDisplayUpdate(kind="output", text="hi", message_id="item_2", message_complete=True)],
             DecodedCliOutput("hi", "01a1152c-9d95-7910-b2e5-7ee397bb85b5"),
         ),
         (
