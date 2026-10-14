@@ -52,6 +52,8 @@ async def test_create_artifact(db_session, test_project):
 async def test_update_artifact_hash(db_session, tmp_path, test_project):
     from huddleroom.services.artifact_service import ArtifactService
     svc = ArtifactService()
+    test_project.workspace_path = str(tmp_path.resolve())  # hashes are read only inside the project workspace
+    await db_session.flush()
 
     f = tmp_path / "spec.yaml"
     f.write_text("openapi: 3.0.0\ninfo:\n  title: Test API")

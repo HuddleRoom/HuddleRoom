@@ -68,7 +68,7 @@ from huddleroom.services.orchestration_artifact_identity import (
     CONFIRMED_MISSING, UNINSPECTABLE, bind_artifacts, recheck_binding,
 )
 from huddleroom.services.orchestration_review_brief import (
-    STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief,
+    MAX_ARTIFACTS, STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief,
 )
 from huddleroom.services.orchestration_plan_ingestion import (
     BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
@@ -196,6 +196,7 @@ IDENTITY_CHANGED_REASON = "Reviewed content changed after its review"
 IDENTITY_MISSING_REASON = "Reviewed deliverable is missing"
 REVIEW_INPUT_MISSING = "review_input_missing"
 IDENTITY_KEY_MARK = ":identity:"
+IDENTITY_CACHE_KEY = "orchestration_identity_cache"  # db.info slot: one recomputation per artifact per pass
 REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; an answered owner ask re-arms it
 
 
@@ -5034,8 +5035,10 @@ class OrchestrationService:
                 .order_by(Artifact.created_at, Artifact.id)
             ))
         # the verdict binds to these identities; the verifier is given the same pinned references
-        identities = await bind_artifacts(db, source_task.project_id, artifacts) if source_task is not None else []
-        artifacts = [self._pinned_artifact(artifact, record) for artifact, record in zip(artifacts, identities)]
+        # only the artifacts the brief shows are bound (the rest are truncated out of it)
+        shown, hidden = artifacts[:MAX_ARTIFACTS], artifacts[MAX_ARTIFACTS:]
+        identities = await bind_artifacts(db, source_task.project_id, shown) if source_task is not None else []
+        artifacts = [self._pinned_artifact(artifact, record) for artifact, record in zip(shown, identities)] + hidden
         return {**build_review_inputs(
             str(source_contract.get("scope") or ""),
             str(source_contract.get("deliverable") or ""),
@@ -10115,9 +10118,9 @@ class OrchestrationService:
         )
         if verdict == "rejected":
             metadata["findings"] = bound_findings([], review_outcome.get("raw_output") or session.output, "Review")
-        graph_run = await db.get(GraphRun, session.graph_run_id) if session.graph_run_id else None
-        if verdict == "candidate" and isinstance((graph_run.context or {}).get("review_identity") if graph_run else None, dict):
-            metadata["artifact_identity"] = [graph_run.context["review_identity"]]
+        # the graph names the content this approval applies to (bound to the approving review session)
+        if verdict == "candidate" and isinstance(identity := event.payload.get("review_identity"), dict):
+            metadata["artifact_identity"] = [identity]
         return await self._record_evidence_once(
             db,
             run_id=run.id,
@@ -10412,11 +10415,14 @@ class OrchestrationService:
         self, db: AsyncSession, gate: OrchestrationGate, item: OrchestrationEvidence,
     ) -> tuple[str, bool] | None:
         """Gate failure (reason, final) when an approval's bound content identity no longer holds; None while it
-        does or when the evidence binds no identity."""
+        does, when the evidence binds no identity, or once the gate is accepted (acceptance consumed the approval;
+        later edits belong to later work and never reopen it)."""
         recorded = self._json_object_or_empty(item.evidence_metadata).get("artifact_identity")
-        if not recorded:
+        if not recorded or gate.status == "accepted":
             return None
-        failure = await recheck_binding(db, await self._project_id_for_run(db, gate.run_id), recorded)
+        failure = await recheck_binding(
+            db, await self._project_id_for_run(db, gate.run_id), recorded, db.info.get(IDENTITY_CACHE_KEY),
+        )
         if failure is None:
             return None
         state, current = failure
@@ -10430,7 +10436,7 @@ class OrchestrationService:
         and content HuddleRoom cannot identify blocks the gate and asks the owner (no revision, no approval)."""
         if await self._result_correction_stale(db, run) is not None:
             return 0
-        created = 0
+        created, cache = 0, {}
         gates = await db.scalars(select(OrchestrationGate).where(
             OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
         ).order_by(OrchestrationGate.created_at, OrchestrationGate.id))
@@ -10444,7 +10450,7 @@ class OrchestrationService:
             for item in reversed(self._latest_evidence_by_source(await self._evidence_for_gate(db, gate))):
                 recorded = self._json_object_or_empty(item.evidence_metadata).get("artifact_identity")
                 if item.verdict in {"candidate", "accepted"} and recorded and (
-                    failure := await recheck_binding(db, goal.project_id, recorded)
+                    failure := await recheck_binding(db, goal.project_id, recorded, cache)
                 ):
                     dropped = (item, *failure)
                     break
@@ -10475,16 +10481,20 @@ class OrchestrationService:
         item: OrchestrationEvidence,
     ) -> int:
         """One new verification for an approval whose content changed, bound to the current content. A dropped
-        revision re-verification stays in its revision's namespace, so only it can clear that revision's rejection."""
+        revision re-verification stays in its revision's namespace, so only it can clear that revision's rejection.
+        A graph review approval is re-reviewed by its own graph instead: the run goes back to review."""
         from huddleroom.services.orchestration_budget_service import BudgetMeasurementError
 
         metadata = self._json_object_or_empty(item.evidence_metadata)
-        source = await db.get(OrchestrationAction, self._event_uuid(metadata.get("verification_action_id")))
-        if source is not None:
-            root = source.idempotency_key.split(IDENTITY_KEY_MARK, 1)[0]
-            work_function = self._json_object_or_empty(source.request).get("work_function") or "validation"
-        else:  # a graph review approval: an independent review of the current content
-            root, work_function = f"run:{run.id}:kind:request_verification:gate:{gate.id}", "review"
+        action_id, graph_run_id = (self._event_uuid(metadata.get(name)) for name in ("verification_action_id", "graph_run_id"))
+        source = await db.get(OrchestrationAction, action_id) if action_id else None
+        if source is None:
+            graph_run = await db.get(GraphRun, graph_run_id) if graph_run_id else None
+            if graph_run is not None:
+                await GraphEngineService().return_changed_approval_to_review(db, graph_run)
+            return 0
+        root = source.idempotency_key.split(IDENTITY_KEY_MARK, 1)[0]
+        work_function = self._json_object_or_empty(source.request).get("work_function") or "validation"
         key = f"{root}{IDENTITY_KEY_MARK}{item.id}"
         attempts = list(await db.scalars(select(OrchestrationAction).where(
             OrchestrationAction.run_id == run.id,
@@ -11699,8 +11709,12 @@ class OrchestrationService:
             .order_by(OrchestrationGate.created_at.asc(), OrchestrationGate.id.asc())
         )
         changed = 0
-        for gate in result.scalars().all():
-            changed += 1 if await self._validate_gate(db, gate) else 0
+        db.info[IDENTITY_CACHE_KEY] = {}
+        try:
+            for gate in result.scalars().all():
+                changed += 1 if await self._validate_gate(db, gate) else 0
+        finally:
+            db.info.pop(IDENTITY_CACHE_KEY, None)
         await db.flush()
         return changed
 

@@ -1007,3 +1007,19 @@ async def test_unpinned_url_never_accepts_and_never_revises(db_session, test_pro
     assert await _revision_tasks(db, work_task) == [] and len(await _verification_actions(db, run, gate)) == 1
     [ask] = _owner_asks(run, "review_input_missing")
     assert ask["scope"].startswith(f"gate:{gate.id}:")
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_later_edits_never_reopen_an_accepted_gate(db_session, test_project):
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    await _finish(db, service, run, verifier_task, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+    (Path(test_project.workspace_path) / "login.py").write_text("later work on the same file\n")
+    await service.tick(db, run.id)
+    await service.recover_run(db, run.id, baseline_ready=True)
+
+    await db.refresh(gate)
+    assert gate.status == "accepted" and len(await _verification_actions(db, run, gate)) == 1

@@ -31,21 +31,18 @@ def _detect_breaking_change(artifact: Artifact, old_hash: str | None, new_hash: 
 
 
 async def _current_hash(db: AsyncSession, artifact: Artifact) -> str | None:
-    """sha256 of the artifact's file (relative paths resolve in the project workspace); None when unreadable.
+    """Content hash of the artifact's workspace file; None when it is absent, outside the workspace or unreadable.
 
-    Display and events only: review and verification recompute identity from content when they need it."""
+    Display and events only: review and verification recompute identity from content when they need it. The
+    same containment as identity checks applies (no paths outside the workspace, regular files only)."""
     from huddleroom.models.project import Project
+    from huddleroom.services.orchestration_artifact_identity import PRESENT, _classify_path
 
-    path = Path(artifact.path)
-    if not path.is_absolute():
-        project = await db.get(Project, artifact.project_id)
-        if project is None or not project.workspace_path:
-            return None
-        path = Path(project.workspace_path) / path
-    try:
-        return await asyncio.get_running_loop().run_in_executor(None, _hash_file, str(path))
-    except (OSError, ValueError):
+    project = await db.get(Project, artifact.project_id)
+    if project is None or not project.workspace_path:
         return None
+    found = await asyncio.to_thread(_classify_path, artifact.path, project.workspace_path)
+    return found.identity if found.state == PRESENT else None
 
 
 class ArtifactService:

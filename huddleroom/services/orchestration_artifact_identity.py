@@ -123,7 +123,9 @@ def _local_commit(metadata: dict, workspace_root: str) -> str | None:
             ["git", "-C", str(repo_path), "cat-file", "-e", f"{commit}^{{commit}}"],
             capture_output=True,
             stdin=subprocess.DEVNULL,
-            env={k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")},
+            # discovery never climbs out of the workspace into an enclosing repository
+            env={**{k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")},
+                 "GIT_CEILING_DIRECTORIES": str(root.parent)},
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -166,6 +168,7 @@ async def classify_input_async(artifact, workspace_root: str) -> InputAvailabili
 
 CHANGED = "changed"
 MAX_REFERENCE_CHARS = 300
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def pinned_reference(artifact, found: InputAvailability) -> str | None:
@@ -180,6 +183,7 @@ def pinned_reference(artifact, found: InputAvailability) -> str | None:
         reference = f"{(artifact.metadata_ or {}).get('repo_path')} at commit {found.identity.removeprefix('commit:')}"
     else:
         reference = f"stored {artifact.artifact_type} content (sha256 {found.identity})"
+    reference = _CONTROL.sub(" ", reference)  # producer-controlled text lands in briefs and messages: one line
     return reference if len(reference) <= MAX_REFERENCE_CHARS else f"{reference[:MAX_REFERENCE_CHARS]}…"
 
 
@@ -205,26 +209,22 @@ async def bind_artifacts(db, project_id, artifacts) -> list[dict]:
     return [await identity_record(artifact, root) for artifact in artifacts]
 
 
-async def recheck_binding(db, project_id, recorded) -> tuple[str, dict] | None:
+async def recheck_binding(db, project_id, recorded, cache: dict | None = None) -> tuple[str, dict] | None:
     """Recompute every bound identity from current content. None when all still hold; else (state, record) for the
     first failure, by priority: CONFIRMED_MISSING (producer revision), UNINSPECTABLE (fail closed), CHANGED
-    (approval no longer applies; review again)."""
-    from huddleroom.models.artifact import Artifact
-
+    (approval no longer applies; review again). ``cache`` (artifact id -> current record) shares one computation
+    per artifact across a pass; pass a fresh dict per pass since content may change between passes."""
     root = await _workspace_root(db, project_id)
     failures: dict[str, dict] = {}
     for item in recorded or []:
         if not isinstance(item, dict):
             continue
-        try:
-            artifact = await db.get(Artifact, uuid.UUID(str(item.get("artifact_id"))))
-        except ValueError:
-            artifact = None
-        if artifact is None or artifact.project_id != project_id:
-            current = {"artifact_id": item.get("artifact_id"), "state": CONFIRMED_MISSING, "identity": None,
-                       "reason": None, "reference": None}
+        if cache is not None and str(item.get("artifact_id")) in cache:
+            current = cache[str(item.get("artifact_id"))]
         else:
-            current = await identity_record(artifact, root)
+            current = await _current_record(db, project_id, item, root)
+            if cache is not None:
+                cache[str(item.get("artifact_id"))] = current
         if current["state"] != PRESENT:
             failures.setdefault(current["state"], current)
         elif (item.get("state"), item.get("identity")) != (PRESENT, current["identity"]):
@@ -233,3 +233,16 @@ async def recheck_binding(db, project_id, recorded) -> tuple[str, dict] | None:
         if state in failures:
             return state, failures[state]
     return None
+
+
+async def _current_record(db, project_id, item: dict, root: str | None) -> dict:
+    from huddleroom.models.artifact import Artifact
+
+    try:
+        artifact = await db.get(Artifact, uuid.UUID(str(item.get("artifact_id"))))
+    except ValueError:
+        artifact = None
+    if artifact is None or artifact.project_id != project_id:
+        return {"artifact_id": item.get("artifact_id"), "state": CONFIRMED_MISSING, "identity": None,
+                "reason": None, "reference": None}
+    return await identity_record(artifact, root)

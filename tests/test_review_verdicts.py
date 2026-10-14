@@ -294,6 +294,7 @@ async def test_graph_approval_of_edited_file_is_not_applied_and_review_is_reques
 
     await _answer(db_session, test_project, run)
     assert run.current_node == "approved" and len(await _approvals(db_session, test_project)) == 1
+    assert "review_identity_blocked" not in run.context  # the later approval ends the earlier refusal
     [message] = await _merger_messages(db_session, test_project, merger)
     assert f"app.py (sha256 {_sha('v2')})" in message
 
@@ -377,3 +378,119 @@ async def test_graph_approval_applies_only_to_the_reviewed_local_commit(db_sessi
     assert run.current_node == "ready_for_review"
     _, rereview = await _review_sessions(db_session, run)
     assert f"repo at commit {second}" in await _task_description(db_session, rereview)
+
+
+async def _redeliver(db, project, session, *, with_outcome=False):
+    """Replay a review session's completion; `with_outcome` replays a payload that already carries its verdict."""
+    payload = {"session_id": str(session.id)}
+    if with_outcome:
+        payload["review_outcome"] = GraphEngineService()._parse_review_outcome(session.output)
+    await GraphEngineService().process_event(db, BusEvent(
+        id=uuid.uuid4(), project_id=project.id, event_type="session.completed", payload=payload, source="system",
+    ))
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_redelivered_approval_of_a_superseded_review_session_never_applies(db_session, test_project):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    run, artifact, _merger = await _open_review(db_session, test_project, path="app.py")
+    first = await _answer(db_session, test_project, run)  # approves v1
+    (workspace / "app.py").write_text("v2")
+    await _event(db_session, test_project, "code.pr_updated", artifact)  # back to review: a new session binds v2
+    await db_session.refresh(run)
+    assert run.current_node == "ready_for_review" and len(await _review_sessions(db_session, run)) == 2
+
+    await _redeliver(db_session, test_project, first)
+
+    await db_session.refresh(run)
+    assert run.current_node == "ready_for_review"  # nobody approved v2
+    assert len(await _approvals(db_session, test_project)) == 1
+
+
+@pytest.mark.asyncio
+async def test_redelivered_refused_approval_does_not_duplicate_reviews_or_merger_messages(db_session, test_project):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    run, _artifact, merger = await _open_review(db_session, test_project, path="app.py")
+    (workspace / "app.py").write_text("v2")
+    first = await _answer(db_session, test_project, run)  # refused: v1 changed, a second review is created
+    await _redeliver(db_session, test_project, first, with_outcome=True)
+    assert len(await _review_sessions(db_session, run)) == 2
+
+    await _answer(db_session, test_project, run)  # the second review approves v2
+    assert run.current_node == "approved"
+    (workspace / "app.py").write_text("v3")
+    _, second = await _review_sessions(db_session, run)
+    await _redeliver(db_session, test_project, second, with_outcome=True)  # replayed while approved
+
+    await db_session.refresh(run)
+    assert run.current_node == "approved" and len(await _review_sessions(db_session, run)) == 2
+    assert len(await _merger_messages(db_session, test_project, merger)) == 1
+
+
+async def _review_gate(db, project):
+    from huddleroom.models.orchestration import OrchestrationGate
+
+    service, _goal, orchestration_run = await _make_run(db, project.id)
+    gate = OrchestrationGate(run_id=orchestration_run.id, success_criterion_key="plan_item:review-pr",
+                             gate_type="review_accepted",
+                             required_evidence={"required_source_types": ["review"], "min_count": 1})
+    db.add(gate)
+    await db.flush()
+    return service, orchestration_run, gate
+
+
+async def _link_review(db, session, orchestration_run, gate):
+    """The orchestrated review task a graph review session works on."""
+    task = await db.get(Task, session.task_id)
+    task.metadata_ = {**task.metadata_, "orchestration": {
+        "run_id": str(orchestration_run.id), "plan_item_gate_id": str(gate.id), "work_function": "review",
+    }}
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_gate_is_not_accepted_on_content_a_later_review_session_was_bound_to(db_session, test_project):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    service, orchestration_run, gate = await _review_gate(db_session, test_project)
+    run, artifact, _merger = await _open_review(db_session, test_project, path="app.py")
+    [first] = await _review_sessions(db_session, run)
+    await _link_review(db_session, first, orchestration_run, gate)
+    await _answer(db_session, test_project, run)  # approves v1
+    (workspace / "app.py").write_text("v2")
+    await _event(db_session, test_project, "code.pr_updated", artifact)  # a second session now binds v2
+
+    await service.tick(db_session, orchestration_run.id)  # the v1 approval is ingested only now
+
+    await db_session.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Reviewed content changed after its review"
+
+
+@pytest.mark.asyncio
+async def test_direct_edit_after_graph_approval_sends_the_graph_back_to_review(db_session, test_project):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    service, orchestration_run, gate = await _review_gate(db_session, test_project)
+    run, _artifact, _merger = await _open_review(db_session, test_project, path="app.py")
+    [first] = await _review_sessions(db_session, run)
+    await _link_review(db_session, first, orchestration_run, gate)
+    await _answer(db_session, test_project, run)
+    assert run.current_node == "approved"
+    (workspace / "app.py").write_text("v2")  # no PR event
+
+    await service.tick(db_session, orchestration_run.id)
+    await service.recover_run(db_session, orchestration_run.id, baseline_ready=True)
+
+    await db_session.refresh(run)
+    await db_session.refresh(gate)
+    assert gate.status == "open" and run.current_node == "ready_for_review"
+    _, second = await _review_sessions(db_session, run)
+    assert f"sha256 {_sha('v2')}" in await _task_description(db_session, second)
+    await _link_review(db_session, second, orchestration_run, gate)
+    await _answer(db_session, test_project, run)
+    await service.tick(db_session, orchestration_run.id)
+    await db_session.refresh(gate)
+    assert gate.status == "accepted"

@@ -371,7 +371,7 @@ class GraphEngineService:
             resolved_guard = await self._resolve_guard(db, edge.get("guard") or {}, run)
             if not self._guard_evaluator.evaluate(resolved_guard, event.payload):
                 continue
-            if await self._approval_no_longer_holds(db, run, graph, edge, event):
+            if await self._approval_no_longer_holds(db, run, graph, edge.get("to"), event.id):
                 break
             await self._fire_edge(
                 db,
@@ -719,7 +719,8 @@ class GraphEngineService:
         run = run_result.scalar_one_or_none()
         if run is None or not self._session_matches_assigned_review_actor(run, session):
             return None
-        if event_type == "review.approved" and await self._review_identity_blocks(db, run, session):
+        identity = None
+        if event_type == "review.approved" and (identity := await self._approvable_review_identity(db, run, session)) is None:
             return None
 
         payload = {
@@ -731,6 +732,8 @@ class GraphEngineService:
             payload["task_id"] = event.payload["task_id"]
         if outcome:
             payload["review_outcome"] = outcome
+        if identity is not None:
+            payload["review_identity"] = identity  # the content this approval applies to
 
         emitted, created = await emit_event_once(
             db,
@@ -755,12 +758,10 @@ class GraphEngineService:
         return emitted
 
     async def _review_identity_failure(self, db: AsyncSession, run: GraphRun) -> tuple[str, dict] | None:
-        from huddleroom.services.orchestration_artifact_identity import UNAVAILABLE, UNINSPECTABLE, recheck_binding
+        """Recheck the run's current binding (the latest review session's)."""
+        from huddleroom.services.orchestration_artifact_identity import recheck_binding
 
-        recorded = (run.context or {}).get("review_identity")
-        if not isinstance(recorded, dict):  # nothing was bound when the review was dispatched: fail closed
-            return UNINSPECTABLE, {"artifact_id": str(run.artifact_id), "reason": UNAVAILABLE}
-        return await recheck_binding(db, run.project_id, [recorded])
+        return await recheck_binding(db, run.project_id, [run.context["review_identity"]])
 
     def _block_review_identity(self, run: GraphRun, state: str, current: dict, session_id: str | None) -> None:
         run.context = {**(run.context or {}), "review_identity_blocked": {
@@ -768,35 +769,52 @@ class GraphEngineService:
             "session_id": session_id,
         }}
 
-    async def _review_identity_blocks(self, db: AsyncSession, run: GraphRun, session: Session) -> bool:
-        """An approval applies only to the content the reviewer was given. Changed content is reviewed again;
-        missing or unpinned content keeps the run waiting with the reason in its context."""
-        from huddleroom.services.orchestration_artifact_identity import CHANGED
+    async def _approvable_review_identity(self, db: AsyncSession, run: GraphRun, session: Session) -> dict | None:
+        """The identity a review session's approval binds to, or None when the approval must not apply.
 
-        failure = await self._review_identity_failure(db, run)
+        Each review session is bound to the content it was given when it was created. Only the run's current
+        review session can approve, and only while that content is unchanged. Changed content is reviewed again;
+        missing or unpinned content keeps the run waiting with the reason in its context."""
+        from huddleroom.services.orchestration_artifact_identity import (
+            CHANGED, UNAVAILABLE, UNINSPECTABLE, recheck_binding,
+        )
+
+        task = await db.get(Task, session.task_id) if session.task_id else None
+        recorded = (task.metadata_ or {}).get("review_identity") if task is not None else None
+        context = run.context or {}
+        if isinstance(recorded, dict) and context.get("review_task_id") != str(task.id):
+            return None  # a superseded review session (e.g. a redelivered completion): its approval never applies
+        if (context.get("review_identity_blocked") or {}).get("session_id") == str(session.id):
+            return None  # this approval was already refused
+        if isinstance(recorded, dict):
+            failure = await recheck_binding(db, run.project_id, [recorded])
+        else:  # nothing was bound when this review was dispatched: fail closed
+            failure = UNINSPECTABLE, {"artifact_id": str(run.artifact_id), "reason": UNAVAILABLE}
         if failure is None:
-            return False
-        blocked = (run.context or {}).get("review_identity_blocked") or {}
-        if blocked.get("session_id") == str(session.id):
-            return True  # this approval was already handled
+            if "review_identity_blocked" in context:  # a later approval applies: the earlier refusal is over
+                run.context = {key: value for key, value in context.items() if key != "review_identity_blocked"}
+            return recorded
         state, current = failure
         self._block_review_identity(run, state, current, str(session.id))
-        if state == CHANGED:
+        if state == CHANGED and run.current_node == "ready_for_review":
             graph = await db.get(Graph, run.graph_id)
-            node_def = ((graph.definition or {}).get("nodes") or {}).get(run.current_node, {}) if graph else {}
+            node_def = ((graph.definition or {}).get("nodes") or {}).get("ready_for_review", {}) if graph else {}
             await self._execute_on_enter(db, node_def, run)  # a new review bound to the current content
         await db.flush()
-        return True
+        return None
 
     async def _approval_no_longer_holds(
-        self, db: AsyncSession, run: GraphRun, graph: Graph, edge: dict, event: BusEvent,
+        self, db: AsyncSession, run: GraphRun, graph: Graph, to_node: str | None, trigger_event_id: uuid.UUID | None,
     ) -> bool:
         """Before a run leaves `approved` (other than back to review), recompute the reviewed identity: changed
-        content returns the run to review, content that cannot be identified keeps it waiting."""
+        content returns the run to review, content that cannot be identified keeps it waiting.
+
+        Runs approved before review identities were recorded carry no `review_identity` and may leave `approved`
+        unchecked (grandfathered); every review session created since binds one."""
         from huddleroom.services.orchestration_artifact_identity import CHANGED
 
         nodes = (graph.definition or {}).get("nodes") or {}
-        if (run.current_node != "approved" or edge.get("to") == "ready_for_review" or "ready_for_review" not in nodes
+        if (run.current_node != "approved" or to_node == "ready_for_review" or "ready_for_review" not in nodes
                 or not isinstance((run.context or {}).get("review_identity"), dict)):
             return False
         failure = await self._review_identity_failure(db, run)
@@ -807,12 +825,19 @@ class GraphEngineService:
         if state == CHANGED:
             await self._fire_edge(
                 db, run, graph, from_node=run.current_node, to_node="ready_for_review",
-                edge_name="reviewed_content_changed", actions=[], trigger_event_id=event.id,
+                edge_name="reviewed_content_changed", actions=[], trigger_event_id=trigger_event_id,
                 trigger_reason="review_identity_changed",
             )
         else:
             await db.flush()
         return True
+
+    async def return_changed_approval_to_review(self, db: AsyncSession, run: GraphRun) -> bool:
+        """Send an approved run back to review when its reviewed content changed (no PR event needed)."""
+        if run.status != "active" or run.current_node != "approved":
+            return False
+        graph = await db.get(Graph, run.graph_id)
+        return graph is not None and await self._approval_no_longer_holds(db, run, graph, None, None)
 
     def _review_graph_event_type(self, verdict: str | None) -> str | None:
         if verdict == "approved":
