@@ -138,12 +138,16 @@ class CliAdapter:
     @staticmethod
     async def _persist_partial(
         db: AsyncSession, session_id: uuid.UUID, provider_id: str | None = None, output: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         """Write early CLI facts in their own short transaction so a later crash cannot lose them."""
         values = {k: v for k, v in (("provider_session_id", provider_id), ("output", output)) if v}
-        if not values:
+        if not values and not metadata:
             return
         async with async_sessionmaker(db.bind, expire_on_commit=False)() as own:
+            if metadata:
+                current = await own.scalar(select(Session.metadata_).where(Session.id == session_id))
+                values["metadata_"] = {**(current or {}), **metadata}
             await own.execute(update(Session).where(Session.id == session_id, Session.status == "running").values(**values))
             await own.commit()
 
@@ -536,7 +540,7 @@ class CliAdapter:
         except FileNotFoundError:
             session.status = "failed"
             session.error = f"command_not_found: {cmd[0]}"
-            session.resumable = True
+            session.resumable = session.provider_session_id is not None
             session.ended_at = datetime.now(timezone.utc)
             self._store_roadmap_elapsed(session)
             if not await finish_if_owned():
@@ -546,7 +550,7 @@ class CliAdapter:
                 "session_id": str(session_id),
                 "error": session.error,
                 "project_id": str(session.project_id),
-                "resumable": True,
+                "resumable": session.resumable,
             })
             from huddleroom.services.session_sync import sync_task_from_session
             await sync_task_from_session(db, session)
@@ -561,7 +565,7 @@ class CliAdapter:
         except Exception as e:
             session.status = "failed"
             session.error = redact_secrets(str(e))
-            session.resumable = True
+            session.resumable = session.provider_session_id is not None
             session.ended_at = datetime.now(timezone.utc)
             self._store_roadmap_elapsed(session)
             if not await finish_if_owned():
@@ -571,7 +575,7 @@ class CliAdapter:
                 "session_id": str(session_id),
                 "error": session.error,
                 "project_id": str(session.project_id),
-                "resumable": True,
+                "resumable": session.resumable,
             })
             from huddleroom.services.session_sync import sync_task_from_session
             await sync_task_from_session(db, session)
@@ -627,7 +631,10 @@ class CliAdapter:
                         try:
                             await self._terminate_process_group(proc)
                             text, provider_id = parse_partial_cli(cli_runtime, partial_output.get("stdout", b""))
-                            await self._persist_partial(db, session_id, provider_id, text)
+                            await self._persist_partial(
+                                db, session_id, provider_id, text,
+                                {"resume_outcome": "resume_failed"} if used_resume_id else None,
+                            )
                         except Exception:
                             logger.exception("CLI collector cleanup failed for session %s", session_id)
                         raise
@@ -653,6 +660,8 @@ class CliAdapter:
                                 session.error = None
                                 session.resumable = False
                                 event_type = "session.cancelled"
+                        if used_resume_id and session.status == "failed":
+                            session.metadata_ = {**(session.metadata_ or {}), "resume_outcome": "resume_failed"}
                         session.ended_at = datetime.now(timezone.utc)
                         self._store_roadmap_elapsed(session)
                         if not await finish_if_owned():

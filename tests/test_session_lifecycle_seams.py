@@ -520,3 +520,76 @@ async def test_escaped_failure_after_effect_started_stays_unknown_effect_for_rec
         gone = RunnerObservation("runner-1", "unknown", datetime.now(timezone.utc))
         assert service.classify(owned, live) == "unknown_external_effect"
         assert service.classify(owned, gone) not in {"interrupted_safe", "resume_exact"}
+
+
+@pytest.mark.asyncio
+async def test_early_provider_id_write_failure_does_not_kill_healthy_run(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    class FinishingProc(_StreamProc):
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    proc = FinishingProc(_EARLY + [b'{"type": "result", "result": "done", "session_id": "prov-early-2"}\n'])
+    proc.stdout.feed_eof()
+    proc.stderr.feed_eof()
+    persist = AsyncMock(side_effect=RuntimeError("database is locked"))
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_persist_partial", new=persist), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=proc)):
+            await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        persist.assert_awaited_once()
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "completed", stored.error
+        assert stored.provider_session_id == "prov-early-2"
+        assert (await _reload(factory, Task, task.id)).status == "done"
+
+
+@pytest.mark.asyncio
+async def test_cli_spawn_failure_without_provider_id_is_not_resumable(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, project, _agent, _task, session):
+        for exc in (FileNotFoundError("nope"), OSError("spawn failed")):
+            async with factory() as db:
+                row = await db.get(Session, session.id)
+                row.status, row.error, row.resumable = "pending", None, False
+                row.started_at = None
+                row.metadata_ = {}
+                await db.commit()
+            with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                    patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                          new=AsyncMock(side_effect=exc)):
+                await session_tasks.execute_cli_session(str(session.id), "runner-1")
+            stored = await _reload(factory, Session, session.id)
+            assert stored.status == "failed" and stored.resumable is False
+        async with factory() as db:
+            events = (await db.execute(select(EventLog).where(
+                EventLog.project_id == project.id, EventLog.event_type == "session.failed"))).scalars().all()
+        assert events and all(e.payload["resumable"] is False for e in events)
+
+
+@pytest.mark.asyncio
+async def test_resumed_cli_collector_failure_is_labelled_resume_failed(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async def broken_collector(*_args, **_kwargs):
+        raise RuntimeError("collector blew up")
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        async with factory() as db:
+            row = await db.get(Session, session.id)
+            row.provider_session_id = "prov-old"
+            await db.commit()
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.collect_cli_process", new=broken_collector), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        assert (await _reload(factory, Session, session.id)).metadata_["resume_outcome"] == "resume_failed"

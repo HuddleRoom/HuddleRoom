@@ -658,8 +658,11 @@ async def collect_cli_process(
             if is_stdout and on_provider_id is not None and not reported_id:
                 early_id = parse_partial_cli(runtime, accumulated)[1]
                 if early_id:
-                    reported_id = True
-                    await on_provider_id(early_id)
+                    reported_id = True  # once only: a failing write must not be retried on every chunk
+                    try:
+                        await on_provider_id(early_id)
+                    except Exception:
+                        logger.warning("Could not persist early provider session id", exc_info=True)
             await route(feed_fn(chunk))
         await route(feed_fn(b"\n"))
         return accumulated
