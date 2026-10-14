@@ -4,6 +4,7 @@ from dataclasses import replace
 from copy import deepcopy
 import hashlib
 import json
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -38,6 +39,7 @@ from huddleroom.schemas.orchestration_recovery import (
 )
 from huddleroom.services.orchestration_recovery_configuration import RecoveryConfigurationService
 from huddleroom.services.orchestration_recovery_registry import RecoveryToolRegistry
+from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
 from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
 from huddleroom.services.orchestration_roster_mutation import (
     CanonicalAgentState,
@@ -249,6 +251,52 @@ def test_manifest_entries_expose_nonempty_strict_argument_schemas():
             assert schema["additionalProperties"] is False
             assert schema["properties"]
             assert schema.get("required")
+
+
+@pytest.mark.asyncio
+async def test_analyzer_manifest_distinguishes_calls_from_server_owned_verification(db_session, test_project):
+    planner = _agent(PLANNER_ID, "Recovery Planner", "planning")
+    db_session.add(Agent(**planner.__dict__))
+    await db_session.flush()
+    goal, run = await _seed_goal_run(db_session, test_project, objective="Plan the release.")
+    registry = RecoveryToolRegistry()
+    manifest = [entry.model_dump(mode="json") for entry in registry.manifest()]
+    draft = _tool_draft("orchestration.request_plan@1", {
+        "agent_id": str(planner.id), "work_function": "planning", "scope": "goal",
+    }).model_copy(update={"general_updates": ["orchestration request plan"]})
+    completion = AsyncMock(return_value={"choices": [{"message": {
+        "content": json.dumps(draft.model_dump(mode="json")),
+    }}]})
+    assessed = await RecoveryAnalyzer(completion_fn=completion).analyze(
+        {"registry_manifest": manifest}, project_id=test_project.id, evidence_query=AsyncMock(),
+    )
+    request = completion.await_args.kwargs
+    captured_manifest = json.loads(request["messages"][1]["content"])["snapshot"]["registry_manifest"]
+    for entry in captured_manifest[:10]:
+        assert "Executable recovery tool" in entry["description"]
+        assert "Allowed in proposal calls" in entry["description"]
+    for entry in captured_manifest[10:]:
+        assert "Read-only verification predicate" in entry["description"]
+        assert "server-owned verification checks; never in proposal calls" in entry["description"]
+    prompt = request["messages"][0]["content"]
+    assert "Proposal calls may use only executable recovery tools" in prompt
+    assert "Verification predicates are used only in server-owned verification checks" in prompt
+    assert "do not author a verification field" in prompt
+
+    proposal = await registry.canonicalize(db_session, goal, run, _trigger(goal.id, run.id), assessed)
+    assert proposal.calls[0].tool == "orchestration.request_plan"
+    assert proposal.verification[0].verifier == "action.completed"
+    assert proposal.verification[0].arguments == {"call_id": proposal.calls[0].call_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("predicate", ("planning.ready", "artifact.exists"))
+async def test_verification_predicates_remain_rejected_in_proposal_calls(db_session, test_project, predicate):
+    goal, run = await _seed_goal_run(db_session, test_project, objective="Plan the release.")
+    with pytest.raises(ValueError, match="unknown_or_unversioned_tool"):
+        await RecoveryToolRegistry().canonicalize(
+            db_session, goal, run, _trigger(goal.id, run.id), _draft(f"{predicate}@1"),
+        )
 
 
 @pytest.mark.asyncio

@@ -143,7 +143,13 @@ class RecoveryToolRegistry:
 
     def manifest(self) -> tuple[ToolManifestV1, ...]:
         return tuple(
-            ToolManifestV1(name=name, version="1", description=f"Registered recovery entry: {name}.", arguments_schema=TypeAdapter(model).json_schema())
+            ToolManifestV1(
+                name=name, version="1",
+                description=(f"Executable recovery tool: {name}. Allowed in proposal calls."
+                             if name in _TOOL_MODELS else
+                             f"Read-only verification predicate: {name}. Used only in server-owned verification checks; never in proposal calls."),
+                arguments_schema=TypeAdapter(model).json_schema(),
+            )
             for name, model in {**_TOOL_MODELS, **_VERIFIER_MODELS}.items()
         )
 

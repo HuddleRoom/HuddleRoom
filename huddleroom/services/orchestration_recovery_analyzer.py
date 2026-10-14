@@ -90,6 +90,10 @@ class RecoveryAnalyzer:
             "Diagnose the recovery blocker. Return one JSON object only. " + budget + "Never author IDs, versions, retry targets, "
             "authority, hashes, registry data, secrets, predicates, queries, or executable code. "
             "Reuse authoritative IDs from the snapshot/evidence for evidence citations and queries. "
+            "The registry manifest separates executable recovery tools from read-only verification predicates. "
+            "Proposal calls may use only executable recovery tools, with the manifest name and version as name@version. "
+            "Verification predicates are used only in server-owned verification checks; never put them in calls. "
+            "The server builds verification checks; do not author a verification field. "
             "The schemas below are authoritative; include every required field. "
             + json.dumps({
                 "assessment_schema": _ASSESSMENT.json_schema(),
