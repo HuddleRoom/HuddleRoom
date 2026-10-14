@@ -336,7 +336,7 @@ async def _terminalize_escaped_failure(session_id: uuid.UUID, runner_task_id: st
     from huddleroom.services.secret_redaction import redact_secrets
     from huddleroom.services.session_sync import sync_task_from_session
 
-    reason = redact_secrets(f"{type(exc).__name__}: {str(exc)[:200]}")
+    reason = redact_secrets(f"{type(exc).__name__}: {exc}")[:200]  # redact first: a cut must not split a secret
     try:
         async with AsyncSessionLocal() as db:
             session = await db.get(SessionModel, session_id)
@@ -344,7 +344,8 @@ async def _terminalize_escaped_failure(session_id: uuid.UUID, runner_task_id: st
                 return
             session.status = "failed"
             session.error = reason
-            session.resumable = True
+            # API sessions have no provider id and were always resumable; CLI only with a captured id.
+            session.resumable = session.adapter_type == "api" or session.provider_session_id is not None
             session.ended_at = datetime.now(timezone.utc)
             if not await _mark_attempt_result(db, session_id, runner_task_id):
                 await db.rollback()
@@ -354,7 +355,7 @@ async def _terminalize_escaped_failure(session_id: uuid.UUID, runner_task_id: st
                 "task_id": str(session.task_id) if session.task_id else None,
                 "error": reason,
                 "project_id": str(session.project_id),
-                "resumable": True,
+                "resumable": session.resumable,
             })
             await sync_task_from_session(db, session)
             await db.commit()

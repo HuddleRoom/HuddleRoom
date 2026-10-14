@@ -8,7 +8,7 @@ import uuid
 from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from fastapi import HTTPException
 
@@ -134,6 +134,26 @@ class CliAdapter:
     async def _terminate_process_group(proc, grace_seconds: float = 0.5) -> None:
         """Stop a CLI and every child it started, escalating after a bounded grace period."""
         await terminate_process_group(proc, grace_seconds)
+
+    @staticmethod
+    async def _persist_partial(
+        db: AsyncSession, session_id: uuid.UUID, provider_id: str | None = None, output: str | None = None,
+    ) -> None:
+        """Write early CLI facts in their own short transaction so a later crash cannot lose them."""
+        values = {k: v for k, v in (("provider_session_id", provider_id), ("output", output)) if v}
+        if not values:
+            return
+        async with async_sessionmaker(db.bind, expire_on_commit=False)() as own:
+            await own.execute(update(Session).where(Session.id == session_id, Session.status == "running").values(**values))
+            await own.commit()
+
+    @staticmethod
+    def _apply_partial(session: Session, runtime: str, stdout: bytes | None) -> None:
+        """Carry what the CLI emitted before it was abandoned onto the session; resumable only with an id."""
+        text, provider_id = parse_partial_cli(runtime, stdout or b"")
+        session.provider_session_id = provider_id or session.provider_session_id
+        session.output = text or session.output
+        session.resumable = session.provider_session_id is not None
 
     @staticmethod
     async def _watch_project_status(
@@ -583,7 +603,12 @@ class CliAdapter:
 
         async def collect_task():
             """Collect CLI process output concurrently."""
-            collected = await collect_cli_process(proc, runtime=cli_runtime, call=call, partial=partial_output)
+            async def remember_provider_id(provider_id: str) -> None:
+                await self._persist_partial(db, session_id, provider_id=provider_id)
+
+            collected = await collect_cli_process(
+                proc, runtime=cli_runtime, call=call, partial=partial_output, on_provider_id=remember_provider_id,
+            )
             return collected.stdout, collected.stderr, collected.returncode
 
         # Use the invocation call within async context manager
@@ -599,29 +624,34 @@ class CliAdapter:
                     try:
                         stdout_bytes, stderr_bytes, exit_code = collect_task_obj.result()
                     except Exception:
-                        await self._terminate_process_group(proc)
+                        try:
+                            await self._terminate_process_group(proc)
+                            text, provider_id = parse_partial_cli(cli_runtime, partial_output.get("stdout", b""))
+                            await self._persist_partial(db, session_id, provider_id, text)
+                        except Exception:
+                            logger.exception("CLI collector cleanup failed for session %s", session_id)
                         raise
                 else:
                     await self._terminate_process_group(proc)
                     collect_task_obj.cancel()
                     await asyncio.gather(collect_task_obj, return_exceptions=True)
                     if watcher_task in done:
+                        self._apply_partial(session, cli_runtime, partial_output.get("stdout"))
                         try:
                             project_status = watcher_task.result()
                         except Exception as exc:
                             session.status = "failed"
                             session.error = f"project_status_watcher_failed: {exc}"
-                            session.resumable = True
                             event_type = "session.failed"
                         else:
                             if project_status != "resetting":
                                 session.status = "failed"
                                 session.error = f"project_status_watcher_failed: unexpected status {project_status!r}"
-                                session.resumable = True
                                 event_type = "session.failed"
                             else:
                                 session.status = "cancelled"
                                 session.error = None
+                                session.resumable = False
                                 event_type = "session.cancelled"
                         session.ended_at = datetime.now(timezone.utc)
                         self._store_roadmap_elapsed(session)
@@ -636,7 +666,7 @@ class CliAdapter:
                         if session.error:
                             payload["error"] = session.error
                         if session.status == "failed":
-                            payload["resumable"] = True
+                            payload["resumable"] = session.resumable
                         await emit_event(db, session.project_id, event_type, payload)
                         from huddleroom.services.session_sync import sync_task_from_session
                         await sync_task_from_session(db, session)
@@ -651,12 +681,11 @@ class CliAdapter:
                         return
 
                     # Keep what the CLI emitted before the deadline; resumable only with a provider id.
-                    partial_text, partial_id = parse_partial_cli(cli_runtime, partial_output.get("stdout", b""))
+                    self._apply_partial(session, cli_runtime, partial_output.get("stdout"))
                     session.status = "failed"
                     session.error = "timeout"
-                    session.provider_session_id = partial_id or session.provider_session_id
-                    session.output = partial_text or session.output
-                    session.resumable = session.provider_session_id is not None
+                    if used_resume_id:
+                        session.metadata_ = {**(session.metadata_ or {}), "resume_outcome": "resume_failed"}
                     session.ended_at = datetime.now(timezone.utc)
                     self._store_roadmap_elapsed(session)
                     if not await finish_if_owned():
@@ -682,8 +711,10 @@ class CliAdapter:
                 await self._terminate_process_group(proc)
                 collect_task_obj.cancel()
                 await asyncio.gather(collect_task_obj, return_exceptions=True)
+                self._apply_partial(session, cli_runtime, partial_output.get("stdout"))
                 session.status = "cancelled"
                 session.error = None
+                session.resumable = False
                 session.ended_at = datetime.now(timezone.utc)
                 metadata = dict(session.metadata_ or {})
                 if not isinstance(metadata.get("token_usage_complete"), bool):
@@ -807,18 +838,19 @@ class CliAdapter:
         session.status = "failed" if repair_error or exit_code != 0 else "completed"
         if repair_error:
             session.error = repair_error
-            session.resumable = True
+            session.resumable = session.provider_session_id is not None
         elif exit_code != 0:
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
             session.error = f"exit_code_{exit_code}" + (f": {redact_secrets(stderr_text[:500])}" if stderr_text else "")
-            session.resumable = True
+            session.resumable = session.provider_session_id is not None
         session.ended_at = datetime.now(timezone.utc)
         self._store_roadmap_elapsed(session)
         session.metadata_ = {
             **(session.metadata_ or {}),
             "exit_code": exit_code,
             "model_used": effective_model,
-            **({"resume_outcome": "resumed"} if used_resume_id and exit_code == 0 else {}),
+            **({"resume_outcome": "resumed" if exit_code == 0 and not repair_error else "resume_failed"}
+               if used_resume_id else {}),
         }
         if (session.metadata_ or {}).get("_run_config", {}).get("_roadmap_budget_enforced"):
             usage = (self._claude_usage(stdout_text) if cli_runtime == "claude_code"
@@ -841,7 +873,7 @@ class CliAdapter:
         }
         if session.status != "completed":
             payload["error"] = session.error
-            payload["resumable"] = True
+            payload["resumable"] = session.resumable
         # INVARIANT: session.completed emitters MUST call sync_task_from_session
         # (task->done) in this same transaction before it commits; the
         # orchestrator's canonical-report consumption in

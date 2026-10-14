@@ -595,7 +595,8 @@ def parse_partial_cli(runtime: str, stdout: bytes) -> tuple[str, str | None]:
 
 
 async def collect_cli_process(
-    proc: Any, *, runtime: str, call: Any, partial: dict[str, bytes] | None = None
+    proc: Any, *, runtime: str, call: Any, partial: dict[str, bytes] | None = None,
+    on_provider_id: Any = None,
 ) -> CollectedCliOutput:
     """Collect CLI subprocess output concurrently, routing updates through call.
 
@@ -605,6 +606,7 @@ async def collect_cli_process(
         call: AgentResponseCall to route updates through
         partial: optional dict kept current with the stdout seen so far (key "stdout"),
             so a caller that abandons the collection can still recover early output
+        on_provider_id: optional async callable awaited once, when the provider session id is first seen
 
     Returns:
         CollectedCliOutput with exact bytes and decoded content
@@ -640,30 +642,45 @@ async def collect_cli_process(
             elif update.kind == "tool_finished":
                 await call.tool_finished(update.tool_name or "unknown", update.outcome, update.value)
 
-    async def read_stream(stream: Any, feed_fn) -> bytes:
+    reported_id = False
+
+    async def read_stream(stream: Any, feed_fn, is_stdout: bool = False) -> bytes:
         """Read concurrently, retaining exact transport bytes and completed boundaries."""
+        nonlocal reported_id
         accumulated = b""
         while True:
             chunk = await stream.read(4096)
             if not chunk:
                 break
             accumulated += chunk
-            if partial is not None and feed_fn == decoder.feed_stdout:
+            if is_stdout and partial is not None:
                 partial["stdout"] = accumulated
+            if is_stdout and on_provider_id is not None and not reported_id:
+                early_id = parse_partial_cli(runtime, accumulated)[1]
+                if early_id:
+                    reported_id = True
+                    await on_provider_id(early_id)
             await route(feed_fn(chunk))
         await route(feed_fn(b"\n"))
         return accumulated
 
     # Read both streams concurrently
     stdout_task = asyncio.create_task(
-        read_stream(proc.stdout, decoder.feed_stdout)
+        read_stream(proc.stdout, decoder.feed_stdout, True)
     )
     stderr_task = asyncio.create_task(
         read_stream(proc.stderr, decoder.feed_stderr)
     )
 
     # Wait for both readers to reach EOF
-    stdout_bytes, stderr_bytes = await asyncio.gather(stdout_task, stderr_task)
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.gather(stdout_task, stderr_task)
+    except BaseException:
+        # A failed or cancelled reader must not leave its sibling reading a dead pipe.
+        for reader in (stdout_task, stderr_task):
+            reader.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        raise
 
     # Now wait for process to exit
     returncode = await proc.wait()

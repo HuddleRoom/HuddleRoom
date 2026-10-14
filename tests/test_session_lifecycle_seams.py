@@ -354,3 +354,169 @@ async def test_cli_timeout_without_provider_id_is_not_resumable(test_engine, tmp
         assert stored.error == "timeout"
         assert stored.provider_session_id is None
         assert stored.resumable is False
+
+
+_EARLY = [
+    b'{"type": "system", "subtype": "init", "session_id": "prov-early-2"}\n',
+    b'{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "so far"}]}}\n',
+]
+
+
+@pytest.mark.asyncio
+async def test_cli_provider_id_is_persisted_as_soon_as_seen(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc(_EARLY))):
+            worker = asyncio.create_task(session_tasks.execute_cli_session(str(session.id), "runner-1"))
+            try:
+                for _ in range(100):  # the worker is still running: no timeout, no terminal write yet
+                    stored = await _reload(factory, Session, session.id)
+                    if stored.provider_session_id:
+                        break
+                    await asyncio.sleep(0.05)
+                assert stored.status == "running"
+                assert stored.provider_session_id == "prov-early-2"
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cli_collector_failure_keeps_partial_provider_id_and_output(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async def broken_collector(proc, *, partial, **_kwargs):
+        partial["stdout"] = b"".join(_EARLY)
+        raise RuntimeError("collector blew up")
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.collect_cli_process", new=broken_collector), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed"
+        assert stored.provider_session_id == "prov-early-2"
+        assert stored.output == "so far"
+        assert stored.resumable is True
+
+
+@pytest.mark.asyncio
+async def test_cli_collector_cleanup_failure_does_not_mask_original_error(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async def broken_collector(*_args, **_kwargs):
+        raise RuntimeError("original collector error")
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock(side_effect=OSError("kill failed"))), \
+                patch("huddleroom.adapters.cli_adapter.collect_cli_process", new=broken_collector), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            with pytest.raises(RuntimeError, match="original collector error"):
+                await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed" and stored.error == "RuntimeError: original collector error"
+
+
+@pytest.mark.asyncio
+async def test_resumed_cli_timeout_is_labelled_resume_failed(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        async with factory() as db:
+            row = await db.get(Session, session.id)
+            row.provider_session_id = "prov-old"
+            row.metadata_ = {"_run_config": {"timeout": 0.3}}
+            await db.commit()
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.error == "timeout"
+        assert stored.provider_session_id == "prov-old" and stored.resumable is True
+        assert stored.metadata_["resume_outcome"] == "resume_failed"
+
+
+@pytest.mark.asyncio
+async def test_escaped_failure_reason_is_redacted_before_truncation(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+
+    async def broken_collector(*_args, **_kwargs):
+        raise RuntimeError("a" * 175 + f" token={secret}")  # the secret straddles the 200 char cut
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.collect_cli_process", new=broken_collector), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        error = (await _reload(factory, Session, session.id)).error
+        assert len(error) <= 200
+        assert secret[:12] not in error and "sk-" not in error
+
+
+@pytest.mark.asyncio
+async def test_escaped_failure_after_effect_started_stays_unknown_effect_for_recovery(test_engine, tmp_path, monkeypatch):
+    import time
+    from datetime import datetime, timezone
+
+    import litellm
+
+    from huddleroom.adapters import api_adapter
+    from huddleroom.services.orchestration_recovery_service import OrchestrationRecoveryService, RunnerObservation
+    from tests.test_orchestration_worker_ownership_recovery import _owned
+
+    async def rate_limited(**_kwargs):
+        time.sleep(0.15)
+        raise litellm.RateLimitError("retry", "openai", "gpt-4o-mini")
+
+    async def no_wait_for(awaitable, timeout=None):
+        return await awaitable
+
+    monkeypatch.setattr(api_adapter, "asyncio", SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in ("get_running_loop", "sleep", "CancelledError")},
+        wait_for=no_wait_for))
+    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(session_tasks, "AsyncSessionLocal", factory)
+    async with factory() as db:
+        project = Project(name=f"Project-{uuid.uuid4()}", workspace_path=str(tmp_path), config={})
+        agent = Agent(name=f"agent-{uuid.uuid4()}", role="developer", provider="openai", model="gpt-4o-mini",
+                      adapter_type="api", capabilities=[], config={})
+        db.add_all([project, agent])
+        await db.flush()
+        goal, _run, _action, _task, session = await _owned(
+            db, project, agent, session_status="pending", task_status="in_progress", runner="runner-1")
+        session.adapter_type = "api"
+        session.metadata_ = {**session.metadata_, "_run_config": {"timeout": 0.1}}
+        await db.commit()
+        session_id, goal_id = session.id, goal.id
+
+    with patch("litellm.acompletion", new=rate_limited):
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(session_tasks.execute_api_session(str(session_id), "runner-1"), timeout=10)
+    stored = await _reload(factory, Session, session_id)
+    assert stored.status == "failed"
+    assert stored.metadata_["attempt"]["effect_state"] == "started"
+    async with factory() as db:
+        service = OrchestrationRecoveryService()
+        snapshot = await service.build_goal_snapshot(db, goal_id, datetime.now(timezone.utc))
+        owned = snapshot.sessions[0]
+        live = RunnerObservation("runner-1", "active", datetime.now(timezone.utc))
+        gone = RunnerObservation("runner-1", "unknown", datetime.now(timezone.utc))
+        assert service.classify(owned, live) == "unknown_external_effect"
+        assert service.classify(owned, gone) not in {"interrupted_safe", "resume_exact"}
