@@ -4896,7 +4896,7 @@ class OrchestrationService:
                     ],
                     "budget": verification_budget,
                     "report_schema": {
-                        "status": "done",
+                        "status": "done|blocked|failed",
                         "verdict": "accepted|rejected",
                         "evidence": "list[str] (at least one item when accepted)",
                         "notes": "str (optional)",
@@ -7452,8 +7452,9 @@ class OrchestrationService:
         field_instruction = (
             "include required fields and omit unused optional/default fields; no extra keys (values show types). "
             if kind == PLANNING_ENVELOPE
-            else 'status must be "done", verdict accepted or rejected, evidence a list of strings with at least '
-            "one item when accepted; notes is optional and extra keys are tolerated (values show types). "
+            else 'status "done" requires verdict accepted or rejected and evidence a list of strings with at least '
+            'one item when accepted; use status "blocked" or "failed" with notes when you cannot verify; '
+            "notes is optional and extra keys are tolerated (values show types). "
             if kind == VERIFICATION_VERDICT
             else "no missing or extra keys (values show types). "
         )
@@ -8090,7 +8091,8 @@ class OrchestrationService:
             for item in attempts
         ]
         if ledger["status"] == "exhausted":
-            if not ledger.get("decision_id"):
+            # A stopped summary correction hands over to the replacement-summary recovery, the single owner decision.
+            if not ledger.get("decision_id") and ledger["kind"] != FINAL_SUMMARY:
                 ask = await self._escalate_owner(
                     db, goal, run, "result_correction_exhausted", subject, history,
                     f"The result of task {parent.id} still fails validation after {len(attempts) - 1} correction(s). "
@@ -8281,10 +8283,17 @@ class OrchestrationService:
         except HTTPException as exc:
             if not 400 <= exc.status_code < 500:
                 raise
-            category = "budget_exhausted" if exc.detail == "budget_wait" else "capability_unavailable"
-            await self._escalate_owner(
-                db, goal, run, category, subject, history, f"Cannot dispatch a result correction: {exc.detail}.",
+            if exc.detail == "budget_wait":  # stays pending: the next tick dispatches once funding returns
+                await self._escalate_owner(
+                    db, goal, run, "budget_exhausted", subject, history, f"Cannot dispatch a result correction: {exc.detail}.",
+                )
+                return
+            ask = await self._escalate_owner(
+                db, goal, run, "capability_unavailable", subject, history,
+                f"Cannot dispatch a result correction: {exc.detail}.", options=RESULT_CORRECTION_ASK_OPTIONS,
             )
+            ledger.update(status="unavailable", reason="correction_dispatch_unavailable", detail=str(exc.detail),
+                          decision_id=str(ask.target_id) if ask.target_id else None)
             return
         correction = await db.get(Task, action.target_id) if action.status == "completed" and action.target_id else None
         if correction is None:
@@ -9454,6 +9463,9 @@ class OrchestrationService:
             self._set_result_correction_status(marker, "rejected", reason="the correction is not a bound verification")
             return
         verdict, errors, findings = self._verification_report(session.output)
+        if verdict is None and not errors:  # the verifier now reports it cannot verify; stop correcting
+            self._set_result_correction_status(marker, "rejected", reason=f"the verifier reported {findings['status']}")
+            return
         if verdict is None:
             await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
             return
@@ -9681,12 +9693,21 @@ class OrchestrationService:
         """(verdict, exact errors, findings); verdict and findings are None when the report is invalid.
 
         Required: status "done", verdict accepted|rejected, evidence list[str] (non-empty when accepted);
-        notes optional, extra keys tolerated. Findings carry "normalized" when the output was unwrapped."""
+        notes optional, extra keys tolerated. Findings carry "normalized" when the output was unwrapped.
+        A well-formed "blocked"/"failed" report has no verdict and no errors."""
         try:
             text, how = normalize_result_output(output or "")
             report = json.loads(text)
         except (TypeError, ValueError) as exc:
             return None, [str(exc)], None
+        notes = report.get("notes")
+        if report.get("status") in {"blocked", "failed"}:
+            # The verifier reported it could not verify: not an output error, and never pressed into a verdict.
+            evidence = report.get("evidence")
+            return None, [], {
+                "status": report["status"], "notes": notes if isinstance(notes, str) else None,
+                "evidence": evidence if isinstance(evidence, list) and all(isinstance(i, str) for i in evidence) else [],
+            }
         errors = []
         if report.get("status") != "done":
             errors.append(f'status must be "done" (got {report.get("status")!r})')
@@ -9700,7 +9721,6 @@ class OrchestrationService:
             errors.append("evidence must contain at least one non-empty item when the verdict is accepted")
         if errors:
             return None, errors, None
-        notes = report.get("notes")
         findings = {"evidence": evidence, "notes": notes if isinstance(notes, str) else None}
         return verdict, [], {**findings, "normalized": how} if how else findings
 
@@ -9800,7 +9820,9 @@ class OrchestrationService:
         verdict, errors, findings = self._verification_report(session.output)
         if verdict is None:
             # An invalid verdict is neither acceptance nor rejection: it goes to a bounded output-only correction.
-            await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
+            # A blocked/failed verifier report is no output error and is never corrected.
+            if errors:
+                await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
             return 0
         return await self._record_verification_verdict(
             db, run, event, gate, task, session, action, source_task, verdict, findings,
@@ -11249,6 +11271,15 @@ class OrchestrationService:
             or orchestration.get("final_summary") is not True
         ):
             return None, "Final summary task linkage is invalid"
+        if correction_parent := task_metadata.get("result_correction_parent_task_id"):
+            marker = await self._existing_action_for_key(
+                db, gate.run_id, f"run:{gate.run_id}:kind:report_consumed:task:{correction_parent}",
+            )
+            ledger = self._json_object_or_empty(self._json_object_or_empty(marker.request if marker else {}).get(
+                "result_correction"
+            ))
+            if ledger.get("kind") != FINAL_SUMMARY or ledger.get("correction_task_id") != str(task.id):
+                return None, "Final summary task linkage is invalid"  # only the current correction answers
         if task.assigned_to != session.agent_id or summary_evidence.producer_agent_id != session.agent_id:
             return None, "Final summary session attribution is invalid"
 

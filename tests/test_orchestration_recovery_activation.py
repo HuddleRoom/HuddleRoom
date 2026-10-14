@@ -858,6 +858,9 @@ async def test_invalid_final_summary_lineage_approves_gate_linked_replacement_an
     await db_session.flush()
     card = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.related_action_id == proposal.id))).one()
+    pending = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending"))).all()
+    assert pending == [card]  # the fix card is the single owner decision once the correction stopped
     await OrchestrationBlockerRecoveryService().reserve_answer(
         db_session, card, selected_option="approve_fix", reason=None, user_id=test_user.id)
     await _complete_goal_definition(db_session, goal, run)

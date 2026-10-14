@@ -1119,3 +1119,43 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
     assert len([item for item in actions if item.action_type == "request_verification" and item.request.get("gate_id") == str(gate.id)]) == 1
     assert len([item for item in actions if item.action_type == "request_final_summary"]) == 1
     assert len([item for item in actions if item.action_type == "complete_run"]) == 1
+
+
+async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
+    db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
+):
+    builder = _agent("verdict-correction-builder", ["implementation"])
+    verifier = _agent("verdict-correction-verifier", ["validation"])
+    db_session.add_all([builder, verifier])
+    await db_session.flush()
+    roadmap, parent, run, _version = await accepted_goal_roadmap(db_session, test_project, [
+        {**roadmap_task("only", mutates_shared_state=False), "agent_id": str(builder.id)},
+    ])
+    service = roadmap.orchestration
+    _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await service.tick(db_session, run.id)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    task = await db_session.get(Task, row.task_id)
+    await _record_measured_completion(db_session, test_project.id, run, task, task.assigned_to, PRODUCER_REPORT)
+    verification = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(row.gate_id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:roadmap_item:{row.item_key}",
+    )
+    verifier_task = await db_session.get(Task, verification.target_id)
+
+    async def ingest():
+        events = await service._new_events(db_session, test_project.id, run.event_cursor)
+        await service._ingest_evidence_from_events(db_session, run, events)
+
+    await _record_measured_completion(db_session, test_project.id, run, verifier_task, verifier.id, "Verified, all good.")
+    await ingest()
+    [correction] = (await db_session.scalars(select(Task).where(Task.parent_id == verifier_task.id))).all()
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True
+
+    await _record_measured_completion(
+        db_session, test_project.id, run, correction, verifier.id,
+        json.dumps({"status": "done", "verdict": "accepted", "evidence": ["independent check"]}),
+    )
+    await ingest()
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False

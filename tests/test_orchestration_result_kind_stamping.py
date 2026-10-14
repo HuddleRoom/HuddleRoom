@@ -50,8 +50,9 @@ async def test_delegation_persists_result_kind(db_session, test_project, work_fu
     assert shown == (CANONICAL_WORK_REPORT_SCHEMA if kind == "work_report" else schema)
     expected_schema = CANONICAL_WORK_REPORT_SCHEMA if kind == "work_report" else schema
     fields = (
-        'status must be "done", verdict accepted or rejected, evidence a list of strings with at least one item '
-        "when accepted; notes is optional and extra keys are tolerated (values show types). "
+        'status "done" requires verdict accepted or rejected and evidence a list of strings with at least one '
+        'item when accepted; use status "blocked" or "failed" with notes when you cannot verify; '
+        "notes is optional and extra keys are tolerated (values show types). "
         if kind == "verification_verdict" else "no missing or extra keys (values show types). "
     )
     expected_tail = (

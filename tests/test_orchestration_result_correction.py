@@ -837,11 +837,15 @@ def test_verification_report_returns_exact_errors_and_findings():
     ) + "\n```")
     assert (verdict, errors) == ("rejected", []) and findings == {"evidence": [], "notes": "Tests fail.", "normalized": "fence"}
     assert report("Looks good to me.") == (None, ["result contains no JSON object"], None)
-    assert report(json.dumps({"status": "blocked", "evidence": "x"})) == (None, [
-        "status must be \"done\" (got 'blocked')",
+    assert report(json.dumps({"status": "complete", "evidence": "x"})) == (None, [
+        "status must be \"done\" (got 'complete')",
         "verdict must be \"accepted\" or \"rejected\" (got None)",
         "evidence must be a list of strings",
     ], None)
+    # a well-formed blocked/failed report is not an output error: no verdict, nothing to correct
+    assert report(json.dumps({"status": "blocked", "notes": "No access to staging."})) == (
+        None, [], {"status": "blocked", "evidence": [], "notes": "No access to staging."},
+    )
     assert report(json.dumps({"status": "done", "verdict": "accepted", "evidence": [" "]}))[1] == [
         "evidence must contain at least one non-empty item when the verdict is accepted",
     ]
@@ -886,8 +890,21 @@ async def _verification_evidence(db, gate):
 async def test_verifier_prompt_states_the_verdict_contract(db_session, test_project):
     _service, _run, _gate, verifier_task = await _verifier_setup(db_session, test_project)
     assert verifier_task.metadata_["orchestration_contract"]["expected_result"] == "verification_verdict"
-    assert '"status": "done"' in verifier_task.description and '"verdict": "accepted|rejected"' in verifier_task.description
+    assert '"status": "done|blocked|failed"' in verifier_task.description and '"verdict": "accepted|rejected"' in verifier_task.description
     assert "notes is optional" in verifier_task.description and "extra keys are tolerated" in verifier_task.description
+    assert '"blocked" or "failed"' in verifier_task.description
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+@pytest.mark.parametrize("status", ["blocked", "failed"])
+async def test_well_formed_blocked_or_failed_verifier_report_is_not_corrected(db_session, test_project, status):
+    service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
+    await _complete(db_session, service, run, verifier_task, json.dumps({"status": status, "notes": "No access."}))
+
+    assert await _corrections(db_session, verifier_task) == []
+    assert await _verification_evidence(db_session, gate) == []
+    await db_session.refresh(gate)
+    assert gate.status != "accepted"
 
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
@@ -948,12 +965,18 @@ async def test_repeated_identical_verdict_failure_stops_without_counting(db_sess
 
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
-async def test_corrected_verdict_from_the_producer_is_not_recorded(db_session, test_project):
+@pytest.mark.parametrize("reassign", [False, True])
+async def test_corrected_verdict_from_another_agent_or_the_producer_is_not_recorded(
+    db_session, test_project, reassign,
+):
     service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
     await _complete(db_session, service, run, verifier_task, "Looks fine.")
     [correction] = await _corrections(db_session, verifier_task)
     producer_id = uuid.UUID(verifier_task.metadata_["orchestration"]["producer_agent_id"])
+    if reassign:  # the producer takes over the correction task and answers it itself
+        correction.assigned_to = producer_id
 
+    # session agent differs from the correction's assignee, or the producer verifies its own work
     await _complete(db_session, service, run, correction, ACCEPTED_VERDICT, agent_id=producer_id)
 
     assert await _verification_evidence(db_session, gate) == []
@@ -1012,10 +1035,53 @@ async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exh
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
-    assert ledger["status"] == "exhausted" and len(_escalations(run, "result_correction_exhausted")) == 1
+    # the replacement recovery is the single owner decision: no separate exhausted ask
+    assert ledger["status"] == "exhausted" and not ledger.get("decision_id")
+    assert _escalations(run, "result_correction_exhausted") == []
     assert len(await _summary_triggers(db_session, run)) == 1
     await service.tick(db_session, run.id)
     assert len(await _summary_triggers(db_session, run)) == 1
     assert len(await _corrections(db_session, task)) == 1
     await db_session.refresh(gate)
     assert gate.status == "failed"
+
+
+@pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
+async def test_summary_correction_that_cannot_be_dispatched_hands_over_to_recovery(db_session, test_project):
+    service, _goal, run, task, gate = await _summary_setup(db_session, test_project)
+    writer = await db_session.get(Agent, task.assigned_to)
+    await _complete(db_session, service, run, task, "not json")
+    writer.is_active = False
+    await db_session.flush()
+
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "unavailable" and ledger["reason"] == "correction_dispatch_unavailable"
+    assert await _corrections(db_session, task) == []
+    assert len(await _summary_triggers(db_session, run)) == 1
+
+
+@pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
+async def test_superseded_summary_correction_cannot_satisfy_the_gate(db_session, test_project):
+    from tests.test_orchestration_final_summary_request import _valid_summary_output
+
+    service, goal, run, task, gate = await _summary_setup(db_session, test_project)
+    await _complete(db_session, service, run, task, "not json")
+    await service.tick(db_session, run.id)
+    [old] = await _corrections(db_session, task)
+    goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await db_session.flush()
+    await service.tick(db_session, run.id)  # a new owner contract starts a fresh correction cycle
+    [new] = [item for item in await _corrections(db_session, task) if item.id != old.id]
+
+    await _complete(db_session, service, run, old, await _valid_summary_output(db_session, goal, run))
+    await service.tick(db_session, run.id)
+    await db_session.refresh(gate)
+    assert gate.status != "accepted"
+    assert await _summary_triggers(db_session, run) == []
+
+    await _complete(db_session, service, run, new, await _valid_summary_output(db_session, goal, run))
+    await service.tick(db_session, run.id)
+    await db_session.refresh(gate)
+    assert gate.status == "accepted"
