@@ -106,7 +106,7 @@ const OPERATION_LABELS: Record<string, string> = {
 }
 
 export function friendlyOperation(operation: string): string {
-  const known = OPERATION_LABELS[operation]
+  const known = Object.prototype.hasOwnProperty.call(OPERATION_LABELS, operation) ? OPERATION_LABELS[operation] : undefined
   if (known) return known
   return operation
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')

@@ -57,6 +57,36 @@ function terminalExplanation(call: AgentCallRecord): string | null {
   return null
 }
 
+const DECISION_ACTION_LABELS: Record<string, string> = {
+  noop: 'Wait for a change', request_plan: 'Request a plan', request_roadmap_replan: 'Replan the roadmap',
+  request_plan_revision: 'Request plan revisions', accept_plan: 'Accept the plan',
+  create_delegation_task: 'Create a delegation task', request_verification: 'Request verification',
+  resolve_meeting_action_item: 'Resolve meeting action item', retry_task: 'Retry task', reassign_task: 'Reassign task',
+  schedule_meeting: 'Schedule a meeting', start_graph: 'Start a workflow', ask_human: 'Ask for guidance',
+  pause_run: 'Pause this run', suggest_agent: 'Suggest an agent', record_warning: 'Record warning',
+  recover_blocker: 'Start managed recovery',
+}
+
+const WAKE_EVENT_LABELS: Record<string, string> = {
+  'task.status_changed': 'Task status changes', 'task.assigned': 'Task assignment changes',
+  'session.created': 'A session is created', 'session.started': 'A session starts',
+  'session.completed': 'A session completes', 'session.failed': 'A session fails',
+  'session.cancelled': 'A session is cancelled', 'session.resumed': 'A session resumes',
+  'authority.decision_resolved': 'Pending decision is resolved', 'artifact.created': 'An artifact is created',
+  'artifact.content_changed': 'Artifact content changes', 'artifact.breaking_change': 'An artifact has a breaking change',
+  'meeting.scheduled': 'A meeting is scheduled', 'meeting.concluded': 'A meeting concludes',
+  'meeting.action_item_waived': 'A meeting action item is waived', 'graph.run_completed': 'A workflow run completes',
+  'graph.run_failed': 'A workflow run fails', 'graph.run_advanced': 'A workflow run advances',
+}
+
+function recheckLabel(seconds: unknown): string | null {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return null
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? '' : 's'}`
+  if (seconds % 3600 === 0) return `${seconds / 3600} hour${seconds === 3600 ? '' : 's'}`
+  if (seconds % 60 === 0) return `${seconds / 60} minute${seconds === 60 ? '' : 's'}`
+  return `${seconds} seconds`
+}
+
 function orchestrationDecisionSummary(call: AgentCallRecord, value: unknown): React.ReactNode | null {
   if (
     call.operation !== 'decision' ||
@@ -69,18 +99,29 @@ function orchestrationDecisionSummary(call: AgentCallRecord, value: unknown): Re
   const decision = envelope.decision
   if (!decision || typeof decision !== 'object' || Array.isArray(decision)) return null
   const fields = decision as Record<string, unknown>
-  if (
-    fields.action_type !== 'recover_blocker' ||
-    typeof fields.reason !== 'string' ||
-    !fields.reason.includes('plan_author_unavailable') ||
-    !Array.isArray(fields.evidence_refs)
-  ) return null
-
-  const count = fields.evidence_refs.length
+  if (typeof fields.action_type !== 'string') return null
+  const wakeWhen = fields.wake_when && typeof fields.wake_when === 'object' && !Array.isArray(fields.wake_when)
+    ? fields.wake_when as Record<string, unknown> : null
+  const reason = typeof fields.reason === 'string' ? fields.reason : null
+  const blockedPlanning = fields.action_type === 'recover_blocker' && reason?.includes('plan_author_unavailable')
+  const prose = ['question', 'topic', 'deliverable', 'scope', 'revision_request', 'message']
+    .map((key) => [key, fields[key]] as const)
+    .filter((item): item is readonly [string, string] => typeof item[1] === 'string' && !!item[1].trim())
+  const events = Array.isArray(wakeWhen?.events) ? wakeWhen.events
+    .map((event) => event && typeof event === 'object' && !Array.isArray(event) ? (event as Record<string, unknown>).event_type : null)
+    .filter((event): event is string => typeof event === 'string') : []
+  const wakeEvents = Array.from(new Set(events.map((event) => Object.prototype.hasOwnProperty.call(WAKE_EVENT_LABELS, event) ? WAKE_EVENT_LABELS[event] : friendlyOperation(event.replace(/[.]/g, '_')))))
+  const recheck = recheckLabel(wakeWhen?.recheck_after_seconds)
+  const expectedResult = typeof wakeWhen?.expected_result === 'string' ? wakeWhen.expected_result : null
+  const evidenceCount = Array.isArray(fields.evidence_refs) ? fields.evidence_refs.length : null
   return <div data-testid="orchestration-decision-summary">
-    <div className="font-semibold">Start managed recovery</div>
-    <p style={{ margin: '4px 0 0' }}>Planning is blocked because the approved team setup has no eligible planning agent.</p>
-    <p className="text-xs text-huddleroom-text-muted" style={{ margin: '4px 0 0' }}>Based on {count} supporting record{count === 1 ? '' : 's'}.</p>
+    <div className="font-semibold">{Object.prototype.hasOwnProperty.call(DECISION_ACTION_LABELS, fields.action_type) ? DECISION_ACTION_LABELS[fields.action_type] : friendlyOperation(fields.action_type)}</div>
+    {blockedPlanning ? <p style={{ margin: '4px 0 0' }}>Planning is blocked because the approved team setup has no eligible planning agent.</p> : reason && <p style={{ margin: '4px 0 0' }}>{reason}</p>}
+    {prose.map(([key, item]) => <p key={key} style={{ margin: '4px 0 0' }}>{item}</p>)}
+    {wakeEvents.map((event) => <p key={event} style={{ margin: '4px 0 0' }}>Resume when: {event}.</p>)}
+    {recheck && <p style={{ margin: '4px 0 0' }}>Recheck in {recheck}.</p>}
+    {expectedResult && <p style={{ margin: '4px 0 0' }}>Expected result: {expectedResult}</p>}
+    {evidenceCount !== null && <p className="text-xs text-huddleroom-text-muted" style={{ margin: '4px 0 0' }}>Based on {evidenceCount} supporting record{evidenceCount === 1 ? '' : 's'}.</p>}
   </div>
 }
 

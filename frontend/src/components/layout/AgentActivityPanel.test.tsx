@@ -12,6 +12,32 @@ import { isAgentResponseEvent, orderedCalls, AgentResponseEvent, reconcileAgentT
 import { AgentActivityPanel } from './AgentActivityPanel'
 import * as responseHelpers from '@/lib/agentResponse'
 
+describe('decision summary unknown prototype-name regressions', () => {
+  beforeEach(() => {
+    useAgentResponseStore.getState().clear()
+    useAgentResponseStore.getState().setProject('proj-123')
+  })
+  it.each([
+    ['action', '__proto__', 'Proto'], ['action', 'constructor', 'Constructor'],
+    ['wake', '__proto__', 'Proto'], ['wake', 'constructor', 'Constructor'],
+  ])('renders unknown %s name %s as readable inert text', async (kind, name, expectedLabel) => {
+    const decision = {
+      action_type: kind === 'action' ? name : 'noop', reason: 'Unknown names remain readable.',
+      ...(kind === 'wake' ? { wake_when: { events: [{ event_type: name }], expected_result: 'A change occurs' } } : {}),
+    }
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent({ operation: 'decision' }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ decision }) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response)).toContain(kind === 'wake' ? `Resume when: ${expectedLabel}.` : expectedLabel)
+      expect(textOf(response)).toContain('Unknown names remain readable.')
+      expect(descendants(response).some((node) => node.tagName === 'SCRIPT')).toBe(false)
+    } finally { view.cleanup() }
+  })
+})
+
 // Shell test mocks (for mounted Shell tests)
 const shellTestState = vi.hoisted(() => ({
   projects: [] as Project[],
@@ -2079,7 +2105,7 @@ describe('SPR189/190 bounded readable Calls contracts', () => {
     } finally { view.cleanup() }
   })
 
-  it('falls back to the structured renderer for an unrecognized decision reason', async () => {
+  it('keeps an unrecognized decision reason readable', async () => {
     const store = useAgentResponseStore.getState()
     store.ingest(baseEvent({ operation: 'decision' }))
     store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ decision: {
@@ -2088,9 +2114,45 @@ describe('SPR189/190 bounded readable Calls contracts', () => {
     const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
     try {
       const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
-      expect(textOf(response)).toContain('Action Type')
-      expect(textOf(response)).toContain('recover_blocker')
-      expect(descendants(response).some((node) => node.getAttribute('data-testid') === 'orchestration-decision-summary')).toBe(false)
+      expect(textOf(response)).toContain('Start managed recovery')
+      expect(textOf(response)).toContain('An unrecognized blocker.')
+      expect(descendants(response).some((node) => node.getAttribute('data-testid') === 'orchestration-decision-summary')).toBe(true)
+    } finally { view.cleanup() }
+  })
+
+  it('renders a waiting decision without matcher identifiers', async () => {
+    const store = useAgentResponseStore.getState()
+    const id = 'fea808f0-ada9-488a-8962-1b1a919255be'
+    store.ingest(baseEvent({ operation: 'decision' }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ decision: {
+      action_type: 'noop', reason: 'Waiting for approval.', wake_when: {
+        events: [{ event_type: 'authority.decision_resolved', matcher: { decision_id: id } }],
+        expected_result: 'An approved decision is available.',
+      },
+    } }) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response)).toContain('Wait for a change')
+      expect(textOf(response)).toContain('Waiting for approval.')
+      expect(textOf(response)).toContain('Resume when: Pending decision is resolved.')
+      expect(textOf(response)).toContain('Expected result: An approved decision is available.')
+      expect(textOf(response)).not.toContain(id)
+    } finally { view.cleanup() }
+  })
+
+  it('uses readable fallbacks for unknown action and wake event names', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent({ operation: 'decision' }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ decision: {
+      action_type: 'future_action', wake_when: { events: [{ event_type: 'future.event', matcher: { id: 'hidden' } }], expected_result: 'Done.' },
+    } }) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response)).toContain('Future Action')
+      expect(textOf(response)).toContain('Resume when: Future Event.')
+      expect(textOf(response)).not.toContain('hidden')
     } finally { view.cleanup() }
   })
 
