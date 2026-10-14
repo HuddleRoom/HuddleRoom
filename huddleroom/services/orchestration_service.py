@@ -4634,8 +4634,10 @@ class OrchestrationService:
             return action
         run = await db.get(OrchestrationRun, run_id)
         reason = self._optional_string(request.get("reason")) or "The orchestrator reported a blocker."
-        basis = {"blocker_code": "reported_blocker", "evidence_refs": sorted(
-            (request.get("evidence_refs") or []), key=lambda ref: json.dumps(ref, sort_keys=True, default=str))}
+        refs = {(str(ref.get("kind", "")).strip().lower(), str(ref.get("id", "")).strip().lower())
+                for ref in request.get("evidence_refs") or [] if isinstance(ref, Mapping)}
+        basis = {"blocker_code": "reported_blocker",
+                 "evidence_refs": [{"kind": kind, "id": ref_id} for kind, ref_id in sorted(refs)]}
         trigger = await self.open_recovery_trigger(db, run_id, self._recovery_fingerprint(basis))
         if trigger is not None:  # repeated reports of the same blocker while its lineage is open join it
             await self._mark_action_completed(db, action, "orchestration_action", trigger.id)

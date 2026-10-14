@@ -905,14 +905,14 @@ async def test_repeated_eventless_noops_and_reports_keep_one_open_lineage_each(d
         await service._dispatch_execution_decision(db_session, run, noop)
         report = await _decision(db_session, run, {
             "action_type": "recover_blocker", "reason": f"Still blocked {uuid.uuid4()}.",
-            "evidence_refs": refs[::-1] if attempt % 2 else refs,
+            "evidence_refs": [refs[attempt % 2], refs[1 - attempt % 2]] if attempt < 2 else refs[:1] * 2 + refs[1:],
         })
         await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, report)
 
     triggers = await _actions(db_session, run.id, "recovery_trigger")
     assert sorted(t.request["source_kind"] for t in triggers) == ["eventless_noop", "reported_blocker"]
     reports = await _actions(db_session, run.id, "recover_blocker")
-    assert len(reports) == 2 and {r.target_id for r in reports} == {
+    assert len(reports) == 3 and {r.target_id for r in reports} == {
         next(t.id for t in triggers if t.request["source_kind"] == "reported_blocker")}
 
 
