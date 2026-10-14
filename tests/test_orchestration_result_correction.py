@@ -448,3 +448,47 @@ async def test_final_summary_failure_dispatches_correction_with_summary_schema(d
     assert output in correction.description and "final summary must be one JSON object" in correction.description
     assert '"unresolved_gaps"' in correction.description
     assert (await _ledger(service, db_session, run, task))["correction_task_id"] == str(correction.id)
+
+
+async def _decision(db, decision_id):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+    return await db.get(OrchestrationAuthorityDecision, uuid.UUID(decision_id))
+
+
+async def test_contract_change_while_exhausted_cancels_the_stale_ask(db_session, test_project):
+    service, goal, run, _agent, task = await _setup(db_session, test_project)
+    await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [first] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, first, MISSING_FIELDS)
+    [blocker] = _escalations(run, "result_correction_exhausted")
+    ask = await _decision(db_session, blocker["decision_id"])
+    assert ask.status == "pending"
+
+    goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await service.tick(db_session, run.id)
+
+    await db_session.refresh(ask)
+    assert ask.status == "cancelled"
+    assert not [b for b in run.active_blockers if b.get("kind") == "owner_escalation"]
+    assert service.run_condition(goal, run) != "needs_attention"
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["cycle"] == 2 and ledger["status"] == "correcting" and ledger.get("decision_id") is None
+
+
+async def test_contract_change_while_waiting_on_budget_cancels_the_stale_budget_ask(db_session, test_project):
+    service, goal, run, _agent, task = await _setup(db_session, test_project, caps={"max_tokens": 2})
+    await _complete(db_session, service, run, task, MISSING_FIELDS, tokens=2)
+    [blocker] = _escalations(run, "budget_exhausted")
+    ask = await _decision(db_session, blocker["decision_id"])
+
+    goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await service.tick(db_session, run.id)
+
+    await db_session.refresh(ask)
+    assert ask.status == "cancelled"
+    # Budget is still exhausted, so only the new cycle's own ask remains, and it is a fresh pending decision.
+    [current] = _escalations(run, "budget_exhausted")
+    assert current["scope"] == f"task:{task.id}:result_correction:cycle:2"
+    assert (await _decision(db_session, current["decision_id"])).status == "pending"
+    assert await _corrections(db_session, task) == []

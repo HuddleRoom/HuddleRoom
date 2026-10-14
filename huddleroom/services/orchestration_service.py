@@ -7973,7 +7973,8 @@ class OrchestrationService:
         if ledger.get("status") in {"corrected", "owner_declined"}:
             return
         if ledger.get("version", version) != version:
-            self._new_result_correction_cycle(ledger, version)  # a new owner contract or plan version resets the count
+            # A new owner contract or plan version resets the count.
+            await self._new_result_correction_cycle(db, run, parent, ledger, version)
         if ledger.get("status") in {"exhausted", "unavailable"}:
             decision_id = self._optional_uuid(ledger.get("decision_id"), "decision_id")
             decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
@@ -7982,7 +7983,7 @@ class OrchestrationService:
             if decision.status != "answered" or decision.selected_option == "dismiss":
                 ledger["status"] = "owner_declined"
                 return
-            self._new_result_correction_cycle(ledger, version)
+            await self._new_result_correction_cycle(db, run, parent, ledger, version)
         attempts = list(ledger.get("attempts") or [])
         if ledger.get("status") == "correcting":
             correction = await db.get(Task, uuid.UUID(ledger["correction_task_id"]))
@@ -8057,9 +8058,27 @@ class OrchestrationService:
             db, goal, run, parent, ledger, failed_output, latest, budget, subject, history, version,
         )
 
-    @staticmethod
-    def _new_result_correction_cycle(ledger: dict[str, Any], version: dict[str, Any]) -> None:
-        """Start a fresh bounded cycle; any in-flight correction is unlinked and never consumed."""
+    async def _new_result_correction_cycle(
+        self, db: AsyncSession, run: OrchestrationRun, parent: Task, ledger: dict[str, Any], version: dict[str, Any],
+    ) -> None:
+        """Start a fresh bounded cycle; any in-flight correction is unlinked and never consumed.
+
+        The old cycle's open owner asks are cancelled and its subject blockers dropped, so nothing stale waits."""
+        from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+        cycle = int(ledger.get("cycle", 1))
+        suffix = f":cycle:{cycle}" if cycle > 1 else ""
+        old_scopes = {f"task:{parent.id}:result_correction{suffix}", f"task:{parent.id}:correction_input_unavailable{suffix}"}
+        stale = [item for item in run.active_blockers
+                 if isinstance(item, Mapping) and item.get("kind") == "owner_escalation" and item.get("scope") in old_scopes]
+        run.active_blockers = [item for item in run.active_blockers if item not in stale]
+        decision_ids = {ledger.get("decision_id"), *(item.get("decision_id") for item in stale)} - {None}
+        for decision_id in decision_ids:
+            decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(str(decision_id)))
+            if decision is not None and decision.status == "pending":
+                await OrchestrationAuthorityDecisionService().cancel_decision(
+                    db, decision, reason="superseded by a new result correction cycle",
+                )
         ledger.update(
             cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
             correction_task_id=None, correction_session_id=None,
