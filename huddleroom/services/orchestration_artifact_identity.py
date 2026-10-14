@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -159,3 +160,76 @@ def classify_input(artifact, workspace_root: str) -> InputAvailability:
 
 async def classify_input_async(artifact, workspace_root: str) -> InputAvailability:
     return await asyncio.to_thread(classify_input, artifact, workspace_root)
+
+
+# --- binding a review/verification to the identities it saw ---------------------------------------------------
+
+CHANGED = "changed"
+MAX_REFERENCE_CHARS = 300
+
+
+def pinned_reference(artifact, found: InputAvailability) -> str | None:
+    """The immutable reference a reviewer and an approval consumer both receive; None when nothing is pinned."""
+    if found.state != PRESENT or not found.identity:
+        return None
+    if artifact.path:
+        reference = f"{artifact.path} (sha256 {found.identity})"
+    elif artifact.url and _PINNED_URL.search(urlparse(artifact.url).path):
+        reference = artifact.url
+    elif artifact.url:
+        reference = f"{(artifact.metadata_ or {}).get('repo_path')} at commit {found.identity.removeprefix('commit:')}"
+    else:
+        reference = f"stored {artifact.artifact_type} content (sha256 {found.identity})"
+    return reference if len(reference) <= MAX_REFERENCE_CHARS else f"{reference[:MAX_REFERENCE_CHARS]}…"
+
+
+async def _workspace_root(db, project_id) -> str | None:
+    from huddleroom.models.project import Project
+
+    project = await db.get(Project, project_id)
+    return project.workspace_path if project is not None else None
+
+
+async def identity_record(artifact, workspace_root: str | None) -> dict:
+    # an unset workspace must not fall back to the process cwd
+    found = await classify_input_async(artifact, workspace_root) if workspace_root else _unavailable()
+    return {
+        "artifact_id": str(artifact.id), "state": found.state, "identity": found.identity, "reason": found.reason,
+        "reference": pinned_reference(artifact, found),
+    }
+
+
+async def bind_artifacts(db, project_id, artifacts) -> list[dict]:
+    """Identity records for the artifacts a review/verification is dispatched with."""
+    root = await _workspace_root(db, project_id)
+    return [await identity_record(artifact, root) for artifact in artifacts]
+
+
+async def recheck_binding(db, project_id, recorded) -> tuple[str, dict] | None:
+    """Recompute every bound identity from current content. None when all still hold; else (state, record) for the
+    first failure, by priority: CONFIRMED_MISSING (producer revision), UNINSPECTABLE (fail closed), CHANGED
+    (approval no longer applies; review again)."""
+    from huddleroom.models.artifact import Artifact
+
+    root = await _workspace_root(db, project_id)
+    failures: dict[str, dict] = {}
+    for item in recorded or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            artifact = await db.get(Artifact, uuid.UUID(str(item.get("artifact_id"))))
+        except ValueError:
+            artifact = None
+        if artifact is None or artifact.project_id != project_id:
+            current = {"artifact_id": item.get("artifact_id"), "state": CONFIRMED_MISSING, "identity": None,
+                       "reason": None, "reference": None}
+        else:
+            current = await identity_record(artifact, root)
+        if current["state"] != PRESENT:
+            failures.setdefault(current["state"], current)
+        elif (item.get("state"), item.get("identity")) != (PRESENT, current["identity"]):
+            failures.setdefault(CHANGED, current)
+    for state in (CONFIRMED_MISSING, UNINSPECTABLE, CHANGED):
+        if state in failures:
+            return state, failures[state]
+    return None

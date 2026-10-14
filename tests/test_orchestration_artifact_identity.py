@@ -196,3 +196,34 @@ def test_local_repo_commit_pinned(tmp_path):
     assert bad.reason == "artifact_identity_unpinned"
     escape = classify_input(art(url=url, metadata_={"repo_path": "..", "commit": sha}), str(tmp_path / "repo"))
     assert escape.reason == "artifact_identity_unpinned"
+
+
+# --- create/update refresh the displayed content hash from the workspace file ---
+
+import hashlib  # noqa: E402
+
+import pytest_asyncio  # noqa: E402
+
+
+@pytest_asyncio.fixture
+async def project_workspace(db_session, test_project, tmp_path):
+    test_project.workspace_path = str(tmp_path.resolve())
+    await db_session.flush()
+    return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_create_and_update_refresh_content_hash_from_the_workspace(db_session, test_project, project_workspace):
+    from huddleroom.services.artifact_service import ArtifactService
+
+    (project_workspace / "spec.md").write_text("one")
+    service = ArtifactService()
+    artifact = await service.create(db_session, test_project.id, "spec", "doc", path="spec.md")
+    assert (artifact.content_hash, artifact.version) == (hashlib.sha256(b"one").hexdigest(), 1)
+
+    (project_workspace / "spec.md").write_text("two")
+    await service.update(db_session, artifact, name="spec v2")
+    assert artifact.content_hash == hashlib.sha256(b"two").hexdigest() and artifact.version == 2
+
+    missing = await service.create(db_session, test_project.id, "later", "doc", path="not-yet.md")
+    assert missing.content_hash is None  # a file that does not exist yet is not an error

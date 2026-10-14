@@ -112,11 +112,16 @@ nodes:
     on_enter:
       - action_type: notify_actor
         actor: merger
-        message: "PR {{artifact.name}} is approved and ready to merge."
+        message: "PR {{artifact.name}} is approved and ready to merge. Merge exactly the reviewed content: {{review_reference}}."
     edges:
       - name: merged
         to: merged
         trigger_event: code.pr_merged
+        guard:
+          artifact_id: "{{graph_run.artifact_id}}"
+      - name: updated_after_approval
+        to: ready_for_review
+        trigger_event: code.pr_updated
         guard:
           artifact_id: "{{graph_run.artifact_id}}"
 

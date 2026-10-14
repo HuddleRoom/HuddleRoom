@@ -50,7 +50,7 @@ async def _complete_review(db_session, test_project, output: str):
         project_id=test_project.id,
         name="verdict-pr",
         artifact_type="pull_request",
-        url="http://example.com/pr/verdict",
+        url=f"https://github.com/org/repo/commit/{'c' * 40}",  # pinned: only pinned content can be approved
         metadata_={"branch": "feature/verdict"},
     )
     task = Task(project_id=test_project.id, title="Review PR", status="in_progress")
@@ -68,18 +68,10 @@ async def _complete_review(db_session, test_project, output: str):
     )
     db_session.add(run)
     await db_session.flush()
-    session = Session(
-        agent_id=reviewer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        graph_run_id=run.id,
-        adapter_type="api",
-        status="completed",
-        output=output,
-        metadata_={},
-        origin="graph",
-    )
-    db_session.add(session)
+    # the reviewer session is created the way the graph creates it, bound to the artifact's identity
+    await GraphEngineService()._execute_on_enter(db_session, proto.definition["nodes"]["ready_for_review"], run)
+    session = (await db_session.execute(select(Session).where(Session.graph_run_id == run.id))).scalar_one()
+    session.status, session.output = "completed", output
     await db_session.flush()
     await GraphEngineService().process_event(
         db_session,
@@ -179,3 +171,209 @@ async def test_commented_outcome_records_no_review_evidence(db_session, test_pro
     assert [r for r in rows if r.source_type == "review"] == []
     await db_session.refresh(gate)
     assert gate.status != "accepted"
+
+
+# --- a graph approval binds to the content identity the reviewer was given ---
+
+import hashlib  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+
+from huddleroom.models.channel import Channel  # noqa: E402
+from huddleroom.models.message import Message  # noqa: E402
+
+COMMIT_URL = f"https://github.com/org/repo/commit/{'d' * 40}"
+
+
+def _git_repo(workspace: Path) -> tuple[str, str]:
+    """A workspace repository with two commits; returns (first sha, second sha)."""
+    repo = workspace / "repo"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, env=env)
+
+    git("init", "-q")
+    shas = []
+    for text in ("one", "two"):
+        (repo / "f.py").write_text(text)
+        git("add", "f.py")
+        git("commit", "-q", "-m", text)
+        shas.append(git("rev-parse", "HEAD").stdout.strip())
+    return shas[0], shas[1]
+
+
+async def _open_review(db, project, **artifact_fields):
+    """A code_review run driven to ready_for_review by real events; the graph creates the reviewer session."""
+    await GraphService().load_from_yaml(db, Path("workspace/graphs/code_review.yaml"))
+    reviewer = Agent(name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+                     adapter_type="api", capabilities=["code_review"], config={})
+    merger = Agent(name=f"pm-{uuid.uuid4()}", role="pm", provider="openai", model="gpt-4o-mini",
+                   adapter_type="api", capabilities=["code_merge"], config={})
+    artifact = Artifact(project_id=project.id, name="identity-pr", **{
+        "artifact_type": "pull_request", "metadata_": {"branch": "feature/identity"}, **artifact_fields,
+    })
+    db.add_all([reviewer, merger, artifact,
+                Channel(project_id=project.id, name="general", channel_type="general", members=[])])
+    await db.flush()
+    for event_type in ("code.pr_opened", "test.passed"):
+        await _event(db, project, event_type, artifact)
+    run = (await db.execute(select(GraphRun).where(GraphRun.artifact_id == artifact.id))).scalar_one()
+    assert run.current_node == "ready_for_review"
+    return run, artifact, merger
+
+
+async def _event(db, project, event_type, artifact):
+    await GraphEngineService().process_event(db, BusEvent(
+        id=uuid.uuid4(), project_id=project.id, event_type=event_type,
+        payload={"artifact_id": str(artifact.id)}, source="system",
+    ))
+    await db.flush()
+
+
+async def _review_sessions(db, run):
+    return list((await db.execute(
+        select(Session).where(Session.graph_run_id == run.id).order_by(Session.created_at, Session.id)
+    )).scalars().all())
+
+
+async def _answer(db, project, run, output="Looks right.\nVERDICT: APPROVE"):
+    *_, session = await _review_sessions(db, run)
+    session.status, session.output = "completed", output
+    await db.flush()
+    await GraphEngineService().process_event(db, BusEvent(
+        id=uuid.uuid4(), project_id=project.id, event_type="session.completed",
+        payload={"session_id": str(session.id)}, source="system",
+    ))
+    await db.flush()
+    await db.refresh(run)
+    return session
+
+
+async def _approvals(db, project):
+    return list((await db.execute(select(EventLog).where(
+        EventLog.project_id == project.id, EventLog.event_type == "review.approved",
+    ))).scalars().all())
+
+
+async def _merger_messages(db, project, merger):
+    channel = (await db.execute(select(Channel).where(
+        Channel.project_id == project.id, Channel.name == f"dm-{merger.id}",
+    ))).scalar_one_or_none()
+    if channel is None:
+        return []
+    return [row.content for row in (await db.execute(select(Message).where(Message.channel_id == channel.id))).scalars()]
+
+
+async def _task_description(db, session):
+    return (await db.get(Task, session.task_id)).description
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_graph_approval_of_edited_file_is_not_applied_and_review_is_requested_again(db_session, test_project):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    run, _artifact, merger = await _open_review(db_session, test_project, path="app.py")
+    [first] = await _review_sessions(db_session, run)
+    assert f"app.py (sha256 {_sha('v1')})" in await _task_description(db_session, first)
+
+    (workspace / "app.py").write_text("v2")  # edited directly in the workspace after the review was dispatched
+    await _answer(db_session, test_project, run)
+
+    assert run.current_node == "ready_for_review" and await _approvals(db_session, test_project) == []
+    assert run.context["review_identity_blocked"]["reason"] == "changed"
+    _, second = await _review_sessions(db_session, run)  # a new review, bound to the new content
+    assert f"app.py (sha256 {_sha('v2')})" in await _task_description(db_session, second)
+    assert run.context["review_identity"]["identity"] == _sha("v2")
+
+    await _answer(db_session, test_project, run)
+    assert run.current_node == "approved" and len(await _approvals(db_session, test_project)) == 1
+    [message] = await _merger_messages(db_session, test_project, merger)
+    assert f"app.py (sha256 {_sha('v2')})" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["code.pr_merged", "code.pr_updated"])
+async def test_graph_returns_to_review_when_content_changes_after_approval(db_session, test_project, event_type):
+    workspace = Path(test_project.workspace_path)
+    (workspace / "app.py").write_text("v1")
+    run, artifact, _merger = await _open_review(db_session, test_project, path="app.py")
+    await _answer(db_session, test_project, run)
+    assert run.current_node == "approved"
+
+    (workspace / "app.py").write_text("v2")
+    await _event(db_session, test_project, event_type, artifact)
+
+    await db_session.refresh(run)
+    assert run.current_node == "ready_for_review" and run.status == "active"
+    _, second = await _review_sessions(db_session, run)
+    assert f"sha256 {_sha('v2')}" in await _task_description(db_session, second)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{}, {"commit": "e" * 40}], ids=["bare_pr_url", "sha_only_in_metadata"])
+async def test_graph_unpinned_pr_url_never_approves(db_session, test_project, metadata):
+    run, _artifact, _merger = await _open_review(
+        db_session, test_project, url="https://github.com/org/repo/pull/9", metadata_={"branch": "b", **metadata},
+    )
+    [session] = await _review_sessions(db_session, run)
+    assert "No pinned content" in await _task_description(db_session, session)
+
+    await _answer(db_session, test_project, run)
+
+    assert run.current_node == "ready_for_review" and await _approvals(db_session, test_project) == []
+    assert run.context["review_identity_blocked"]["reason"] == "artifact_identity_unpinned"
+    assert len(await _review_sessions(db_session, run)) == 1  # no re-review loop and no producer revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin", ["commit_url", "local_repo_commit", "stored_plan"])
+async def test_graph_pinned_content_approves_and_the_merger_gets_the_same_reference(db_session, test_project, pin):
+    if pin == "commit_url":
+        fields, reference = {"url": COMMIT_URL}, COMMIT_URL
+    elif pin == "local_repo_commit":
+        first, _second = _git_repo(Path(test_project.workspace_path))
+        fields = {"url": "https://github.com/org/repo/pull/9", "metadata_": {"repo_path": "repo", "commit": first}}
+        reference = f"repo at commit {first}"
+    else:
+        fields = {"artifact_type": "plan", "metadata_": {"schema_version": 1, "plan_kind": "work", "summary": "s",
+                                                         "plan_items": [{"key": "a"}]}}
+        reference = "stored plan content (sha256 "
+    run, artifact, merger = await _open_review(db_session, test_project, **fields)
+    [session] = await _review_sessions(db_session, run)
+    assert reference in await _task_description(db_session, session)
+
+    await _answer(db_session, test_project, run)
+
+    assert run.current_node == "approved" and len(await _approvals(db_session, test_project)) == 1
+    [message] = await _merger_messages(db_session, test_project, merger)
+    assert reference in message
+    await _event(db_session, test_project, "code.pr_merged", artifact)
+    await db_session.refresh(run)
+    assert run.current_node == "merged"
+
+
+@pytest.mark.asyncio
+async def test_graph_approval_applies_only_to_the_reviewed_local_commit(db_session, test_project):
+    first, second = _git_repo(Path(test_project.workspace_path))
+    run, artifact, _merger = await _open_review(
+        db_session, test_project, url="https://github.com/org/repo/pull/9",
+        metadata_={"repo_path": "repo", "commit": first},
+    )
+    await _answer(db_session, test_project, run)
+    assert run.current_node == "approved"
+
+    artifact.metadata_ = {**artifact.metadata_, "commit": second}  # the PR now points at another commit
+    await db_session.flush()
+    await _event(db_session, test_project, "code.pr_merged", artifact)
+
+    await db_session.refresh(run)
+    assert run.current_node == "ready_for_review"
+    _, rereview = await _review_sessions(db_session, run)
+    assert f"repo at commit {second}" in await _task_description(db_session, rereview)

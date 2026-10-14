@@ -888,7 +888,7 @@ async def test_engine_completes_graph_on_merge(db_session, test_project, monkeyp
         project_id=test_project.id,
         name="merge-pr",
         artifact_type="pull_request",
-        url="http://example.com",
+        url=f"https://github.com/org/repo/commit/{'a' * 40}",  # only pinned content can be merged
         metadata_={"branch": "feature/merge"},
     )
     linked_task = Task(project_id=test_project.id, title="Ship PR", status="in_progress")
@@ -1463,7 +1463,7 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_run(db
         project_id=test_project.id,
         name="auto-approved-pr",
         artifact_type="pull_request",
-        url="http://example.com/pr/approved",
+        url=f"https://github.com/org/repo/commit/{'b' * 40}",  # only pinned content can be approved
         metadata_={"branch": "feature/approved"},
     )
     task = Task(project_id=test_project.id, title="Review auto approved PR", status="in_progress")
@@ -1483,21 +1483,13 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_run(db
     db_session.add(run)
     await db_session.flush()
 
-    session = Session(
-        agent_id=reviewer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        graph_run_id=run.id,
-        adapter_type="api",
-        status="completed",
-        output="VERDICT: APPROVE",
-        metadata_={},
-        origin="graph",
-    )
-    db_session.add(session)
+    engine = GraphEngineService()
+    # the graph creates the review session, bound to the artifact's pinned identity
+    await engine._execute_on_enter(db_session, proto.definition["nodes"]["ready_for_review"], run)
+    session = (await db_session.execute(select(Session).where(Session.graph_run_id == run.id))).scalar_one()
+    session.status, session.output = "completed", "VERDICT: APPROVE"
     await db_session.flush()
 
-    engine = GraphEngineService()
     completion_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,
@@ -1627,7 +1619,7 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
         project_id=test_project.id,
         name="auto-dedup-pr",
         artifact_type="pull_request",
-        url="http://example.com/pr/dedup",
+        url=f"https://github.com/org/repo/commit/{'b' * 40}",  # only pinned content can be approved
         metadata_={"branch": "feature/dedup"},
     )
     task = Task(project_id=test_project.id, title="Review auto dedup PR", status="in_progress")
@@ -1647,21 +1639,13 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
     db_session.add(run)
     await db_session.flush()
 
-    session = Session(
-        agent_id=reviewer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        graph_run_id=run.id,
-        adapter_type="api",
-        status="completed",
-        output="VERDICT: APPROVE",
-        metadata_={},
-        origin="graph",
-    )
-    db_session.add(session)
+    engine = GraphEngineService()
+    # the graph creates the review session, bound to the artifact's pinned identity
+    await engine._execute_on_enter(db_session, proto.definition["nodes"]["ready_for_review"], run)
+    session = (await db_session.execute(select(Session).where(Session.graph_run_id == run.id))).scalar_one()
+    session.status, session.output = "completed", "VERDICT: APPROVE"
     await db_session.flush()
 
-    engine = GraphEngineService()
     completion_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,

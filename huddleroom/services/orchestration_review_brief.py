@@ -15,6 +15,7 @@ MAX_ARTIFACTS = 20
 MAX_MARKER_REF_CHARS = 100
 MAX_ARTIFACT_ID_CHARS = 100
 MAX_HASH_CHARS = 128
+MAX_REFERENCE_CHARS = 300
 MAX_FINDINGS_NOTES_CHARS = 4000
 MAX_FINDINGS_EVIDENCE_ITEMS = 20
 
@@ -66,12 +67,17 @@ def _field(artifact: Any, name: str) -> Any:
 
 
 def render_artifact(artifact: Any) -> str:
-    """Artifact is a dict or object with `id` and `version` and/or `content_hash` (or `hash`)."""
+    """Artifact is a dict or object with `id` and `version` and/or `content_hash` (or `hash`); an optional
+    `reference` is the pinned content the judgement binds to, else `unpinned` says why nothing is pinned."""
     version = _field(artifact, "version")
     digest = _field(artifact, "content_hash") or _field(artifact, "hash")
     parts = [f"Artifact {_short(_field(artifact, 'id'), MAX_ARTIFACT_ID_CHARS)}"]
     parts.append(f"version {version}" if version is not None else "version unknown")
     parts.append(f"hash {_short(digest, MAX_HASH_CHARS)}" if digest else "hash unknown")
+    if reference := _field(artifact, "reference"):
+        parts.append(f"pinned {_short(reference, MAX_REFERENCE_CHARS)}")
+    elif unpinned := _field(artifact, "unpinned"):
+        parts.append(f"no pinned content ({_short(unpinned, MAX_HASH_CHARS)})")
     return ", ".join(parts)
 
 

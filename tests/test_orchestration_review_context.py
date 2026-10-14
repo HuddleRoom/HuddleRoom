@@ -141,6 +141,7 @@ def test_findings_are_bounded_with_counts():
 
 import json  # noqa: E402
 import uuid  # noqa: E402
+from pathlib import Path  # noqa: E402
 from unittest.mock import AsyncMock, patch  # noqa: E402
 
 import pytest  # noqa: E402
@@ -171,8 +172,10 @@ async def workspace(db_session, test_project, tmp_path):
     await db_session.flush()
 
 
-async def _verifier_for_db_only_report(db, project, verifier_adapter="api", producer_output=None):
-    """A plan item produces a report that lives only in the consumed-report marker, then a verifier is requested."""
+async def _verifier_for_db_only_report(db, project, verifier_adapter="api", producer_output=None, artifact_fields=None):
+    """A plan item produces a report that lives only in the consumed-report marker, then a verifier is requested.
+
+    The producer's artifact is a workspace file (`login.py`) unless `artifact_fields` replaces its location."""
     from tests.test_orchestration_result_correction import _complete
     from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _seed_accepted_plan, _tasks_for_run
 
@@ -194,8 +197,9 @@ async def _verifier_for_db_only_report(db, project, verifier_adapter="api", prod
     work_task = next(task for task in await _tasks_for_run(db, run.id)
                      if service._task_work_function(task) == "implementation")
     gate = await db.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
+    (Path(project.workspace_path) / "login.py").write_text("def login(email, password): ...\n")
     artifact = Artifact(project_id=project.id, name="login.py", artifact_type="file", linked_task_id=work_task.id,
-                        content_hash="sha256:feedface", version=3)
+                        content_hash="sha256:feedface", version=3, **(artifact_fields or {"path": "login.py"}))
     db.add(artifact)
     session = await _complete(db, service, run, work_task, producer_output or json.dumps(PRODUCER_REPORT))
     if producer_output is not None:  # an invalid report: its output-only correction carries the valid one
@@ -865,3 +869,141 @@ async def test_spend_authority_wait_inside_dispatch_spends_no_attempt(db_session
     await service.tick(db, run.id)  # spend authority granted: dispatched although three attempts failed
     reviewer_task = await _reverifier(db, service, run, revision)
     assert reviewer_task is not None and _owner_asks(run, "budget_exhausted") == []
+
+
+# --- a verification approval binds to the content identity it was dispatched with ---
+
+import hashlib  # noqa: E402
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+async def _verification_actions(db, run, gate):
+    return [row for row in await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_verification",
+    ).order_by(OrchestrationAction.created_at)) if row.request.get("gate_id") == str(gate.id)]
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_unchanged_pinned_file_is_accepted_and_the_verifier_sees_its_pinned_reference(db_session, test_project):
+    db = db_session
+    service, run, gate, _work_task, artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    digest = _sha("def login(email, password): ...\n")
+    [action] = await _verification_actions(db, run, gate)
+    assert action.request["artifact_identity"] == [{
+        "artifact_id": str(artifact.id), "state": "present", "identity": digest, "reason": None,
+        "reference": f"login.py (sha256 {digest})",
+    }]
+    assert f"pinned login.py (sha256 {digest})" in verifier_task.description
+
+    await _finish(db, service, run, verifier_task, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_direct_workspace_edit_after_dispatch_drops_the_approval_and_verifies_again(db_session, test_project):
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): return True\n")
+
+    await _finish(db, service, run, verifier_task, ACCEPTED)  # the verifier approved the old content
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Reviewed content changed after its review"
+    first, second = await _verification_actions(db, run, gate)  # a new verification, bound to the new content
+    new_digest = _sha("def login(email, password): return True\n")
+    assert second.request["artifact_identity"][0]["identity"] == new_digest
+    reverifier = await db.get(Task, second.target_id)
+    assert reverifier.id != verifier_task.id and f"sha256 {new_digest}" in reverifier.description
+
+    await service.tick(db, run.id)  # repeated ticks request nothing more
+    assert len(await _verification_actions(db, run, gate)) == 2
+
+    await _finish(db, service, run, reverifier, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_edit_after_approval_before_acceptance_is_not_accepted(db_session, test_project):
+    from tests.test_orchestration_result_correction import _complete
+
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    await _complete(db, service, run, verifier_task, ACCEPTED)  # approval recorded, gate not validated yet
+    (Path(test_project.workspace_path) / "login.py").write_text("tampered\n")
+
+    await service.tick(db, run.id)
+
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Reviewed content changed after its review"
+    assert len(await _verification_actions(db, run, gate)) == 2
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_file_vanishing_after_dispatch_goes_back_to_the_producer_once(db_session, test_project):
+    db = db_session
+    service, run, gate, work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    (Path(test_project.workspace_path) / "login.py").unlink()
+
+    await _finish(db, service, run, verifier_task, ACCEPTED)
+    await service.tick(db, run.id)
+    await service.recover_run(db, run.id, baseline_ready=True)
+
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Reviewed deliverable is missing"
+    [revision] = await _revision_tasks(db, work_task)
+    [entry] = await _revisions(service, db, run, gate)
+    assert entry["cause"] == "deliverable_missing" and entry["revision_task_id"] == str(revision.id)
+    assert len(await _verification_actions(db, run, gate)) == 1  # no verifier for missing content
+    await service.tick(db, run.id)  # repeated ticks: still one revision
+    assert len(await _revision_tasks(db, work_task)) == 1 and len(await _revisions(service, db, run, gate)) == 1
+
+    (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): restored\n")
+    await _finish(db, service, run, revision, json.dumps(PRODUCER_REPORT))
+    reverifier = await _reverifier(db, service, run, revision)
+    await _finish(db, service, run, reverifier, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_changed_content_during_a_revision_re_verification_is_re_verified_for_that_revision(db_session, test_project):
+    db = db_session
+    service, run, gate, work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    await _finish(db, service, run, verifier_task, _rejection("Empty password returns 500."))
+    [revision] = await _revision_tasks(db, work_task)
+    await _finish(db, service, run, revision, json.dumps(PRODUCER_REPORT))
+    first = await _reverifier(db, service, run, revision)
+    (Path(test_project.workspace_path) / "login.py").write_text("changed after the re-verification started\n")
+
+    await _finish(db, service, run, first, ACCEPTED)
+
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "Reviewed content changed after its review"
+    second = await _reverifier(db, service, run, revision)  # still the revision's own re-verification
+    assert second is not None and second.id != first.id
+    await _finish(db, service, run, second, ACCEPTED)
+    await db.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+@pytest.mark.parametrize("metadata", [{}, {"commit": "a" * 40}])
+async def test_unpinned_url_never_accepts_and_never_revises(db_session, test_project, metadata):
+    db = db_session
+    service, run, gate, work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(
+        db, test_project, artifact_fields={"url": "https://github.com/org/repo/pull/7", "metadata_": metadata},
+    )
+    assert "no pinned content (artifact_identity_unpinned)" in verifier_task.description
+
+    await _finish(db, service, run, verifier_task, ACCEPTED)
+    await service.tick(db, run.id)
+
+    await db.refresh(gate)
+    assert gate.status == "open" and gate.failure_reason == "review_input_missing: artifact_identity_unpinned"
+    assert await _revision_tasks(db, work_task) == [] and len(await _verification_actions(db, run, gate)) == 1
+    [ask] = _owner_asks(run, "review_input_missing")
+    assert ask["scope"].startswith(f"gate:{gate.id}:")

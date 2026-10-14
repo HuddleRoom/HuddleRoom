@@ -64,6 +64,9 @@ from huddleroom.schemas.orchestration import (
 )
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
+from huddleroom.services.orchestration_artifact_identity import (
+    CONFIRMED_MISSING, UNINSPECTABLE, bind_artifacts, recheck_binding,
+)
 from huddleroom.services.orchestration_review_brief import (
     STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief,
 )
@@ -188,6 +191,11 @@ REVISABLE_REJECTION_REASONS = frozenset(
     {"Rejected evidence from verification", "Rejected evidence from review"}
 )
 GATE_REVISION_CAP = 2
+# An approval binds to the content identity it was dispatched with; these reasons hold the gate open once it does not.
+IDENTITY_CHANGED_REASON = "Reviewed content changed after its review"
+IDENTITY_MISSING_REASON = "Reviewed deliverable is missing"
+REVIEW_INPUT_MISSING = "review_input_missing"
+IDENTITY_KEY_MARK = ":identity:"
 REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; an answered owner ask re-arms it
 
 
@@ -4780,7 +4788,13 @@ class OrchestrationService:
         failed = sum(1 for req in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id))
         # each automatic revision is re-verified under a fresh key
         revisions = len(await self._gate_revision_entries(db, run_id, gate_id))
-        return (f":attempt:{failed}" if failed else "") + (f":revision:{revisions}" if revisions else "")
+        # so is content that changed after its review (the reserved request counts itself)
+        changed = sum(1 for req in (await db.execute(select(OrchestrationAction.request).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "request_verification",
+            OrchestrationAction.idempotency_key.contains(IDENTITY_KEY_MARK, autoescape=True),
+        ))).scalars().all() if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id))
+        return ((f":attempt:{failed}" if failed else "") + (f":revision:{revisions}" if revisions else "")
+                + (f":changed:{changed}" if changed else ""))
 
     async def _task_has_active_session(self, db: AsyncSession, task_id: uuid.UUID) -> bool:
         result = await db.execute(
@@ -4889,6 +4903,7 @@ class OrchestrationService:
             from huddleroom.services.orchestration_budget_service import OrchestrationBudgetService
 
             brief = await self._verification_brief(db, run, goal, gate, source_task, source_contract)
+            action.request = {**action.request, "artifact_identity": brief.pop("artifact_identity")}
 
             verification_budget = await OrchestrationBudgetService().protected_action_allocation(db, goal, run)
             delegation_action = await self.execute_create_delegation_task_action(
@@ -5013,12 +5028,15 @@ class OrchestrationService:
             artifacts = list(await db.scalars(
                 select(Artifact)
                 .where(
-                    Artifact.project_id == source_task.project_id,
+                    Artifact.project_id == source_task.project_id, Artifact.status != "deleted",
                     or_(Artifact.id.in_(artifact_ids), Artifact.linked_task_id.in_({source_task.id, report_task.id})),
                 )
                 .order_by(Artifact.created_at, Artifact.id)
             ))
-        return build_review_inputs(
+        # the verdict binds to these identities; the verifier is given the same pinned references
+        identities = await bind_artifacts(db, source_task.project_id, artifacts) if source_task is not None else []
+        artifacts = [self._pinned_artifact(artifact, record) for artifact, record in zip(artifacts, identities)]
+        return {**build_review_inputs(
             str(source_contract.get("scope") or ""),
             str(source_contract.get("deliverable") or ""),
             self._string_list(source_contract.get("success_evidence")),
@@ -5027,7 +5045,16 @@ class OrchestrationService:
             marker_ref,
             artifacts,
             failure_reason=gate.failure_reason,
-        )
+        ), "artifact_identity": identities}
+
+    @staticmethod
+    def _pinned_artifact(artifact: Artifact, record: Mapping[str, Any]) -> dict[str, Any]:
+        """An artifact as a reviewer brief shows it: stored version/hash plus the pinned reference it binds to."""
+        return {
+            "id": artifact.id, "version": artifact.version, "content_hash": artifact.content_hash,
+            "reference": record.get("reference"),
+            "unpinned": None if record.get("reference") else (record.get("reason") or record.get("state")),
+        }
 
     async def execute_pause_run_action(
         self,
@@ -9993,6 +10020,8 @@ class OrchestrationService:
                 "source_task_id": str(source_task.id),
                 "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
                 **({"normalized": findings["normalized"]} if findings.get("normalized") else {}),
+                **({"artifact_identity": identity}
+                   if (identity := self._json_object_or_empty(action.request).get("artifact_identity")) else {}),
                 **({"findings": bound_findings(findings.get("evidence") or [], findings.get("notes"), "Verification")}
                    if verdict == "rejected" else {}),
                 **extra,
@@ -10020,6 +10049,7 @@ class OrchestrationService:
             if (
                 binding is None
                 or self._verification_report(session.output)[0] != "accepted"
+                or await self._identity_failure(db, gate, item) is not None
             ):
                 continue
             action, source_task = binding
@@ -10085,6 +10115,9 @@ class OrchestrationService:
         )
         if verdict == "rejected":
             metadata["findings"] = bound_findings([], review_outcome.get("raw_output") or session.output, "Review")
+        graph_run = await db.get(GraphRun, session.graph_run_id) if session.graph_run_id else None
+        if verdict == "candidate" and isinstance((graph_run.context or {}).get("review_identity") if graph_run else None, dict):
+            metadata["artifact_identity"] = [graph_run.context["review_identity"]]
         return await self._record_evidence_once(
             db,
             run_id=run.id,
@@ -10350,6 +10383,8 @@ class OrchestrationService:
             created += await self._recover_failed_gates(db, goal, run, baseline_ready=baseline_ready)
         if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
             created += await self._reverify_gate_revisions(db, goal, run)
+        if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
+            created += await self._rebind_reviewed_identities(db, goal, run)
         await db.flush()
         return created
 
@@ -10372,6 +10407,106 @@ class OrchestrationService:
             or_(OrchestrationAction.idempotency_key == base,
                 OrchestrationAction.idempotency_key.startswith(base + ":", autoescape=True)),
         ).order_by(OrchestrationAction.created_at, OrchestrationAction.id)))
+
+    async def _identity_failure(
+        self, db: AsyncSession, gate: OrchestrationGate, item: OrchestrationEvidence,
+    ) -> tuple[str, bool] | None:
+        """Gate failure (reason, final) when an approval's bound content identity no longer holds; None while it
+        does or when the evidence binds no identity."""
+        recorded = self._json_object_or_empty(item.evidence_metadata).get("artifact_identity")
+        if not recorded:
+            return None
+        failure = await recheck_binding(db, await self._project_id_for_run(db, gate.run_id), recorded)
+        if failure is None:
+            return None
+        state, current = failure
+        if state == UNINSPECTABLE:
+            return f"{REVIEW_INPUT_MISSING}: {current.get('reason')}", False
+        return (IDENTITY_MISSING_REASON if state == CONFIRMED_MISSING else IDENTITY_CHANGED_REASON), False
+
+    async def _rebind_reviewed_identities(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
+        """Route each open gate whose approval was dropped because its content identity no longer holds: changed
+        content is verified again (once per dropped approval), a vanished deliverable goes back to its producer,
+        and content HuddleRoom cannot identify blocks the gate and asks the owner (no revision, no approval)."""
+        if await self._result_correction_stale(db, run) is not None:
+            return 0
+        created = 0
+        gates = await db.scalars(select(OrchestrationGate).where(
+            OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
+        ).order_by(OrchestrationGate.created_at, OrchestrationGate.id))
+        for gate in list(gates):
+            reason = gate.failure_reason or ""
+            if reason not in {IDENTITY_CHANGED_REASON, IDENTITY_MISSING_REASON} and not reason.startswith(
+                f"{REVIEW_INPUT_MISSING}:"
+            ):
+                continue
+            dropped = None
+            for item in reversed(self._latest_evidence_by_source(await self._evidence_for_gate(db, gate))):
+                recorded = self._json_object_or_empty(item.evidence_metadata).get("artifact_identity")
+                if item.verdict in {"candidate", "accepted"} and recorded and (
+                    failure := await recheck_binding(db, goal.project_id, recorded)
+                ):
+                    dropped = (item, *failure)
+                    break
+            if dropped is None:
+                continue
+            item, state, current = dropped
+            artifact_id = current.get("artifact_id")
+            if state == CONFIRMED_MISSING:
+                created += await self._request_gate_revision(
+                    db, goal, run, gate, "deliverable_missing",
+                    reason=f"Reviewed artifact {artifact_id} is missing from the workspace.",
+                    source_id=f"identity:{item.id}:{artifact_id}",
+                )
+            elif state == UNINSPECTABLE:
+                await self._escalate_owner(
+                    db, goal, run, REVIEW_INPUT_MISSING, f"gate:{gate.id}:artifact:{artifact_id}",
+                    [f"approval {item.id} cannot apply: {current.get('reason')}"],
+                    f"HuddleRoom cannot identify the reviewed content of artifact {artifact_id} "
+                    f"({current.get('reason')}). Pin it to an immutable revision (a commit URL, or repo_path and "
+                    "commit metadata) or restore read access; the gate stays open until then.",
+                )
+            else:
+                created += await self._reverify_changed_content(db, goal, run, gate, item)
+        return created
+
+    async def _reverify_changed_content(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, gate: OrchestrationGate,
+        item: OrchestrationEvidence,
+    ) -> int:
+        """One new verification for an approval whose content changed, bound to the current content. A dropped
+        revision re-verification stays in its revision's namespace, so only it can clear that revision's rejection."""
+        from huddleroom.services.orchestration_budget_service import BudgetMeasurementError
+
+        metadata = self._json_object_or_empty(item.evidence_metadata)
+        source = await db.get(OrchestrationAction, self._event_uuid(metadata.get("verification_action_id")))
+        if source is not None:
+            root = source.idempotency_key.split(IDENTITY_KEY_MARK, 1)[0]
+            work_function = self._json_object_or_empty(source.request).get("work_function") or "validation"
+        else:  # a graph review approval: an independent review of the current content
+            root, work_function = f"run:{run.id}:kind:request_verification:gate:{gate.id}", "review"
+        key = f"{root}{IDENTITY_KEY_MARK}{item.id}"
+        attempts = list(await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+            or_(OrchestrationAction.idempotency_key == key,
+                OrchestrationAction.idempotency_key.startswith(f"{key}:attempt:", autoescape=True)),
+        )))
+        if any(action.status != "failed" for action in attempts):
+            return 0
+        if len(attempts) >= REVERIFICATION_ATTEMPTS:
+            await self._escalate_owner(
+                db, goal, run, "capability_unavailable", f"gate:{gate.id}:reverify:{item.id}",
+                [f"verification failed: {action.error}" for action in attempts],
+                f"Cannot verify gate {gate.id} again after its reviewed content changed.",
+            )
+            return 0
+        try:
+            await self.execute_request_verification_action(db, run.id, {
+                "action_type": "request_verification", "gate_id": str(gate.id), "work_function": work_function,
+            }, key + (f":attempt:{len(attempts)}" if attempts else ""))
+        except (HTTPException, BudgetMeasurementError):
+            return 0  # the failed action is the record; a later tick retries under the next attempt key
+        return 1
 
     async def _reverify_gate_revisions(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Each finished revision with a valid report gets one independent re-verification of its gate (only the
@@ -11856,15 +11991,20 @@ class OrchestrationService:
             configured_min_count if isinstance(configured_min_count, int) and configured_min_count > 0 else None
         )
         min_count = max(min_count or len(required_source_types) or 1, len(required_source_types))
-        selected, missing = self._select_required_evidence(
-            [item for item in latest_evidence if item.verdict in {"candidate", "accepted"}],
-            required_source_types,
-            min_count,
-        )
+        # An approval applies only while the content it judged is unchanged; a dropped approval is no evidence.
+        candidates, identity_failure = [], None
+        for item in latest_evidence:
+            if item.verdict not in {"candidate", "accepted"}:
+                continue
+            if (failure := await self._identity_failure(db, gate, item)) is None:
+                candidates.append(item)
+            else:
+                identity_failure = identity_failure or failure
+        selected, missing = self._select_required_evidence(candidates, required_source_types, min_count)
         if missing:
-            return selected, (f"Missing evidence: {', '.join(missing)}", False)
+            return selected, identity_failure or (f"Missing evidence: {', '.join(missing)}", False)
         if len(selected) < min_count:
-            return selected, ("Missing evidence", False)
+            return selected, identity_failure or ("Missing evidence", False)
         if gate.gate_type == ADHOC_GATE_TYPE and (failure := await self._adhoc_report_failure(db, gate)):
             return selected, failure
 
@@ -11877,7 +12017,7 @@ class OrchestrationService:
             )
             and not await self._has_bound_outcome_verification_evidence(db, gate)
         ):
-            return selected, ("Independent verification evidence is missing", False)
+            return selected, identity_failure or ("Independent verification evidence is missing", False)
 
         if gate.gate_type == FINAL_SUMMARY_GATE_TYPE:
             summary_failure = await self._final_summary_evidence_failure(db, gate, selected)

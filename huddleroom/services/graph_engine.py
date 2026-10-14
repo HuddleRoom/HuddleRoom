@@ -371,6 +371,8 @@ class GraphEngineService:
             resolved_guard = await self._resolve_guard(db, edge.get("guard") or {}, run)
             if not self._guard_evaluator.evaluate(resolved_guard, event.payload):
                 continue
+            if await self._approval_no_longer_holds(db, run, graph, edge, event):
+                break
             await self._fire_edge(
                 db,
                 run,
@@ -717,6 +719,8 @@ class GraphEngineService:
         run = run_result.scalar_one_or_none()
         if run is None or not self._session_matches_assigned_review_actor(run, session):
             return None
+        if event_type == "review.approved" and await self._review_identity_blocks(db, run, session):
+            return None
 
         payload = {
             "artifact_id": str(artifact_id),
@@ -749,6 +753,66 @@ class GraphEngineService:
         if not created:
             return None
         return emitted
+
+    async def _review_identity_failure(self, db: AsyncSession, run: GraphRun) -> tuple[str, dict] | None:
+        from huddleroom.services.orchestration_artifact_identity import UNAVAILABLE, UNINSPECTABLE, recheck_binding
+
+        recorded = (run.context or {}).get("review_identity")
+        if not isinstance(recorded, dict):  # nothing was bound when the review was dispatched: fail closed
+            return UNINSPECTABLE, {"artifact_id": str(run.artifact_id), "reason": UNAVAILABLE}
+        return await recheck_binding(db, run.project_id, [recorded])
+
+    def _block_review_identity(self, run: GraphRun, state: str, current: dict, session_id: str | None) -> None:
+        run.context = {**(run.context or {}), "review_identity_blocked": {
+            "reason": current.get("reason") or state, "artifact_id": current.get("artifact_id"),
+            "session_id": session_id,
+        }}
+
+    async def _review_identity_blocks(self, db: AsyncSession, run: GraphRun, session: Session) -> bool:
+        """An approval applies only to the content the reviewer was given. Changed content is reviewed again;
+        missing or unpinned content keeps the run waiting with the reason in its context."""
+        from huddleroom.services.orchestration_artifact_identity import CHANGED
+
+        failure = await self._review_identity_failure(db, run)
+        if failure is None:
+            return False
+        blocked = (run.context or {}).get("review_identity_blocked") or {}
+        if blocked.get("session_id") == str(session.id):
+            return True  # this approval was already handled
+        state, current = failure
+        self._block_review_identity(run, state, current, str(session.id))
+        if state == CHANGED:
+            graph = await db.get(Graph, run.graph_id)
+            node_def = ((graph.definition or {}).get("nodes") or {}).get(run.current_node, {}) if graph else {}
+            await self._execute_on_enter(db, node_def, run)  # a new review bound to the current content
+        await db.flush()
+        return True
+
+    async def _approval_no_longer_holds(
+        self, db: AsyncSession, run: GraphRun, graph: Graph, edge: dict, event: BusEvent,
+    ) -> bool:
+        """Before a run leaves `approved` (other than back to review), recompute the reviewed identity: changed
+        content returns the run to review, content that cannot be identified keeps it waiting."""
+        from huddleroom.services.orchestration_artifact_identity import CHANGED
+
+        nodes = (graph.definition or {}).get("nodes") or {}
+        if (run.current_node != "approved" or edge.get("to") == "ready_for_review" or "ready_for_review" not in nodes
+                or not isinstance((run.context or {}).get("review_identity"), dict)):
+            return False
+        failure = await self._review_identity_failure(db, run)
+        if failure is None:
+            return False
+        state, current = failure
+        self._block_review_identity(run, state, current, None)
+        if state == CHANGED:
+            await self._fire_edge(
+                db, run, graph, from_node=run.current_node, to_node="ready_for_review",
+                edge_name="reviewed_content_changed", actions=[], trigger_event_id=event.id,
+                trigger_reason="review_identity_changed",
+            )
+        else:
+            await db.flush()
+        return True
 
     def _review_graph_event_type(self, verdict: str | None) -> str | None:
         if verdict == "approved":
