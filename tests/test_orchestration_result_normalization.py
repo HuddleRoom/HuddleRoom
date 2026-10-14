@@ -212,6 +212,11 @@ def test_validate_work_report_rejects_ambiguous_output():
 
 def test_verification_report_verdict_and_ambiguity():
     verdict = json.dumps({"status": "done", "verdict": "accepted", "evidence": ["e"]})
-    assert OrchestrationService._verification_report("```json\n" + verdict + "\n```") == ("accepted", "fence")
-    assert OrchestrationService._verification_report(verdict) == ("accepted", None)
-    assert OrchestrationService._verification_report(verdict + verdict) == (None, None)
+    findings = {"evidence": ["e"], "notes": None}
+    assert OrchestrationService._verification_report("```json\n" + verdict + "\n```") == (
+        "accepted", [], {**findings, "normalized": "fence"},
+    )
+    assert OrchestrationService._verification_report(verdict) == ("accepted", [], findings)
+    assert OrchestrationService._verification_report(verdict + verdict) == (
+        None, ["result contains more than one JSON object"], None,
+    )

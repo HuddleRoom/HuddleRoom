@@ -617,7 +617,7 @@ async def test_invalid_final_summary_creates_trigger_not_replacement_task(
 ):
     from huddleroom.services.event_bus import emit_event_once
     from tests.conftest import heal_baseline_drift_for_test
-    from tests.test_orchestration_final_summary_request import _request_summary
+    from tests.test_orchestration_final_summary_request import _repeat_failure_in_correction, _request_summary
 
     # Same harness as tests/test_orchestration_final_summary_request.py (manual start, runnable workspace).
     async def _no_autostart(self, db, goal, run):
@@ -642,7 +642,9 @@ async def test_invalid_final_summary_creates_trigger_not_replacement_task(
                           dedup_key=f"task12-invalid-summary:{invalid_session.id}")
     tasks_before = await db_session.scalar(select(func.count(Task.id)))
 
-    await service.tick(db_session, run.id)
+    await service.tick(db_session, run.id)  # an output-only correction comes first
+    tasks_before += 1
+    invalid_session, _ = await _repeat_failure_in_correction(db_session, service, run, task, "not json")
     await service.tick(db_session, run.id)
 
     failed_evidence = (await db_session.scalars(select(OrchestrationEvidence).where(
@@ -803,7 +805,7 @@ async def test_invalid_final_summary_lineage_approves_gate_linked_replacement_an
     from huddleroom.services.event_bus import emit_event_once
     from tests.conftest import heal_baseline_drift_for_test
     from tests.test_orchestration_final_summary_request import (
-        _complete_goal_definition, _request_summary, _valid_summary_output,
+        _complete_goal_definition, _repeat_failure_in_correction, _request_summary, _valid_summary_output,
     )
     from tests.test_orchestration_recovery_execution import Executors
 
@@ -841,11 +843,13 @@ async def test_invalid_final_summary_lineage_approves_gate_linked_replacement_an
     await db_session.flush()
     await emit_event_once(db_session, test_project.id, "session.completed",
                           {"session_id": str(invalid.id), "task_id": str(task.id)}, dedup_key=f"c1:{invalid.id}")
+    await service.tick(db_session, run.id)  # an output-only correction comes first
 
     if not fit_at_seal:  # N2: no strong summarization fit while the trigger is sealed
         writer.is_active = False
         await db_session.flush()
-    await service.tick(db_session, run.id)  # gate trigger -> diagnosis -> pending fix card
+    # the correction repeats the failure -> gate trigger -> diagnosis -> pending fix card
+    await _repeat_failure_in_correction(db_session, service, run, task, "not json")
     (proposal,) = await _actions(db_session, run.id, "recovery_proposal")
     assert proposal.request["retry"]["target"]["kind"] == "action"
     (marker,) = await _actions(db_session, run.id, "failure_observed")
@@ -935,7 +939,9 @@ async def test_final_summary_retry_with_unavailable_manifest_fails_into_its_line
     from huddleroom.schemas.orchestration_recovery import ProposalDraftV1
     from huddleroom.services.event_bus import emit_event_once
     from tests.conftest import heal_baseline_drift_for_test
-    from tests.test_orchestration_final_summary_request import _complete_goal_definition, _request_summary
+    from tests.test_orchestration_final_summary_request import (
+        _complete_goal_definition, _repeat_failure_in_correction, _request_summary,
+    )
     from tests.test_orchestration_recovery_execution import Executors
 
     async def _no_autostart(self, db, goal, run):
@@ -978,7 +984,8 @@ async def test_final_summary_retry_with_unavailable_manifest_fails_into_its_line
     await db_session.flush()
     await emit_event_once(db_session, test_project.id, "session.completed",
                           {"session_id": str(invalid.id), "task_id": str(task.id)}, dedup_key=f"n3:{invalid.id}")
-    await service.tick(db_session, run.id)
+    await service.tick(db_session, run.id)  # an output-only correction comes first
+    await _repeat_failure_in_correction(db_session, service, run, task, "not json")
     (proposal,) = await _actions(db_session, run.id, "recovery_proposal")
     card = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.related_action_id == proposal.id))).one()

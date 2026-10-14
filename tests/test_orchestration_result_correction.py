@@ -822,3 +822,200 @@ async def test_plan_fence_requires_the_ledger_planning_version(db_session, test_
     with pytest.raises(PlanIngestionError, match="does not belong") as exc:
         await ingest(db_session, goal, run, task, fixed.id, version, _plan())
     assert not exc.value.stale
+
+
+ACCEPTED_VERDICT = json.dumps({"status": "done", "verdict": "accepted", "evidence": ["pytest -q passed: 12 tests."]})
+
+
+def test_verification_report_returns_exact_errors_and_findings():
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    report = OrchestrationService._verification_report
+    assert report(ACCEPTED_VERDICT) == ("accepted", [], {"evidence": ["pytest -q passed: 12 tests."], "notes": None})
+    verdict, errors, findings = report("```json\n" + json.dumps(
+        {"status": "done", "verdict": "rejected", "evidence": [], "notes": "Tests fail.", "extra": 1}
+    ) + "\n```")
+    assert (verdict, errors) == ("rejected", []) and findings == {"evidence": [], "notes": "Tests fail.", "normalized": "fence"}
+    assert report("Looks good to me.") == (None, ["result contains no JSON object"], None)
+    assert report(json.dumps({"status": "blocked", "evidence": "x"})) == (None, [
+        "status must be \"done\" (got 'blocked')",
+        "verdict must be \"accepted\" or \"rejected\" (got None)",
+        "evidence must be a list of strings",
+    ], None)
+    assert report(json.dumps({"status": "done", "verdict": "accepted", "evidence": [" "]}))[1] == [
+        "evidence must contain at least one non-empty item when the verdict is accepted",
+    ]
+
+
+async def _verifier_setup(db, project):
+    from tests.test_orchestration_runtime_e2e import _agent as _runtime_agent
+    from tests.test_orchestration_runtime_e2e import _complete_task_session, _seed_accepted_plan, _tasks_for_run
+
+    producer, verifier = _runtime_agent("verdict-producer", ["implementation"]), _runtime_agent(
+        "verdict-verifier", ["validation"],
+    )
+    producer.role, verifier.role = "developer", "validator"
+    db.add_all([producer, verifier])
+    await db.flush()
+    service, _goal, run = await _authorized_run(db, project)
+    await _seed_accepted_plan(db, project, service, run, producer, plan_items=[{
+        "id": "verdict-item", "work_function": "implementation",
+        "scope": "Deliver work.", "deliverable": "Delivered work.", "agent_id": str(producer.id),
+    }])
+    await service.tick(db, run.id)
+    work_task = next(task for task in await _tasks_for_run(db, run.id)
+                     if service._task_work_function(task) == "implementation")
+    gate = await db.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
+    await _complete_task_session(db, project.id, work_task, producer.id, json.dumps(VALID))
+    action = await service.execute_request_verification_action(
+        db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
+        f"run:{run.id}:kind:verdict-correction",
+    )
+    return service, run, gate, await db.get(Task, action.target_id)
+
+
+async def _verification_evidence(db, gate):
+    from huddleroom.models.orchestration import OrchestrationEvidence
+
+    return list(await db.scalars(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == gate.id, OrchestrationEvidence.source_type == "verification",
+    )))
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_verifier_prompt_states_the_verdict_contract(db_session, test_project):
+    _service, _run, _gate, verifier_task = await _verifier_setup(db_session, test_project)
+    assert verifier_task.metadata_["orchestration_contract"]["expected_result"] == "verification_verdict"
+    assert '"status": "done"' in verifier_task.description and '"verdict": "accepted|rejected"' in verifier_task.description
+    assert "notes is optional" in verifier_task.description and "extra keys are tolerated" in verifier_task.description
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_fenced_verdict_is_normalized_and_counted_without_correction(db_session, test_project):
+    service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
+    session = await _complete(db_session, service, run, verifier_task, "```json\n" + ACCEPTED_VERDICT + "\n```")
+    [evidence] = await _verification_evidence(db_session, gate)
+    assert evidence.source_id == session.id and evidence.evidence_metadata["normalized"] == "fence"
+    assert await _corrections(db_session, verifier_task) == []
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_prose_verdict_is_corrected_and_the_corrected_verdict_is_recorded(db_session, test_project):
+    service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
+    prose = "I checked everything and it looks good to me."
+    await _complete(db_session, service, run, verifier_task, prose)
+
+    assert await _verification_evidence(db_session, gate) == []  # never counted as acceptance or rejection
+    [correction] = await _corrections(db_session, verifier_task)
+    assert correction.assigned_to == verifier_task.assigned_to
+    assert correction.metadata_["orchestration_contract"]["expected_result"] == "verification_verdict"
+    assert prose in correction.description and "- result contains no JSON object" in correction.description
+    assert '"verdict": "accepted|rejected"' in correction.description
+    ledger = await _ledger(service, db_session, run, verifier_task)
+    assert ledger["kind"] == "verification_verdict" and ledger["status"] == "correcting"
+    await service.tick(db_session, run.id)
+    await db_session.refresh(gate)
+    assert gate.status != "accepted"
+
+    fixed = await _complete(db_session, service, run, correction, ACCEPTED_VERDICT)
+
+    [evidence] = await _verification_evidence(db_session, gate)
+    assert evidence.source_id == fixed.id and evidence.verdict == "candidate"
+    assert evidence.evidence_metadata["result_correction_parent_task_id"] == str(verifier_task.id)
+    assert (await _ledger(service, db_session, run, verifier_task))["status"] == "corrected"
+    await service.tick(db_session, run.id)
+    await db_session.refresh(gate)
+    assert gate.status == "accepted"
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_repeated_identical_verdict_failure_stops_without_counting(db_session, test_project):
+    service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
+    missing_verdict = json.dumps({"status": "done", "evidence": ["Looked at it."]})
+    await _complete(db_session, service, run, verifier_task, missing_verdict)
+    [correction] = await _corrections(db_session, verifier_task)
+
+    await _complete(db_session, service, run, correction, missing_verdict)
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, verifier_task)
+    assert ledger["status"] == "exhausted" and len(ledger["attempts"]) == 2
+    assert len(_escalations(run, "result_correction_exhausted")) == 1
+    assert await _verification_evidence(db_session, gate) == []
+    assert len(await _corrections(db_session, verifier_task)) == 1
+    await db_session.refresh(gate)
+    assert gate.status != "accepted"
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_corrected_verdict_from_the_producer_is_not_recorded(db_session, test_project):
+    service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
+    await _complete(db_session, service, run, verifier_task, "Looks fine.")
+    [correction] = await _corrections(db_session, verifier_task)
+    producer_id = uuid.UUID(verifier_task.metadata_["orchestration"]["producer_agent_id"])
+
+    await _complete(db_session, service, run, correction, ACCEPTED_VERDICT, agent_id=producer_id)
+
+    assert await _verification_evidence(db_session, gate) == []
+    assert (await _ledger(service, db_session, run, verifier_task))["status"] == "rejected"
+
+
+async def _summary_setup(db, project):
+    from tests.conftest import heal_baseline_drift_for_test
+    from tests.test_orchestration_final_summary_request import _request_summary
+
+    service, goal, run, _writer, task, gate = await _request_summary(db, project)
+    goal.weight = "trivial"
+    await heal_baseline_drift_for_test(db, goal, run)
+    return service, goal, run, task, gate
+
+
+async def _summary_triggers(db, run):
+    return [action for action in await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "recovery_trigger",
+    )) if action.request.get("blocker_code") == "final_summary_invalid"]
+
+
+@pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
+async def test_invalid_final_summary_is_corrected_and_the_corrected_summary_completes_the_run(db_session, test_project):
+    from tests.test_orchestration_final_summary_request import _valid_summary_output
+
+    service, goal, run, task, gate = await _summary_setup(db_session, test_project)
+    await _complete(db_session, service, run, task, "Everything shipped; see the gates.")
+    await service.tick(db_session, run.id)
+
+    [correction] = await _corrections(db_session, task)
+    assert "- Final summary output must be valid JSON" in correction.description
+    assert all(f'"{key}"' in correction.description for key in ("summary", "criteria", "unresolved_gaps"))
+    assert correction.metadata_["orchestration"]["gate_id"] == str(gate.id)
+    assert await _summary_triggers(db_session, run) == []
+
+    await _complete(db_session, service, run, correction, await _valid_summary_output(db_session, goal, run))
+    result = await service.tick(db_session, run.id)
+
+    await db_session.refresh(gate)
+    assert gate.status == "accepted" and result["run_completed"] is True
+    assert (await _ledger(service, db_session, run, task))["status"] == "corrected"
+    assert await _summary_triggers(db_session, run) == []
+
+
+@pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
+async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exhausted(db_session, test_project):
+    service, _goal, run, task, gate = await _summary_setup(db_session, test_project)
+    await _complete(db_session, service, run, task, "not json")
+    await service.tick(db_session, run.id)
+    [correction] = await _corrections(db_session, task)
+    await service.tick(db_session, run.id)
+    assert await _summary_triggers(db_session, run) == []
+
+    await _complete(db_session, service, run, correction, "not json")
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "exhausted" and len(_escalations(run, "result_correction_exhausted")) == 1
+    assert len(await _summary_triggers(db_session, run)) == 1
+    await service.tick(db_session, run.id)
+    assert len(await _summary_triggers(db_session, run)) == 1
+    assert len(await _corrections(db_session, task)) == 1
+    await db_session.refresh(gate)
+    assert gate.status == "failed"

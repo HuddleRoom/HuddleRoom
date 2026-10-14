@@ -121,8 +121,8 @@ from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_decision_validator import SELF_GRANT_ERROR, independent_work_rejection
 from huddleroom.services.orchestration_result_contract import (
-    CORRECTABLE_KINDS, PLANNING_ENVELOPE, WORK_REPORT, build_correction_brief, expected_result_kind,
-    failure_fingerprint, next_step, normalize_result_output, stable_hash,
+    CORRECTABLE_KINDS, FINAL_SUMMARY, PLANNING_ENVELOPE, VERIFICATION_VERDICT, WORK_REPORT, build_correction_brief,
+    expected_result_kind, failure_fingerprint, next_step, normalize_result_output, stable_hash,
 )
 from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
@@ -186,6 +186,11 @@ TASK_SCOPED_AUTH_DENIALS = frozenset({
     "live_send_not_granted", "workspace_mutation_exceeds_policy",
 })
 FINAL_SUMMARY_WORK_FUNCTION = "summarization"
+# Final-summary failures a re-emitted summary can fix (format, schema, keys, citations); the rest are not output errors.
+FINAL_SUMMARY_OUTPUT_ERRORS = (
+    "Final summary output must", "Final summary text", "Final summary criteri", "Final summary evidence",
+    "Final summary unresolved_gaps",
+)
 FINAL_SUMMARY_REQUESTED_EVENT_TYPE = "orchestration.final_summary_requested"
 # Run work a plan can never adopt (and need not disposition): coordination, not discovery.
 NON_ADOPTABLE_WORK_FUNCTIONS = frozenset(
@@ -4891,10 +4896,10 @@ class OrchestrationService:
                     ],
                     "budget": verification_budget,
                     "report_schema": {
-                        "status": "done|blocked|failed",
+                        "status": "done",
                         "verdict": "accepted|rejected",
-                        "evidence": "list[str]",
-                        "notes": "str",
+                        "evidence": "list[str] (at least one item when accepted)",
+                        "notes": "str (optional)",
                     },
                     "parent_task_id": str(source_task.id) if source_task is not None else None,
                     "orchestrator_context": verification_context,
@@ -7447,6 +7452,9 @@ class OrchestrationService:
         field_instruction = (
             "include required fields and omit unused optional/default fields; no extra keys (values show types). "
             if kind == PLANNING_ENVELOPE
+            else 'status must be "done", verdict accepted or rejected, evidence a list of strings with at least '
+            "one item when accepted; notes is optional and extra keys are tolerated (values show types). "
+            if kind == VERIFICATION_VERDICT
             else "no missing or extra keys (values show types). "
         )
         output = (
@@ -8131,11 +8139,22 @@ class OrchestrationService:
         """Start a fresh bounded cycle; any in-flight correction is unlinked and never consumed.
 
         The old cycle's open owner asks are cancelled and its subject blockers dropped, so nothing stale waits."""
+        await self._close_result_correction_asks(db, run, parent.id, ledger, "superseded by a new result correction cycle")
+        ledger.update(
+            cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
+            correction_task_id=None, correction_session_id=None, revision_fallback=False,
+            previous_attempts=[*ledger.get("previous_attempts", []), *ledger.get("attempts", [])], attempts=[],
+        )
+
+    async def _close_result_correction_asks(
+        self, db: AsyncSession, run: OrchestrationRun, parent_id: uuid.UUID, ledger: Mapping[str, Any], reason: str,
+    ) -> None:
+        """Cancel the current cycle's pending owner asks and drop its subject blockers."""
         from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 
         cycle = int(ledger.get("cycle", 1))
         suffix = f":cycle:{cycle}" if cycle > 1 else ""
-        old_scopes = {f"task:{parent.id}:result_correction{suffix}", f"task:{parent.id}:correction_input_unavailable{suffix}"}
+        old_scopes = {f"task:{parent_id}:result_correction{suffix}", f"task:{parent_id}:correction_input_unavailable{suffix}"}
         stale = [item for item in run.active_blockers
                  if isinstance(item, Mapping) and item.get("kind") == "owner_escalation" and item.get("scope") in old_scopes]
         run.active_blockers = [item for item in run.active_blockers if item not in stale]
@@ -8143,14 +8162,24 @@ class OrchestrationService:
         for decision_id in decision_ids:
             decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(str(decision_id)))
             if decision is not None and decision.status == "pending":
-                await OrchestrationAuthorityDecisionService().cancel_decision(
-                    db, decision, reason="superseded by a new result correction cycle",
-                )
-        ledger.update(
-            cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
-            correction_task_id=None, correction_session_id=None, revision_fallback=False,
-            previous_attempts=[*ledger.get("previous_attempts", []), *ledger.get("attempts", [])], attempts=[],
-        )
+                await OrchestrationAuthorityDecisionService().cancel_decision(db, decision, reason=reason)
+
+    async def _settle_final_summary_corrections(self, db: AsyncSession, run: OrchestrationRun) -> None:
+        """An accepted final summary (for example an approved replacement) settles stopped summary corrections."""
+        markers = await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+            OrchestrationAction.action_type == "report_consumed",
+            OrchestrationAction.request["result_correction"]["kind"].as_string() == FINAL_SUMMARY,
+            OrchestrationAction.request["result_correction"]["status"].as_string().in_(
+                ("pending", "correcting", "exhausted", "unavailable")
+            ),
+        ))
+        for marker in markers:
+            ledger = self._json_object_or_empty(marker.request).get("result_correction")
+            await self._close_result_correction_asks(
+                db, run, marker.target_id, ledger, "the final summary was accepted",
+            )
+            self._set_result_correction_status(marker, "superseded")
 
     async def _sweep_result_corrections(self, db: AsyncSession, run: OrchestrationRun) -> None:
         """Re-enter open correction ledgers each tick: funding, resume, contract change, owner answer, failed task."""
@@ -8264,6 +8293,12 @@ class OrchestrationService:
         if "result_correction_parent_task_id" not in correction_metadata:
             correction.metadata_ = {**correction_metadata, "result_correction_parent_task_id": str(parent.id)}
             correction.description = f"{correction.description or ''}\n\n{brief}"
+            summary_gate_id = task_gate_id(parent, run.id) if kind == FINAL_SUMMARY else None
+            summary_gate = await db.get(OrchestrationGate, summary_gate_id) if summary_gate_id else None
+            if summary_gate is not None:  # the corrected summary lands on the original's final-summary gate
+                self._set_final_summary_task_metadata(correction, summary_gate, self._json_object_or_empty(
+                    self._json_object_or_empty(parent.metadata_).get("orchestration_final_summary")
+                ))
         ledger.update(
             status="correcting", correction_task_id=str(correction.id), correction_session_id=None,
             correction_task_ids=[*dispatched, str(correction.id)] if str(correction.id) not in dispatched else dispatched,
@@ -9366,8 +9401,22 @@ class OrchestrationService:
                 return
             await self._land_plan_output(db, run, parent, marker, task, session.id, session.output)
             return
+        if ledger.get("kind") == VERIFICATION_VERDICT:
+            if ledger.get("status") == "correcting":
+                await self._land_verification_correction(db, run, task, session, marker, event_id)
+            return
+        if ledger.get("kind") == FINAL_SUMMARY:
+            if ledger.get("status") == "correcting" and session is not None:
+                gate_ref = await self._task_gate_for_run(db, run.id, task)
+                evidence = [
+                    item for item in await self._evidence_for_gate(db, gate_ref[0])
+                    if item.source_type == "session" and item.source_id == session.id
+                ] if gate_ref else []
+                if evidence and (await self._validated_final_summary_payload(db, gate_ref[0], evidence))[1] is None:
+                    self._set_result_correction_status(marker, "corrected")
+            return  # an invalid corrected summary fails the gate; the failed-gate path records the next attempt
         if ledger.get("kind") != WORK_REPORT:
-            return  # other kinds land through their own consumers
+            return
         _, report = await self.consume_canonical_report(db, run, task, session_id, event_id)
         if report is not None:
             # The corrected report becomes the original's effective report; the failed candidate stays recorded.
@@ -9383,6 +9432,45 @@ class OrchestrationService:
                 "effective_report": {"task_id": str(task.id), "session_id": str(session_id) if session_id else None},
             }
             self._set_result_correction_status(marker, "corrected")
+
+    async def _land_verification_correction(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun,
+        task: Task,
+        session: Session | None,
+        marker: OrchestrationAction,
+        event_id: uuid.UUID | None,
+    ) -> None:
+        """Record a corrected verdict for the original verifier's gate; an invalid one is the next attempt."""
+        parent_id = self._event_uuid(self._json_object_or_empty(task.metadata_).get("result_correction_parent_task_id"))
+        parent = await db.get(Task, parent_id) if parent_id else None
+        gate_ref = await self._task_gate_for_run(db, run.id, parent) if parent is not None else None
+        binding = (
+            await self._bound_outcome_verification_binding(db, run, gate_ref[0], task, session)
+            if gate_ref is not None and session is not None else None
+        )
+        if binding is None:  # independence and the verifier binding still hold for a corrected verdict
+            self._set_result_correction_status(marker, "rejected", reason="the correction is not a bound verification")
+            return
+        verdict, errors, findings = self._verification_report(session.output)
+        if verdict is None:
+            await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
+            return
+        event = await db.scalar(select(EventLog).where(EventLog.id == event_id)) if event_id else None
+        if event is None or event.event_type != "session.completed":
+            event = await db.scalar(select(EventLog).where(
+                EventLog.event_type == "session.completed",
+                EventLog.payload["session_id"].as_string() == str(session.id),
+            ).order_by(EventLog.seq).limit(1))
+        if event is None:
+            return  # recorded once its completion event is ingested
+        action, source_task = binding
+        await self._record_verification_verdict(
+            db, run, event, gate_ref[0], task, session, action, source_task, verdict, findings,
+            result_correction_parent_task_id=str(parent.id),
+        )
+        self._set_result_correction_status(marker, "corrected")
 
     async def _ingest_task_evidence(
         self,
@@ -9500,6 +9588,10 @@ class OrchestrationService:
         ):
             self._reopen_gate(gate)
 
+        if (event.event_type == "session.completed" and task.status == "done"
+                and self._json_object_or_empty(task.metadata_).get("result_correction_parent_task_id")):
+            await self._consume_result_correction(db, run, task, session.id, event.id)
+
         # INVARIANT: this keys off task.status == "done" being already committed
         # by the time this event is processed, which relies on every
         # session.completed emitter calling sync_task_from_session(task->done)
@@ -9557,6 +9649,17 @@ class OrchestrationService:
             or gate.gate_type in {"roadmap_plan_approval", "roadmap_integration"}
         ):
             return None
+        verifier_task_id = task.id
+        parent_id = self._event_uuid(self._json_object_or_empty(task.metadata_).get("result_correction_parent_task_id"))
+        if parent_id is not None:
+            # A verdict correction answers for the original verifier task only while the ledger names it as current.
+            marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent_id}")
+            ledger = self._json_object_or_empty(self._json_object_or_empty(marker.request if marker else {}).get(
+                "result_correction"
+            ))
+            if ledger.get("kind") != VERIFICATION_VERDICT or ledger.get("correction_task_id") != str(task.id):
+                return None
+            verifier_task_id = parent_id
         action = await db.scalar(
             select(OrchestrationAction)
             .where(
@@ -9564,7 +9667,7 @@ class OrchestrationService:
                 OrchestrationAction.action_type == "request_verification",
                 OrchestrationAction.status == "completed",
                 OrchestrationAction.target_type == "task",
-                OrchestrationAction.target_id == task.id,
+                OrchestrationAction.target_id == verifier_task_id,
             )
             .order_by(desc(OrchestrationAction.created_at), desc(OrchestrationAction.id))
             .limit(1)
@@ -9574,24 +9677,32 @@ class OrchestrationService:
         return action
 
     @staticmethod
-    def _verification_report(output: str | None) -> tuple[str | None, str | None]:
-        """Return (verdict, how the output was normalized); verdict is None when the report is invalid."""
+    def _verification_report(output: str | None) -> tuple[str | None, list[str], dict[str, Any] | None]:
+        """(verdict, exact errors, findings); verdict and findings are None when the report is invalid.
+
+        Required: status "done", verdict accepted|rejected, evidence list[str] (non-empty when accepted);
+        notes optional, extra keys tolerated. Findings carry "normalized" when the output was unwrapped."""
         try:
             text, how = normalize_result_output(output or "")
             report = json.loads(text)
-        except (TypeError, ValueError):
-            return None, None
-        if not isinstance(report, Mapping) or report.get("status") != "done":
-            return None, None
+        except (TypeError, ValueError) as exc:
+            return None, [str(exc)], None
+        errors = []
+        if report.get("status") != "done":
+            errors.append(f'status must be "done" (got {report.get("status")!r})')
         verdict = report.get("verdict")
         if verdict not in {"accepted", "rejected"}:
-            return None, None
+            errors.append(f'verdict must be "accepted" or "rejected" (got {verdict!r})')
         evidence = report.get("evidence")
         if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
-            return None, None
-        if verdict == "accepted" and not any(item.strip() for item in evidence):
-            return None, None
-        return verdict, how
+            errors.append("evidence must be a list of strings")
+        elif verdict == "accepted" and not any(item.strip() for item in evidence):
+            errors.append("evidence must contain at least one non-empty item when the verdict is accepted")
+        if errors:
+            return None, errors, None
+        notes = report.get("notes")
+        findings = {"evidence": evidence, "notes": notes if isinstance(notes, str) else None}
+        return verdict, [], {**findings, "normalized": how} if how else findings
 
     async def _bound_outcome_verification_binding(
         self,
@@ -9686,9 +9797,29 @@ class OrchestrationService:
         if event.event_type != "session.completed" or binding is None:
             return 0
         action, source_task = binding
-        verdict, how = self._verification_report(session.output)
+        verdict, errors, findings = self._verification_report(session.output)
         if verdict is None:
+            # An invalid verdict is neither acceptance nor rejection: it goes to a bounded output-only correction.
+            await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
             return 0
+        return await self._record_verification_verdict(
+            db, run, event, gate, task, session, action, source_task, verdict, findings,
+        )
+
+    async def _record_verification_verdict(
+        self,
+        db: AsyncSession,
+        run: OrchestrationRun,
+        event: EventLog,
+        gate: OrchestrationGate,
+        task: Task,
+        session: Session,
+        action: OrchestrationAction,
+        source_task: Task,
+        verdict: str,
+        findings: Mapping[str, Any],
+        **extra: Any,
+    ) -> int:
         return await self._record_evidence_once(
             db,
             run_id=run.id,
@@ -9706,7 +9837,8 @@ class OrchestrationService:
                 "verification_action_id": str(action.id),
                 "source_task_id": str(source_task.id),
                 "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
-                **({"normalized": how} if how else {}),
+                **({"normalized": findings["normalized"]} if findings.get("normalized") else {}),
+                **extra,
             },
         )
 
@@ -10344,6 +10476,8 @@ class OrchestrationService:
                 )
                 if source_task is None:
                     continue
+                if await self._final_summary_correction_open(db, run, gate, source_task, source_session):
+                    continue
                 final_summary_metadata = self._json_object_or_empty(
                     self._json_object_or_empty(source_task.metadata_).get("orchestration_final_summary")
                 )
@@ -10367,6 +10501,34 @@ class OrchestrationService:
             if latest_rejected is not None and latest_rejected.source_type == "review":
                 created += await self._create_rejected_review_fix_task(db, goal, run, gate, latest_rejected)
         return created
+
+    async def _final_summary_correction_open(
+        self, db: AsyncSession, run: OrchestrationRun, gate: OrchestrationGate, source_task: Task, session: Session,
+    ) -> bool:
+        """Request a bounded correction of an invalid summary output; True while that correction is still open.
+
+        The replacement-summary recovery trigger fires only once the correction stopped without a valid summary."""
+        reason = gate.failure_reason or ""
+        # ponytail: output errors are recognised by message prefix; return a typed code if the validator grows
+        correctable = reason.startswith(FINAL_SUMMARY_OUTPUT_ERRORS) and (
+            await self._stored_result_output(db, source_task, session.id)
+        )[0] is not None
+        if correctable:
+            await self._request_result_correction(db, run, source_task, session.id, FINAL_SUMMARY, [reason])
+        parent_id = self._event_uuid(
+            self._json_object_or_empty(source_task.metadata_).get("result_correction_parent_task_id")
+        ) or source_task.id
+        marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent_id}")
+        ledger = self._json_object_or_empty(self._json_object_or_empty(marker.request if marker else {}).get(
+            "result_correction"
+        ))
+        if ledger.get("kind") != FINAL_SUMMARY or ledger.get("status") not in {"pending", "correcting"}:
+            return False
+        if correctable or ledger.get("correction_task_id") != str(source_task.id):
+            return True
+        # The current correction failed for a reason no output correction can fix.
+        self._set_result_correction_status(marker, "rejected", reason=reason)
+        return False
 
     async def _retry_failed_task_once(
         self,
@@ -11080,7 +11242,10 @@ class OrchestrationService:
         if (
             orchestration.get("run_id") != str(gate.run_id)
             or orchestration.get("gate_id") != str(gate.id)
-            or orchestration.get("work_function") != FINAL_SUMMARY_WORK_FUNCTION
+            or orchestration.get("work_function") != (
+                "report_clarification" if task_metadata.get("result_correction_parent_task_id")
+                else FINAL_SUMMARY_WORK_FUNCTION
+            )
             or orchestration.get("final_summary") is not True
         ):
             return None, "Final summary task linkage is invalid"
@@ -11225,6 +11390,8 @@ class OrchestrationService:
             gate.failure_reason = reason
             return False
         self._accept_gate(gate, selected)
+        if gate.gate_type == FINAL_SUMMARY_GATE_TYPE and (run := await db.get(OrchestrationRun, gate.run_id)):
+            await self._settle_final_summary_corrections(db, run)
         return True
 
     async def _gate_validation_result(

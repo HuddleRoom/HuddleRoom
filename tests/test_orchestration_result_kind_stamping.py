@@ -49,10 +49,15 @@ async def test_delegation_persists_result_kind(db_session, test_project, work_fu
     shown = _schema_in_prompt(task.description)
     assert shown == (CANONICAL_WORK_REPORT_SCHEMA if kind == "work_report" else schema)
     expected_schema = CANONICAL_WORK_REPORT_SCHEMA if kind == "work_report" else schema
+    fields = (
+        'status must be "done", verdict accepted or rejected, evidence a list of strings with at least one item '
+        "when accepted; notes is optional and extra keys are tolerated (values show types). "
+        if kind == "verification_verdict" else "no missing or extra keys (values show types). "
+    )
     expected_tail = (
         "Required output:\nWhen done, return exactly one JSON object as your final message: no prose, "
-        "no Markdown fences, no missing or extra keys (values show types). "
-        "Read-only work reports its findings in this JSON.\n" + json.dumps(expected_schema, indent=2)
+        "no Markdown fences, " + fields
+        + "Read-only work reports its findings in this JSON.\n" + json.dumps(expected_schema, indent=2)
     )
     if kind == "work_report":
         expected_tail += "\nUse only IDs given in this task; never invent IDs, and do not register Artifacts for this output."
