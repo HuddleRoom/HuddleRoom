@@ -2120,7 +2120,7 @@ async def test_outcome_verification_rejects_unbound_or_invalid_sessions(
     json.dumps({"status": "done", "verdict": "accepted", "evidence": [1]}),
 ])
 async def test_outcome_verification_report_rejects_incomplete_structured_output(output):
-    assert OrchestrationService._verification_report(output) is None
+    assert OrchestrationService._verification_report(output)[0] is None
 
 
 async def test_non_outcome_plan_item_gate_preserves_configured_evidence(db_session, test_project):
