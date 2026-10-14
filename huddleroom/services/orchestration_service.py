@@ -10153,19 +10153,24 @@ class OrchestrationService:
         """Ask the owner about one subject and block only that subject; the run keeps dispatching other work."""
         if category not in self._ESCALATION_CATEGORIES:
             raise ValueError(f"Unknown escalation category: {category}")
-        attempts = [str(item) for item in history]
+        attempts = [str(item) for item in history][-10:]  # ponytail: keep only the latest attempts
         lines = "\n".join(f"{index}. {item}" for index, item in enumerate(attempts, 1)) or "None recorded."
         text = f"[{category}] {subject}\n{question}\nAttempt history:\n{lines}"
+        key_subject = subject if len(subject) <= 120 else hashlib.sha256(subject.encode()).hexdigest()
         action = await self.execute_ask_human_action(
             db,
             run.id,
             {"question": text, "subject": f"{category}:{subject}", "reason": category},
-            f"run:{run.id}:kind:ask_human:{category}:{subject}",
+            f"run:{run.id}:kind:ask_human:{category}:{key_subject}",
         )
-        # scope keys the blocker per subject, so other subjects of the same category coexist.
-        self._upsert_active_blocker(
-            run, {"kind": category, "scope": subject, "subject": subject, "history": attempts}
-        )
+        decision = await db.get(OrchestrationAuthorityDecision, action.target_id) if action.target_id else None
+        if decision is None or decision.status == "pending":  # an answered ask must not resurrect its blocker
+            # kind is not the category: budget_exhausted etc. are synced/cleared by other blocker owners.
+            # scope keys the blocker per subject; decision_id lets an owner answer clear it.
+            self._upsert_active_blocker(run, {
+                "kind": "owner_escalation", "category": category, "scope": subject, "subject": subject,
+                "history": attempts, "decision_id": str(action.target_id) if action.target_id else None,
+            })
         await db.flush()
         return action
 
