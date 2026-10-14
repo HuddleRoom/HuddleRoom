@@ -108,12 +108,19 @@ async def _record_measured_completion(db, project_id, run, task, agent_id, outpu
     return session
 
 
+# A complete canonical work report: an incomplete one would (correctly) start a result correction.
+PRODUCER_REPORT = json.dumps({
+    "status": "done", "changes": [], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [],
+    "open_questions": [], "next_step": "verify", "collaboration_need": None,
+})
+
+
 async def _complete_roadmap_task(db, project_id, service, run, row, verifier_id, *, complete_producer=True):
     task = await db.get(Task, row.task_id)
     producer = None
     if complete_producer:
         producer = await _record_measured_completion(
-            db, project_id, run, task, task.assigned_to, json.dumps({"status": "done"}),
+            db, project_id, run, task, task.assigned_to, PRODUCER_REPORT,
         )
     verification = await service.execute_request_verification_action(
         db, run.id,

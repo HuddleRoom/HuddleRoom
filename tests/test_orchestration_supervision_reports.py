@@ -140,10 +140,8 @@ async def test_sessionless_invalid_report_records_validation_errors(db_session, 
 
 
 async def test_malformed_report_gets_one_funded_same_owner_clarification(db_session, test_project, test_agent):
-    service, run, task, session = await _terminal_task(
-        db_session, test_project, test_agent, "not json",
-        contract={"expected_result": "canonical_work_report"},
-    )
+    # A legacy contract without a stored result kind is a work report and gets the same bounded correction.
+    service, run, task, session = await _terminal_task(db_session, test_project, test_agent, "not json")
     goal = await db_session.get(OrchestrationGoal, run.goal_id)
     goal.budget = {"caps": {"max_tokens": 2}}
     session.metadata_ = {"token_count_in": 0, "token_count_out": 0}
@@ -157,21 +155,12 @@ async def test_malformed_report_gets_one_funded_same_owner_clarification(db_sess
     assert clarification is not None and clarification.status == "completed"
     follow_up = await db_session.get(Task, clarification.target_id)
     assert follow_up is not None and follow_up.assigned_to == test_agent.id
-    assert follow_up.metadata_["orchestration_contract"]["budget"]
-
-
-async def test_legacy_malformed_report_does_not_request_clarification(db_session, test_project, test_agent):
-    service, run, task, session = await _terminal_task(db_session, test_project, test_agent, "not json")
-    goal = await db_session.get(OrchestrationGoal, run.goal_id)
-    goal.budget = {"caps": {"max_tokens": 2}}
-    session.metadata_ = {"token_count_in": 0, "token_count_out": 0}
-
-    await service.consume_canonical_report(db_session, run, task, session.id)
-
-    assert await db_session.scalar(select(OrchestrationAction).where(
-        OrchestrationAction.run_id == run.id,
-        OrchestrationAction.idempotency_key == f"run:{run.id}:kind:report_clarification:task:{task.id}",
-    )) is None
+    assert follow_up.metadata_["orchestration_contract"]["budget"] == {"max_tokens": "1"}
+    assert follow_up.metadata_["result_correction_parent_task_id"] == str(task.id)
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}"
+    )
+    assert marker.request["result_correction"]["correction_task_id"] == str(follow_up.id)
 
 
 async def test_malformed_report_in_exhausted_outcome_records_attention_without_follow_up(
@@ -226,7 +215,9 @@ async def test_malformed_report_in_exhausted_outcome_records_attention_without_f
     await service._ingest_session_evidence(db_session, run, event)
 
     assert any(item.get("kind") == "budget_exhausted" for item in run.active_blockers)
-    assert any(item.get("kind") == "report_clarification_required" for item in run.active_blockers)
+    assert [item["category"] for item in run.active_blockers if item.get("kind") == "owner_escalation"] == [
+        "budget_exhausted"
+    ]
     assert await db_session.scalar(select(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id,
         OrchestrationAction.idempotency_key == f"run:{run.id}:kind:report_clarification:task:{task.id}",
@@ -258,7 +249,10 @@ async def test_second_malformed_report_requests_human_attention(db_session, test
 
     await service.consume_canonical_report(db_session, run, follow_up, retry.id)
 
-    assert any(item.get("kind") == "report_clarification_required" for item in run.active_blockers)
+    # Same error count as the first failure: no second correction, the owner is asked.
+    assert [item["category"] for item in run.active_blockers if item.get("kind") == "owner_escalation"] == [
+        "result_correction_exhausted"
+    ]
 
 
 async def test_done_task_event_consumes_sessionless_metadata_report(db_session, test_project, test_agent):
@@ -328,16 +322,16 @@ async def test_cached_invalid_report_retries_after_funding_returns(db_session, t
     await service.consume_canonical_report(db_session, run, task, session.id)
     marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
     assert marker.request["clarification_count"] == 0
+    escalated = lambda: [b for b in run.active_blockers if b.get("kind") == "owner_escalation"]  # noqa: E731
+    assert [b["category"] for b in escalated()] == ["budget_exhausted"]
     session.metadata_ = {"token_count_in": 0, "token_count_out": 0}
     for _ in range(2):
         await service.consume_canonical_report(db_session, run, task, session.id)
+    assert escalated() == []
     clarification = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}")
     assert clarification is not None and clarification.status == "completed"
-    assert marker.request["clarification_count"] == 0
-    follow_up = await db_session.get(Task, clarification.target_id)
-    follow_up.status = "in_progress"
-    db_session.add(Session(task_id=follow_up.id, agent_id=test_agent.id, project_id=test_project.id,
-                          adapter_type="api", status="running", origin="orchestrator"))
-    await db_session.flush()
+    ledger = marker.request["result_correction"]
+    assert ledger["status"] == "correcting" and ledger["correction_task_id"] == str(clarification.target_id)
+    assert len(ledger["attempts"]) == 1  # replays never add attempts
     await service.consume_canonical_report(db_session, run, task, session.id)
-    assert marker.request["clarification_count"] == 1
+    assert marker.request["result_correction"] == ledger

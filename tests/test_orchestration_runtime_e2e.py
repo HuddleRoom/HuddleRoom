@@ -1102,9 +1102,11 @@ async def test_dependent_item_waits_for_accepted_predecessor_gate(
             )
         )
     ).scalar_one()
-    await _complete_task_session(
+    await _complete_task_session(  # a complete report: no result correction occupies the producer
         db_session, test_project.id, item_a_task, planner.id,
-        json.dumps({"status": "done", "changes": ["Output for item-a."]}),
+        json.dumps({"status": "done", "changes": ["Output for item-a."], "evidence": [], "criterion_progress": {},
+                    "decisions": [], "risks": [], "open_questions": [], "next_step": "verify",
+                    "collaboration_need": None}),
     )
     action = await service.execute_request_verification_action(
         db_session,
@@ -2379,7 +2381,9 @@ async def test_exhausted_budget_still_ingests_terminal_work_without_dispatch(
     action_ids_before = {action.id for action in actions_before}
     new_actions = [action for action in await _run_actions(db_session, run.id)
                    if action.id not in action_ids_before]
-    assert [action.action_type for action in new_actions] == ["report_consumed"]
+    # The malformed report gets no correction while the budget is exhausted; the owner is asked instead.
+    assert [action.action_type for action in new_actions] == ["report_consumed", "ask_human"]
+    assert [b["category"] for b in run.active_blockers if b.get("kind") == "owner_escalation"] == ["budget_exhausted"]
 
 
 async def test_malformed_report_curates_nothing_and_verifier_alone_accepts(

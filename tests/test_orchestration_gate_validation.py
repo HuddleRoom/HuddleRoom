@@ -1296,13 +1296,12 @@ async def test_adhoc_gate_accepts_report_repaired_on_the_clarification_task_mark
     service, run, agent = await _adhoc_run(db_session, test_project.id)
     task = await _delegate_adhoc(db_session, service, run, agent, "r1")
     gate = await _adhoc_gate(db_session, task)
-    clarification_id = uuid.uuid4()
-    repair = await service.reserve_action(
-        db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}", "create_delegation_task", {},
-    )
-    repair.target_id = clarification_id
     await _finish(db_session, test_project.id, task, "not a report")
     await service.tick(db_session, run.id)
+    repair = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}",
+    )
+    clarification_id = repair.target_id
     # The repair is still pending, so the invalid first report is not final.
     assert gate.status == "open" and gate.failure_reason == "Task report is invalid"
 
@@ -1375,20 +1374,18 @@ async def test_verification_request_scope_states_final_evidence_fit(db_session, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repair_status", ["failed", "cancelled"])
 async def test_dispatched_failed_clarification_is_final(db_session, test_project, repair_status):
-    from huddleroom.models.orchestration import OrchestrationAction
     service, run, agent = await _adhoc_run(db_session, test_project.id)
     task = await _delegate_adhoc(db_session, service, run, agent, "terminal-clarification")
     await _finish(db_session, test_project.id, task, report="not json")
     await service.consume_canonical_report(db_session, run, task, None)
     gate = await _adhoc_gate(db_session, task)
-    repair = Task(project_id=test_project.id, title="Repair", status=repair_status, assigned_to=agent.id)
-    db_session.add(repair)
-    await db_session.flush()
+    clarification = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}",
+    )
+    repair = await db_session.get(Task, clarification.target_id)  # the dispatched correction task
+    repair.status = repair_status
     marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
     marker.request = {**marker.request, "clarification_count": 1}
-    db_session.add(OrchestrationAction(run_id=run.id,
-        idempotency_key=f"run:{run.id}:kind:report_clarification:task:{task.id}",
-        action_type="create_delegation_task", status="completed", target_type="task", target_id=repair.id))
     await db_session.flush()
     assert await service._adhoc_report_failure(db_session, gate) == ("Task report is invalid", True)
 

@@ -120,7 +120,8 @@ from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_decision_validator import SELF_GRANT_ERROR, independent_work_rejection
 from huddleroom.services.orchestration_result_contract import (
-    PLANNING_ENVELOPE, WORK_REPORT, expected_result_kind, normalize_result_output,
+    CORRECTABLE_KINDS, PLANNING_ENVELOPE, WORK_REPORT, build_correction_brief, expected_result_kind,
+    failure_fingerprint, next_step, normalize_result_output, stable_hash,
 )
 from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
@@ -1727,6 +1728,7 @@ class OrchestrationService:
         ad_hoc: bool = False,
         baseline_repair_admission: BaselineRepairAdmissionV1 | None = None,
         gate_bound: bool = False,
+        expected_result: str | None = None,
     ) -> OrchestrationAction:
         gate_run = await db.get(OrchestrationRun, run_id)
         if gate_run is None:
@@ -1845,7 +1847,8 @@ class OrchestrationService:
             run_id=run.id,
             action_id=action.id,
             agent_id=agent_id,
-            expected_result=expected_result_kind({"report_schema": report_schema}, has_gate),
+            # Server-only override: a result correction keeps the original task's kind.
+            expected_result=expected_result or expected_result_kind({"report_schema": report_schema}, has_gate),
             work_function=work_function,
             scope=self._required_string(stored_request.get("scope"), "scope"),
             inputs=self._string_list(stored_request.get("inputs")),
@@ -5058,8 +5061,7 @@ class OrchestrationService:
 
     @staticmethod
     def _stable_hash(value: Mapping[str, Any]) -> str:
-        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()[:16]
+        return stable_hash(value)
 
     @staticmethod
     def _stable_need_hash(work_function: str, required_capabilities: list[str]) -> str:
@@ -7367,9 +7369,8 @@ class OrchestrationService:
         report_schema = contract.report_schema or {}
         strict = True
         kind = expected_result_kind({"expected_result": contract.expected_result, "report_schema": report_schema}, False)
+        schema = OrchestrationService._result_schema(goal, kind, report_schema)
         if kind == PLANNING_ENVELOPE:
-            plan_kind = report_schema.get("plan_kind")
-            schema = planning_envelope_report_schema(plan_kind if plan_kind in PLAN_KINDS else plan_kind_for(goal))
             rules = [
                 "Planning rules:",
                 "Adoption: use only a supplied existing task ID from the same run, in one item only, with a "
@@ -7434,10 +7435,8 @@ class OrchestrationService:
                 "plan_items": [task_example],
             }, sort_keys=True))
             sections.append("\n".join(rules))
-        elif kind == WORK_REPORT:
-            schema = CANONICAL_WORK_REPORT_SCHEMA
-        else:
-            schema, strict = report_schema, False
+        elif kind != WORK_REPORT:
+            strict = False
         field_instruction = (
             "include required fields and omit unused optional/default fields; no extra keys (values show types). "
             if kind == PLANNING_ENVELOPE
@@ -7457,6 +7456,14 @@ class OrchestrationService:
             )
         sections.append(output)
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _result_schema(goal: OrchestrationGoal, kind: str, report_schema: Mapping[str, Any]) -> dict:
+        """The exact schema a result of this kind is validated against, as shown in its brief."""
+        if kind == PLANNING_ENVELOPE:
+            plan_kind = report_schema.get("plan_kind")
+            return planning_envelope_report_schema(plan_kind if plan_kind in PLAN_KINDS else plan_kind_for(goal))
+        return CANONICAL_WORK_REPORT_SCHEMA if kind == WORK_REPORT else dict(report_schema)
 
     @staticmethod
     def _authorization_scope_text(scope) -> str:
@@ -7846,7 +7853,9 @@ class OrchestrationService:
                 self._json_object_or_empty(marker.request).get("report_validation_errors", []),
             )
             if validation.report is None:
-                await self._handle_malformed_canonical_report(db, run, task, session_id, marker)
+                await self._request_result_correction(
+                    db, run, task, session_id, WORK_REPORT, list(validation.errors),
+                )
             return session_id, validation.report
         if marker is None and expected_session_id is None:
             sessions = list(await db.scalars(select(Session).where(
@@ -7889,171 +7898,314 @@ class OrchestrationService:
                 )
         await self._mark_action_completed(db, marker, "task", task.id)
         if validation.report is None:
-            await self._handle_malformed_canonical_report(db, run, task, session_id, marker)
+            await self._request_result_correction(db, run, task, session_id, WORK_REPORT, list(validation.errors))
         return session_id, validation.report
 
-    async def _handle_malformed_canonical_report(
+    async def _request_result_correction(
         self,
         db: AsyncSession,
         run: OrchestrationRun,
         task: Task,
         session_id: uuid.UUID | None,
-        marker: OrchestrationAction,
+        kind: str,
+        errors: Sequence[str],
     ) -> None:
-        """Give a non-discovery producer one bounded chance to repair its report."""
+        """Bounded, output-only correction of a result that failed validation, tracked on the original's ledger.
+
+        ``task`` is the original task or its current correction task; ``kind`` names the validator that failed."""
         metadata = self._json_object_or_empty(task.metadata_)
         contract = self._json_object_or_empty(metadata.get("orchestration_contract"))
         context = self._json_object_or_empty(contract.get("orchestrator_context"))
-        continuous = self._json_object_or_empty(context.get("continuous"))
-        if continuous.get("discovery_run_id") == str(run.id):
+        if self._json_object_or_empty(context.get("continuous")).get("discovery_run_id") == str(run.id):
             return
-        report_schema = self._json_object_or_empty(contract.get("report_schema"))
-        if contract.get("expected_result") != "canonical_work_report" and set(report_schema) != set(CANONICAL_WORK_REPORT_SCHEMA):
+        if kind not in CORRECTABLE_KINDS or expected_result_kind(contract, task_gate_id(task, run.id) is not None) != kind:
             return
-
         parent_task_id = self._optional_uuid(
-            metadata.get("report_clarification_parent_task_id"), "report_clarification_parent_task_id"
+            metadata.get("result_correction_parent_task_id"), "result_correction_parent_task_id"
         ) or task.id
-        parent_marker = marker
-        if parent_task_id != task.id:
-            parent_marker = await self._existing_action_for_key(
-                db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent_task_id}"
-            )
-            if parent_marker is None:
-                return
-        parent_request = self._json_object_or_empty(parent_marker.request)
-        parent = await db.get(Task, parent_task_id)
-        gate_id = task_gate_id(parent, run.id) if parent is not None else None
-        gate = await db.get(OrchestrationGate, gate_id) if gate_id else None
-        repair = await self._existing_action_for_key(
-            db, run.id, f"run:{run.id}:kind:report_clarification:task:{parent_task_id}"
-        )
-        if (gate is not None and gate.status == "failed" and gate.gate_type == ADHOC_GATE_TYPE
-                and gate.id == uuid.uuid5(uuid.NAMESPACE_URL,
-                                         f"rally:orchestration:gate:{run.id}:{ADHOC_GATE_TYPE}:adhoc_task:{parent_task_id}")
-                and gate.success_criterion_key == f"adhoc_task:{parent_task_id}"
-                and gate.required_evidence.get("task_id") == str(parent_task_id)
-                and gate.failure_reason == "Task report is invalid"
-                and parent_marker.status == "completed" and parent_marker.target_id == parent_task_id
-                and not parent_request.get("clarification_count") and repair is None
-                and run.status in LLM_DECISION_RUN_STATUSES
-                and run.id == await db.scalar(select(OrchestrationRun.id).where(
-                    OrchestrationRun.goal_id == run.goal_id
-                ).order_by(OrchestrationRun.started_at.desc(), OrchestrationRun.id.desc()).limit(1))):
-            self._reopen_gate(gate)
-        clarification_task = await db.get(Task, repair.target_id) if repair and repair.target_id else None
-        if clarification_task is not None:
-            dispatched = clarification_task.status == "in_progress" or await db.scalar(
-                select(Session.id).where(Session.task_id == clarification_task.id).limit(1)
-            ) is not None
-            if dispatched:
-                parent_request = {**parent_request, "clarification_count": 1}
-                parent_marker.request = parent_request
-            if parent_task_id == task.id:
-                return
-        clarification_count = int(parent_request.get("clarification_count", 0))
-        if clarification_count:
-            key = f"run:{run.id}:kind:ask_human:report_clarification:task:{parent_task_id}"
-            ask = await self._existing_action_for_key(db, run.id, key)
-            if ask is None:
-                ask = await self.execute_ask_human_action(
-                    db, run.id,
-                    {
-                        "action_type": "ask_human",
-                        "question": f"Task report remained invalid after clarification: {parent_task_id}",
-                        "work_function": self._task_work_function(task),
-                        "required_capabilities": [], "candidate_agent_ids": [],
-                        "reason": "Canonical work report was invalid twice.",
-                    }, key,
-                )
-            goal = await db.get(OrchestrationGoal, run.goal_id)
-            if goal is not None:
-                self._mark_run_blocked(goal, run)
-            self._upsert_active_blocker(run, {
-                "kind": "report_clarification_required", "task_id": str(parent_task_id),
-                "reason": "Canonical work report was invalid twice.",
-                "decision_id": str(ask.target_id),
-            })
-            return
-
+        parent = task if parent_task_id == task.id else await db.get(Task, parent_task_id)
         goal = await db.get(OrchestrationGoal, run.goal_id)
-        if goal is None or task.assigned_to is None:
+        if parent is None or goal is None:
             return
+        key = f"run:{run.id}:kind:report_consumed:task:{parent.id}"
+        marker = await self._existing_action_for_key(db, run.id, key)
+        if marker is None:
+            if parent is not task:
+                return
+            marker = await self.reserve_action(db, run.id, key, "report_consumed", {
+                "task_id": str(task.id), "session_id": str(session_id) if session_id else None,
+            })
+            await self._mark_action_completed(db, marker, "task", task.id)
+        ledger = dict(self._json_object_or_empty(self._json_object_or_empty(marker.request).get("result_correction")))
+        if parent is not task and ledger.get("correction_task_id") != str(task.id):
+            return  # an unlinked or superseded correction never steers the original's ledger
+        version = self._result_correction_version(goal, run)
+        ledger = ledger or {
+            "kind": kind, "cycle": 1, "version": version, "attempts": [],
+            "correction_task_id": None, "correction_task_ids": [], "status": "pending",
+        }
+        try:
+            await self._advance_result_correction(db, goal, run, parent, marker, ledger, task, session_id, errors, version)
+        finally:
+            marker.request = {**self._json_object_or_empty(marker.request), "result_correction": ledger}
+
+    async def _advance_result_correction(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        parent: Task,
+        marker: OrchestrationAction,
+        ledger: dict[str, Any],
+        task: Task,
+        session_id: uuid.UUID | None,
+        errors: Sequence[str],
+        version: dict[str, Any],
+    ) -> None:
+        stale = await self._result_correction_stale(db, run, ledger, version)
+        if stale is not None:
+            ledger["stale"] = stale  # neither dispatched nor consumed onto a paused/superseded/changed run
+            return
+        ledger.pop("stale", None)
+        if ledger.get("status") in {"exhausted", "unavailable"}:
+            decision_id = self._optional_uuid(ledger.get("decision_id"), "decision_id")
+            decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
+            if decision is None or decision.status == "pending":
+                return  # ticks and replays never re-arm; only an owner answer does
+            ledger.update(
+                cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
+                previous_attempts=[*ledger.get("previous_attempts", []), *ledger.get("attempts", [])], attempts=[],
+            )
+        attempts = list(ledger.get("attempts") or [])
+        identity = {"task_id": str(task.id), "session_id": str(session_id) if session_id else None}
+        if not any(item.get("task_id") == identity["task_id"] and item.get("session_id") == identity["session_id"]
+                   for item in attempts):
+            output, _reason = await self._stored_result_output(db, task, session_id)
+            try:
+                normalized = normalize_result_output(output or "")[0]
+            except ValueError:
+                normalized = output or ""
+            fingerprint = failure_fingerprint(ledger["kind"], normalized, errors)
+            step = next_step(attempts, fingerprint, len(errors))
+            attempts.append({**identity, "fingerprint": fingerprint, "errors": [str(error) for error in errors]})
+            ledger.update(attempts=attempts, status="exhausted" if step == "stop" else "pending")
+        subject = f"task:{parent.id}:result_correction" + (f":cycle:{ledger['cycle']}" if ledger.get("cycle", 1) > 1 else "")
+        history = [
+            f"task {item['task_id']} session {item['session_id']}: {len(item['errors'])} error(s): "
+            + "; ".join(item["errors"])
+            for item in attempts
+        ]
+        if ledger["status"] == "exhausted":
+            if not ledger.get("decision_id"):
+                ask = await self._escalate_owner(
+                    db, goal, run, "result_correction_exhausted", subject, history,
+                    f"The result of task {parent.id} still fails validation after {len(attempts) - 1} correction(s). "
+                    "Decide how to proceed.",
+                )
+                ledger["decision_id"] = str(ask.target_id) if ask.target_id else None
+            return
+        if ledger["status"] == "correcting":
+            correction = await db.get(Task, uuid.UUID(ledger["correction_task_id"]))
+            if correction is not None and correction.status not in {"failed", "cancelled"}:
+                await self._reopen_invalid_report_gate(db, run, parent, marker)
+            return
+        if ledger["status"] != "pending":
+            return
+        latest = attempts[-1]
+        source = task if latest["task_id"] == str(task.id) else await db.get(Task, uuid.UUID(latest["task_id"]))
+        failed_output, unavailable = await self._stored_result_output(
+            db, source, self._optional_uuid(latest["session_id"], "session_id"),
+        ) if source is not None else (None, f"task {latest['task_id']} is missing")
+        if failed_output is None:
+            ledger.update(status="unavailable", reason="correction_input_unavailable", detail=unavailable)
+            ask = await self._escalate_owner(
+                db, goal, run, "capability_unavailable", f"task:{parent.id}:correction_input_unavailable", history,
+                f"Cannot correct the result of task {parent.id}: {unavailable}.",
+            )
+            ledger["decision_id"] = str(ask.target_id) if ask.target_id else None
+            return
+        budget, shortfall = await self._result_correction_budget(goal, run, db, parent.id)
+        if shortfall is not None:
+            await self._escalate_owner(
+                db, goal, run, "budget_exhausted", subject, history, f"Cannot fund a result correction: {shortfall}.",
+            )
+            return
+        await self._dispatch_result_correction(
+            db, goal, run, parent, ledger, failed_output, latest, budget, subject, history, version,
+        )
+
+    async def _dispatch_result_correction(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        parent: Task,
+        ledger: dict[str, Any],
+        failed_output: str,
+        latest: Mapping[str, Any],
+        budget: dict[str, str],
+        subject: str,
+        history: Sequence[str],
+        version: dict[str, Any],
+    ) -> None:
+        contract = self._json_object_or_empty(self._json_object_or_empty(parent.metadata_).get("orchestration_contract"))
+        kind = ledger["kind"]
+        report_schema = self._json_object_or_empty(contract.get("report_schema"))
+        brief = build_correction_brief(
+            parent.description or "", failed_output, self._result_schema(goal, kind, report_schema), latest["errors"],
+            {"task_id": str(parent.id), "run_id": str(run.id), **version},
+        )
+        request = {
+            "action_type": "create_delegation_task", "agent_id": str(parent.assigned_to),
+            "work_function": "report_clarification",
+            "title": f"Correct result: {parent.title}",
+            "scope": "Output-only correction: re-emit the prior task's result so it passes validation.",
+            "inputs": [f"Prior task: {parent.id}"],
+            "deliverable": "The corrected result.",
+            "forbidden_work": [
+                "Do not redo the work, repeat tool or external effects, invent evidence or widen scope.",
+            ],
+            "success_evidence": ["A result that passes validation."],
+            "budget": budget,
+            "report_schema": report_schema,
+            "parent_task_id": str(parent.id),
+            "source_session_id": latest["session_id"],
+        }
+        if contract.get("orchestrator_context"):
+            request["orchestrator_context"] = contract["orchestrator_context"]
+        if contract.get("authorization_scope"):
+            request["authorization_scope"] = contract["authorization_scope"]
+        dispatched = list(ledger.get("correction_task_ids") or [])
+        key = f"run:{run.id}:kind:report_clarification:task:{parent.id}"
+        if dispatched:
+            key += f":correction:{len(dispatched) + 1}"
+        try:
+            if parent.assigned_to is None:
+                raise HTTPException(status_code=409, detail="the original task has no assigned agent")
+            # Output-only re-emission of already admitted work: the baseline gate already passed for the original.
+            action = await self.execute_create_delegation_task_action(
+                db, run.id, request, key, skip_baseline_gate=True, expected_result=kind,
+            )
+        except HTTPException as exc:
+            if not 400 <= exc.status_code < 500:
+                raise
+            category = "budget_exhausted" if exc.detail == "budget_wait" else "capability_unavailable"
+            await self._escalate_owner(
+                db, goal, run, category, subject, history, f"Cannot dispatch a result correction: {exc.detail}.",
+            )
+            return
+        correction = await db.get(Task, action.target_id) if action.status == "completed" and action.target_id else None
+        if correction is None:
+            return
+        correction_metadata = self._json_object_or_empty(correction.metadata_)
+        if "result_correction_parent_task_id" not in correction_metadata:
+            correction.metadata_ = {**correction_metadata, "result_correction_parent_task_id": str(parent.id)}
+            correction.description = f"{correction.description or ''}\n\n{brief}"
+        ledger.update(
+            status="correcting", correction_task_id=str(correction.id), correction_session_id=None,
+            correction_task_ids=[*dispatched, str(correction.id)] if str(correction.id) not in dispatched else dispatched,
+        )
+        run.active_blockers = [  # funding returned: the subject's budget ask no longer blocks it
+            item for item in run.active_blockers
+            if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
+                    and item.get("category") == "budget_exhausted" and item.get("scope") == subject)
+        ]
+        await self._reopen_invalid_report_gate(db, run, parent, await self._existing_action_for_key(
+            db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent.id}",
+        ))
+
+    async def _result_correction_budget(
+        self, goal: OrchestrationGoal, run: OrchestrationRun, db: AsyncSession, parent_task_id: uuid.UUID,
+    ) -> tuple[dict[str, str], str | None]:
+        """(allowance, shortfall): capped goals use the protected allowance; uncapped goals need none."""
         from huddleroom.services.orchestration_budget_service import (
             BudgetMeasurementError,
             OrchestrationBudgetService,
             parent_caps,
         )
 
+        if self._budget_is_exhausted(run):
+            return {}, "budget capacity is exhausted"
         if not parent_caps(goal):
-            return
-
+            return {}, None
+        budgets = OrchestrationBudgetService()
         try:
-            budget = await OrchestrationBudgetService().protected_action_allocation(db, goal, run)
+            budget = await budgets.protected_action_allocation(db, goal, run)
         except BudgetMeasurementError as exc:
             self._upsert_active_blocker(run, {
                 "kind": "budget_measurement", "dimension": exc.dimension,
-                "session_id": str(exc.session_id), "scope": f"report_clarification:{parent_task_id}",
+                "session_id": str(exc.session_id), "scope": f"result_correction:{parent_task_id}",
             })
-            self._upsert_active_blocker(run, {
-                "kind": "report_clarification_required", "task_id": str(parent_task_id),
-                "reason": f"Cannot fund report clarification: missing {exc.dimension} measurement.",
-            })
-            return
+            return {}, f"missing {exc.dimension} measurement"
         if not any(Decimal(amount) for amount in budget.values()):
             self._upsert_active_blocker(run, {"kind": "budget_exhausted"})
-            self._upsert_active_blocker(run, {
-                "kind": "report_clarification_required", "task_id": str(parent_task_id),
-                "reason": "Cannot fund report clarification: budget capacity is exhausted.",
-            })
-            return
-        if not await OrchestrationBudgetService().can_dispatch(db, goal, run, budget):
+            return budget, "budget capacity is exhausted"
+        if not await budgets.can_dispatch(db, goal, run, budget):
             if self._has_active_blocker(run, "budget_measurement"):
-                self._upsert_active_blocker(run, {
-                    "kind": "report_clarification_required", "task_id": str(parent_task_id),
-                    "reason": "Cannot fund report clarification until budget telemetry is complete.",
-                })
-                return
+                return budget, "budget telemetry is incomplete"
             self._upsert_active_blocker(run, {"kind": "budget_exhausted"})
-            self._upsert_active_blocker(run, {
-                "kind": "report_clarification_required", "task_id": str(parent_task_id),
-                "reason": "Cannot fund report clarification: budget capacity is exhausted.",
-            })
-            return
-        key = f"run:{run.id}:kind:report_clarification:task:{parent_task_id}"
-        action = await self.execute_create_delegation_task_action(
-            db, run.id,
-            {
-                "action_type": "create_delegation_task", "agent_id": str(task.assigned_to),
-                "work_function": "report_clarification",
-                "scope": "Return only a corrected canonical report for the prior completed task.",
-                "inputs": [
-                    f"Prior task: {parent_task_id}",
-                    f"Invalid report errors: {parent_request.get('report_validation_errors', [])}",
-                ],
-                "deliverable": "A valid canonical work report.",
-                "forbidden_work": ["Do not change project artifacts or repeat the task work."],
-                "success_evidence": ["A valid canonical work report."],
-                "budget": budget,
-                "report_schema": {
-                    "status": "str", "changes": "list[str]", "evidence": "list[str]",
-                    "criterion_progress": "object", "decisions": "list[str]", "risks": "list[str]",
-                    "open_questions": "list[str]", "next_step": "str", "collaboration_need": "str|null",
-                },
-                "parent_task_id": str(parent_task_id),
-                "source_session_id": str(session_id) if session_id else None,
-            }, key,
-        )
-        if action.status == "completed" and action.target_id is not None:
-            clarification = await db.get(Task, action.target_id)
-            if clarification is not None:
-                clarification.metadata_ = {
-                    **self._json_object_or_empty(clarification.metadata_),
-                    "report_clarification_parent_task_id": str(parent_task_id),
-                }
-            if clarification is not None and (clarification.status == "in_progress"
-                    or await db.scalar(select(Session.id).where(Session.task_id == clarification.id).limit(1))):
-                parent_marker.request = {**parent_request, "clarification_count": 1}
+            return budget, "budget capacity is exhausted"
+        return budget, None
+
+    @staticmethod
+    def _result_correction_version(goal: OrchestrationGoal, run: OrchestrationRun) -> dict[str, Any]:
+        # Budget is left out on purpose: raising it must fund a waiting correction, not invalidate it.
+        return {
+            "owner_contract": stable_hash({
+                "objective": goal.objective, "success_criteria": goal.success_criteria,
+                "constraints": goal.constraints,
+            }),
+            "planning_version": OrchestrationService._json_object_or_empty(run.plan_state).get("planning_version"),
+        }
+
+    async def _result_correction_stale(
+        self, db: AsyncSession, run: OrchestrationRun, ledger: Mapping[str, Any], version: Mapping[str, Any],
+    ) -> str | None:
+        if run.status not in LLM_DECISION_RUN_STATUSES:
+            return f"run_{run.status}"
+        latest = await db.scalar(select(OrchestrationRun.id).where(
+            OrchestrationRun.goal_id == run.goal_id
+        ).order_by(OrchestrationRun.started_at.desc(), OrchestrationRun.id.desc()).limit(1))
+        if latest != run.id:
+            return "run_superseded"
+        if ledger.get("version", version) != version:
+            return "version_changed"
+        return None
+
+    async def _stored_result_output(
+        self, db: AsyncSession, task: Task, session_id: uuid.UUID | None,
+    ) -> tuple[str | None, str | None]:
+        """(complete stored output, None) or (None, exact reason it cannot be used for a correction)."""
+        from huddleroom.services.tool_executor import TOOL_EXECUTED_NO_CONTENT
+
+        if session_id is None:
+            orchestration = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))
+            output = orchestration.get("terminal_output")
+        else:
+            session = await db.get(Session, session_id)
+            if session is None or session.task_id != task.id or session.status != "completed":
+                return None, f"session {session_id} is not a completed session of task {task.id}"
+            output = session.output
+        if not isinstance(output, str) or not output.strip():
+            return None, f"the stored output of task {task.id} is absent"
+        if output == TOOL_EXECUTED_NO_CONTENT:
+            return None, f"the stored output of task {task.id} is a placeholder, not the agent's result"
+        return output, None
+
+    async def _reopen_invalid_report_gate(
+        self, db: AsyncSession, run: OrchestrationRun, parent: Task, marker: OrchestrationAction | None,
+    ) -> None:
+        """Reopen the original's ad-hoc gate, failed only for its invalid report, while a correction is pending."""
+        gate_id = task_gate_id(parent, run.id)
+        gate = await db.get(OrchestrationGate, gate_id) if gate_id else None
+        if (gate is not None and gate.status == "failed" and gate.gate_type == ADHOC_GATE_TYPE
+                and gate.id == uuid.uuid5(uuid.NAMESPACE_URL,
+                                         f"rally:orchestration:gate:{run.id}:{ADHOC_GATE_TYPE}:adhoc_task:{parent.id}")
+                and gate.success_criterion_key == f"adhoc_task:{parent.id}"
+                and gate.required_evidence.get("task_id") == str(parent.id)
+                and gate.failure_reason == "Task report is invalid"
+                and marker is not None and marker.status == "completed" and marker.target_id == parent.id):
+            self._reopen_gate(gate)
 
     def _canonical_reassign_task_request(self, request: Any) -> dict[str, Any]:
         request_obj = self._json_object_or_empty(request)
@@ -8993,6 +9145,9 @@ class OrchestrationService:
     ) -> None:
         """Route an ungated planning-role task's terminal output by the result kind its contract expects."""
         metadata = self._json_object_or_empty(task.metadata_)
+        if metadata.get("result_correction_parent_task_id"):
+            await self._consume_result_correction(db, run, task, session_id, event_id)
+            return
         orchestration = self._json_object_or_empty(metadata.get("orchestration"))
         if orchestration.get("work_function") != PLAN_WORK_FUNCTION or orchestration.get("run_id") != str(run.id):
             return
@@ -9001,6 +9156,47 @@ class OrchestrationService:
             await self._ingest_planning_output(db, run, task, session_id)
         elif kind == WORK_REPORT and task.status == "done":
             await self.consume_canonical_report(db, run, task, session_id, event_id)
+
+    async def _consume_result_correction(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task, session_id: uuid.UUID | None,
+        event_id: uuid.UUID | None = None,
+    ) -> None:
+        """Consume a correction task's result only when the original's ledger names it as current, it points back
+        to the original, and the run, owner contract and plan version are still the ones it was dispatched under."""
+        if task.status != "done":
+            return
+        parent_id = self._optional_uuid(
+            self._json_object_or_empty(task.metadata_).get("result_correction_parent_task_id"),
+            "result_correction_parent_task_id",
+        )
+        marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent_id}")
+        ledger = self._json_object_or_empty(self._json_object_or_empty(marker.request if marker else {}).get(
+            "result_correction"
+        ))
+        if marker is None or ledger.get("correction_task_id") != str(task.id):
+            return
+        if session_id is None:
+            sessions = list(await db.scalars(select(Session.id).where(
+                Session.task_id == task.id, Session.status == "completed",
+            )))
+            if len(sessions) > 1:
+                return
+            session_id = sessions[0] if sessions else None
+        session = await db.get(Session, session_id) if session_id is not None else None
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        if (session_id is not None and (session is None or session.task_id != task.id)) or goal is None:
+            return
+        stale = await self._result_correction_stale(db, run, ledger, self._result_correction_version(goal, run))
+        recorded = {"stale": stale} if stale else {"correction_session_id": str(session_id) if session_id else None}
+        marker.request = {**self._json_object_or_empty(marker.request), "result_correction": {
+            **{key: value for key, value in ledger.items() if key != "stale"}, **recorded,
+        }}
+        if stale or ledger.get("kind") != WORK_REPORT:
+            return  # other kinds land through their own consumers
+        _, report = await self.consume_canonical_report(db, run, task, session_id, event_id)
+        if report is not None:
+            current = self._json_object_or_empty(self._json_object_or_empty(marker.request).get("result_correction"))
+            marker.request = {**marker.request, "result_correction": {**current, "status": "corrected"}}
 
     async def _ingest_task_evidence(
         self,
@@ -10198,7 +10394,7 @@ class OrchestrationService:
             # scope keys the blocker per subject; decision_id lets an owner answer clear it.
             self._upsert_active_blocker(run, {
                 "kind": "owner_escalation", "category": category, "scope": subject, "subject": subject,
-                "history": attempts, "decision_id": str(action.target_id) if action.target_id else None,
+                "reason": f"{category}: {subject}", "history": attempts, "decision_id": str(action.target_id) if action.target_id else None,
             })
         await db.flush()
         return action
