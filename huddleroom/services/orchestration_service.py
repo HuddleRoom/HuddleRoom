@@ -10123,6 +10123,46 @@ class OrchestrationService:
             )
             return 1
 
+    _ESCALATION_CATEGORIES = (
+        "owner_decision", "permission_required", "capability_unavailable", "budget_exhausted",
+        "result_correction_exhausted", "revision_exhausted", "review_input_missing",
+    )
+
+    @staticmethod
+    def escalation_subject(category: str, task_id: Any, detail: str) -> str:
+        """Subject for per-task escalations, e.g. `task:<id>:permission:<tool>` or `task:<id>:capability:<name>`."""
+        label = {"permission_required": "permission", "capability_unavailable": "capability"}.get(category, category)
+        return f"task:{task_id}:{label}:{detail}"
+
+    async def _escalate_owner(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        category: str,
+        subject: str,
+        history: Sequence[str],
+        question: str,
+    ) -> OrchestrationAction:
+        """Ask the owner about one subject and block only that subject; the run keeps dispatching other work."""
+        if category not in self._ESCALATION_CATEGORIES:
+            raise ValueError(f"Unknown escalation category: {category}")
+        attempts = [str(item) for item in history]
+        lines = "\n".join(f"{index}. {item}" for index, item in enumerate(attempts, 1)) or "None recorded."
+        text = f"[{category}] {subject}\n{question}\nAttempt history:\n{lines}"
+        action = await self.execute_ask_human_action(
+            db,
+            run.id,
+            {"question": text, "subject": f"{category}:{subject}", "reason": category},
+            f"run:{run.id}:kind:ask_human:{category}:{subject}",
+        )
+        # scope keys the blocker per subject, so other subjects of the same category coexist.
+        self._upsert_active_blocker(
+            run, {"kind": category, "scope": subject, "subject": subject, "history": attempts}
+        )
+        await db.flush()
+        return action
+
     async def _create_rejected_review_fix_task(
         self,
         db: AsyncSession,
