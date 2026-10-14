@@ -7785,21 +7785,32 @@ class OrchestrationService:
             plan_text, how = normalize_result_output(output)
         except ValueError:
             plan_text, how = output, None  # parse_envelope reports the precise rejection
-        if how:
+        if how and source is task:  # a correction never overwrites the original's own record
             marker.request = {**self._json_object_or_empty(marker.request), "normalized": how}
         try:
             artifact = await ingest(db, goal, run, task, session_id, version, plan_text)
         except PlanIngestionError as exc:
-            marker.request = {**self._json_object_or_empty(marker.request), "plan_ingestion_error": exc.reason}
-            if source is not task and not exc.correctable:  # a linked correction failing a fence ends the correction
+            # ponytail: legacy self-registering planners keep working; drop this check once they are gone.
+            manual_plan = await db.scalar(select(Artifact.id).where(
+                Artifact.linked_task_id == task.id,
+                Artifact.artifact_type == "plan",
+                Artifact.id != plan_artifact_id(task.id, version),
+            ).limit(1))
+            # Planner prose with no JSON object never emitted an envelope: a missing plan, which a revision regenerates.
+            # ponytail: "has a brace" is the envelope test, so brace-bearing prose goes to correction; parse if that bites.
+            correct = exc.correctable and manual_plan is None and (source is not task or "{" in (output or ""))
+            if source is task:
+                marker.request = {**self._json_object_or_empty(marker.request), "plan_ingestion_error": exc.reason}
+            elif not correct:  # a linked correction failing a fence ends the correction; nothing re-runs it
                 self._set_result_correction_status(marker, "rejected", reason=exc.reason)
             if exc.code == BUDGET_REQUIRED_CODE:
                 details = {
                     "code": exc.code, "title": "Budget required", "message": BUDGET_REQUIRED_MESSAGE,
                     "raw_output": output, "diagnostics": exc.diagnostics,
                 }
-                marker.request = {**marker.request, "plan_ingestion_error_code": exc.code,
-                                  "plan_validation_diagnostics": exc.diagnostics, "rejected_output": output}
+                if source is task:
+                    marker.request = {**marker.request, "plan_ingestion_error_code": exc.code,
+                                      "plan_validation_diagnostics": exc.diagnostics, "rejected_output": output}
                 run.plan_state = {**plan_state, "status": "budget_required", "budget_required": details}
                 self._mark_run_blocked(goal, run)
                 self._upsert_active_blocker(run, {
@@ -7818,34 +7829,45 @@ class OrchestrationService:
                 question.title = "Budget required"
                 await self._mark_action_completed(db, marker, "task", task.id)
                 return
-            # ponytail: legacy self-registering planners keep working; drop this check once they are gone.
-            manual_plan = await db.scalar(select(Artifact.id).where(
-                Artifact.linked_task_id == task.id,
-                Artifact.artifact_type == "plan",
-                Artifact.id != plan_artifact_id(task.id, version),
-            ).limit(1))
-            # Planner prose with no JSON object never emitted an envelope: a missing plan, which a revision regenerates.
-            if exc.correctable and manual_plan is None and (source is not task or "{" in (output or "")):
-                marker.request = {**marker.request, "rejected_output": output}
+            if correct:
+                if source is task:
+                    marker.request = {**marker.request, "rejected_output": output}
                 await self._mark_action_completed(db, marker, "task", task.id)
                 await self._request_result_correction(
                     db, run, source, session_id, PLANNING_ENVELOPE, exc.diagnostics or [exc.reason],
                 )
-                return
+                if self._json_object_or_empty(marker.request).get("result_correction"):
+                    return
+                # No correction applies to this contract (legacy or exempt): the revision path below decides.
             if not exc.stale and manual_plan is None:
-                reason = f"planning_output_rejected: {exc.reason}"
-                pending = self._json_object_or_empty(plan_state.get("pending_replan"))
-                if pending:
-                    # A pending Roadmap replan sits on an accepted plan; revision_required would strand it,
-                    # so surface the rejection to the decision context instead.
-                    run.plan_state = {**plan_state, "pending_replan": {**pending, "ingestion_error": reason}}
-                else:
-                    self._set_plan_revision_required(run, reason)
+                self._plan_output_rejected(run, f"planning_output_rejected: {exc.reason}")
             await self._mark_action_completed(db, marker, "task", task.id)
             return
         await self._mark_action_completed(db, marker, "artifact", artifact.id)
         if source is not task:
             self._set_result_correction_status(marker, "corrected")
+
+    def _plan_output_rejected(self, run: OrchestrationRun, reason: str) -> None:
+        plan_state = self._json_object_or_empty(run.plan_state)
+        pending = self._json_object_or_empty(plan_state.get("pending_replan"))
+        if pending:
+            # A pending Roadmap replan sits on an accepted plan; revision_required would strand it,
+            # so surface the rejection to the decision context instead.
+            run.plan_state = {**plan_state, "pending_replan": {**pending, "ingestion_error": reason}}
+        else:
+            self._set_plan_revision_required(run, reason)
+
+    def _plan_correction_fallback(self, run: OrchestrationRun, ledger: dict[str, Any]) -> None:
+        """A planning correction that stopped without a plan falls back to the plan revision path, once per cycle."""
+        status = ledger.get("status")
+        if (ledger.get("kind") != PLANNING_ENVELOPE or status not in {"exhausted", "unavailable", "owner_declined"}
+                or ledger.get("revision_fallback")):
+            return
+        ledger["revision_fallback"] = True
+        errors = next((item["errors"] for item in reversed(ledger.get("attempts") or []) if item.get("errors")), [])
+        self._plan_output_rejected(
+            run, f"planning_output_rejected: result correction {status}: " + "; ".join(errors or [ledger.get("detail") or ""]),
+        )
 
     def _set_result_correction_status(self, marker: OrchestrationAction, status: str, **fields: Any) -> None:
         request = self._json_object_or_empty(marker.request)
@@ -7986,6 +8008,7 @@ class OrchestrationService:
         }
         try:
             await self._advance_result_correction(db, goal, run, parent, marker, ledger, task, session_id, errors, version)
+            self._plan_correction_fallback(run, ledger)
         finally:
             marker.request = {**self._json_object_or_empty(marker.request), "result_correction": ledger}
 
@@ -8125,7 +8148,7 @@ class OrchestrationService:
                 )
         ledger.update(
             cycle=int(ledger.get("cycle", 1)) + 1, version=version, status="pending", decision_id=None,
-            correction_task_id=None, correction_session_id=None,
+            correction_task_id=None, correction_session_id=None, revision_fallback=False,
             previous_attempts=[*ledger.get("previous_attempts", []), *ledger.get("attempts", [])], attempts=[],
         )
 
@@ -8170,6 +8193,7 @@ class OrchestrationService:
                 db, goal, run, parent, marker, ledger, task,
                 self._optional_uuid(latest["session_id"], "session_id"), latest["errors"], version,
             )
+            self._plan_correction_fallback(run, ledger)
         finally:
             marker.request = {**self._json_object_or_empty(marker.request), "result_correction": ledger}
 
@@ -9334,6 +9358,8 @@ class OrchestrationService:
         if stale:
             return
         if ledger.get("kind") == PLANNING_ENVELOPE:
+            if ledger.get("status") != "correcting":
+                return  # a replayed completion after the correction settled lands nothing
             parent = await db.get(Task, parent_id)
             if session is None or parent is None:  # a plan only lands from a recorded session of the correction
                 self._set_result_correction_status(marker, "rejected", reason="the correction has no recorded session")
@@ -9348,6 +9374,8 @@ class OrchestrationService:
             from huddleroom.services.orchestration_work_report import work_report_payload
 
             request = self._json_object_or_empty(marker.request)
+            # `report` now holds the corrected content while `session_id` stays the original's; read
+            # `effective_report` for the session that produced it.
             marker.request = {
                 **request,
                 "original_report": request.get("original_report", request.get("report")),

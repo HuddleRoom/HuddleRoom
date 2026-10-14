@@ -719,3 +719,106 @@ async def test_plan_revision_supersedes_an_in_flight_plan_correction(db_session,
     assert "plan_artifact_id" not in run.plan_state and await _plan_artifact_count(db_session, test_project) == 0
     assert (await _ledger(service, db_session, run, task))["status"] == "superseded"
     assert len(await _corrections(db_session, task)) == 1
+
+
+async def test_exhausted_plan_correction_falls_back_to_plan_revision(db_session, test_project):
+    failed = _plan(keys=("protocol_fallback",))
+    service, _goal, run, task, _session = await _planning_correction(db_session, test_project, failed)
+    assert run.plan_state["status"] != "revision_required"
+    [correction] = await _corrections(db_session, task)
+
+    await _complete(db_session, service, run, correction, failed)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "exhausted"
+    assert run.plan_state["status"] == "revision_required"
+    assert "protocol_fallback" in run.plan_state["revision_reason"]
+    await service.tick(db_session, run.id)
+    assert len(await _corrections(db_session, task)) == 1
+
+
+async def test_dismissed_pending_replan_correction_allows_the_replan_revision(db_session, test_project, test_user):
+    from tests.test_orchestration_plan_ingestion import _completed, _finish, _planning_run
+
+    service, _goal, run, task, session = await _planning_run(db_session, test_project.id)
+    run.plan_state = {**run.plan_state, "status": "accepted", "pending_replan": {"task_id": str(task.id)}}
+    failed = _plan(keys=("protocol_fallback",))
+    await _finish(db_session, task, session, failed)
+    await service._ingest_session_evidence(db_session, run, _completed(session.id))
+    [correction] = await _corrections(db_session, task)
+    assert "ingestion_error" not in run.plan_state["pending_replan"]
+
+    await _complete(db_session, service, run, correction, failed)
+    await _answer(db_session, run, await _ledger(service, db_session, run, task), "dismiss", test_user)
+    await service.tick(db_session, run.id)
+
+    assert (await _ledger(service, db_session, run, task))["status"] == "owner_declined"
+    assert "protocol_fallback" in run.plan_state["pending_replan"]["ingestion_error"]
+    await service._ensure_plan_revision_allowed(db_session, run)  # no longer stuck on the rejected replan
+
+
+async def test_legacy_planning_contract_without_correction_keeps_the_revision_path(db_session, test_project):
+    from tests.test_orchestration_plan_ingestion import _completed, _finish, _planning_run
+
+    service, _goal, run, task, session = await _planning_run(db_session, test_project.id)
+    contract = dict(task.metadata_["orchestration_contract"])
+    contract.pop("expected_result", None)
+    contract["report_schema"] = {k: v for k, v in contract.get("report_schema", {}).items() if k != "plan_kind"}
+    task.metadata_ = {**task.metadata_, "orchestration_contract": contract}
+    await _finish(db_session, task, session, _plan(keys=("protocol_fallback",)))
+
+    await service._ingest_planning_output(db_session, run, task, session.id)
+
+    assert await _corrections(db_session, task) == []
+    assert run.plan_state["status"] == "revision_required"
+    assert "protocol_fallback" in run.plan_state["revision_reason"]
+
+
+async def test_plan_correction_rejected_with_a_manual_plan_present_stops_and_keeps_the_original_record(
+    db_session, test_project,
+):
+    from huddleroom.models.artifact import Artifact
+
+    failed = _plan(keys=("protocol_fallback",))
+    service, _goal, run, task, _session = await _planning_correction(db_session, test_project, failed)
+    [correction] = await _corrections(db_session, task)
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    original = {key: marker.request.get(key) for key in ("rejected_output", "plan_ingestion_error", "normalized")}
+    db_session.add(Artifact(project_id=test_project.id, name="manual-plan", artifact_type="plan", status="draft",
+                            linked_task_id=task.id, created_by_agent=task.assigned_to))
+    await db_session.flush()
+
+    await _complete(db_session, service, run, correction, "Here it is: " + _plan(keys=("other_key",)))
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["status"] == "rejected" and "other_key" in ledger["reason"]
+    assert {key: marker.request.get(key) for key in original} == original
+    await service.tick(db_session, run.id)
+    assert len(await _corrections(db_session, task)) == 1
+
+
+async def test_plan_fence_requires_the_ledger_planning_version(db_session, test_project):
+    from huddleroom.services.orchestration_plan_ingestion import PlanIngestionError, ingest
+
+    service, goal, run, task, _session = await _planning_correction(
+        db_session, test_project, _plan(keys=("protocol_fallback",)),
+    )
+    version = run.plan_state["planning_version"]
+    [correction] = await _corrections(db_session, task)
+    fixed = await _complete(db_session, service, run, correction, _plan())
+    assert (await ingest(db_session, goal, run, task, fixed.id, version, _plan())).linked_task_id == task.id
+
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    )
+    ledger = marker.request["result_correction"]
+    # Only the ledger's dispatch version differs; the run's current planning version still matches.
+    marker.request = {**marker.request, "result_correction": {
+        **ledger, "version": {**ledger["version"], "planning_version": version - 1},
+    }}
+    await db_session.flush()
+    with pytest.raises(PlanIngestionError, match="does not belong") as exc:
+        await ingest(db_session, goal, run, task, fixed.id, version, _plan())
+    assert not exc.value.stale
