@@ -57,6 +57,33 @@ function terminalExplanation(call: AgentCallRecord): string | null {
   return null
 }
 
+function orchestrationDecisionSummary(call: AgentCallRecord, value: unknown): React.ReactNode | null {
+  if (
+    call.operation !== 'decision' ||
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value)
+  ) return null
+
+  const envelope = value as Record<string, unknown>
+  const decision = envelope.decision
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) return null
+  const fields = decision as Record<string, unknown>
+  if (
+    fields.action_type !== 'recover_blocker' ||
+    typeof fields.reason !== 'string' ||
+    !fields.reason.includes('plan_author_unavailable') ||
+    !Array.isArray(fields.evidence_refs)
+  ) return null
+
+  const count = fields.evidence_refs.length
+  return <div data-testid="orchestration-decision-summary">
+    <div className="font-semibold">Start managed recovery</div>
+    <p style={{ margin: '4px 0 0' }}>Planning is blocked because the approved team setup has no eligible planning agent.</p>
+    <p className="text-xs text-huddleroom-text-muted" style={{ margin: '4px 0 0' }}>Based on {count} supporting record{count === 1 ? '' : 's'}.</p>
+  </div>
+}
+
 function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibleContent: () => void }) {
   const isTerminal = !!call.terminal
   const [reasoningOpen, setReasoningOpen] = useState(!isTerminal)
@@ -65,6 +92,7 @@ function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibl
   const reasoning = assembleStream(call.items, 'reasoning')
   const stderr = assembleStream(call.items, 'stderr')
   const response = responsePresentation(call)
+  const decisionSummary = response.value === undefined ? null : orchestrationDecisionSummary(call, response.value)
   const tools = call.items.filter((item) => item.type !== 'output')
   const explanation = terminalExplanation(call)
   const preview = requestPreview(call.requestDisplay, 240)
@@ -114,7 +142,7 @@ function CallBlock({ call, onVisibleContent }: { call: AgentCallRecord; onVisibl
         }}>Thinking</summary>
         <div style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>{reasoning}</div>
       </details>}
-      {response.value !== undefined && <div data-testid="call-response" style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', marginBottom: 12 }}><ReadableValue value={response.value} /></div>}
+      {response.value !== undefined && <div data-testid="call-response" style={{ fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', marginBottom: 12 }}>{decisionSummary || <ReadableValue value={response.value} />}</div>}
       {response.mismatch && <p className="text-xs text-huddleroom-text-muted">The final response differs from the provisional stream; the final response is shown. The provisional response is in Details.</p>}
       {response.finalLimited && <p className="text-xs text-huddleroom-text-muted">The captured final response was truncated; available streamed text is retained.</p>}
       {response.toolOnly && <p data-testid="call-response" className="text-[13px] text-huddleroom-text-secondary">This call returned tool calls without response text. See Details.</p>}

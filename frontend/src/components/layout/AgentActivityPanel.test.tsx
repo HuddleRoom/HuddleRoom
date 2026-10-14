@@ -2055,6 +2055,45 @@ describe('SPR189/190 bounded readable Calls contracts', () => {
     } finally { view.cleanup() }
   })
 
+  it('renders the screenshot-shaped blocked planning decision as a concise recovery summary', async () => {
+    const store = useAgentResponseStore.getState()
+    const id = 'fea808f0-ada9-488a-8962-1b1a919255be'
+    const reason = 'Planning remains blocked by plan_author_unavailable: approved hierarchy assignments conflict with effective agent eligibility despite semantic approvals.'
+    store.ingest(baseEvent({ operation: 'decision' }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ decision: {
+      action_type: 'recover_blocker',
+      evidence_refs: [{ kind: 'action', id }, { kind: 'process', id }, { kind: 'process', id }, { kind: 'decision', id }],
+      reason,
+    } }) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response)).toContain('Start managed recovery')
+      expect(textOf(response)).toContain('Planning is blocked because the approved team setup has no eligible planning agent.')
+      expect(textOf(response)).toContain('Based on 4 supporting records.')
+      expect(textOf(response)).not.toContain('Action Type')
+      expect(textOf(response)).not.toContain(id)
+      const detail = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-details')!
+      expect(textOf(detail)).toContain(reason)
+      expect(textOf(detail)).toContain(id)
+    } finally { view.cleanup() }
+  })
+
+  it('falls back to the structured renderer for an unrecognized decision reason', async () => {
+    const store = useAgentResponseStore.getState()
+    store.ingest(baseEvent({ operation: 'decision' }))
+    store.ingest(terminalEvent({ payload: { final_response: finalSnapshot({ decision: {
+      action_type: 'recover_blocker', evidence_refs: [], reason: 'An unrecognized blocker.',
+    } }) } }))
+    const view = await mountWithTestDom(() => <AgentActivityPanel projectId="proj-123" />, React.act)
+    try {
+      const response = descendants(view.container).find((node) => node.getAttribute('data-testid') === 'call-response')!
+      expect(textOf(response)).toContain('Action Type')
+      expect(textOf(response)).toContain('recover_blocker')
+      expect(descendants(response).some((node) => node.getAttribute('data-testid') === 'orchestration-decision-summary')).toBe(false)
+    } finally { view.cleanup() }
+  })
+
   it('retains longer provisional passage when final snapshot is limited and shows notice', async () => {
     const store = useAgentResponseStore.getState()
     store.ingest(baseEvent()); store.ingest(sprOutput(1, 'a longer captured response'))
