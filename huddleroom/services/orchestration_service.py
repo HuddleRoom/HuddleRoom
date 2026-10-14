@@ -8115,6 +8115,8 @@ class OrchestrationService:
         ) if source is not None else (None, f"task {latest['task_id']} is missing")
         if failed_output is None:
             ledger.update(status="unavailable", reason="correction_input_unavailable", detail=unavailable)
+            if ledger["kind"] == FINAL_SUMMARY:
+                return  # the replacement-summary recovery is the single owner decision
             ask = await self._escalate_owner(
                 db, goal, run, "capability_unavailable",
                 f"task:{parent.id}:correction_input_unavailable" + subject.removeprefix(
@@ -8188,11 +8190,15 @@ class OrchestrationService:
         if run.status != "running":
             return
         # ponytail: oldest 50 open ledgers per tick; page by cursor if a run ever holds more
+        ledger = OrchestrationAction.request["result_correction"]
         markers = list(await db.scalars(select(OrchestrationAction).where(
             OrchestrationAction.run_id == run.id,
             OrchestrationAction.action_type == "report_consumed",
-            OrchestrationAction.request["result_correction"]["status"].as_string().in_(
-                ("pending", "correcting", "exhausted", "unavailable")
+            or_(
+                ledger["status"].as_string().in_(("pending", "correcting")),
+                # a stopped ledger only waits on its owner ask; one without an ask is settled
+                and_(ledger["status"].as_string().in_(("exhausted", "unavailable")),
+                     ledger["decision_id"].as_string().is_not(None)),
             ),
         ).order_by(OrchestrationAction.created_at, OrchestrationAction.id).limit(50)))
         for marker in markers:
@@ -8288,12 +8294,14 @@ class OrchestrationService:
                     db, goal, run, "budget_exhausted", subject, history, f"Cannot dispatch a result correction: {exc.detail}.",
                 )
                 return
+            ledger.update(status="unavailable", reason="correction_dispatch_unavailable", detail=str(exc.detail))
+            if kind == FINAL_SUMMARY:
+                return  # the replacement-summary recovery is the single owner decision
             ask = await self._escalate_owner(
                 db, goal, run, "capability_unavailable", subject, history,
                 f"Cannot dispatch a result correction: {exc.detail}.", options=RESULT_CORRECTION_ASK_OPTIONS,
             )
-            ledger.update(status="unavailable", reason="correction_dispatch_unavailable", detail=str(exc.detail),
-                          decision_id=str(ask.target_id) if ask.target_id else None)
+            ledger["decision_id"] = str(ask.target_id) if ask.target_id else None
             return
         correction = await db.get(Task, action.target_id) if action.status == "completed" and action.target_id else None
         if correction is None:
@@ -9442,6 +9450,21 @@ class OrchestrationService:
             }
             self._set_result_correction_status(marker, "corrected")
 
+    async def _escalate_verifier_could_not_verify(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task, session: Session, findings: Mapping[str, Any],
+    ) -> None:
+        """A verifier that reports blocked/failed asks the owner on that verifier's subject; nothing is counted."""
+        goal = await db.get(OrchestrationGoal, run.goal_id)
+        if goal is None:
+            return
+        status = findings["status"]
+        await self._escalate_owner(
+            db, goal, run, "capability_unavailable", f"task:{task.id}:verifier_{status}",
+            [f"task {task.id} session {session.id}: verifier reported {status}: {findings['notes']}",
+             *(f"evidence: {item}" for item in findings.get("evidence") or [])],
+            f"The verifier for task {task.id} reported it could not verify ({status}): {findings['notes']}",
+        )
+
     async def _land_verification_correction(
         self,
         db: AsyncSession,
@@ -9465,6 +9488,7 @@ class OrchestrationService:
         verdict, errors, findings = self._verification_report(session.output)
         if verdict is None and not errors:  # the verifier now reports it cannot verify; stop correcting
             self._set_result_correction_status(marker, "rejected", reason=f"the verifier reported {findings['status']}")
+            await self._escalate_verifier_could_not_verify(db, run, parent, session, findings)
             return
         if verdict is None:
             await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
@@ -9694,20 +9718,24 @@ class OrchestrationService:
 
         Required: status "done", verdict accepted|rejected, evidence list[str] (non-empty when accepted);
         notes optional, extra keys tolerated. Findings carry "normalized" when the output was unwrapped.
-        A well-formed "blocked"/"failed" report has no verdict and no errors."""
+        A well-formed "blocked"/"failed" report has no verdict and no errors; its findings carry the status."""
         try:
             text, how = normalize_result_output(output or "")
             report = json.loads(text)
         except (TypeError, ValueError) as exc:
             return None, [str(exc)], None
         notes = report.get("notes")
-        if report.get("status") in {"blocked", "failed"}:
-            # The verifier reported it could not verify: not an output error, and never pressed into a verdict.
-            evidence = report.get("evidence")
-            return None, [], {
-                "status": report["status"], "notes": notes if isinstance(notes, str) else None,
-                "evidence": evidence if isinstance(evidence, list) and all(isinstance(i, str) for i in evidence) else [],
-            }
+        status = report.get("status")
+        if status in {"blocked", "failed"}:
+            # Well-formed = non-empty notes and evidence absent or list[str]: the verifier could not verify, which is
+            # no output error and is never pressed into a verdict. Anything else is malformed and corrected.
+            evidence = report.get("evidence", [])
+            errors = [] if isinstance(notes, str) and notes.strip() else [
+                f'notes must be a non-empty string when status is "{status}"'
+            ]
+            if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+                errors.append("evidence must be a list of strings")
+            return (None, errors, None) if errors else (None, [], {"status": status, "evidence": evidence, "notes": notes})
         errors = []
         if report.get("status") != "done":
             errors.append(f'status must be "done" (got {report.get("status")!r})')
@@ -9820,9 +9848,11 @@ class OrchestrationService:
         verdict, errors, findings = self._verification_report(session.output)
         if verdict is None:
             # An invalid verdict is neither acceptance nor rejection: it goes to a bounded output-only correction.
-            # A blocked/failed verifier report is no output error and is never corrected.
+            # A blocked/failed verifier report is no output error and is never corrected: the owner is asked.
             if errors:
                 await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
+            else:
+                await self._escalate_verifier_could_not_verify(db, run, task, session, findings)
             return 0
         return await self._record_verification_verdict(
             db, run, event, gate, task, session, action, source_task, verdict, findings,

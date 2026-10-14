@@ -501,7 +501,14 @@ class OrchestrationRoadmapService:
         ledger = self.orchestration._json_object_or_empty(
             self.orchestration._json_object_or_empty(marker.request if marker else {}).get("result_correction")
         )
-        return ledger.get("kind") == "verification_verdict" and ledger.get("status") in {"pending", "correcting"}
+        if ledger.get("kind") != "verification_verdict":
+            return False
+        if ledger.get("status") in {"pending", "correcting"}:
+            return True
+        # stopped with an open owner ask: wait for the owner rather than dispatching a second verifier
+        decision_id = self.orchestration._event_uuid(ledger.get("decision_id"))
+        decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
+        return ledger.get("status") in {"exhausted", "unavailable"} and decision is not None and decision.status == "pending"
 
     async def has_active_bound_verifier(self, db, run) -> bool:
         actions = list((await db.scalars(select(OrchestrationAction).where(

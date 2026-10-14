@@ -1121,8 +1121,9 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
     assert len([item for item in actions if item.action_type == "complete_run"]) == 1
 
 
+@pytest.mark.parametrize("fixed", [True, False])
 async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
-    db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
+    db_session, test_project, monkeypatch, safe_effectiveness_review_continue, fixed,
 ):
     builder = _agent("verdict-correction-builder", ["implementation"])
     verifier = _agent("verdict-correction-verifier", ["validation"])
@@ -1152,10 +1153,15 @@ async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
     await ingest()
     [correction] = (await db_session.scalars(select(Task).where(Task.parent_id == verifier_task.id))).all()
     assert await roadmap.has_active_bound_verifier(db_session, run) is True
+    tick = await service.tick(db_session, run.id)
+    assert tick["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
+    assert len([a for a in await _run_actions(db_session, run.id) if a.action_type == "request_verification"]) == 1
 
     await _record_measured_completion(
         db_session, test_project.id, run, correction, verifier.id,
-        json.dumps({"status": "done", "verdict": "accepted", "evidence": ["independent check"]}),
+        json.dumps({"status": "done", "verdict": "accepted", "evidence": ["independent check"]})
+        if fixed else "Verified, all good.",
     )
     await ingest()
-    assert await roadmap.has_active_bound_verifier(db_session, run) is False
+    # an exhausted correction with a pending owner ask still holds the verifier slot: the roadmap waits for the owner
+    assert await roadmap.has_active_bound_verifier(db_session, run) is not fixed

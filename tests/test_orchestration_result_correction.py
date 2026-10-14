@@ -842,10 +842,13 @@ def test_verification_report_returns_exact_errors_and_findings():
         "verdict must be \"accepted\" or \"rejected\" (got None)",
         "evidence must be a list of strings",
     ], None)
-    # a well-formed blocked/failed report is not an output error: no verdict, nothing to correct
+    # a well-formed blocked/failed report (non-empty notes, evidence absent or list[str]) is not an output error
     assert report(json.dumps({"status": "blocked", "notes": "No access to staging."})) == (
         None, [], {"status": "blocked", "evidence": [], "notes": "No access to staging."},
     )
+    assert report(json.dumps({"status": "blocked"}))[1] == [
+        'notes must be a non-empty string when status is "blocked"',
+    ]
     assert report(json.dumps({"status": "done", "verdict": "accepted", "evidence": [" "]}))[1] == [
         "evidence must contain at least one non-empty item when the verdict is accepted",
     ]
@@ -897,14 +900,31 @@ async def test_verifier_prompt_states_the_verdict_contract(db_session, test_proj
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
 @pytest.mark.parametrize("status", ["blocked", "failed"])
-async def test_well_formed_blocked_or_failed_verifier_report_is_not_corrected(db_session, test_project, status):
+async def test_well_formed_blocked_or_failed_verifier_report_escalates_once_and_is_not_corrected(
+    db_session, test_project, status,
+):
     service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
     await _complete(db_session, service, run, verifier_task, json.dumps({"status": status, "notes": "No access."}))
+    await service.tick(db_session, run.id)
+    await service.tick(db_session, run.id)
 
     assert await _corrections(db_session, verifier_task) == []
     assert await _verification_evidence(db_session, gate) == []
+    [escalation] = _escalations(run, "capability_unavailable")
+    assert escalation["scope"] == f"task:{verifier_task.id}:verifier_{status}"
+    assert any("No access." in line for line in escalation["history"])
     await db_session.refresh(gate)
     assert gate.status != "accepted"
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+@pytest.mark.parametrize("report", [{"status": "blocked"}, {"status": "blocked", "notes": " "},
+                                    {"status": "failed", "notes": "x", "evidence": "y"}])
+async def test_blocked_verifier_report_without_well_formed_notes_is_corrected(db_session, test_project, report):
+    service, run, _gate, verifier_task = await _verifier_setup(db_session, test_project)
+    await _complete(db_session, service, run, verifier_task, json.dumps(report))
+    assert len(await _corrections(db_session, verifier_task)) == 1
+    assert _escalations(run, "capability_unavailable") == []
 
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
@@ -1039,9 +1059,18 @@ async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exh
     assert ledger["status"] == "exhausted" and not ledger.get("decision_id")
     assert _escalations(run, "result_correction_exhausted") == []
     assert len(await _summary_triggers(db_session, run)) == 1
+    assert await _non_recovery_asks(db_session, run) == []
     await service.tick(db_session, run.id)
     assert len(await _summary_triggers(db_session, run)) == 1
     assert len(await _corrections(db_session, task)) == 1
+    resumed = []
+
+    async def record(_db, _run, marker):
+        resumed.append(marker.target_id)
+
+    service._resume_result_correction = record
+    await service._sweep_result_corrections(db_session, run)
+    assert task.id not in resumed  # a settled summary ledger leaves the sweep
     await db_session.refresh(gate)
     assert gate.status == "failed"
 
@@ -1060,6 +1089,22 @@ async def test_summary_correction_that_cannot_be_dispatched_hands_over_to_recove
     assert ledger["status"] == "unavailable" and ledger["reason"] == "correction_dispatch_unavailable"
     assert await _corrections(db_session, task) == []
     assert len(await _summary_triggers(db_session, run)) == 1
+    assert not ledger.get("decision_id") and await _non_recovery_asks(db_session, run) == []
+
+
+async def _non_recovery_asks(db, run):
+    """Pending owner decisions other than recovery fix cards."""
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+    pending = await db.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending",
+    ))
+    result = []
+    for decision in pending:
+        related = await db.get(OrchestrationAction, decision.related_action_id) if decision.related_action_id else None
+        if related is None or related.action_type != "recovery_proposal":
+            result.append(decision)
+    return result
 
 
 @pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
