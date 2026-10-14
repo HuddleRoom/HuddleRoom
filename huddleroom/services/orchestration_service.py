@@ -119,7 +119,9 @@ from huddleroom.services.project_service import ProjectService
 from huddleroom.services.session_service import SessionService
 from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_decision_validator import SELF_GRANT_ERROR, independent_work_rejection
-from huddleroom.services.orchestration_result_contract import PLANNING_ENVELOPE, WORK_REPORT, expected_result_kind
+from huddleroom.services.orchestration_result_contract import (
+    PLANNING_ENVELOPE, WORK_REPORT, expected_result_kind, normalize_result_output,
+)
 from huddleroom.services.orchestration_dependencies import (
     ADHOC_GATE_TYPE,
     NON_BLOCKING_GATE_TYPES,
@@ -7750,7 +7752,13 @@ class OrchestrationService:
             version = plan_state.get("planning_version")
         goal = await db.get(OrchestrationGoal, run.goal_id)
         try:
-            artifact = await ingest(db, goal, run, task, session_id, version, output)
+            plan_text, how = normalize_result_output(output)
+        except ValueError:
+            plan_text, how = output, None  # parse_envelope reports the precise rejection
+        if how:
+            marker.request = {**self._json_object_or_empty(marker.request), "normalized": how}
+        try:
+            artifact = await ingest(db, goal, run, task, session_id, version, plan_text)
         except PlanIngestionError as exc:
             marker.request = {**self._json_object_or_empty(marker.request), "plan_ingestion_error": exc.reason}
             if exc.code == BUDGET_REQUIRED_CODE:
@@ -7857,6 +7865,7 @@ class OrchestrationService:
         marker.request = {
             **self._json_object_or_empty(marker.request),
             "report_validation_errors": list(validation.errors),
+            "normalized": validation.normalized,
             "clarification_count": 0,
             "report": work_report_payload(validation.report),
         }
@@ -9185,7 +9194,7 @@ class OrchestrationService:
     @staticmethod
     def _verification_report(output: str | None) -> str | None:
         try:
-            report = json.loads(output or "")
+            report = json.loads(normalize_result_output(output or "")[0])
         except (TypeError, ValueError):
             return None
         if not isinstance(report, Mapping) or report.get("status") != "done":
@@ -10692,8 +10701,8 @@ class OrchestrationService:
             return None, "Final summary session attribution is invalid"
 
         try:
-            payload = json.loads(session.output)
-        except (TypeError, json.JSONDecodeError):
+            payload = json.loads(normalize_result_output(session.output)[0])
+        except (TypeError, ValueError):
             return None, "Final summary output must be valid JSON"
         if not isinstance(payload, Mapping):
             return None, "Final summary output must be a JSON object"
