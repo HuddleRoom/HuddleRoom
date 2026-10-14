@@ -686,6 +686,8 @@ class CliAdapter:
                     "task_id": str(session.task_id) if session.task_id else None,
                     "project_id": str(session.project_id),
                 })
+                from huddleroom.services.session_sync import sync_task_from_session
+                await sync_task_from_session(db, session)
                 raise
             finally:
                 watcher_task.cancel()

@@ -883,13 +883,17 @@ class SessionService:
             except Exception:
                 pass
 
+        from datetime import datetime, timezone
+        from huddleroom.services.session_sync import sync_task_from_session
         session.status = "cancelled"
+        session.ended_at = datetime.now(timezone.utc)
         await db.flush()
         await emit_event(db, session.project_id, "session.cancelled", {
             "session_id": str(session.id),
             "task_id": str(session.task_id) if session.task_id else None,
             "project_id": str(session.project_id),
         })
+        await sync_task_from_session(db, session)
         return session
 
     async def resume(self, db: AsyncSession, session_id: uuid.UUID) -> Session:
@@ -968,6 +972,16 @@ class SessionService:
 
         # Refresh session to get updated values from the atomic UPDATE
         session = await self.get_or_404(db, session_id)
+        if task is not None and task.status == "failed":
+            task.status = "in_progress"
+            await db.flush()
+            await emit_event(db, task.project_id, "task.status_changed", {
+                "task_id": str(task.id),
+                "status": "in_progress",
+                "previous_status": "failed",
+                "source": "session_resume",
+                "project_id": str(task.project_id),
+            })
         if budget_limits:
             config = dict((session.metadata_ or {}).get("_run_config", {}))
             config["_roadmap_budget_enforced"] = True

@@ -178,7 +178,9 @@ class ApiAdapter:
     ) -> None:
         import litellm
 
-        orchestration = isinstance((session.metadata_ or {}).get("attempt"), dict)
+        # run() passes runner_task_id only for orchestrator-owned lineage; manual sessions
+        # carry an attempt marker too but never held an orchestrator claim.
+        orchestration = runner_task_id is not None and isinstance((session.metadata_ or {}).get("attempt"), dict)
 
         if invocation is None:
             invocation = AgentResponseInvocation(
