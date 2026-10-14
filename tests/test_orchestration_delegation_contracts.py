@@ -980,6 +980,22 @@ async def test_adhoc_defaults_keep_legacy_request_and_unknown_artifact_creates_n
 
 
 @pytest.mark.asyncio
+async def test_soft_deleted_artifact_is_artifact_invalid_and_creates_nothing(db_session, test_project):
+    from huddleroom.models.artifact import Artifact
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    artifact = Artifact(project_id=test_project.id, name="gone", artifact_type="document", status="deleted")
+    db_session.add(artifact)
+    await db_session.flush()
+
+    before = await _task_count(db_session, test_project.id)
+    with pytest.raises(HTTPException) as exc:
+        await _delegate(service, run, agent, "deleted-art", db=db_session, artifact_ids=[str(artifact.id)])
+    assert exc.value.status_code == 409 and exc.value.detail.startswith("artifact_invalid:")
+    assert await _task_count(db_session, test_project.id) == before
+
+
+@pytest.mark.asyncio
 async def test_dispatch_unknown_artifact_is_failed_action_with_zero_tasks(db_session, test_project):
     from huddleroom.models.orchestration import OrchestrationDecision
     from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher

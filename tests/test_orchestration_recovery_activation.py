@@ -895,7 +895,8 @@ async def test_repeated_eventless_noops_and_reports_keep_one_open_lineage_each(d
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     service, goal, run = await _authorized_run(db_session, test_project)
-    for _ in range(3):
+    refs = [{"kind": "task", "id": str(uuid.uuid4())}, {"kind": "task", "id": str(uuid.uuid4())}]
+    for attempt in range(3):  # the same blocker, reported again each time (evidence order may differ)
         context = await service._decision_context(db_session, goal, run)
         noop = await _decision(db_session, run, {
             "action_type": "noop", "reason": "Waiting.",
@@ -904,7 +905,7 @@ async def test_repeated_eventless_noops_and_reports_keep_one_open_lineage_each(d
         await service._dispatch_execution_decision(db_session, run, noop)
         report = await _decision(db_session, run, {
             "action_type": "recover_blocker", "reason": f"Still blocked {uuid.uuid4()}.",
-            "evidence_refs": [{"kind": "decision", "id": str(noop.id)}],
+            "evidence_refs": refs[::-1] if attempt % 2 else refs,
         })
         await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, report)
 

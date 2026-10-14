@@ -4256,6 +4256,10 @@ class OrchestrationService:
 
     # ---- recovery triggers (SPR 180/184) ---------------------------------------------------
 
+    @staticmethod
+    def _recovery_fingerprint(basis: Any) -> str:
+        return hashlib.sha256(json.dumps(basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
     async def create_recovery_trigger(
         self, db: AsyncSession, run: OrchestrationRun, *, source_kind: str, source_id: uuid.UUID,
         blocker_code: str, summary: str, retry_target: dict[str, Any], fingerprint_basis: Any,
@@ -4265,8 +4269,7 @@ class OrchestrationService:
         from huddleroom.schemas.orchestration_recovery import RecoveryTriggerV1
         from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService, _trigger_key
 
-        fingerprint = hashlib.sha256(
-            json.dumps(fingerprint_basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        fingerprint = self._recovery_fingerprint(fingerprint_basis)
         trigger = RecoveryTriggerV1.model_validate({
             "schema_version": 1, "goal_id": str(run.goal_id), "run_id": str(run.id), "source_kind": source_kind,
             "source_id": str(source_id), "blocker_code": blocker_code[:255], "summary": summary[:4_000],
@@ -4631,14 +4634,16 @@ class OrchestrationService:
             return action
         run = await db.get(OrchestrationRun, run_id)
         reason = self._optional_string(request.get("reason")) or "The orchestrator reported a blocker."
-        trigger = await self.open_recovery_lineage(db, run_id, "reported_blocker", "reported_blocker")
-        if trigger is not None:  # repeated reports while a lineage is open join it
+        basis = {"blocker_code": "reported_blocker", "evidence_refs": sorted(
+            (request.get("evidence_refs") or []), key=lambda ref: json.dumps(ref, sort_keys=True, default=str))}
+        trigger = await self.open_recovery_trigger(db, run_id, self._recovery_fingerprint(basis))
+        if trigger is not None:  # repeated reports of the same blocker while its lineage is open join it
             await self._mark_action_completed(db, action, "orchestration_action", trigger.id)
             return action
         trigger, _created = await self.create_recovery_trigger(
             db, run, source_kind="reported_blocker", source_id=decision_id or action.id, blocker_code="reported_blocker",
             summary=reason, retry_target={"kind": "decision_loop"},
-            fingerprint_basis={"evidence_refs": request.get("evidence_refs") or []},
+            fingerprint_basis=basis,
         )
         await self._mark_action_completed(db, action, "orchestration_action", trigger.id if trigger else action.id)
         return action
@@ -5765,7 +5770,8 @@ class OrchestrationService:
         if not wanted:
             return None
         found = set((await db.execute(
-            select(Artifact.id).where(Artifact.id.in_(wanted), Artifact.project_id == project_id)
+            select(Artifact.id).where(Artifact.id.in_(wanted), Artifact.project_id == project_id,
+                                      Artifact.status != "deleted")
         )).scalars())
         return min(wanted - found, key=str) if wanted - found else None
 
