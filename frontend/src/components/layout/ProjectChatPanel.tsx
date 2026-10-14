@@ -8,6 +8,11 @@ import { ErrorRecord } from '@/components/common/ErrorRecord'
 import { StartWorkDialog } from '@/pages/orchestration/StartWorkDialog'
 import type { OrchestrationAuthorization, OrchestrationGoal, OrchestrationConversationFeedbackReason, ProjectChatAction, ProjectChatTurn } from '@/lib/types'
 
+function historicalAllowanceError(code: unknown): string | null {
+  return typeof code === 'string' && ['conversation_disabled', 'conversation_exhausted', 'conversation_allowance_exhausted', 'advisor_disabled', 'advisor_allowance_exhausted'].includes(code)
+    ? `Historical conversation stopped at a retired conversation allowance limit (${code}). Send a new message to ask again.` : null
+}
+
 function reviewEnvelope(action: ProjectChatAction) {
   try { return JSON.parse(action.summary.slice(action.summary.indexOf('\n') + 1)) as {
     contract?: Partial<OrchestrationGoal>; authorization?: OrchestrationAuthorization
@@ -31,10 +36,7 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
   const requestRef = useRef<{ content: string; actionId?: string; contextGoalId: string | null; id: string } | null>(null)
   const [announcement, setAnnouncement] = useState('')
   useEffect(() => { if (focusRequest && active) textareaRef.current?.focus() }, [focusRequest, active])
-  const messageGoalId = replyAction?.goal_id ?? draftGoalId ?? contextGoalId
-  const allowance = messageGoalId ? query.data?.goal_allowances[messageGoalId] : query.data?.allowance
-  const unlimited = allowance && 'unlimited' in allowance && allowance.unlimited
-  const unavailable = !allowance?.enabled || (!unlimited && allowance.remaining <= 0)
+  const unavailable = query.isLoading || query.isError || !query.data
   const send = (content: string, action?: ProjectChatAction, confirming = false) => {
     if (mutation.isPending || !content.trim()) return
     const goalId = action?.goal_id ?? draftGoalId ?? contextGoalId
@@ -72,7 +74,7 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
     <p className="mt-1 text-xs text-huddleroom-text-muted">{turn.historical ? 'Historical · ' : ''}{turn.context_goal_id ? `Goal: ${goalLabel(turn.context_goal_id, turn)}` : 'Project overview'} · {turn.status}</p>
     {turn.source_references.map((source) => <p key={`${source.kind}:${source.id}`} className="break-words text-xs">Source: {source.kind.replace(/_/g, ' ')} · {source.id}</p>)}
     {turn.citations.map((citation) => <Link className="mr-2 text-xs underline" key={`${citation.type}:${citation.id}`} to={citation.type === 'meeting' ? `/meetings/${citation.id}` : `/orchestration/${citation.goal_id ?? citation.id}${citation.type === 'decision' ? `#decision-${citation.id}` : ''}`}>{citation.label}</Link>)}
-    {turn.error && <p role="alert" className="break-words text-huddleroom-status-red">{String(turn.error.message ?? turn.error.code ?? 'Message failed.')}</p>}
+    {turn.error && <p role="alert" className="break-words text-huddleroom-status-red">{historicalAllowanceError(turn.error.code) ?? String(turn.error.message ?? turn.error.code ?? 'Message failed.')}</p>}
     {turn.actions.map((action) => <section key={action.action_id} className="mt-2 rounded border border-huddleroom-border p-2" aria-label={`${action.operation} action`}>
       <p className="font-medium">{action.operation.replace(/_/g, ' ')} · {terminalActionIds.has(action.action_id) ? 'Result recorded' : action.status}</p>
       <p className="break-words text-xs">Goal: {goalLabel(action.goal_id, turn)} ({action.goal_id}) · Run: {action.run_id ?? 'not started'}</p>
@@ -82,7 +84,9 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
     </section>)}
     {turn.receipts.map((receipt) => <p key={receipt.action_id} className="mt-2 break-words text-xs">{receipt.operation.replace(/_/g, ' ')} · {receipt.status}: {receipt.message}{receipt.error_code ? ` (${receipt.error_code})` : ''}</p>)}
     {turn.goal_turn?.investigation && <section className="mt-2 text-xs" aria-label="Investigation">
-      <p>Investigation: {turn.goal_turn.investigation.status}</p><p>{turn.goal_turn.investigation.objective}</p>
+      <p>Investigation: {turn.goal_turn.investigation.status}</p>
+      {turn.goal_turn.investigation.status === 'limited' && <p>Historical investigation stopped at a retired conversation allowance limit. Send a new message to ask again.</p>}
+      {turn.goal_turn.investigation.status === 'interrupted_unknown' && <p>Investigation outcome is unknown. Usage remains held and the orchestrator will not retry it automatically. Send a new message to ask again.</p>}<p>{turn.goal_turn.investigation.objective}</p>
       {turn.goal_turn.investigation.report && <><p>Findings: {turn.goal_turn.investigation.report.findings}</p><p>Uncertainty: {turn.goal_turn.investigation.report.uncertainty}</p></>}
       {turn.goal_turn.investigation.error && <p role="alert">{turn.goal_turn.investigation.error.code}</p>}
       {turn.goal_turn.investigation.sources.map((source, i) => <p className="break-words" key={i}>{source.operation}: {source.reference}</p>)}
@@ -121,8 +125,6 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
       {replyAction && <p className="break-words text-xs">Replying to {replyAction.operation} · Goal {replyAction.goal_id}<Button variant="secondary" onClick={() => setReplyAction(null)}>Clear reply</Button></p>}
       <Textarea ref={textareaRef} label="Message the orchestrator" rows={3} value={draft} disabled={mutation.isPending || unavailable} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); if (!unavailable) send(draft, replyAction ?? undefined) } }} />
       <Button type="submit" disabled={mutation.isPending || unavailable || !draft.trim()}>Send</Button>
-      <p className="text-xs">Charged pool: {messageGoalId ? 'goal conversation' : 'project advisor'} · {allowance ? unlimited ? 'Unlimited' : `${allowance.remaining} remaining` : 'Loading allowance'}</p>
-      {unavailable && <p className="text-xs">New model messages are unavailable. History and prepared confirmations remain available.</p>}
     </form>
     {mutation.isError && <ErrorRecord error={mutation.error} entity="conversation" />}
     {feedback.isError && <ErrorRecord error={feedback.error} entity="feedback" />}

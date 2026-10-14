@@ -69,12 +69,8 @@ export function ProjectAdvisorPanel({ projectId }: { projectId: string }) {
   useEffect(() => { if (query.isError) announceError('Failed to load advisor history. Retry to view answers.') }, [query.isError, announceError])
   useEffect(() => { if (mutation.isError && !errorDismissed) announceError(safeError) }, [mutation.isError, errorDismissed, safeError, announceError])
 
-  const allowance = query.data?.allowance
-  if (query.data && !allowance?.enabled) return null
-
   const unknown = query.isLoading || query.isError || !query.data
-  const exhausted = !unknown && !allowance!.unlimited && allowance!.remaining <= 0
-  const disabled = unknown || exhausted
+  const disabled = unknown
 
   const submit = () => {
     if (disabled || mutation.isPending || !draft.trim()) return
@@ -102,9 +98,7 @@ export function ProjectAdvisorPanel({ projectId }: { projectId: string }) {
         </>}
     <form onSubmit={onSubmit} className="flex min-w-0 flex-col gap-2">
       <Textarea ref={textareaRef} label="Ask the orchestrator" placeholder="Ask about this project…" rows={3} value={draft} disabled={disabled || mutation.isPending} onChange={(event) => setDraft(event.target.value)} onKeyDown={onKeyDown} className="min-w-0 break-words" />
-      <Button type="submit" disabled={disabled || mutation.isPending} className="min-h-11 shrink-0 self-start">{mutation.isPending ? 'Sending…' : 'Send question'}</Button>
-      {!unknown && !allowance!.unlimited && <p className="text-xs text-huddleroom-text-secondary">{`Allowance: ${allowance!.remaining} remaining of ${allowance!.limit}`}</p>}
-      {exhausted && <p className="text-sm text-huddleroom-status-red">Advisor allowance is exhausted. New questions are unavailable.</p>}
+      <Button type="submit" disabled={disabled || mutation.isPending || !draft.trim()} className="min-h-11 shrink-0 self-start">{mutation.isPending ? 'Sending…' : 'Send question'}</Button>
     </form>
     {mutation.isError && !errorDismissed && <div ref={errorRef} tabIndex={-1}><ErrorRecord error={mutation.error} entity="advisor" /></div>}
   </Panel>

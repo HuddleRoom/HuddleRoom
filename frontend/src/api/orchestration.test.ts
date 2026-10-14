@@ -260,7 +260,7 @@ describe('orchestration API', () => {
   })
 
   it('loads and submits a conversation through the goal-scoped endpoint', async () => {
-    const history = { items: [], total: 0, omitted: 0, allowance: { enabled: true, limit: 1000, used: 0, remaining: 1000 } }
+    const history = { items: [], total: 0, omitted: 0, allowance: { enabled: true, unlimited: false, limit: 1000, used: 0, remaining: 1000 } }
     const turn = { status: 'completed' }
     const fetchMock = vi.fn().mockResolvedValueOnce(okJson(history)).mockResolvedValueOnce(okJson(turn))
     vi.stubGlobal('fetch', fetchMock)

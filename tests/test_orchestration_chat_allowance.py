@@ -94,28 +94,39 @@ async def test_admission_counts_calls_and_allows_prepared_confirmation(
         assert stored.accounting_snapshot["unknown_usage"] is False
 
 
-@pytest.mark.parametrize("kind", ["disabled", "exhausted", "unknown"])
-async def test_project_disabled_exhausted_unknown_prevent_new_calls(
-    kind, test_engine, advisor_session, advisor_project, advisor_user, monkeypatch
+@pytest.mark.parametrize("limit", [0, 1, -1])
+@pytest.mark.parametrize("historical_unknown", [False, True])
+async def test_spr209_project_chat_ignores_allowance(
+    limit, historical_unknown, test_engine, advisor_session, advisor_project, advisor_user, monkeypatch
 ):
-    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 0 if kind == "disabled" else 1000)
-    if kind != "disabled":
-        advisor_session.add(ProjectAdvisorTurn(project_id=advisor_project.id, actor_id=advisor_user.id,
-            question="old", answer="old", status="completed", tokens_used=None if kind == "unknown" else 1000))
-        await advisor_session.commit()
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", limit)
+    old = ProjectAdvisorTurn(project_id=advisor_project.id, actor_id=advisor_user.id,
+        question="old", answer=None if historical_unknown else "old", status="failed" if historical_unknown else "completed",
+        tokens_used=None if historical_unknown else 1000)
+    advisor_session.add(old)
+    await advisor_session.commit()
     turn = await _new_turn(advisor_session, advisor_project.id, advisor_user.id)
     calls = []
 
     async def completion(**kwargs):
         calls.append(kwargs)
-        raise AssertionError("provider must not be called without allowance")
+        return _response({"intent": "question", "answer": "Project answer"})
 
-    try:
-        result = await _service(test_engine, completion).interpret(turn.id)
-        assert result.operation is None
-    except ConversationDomainError:
-        pass
-    assert calls == []
+    interpreter = _service(test_engine, completion)
+    result = await interpreter.interpret(turn.id)
+    replay = await interpreter.interpret(turn.id)
+    assert result.answer == "Project answer" and result.operation is None and replay == result and len(calls) == 1
+    async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
+        source = await db.get(ProjectAdvisorTurn, turn.source_record_id)
+        assert source.status == "completed" and source.tokens_used == 10
+        stored = await db.get(ProjectChatTurn, turn.id)
+        assert stored.source_kind == "project_advisor"
+        assert stored.accounting_snapshot["limit_tokens"] == -1 and stored.accounting_snapshot["calls_admitted"] == 1
+        assert stored.accounting_snapshot["tokens_observed"] == 10 and stored.accounting_snapshot["unknown_usage"] is False
+        saved_old = await db.get(ProjectAdvisorTurn, old.id)
+        assert saved_old.tokens_used == old.tokens_used and saved_old.status == old.status
+        assert await db.scalar(select(func.count()).select_from(OrchestrationGoal)) == 0
+        assert await db.scalar(select(func.count()).select_from(OrchestrationAction)) == 0
 
 
 async def test_unknown_project_provider_outcome_is_never_redispatched(
@@ -202,7 +213,7 @@ async def test_advisor_source_committed_before_index_link_recovers_without_dispa
         assert stored.accounting_snapshot["unknown_usage"] is False
 
 
-async def test_project_repair_denied_when_first_response_usage_consumes_pool(
+async def test_spr209_project_repair_counts_every_attempt_after_retired_pool_exhaustion(
     test_engine, advisor_session, advisor_project, advisor_user, monkeypatch
 ):
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 100_000)
@@ -214,19 +225,19 @@ async def test_project_repair_denied_when_first_response_usage_consumes_pool(
         return {"choices": [{"message": {"content": "not-json"}}],
                 "usage": {"prompt_tokens": 100_000, "completion_tokens": 0}}
 
-    with pytest.raises(ConversationDomainError):
+    with pytest.raises(ValueError):
         await _service(test_engine, completion).interpret(turn.id)
-    assert len(calls) == 1
+    assert len(calls) == 3
     async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
         source = await db.get(ProjectAdvisorTurn, turn.source_record_id)
-        assert source.tokens_used == 100_000
+        assert source.tokens_used == 300_000
         stored = await db.get(ProjectChatTurn, turn.id)
-        assert stored.accounting_snapshot["calls_admitted"] == 1
+        assert stored.accounting_snapshot["calls_admitted"] == 3
         assert stored.accounting_snapshot["tokens_observed"] == source.tokens_used
         assert stored.accounting_snapshot["unknown_usage"] is False
 
 
-async def test_project_unknown_usage_denies_repair_without_free_call(
+async def test_spr209_project_unknown_usage_repair_is_bounded_and_unknown(
     test_engine, advisor_session, advisor_project, advisor_user, monkeypatch
 ):
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 100_000)
@@ -237,14 +248,14 @@ async def test_project_unknown_usage_denies_repair_without_free_call(
         calls.append(kwargs)
         return {"choices": [{"message": {"content": "not-json"}}]}
 
-    with pytest.raises(ConversationDomainError):
+    with pytest.raises(ValueError):
         await _service(test_engine, completion).interpret(turn.id)
-    assert len(calls) == 1
+    assert len(calls) == 3
     async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
         assert (await db.get(ProjectAdvisorTurn, turn.source_record_id)).tokens_used is None
         stored = await db.get(ProjectChatTurn, turn.id)
         assert stored.accounting_snapshot["unknown_usage"] is True
-        assert stored.accounting_snapshot["calls_admitted"] == 1
+        assert stored.accounting_snapshot["calls_admitted"] == 3
 
 
 async def test_goal_context_charges_goal_pool_and_keeps_project_disabled(
@@ -290,24 +301,29 @@ async def test_goal_context_charges_goal_pool_and_keeps_project_disabled(
 
 
 @pytest.mark.parametrize("limit", [0, 1])
-async def test_goal_disabled_or_exhausted_never_swaps_to_advisor(
+async def test_goal_retired_limit_never_swaps_to_advisor(
     limit, test_engine, conversation_goal_run, test_user, db_session, monkeypatch
 ):
+    from huddleroom.models.orchestration_conversation import ConversationReservation
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 100_000)
     monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", limit)
     goal, _ = conversation_goal_run
     await db_session.commit()
     async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
-        turn = await _new_turn(db, goal.project_id, test_user.id, "Resume this goal", goal.id)
+        turn = await _new_turn(db, goal.project_id, test_user.id, "What changed?", goal.id)
     calls = []
 
     async def completion(**kwargs):
         calls.append(kwargs)
-        raise AssertionError("goal allowance failure cannot swap charge scope")
+        return {"choices": [{"message": {"content": json.dumps({"intent": "question", "answer": "Goal answer"})}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
 
-    with pytest.raises(ConversationDomainError):
-        await _service(test_engine, completion).interpret(turn.id)
-    assert calls == []
+    result = await _service(test_engine, completion).interpret(turn.id)
+    assert result.answer == "Goal answer" and len(calls) == 1
+    async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
+        reservation = await db.scalar(select(ConversationReservation).where(ConversationReservation.response_id == turn.source_record_id))
+        assert reservation.status == "settled" and reservation.settled_tokens == 5 and reservation.ceiling_snapshot == 0
+        assert await db.scalar(select(func.count()).select_from(ProjectAdvisorTurn)) == 0
 
 
 async def test_hanging_advisor_times_out_releases_claim_lock_and_never_redispatches(
@@ -327,6 +343,8 @@ async def test_hanging_advisor_times_out_releases_claim_lock_and_never_redispatc
 
     async def completion(**kwargs):
         calls.append(kwargs)
+        if len(calls) > 1:
+            return _response({"intent": "question", "answer": "Fresh answer"})
         async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
             stored = await db.get(ProjectChatTurn, turn.id)
             assert stored.deadline_at is not None and stored.provider_status == "running"
@@ -337,9 +355,8 @@ async def test_hanging_advisor_times_out_releases_claim_lock_and_never_redispatc
         await service.interpret(turn.id)
     replay = await original_wait_for(service.interpret(turn.id), timeout=1)
     assert replay.operation is None
-    with pytest.raises(ConversationDomainError):
-        await original_wait_for(service.interpret(next_turn.id), timeout=1)
-    assert len(calls) == 1
+    fresh = await original_wait_for(service.interpret(next_turn.id), timeout=1)
+    assert fresh.answer == "Fresh answer" and len(calls) == 2
     async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
         stored = await db.get(ProjectChatTurn, turn.id)
         assert stored.provider_status == "interrupted_unknown"
@@ -392,7 +409,7 @@ async def test_goal_chat_keeps_investigation_continuation_and_reservations(
         assert first.settled_tokens == second.settled_tokens == 9
 
 
-async def test_concurrent_project_turns_cannot_overadmit_same_pool(
+async def test_spr209_concurrent_project_turns_remain_serialized_and_independently_counted(
     test_engine, advisor_session, advisor_project, advisor_user, monkeypatch
 ):
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 100_000)
@@ -413,5 +430,9 @@ async def test_concurrent_project_turns_cannot_overadmit_same_pool(
     pending_second = asyncio.create_task(service.interpret(second.id))
     release.set()
     results = await asyncio.gather(pending_first, pending_second, return_exceptions=True)
-    assert len(calls) == 1
-    assert sum(isinstance(result, ConversationDomainError) for result in results) == 1
+    assert len(calls) == 2
+    assert all(result.answer == "Done" for result in results)
+    async with async_sessionmaker(test_engine, expire_on_commit=False)() as db:
+        sources = (await db.scalars(select(ProjectAdvisorTurn))).all()
+        assert len(sources) == 2 and all(source.status == "completed" and source.tokens_used == 100_000 for source in sources)
+        assert await advisor_allowance_used(db, advisor_project.id, advisor_user.id) == 200_000

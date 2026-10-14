@@ -116,7 +116,7 @@ vi.mock('@/api/orchestration', () => ({
   // toc-entry open; unused when nothing is opened in these static-render tests.
   useOrchestrationMemorySection: () => ({ data: undefined, isLoading: false, isError: false }),
   useOrchestrationConversation: () => ({
-    data: { items: [], total: 0, omitted: 0, allowance: { enabled: true, limit: 100, used: 0, remaining: 100 }, steering: { enabled: false, eligibility: 'unstarted', eligibility_reason: null, inbox_version: 0, direction_version: 0, requests: [], proposals: [] } },
+    data: { items: [], total: 0, omitted: 0, allowance: { enabled: true, unlimited: false, limit: 100, used: 0, remaining: 100 }, steering: { enabled: false, eligibility: 'unstarted', eligibility_reason: null, inbox_version: 0, direction_version: 0, requests: [], proposals: [] } },
     isLoading: false, isError: false, refetch: vi.fn(),
   }),
   useSubmitOrchestrationConversation: () => ({ isPending: false, isError: false, error: null, mutate: vi.fn() }),

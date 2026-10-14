@@ -391,7 +391,7 @@ def test_toml_sourced_setting_names_reference_the_config_file(tmp_path):
     assert "auth_enabled" in result.stderr
 
 
-def test_config_toml_example_covers_all_settings_and_provider_keys():
+def test_config_toml_example_covers_active_settings_and_provider_keys():
     from huddleroom.config import PROVIDER_ENV_KEYS, Settings
 
     contents = (ROOT / "config.toml.example").read_text(encoding="utf-8")
@@ -399,7 +399,12 @@ def test_config_toml_example_covers_all_settings_and_provider_keys():
         re.findall(r"(?m)^\s*#\s*([A-Za-z_]\w*)\s*=", contents)
     )
 
-    assert set(Settings.model_fields) <= documented_names
+    retired_allowance_settings = {
+        "orchestration_conversation_allowance_tokens",
+        "orchestration_advisor_allowance_tokens",
+    }
+    assert (set(Settings.model_fields) - retired_allowance_settings) <= documented_names
+    assert retired_allowance_settings.isdisjoint(documented_names)
     assert PROVIDER_ENV_KEYS <= documented_names
 
 

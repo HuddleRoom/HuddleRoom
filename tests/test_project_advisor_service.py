@@ -93,7 +93,7 @@ async def test_ask_succeeds_under_allowance(advisor_session, advisor_user, advis
 
 
 @pytest.mark.asyncio
-async def test_unknown_usage_is_persisted_and_blocks_a_finite_allowance(
+async def test_unknown_usage_is_persisted_and_does_not_block_fresh_question(
     advisor_session, advisor_user, advisor_project, monkeypatch
 ):
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1_000)
@@ -105,8 +105,10 @@ async def test_unknown_usage_is_persisted_and_blocks_a_finite_allowance(
     turn = await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What changed?")
 
     assert turn.tokens_used is None
-    with pytest.raises(ConversationDomainError, match="allowance"):
-        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What next?")
+    fresh = await OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(_canned_response(
+        {"answer": "Fresh answer", "citations": [], "off_topic": False}))).ask(
+            advisor_session, advisor_project.id, advisor_user.id, "What next?")
+    assert fresh.status == "completed" and fresh.tokens_used == 30
 
 
 @pytest.mark.asyncio
@@ -163,7 +165,7 @@ async def test_ask_accepts_fenced_json_response(advisor_session, advisor_user, a
 
 
 @pytest.mark.asyncio
-async def test_ask_raises_when_allowance_at_limit(advisor_session, advisor_user, advisor_project, monkeypatch):
+async def test_ask_succeeds_when_retired_allowance_at_limit(advisor_session, advisor_user, advisor_project, monkeypatch):
     from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
 
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 100)
@@ -174,12 +176,10 @@ async def test_ask_raises_when_allowance_at_limit(advisor_session, advisor_user,
         )
     )
     await advisor_session.commit()
-    service = OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(_canned_response({})))
-
-    with pytest.raises(ConversationDomainError) as exc_info:
-        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What's next?")
-
-    assert exc_info.value.code == "advisor_allowance_exhausted"
+    service = OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(_canned_response(
+        {"answer": "Fresh answer", "citations": [], "off_topic": False})))
+    turn = await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What's next?")
+    assert turn.status == "completed" and turn.tokens_used == 30
 
 
 @pytest.mark.asyncio
@@ -221,19 +221,18 @@ async def test_finite_allowance_serializes_concurrent_asks(advisor_session, advi
 
     first, second = await asyncio.gather(ask_once(), ask_once(), return_exceptions=True)
 
-    assert sum(isinstance(result, ConversationDomainError) for result in (first, second)) == 1
-    assert sum(getattr(result, "tokens_used", 0) for result in (first, second)) == 30
+    assert all(result.status == "completed" for result in (first, second))
+    assert first.id != second.id
+    assert sum(result.tokens_used for result in (first, second)) == 60
 
 
 @pytest.mark.asyncio
-async def test_ask_raises_when_allowance_disabled(advisor_session, advisor_user, advisor_project, monkeypatch):
+async def test_ask_succeeds_when_retired_allowance_disabled(advisor_session, advisor_user, advisor_project, monkeypatch):
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 0)
-    service = OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(_canned_response({})))
-
-    with pytest.raises(ConversationDomainError) as exc_info:
-        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What's next?")
-
-    assert exc_info.value.code == "advisor_disabled"
+    service = OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(_canned_response(
+        {"answer": "Fresh answer", "citations": [], "off_topic": False})))
+    turn = await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What's next?")
+    assert turn.status == "completed" and turn.tokens_used == 30
 
 
 @pytest.mark.asyncio
@@ -329,7 +328,7 @@ async def test_ask_repairs_invalid_decision_citation_and_counts_each_attempt(
 
 
 @pytest.mark.asyncio
-async def test_repair_then_backend_failure_persists_unknown_and_blocks_finite_allowance(
+async def test_repair_then_backend_failure_preserves_unknown_without_blocking_fresh_question(
     advisor_session, advisor_user, advisor_project, monkeypatch
 ):
     from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
@@ -348,8 +347,10 @@ async def test_repair_then_backend_failure_persists_unknown_and_blocks_finite_al
         await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What changed?")
 
     assert (await advisor_session.scalars(select(ProjectAdvisorTurn))).one().tokens_used is None
-    with pytest.raises(ConversationDomainError, match="allowance"):
-        await service.ask(advisor_session, advisor_project.id, advisor_user.id, "What next?")
+    fresh = await OrchestrationProjectAdvisorService(completion_fn=_fake_completion_fn(_canned_response(
+        {"answer": "Fresh answer", "citations": [], "off_topic": False}))).ask(
+            advisor_session, advisor_project.id, advisor_user.id, "What next?")
+    assert fresh.status == "completed" and fresh.tokens_used == 30
 
 
 @pytest.mark.asyncio
@@ -446,3 +447,108 @@ async def test_history_returns_last_20_turns_newest_first(
     assert len(turns) == 20
     assert turns[0].question == "q24"
     assert turns[-1].question == "q5"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1, -1])
+@pytest.mark.parametrize("historical_unknown", [False, True])
+async def test_spr209_advisor_question_ignores_allowance(
+    advisor_session, advisor_user, advisor_project, monkeypatch, limit, historical_unknown,
+):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn, advisor_allowance_used
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", limit)
+    old = ProjectAdvisorTurn(project_id=advisor_project.id, actor_id=advisor_user.id,
+        question="old", answer=None if historical_unknown else "old answer",
+        status="failed" if historical_unknown else "completed", tokens_used=None if historical_unknown else 100_000)
+    advisor_session.add(old)
+    await advisor_session.commit()
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        return _canned_response({"answer": "Fresh answer", "citations": [], "off_topic": False})
+
+    turn = await OrchestrationProjectAdvisorService(completion_fn=completion).ask(
+        advisor_session, advisor_project.id, advisor_user.id, "Fresh question")
+    assert turn.status == "completed" and turn.answer == "Fresh answer" and turn.tokens_used == 30
+    assert len(calls) == 1
+    await advisor_session.refresh(old)
+    assert (old.status, old.tokens_used, old.answer) == (
+        "failed" if historical_unknown else "completed", None if historical_unknown else 100_000,
+        None if historical_unknown else "old answer")
+    assert await advisor_allowance_used(advisor_session, advisor_project.id, advisor_user.id) == (
+        None if historical_unknown else 100_030)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_usage", [False, True])
+@pytest.mark.parametrize("valid_repair", [False, True])
+async def test_spr209_advisor_repair_remains_bounded_and_counted(
+    advisor_session, advisor_user, advisor_project, monkeypatch, missing_usage, valid_repair,
+):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 1)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        response = _canned_response({"answer": "Repaired answer", "citations": [], "off_topic": False}, 2, 3)
+        if len(calls) == 1 or not valid_repair:
+            response["choices"][0]["message"]["content"] = "not-json"
+        if missing_usage:
+            response.pop("usage")
+        return response
+
+    service = OrchestrationProjectAdvisorService(completion_fn=completion)
+    if valid_repair:
+        turn = await service.ask(advisor_session, advisor_project.id, advisor_user.id, "Question")
+        assert turn.answer == "Repaired answer" and turn.status == "completed"
+    else:
+        with pytest.raises(ValueError):
+            await service.ask(advisor_session, advisor_project.id, advisor_user.id, "Question")
+        turn = (await advisor_session.scalars(select(ProjectAdvisorTurn))).one()
+        assert turn.status == "failed"
+    assert len(calls) == (2 if valid_repair else 3)
+    assert turn.tokens_used == (None if missing_usage else 5 * len(calls))
+
+
+@pytest.mark.asyncio
+async def test_spr209_pending_advisor_claim_blocks_until_terminal(
+    test_engine, advisor_session, advisor_user, advisor_project, monkeypatch,
+):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+    from huddleroom.models.orchestration_chat import ProjectChatTurn
+    from tests.test_orchestration_chat_allowance import _new_turn, _service, _response
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", -1)
+    held = ProjectAdvisorTurn(project_id=advisor_project.id, actor_id=advisor_user.id,
+        question="pending claim", status="pending", tokens_used=None)
+    advisor_session.add(held)
+    await advisor_session.commit()
+    blocked = await _new_turn(advisor_session, advisor_project.id, advisor_user.id)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        return _response({"intent": "question", "answer": "Fresh answer"})
+
+    interpreter = _service(test_engine, completion)
+    with pytest.raises(ConversationDomainError) as error:
+        await interpreter.interpret(blocked.id)
+    assert error.value.code == "advisor_provider_claim_pending" and error.value.status_code == 409
+    assert calls == []
+    await advisor_session.refresh(held)
+    held.status, held.error = "failed", "terminal unknown fixture"
+    await advisor_session.commit()
+    fresh = await _new_turn(advisor_session, advisor_project.id, advisor_user.id, "Fresh question")
+    result = await interpreter.interpret(fresh.id)
+    assert result.answer == "Fresh answer" and len(calls) == 1
+    replay = await interpreter.interpret(blocked.id)
+    assert replay.operation is None and len(calls) == 1
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as db:
+        row = await db.get(ProjectChatTurn, fresh.id)
+        assert row.accounting_snapshot["limit_tokens"] == -1
+        assert row.accounting_snapshot["calls_admitted"] == 1
+        assert row.accounting_snapshot["tokens_observed"] == 10
+        assert row.accounting_snapshot["unknown_usage"] is False
+        assert (await db.get(ProjectAdvisorTurn, held.id)).tokens_used is None

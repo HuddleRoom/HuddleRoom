@@ -228,7 +228,7 @@ async def test_upgrade_preserves_sources_and_visibility(tmp_path, monkeypatch):
         assert ledger.requests[1].request_id == seeded["active_request"]
         assert ledger.requests[1].status == "applied"
         assert first.goal_allowances[str(seeded["goal"])].used == 115
-        assert first.allowance.remaining == 0  # Unknown historical advisor usage stays unknown/exhausted.
+        assert first.allowance.remaining == -1  # Historical unknown accounting does not limit admission.
         async with sessions() as db:
             other = await history(db, seeded["project"], seeded["actors"][1])
         other_content = {item.content: item for item in other.items}
@@ -285,3 +285,21 @@ async def test_history_rejects_missing_project_without_indexing(db_session, test
     with pytest.raises(ConversationDomainError) as error:
         await history(db_session, uuid.uuid4(), test_user.id)
     assert error.value.code == "project_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1, -1])
+async def test_spr209_project_unified_history_is_unlimited(db_session, monkeypatch, limit):
+    from huddleroom.config import settings
+    from huddleroom.services.orchestration_chat_history import history
+    from huddleroom.models.orchestration_advisor import advisor_allowance_used
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", limit)
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", max(limit, 0))
+    seeded = await _seed_sources(db_session, commit=False)
+    result = await history(db_session, seeded["project"], seeded["actors"][0])
+    assert result.allowance.model_dump() == {"enabled": True, "unlimited": True, "limit": -1, "remaining": -1}
+    goal_allowance = result.goal_allowances[str(seeded["goal"])]
+    assert goal_allowance.model_dump() == {"enabled": True, "unlimited": True, "limit": -1, "remaining": -1, "used": 115}
+    assert await advisor_allowance_used(db_session, seeded["project"], seeded["actors"][0]) is None
+    assert {item.content for item in result.items} == {"private A", "unknown usage", "pending advisor",
+        "shared 1", "shared 2", "shared 3", "shared 4"}

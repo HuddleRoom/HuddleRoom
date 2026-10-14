@@ -40,6 +40,59 @@ from huddleroom.main import create_app
 ANON_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
 
+@pytest.mark.parametrize("limit", [0, 1])
+@pytest.mark.parametrize("historical_unknown", [False, True])
+async def test_spr209_goal_direct_question_ignores_allowance(
+    conversation_client, conversation_goal_run, db_session, monkeypatch, test_engine, limit, historical_unknown,
+):
+    from huddleroom.config import settings
+    goal, run = conversation_goal_run
+    await db_session.commit()
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1 and historical_unknown:
+            raise TimeoutError("historical unknown outcome")
+        return {"choices": [{"message": {"content": "Safe answer"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
+
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    provider = OrchestrationConversationService(factory, completion, orchestration_service=OrchestrationService())
+    monkeypatch.setattr(goals_router, "conversation_service", provider)
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 100_000)
+    url = f"/api/v1/projects/{goal.project_id}/orchestration/goals/{goal.id}/conversation"
+    old_payload = {"client_request_id": str(uuid.uuid4()), "content": "Old question"}
+    old = await conversation_client.post(url, json=old_payload)
+    assert old.status_code == 200
+    old_id = uuid.UUID(old.json()["response_id"])
+    async with factory() as db:
+        old_reservation = await db.get(ConversationReservation, conversation_reservation_id(old_id))
+        old_state = (old_reservation.status, old_reservation.reserved_tokens, old_reservation.ceiling_snapshot)
+        assert old_reservation.status == ("held_unknown" if historical_unknown else "settled")
+        execution_before = dict((await db.get(type(run), run.id)).budget_state)
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", limit)
+    old_replay = await conversation_client.post(url, json=old_payload)
+    assert old_replay.status_code == 200 and old_replay.json()["response_id"] == old.json()["response_id"]
+    assert len(calls) == 1
+    payload = {"client_request_id": str(uuid.uuid4()), "content": "Fresh question"}
+    response = await conversation_client.post(url, json=payload)
+    assert response.status_code == 200 and response.json()["answer"] == "Safe answer"
+    replay = await conversation_client.post(url, json=payload)
+    assert replay.status_code == 200 and replay.json()["response_id"] == response.json()["response_id"]
+    assert replay.json()["answer"] == response.json()["answer"]
+    conflict = await conversation_client.post(url, json={**payload, "content": "Changed question"})
+    assert conflict.status_code == 409 and len(calls) == 2
+    async with factory() as db:
+        old_reservation = await db.get(ConversationReservation, conversation_reservation_id(old_id))
+        assert (old_reservation.status, old_reservation.reserved_tokens, old_reservation.ceiling_snapshot) == old_state
+        rows = (await db.scalars(select(ConversationReservation))).all()
+        assert len(rows) == 2
+        fresh = next(row for row in rows if row.response_id != old_id)
+        assert fresh.status == "settled" and fresh.settled_tokens == 5 and fresh.ceiling_snapshot == 0
+        assert (await db.get(type(run), run.id)).budget_state == execution_before
+
+
 def _contains_forbidden(value, forbidden, values=()):
     if isinstance(value, dict):
         return any(key in forbidden or _contains_forbidden(item, forbidden, values) for key, item in value.items())
@@ -293,7 +346,7 @@ async def test_submit_rejects_an_investigation_request_field_before_recovery(
     recover.assert_not_awaited()
 
 
-async def test_history_returns_latest_fifty_in_order_and_current_actor_allowance(
+async def test_spr209_goal_history_is_unlimited(
     conversation_client, conversation_goal_run, test_user, db_session
 ):
     goal, run = conversation_goal_run
@@ -376,7 +429,7 @@ async def test_history_returns_latest_fifty_in_order_and_current_actor_allowance
     )
     assert body["items"][0]["context_manifest"]["sources"][0]["source"] == "goal"
     assert all(item["investigation"] is None for item in body["items"])
-    assert body["allowance"] == {"enabled": True, "limit": 1_000, "used": 100, "remaining": 900}
+    assert body["allowance"] == {"enabled": True, "unlimited": True, "limit": -1, "used": 100, "remaining": -1}
 
 
 async def test_history_projects_every_investigation_status_with_only_safe_manifest_metadata(
@@ -509,7 +562,7 @@ async def test_history_projects_every_investigation_status_with_only_safe_manife
     )
 
 
-async def test_history_allowance_combines_current_actor_reservations_from_both_tables(
+async def test_spr209_goal_history_preserves_actor_accounting(
     conversation_client, conversation_goal_run, test_user, db_session, monkeypatch
 ):
     """Breaks if either reservation table mischarges a current actor lifecycle state."""
@@ -622,7 +675,7 @@ async def test_history_allowance_combines_current_actor_reservations_from_both_t
 
     assert response.status_code == 200
     assert response.json()["allowance"] == {
-        "enabled": True, "limit": 100, "used": 150, "remaining": 0,
+        "enabled": True, "unlimited": True, "limit": -1, "used": 150, "remaining": -1,
     }
 
 
@@ -657,11 +710,11 @@ def test_openapi_keeps_conversation_as_the_only_investigation_surface():
 @pytest.mark.parametrize(
     ("allowance", "content", "status", "code"),
     [
-        (0, "question", 409, "conversation_disabled"),
-        (1, "question", 429, "conversation_exhausted"),
+        (0, "question", 200, None),
+        (1, "question", 200, None),
     ],
 )
-async def test_submit_maps_allowance_errors_to_stable_detail(
+async def test_submit_ignores_retired_allowance_settings(
     conversation_client, conversation_goal_run, db_session, monkeypatch, allowance, content, status, code
 ):
     goal, _ = conversation_goal_run
@@ -677,7 +730,7 @@ async def test_submit_maps_allowance_errors_to_stable_detail(
     )
 
     assert response.status_code == status
-    assert response.json()["detail"]["code"] == code
+    assert response.json()["answer"] == "Safe answer" and code is None
 
 
 async def test_submit_closes_request_session_before_provider_dispatch(
@@ -800,8 +853,9 @@ async def test_completed_replay_survives_later_disable(
 
     assert replay.status_code == 200
     assert replay.json()["response_id"] == first.json()["response_id"]
-    assert new.status_code == 409
-    assert new.json()["detail"]["code"] == "conversation_disabled"
+    assert new.status_code == 200
+    assert new.json()["answer"] == "Safe answer"
+    assert new.json()["response_id"] != first.json()["response_id"]
 
 
 async def test_submit_maps_idempotency_conflict_to_stable_detail(

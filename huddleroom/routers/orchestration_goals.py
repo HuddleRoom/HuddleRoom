@@ -325,13 +325,13 @@ async def _steering_ledger(
 async def _conversation_allowance(
     db: AsyncSession, goal_id: uuid.UUID, actor_id: uuid.UUID
 ) -> OrchestrationConversationAllowanceResponse:
-    limit = settings.orchestration_conversation_allowance_tokens
     used = await conversation_allowance_used(db, goal_id, actor_id)
     return OrchestrationConversationAllowanceResponse(
-        enabled=limit > 0,
-        limit=limit,
+        enabled=True,
+        unlimited=True,
+        limit=-1,
         used=used,
-        remaining=max(limit - used, 0),
+        remaining=-1,
     )
 
 

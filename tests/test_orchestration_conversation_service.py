@@ -50,6 +50,101 @@ from huddleroom.services.orchestration_conversation_service import (
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1])
+@pytest.mark.parametrize("historical_unknown", [False, True])
+async def test_spr209_goal_question_ignores_allowance(
+    test_engine, conversation_goal_run, test_user, db_session, monkeypatch, limit, historical_unknown,
+):
+    goal, run = conversation_goal_run
+    await db_session.commit()
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 100_000)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1 and historical_unknown:
+            raise TimeoutError("unverifiable historical outcome")
+        return {"choices": [{"message": {"content": "Fresh answer"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
+
+    service = _service(test_engine, completion)
+    old_request = uuid.uuid4()
+    old = await service.submit(goal.project_id, goal.id, test_user.id, old_request, "Old question")
+    async with _factory(test_engine)() as db:
+        reservation = await db.get(ConversationReservation, conversation_reservation_id(old.response.id))
+        old_state = (reservation.status, reservation.reserved_tokens, reservation.ceiling_snapshot)
+        execution_before = dict((await db.get(type(run), run.id)).budget_state)
+        assert reservation.status == ("held_unknown" if historical_unknown else "settled")
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", limit)
+    replay = await service.submit(goal.project_id, goal.id, test_user.id, old_request, "Old question")
+    assert replay.response.status == old.response.status and len(calls) == 1
+    request_id = uuid.uuid4()
+    fresh = await service.submit(goal.project_id, goal.id, test_user.id, request_id, "Fresh question")
+    assert fresh.response.status == "completed" and fresh.response.answer == "Fresh answer"
+    replay = await service.submit(goal.project_id, goal.id, test_user.id, request_id, "Fresh question")
+    assert replay.response.id == fresh.response.id and len(calls) == 2
+    with pytest.raises(ConversationDomainError) as conflict:
+        await service.submit(goal.project_id, goal.id, test_user.id, request_id, "Changed content")
+    assert conflict.value.status_code == 409
+    async with _factory(test_engine)() as db:
+        reservation = await db.get(ConversationReservation, conversation_reservation_id(old.response.id))
+        assert (reservation.status, reservation.reserved_tokens, reservation.ceiling_snapshot) == old_state
+        fresh_reservation = await db.get(ConversationReservation, conversation_reservation_id(fresh.response.id))
+        assert fresh_reservation.ceiling_snapshot == 0 and fresh_reservation.settled_tokens == 5
+        assert (await db.get(type(run), run.id)).budget_state == execution_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1])
+async def test_spr209_investigation_ignores_allowance_preserves_accounting(
+    test_engine, conversation_goal_run, test_user, db_session, monkeypatch, tmp_path, limit,
+):
+    goal, _ = conversation_goal_run
+    workspace = tmp_path / "spr209-investigation"
+    workspace.mkdir()
+    (workspace / "risk.txt").write_text("gate pending\n", encoding="utf-8")
+    await _set_workspace(db_session, goal.project_id, workspace)
+    await db_session.commit()
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 100_000)
+
+    async def unknown_completion(**_kwargs):
+        raise TimeoutError("historical unknown outcome")
+
+    old = await _service(test_engine, unknown_completion).submit(
+        goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Historical question")
+    async with _factory(test_engine)() as db:
+        held = await db.get(ConversationReservation, conversation_reservation_id(old.response.id))
+        assert held.status == "held_unknown"
+        old_state = (held.status, held.reserved_tokens, held.ceiling_snapshot)
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", limit)
+    monkeypatch.setattr(settings, "orchestration_conversation_investigation_enabled", True)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return _tool_result()
+        return {"choices": [{"message": {"content": json.dumps({
+            "findings": "Gate is pending.", "uncertainty": "", "sources": ["risk.txt#L1-L1"],
+        })}}], "usage": {"prompt_tokens": 6, "completion_tokens": 3}}
+
+    service = _service(test_engine, completion)
+    request_id = uuid.uuid4()
+    result = await service.submit(goal.project_id, goal.id, test_user.id, request_id, "Investigate risk")
+    assert result.investigation.status == "completed" and result.investigation.report["findings"] == "Gate is pending."
+    replay = await service.submit(goal.project_id, goal.id, test_user.id, request_id, "Investigate risk")
+    assert replay.investigation.id == result.investigation.id and len(calls) == 2
+    async with _factory(test_engine)() as db:
+        first = await db.get(ConversationReservation, conversation_reservation_id(result.response.id))
+        second = await db.get(ConversationInvestigationReservation, conversation_investigation_reservation_id(result.investigation.id))
+        assert first.status == second.status == "settled"
+        assert first.settled_tokens == second.settled_tokens == 9
+        assert first.ceiling_snapshot == second.ceiling_snapshot == 0
+        held = await db.get(ConversationReservation, conversation_reservation_id(old.response.id))
+        assert (held.status, held.reserved_tokens, held.ceiling_snapshot) == old_state
+
+
 def _service(test_engine, completion):
     return OrchestrationConversationService(
         async_sessionmaker(test_engine, expire_on_commit=False),
@@ -355,7 +450,7 @@ async def test_duplicate_returns_running_without_second_provider_call(
 
 
 @pytest.mark.asyncio
-async def test_idempotency_conflict_and_exhaustion_do_not_dispatch(
+async def test_idempotency_conflict_does_not_dispatch_and_legacy_exhaustion_admits(
     test_engine, conversation_goal_run, test_user, db_session, monkeypatch
 ):
     goal, _ = conversation_goal_run
@@ -378,11 +473,8 @@ async def test_idempotency_conflict_and_exhaustion_do_not_dispatch(
     with pytest.raises(ConversationDomainError, match="idempotency_conflict"):
         await service.submit(goal.project_id, goal.id, test_user.id, request_id, "two")
     monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 1)
-    with pytest.raises(ConversationDomainError, match="conversation_exhausted"):
-        await service.submit(
-            goal.project_id, goal.id, test_user.id, uuid.uuid4(), "new"
-        )
-    assert calls == 1
+    fresh = await service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "new")
+    assert fresh.response.status == "completed" and calls == 2
 
 
 @pytest.mark.asyncio
@@ -447,35 +539,29 @@ async def test_history_keeps_the_existing_project_goal_boundary(
 
 
 @pytest.mark.asyncio
-async def test_disabled_and_exhausted_requests_persist_no_new_rows(
+async def test_legacy_zero_and_finite_requests_persist_accounting(
     test_engine, conversation_goal_run, test_user, db_session, monkeypatch
 ):
     goal, _ = conversation_goal_run
     await db_session.commit()
 
     async def completion(**_kwargs):
-        raise AssertionError("disabled/exhausted requests must not dispatch")
+        return {"choices": [{"message": {"content": "answer"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
     service = _service(test_engine, completion)
-    for allowance, code in (
-        (0, "conversation_disabled"),
-        (1, "conversation_exhausted"),
-    ):
-        monkeypatch.setattr(
-            settings, "orchestration_conversation_allowance_tokens", allowance
-        )
-        with pytest.raises(ConversationDomainError, match=code):
-            await service.submit(
-                goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question"
-            )
+    for allowance in (0, 1):
+        monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", allowance)
+        turn = await service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question")
+        assert turn.response.status == "completed"
     async with _factory(test_engine)() as session:
-        assert await session.scalar(select(ConversationMessage)) is None
-        assert await session.scalar(select(ConversationResponse)) is None
-        assert await session.scalar(select(ConversationReservation)) is None
+        assert len((await session.scalars(select(ConversationMessage))).all()) == 2
+        assert len((await session.scalars(select(ConversationResponse))).all()) == 2
+        reservations = (await session.scalars(select(ConversationReservation))).all()
+        assert len(reservations) == 2 and all(row.status == "settled" and row.settled_tokens == 2 for row in reservations)
 
 
 @pytest.mark.asyncio
-async def test_completed_replay_survives_later_disable_but_new_request_is_rejected(
+async def test_completed_replay_survives_retired_disable_and_new_request_completes(
     test_engine, conversation_goal_run, test_user, db_session, monkeypatch
 ):
     goal, _ = conversation_goal_run
@@ -501,15 +587,12 @@ async def test_completed_replay_survives_later_disable_but_new_request_is_reject
     replay = await service.submit(
         goal.project_id, goal.id, test_user.id, request_id, "Question"
     )
-    with pytest.raises(ConversationDomainError, match="conversation_disabled"):
-        await service.submit(
-            goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question"
-        )
-
+    fresh = await service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question")
+    assert fresh.response.status == "completed"
     assert replay.response.id == first.response.id
-    assert calls == 1
+    assert calls == 2
     async with _factory(test_engine)() as session:
-        assert len((await session.scalars(select(ConversationMessage))).all()) == 1
+        assert len((await session.scalars(select(ConversationMessage))).all()) == 2
 
 
 @pytest.mark.asyncio
@@ -1107,7 +1190,7 @@ async def test_trigger_handoff_is_settled_before_direct_investigator_without_act
                 conversation_investigation_reservation_id(expected_id), expected_id, goal.id, test_user.id,
             )
             assert (reservation.status, reservation.reserved_tokens, reservation.ceiling_snapshot) == (
-                "committed", _investigation_demand(payload), 50_000,
+                "committed", _investigation_demand(payload), 0,
             )
             observed.update(response=response, chat=chat, investigation=investigation, payload=payload)
         assert kwargs == {
@@ -1491,7 +1574,6 @@ async def test_known_excess_chat_usage_holds_only_chat_authority_before_investig
 
 @pytest.mark.parametrize(("workspace_exists", "allowance", "code", "status"), (
     (False, 50_000, "workspace_unavailable", "unavailable"),
-    (True, 10_000, "conversation_allowance_exhausted", "limited"),
 ))
 @pytest.mark.asyncio
 async def test_trigger_terminal_investigation_failures_do_not_dispatch_investigator(
@@ -1604,13 +1686,14 @@ async def test_chat_reservation_counts_existing_held_investigation_usage(
     async def must_not_dispatch(**_kwargs):
         nonlocal calls
         calls += 1
-        raise AssertionError("shared allowance must block chat before dispatch")
+        return {"choices": [{"message": {"content": "accepted"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
-    with pytest.raises(ConversationDomainError, match="conversation_exhausted"):
-        await _service(test_engine, must_not_dispatch).submit(
-            goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Another question"
-        )
-    assert calls == 0
+    fresh = await _service(test_engine, must_not_dispatch).submit(
+        goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Another question")
+    assert fresh.response.status == "completed" and calls == 1
+    async with _factory(test_engine)() as db:
+        unchanged = await db.get(ConversationInvestigationReservation, held.id)
+        assert unchanged.status == "held_unknown" and unchanged.reserved_tokens == held.reserved_tokens
 
 
 @pytest.mark.parametrize("status", ("reserved", "committed", "settled", "released", "held_unknown"))
@@ -1668,11 +1751,12 @@ async def test_chat_shared_allowance_uses_each_investigation_reservation_lifecyc
     async def blocked(**_kwargs):
         nonlocal calls
         calls += 1
-        raise AssertionError("shared allowance rejection must precede dispatch")
+        return {"choices": [{"message": {"content": "accepted"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
-    with pytest.raises(ConversationDomainError, match="conversation_exhausted"):
-        await _service(test_engine, blocked).submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Blocked")
-    assert calls == 0
+    fresh = await _service(test_engine, blocked).submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Fresh")
+    assert fresh.response.status == "completed" and calls == 1
+    async with _factory(test_engine)() as db:
+        assert await conversation_allowance_used(db, goal.id, test_user.id) == used + 2
 
 
 @pytest.mark.parametrize(("status", "settled_tokens"), (("settled", 7), ("released", 0)))
@@ -1741,18 +1825,18 @@ async def test_chat_shared_pool_uses_partial_actual_or_zero_released_investigati
         return {"choices": [{"message": {"content": "accepted"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
     monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", used + demand - 1)
-    with pytest.raises(ConversationDomainError, match="conversation_exhausted"):
-        await _service(test_engine, completion).submit(
-            goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Boundary question"
-        )
+    admitted = await _service(test_engine, completion).submit(
+        goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Boundary question")
+    assert admitted.response.status == "completed" and calls == 1
     async with _factory(test_engine)() as db:
-        assert await _conversation_row_counts(db) == before
-    assert calls == 0
+        after = await _conversation_row_counts(db)
+        assert after == (before[0] + 1, before[1] + 1, before[2] + 1, before[3], before[4])
+        assert await conversation_allowance_used(db, goal.id, test_user.id) == used + 2
     monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", used + demand)
     accepted = await _service(test_engine, completion).submit(
         goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Boundary question"
     )
-    assert (accepted.response.status, calls) == ("completed", 1)
+    assert (accepted.response.status, calls) == ("completed", 2)
 
 
 @pytest.mark.asyncio
@@ -1883,7 +1967,7 @@ async def test_history_projects_only_viewer_feedback_and_the_frozen_eligibility_
 
 
 @pytest.mark.asyncio
-async def test_one_remaining_reservation_allows_only_one_concurrent_request(
+async def test_retired_remaining_limit_allows_independently_accounted_concurrent_requests(
     test_engine, conversation_goal_run, test_user, db_session, monkeypatch
 ):
     goal, _ = conversation_goal_run
@@ -1905,12 +1989,14 @@ async def test_one_remaining_reservation_allows_only_one_concurrent_request(
         service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question")
     )
     await asyncio.wait_for(entered.wait(), timeout=5)
-    with pytest.raises(ConversationDomainError, match="conversation_exhausted"):
-        await service.submit(
-            goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question"
-        )
+    second = asyncio.create_task(service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question"))
     release.set()
-    assert (await first).response.status == "completed"
+    results = await asyncio.gather(first, second)
+    assert all(turn.response.status == "completed" for turn in results)
+    assert results[0].response.id != results[1].response.id
+    async with _factory(test_engine)() as db:
+        reservations = (await db.scalars(select(ConversationReservation))).all()
+        assert len(reservations) == 2 and all(row.status == "settled" and row.settled_tokens == 2 for row in reservations)
 
 
 @pytest.mark.asyncio
@@ -2230,10 +2316,8 @@ async def test_allowance_is_isolated_by_goal_and_actor(
     await service.submit(
         goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question"
     )
-    with pytest.raises(ConversationDomainError, match="conversation_exhausted"):
-        await service.submit(
-            goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question"
-        )
+    fresh = await service.submit(goal.project_id, goal.id, test_user.id, uuid.uuid4(), "Question")
+    assert fresh.response.status == "completed"
     assert (
         await service.submit(
             goal.project_id, goal.id, _ANON_USER.id, uuid.uuid4(), "Question"
@@ -2530,7 +2614,7 @@ async def test_enabled_chat_exception_lookup_has_a_bounded_unknown_outcome(
             reservation.status, reservation.settled_tokens, reservation.released_tokens,
         ) == (
             conversation_reservation_id(response.id), response.id, goal.id, test_user.id,
-            expected_demand, 50_000, "held_unknown", 0, 0,
+            expected_demand, 0, "held_unknown", 0, 0,
         )
     replay = await service.submit(goal.project_id, goal.id, test_user.id, request_id, "Investigate gate")
     await service.recover_goal(goal.id)

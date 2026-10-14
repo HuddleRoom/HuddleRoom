@@ -487,3 +487,10 @@ LICENSE                     # AGPL-3.0-or-later license
 ## License
 
 HuddleRoom is licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE). If you run a modified version as a network service, the AGPL requires you to offer its source to its users.
+
+Conversation questions and read-only investigations have unlimited application admission.
+Usage accounting, execution budgets, spending authorization, and provider limits still apply.
+The legacy `orchestration_conversation_allowance_tokens` and
+`orchestration_advisor_allowance_tokens` settings (including environment aliases) are
+deprecated no-ops accepted for configuration compatibility. Historical allowance failures
+remain visible; send a new message to ask again.

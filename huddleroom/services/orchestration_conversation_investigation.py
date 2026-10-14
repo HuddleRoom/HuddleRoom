@@ -696,15 +696,13 @@ class ConversationInvestigationService:
                 payload = {"context_version": context_version, "objective": request.objective, "scope": list(data.scope),
                            "sources": list(data.sources), "omissions": list(data.omissions)}
                 demand = self._demand(payload)
-                if await conversation_allowance_used(db, goal_id, actor_id) + demand > settings.orchestration_conversation_allowance_tokens:
-                    return await self._no_dispatch(db, response, ident, goal_id, actor_id, context_version, request, "limited"), True
                 row = ConversationInvestigation(id=ident, response_id=response_id, goal_id=goal_id, actor_id=actor_id,
                     context_version=context_version, objective=request.objective, scope=list(data.scope),
                     input_manifest={**payload, "root_identity": list(data.root_identity)},
                     provider_identity=conversation_investigation_provider_identity(ident))
                 db.add(row); await db.flush()
                 db.add(ConversationInvestigationReservation(id=conversation_investigation_reservation_id(ident), investigation_id=ident,
-                    goal_id=goal_id, actor_id=actor_id, ceiling_snapshot=settings.orchestration_conversation_allowance_tokens,
+                    goal_id=goal_id, actor_id=actor_id, ceiling_snapshot=0,
                     reserved_tokens=demand))
                 return row, True
 

@@ -3,10 +3,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from huddleroom.config import settings
 from huddleroom.database import get_db
 from huddleroom.dependencies import ensure_project_exists, get_current_user
-from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn, advisor_allowance_used
+from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
 from huddleroom.models.user import User
 from huddleroom.schemas.orchestration_advisor import (
     ProjectAdvisorAllowance,
@@ -41,13 +40,7 @@ def _turn_response(turn: ProjectAdvisorTurn) -> ProjectAdvisorTurnResponse:
 
 
 async def _allowance(db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID) -> ProjectAdvisorAllowance:
-    limit = settings.orchestration_advisor_allowance_tokens
-    unlimited = limit < 0
-    used = await advisor_allowance_used(db, project_id, actor_id)
-    remaining = -1 if unlimited else max(0, limit - used) if used is not None else 0
-    return ProjectAdvisorAllowance(
-        enabled=limit != 0, unlimited=unlimited, limit=limit, remaining=remaining
-    )
+    return ProjectAdvisorAllowance(enabled=True, unlimited=True, limit=-1, remaining=-1)
 
 
 @router.post("/conversation", response_model=ProjectAdvisorTurnResponse)

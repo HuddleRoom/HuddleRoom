@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.config import settings
-from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn, advisor_allowance_used
+from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
 from huddleroom.models.project import Project
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_conversation_service import ConversationDomainError
@@ -29,7 +29,7 @@ from huddleroom.services.secret_redaction import redact_secrets
 _CITATION_TYPES = {"goal", "decision", "meeting"}
 _HISTORY_LIMIT = 20
 _MAX_ERROR_LEN = 500
-_finite_advisor_locks: dict[tuple[uuid.UUID, uuid.UUID], asyncio.Lock] = {}
+_advisor_locks: dict[tuple[uuid.UUID, uuid.UUID], asyncio.Lock] = {}
 
 # History ordering: newest-first (created_at desc). The frontend history list
 # renders most-recent turn at the top of the Ask tab.
@@ -125,25 +125,12 @@ class OrchestrationProjectAdvisorService:
         if not question:
             raise ConversationDomainError("invalid_content", 422, "Question is required")
 
-        limit = settings.orchestration_advisor_allowance_tokens
-        if chat_turn_id is not None:
-            from huddleroom.models.orchestration_chat import ProjectChatTurn
-            chat = await db.get(ProjectChatTurn, chat_turn_id)
-            if chat is not None and await db.get(ProjectAdvisorTurn, chat.source_record_id) is not None:
-                lock = _finite_advisor_locks.setdefault((project_id, actor_id), asyncio.Lock())
-                async with lock:
-                    return await self._ask(db, project_id, actor_id, question, limit, chat_turn_id)
-        if limit == 0:
-            raise ConversationDomainError("advisor_disabled", 409, "Project advisor is disabled")
-
-        if limit > 0 or chat_turn_id is not None:
-            lock = _finite_advisor_locks.setdefault((project_id, actor_id), asyncio.Lock())
-            async with lock:
-                return await self._ask(db, project_id, actor_id, question, limit, chat_turn_id)
-        return await self._ask(db, project_id, actor_id, question, limit, chat_turn_id)
+        lock = _advisor_locks.setdefault((project_id, actor_id), asyncio.Lock())
+        async with lock:
+            return await self._ask(db, project_id, actor_id, question, chat_turn_id)
 
     async def _ask(
-        self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str, limit: int,
+        self, db: AsyncSession, project_id: uuid.UUID, actor_id: uuid.UUID, question: str,
         chat_turn_id: uuid.UUID | None = None,
     ) -> ProjectAdvisorTurn:
         chat = None
@@ -169,13 +156,6 @@ class OrchestrationProjectAdvisorService:
                     chat.provider_status = "interrupted_unknown"
                 await db.commit()
                 return source
-        if limit > 0:
-            used = await advisor_allowance_used(db, project_id, actor_id)
-            if used is None or used >= limit:
-                raise ConversationDomainError(
-                    "advisor_allowance_exhausted", 429, "Project advisor allowance is exhausted"
-                )
-
         context = await build_advisor_context(db, project_id)
         project = await db.get(Project, project_id)
         project_dict = (
@@ -223,14 +203,10 @@ class OrchestrationProjectAdvisorService:
                     ProjectAdvisorTurn.project_id == project_id, ProjectAdvisorTurn.actor_id == actor_id,
                     ProjectAdvisorTurn.status == "pending", ProjectAdvisorTurn.id != source.id).limit(1))
                 if pending is not None:
-                    raise ConversationDomainError("advisor_allowance_exhausted", 429, "Project advisor has an unresolved provider claim")
-            if limit > 0:
-                persisted = await advisor_allowance_used(db, project_id, actor_id)
-                if persisted is None or usage_holder["unknown"] or persisted + usage_holder["tokens"] + (len(json.dumps(completion_request, default=str).encode("utf-8")) + 800 if chat is not None else 1) > limit:
-                    raise ConversationDomainError("advisor_allowance_exhausted", 429, "Project advisor allowance is exhausted")
+                    raise ConversationDomainError("advisor_provider_claim_pending", 409, "Project advisor has an unresolved provider claim")
             usage_holder["started"] += 1
             if chat is not None:
-                chat.accounting_snapshot = {"scope": "project_advisor", "limit_tokens": limit,
+                chat.accounting_snapshot = {"scope": "project_advisor", "limit_tokens": -1,
                     "calls_admitted": usage_holder["started"], "tokens_observed": usage_holder["tokens"],
                     "unknown_usage": usage_holder["unknown"]}
                 await db.commit()

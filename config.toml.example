@@ -32,8 +32,6 @@ orchestration_backend = "api"
 # API needs LiteLLM metadata; Codex with default model needs native metadata; Claude or CLI with
 # orchestration_cli_model passes effort to CLI, which rejects unsupported values.
 # orchestration_effort = "high"
-orchestration_conversation_allowance_tokens = 50000
-orchestration_advisor_allowance_tokens = -1
 orchestration_conversation_investigation_enabled = true
 orchestration_conversation_steering_enabled = true
 orchestration_checkpoint_max_questions = 5

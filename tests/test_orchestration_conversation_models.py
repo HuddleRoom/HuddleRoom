@@ -261,16 +261,21 @@ def test_investigation_identities_are_stable_and_attempt_scoped():
             conversation_investigation_provider_request_id(investigation_id, attempt)
 
 
-def test_conversation_allowance_setting_defaults_enables_and_rejects_negative(monkeypatch):
+@pytest.mark.parametrize("prefix", ["HUDDLEROOM", "RALLY"])
+@pytest.mark.parametrize("field,default,allowed,rejected", [
+    ("ORCHESTRATION_CONVERSATION_ALLOWANCE_TOKENS", 50_000, [0, 1], -1),
+    ("ORCHESTRATION_ADVISOR_ALLOWANCE_TOKENS", -1, [-1, 0, 1], -2),
+])
+def test_deprecated_allowance_setting_compatibility(monkeypatch, prefix, field, default, allowed, rejected):
     from huddleroom.config import Settings
-
-    monkeypatch.delenv("RALLY_ORCHESTRATION_CONVERSATION_ALLOWANCE_TOKENS", raising=False)
-    assert Settings(_env_file=None).orchestration_conversation_allowance_tokens == 50000
-
-    monkeypatch.setenv("RALLY_ORCHESTRATION_CONVERSATION_ALLOWANCE_TOKENS", "12")
-    assert Settings(_env_file=None).orchestration_conversation_allowance_tokens == 12
-
-    monkeypatch.setenv("RALLY_ORCHESTRATION_CONVERSATION_ALLOWANCE_TOKENS", "-1")
+    for alias in ("HUDDLEROOM", "RALLY"):
+        monkeypatch.delenv(f"{alias}_{field}", raising=False)
+    name = field.lower()
+    assert getattr(Settings(_env_file=None), name) == default
+    for value in allowed:
+        monkeypatch.setenv(f"{prefix}_{field}", str(value))
+        assert getattr(Settings(_env_file=None), name) == value
+    monkeypatch.setenv(f"{prefix}_{field}", str(rejected))
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 

@@ -1903,6 +1903,7 @@ class OrchestrationSteeringLedgerResponse(BaseModel):
 
 class OrchestrationConversationAllowanceResponse(BaseModel):
     enabled: bool
+    unlimited: bool
     limit: int
     used: int
     remaining: int

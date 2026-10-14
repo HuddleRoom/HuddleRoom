@@ -573,7 +573,7 @@ async def test_enabled_chat_recovery_lookup_timeout_holds_persisted_authority_on
             reservation.status, reservation.settled_tokens, reservation.released_tokens,
         ) == (
             conversation_reservation_id(response_id), response_id, goal.id, test_user.id,
-            expected_demand, 50_000, "held_unknown", 0, 0,
+            expected_demand, 0, "held_unknown", 0, 0,
         )
     await service.recover_goal(goal.id)
     assert len(lookups) == 1

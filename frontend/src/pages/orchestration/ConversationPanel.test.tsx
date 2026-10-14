@@ -69,7 +69,7 @@ const turn = (overrides: Partial<OrchestrationConversationTurn> & FeedbackFixtur
 }, { feedback: null, feedback_eligible: false }, overrides)
 
 const history = (items: OrchestrationConversationTurn[] = [turn()]): OrchestrationConversationHistory => ({
-  items, total: items.length, omitted: 0, allowance: { enabled: true, limit: 1000, used: 100, remaining: 900 },
+  items, total: items.length, omitted: 0, allowance: { enabled: true, unlimited: false, limit: 1000, used: 100, remaining: 900 },
   steering: { enabled: true, eligibility: 'active', eligibility_reason: null, inbox_version: 0, direction_version: 0, requests: [], proposals: [] },
 })
 
@@ -341,11 +341,11 @@ describe('ConversationPanel', () => {
     ['pending', 'Investigation queued.'],
     ['running', 'Investigation in progress.'],
     ['completed', 'Investigation completed.'],
-    ['limited', 'Investigation stopped at the conversation allowance limit. Send a new message when allowance is available.'],
+    ['limited', 'Historical investigation stopped at a retired conversation allowance limit. Send a new message to ask again.'],
     ['failed', 'Investigation failed safely. No finding was accepted.'],
     ['cancelled', 'Investigation cancelled. Send a new message to investigate again; late output is ignored.'],
     ['unavailable', 'Investigation is not enabled for this project. The conversation remains read-only.'],
-    ['interrupted_unknown', 'Investigation outcome is unknown. Usage remains held and the orchestrator will not retry it automatically. Send a new message if allowance remains.'],
+    ['interrupted_unknown', 'Investigation outcome is unknown. Usage remains held and the orchestrator will not retry it automatically. Send a new message to ask again.'],
   ] as const)('renders safe %s investigation state without controls', async (status, copy) => {
     conversation.query.data = history([turn({ investigation: investigation(status) })])
     const view = await mount()
@@ -475,7 +475,7 @@ describe('ConversationPanel', () => {
     const view = await mount()
     try {
       expect(textOf(view.container)).toContain('Messages are advisory. They do not change goal state, plans, agents, or reservations.')
-      expect(textOf(view.container)).toContain('Allowance: 900 remaining of 1000')
+      expect(textOf(view.container)).not.toContain('Allowance:')
       expect(textOf(view.container)).toContain('Run context: No run attached')
       expect(textOf(view.container)).toContain('Run context: run-2')
       expect(textOf(view.container)).toContain('provider_failed')
@@ -527,26 +527,26 @@ describe('ConversationPanel', () => {
   })
 
   it('keeps history readable while disabled or exhausted', async () => {
-    conversation.query.data = { ...history(), allowance: { enabled: false, limit: 0, used: 0, remaining: 0 } }
+    conversation.query.data = { ...history(), allowance: { enabled: false, unlimited: false, limit: 0, used: 0, remaining: 0 } }
     const view = await mount()
     try {
-      expect(textOf(view.container)).toContain('Conversation is not enabled for this goal.')
+      expect(textOf(view.container)).not.toContain('Conversation is not enabled for this goal.')
       expect(textOf(view.container)).toContain('What is the current risk?')
-      expect(textarea(view.container).getAttribute('disabled')).not.toBeNull()
-      conversation.query.data = { ...history(), allowance: { enabled: true, limit: 10, used: 10, remaining: 0 } }
+      expect(textarea(view.container).getAttribute('disabled')).toBeNull()
+      conversation.query.data = { ...history(), allowance: { enabled: true, unlimited: false, limit: 10, used: 10, remaining: 0 } }
       await view.rerender()
-      expect(textOf(view.container)).toContain('Allowance: 0 remaining of 10')
-      expect(textOf(view.container)).toContain('Conversation allowance is exhausted. New messages are unavailable.')
+      expect(textOf(view.container)).not.toContain('Allowance:')
+      expect(textOf(view.container)).not.toContain('Conversation allowance is exhausted')
       expect(textOf(view.container)).toContain('What is the current risk?')
     } finally { view.cleanup() }
   })
 
-  it('hides the entire panel when allowance is disabled and there are no items', async () => {
-    conversation.query.data = { ...history([]), allowance: { enabled: false, limit: 0, used: 0, remaining: 0 } }
+  it('keeps the empty panel visible with deprecated disabled allowance', async () => {
+    conversation.query.data = { ...history([]), allowance: { enabled: false, unlimited: false, limit: 0, used: 0, remaining: 0 } }
     const view = await mount()
     try {
       const section = descendants(view.container).find((node) => node.tagName === 'SECTION' && node.getAttribute('aria-label') === 'Conversation')
-      expect(section).toBeUndefined()
+      expect(section).toBeDefined()
       expect(textOf(view.container)).not.toContain('CONVERSATION')
     } finally { view.cleanup() }
   })
@@ -963,6 +963,38 @@ describe('ConversationPanel', () => {
       expect(descendants(view.container).filter((node) => node.getAttribute('role') === 'status' && textOf(node) === 'Feedback recorded.').length).toBe(1)
       await view.rerender(() => <GoalAnnouncerProvider key="goal-2"><ConversationPanel projectId="project-1" goalId="goal-2" /></GoalAnnouncerProvider>)
       expect(descendants(view.container).filter((node) => node.getAttribute('role') === 'status' && textOf(node) === 'Feedback recorded.').length).toBe(0)
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('SPR209 retired goal allowance', () => {
+  it.each([0, 1])('submits with a loaded retired limit %s and empty history', async (limit) => {
+    conversation.query.data = history([])
+    conversation.query.data.allowance = { enabled: false, unlimited: false, limit, used: 100, remaining: 0 }
+    const view = await mount()
+    try {
+      const control = textarea(view.container)
+      expect(control).toBeDefined()
+      expect(control.getAttribute('disabled')).toBeNull()
+      expect(getButton(view.container, 'Send message').getAttribute('disabled')).not.toBeNull()
+      expect(textOf(view.container)).not.toMatch(/Allowance:|allowance is exhausted|allowance is not enabled/i)
+      await act(async () => changeControl(control, 'What is the current risk?'))
+      await act(async () => pressKey(control, 'Enter'))
+      expect(conversation.mutation.mutate).toHaveBeenCalledWith(expect.objectContaining({ content: 'What is the current risk?' }), expect.any(Object))
+    } finally { view.cleanup() }
+  })
+
+  it('labels historical limited investigation and unknown outcomes without refill advice', async () => {
+    conversation.query.data = history([
+      turn({ investigation: investigation('limited') }),
+      turn({ message_id: 'message-2', response_id: 'response-2', sequence: 2, investigation: investigation('interrupted_unknown') }),
+    ])
+    const view = await mount()
+    try {
+      expect(textOf(view.container)).toContain('Historical investigation stopped at a retired conversation allowance limit. Send a new message to ask again.')
+      expect(textOf(view.container)).toContain('Usage remains held and the orchestrator will not retry it automatically.')
+      expect(textOf(view.container)).not.toContain('if allowance remains')
     } finally { view.cleanup() }
   })
 })

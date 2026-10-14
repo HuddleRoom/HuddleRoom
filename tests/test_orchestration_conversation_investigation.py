@@ -2653,14 +2653,14 @@ async def test_distinct_response_prepares_compete_for_one_shared_cumulative_allo
         for item in (response, competing)
     ))
     prepared = (first[0], second[0])
-    assert sorted(item.status for item in prepared) == ["limited", "pending"]
+    assert sorted(item.status for item in prepared) == ["pending", "pending"]
     investigations, reservations = await _investigation_rows(test_engine)
-    assert len(investigations) == 3 and len(reservations) == 2 and calls == 0
+    assert len(investigations) == 3 and len(reservations) == 3 and calls == 0
     async with _factory(test_engine)() as db:
         used = await runtime.api.conversation_allowance_used(db, goal.id, test_user.id)
-    new_reservation = next(item for item in reservations if item.investigation_id != prior_investigation_id)
-    assert used <= ceiling
-    assert used == 13 + prior_investigation_charge + new_reservation.reserved_tokens
+    new_reservations = [item for item in reservations if item.investigation_id != prior_investigation_id]
+    assert len(new_reservations) == 2 and all(item.ceiling_snapshot == 0 for item in new_reservations)
+    assert used == 13 + prior_investigation_charge + sum(item.reserved_tokens for item in new_reservations)
 
 
 @pytest.mark.asyncio
@@ -2694,13 +2694,13 @@ async def test_prepare_accepts_exact_allowance_boundary_and_rejects_one_token_ov
         goal.project_id, goal.id, actor.id, response.id, response.context_version, _request_for()
     )
     assert created is True
-    assert prepared.status == ("limited" if one_over else "pending")
+    assert prepared.status == "pending"
     async with _factory(test_engine)() as db:
         used = await runtime.api.conversation_allowance_used(db, goal.id, actor.id)
     assert ceiling - 17 == demand - int(one_over)
     investigations, reservations = await _investigation_rows(test_engine)
     assert len(investigations) == 1
-    assert (len(reservations), used) == ((0, 17) if one_over else (1, ceiling))
+    assert (len(reservations), used) == (1, 17 + demand)
     if reservations:
         assert reservations[0].reserved_tokens == demand
 
@@ -3264,10 +3264,11 @@ async def test_unavailable_root_and_held_phase_one_allowance_never_dispatch_or_r
     limited = await _service(test_engine, completion).execute(
         goal.project_id, goal.id, actor.id, limited_response.id, limited_response.context_version, _request_for()
     )
-    assert limited.status == "limited"
-    assert calls == 0
+    assert limited.status == "completed"
+    assert calls == 1
     _, reservations = await _investigation_rows(test_engine)
-    assert not reservations
+    assert len(reservations) == 1 and reservations[0].status == "settled"
+    assert reservations[0].ceiling_snapshot == 0
 
 
 @pytest.mark.asyncio

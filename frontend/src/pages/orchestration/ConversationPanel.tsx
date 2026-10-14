@@ -11,7 +11,7 @@ import { useGoalAnnouncer } from './goalAnnouncer'
 
 function answerText(turn: OrchestrationConversationTurn) {
   if (turn.answer !== null) return <><span className="font-medium">Answer</span><p className="whitespace-pre-wrap break-words">{turn.answer}</p></>
-  if (turn.error) return <><span className="font-medium">Error</span><p className="font-mono text-[13px]">{turn.error.code}</p></>
+  if (turn.error) return <><span className="font-medium">Error</span><p className="font-mono text-[13px]">{turn.error.code}</p>{['conversation_disabled', 'conversation_exhausted', 'conversation_allowance_exhausted'].includes(turn.error.code) && <p>Historical conversation stopped at a retired conversation allowance limit. Send a new message to ask again.</p>}</>
   if (turn.status === 'pending' || turn.status === 'running') return <p>Awaiting response.</p>
   if (turn.status === 'interrupted_unknown') return <p>Response status is unknown after interruption.</p>
   return <p>No response recorded.</p>
@@ -21,11 +21,11 @@ const investigationStatusCopy: Record<OrchestrationConversationInvestigationStat
   pending: 'Investigation queued.',
   running: 'Investigation in progress.',
   completed: 'Investigation completed.',
-  limited: 'Investigation stopped at the conversation allowance limit. Send a new message when allowance is available.',
+  limited: 'Historical investigation stopped at a retired conversation allowance limit. Send a new message to ask again.',
   failed: 'Investigation failed safely. No finding was accepted.',
   cancelled: 'Investigation cancelled. Send a new message to investigate again; late output is ignored.',
   unavailable: 'Investigation is not enabled for this project. The conversation remains read-only.',
-  interrupted_unknown: 'Investigation outcome is unknown. Usage remains held and the orchestrator will not retry it automatically. Send a new message if allowance remains.',
+  interrupted_unknown: 'Investigation outcome is unknown. Usage remains held and the orchestrator will not retry it automatically. Send a new message to ask again.',
 }
 
 function InvestigationDetails({ investigation, sequence, isLatest }: {
@@ -271,8 +271,7 @@ export function ConversationPanel({ projectId, goalId }: { projectId: string; go
   }, [activeSteeringFailed])
 
   const unknown = query.isLoading || query.isError || !query.data
-  const allowance = query.data?.allowance
-  const disabled = unknown || !allowance?.enabled || allowance.remaining <= 0
+  const disabled = unknown
   const submit = () => {
     if (disabled || mutation.isPending || !draft.trim()) return
     setSent(false)
@@ -345,8 +344,6 @@ export function ConversationPanel({ projectId, goalId }: { projectId: string; go
     })
   }
 
-  // ponytail: hide panel entirely when loaded + disabled allowance + zero items; preserves history-with-disabled-composer case
-  if (!unknown && !allowance?.enabled && query.data.items.length === 0) return null
 
   return <section aria-label="Conversation" className="flex flex-col gap-3 rounded-md border border-huddleroom-border bg-huddleroom-surface p-3">
     <h3 className="text-sm font-semibold text-huddleroom-text-primary">Conversation</h3>
@@ -354,14 +351,11 @@ export function ConversationPanel({ projectId, goalId }: { projectId: string; go
     {query.isLoading ? <div aria-busy="true" aria-label="Loading conversation" className="space-y-2"><SkeletonRow /><SkeletonRow /><SkeletonRow /></div>
       : query.isError || !query.data ? <div className="flex flex-wrap items-center gap-2"><span className="text-sm text-huddleroom-status-red">Failed to load conversation. Retry to view messages.</span><Button type="button" variant="secondary" className="min-h-11" onClick={() => { void query.refetch() }}>Retry</Button></div>
         : <>
-          {query.data.allowance.enabled && <p className="text-xs text-huddleroom-text-secondary">{`Allowance: ${query.data.allowance.remaining} remaining of ${query.data.allowance.limit}`}</p>}
-          {query.data.allowance.enabled && query.data.allowance.remaining <= 0 && <p className="text-sm text-huddleroom-status-red">Conversation allowance is exhausted. New messages are unavailable.</p>}
-          {!query.data.allowance.enabled && <p className="text-sm text-huddleroom-text-secondary">Conversation is not enabled for this goal.</p>}
           {query.data.items.length === 0 ? <p className="text-sm text-huddleroom-text-secondary">No conversation messages yet. Send an advisory question to the orchestrator.</p> : <Ledger items={query.data.items} mutationsPending={steeringMutationsPending} canSteer={Boolean(canSteer)} unavailableReason={steering?.eligibility_reason ?? 'steering is not enabled for this goal'} feedbackDraft={feedbackDraft} feedbackPending={feedback.isPending} feedbackErrorRef={feedbackErrorRef} feedbackError={feedback.error} onHelpful={(responseId) => recordFeedback(responseId, 'helpful', null)} onNeedsWork={(responseId) => setFeedbackDraft({ responseId, rating: 'not_helpful', reason: null, phase: 'choose-reason' })} onReason={(reason) => setFeedbackDraft((draft) => draft ? { ...draft, reason, phase: 'choose-reason' } : draft)} onRecord={() => { if (feedbackDraft?.reason) recordFeedback(feedbackDraft.responseId, 'not_helpful', feedbackDraft.reason) }} onReview={(proposal) => { setSteeringDraft({ clientRequestId: '', directive: proposal.directive, impactSummary: proposal.impact_summary, scope: proposal.scope, targetType: proposal.target_type, targetId: proposal.target_id, lifetime: proposal.lifetime, sourceProposalId: proposal.proposal_id, supersedesRequestId: null }); setSteeringOpen(true) }} onDismiss={(proposalId) => { if (steeringMutationsPending) return; const dismissAction = () => { setSteeringErrorDismissed(false); setActiveSteeringMutation('dismiss'); setSteeringMutationPending(true); const attempt = ++steeringAttempt.current; dismissProposal.mutate({ goalId, proposalId }, { onSuccess: () => { if (steeringAttempt.current === attempt) { setSteeringMutationPending(false); setActiveSteeringMutation(null) } }, onError: () => { if (steeringAttempt.current === attempt) setSteeringMutationPending(false) } }) }; lastSteeringActionRef.current = dismissAction; dismissAction() }} />}
         </>}
     <form onSubmit={onSubmit} className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-end">
       <Textarea ref={textareaRef} label="Advisory message" placeholder="Ask about the current goal context…" rows={3} value={draft} disabled={disabled || mutation.isPending} onChange={(event) => onChange(event.target.value)} onKeyDown={onKeyDown} className="min-w-0 flex-1 break-words" />
-      <Button type="submit" disabled={disabled || mutation.isPending} className="min-h-11 shrink-0 sm:mb-3 sm:w-auto">{mutation.isPending ? 'Sending…' : 'Send message'}</Button>
+      <Button type="submit" disabled={disabled || mutation.isPending || !draft.trim()} className="min-h-11 shrink-0 sm:mb-3 sm:w-auto">{mutation.isPending ? 'Sending…' : 'Send message'}</Button>
       {canSteer && !steeringOpen && <Button type="button" variant="secondary" className="min-h-11 shrink-0 sm:mb-3 sm:w-auto" onClick={() => { setSteeringErrorDismissed(true); setSteeringOpen(true) }}>Steer work</Button>}
     </form>
     <Dialog

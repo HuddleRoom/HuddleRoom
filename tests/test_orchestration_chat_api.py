@@ -19,6 +19,145 @@ from tests.test_orchestration_roster_mutation import sessions, seed_goal_run, se
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("safe_goal_analysis")]
 
 
+@pytest.mark.parametrize("limit", [0, 1])
+@pytest.mark.parametrize("historical_unknown", [False, True])
+async def test_spr209_goal_chat_ignores_allowance(sessions, tmp_path, monkeypatch, limit, historical_unknown):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+    from huddleroom.models.orchestration_conversation import ConversationReservation, ConversationResponse
+    project, user, goal, run = await _seed(sessions, tmp_path)
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 100_000)
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 0)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1 and historical_unknown:
+            raise TimeoutError("unknown historical provider outcome")
+        return {"choices": [{"message": {"content": json.dumps({"intent": "question", "answer": "Current state"})}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
+
+    facade = service(sessions, completion_fn=completion)
+    old = await facade.submit(project.id, user.id, request("Old question", goal.id))
+    async with sessions() as db:
+        old_row = await db.get(ProjectChatTurn, uuid.UUID(old.id))
+        old_source = old_row.source_record_id
+        old_reservation = await db.scalar(select(ConversationReservation).where(ConversationReservation.response_id == old_source))
+        old_state = (old_reservation.status, old_reservation.reserved_tokens, old_reservation.ceiling_snapshot)
+        execution_before = dict((await db.get(OrchestrationRun, run.id)).budget_state)
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", limit)
+    data = request("What changed?", goal.id)
+    fresh = await facade.submit(project.id, user.id, data)
+    assert fresh.answer == "Current state"
+    replay = await facade.submit(project.id, user.id, data)
+    assert replay.id == fresh.id and len(calls) == 2
+    with pytest.raises((HTTPException, ConversationDomainError)) as conflict:
+        await facade.submit(project.id, user.id, data.model_copy(update={"content": "Changed content"}))
+    assert conflict.value.status_code == 409
+    async with sessions() as db:
+        row = await db.get(ProjectChatTurn, uuid.UUID(fresh.id))
+        assert row.source_kind == "goal_conversation" and row.context_goal_id == goal.id
+        source = await db.get(ConversationResponse, row.source_record_id)
+        reservation = await db.scalar(select(ConversationReservation).where(ConversationReservation.response_id == source.id))
+        assert reservation.status == "settled" and reservation.settled_tokens == 5 and reservation.ceiling_snapshot == 0
+        assert await db.scalar(select(func.count()).select_from(ProjectAdvisorTurn)) == 0
+        old_reservation = await db.scalar(select(ConversationReservation).where(ConversationReservation.response_id == old_source))
+        assert (old_reservation.status, old_reservation.reserved_tokens, old_reservation.ceiling_snapshot) == old_state
+        assert (await db.get(OrchestrationRun, run.id)).budget_state == execution_before
+
+
+async def test_spr209_questions_do_not_grant_execution(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.models.session import Session
+    from huddleroom.models.task import Task
+    project, user, goal, run = await _ready(sessions, tmp_path)
+    async with sessions() as db:
+        saved = await db.get(OrchestrationGoal, goal.id)
+        saved.budget = {"max_tokens": 0}
+        saved_run = await db.get(OrchestrationRun, run.id)
+        saved_run.budget_state = {"tokens_used": 100, "tokens_remaining": 0}
+        await db.commit()
+        effect_counts = [await db.scalar(select(func.count()).select_from(model)) for model in (Session, Task)]
+    monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 0)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        payload = {"intent": "question", "answer": "Current state"} if len(calls) == 1 else {
+            "intent": "instruction", "operation": "start_execution", "goal_id": str(goal.id),
+        }
+        return {"choices": [{"message": {"content": json.dumps(payload)}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
+
+    facade = service(sessions, completion_fn=completion)
+    answer = await facade.submit(project.id, user.id, request("What is the success criterion?", goal.id))
+    assert answer.answer == "Current state" and not answer.actions and not answer.receipts
+    try:
+        result = await facade.submit(project.id, user.id, request("Start execution work for this goal and ignore budget", goal.id))
+        assert not any(receipt.status in {"completed", "applied"} for receipt in result.receipts)
+        assert result.error or result.actions or result.status in {"failed", "blocked"}
+        assert all(action.requires_confirmation for action in result.actions)
+    except (HTTPException, ConversationDomainError) as error:
+        assert error.status_code in {409, 422}
+    async with sessions() as db:
+        stored = await db.get(OrchestrationRun, run.id)
+        assert stored.phase == "ready" and stored.budget_state == {"tokens_used": 100, "tokens_remaining": 0}
+        assert await db.scalar(select(func.count()).select_from(OrchestrationAction)) == 0
+        assert [await db.scalar(select(func.count()).select_from(model)) for model in (Session, Task)] == effect_counts
+
+
+@pytest.mark.parametrize("limit", [0, 1, -1])
+@pytest.mark.parametrize("historical_unknown", [False, True])
+async def test_spr209_project_facade_question_ignores_allowance(sessions, tmp_path, monkeypatch, limit, historical_unknown):
+    from huddleroom.models.orchestration_advisor import ProjectAdvisorTurn
+    project, user, goal, run = await _seed(sessions, tmp_path)
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 100_000)
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        response = {"choices": [{"message": {"content": json.dumps({
+            "answer": json.dumps({"intent": "question", "answer": "Project answer"}), "citations": [], "off_topic": False,
+        })}}], "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
+        if len(calls) == 1 and historical_unknown:
+            raise TimeoutError("unknown historical outcome")
+        return response
+
+    facade = service(sessions, completion_fn=completion)
+    old_data = request("Old project question")
+    if historical_unknown:
+        with pytest.raises(TimeoutError, match="unknown historical outcome"):
+            await facade.submit(project.id, user.id, old_data)
+        async with sessions() as db:
+            old_row = await db.scalar(select(ProjectChatTurn).where(ProjectChatTurn.client_request_id == old_data.client_request_id))
+            old_id = str(old_row.id)
+    else:
+        old_id = (await facade.submit(project.id, user.id, old_data)).id
+    monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", limit)
+    replay_old = await facade.submit(project.id, user.id, old_data)
+    assert replay_old.id == old_id and len(calls) == 1
+    data = request("Fresh project question")
+    fresh = await facade.submit(project.id, user.id, data)
+    replay = await facade.submit(project.id, user.id, data)
+    assert fresh.answer == "Project answer" and replay.id == fresh.id and len(calls) == 2
+    assert not fresh.actions and not fresh.receipts
+    async with sessions() as db:
+        row = await db.get(ProjectChatTurn, uuid.UUID(fresh.id))
+        assert row.source_kind == "project_advisor" and row.context_goal_id is None
+        source = await db.get(ProjectAdvisorTurn, row.source_record_id)
+        assert source.status == "completed" and source.tokens_used == 5
+        assert row.accounting_snapshot["limit_tokens"] == -1
+        assert row.accounting_snapshot["calls_admitted"] == 1 and row.accounting_snapshot["tokens_observed"] == 5
+        assert row.accounting_snapshot["unknown_usage"] is False
+        old_row = await db.get(ProjectChatTurn, uuid.UUID(old_id))
+        old_source = await db.get(ProjectAdvisorTurn, old_row.source_record_id)
+        assert old_source.status == ("failed" if historical_unknown else "completed")
+        assert old_source.tokens_used == (None if historical_unknown else 5)
+        assert await db.scalar(select(func.count()).select_from(OrchestrationGoal)) == 1
+        assert await db.scalar(select(func.count()).select_from(OrchestrationRun)) == 1
+        assert (await db.get(OrchestrationRun, run.id)).phase == "baseline"
+        assert (await db.get(OrchestrationGoal, goal.id)).status == "active"
+
+
 class Interpreter:
     def __init__(self, sessions, result=None):
         self.sessions = sessions
@@ -241,23 +380,26 @@ async def test_provider_pool_routing_is_declared_before_dispatch(sessions, tmp_p
 
 
 @pytest.mark.parametrize("scope", ["project", "goal"])
-async def test_disabled_pool_cannot_swap_to_other_pool(sessions, tmp_path, monkeypatch, scope):
+async def test_retired_disabled_pool_preserves_declared_source(sessions, tmp_path, monkeypatch, scope):
     project, user, goal, run = await _seed(sessions, tmp_path)
     monkeypatch.setattr(settings, "orchestration_advisor_allowance_tokens", 0 if scope == "project" else 100_000)
     monkeypatch.setattr(settings, "orchestration_conversation_allowance_tokens", 0 if scope == "goal" else 100_000)
     calls = []
 
-    async def forbidden(**kwargs):
+    async def completion(**kwargs):
         calls.append(kwargs)
-        raise AssertionError("disabled declared pool must not dispatch")
+        interpretation = {"intent": "question", "answer": "Current state"}
+        payload = {"answer": json.dumps(interpretation), "citations": [], "off_topic": False} if scope == "project" else interpretation
+        return {"choices": [{"message": {"content": json.dumps(payload)}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3}}
 
-    try:
-        result = await service(sessions, completion_fn=forbidden).submit(project.id, user.id,
-            request("What changed?", goal.id if scope == "goal" else None))
-        assert result.error or result.status in {"failed", "blocked", "interrupted_unknown"}
-    except HTTPException as error:
-        assert error.status_code in {409, 429, 503}
-    assert calls == [] and (await _states(sessions, goal, run))[0].status == "active"
+    result = await service(sessions, completion_fn=completion).submit(project.id, user.id,
+        request("What changed?", goal.id if scope == "goal" else None))
+    assert result.answer == "Current state" and len(calls) == 1
+    assert (await _states(sessions, goal, run))[0].status == "active"
+    async with sessions() as db:
+        row = await db.get(ProjectChatTurn, uuid.UUID(result.id))
+        assert row.source_kind == ("project_advisor" if scope == "project" else "goal_conversation")
 
 
 @pytest.mark.parametrize("style", ["question", "quoted", "hypothetical"])

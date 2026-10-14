@@ -172,8 +172,9 @@ class Settings(BaseSettings):
     orchestration_backend: Literal["api", "claude", "codex"] = "api"
     orchestration_cli_model: str | None = None  # --model/-m for the claude/codex CLI; orchestration_model is API-only
     orchestration_effort: OrchestrationEffort | None = None
+    # Deprecated compatibility setting; conversation admission is unlimited.
     orchestration_conversation_allowance_tokens: int = Field(default=50000, ge=0)
-    # -1 = unlimited (default), 0 = disabled, >0 = lifetime token cap
+    # Deprecated compatibility setting; advisor admission is unlimited.
     orchestration_advisor_allowance_tokens: int = Field(default=-1, ge=-1)
     orchestration_conversation_investigation_enabled: bool = True
     orchestration_conversation_steering_enabled: bool = True

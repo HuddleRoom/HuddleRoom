@@ -462,10 +462,6 @@ class OrchestrationConversationService:
                         return ConversationTurn(
                             message=message, response=response, investigation=investigation
                         ), False
-                    if settings.orchestration_conversation_allowance_tokens <= 0:
-                        raise ConversationDomainError(
-                            "conversation_disabled", 409, "Conversation is disabled"
-                        )
                     pairs = (
                         await db.execute(
                             select(ConversationMessage, ConversationResponse)
@@ -503,17 +499,6 @@ class OrchestrationConversationService:
                         + 64
                         + self._completion_tokens(steering_allowed)
                     )
-                    from huddleroom.services.orchestration_conversation_investigation import conversation_allowance_used
-                    used = await conversation_allowance_used(db, goal_id, actor_id)
-                    if (
-                        int(used) + demand
-                        > settings.orchestration_conversation_allowance_tokens
-                    ):
-                        raise ConversationDomainError(
-                            "conversation_exhausted",
-                            429,
-                            "Conversation allowance exhausted",
-                        )
                     sequence = (
                         int(
                             await db.scalar(
@@ -557,7 +542,7 @@ class OrchestrationConversationService:
                         response_id=response.id,
                         goal_id=goal_id,
                         actor_id=actor_id,
-                        ceiling_snapshot=settings.orchestration_conversation_allowance_tokens,
+                        ceiling_snapshot=0,
                         reserved_tokens=demand,
                     )
                     db.add_all((message, response))

@@ -663,6 +663,7 @@ export interface OrchestrationSteeringLedger {
 
 export interface OrchestrationConversationAllowance {
   enabled: boolean
+  unlimited: boolean
   limit: number
   used: number
   remaining: number

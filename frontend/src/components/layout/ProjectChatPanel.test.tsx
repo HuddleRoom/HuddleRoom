@@ -43,8 +43,8 @@ const turn = (overrides: Partial<ProjectChatTurn> = {}): ProjectChatTurn => ({
 const history = (items: ProjectChatTurn[] = []): ProjectChatHistory => ({
   items, total: items.length, omitted: 0,
   allowance: { enabled: true, unlimited: false, limit: 1000, remaining: 900 },
-  goal_allowances: { 'goal-alpha': { enabled: true, limit: 1000, used: 100, remaining: 900 },
-    'goal-beta': { enabled: true, limit: 1000, used: 100, remaining: 900 } }, steering: {},
+  goal_allowances: { 'goal-alpha': { enabled: true, unlimited: false, limit: 1000, used: 100, remaining: 900 },
+    'goal-beta': { enabled: true, unlimited: false, limit: 1000, used: 100, remaining: 900 } }, steering: {},
 })
 beforeEach(() => {
   state.query = { data: history(), isLoading: false, isError: false, error: null, refetch: vi.fn() }
@@ -58,7 +58,7 @@ async function mount(goal: string | null = 'goal-alpha') {
 const textarea = (container: Parameters<typeof descendants>[0]) => descendants(container).find((node) => node.tagName === 'TEXTAREA')!
 
 describe('ProjectChatPanel', () => {
-  it('renders one labeled composer and persistent history with charged scope and historical links', async () => {
+  it('renders one labeled composer and persistent history with context and historical links', async () => {
     state.query.data = history([turn({ historical: true, content: 'Old question', answer: 'Old answer',
       source_references: [{ kind: 'goal_conversation', id: 'response-original', goal_id: 'goal-alpha' }],
       citations: [{ type: 'goal', id: 'goal-alpha', label: 'Alpha source' }] })])
@@ -66,7 +66,7 @@ describe('ProjectChatPanel', () => {
     try {
       expect(descendants(view.container).filter((node) => node.tagName === 'TEXTAREA')).toHaveLength(1)
       expect(textOf(view.container)).toContain('Context: Alpha')
-      expect(textOf(view.container)).toContain('Charged pool: goal conversation')
+      expect(textOf(view.container)).not.toContain('Charged pool:')
       expect(textOf(view.container)).toContain('Human (historical)Old questionOrchestratorOld answer')
       expect(textOf(view.container)).toContain('Historical')
       expect(descendants(view.container).find((node) => node.tagName === 'A' && textOf(node) === 'Alpha source')?.getAttribute('href')).toBe('/orchestration/goal-alpha')
@@ -94,15 +94,15 @@ describe('ProjectChatPanel', () => {
 
   it.each([false, true])('keeps history and no-model confirmations usable when pool unavailable (%s)', async (disabled) => {
     state.query.data = history([turn({ actions: [action()] })])
-    state.query.data.goal_allowances['goal-alpha'] = { enabled: !disabled, limit: disabled ? 0 : 1000, used: 1000, remaining: 0 }
+    state.query.data.goal_allowances['goal-alpha'] = { enabled: !disabled, unlimited: false, limit: disabled ? 0 : 1000, used: 1000, remaining: 0 }
     const view = await mount()
     try {
-      expect(textarea(view.container).getAttribute('disabled')).not.toBeNull()
+      expect(textarea(view.container).getAttribute('disabled')).toBeNull()
       await React.act(async () => getButton(view.container, 'Review pause').click())
       await React.act(async () => getButton(view.container, 'Confirm').click())
       expect(state.mutation.mutate).toHaveBeenCalledWith(expect.objectContaining({ content: 'yes',
         contextGoalId: 'goal-alpha', actionId: 'action-alpha' }), expect.any(Object))
-      expect(textOf(view.container)).toContain('History and prepared confirmations remain available')
+      expect(textOf(view.container)).not.toContain('History and prepared confirmations remain available')
     } finally { view.cleanup() }
   })
 
@@ -232,6 +232,53 @@ describe('ProjectChatPanel', () => {
       expect(state.mutation.mutate).toHaveBeenCalledOnce()
       await React.act(async () => onKeyDown(Object.assign(new TestEvent('keydown'), { key: 'Enter', ctrlKey: false, metaKey: true })))
       expect(state.mutation.mutate).toHaveBeenCalledTimes(2)
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('SPR209 retired PROJECT allowance', () => {
+  it.each([null, 'goal-alpha'])('submits with disabled exhausted legacy metadata in context %s', async (goal) => {
+    state.query.data = history()
+    state.query.data.allowance = { enabled: false, unlimited: false, limit: 0, remaining: 0 }
+    state.query.data.goal_allowances['goal-alpha'] = { enabled: false, unlimited: false, limit: 0, used: 100, remaining: 0 }
+    const view = await mount(goal)
+    try {
+      const control = textarea(view.container)
+      expect(control.getAttribute('disabled')).toBeNull()
+      expect(getButton(view.container, 'Send').getAttribute('disabled')).not.toBeNull()
+      expect(textOf(view.container)).not.toMatch(/Charged pool|allowance is exhausted|remaining/i)
+      await React.act(async () => changeControl(control, 'What should I do next?'))
+      await React.act(async () => getButton(view.container, 'Send').click())
+      expect(state.mutation.mutate).toHaveBeenCalledWith(expect.objectContaining({ content: 'What should I do next?', contextGoalId: goal }), expect.any(Object))
+    } finally { view.cleanup() }
+  })
+
+  it('labels a historical limited investigation without active refill advice', async () => {
+    const goalTurn = { investigation: { status: 'limited', objective: 'Inspect release', sources: [], report: null, error: null } } as unknown as OrchestrationConversationTurn
+    state.query.data = history([turn({ historical: true, goal_turn: goalTurn })])
+    const view = await mount()
+    try {
+      expect(textOf(view.container)).toContain('Historical investigation stopped at a retired conversation allowance limit. Send a new message to ask again.')
+      expect(textOf(view.container)).not.toContain('if allowance remains')
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('SPR209 PROJECT readiness controls', () => {
+  it.each(['loading', 'error', 'pending'])('blocks submission while %s', async (mode) => {
+    if (mode === 'pending') state.mutation.isPending = true
+    else state.query = { data: undefined, isLoading: mode === 'loading', isError: mode === 'error', error: null, refetch: vi.fn() }
+    const view = await mount()
+    try {
+      expect(textarea(view.container).getAttribute('disabled')).not.toBeNull()
+      expect(getButton(view.container, 'Send').getAttribute('disabled')).not.toBeNull()
+      if (mode === 'error') {
+        await React.act(async () => getButton(view.container, 'Retry').click())
+        expect(state.query.refetch).toHaveBeenCalledOnce()
+      }
+      expect(state.mutation.mutate).not.toHaveBeenCalled()
     } finally { view.cleanup() }
   })
 })

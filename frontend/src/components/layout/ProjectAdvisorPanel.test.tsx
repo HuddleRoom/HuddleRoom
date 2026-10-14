@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import React from 'react'
-import { changeControl, descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
+import { changeControl, descendants, getButton, mountWithTestDom, TestEvent, textOf } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
 import type { ProjectAdvisorHistory, ProjectAdvisorTurn } from '@/lib/types'
 
@@ -54,11 +54,11 @@ function textarea(container: Parameters<typeof descendants>[0]) {
 }
 
 describe('ProjectAdvisorPanel', () => {
-  it('renders nothing when allowance is disabled', async () => {
-    advisor.query.data = history([], { enabled: false, limit: 0, remaining: 0 })
+  it('keeps composer visible with deprecated disabled allowance', async () => {
+    advisor.query.data = history([], { enabled: false, unlimited: false, limit: 0, remaining: 0 })
     const view = await mount()
     try {
-      expect(textOf(view.container)).toBe('')
+      expect(textarea(view.container)).toBeDefined()
     } finally { view.cleanup() }
   })
 
@@ -111,13 +111,13 @@ describe('ProjectAdvisorPanel', () => {
     } finally { view.cleanup() }
   })
 
-  it('disables the composer and shows the exhausted message when remaining is 0', async () => {
+  it('keeps composer enabled with deprecated exhausted allowance', async () => {
     advisor.query.data = history([], { remaining: 0 })
     const view = await mount()
     try {
-      expect(textarea(view.container).getAttribute('disabled')).not.toBeNull()
+      expect(textarea(view.container).getAttribute('disabled')).toBeNull()
       expect(getButton(view.container, 'Send question').getAttribute('disabled')).not.toBeNull()
-      expect(textOf(view.container)).toContain('Advisor allowance is exhausted. New questions are unavailable.')
+      expect(textOf(view.container)).not.toContain('Advisor allowance is exhausted')
     } finally { view.cleanup() }
   })
 
@@ -128,7 +128,7 @@ describe('ProjectAdvisorPanel', () => {
       expect(textOf(view.container)).not.toContain('Allowance:')
       expect(textOf(view.container)).not.toContain('Advisor allowance is exhausted')
       expect(textarea(view.container).getAttribute('disabled')).toBeNull()
-      expect(getButton(view.container, 'Send question').getAttribute('disabled')).toBeNull()
+      expect(getButton(view.container, 'Send question').getAttribute('disabled')).not.toBeNull()
     } finally { view.cleanup() }
   })
 
@@ -154,6 +154,55 @@ describe('ProjectAdvisorPanel', () => {
     try {
       expect(textOf(view.container)).toContain('Advisor service is unavailable.')
       expect(descendants(view.container).some((node) => node.getAttribute('role') === 'alert')).toBe(true)
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('SPR209 retired advisor allowance', () => {
+  it.each([0, 1])('submits with a loaded retired limit %s and empty history', async (limit) => {
+    advisor.query.data = history([], { enabled: false, unlimited: false, limit, remaining: 0 })
+    const view = await mount()
+    try {
+      const control = textarea(view.container)
+      expect(control).toBeDefined()
+      expect(control.getAttribute('disabled')).toBeNull()
+      expect(getButton(view.container, 'Send question').getAttribute('disabled')).not.toBeNull()
+      expect(textOf(view.container)).not.toMatch(/Allowance:|allowance is exhausted|remaining/i)
+      await React.act(async () => changeControl(control, 'What should I do next?'))
+      await React.act(async () => getButton(view.container, 'Send question').click())
+      expect(advisor.mutation.mutate).toHaveBeenCalledWith('What should I do next?', expect.any(Object))
+    } finally { view.cleanup() }
+  })
+})
+
+
+describe('SPR209 advisor readiness controls', () => {
+  it.each(['loading', 'error', 'pending'])('blocks submission while %s', async (mode) => {
+    if (mode === 'pending') advisor.mutation.isPending = true
+    else advisor.query = { data: undefined, isLoading: mode === 'loading', isError: mode === 'error', refetch: vi.fn() }
+    const view = await mount()
+    try {
+      expect(textarea(view.container).getAttribute('disabled')).not.toBeNull()
+      expect(getButton(view.container, mode === 'pending' ? 'Sending…' : 'Send question').getAttribute('disabled')).not.toBeNull()
+      if (mode === 'error') {
+        await React.act(async () => getButton(view.container, 'Retry').click())
+        expect(advisor.query.refetch).toHaveBeenCalledOnce()
+      }
+      expect(advisor.mutation.mutate).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('submits Ctrl+Enter with exhausted legacy metadata', async () => {
+    advisor.query.data = history([], { enabled: false, limit: 0, remaining: 0 })
+    const view = await mount()
+    try {
+      const control = textarea(view.container)
+      await React.act(async () => changeControl(control, 'What is next?'))
+      const propsKey = Object.keys(control).find((key) => key.startsWith('__reactProps$'))!
+      const handler = (control as unknown as Record<string, { onKeyDown: (event: unknown) => void }>)[propsKey].onKeyDown
+      await React.act(async () => handler(Object.assign(new TestEvent('keydown'), { key: 'Enter', ctrlKey: true, metaKey: false })))
+      expect(advisor.mutation.mutate).toHaveBeenCalledWith('What is next?', expect.any(Object))
     } finally { view.cleanup() }
   })
 })
