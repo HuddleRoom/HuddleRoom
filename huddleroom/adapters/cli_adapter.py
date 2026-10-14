@@ -720,12 +720,17 @@ class CliAdapter:
                 await self._terminate_process_group(proc)
                 collect_task_obj.cancel()
                 await asyncio.gather(collect_task_obj, return_exceptions=True)
+                # The canceller commits this flag after the worker loaded its copy of the row.
+                with db.no_autoflush:
+                    stored_metadata = await db.scalar(select(Session.metadata_).where(Session.id == session_id))
+                owner_managed = bool((stored_metadata or {}).get("cancel_owner_managed"))
                 self._apply_partial(session, cli_runtime, partial_output.get("stdout"))
                 session.status = "cancelled"
                 session.error = None
                 session.resumable = False
                 session.ended_at = datetime.now(timezone.utc)
                 metadata = dict(session.metadata_ or {})
+                metadata.pop("cancel_owner_managed", None)
                 if not isinstance(metadata.get("token_usage_complete"), bool):
                     metadata["token_usage_complete"] = False
                 session.metadata_ = metadata
@@ -738,8 +743,9 @@ class CliAdapter:
                     "task_id": str(session.task_id) if session.task_id else None,
                     "project_id": str(session.project_id),
                 })
-                from huddleroom.services.session_sync import sync_task_from_session
-                await sync_task_from_session(db, session)
+                if not owner_managed:
+                    from huddleroom.services.session_sync import sync_task_from_session
+                    await sync_task_from_session(db, session)
                 raise
             finally:
                 watcher_task.cancel()

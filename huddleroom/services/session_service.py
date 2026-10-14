@@ -855,6 +855,9 @@ class SessionService:
                     or transaction is None or transaction.origin != SessionTransactionOrigin.AUTOBEGIN
                     or await OrchestrationService._sqlite_transaction_has_writes(db)):
                 raise HTTPException(status_code=409, detail={"code": "cli_cancel_transaction_conflict"})
+            if not sync_task:
+                # The worker's cancel branch skips the task sync when the caller owns the task outcome.
+                session.metadata_ = {**(session.metadata_ or {}), "cancel_owner_managed": True}
             await db.commit()  # release only a proven clean read before the independent worker write
             error = None
             acknowledged = False

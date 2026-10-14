@@ -620,3 +620,44 @@ async def test_owner_cancel_emits_no_failed_task_event_but_manual_cancel_does(te
             await SessionService().cancel(db, session.id)
             await db.commit()
         assert len(await failed_events(factory, project.id)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_managed", [True, False])
+async def test_sqlite_cli_cancel_task_sync_follows_canceller_ownership(test_engine, tmp_path, monkeypatch, owner_managed):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+    from huddleroom.config import settings
+    from huddleroom.workers import task_runner
+
+    if not settings.is_sqlite:
+        pytest.skip("worker-driven CLI cancel is the SQLite path")
+    started = asyncio.Event()
+
+    class HangingProc:
+        returncode = None
+        pid = 99999
+
+        async def communicate(self):
+            started.set()
+            await asyncio.Event().wait()
+
+    runner = f"runner-{uuid.uuid4()}"
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli", runner=runner) as (
+            factory, project, _agent, task, session):
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=HangingProc())):
+            await task_runner.dispatch_session(str(session.id), "cli", project.id, runner)
+            await asyncio.wait_for(started.wait(), timeout=10)
+            async with factory() as db:
+                cancelled = await SessionService().cancel(db, session.id, sync_task=not owner_managed)
+            assert cancelled.status == "cancelled"
+        async with factory() as db:
+            failed = [e for e in (await db.execute(select(EventLog).where(
+                EventLog.project_id == project.id, EventLog.event_type == "task.status_changed"))).scalars()
+                if e.payload.get("status") == "failed"]
+        stored = await _reload(factory, Session, session.id)
+        assert "cancel_owner_managed" not in (stored.metadata_ or {})
+        assert (await _reload(factory, Task, task.id)).status == ("in_progress" if owner_managed else "failed")
+        assert len(failed) == (0 if owner_managed else 1)
