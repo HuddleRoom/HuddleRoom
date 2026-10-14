@@ -6683,19 +6683,19 @@ class OrchestrationService:
                     self._json_object_or_empty(gate.required_evidence).get("success_criterion_keys")
                 ):
                     manifest.setdefault(key, []).extend(evidence_ids)
-            return manifest
-        for gate in gates:
-            if gate.gate_type != PLAN_ITEM_GATE_TYPE or non_final(gate):
-                continue
-            evidence_ids = [
-                str(item.id)
-                for item in evidence
-                if item.gate_id == gate.id and item.source_type == "verification"
-            ]
-            for key in self._string_list(
-                self._json_object_or_empty(gate.required_evidence).get("success_criterion_keys")
-            ):
-                manifest.setdefault(key, []).extend(evidence_ids)
+        else:
+            for gate in gates:
+                if gate.gate_type != PLAN_ITEM_GATE_TYPE or non_final(gate):
+                    continue
+                evidence_ids = [
+                    str(item.id)
+                    for item in evidence
+                    if item.gate_id == gate.id and item.source_type == "verification"
+                ]
+                for key in self._string_list(
+                    self._json_object_or_empty(gate.required_evidence).get("success_criterion_keys")
+                ):
+                    manifest.setdefault(key, []).extend(evidence_ids)
         if plan_items:
             manifest = {k: v for k, v in manifest.items() if criterion_state(k, plan_items, gates) == "accepted"}
         return manifest

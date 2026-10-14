@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 import pytest
@@ -1175,6 +1176,69 @@ async def _task_done(db_session, run, item_id):
     await db_session.flush()
 
 
+async def _manifest(service, db_session, run, goal=None, roadmap_version_id=None):
+    from huddleroom.services.orchestration_dependencies import accepted_plan_items
+
+    gates = list((await db_session.execute(
+        select(OrchestrationGate).where(OrchestrationGate.run_id == run.id, OrchestrationGate.status == "accepted")
+    )).scalars())
+    evidence = list((await db_session.execute(
+        select(OrchestrationEvidence).where(OrchestrationEvidence.run_id == run.id)
+    )).scalars())
+    return service._criterion_evidence_manifest(
+        gates, evidence, goal, roadmap_version_id, accepted_plan_items(run.plan_state)
+    )
+
+
+async def _two_final_items_plan(db_session, project_id):
+    from tests.test_orchestration_plan_to_work_expansion import _agent, _make_accepted_plan, _raw_plan_item
+
+    planner = _agent("planner", role="planner", capabilities=["planning"])
+    developer = _agent("developer", role="developer", capabilities=["implementation"])
+    db_session.add_all([planner, developer])
+    await db_session.flush()
+    items = [_raw_plan_item(developer.id, item_id=i, work_function="implementation") for i in ("first", "second")]
+    return await _make_accepted_plan(db_session, project_id, planner, items)
+
+
+@pytest.mark.parametrize("second_released", [False, True])
+async def test_accepted_final_item_with_unfinished_sibling_final_item_is_not_accepted(
+    db_session, test_project, second_released
+):
+    service, goal, run, _ = await _two_final_items_plan(db_session, test_project.id)
+    await _expand_item(service, db_session, run, "first")
+    await _task_done(db_session, run, "first")
+    await _accept_item_gate(db_session, run, "first")
+    if second_released:
+        await _expand_item(service, db_session, run, "second")  # gate stays open
+
+    situation = await OrchestrationProgressView().build(db_session, goal, run)
+    manifest = await _manifest(service, db_session, run)
+
+    assert _entry(situation, "expanded")["state"] != "accepted"
+    assert "expanded" not in manifest
+
+
+async def test_manifest_applies_the_acceptance_predicate_to_roadmap_goals(db_session, test_project):
+    service, goal, run, _ = await _two_final_items_plan(db_session, test_project.id)
+    await _expand_item(service, db_session, run, "first")
+    await _accept_item_gate(db_session, run, "first")  # "second" stays unreleased
+    integration = OrchestrationGate(
+        run_id=run.id, success_criterion_key="integration", gate_type="roadmap_integration", status="accepted",
+        required_evidence={"roadmap_version_id": "v1", "success_criterion_keys": ["expanded"]},
+    )
+    db_session.add(integration)
+    await db_session.flush()
+    db_session.add(OrchestrationEvidence(
+        run_id=run.id, gate_id=integration.id, source_type="verification", source_id=uuid.uuid4(),
+        verdict="accepted", evidence_metadata={},
+    ))
+    await db_session.flush()
+    roadmap_goal = SimpleNamespace(goal_type="roadmap")  # the row's CHECK constraint forbids flipping the type
+
+    assert "expanded" not in await _manifest(service, db_session, run, roadmap_goal, "v1")
+
+
 async def test_accepted_readiness_with_unreleased_final_item_is_not_accepted(db_session, test_project):
     service, goal, run, _ = await _readiness_and_final_plan(db_session, test_project.id)
     await _expand_item(service, db_session, run, "readiness")
@@ -1184,12 +1248,7 @@ async def test_accepted_readiness_with_unreleased_final_item_is_not_accepted(db_
     situation = await OrchestrationProgressView().build(db_session, goal, run)
 
     assert _entry(situation, "expanded")["state"] == "no_work"
-    all_gates = list((await db_session.execute(select(OrchestrationGate).where(OrchestrationGate.run_id == run.id))).scalars())
-    all_evidence = list((await db_session.execute(select(OrchestrationEvidence))).scalars())
-    from huddleroom.services.orchestration_dependencies import accepted_plan_items
-    manifest = service._criterion_evidence_manifest(
-        [g for g in all_gates if g.status == "accepted"], all_evidence, plan_items=accepted_plan_items(run.plan_state)
-    )
+    manifest = await _manifest(service, db_session, run)
     assert "expanded" not in manifest
 
 
@@ -1203,10 +1262,5 @@ async def test_preliminary_readiness_plus_accepted_final_delivery_is_accepted(db
     situation = await OrchestrationProgressView().build(db_session, goal, run)
 
     assert _entry(situation, "expanded")["state"] == "accepted"
-    all_gates = list((await db_session.execute(select(OrchestrationGate).where(OrchestrationGate.run_id == run.id))).scalars())
-    all_evidence = list((await db_session.execute(select(OrchestrationEvidence))).scalars())
-    from huddleroom.services.orchestration_dependencies import accepted_plan_items
-    manifest = service._criterion_evidence_manifest(
-        [g for g in all_gates if g.status == "accepted"], all_evidence, plan_items=accepted_plan_items(run.plan_state)
-    )
+    manifest = await _manifest(service, db_session, run)
     assert manifest["expanded"]
