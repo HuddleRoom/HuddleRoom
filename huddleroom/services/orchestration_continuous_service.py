@@ -468,11 +468,9 @@ class OrchestrationContinuousService:
                 active_sessions = list((await db.scalars(select(Session).where(
                     Session.task_id == task.id, Session.status.in_(("pending", "running")),
                 ))).all())
-                # Session cancel syncs the linked task to failed; decide on the pre-cancel status.
-                task_open = task.status not in {"completed", "cancelled", "failed", "done"}
                 for session in active_sessions:
-                    await sessions.cancel(db, session.id)
-                if task_open:
+                    await sessions.cancel(db, session.id, sync_task=False)
+                if task.status not in {"completed", "cancelled", "failed", "done"}:
                     await tasks.cancel(db, goal.project_id, task.id)
             reservation = await db.scalar(select(OrchestrationBudgetReservation).where(
                 OrchestrationBudgetReservation.discovery_run_id == source_run.id,

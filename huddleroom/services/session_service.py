@@ -836,7 +836,8 @@ class SessionService:
             next_cursor = f"{last.created_at.isoformat()}__{last.id}"
         return items, next_cursor
 
-    async def cancel(self, db: AsyncSession, session_id: uuid.UUID) -> Session:
+    async def cancel(self, db: AsyncSession, session_id: uuid.UUID, *, sync_task: bool = True) -> Session:
+        """Cancel a session. Callers that own the task outcome pass sync_task=False."""
         pending_writes = bool(db.new or db.dirty or db.deleted)
         with db.no_autoflush:
             session = await self.get_or_404(db, session_id)
@@ -893,7 +894,8 @@ class SessionService:
             "task_id": str(session.task_id) if session.task_id else None,
             "project_id": str(session.project_id),
         })
-        await sync_task_from_session(db, session)
+        if sync_task:
+            await sync_task_from_session(db, session)
         return session
 
     async def resume(self, db: AsyncSession, session_id: uuid.UUID) -> Session:

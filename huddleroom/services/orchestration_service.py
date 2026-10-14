@@ -2218,7 +2218,7 @@ class OrchestrationService:
         session_id, task_id = old_session.id, old_session.task_id
         await self._assert_sqlite_replacement_transaction(db)
         await db.commit()
-        await SessionService().cancel(db, session_id)
+        await SessionService().cancel(db, session_id, sync_task=False)
         await self._assert_current_plan_generation(db, run_id, expected)
         old_task = await db.get(Task, task_id, populate_existing=True)
         if old_task is not None and "cancelled" in Task.VALID_TRANSITIONS.get(old_task.status, set()):
@@ -7104,7 +7104,7 @@ class OrchestrationService:
         )
         active_session = session_result.scalar_one_or_none()
         if active_session is not None:
-            await SessionService().cancel(db, active_session.id)
+            await SessionService().cancel(db, active_session.id, sync_task=False)
 
         if "cancelled" not in Task.VALID_TRANSITIONS.get(planning_task.status, set()):
             return
@@ -8440,7 +8440,7 @@ class OrchestrationService:
                     )
                 )
                 for session in active_sessions:
-                    await SessionService().cancel(db, session.id)
+                    await SessionService().cancel(db, session.id, sync_task=False)
                 await TaskService().cancel(db, goal.project_id, task.id)
         goal.status = "cancelled"
         if run is not None:

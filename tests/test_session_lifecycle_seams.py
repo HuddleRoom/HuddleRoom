@@ -593,3 +593,30 @@ async def test_resumed_cli_collector_failure_is_labelled_resume_failed(test_engi
             with pytest.raises(RuntimeError):
                 await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
         assert (await _reload(factory, Session, session.id)).metadata_["resume_outcome"] == "resume_failed"
+
+
+@pytest.mark.asyncio
+async def test_owner_cancel_emits_no_failed_task_event_but_manual_cancel_does(test_engine, tmp_path, monkeypatch):
+    async def failed_events(factory, project_id):
+        async with factory() as db:
+            rows = (await db.execute(select(EventLog).where(
+                EventLog.project_id == project_id, EventLog.event_type == "task.status_changed"))).scalars().all()
+        return [e for e in rows if e.payload.get("status") == "failed"]
+
+    async with _world(test_engine, tmp_path, monkeypatch, session_status="running", runner=None) as (
+            factory, project, _agent, task, session):
+        async with factory() as db:
+            await SessionService().cancel(db, session.id, sync_task=False)
+            from huddleroom.services.task_service import TaskService
+            await TaskService().cancel(db, project.id, task.id)
+            await db.commit()
+        assert (await _reload(factory, Task, task.id)).status == "cancelled"
+        assert (await _reload(factory, Session, session.id)).ended_at is not None
+        assert await failed_events(factory, project.id) == []
+
+    async with _world(test_engine, tmp_path, monkeypatch, session_status="running", runner=None) as (
+            factory, project, _agent, task, session):
+        async with factory() as db:
+            await SessionService().cancel(db, session.id)
+            await db.commit()
+        assert len(await failed_events(factory, project.id)) == 1
