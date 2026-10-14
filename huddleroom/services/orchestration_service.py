@@ -9489,6 +9489,10 @@ class OrchestrationService:
         if gate_ref is None or gate_ref[0].id != gate.id:
             return 0
 
+        review_verdict = await self._meeting_review_verdict(db, meeting, decision.agenda_item_id)
+        if review_verdict is None:
+            return 0
+        verdict = "rejected" if decision.is_vetoed else review_verdict
         metadata = {
             "event_type": event.event_type,
             "event_seq": event.seq,
@@ -9510,27 +9514,35 @@ class OrchestrationService:
             source_id=decision.id,
             observed_event=event,
             producer_agent_id=meeting.organizer_agent_id or meeting.created_by_agent_id,
-            verdict=(
-                "rejected"
-                if decision.is_vetoed
-                or not await self._meeting_review_approved(db, meeting, decision.agenda_item_id)
-                else "candidate"
-            ),
+            verdict=verdict,
             evidence_metadata=metadata,
         )
 
     @staticmethod
-    async def _meeting_review_approved(
+    async def _meeting_review_verdict(
         db: AsyncSession, meeting: Meeting, agenda_item_id: uuid.UUID | None = None
-    ) -> bool:
-        """Non-review meetings pass; review items must all resolve approved (follow-ups allowed)."""
+    ) -> str | None:
+        """Evidence verdict for a review meeting's items: candidate, rejected, or None (no evidence yet).
+
+        Non-review meetings are always candidate. Human-overridden items (resolved without a
+        resolution kind) count as approved; unresolved, majority and deferred items yield no evidence.
+        """
         if meeting.meeting_type != "review":
-            return True
+            return "candidate"
         query = select(MeetingAgendaItem).where(MeetingAgendaItem.meeting_id == meeting.id)
         if agenda_item_id is not None:
             query = query.where(MeetingAgendaItem.id == agenda_item_id)
-        items = list((await db.execute(query)).scalars().all())
-        return all(i.resolution_kind in {"approved", "approved_with_followups"} for i in items)
+        kinds: list[str | None] = []
+        for item in (await db.execute(query)).scalars().all():
+            if item.resolution_kind is None and item.status == "resolved":
+                kinds.append("approved")
+            else:
+                kinds.append(item.resolution_kind)
+        if any(k in {"rejected", "changes_requested", "verdict_missing"} for k in kinds):
+            return "rejected"
+        if all(k in {"approved", "approved_with_followups"} for k in kinds):
+            return "candidate"
+        return None
 
     async def _ingest_meeting_concluded_evidence(
         self,
@@ -9562,7 +9574,9 @@ class OrchestrationService:
         )
         decisions = list(result.scalars().all())
         producer_agent_id = meeting.organizer_agent_id or meeting.created_by_agent_id
-        verdict = "candidate" if await self._meeting_review_approved(db, meeting) else "rejected"
+        verdict = await self._meeting_review_verdict(db, meeting)
+        if verdict is None:
+            return 0
         if not decisions:
             return await self._record_evidence_once(
                 db,

@@ -837,6 +837,28 @@ async def test_review_round_outcome_requires_explicit_reviewer_verdict(
 
 
 @pytest.mark.asyncio
+async def test_review_outcome_uses_only_latest_turn_per_reviewer(db_session, test_project, test_agent):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    rid = reviewer.id
+    turns = [
+        MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=rid, content="Still reading.", references=[]),
+        MeetingTurn(turn_number=2, round_number=1, speaker_agent_id=test_agent.id, content="Ok.", references=[]),
+        MeetingTurn(turn_number=3, round_number=2, speaker_agent_id=rid, content="Fine.\nVERDICT: APPROVE", references=[]),
+    ]
+    resolution, outcome = MeetingRunner()._review_outcome(turns, {str(rid): "reviewer"})
+    assert (resolution, outcome["resolution_kind"]) == ("resolved", "approved")
+
+
+@pytest.mark.asyncio
 async def test_standup_round_complete_advances_without_consensus_check(
     db_session, test_project, test_agent
 ):

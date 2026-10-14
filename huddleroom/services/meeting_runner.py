@@ -1856,7 +1856,7 @@ class MeetingRunner:
 
     def _review_outcome(self, turns: list[MeetingTurn], agent_roles: dict[str, str]) -> tuple[str, dict]:
         severities: list[str] = []
-        verdicts: list[str | None] = []
+        last_verdict: dict[str, str | None] = {}  # each required reviewer's latest turn only
         summary_lines: list[str] = []
         for turn in turns:
             content = (turn.content or "").strip()
@@ -1864,13 +1864,15 @@ class MeetingRunner:
                 continue
             for match in _REVIEW_SEVERITY_PATTERN.finditer(content):
                 severities.append(match.group(1).lower())
-            if agent_roles.get(str(turn.speaker_agent_id), "").lower() in {"security", "reviewer"}:
+            speaker = str(turn.speaker_agent_id)
+            if agent_roles.get(speaker, "").lower() in {"security", "reviewer"}:
                 match = _REVIEW_VERDICT_PATTERN.fullmatch(content.splitlines()[-1].strip())
-                verdicts.append(match.group(1).upper() if match else None)
+                last_verdict[speaker] = match.group(1).upper() if match else None
             first_line = content.splitlines()[0].strip()
             if first_line:
                 summary_lines.append(first_line)
 
+        verdicts = list(last_verdict.values())
         # Strictest signal wins; a required reviewer without a final-line verdict never approves.
         if "BLOCK" in verdicts or "blocker" in severities:
             resolution_kind, resolution = "rejected", "unresolved"
