@@ -1022,3 +1022,43 @@ async def test_escalation_blocker_does_not_block_goal_completion(
 
     finish_calls = ["final_summary", "closeout_preconditions", "closeout", "completion"]
     assert [c for c in calls if c in finish_calls] == (finish_calls if finish_expected else [])
+
+
+async def test_precontract_roadmap_judgment_defers_until_accepted_version(
+    db_session, test_project, monkeypatch,
+):
+    from fastapi import HTTPException
+    from huddleroom.models.orchestration import OrchestrationRoadmapVersion
+    goal, run = await _run(db_session, test_project)
+    goal.goal_type = "roadmap"
+    goal.planning_mode = "roadmap"
+    state = {"needs_judgment": True, "judgment_dirty": True, "judgment_due_at": _NOW.isoformat()}
+    run.supervision_state = state
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+
+    async def local_tick(self, db, run_id, *, local_only=False):
+        assert local_only is True
+        return {}
+
+    monkeypatch.setattr(OrchestrationService, "tick", local_tick)
+    scheduler = OrchestrationSupervisionScheduler()
+    async with sessions() as guard_db:
+        with pytest.raises(HTTPException) as error:
+            await OrchestrationService().supervision._contract_version(guard_db, goal, run)
+        assert error.value.status_code == 409
+        assert error.value.detail == "Roadmap supervision has no current contract"
+    assert await scheduler._claim_judgment(run.id, _NOW) is None
+    assert await _persisted_state(sessions, run.id) == state
+    async with sessions() as accepting:
+        artifact = Artifact(project_id=test_project.id, name="Accepted roadmap", artifact_type="plan", metadata_={})
+        accepting.add(artifact)
+        await accepting.flush()
+        accepting.add(OrchestrationRoadmapVersion(
+            goal_id=goal.id, run_id=run.id, version=1, plan_artifact_id=artifact.id,
+            snapshot={"items": []}, fingerprint="a" * 64, approval_reference={},
+        ))
+        await accepting.commit()
+    claim = await scheduler._claim_judgment(run.id, _NOW)
+    assert claim is not None
+    assert claim["payload"]["contract_version"] == "plan:1"
+    assert (await _persisted_state(sessions, run.id))["judgment_claim_token"] == claim["token"]

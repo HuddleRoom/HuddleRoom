@@ -471,3 +471,37 @@ async def test_second_stale_decision_waits_without_an_action(
     await db_session.refresh(refreshed)
     assert (stale.validator_status, refreshed.validator_status) == ("rejected", "rejected")
     assert await db_session.scalar(select(OrchestrationAction.id).where(OrchestrationAction.run_id == run.id)) is None
+
+
+async def test_distinct_accepted_noop_replay_preserves_original_steering_lineage(
+    db_session, conversation_goal_run, test_project, test_user, monkeypatch,
+):
+    goal, run, _task, request = await _applied_item(
+        db_session, conversation_goal_run, test_project, test_user, monkeypatch,
+    )
+    steering = OrchestrationSteeringService()
+    snapshot = await steering.context_snapshot(db_session, goal, run)
+    decisions = [OrchestrationDecision(
+        run_id=run.id, decision_type="m7", validator_status="accepted",
+        input_snapshot={"steering": snapshot},
+        parsed_decision={"action_type": "noop", "reason": reason},
+    ) for reason in ("Wait for planner", "Continue waiting for planner")]
+    db_session.add_all(decisions)
+    await db_session.flush()
+    dispatcher = OrchestrationDecisionDispatcher(OrchestrationService())
+    first = await dispatcher.dispatch(db_session, run, decisions[0])
+    replay = await dispatcher.dispatch(db_session, run, decisions[1])
+    assert first.id == replay.id
+    assert replay.status == "completed"
+    assert replay.decision_id == decisions[0].id
+    assert [decision.validator_status for decision in decisions] == ["accepted", "accepted"]
+    assert list((await db_session.scalars(select(OrchestrationAction.id).where(
+        OrchestrationAction.run_id == run.id,
+    ))).all()) == [first.id]
+    links = list((await db_session.scalars(select(OrchestrationSteeringResultLink))).all())
+    assert [(link.request_id, link.decision_id, link.action_id) for link in links] == [
+        (request.id, decisions[0].id, first.id),
+    ]
+    with pytest.raises(SteeringDomainError) as error:
+        await steering.link_result(db_session, request.id, decisions[1].id, first.id)
+    assert error.value.code == "steering_invalid_target"

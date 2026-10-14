@@ -292,7 +292,8 @@ class OrchestrationDecisionDispatcher:
             action.dispatch_contract = contract
         if recovery:
             self.link_recovery_effect(recovery, recovery_context, request, action)
-        if steering is not None and action.status != "failed":
+        # A replay retains its original decision ownership and steering result links.
+        if steering is not None and action.status != "failed" and action.decision_id == decision.id:
             for request_id in active_direction_ids(input_snapshot):
                 await steering.link_result(db, request_id, decision.id, action.id)
         return action

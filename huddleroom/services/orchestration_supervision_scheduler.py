@@ -96,6 +96,7 @@ class OrchestrationSupervisionScheduler:
     async def _claim_judgment(self, run_id, now):
         """Commit a complete local snapshot before the untrusted provider call."""
         from huddleroom.database import AsyncSessionLocal
+        from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
         from huddleroom.services.orchestration_service import OrchestrationService
         from huddleroom.services.orchestration_supervision_context import OrchestrationSupervisionContextBuilder
 
@@ -123,6 +124,12 @@ class OrchestrationSupervisionScheduler:
                     or not state.get("judgment_due_at")
                     or self._parse_time(state["judgment_due_at"]) > now
                 ):
+                    await db.commit()
+                    return None
+                if goal.goal_type == "roadmap" and await OrchestrationRoadmapService(service).current_version(
+                    db, goal.id,
+                ) is None:
+                    # Keep judgment pending until the roadmap has an accepted contract.
                     await db.commit()
                     return None
                 canonical_payload, fingerprint = await self._judgment_payload(

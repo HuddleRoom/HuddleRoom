@@ -101,7 +101,8 @@ async def test_ordinary_dispatch_keeps_run_type_request_identity_without_recover
 @pytest.mark.asyncio
 async def test_dispatch_fences_versioned_steering_snapshot(monkeypatch):
     service = OrchestrationService()
-    service.execute_noop_action = AsyncMock(return_value=SimpleNamespace(status="completed", id=uuid.uuid4()))
+    action = SimpleNamespace(status="completed", id=uuid.uuid4(), decision_id=None)
+    service.execute_noop_action = AsyncMock(return_value=action)
     service._steering_action_fence = AsyncMock(return_value=("fenced", None, None, None, None))
     steering = SimpleNamespace(assert_current_versions=AsyncMock(), link_result=AsyncMock())
     monkeypatch.setattr(
@@ -117,6 +118,7 @@ async def test_dispatch_fences_versioned_steering_snapshot(monkeypatch):
         }}},
     )
 
+    action.decision_id = decision.id
     await OrchestrationDecisionDispatcher(service).dispatch(db, run, decision)
 
     service._steering_action_fence.assert_awaited_once_with(db, run.id, ANY, decision.id)
