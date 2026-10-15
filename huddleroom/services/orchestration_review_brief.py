@@ -96,7 +96,9 @@ _FENCE_MARK = re.compile(r"<<<(?=[A-Z_])|(?<=[A-Z_])>>>")
 
 
 def fenced(tag: str, body: str) -> str:
-    """Untrusted agent text between `<<<TAG` and `TAG>>>`; the only way briefs embed it."""
+    """Untrusted agent text between `<<<TAG` and `TAG>>>`, as verifier and revision briefs embed it. The result
+    correction brief's FAILED_OUTPUT block is deliberately not built here: it returns the producer's own output
+    verbatim to the same producer."""
     body = _FENCE_MARK.sub(lambda m: m.group(0)[0] + "\\" + m.group(0)[1:], body)
     return f"<<<{tag}\n{body}\n{tag}>>>"
 

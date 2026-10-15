@@ -1449,7 +1449,9 @@ class OrchestrationRoadmapService:
                 action = await self.orchestration.execute_request_verification_action(
                     db, run.id,
                     {"action_type": "request_verification", "gate_id": str(approval.id), "work_function": "validation"},
-                    f"run:{run.id}:kind:request_verification:roadmap_plan:{approval.id}", decision_id=decision.id,
+                    await self.orchestration._verification_retry_key(
+                        db, run.id, f"run:{run.id}:kind:request_verification:roadmap_plan:{approval.id}",
+                    ), decision_id=decision.id,
                 )
                 return {"step": "waiting_plan_authority", "action_id": str(action.id)}
 

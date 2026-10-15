@@ -2445,10 +2445,10 @@ async def test_malformed_report_curates_nothing_and_verifier_waits_for_its_corre
         "status": "done", "changes": ["Delivered."], "evidence": [], "criterion_progress": {}, "decisions": [],
         "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None,
     }))
+    await service.tick(db_session, run.id)  # the held verification is requested again with no new request
     await service.tick(db_session, run.id)
-    request = await service.execute_request_verification_action(
-        db_session, run.id, verify, f"run:{run.id}:kind:malformed-report-verification:corrected",
-    )
+    request = next(action for action in reversed(await _run_actions(db_session, run.id))
+                   if action.action_type == "request_verification" and action.target_type == "task")
     verification_task = await db_session.get(Task, request.target_id)
     assert verification_task is not None and verification_task.assigned_to == verifier.id
     await _complete_task_session(

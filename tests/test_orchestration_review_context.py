@@ -1061,6 +1061,9 @@ import os  # noqa: E402
 needs_permissions = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads anything")
 
 
+from huddleroom.services.orchestration_progress_view import OrchestrationProgressView  # noqa: E402
+
+
 def _cites(artifact_id):
     return lambda _artifact: {**PRODUCER_REPORT, "evidence": [f"artifact:{artifact_id} holds the login form."]}
 
@@ -1108,8 +1111,14 @@ async def test_soft_deleted_cited_artifact_goes_back_to_the_producer_and_nothing
     await db.flush()
     non_plan = select(Artifact.id).where(Artifact.artifact_type != "plan")
     artifacts_before = len(list(await db.scalars(non_plan)))
+
+
+    def produced_by_the_producer(artifact):
+        gone.linked_task_id = artifact.linked_task_id
+        return _cites(gone.id)(artifact)
+
     service, run, gate, work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(
-        db, test_project, report_for=_cites(gone.id),
+        db, test_project, report_for=produced_by_the_producer,
     )
 
     assert verifier_task is None
@@ -1205,7 +1214,17 @@ async def test_rejection_while_the_deliverable_is_unreadable_asks_instead_of_rev
     [ask] = _owner_asks(run, "permission_required")
     assert ask["scope"] == f"gate:{gate.id}:artifact:{artifact.id}"
 
-    await service.recover_run(db, run.id, baseline_ready=True)  # access restored: the rejection is revised
+    await service.recover_run(db, run.id, baseline_ready=True)  # access restored, ask pending: nothing re-checked
+    assert await _revision_tasks(db, work_task) == []
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(ask["decision_id"]))
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option=(decision.options or [{"key": "done"}])[0]["key"],
+        decided_by_user_id=(await db.get(OrchestrationGoal, run.goal_id)).manager_user_id or uuid.uuid4(),
+    )
+    await service.tick(db, run.id)  # the owner answered: the rejection is revised
+    await service.recover_run(db, run.id, baseline_ready=True)
     [revision] = await _revision_tasks(db, work_task)
     assert "Empty password returns 500." in revision.description
 
@@ -1250,16 +1269,20 @@ async def test_wrong_artifact_id_for_present_content_is_corrected_then_verified(
     assert f"artifact:{wrong}" in correction.description and f"artifact:{artifact.id}" in correction.description
     assert _owner_asks(run, "capability_unavailable") == []
 
+    progress = await OrchestrationProgressView().build(db, await db.get(OrchestrationGoal, run.goal_id), run)
+    assert not [f for f in progress.untracked_follow_ups if f["id"] == str(gate.id)]  # the correction is the work
+    await service.tick(db, run.id)  # nothing to verify while the correction runs
+    assert len(await _verification_actions(db, run, gate)) == 1
+
     fixed = await _complete(db, service, run, correction, json.dumps(_cites(artifact.id)(artifact)))
     fixed.output = None
     marker = await service._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{work_task.id}")
     assert marker.request["result_correction"]["status"] == "corrected"
     assert len(list(await db.scalars(select(Session).where(
         Session.task_id == work_task.id, Session.status == "completed")))) == 1  # no work redone
-    action = await service.execute_request_verification_action(
-        db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
-        f"run:{run.id}:kind:login-verification:corrected",
-    )
+    await service.tick(db, run.id)  # the held verification is requested again by itself, with no new request
+    await service.tick(db, run.id)
+    held, action = await _verification_actions(db, run, gate)
     verifier = await db.get(Task, action.target_id)
     assert action.target_type == "task" and f"artifact:{artifact.id} holds the login form." in verifier.description
 
@@ -1282,3 +1305,193 @@ async def test_stopped_citation_correction_never_readmits_the_original_report(db
     assert (await service._effective_report(db, run.id, work_task))[1] is None
     adhoc_gate = SimpleNamespace(required_evidence={"task_id": str(work_task.id)}, run_id=run.id)
     assert await service._adhoc_report_failure(db, adhoc_gate) == ("Task report is invalid", True)
+
+
+async def _request(service, db, run, gate, key):
+    return await service.execute_request_verification_action(
+        db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
+        f"run:{run.id}:kind:{key}",
+    )
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+@pytest.mark.parametrize("producer_made", [True, False])
+async def test_missing_contract_artifact_revises_only_what_the_producer_made(db_session, test_project, producer_made):
+    db = db_session
+    service, run, gate, work_task, _artifact, verifier, _task = await _verifier_for_db_only_report(db, test_project)
+    supplied = Artifact(project_id=test_project.id, name="spec.md", artifact_type="file", path="spec.md",
+                        status="deleted", created_by_agent=work_task.assigned_to if producer_made else None)
+    db.add(supplied)
+    await db.flush()
+    contract = work_task.metadata_["orchestration_contract"]
+    work_task.metadata_ = {**work_task.metadata_, "orchestration_contract": {
+        **contract, "artifact_ids": [*contract.get("artifact_ids", []), str(supplied.id)]}}
+    await db.flush()
+
+    action = await _request(service, db, run, gate, "contract-input")
+
+    assert action.target_type == "gate"
+    if producer_made:
+        [entry] = await _revisions(service, db, run, gate)
+        assert entry["cause"] == "deliverable_missing" and _owner_asks(run, "capability_unavailable") == []
+    else:  # an input the producer was given: its producer cannot restore it, the owner is asked
+        assert await _revisions(service, db, run, gate) == [] and await _revision_tasks(db, work_task) == []
+        [ask] = _owner_asks(run, "capability_unavailable")
+        assert ask["scope"] == f"gate:{gate.id}:artifact:{supplied.id}"
+        assert "review_input_missing: supplied_input_missing" in ask["history"][0]
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_dismissed_report_correction_asks_once_on_the_gate_instead_of_holding_silently(db_session, test_project):
+    from datetime import timedelta
+
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+    from tests.test_orchestration_result_correction import _complete
+
+    db = db_session
+    wrong = uuid.uuid4()
+    service, run, gate, work_task, _artifact, _verifier, _task = await _verifier_for_db_only_report(
+        db, test_project, report_for=_cites(wrong),
+    )
+    [correction] = [row for row in await db.scalars(select(Task).where(Task.parent_id == work_task.id))
+                    if (row.metadata_ or {}).get("result_correction_parent_task_id") == str(work_task.id)]
+    await _complete(db, service, run, correction, json.dumps(_cites(wrong)(None)))  # stops: exhausted
+    await service.tick(db, run.id)
+    assert _owner_asks(run, "capability_unavailable") == []  # the correction's own ask is the owner's decision
+
+    [exhausted] = _owner_asks(run, "result_correction_exhausted")
+    decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(exhausted["decision_id"]))
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option="dismiss",
+        decided_by_user_id=(await db.get(OrchestrationGoal, run.goal_id)).manager_user_id or uuid.uuid4(),
+    )
+    for _ in range(3):
+        for action in await _verification_actions(db, run, gate):
+            action.created_at = action.created_at - timedelta(hours=1)
+        await service.tick(db, run.id)
+
+    [ask] = _owner_asks(run, "capability_unavailable")
+    assert ask["scope"] == f"gate:{gate.id}:report:{work_task.id}"
+    assert len(await _verification_actions(db, run, gate)) == 2  # held, then one re-check; none while the ask waits
+    progress = await OrchestrationProgressView().build(db, await db.get(OrchestrationGoal, run.goal_id), run)
+    [held] = [f for f in progress.untracked_follow_ups if f["id"] == str(gate.id)]
+    assert "verification held: producer_report_unreadable" in held["summary"]
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+@needs_permissions
+async def test_pending_input_ask_adds_no_classification_or_routed_rows(db_session, test_project, monkeypatch):
+    from datetime import timedelta
+
+    from huddleroom.services import orchestration_service as orchestration_module
+
+    db = db_session
+    secret = Path(test_project.workspace_path) / "secret"
+    secret.mkdir()
+    (secret / "login.py").write_text("x\n")
+    secret.chmod(0)
+    try:
+        service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(
+            db, test_project, artifact_fields={"path": "secret/login.py"},
+        )
+        assert verifier_task is None and len(_owner_asks(run, "permission_required")) == 1
+        binds = []
+        real_bind = orchestration_module.bind_artifacts
+
+        async def counting_bind(*args, **kwargs):
+            binds.append(1)
+            return await real_bind(*args, **kwargs)
+
+        monkeypatch.setattr(orchestration_module, "bind_artifacts", counting_bind)
+        for _ in range(3):
+            for action in await _verification_actions(db, run, gate):
+                action.created_at = action.created_at - timedelta(hours=1)
+            await service.tick(db, run.id)
+            await service.recover_run(db, run.id, baseline_ready=True)
+    finally:
+        secret.chmod(0o700)
+    assert len(await _verification_actions(db, run, gate)) == 1 and binds == []
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_sessionless_work_with_a_consumed_marker_still_gets_a_verifier(db_session, test_project):
+    from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _seed_accepted_plan, _tasks_for_run
+
+    db = db_session
+    producer, verifier = _agent("hand-producer", ["implementation"]), _agent("hand-verifier", ["validation"])
+    producer.role, verifier.role = "developer", "validator"
+    db.add_all([producer, verifier])
+    await db.flush()
+    service, _goal, run = await _authorized_run(db, test_project)
+    await _seed_accepted_plan(db, test_project, service, run, producer, plan_items=[{
+        "id": "hand-item", "work_function": "implementation", "scope": "Finish by hand.",
+        "deliverable": "Delivered work.", "agent_id": str(producer.id),
+    }])
+    await service.tick(db, run.id)
+    work_task = next(task for task in await _tasks_for_run(db, run.id)
+                     if service._task_work_function(task) == "implementation")
+    gate = await db.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
+    work_task.status = "done"
+    await db.flush()
+    await service.consume_canonical_report(db, run, work_task)  # a marker with no report, from no session
+    assert await service._existing_action_for_key(
+        db, run.id, f"run:{run.id}:kind:report_consumed:task:{work_task.id}") is not None
+
+    action = await _request(service, db, run, gate, "hand-verification")
+
+    task = await db.get(Task, action.target_id)
+    assert action.target_type == "task" and task.assigned_to == verifier.id
+    assert "without a completed agent session" in task.description
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_fixed_key_verification_is_keyed_again_only_after_its_hold_backoff(db_session, test_project):
+    from datetime import timedelta
+
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, _task = await _verifier_for_db_only_report(
+        db, test_project, artifact_fields={"metadata_": {}},  # uninspectable: the request is held
+    )
+    base = f"run:{run.id}:kind:request_verification:stale_gate:{gate.id}"
+    assert await service._verification_retry_key(db, run.id, base) == base
+    held = await service.execute_request_verification_action(
+        db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"}, base,
+    )
+    assert held.target_type == "gate"
+    assert await service._verification_retry_key(db, run.id, base) == base  # within the backoff: the same request
+    held.created_at = held.created_at - timedelta(hours=1)
+    assert await service._verification_retry_key(db, run.id, base) == f"{base}:held:1"
+    assert await service._verification_retry_key(db, run.id, base, immediate=True) == f"{base}:held:1"
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_funding_wait_for_changed_content_asks_the_owner_and_clears_once_dispatched(
+    db_session, test_project, monkeypatch,
+):
+    from datetime import timedelta
+
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    real_authority = service.roadmap_pre_release_authority
+    pending = {"left": 1}
+
+    async def authority(*args, **kwargs):
+        if pending["left"]:
+            pending["left"] -= 1
+            return {"status": "pending"}
+        return await real_authority(*args, **kwargs)
+
+    monkeypatch.setattr(service, "roadmap_pre_release_authority", authority)
+    (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): return True\n")
+    await _finish(db, service, run, verifier_task, ACCEPTED)
+    await service.tick(db, run.id)  # within the wait backoff: no second waiting action
+
+    first, waiting = await _verification_actions(db, run, gate)
+    assert waiting.error == "budget_wait"
+    [ask] = _owner_asks(run, "budget_exhausted")
+    assert ask["scope"].startswith(f"gate:{gate.id}:reverify:")
+
+    waiting.created_at = waiting.created_at - timedelta(hours=1)
+    await service.tick(db, run.id)
+    actions = await _verification_actions(db, run, gate)
+    assert actions[-1].target_type == "task" and _owner_asks(run, "budget_exhausted") == []

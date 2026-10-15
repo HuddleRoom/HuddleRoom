@@ -436,9 +436,24 @@ async def _follow_up_rows(
         if gate.status != "open" or gate.gate_type in NON_BLOCKING_GATE_TYPES or gate_id in producer_gate_ids:
             continue
         verification = latest_verification.get(gate_id)
-        if verification is not None and verification.status != "failed":
+        held = (verification.request or {}).get("routed") if verification is not None and (
+            verification.status == "completed") else None
+        if verification is not None and verification.status != "failed" and not held:
             continue
+        if held and await _report_correction_running(db, run, held):
+            continue  # the producer's report correction is the visible work; the verifier follows it
         title = plan_titles.get(gate_id)
+        if held:
+            subject = f"{title} ({gate.gate_type} gate)" if title else f"{gate.gate_type} gate for {gate.success_criterion_key}"
+            rows.append((RANK_UNVERIFIED_GATE, _naive_utc(gate.created_at), gate_id, {
+                "kind": "unverified_gate",
+                "id": gate_id,
+                "summary": f"{subject} verification held: {held.get('reason')} ({held.get('detail')})"[
+                    :FOLLOW_UP_SUMMARY_MAX
+                ],
+                "suggested_actions": [],
+            }))
+            continue
         if verification is None:
             summary = (
                 f"{title} ({gate.gate_type} gate) awaiting verification" if title
@@ -455,6 +470,19 @@ async def _follow_up_rows(
             "suggested_actions": ["request_verification"],
         }))
     return rows
+
+
+async def _report_correction_running(db: AsyncSession, run: OrchestrationRun, held: dict) -> bool:
+    """A verification held on the producer's report while that report's correction is pending or running."""
+    item = str(held.get("item") or "")
+    if not item.startswith("report:"):
+        return False
+    marker = await db.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+        OrchestrationAction.idempotency_key == f"run:{run.id}:kind:report_consumed:task:{item.removeprefix('report:')}",
+    ))
+    ledger = ((marker.request or {}) if marker is not None else {}).get("result_correction") or {}
+    return isinstance(ledger, dict) and ledger.get("status") in {"pending", "correcting"}
 
 
 async def _run_tasks(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> list[Task]:

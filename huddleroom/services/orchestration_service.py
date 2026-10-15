@@ -199,6 +199,7 @@ IDENTITY_KEY_MARK = ":identity:"
 IDENTITY_CACHE_KEY = "orchestration_identity_cache"  # db.info slot: one recomputation per artifact per pass
 MAX_LISTED_ARTIFACTS = 10  # artifacts named in a citation error
 PRODUCER_REPORT_UNREADABLE = "producer_report_unreadable"
+SUPPLIED_INPUT_MISSING = "supplied_input_missing"  # a missing input its producer did not make: no revision
 REVIEW_INPUT_WAIT_SECONDS = 60  # ponytail: fixed backoff for a re-verification held by funding or its inputs
 REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; an answered owner ask re-arms it
 
@@ -4783,14 +4784,19 @@ class OrchestrationService:
         request_verification for the gate, plus one per automatic gate revision. Attempt 0 with no revision has no
         suffix (legacy keys unchanged)."""
         rows = (await db.execute(
-            select(OrchestrationAction.status, OrchestrationAction.request).where(
+            select(OrchestrationAction.status, OrchestrationAction.request, OrchestrationAction.created_at).where(
                 OrchestrationAction.run_id == run_id,
                 OrchestrationAction.action_type == "request_verification",
                 OrchestrationAction.status.in_(("failed", "completed")),
             )
         )).all()
-        failed = sum(1 for status, req in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id)
-                     and (status == "failed" or req.get("routed")))
+        run = await db.get(OrchestrationRun, run_id)
+        # a held request counts once its backoff passed and no owner ask about its input is pending, so repeated
+        # requests while it waits reuse the held action instead of classifying and writing one more
+        cutoff = _naive_utc(_utcnow()) - timedelta(seconds=REVIEW_INPUT_WAIT_SECONDS)
+        waiting = run is not None and await self._input_ask_pending(db, run, gate_id)
+        failed = sum(1 for status, req, at in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id)
+                     and (status == "failed" or (req.get("routed") and not waiting and _naive_utc(at) <= cutoff)))
         # each automatic revision is re-verified under a fresh key
         revisions = len(await self._gate_revision_entries(db, run_id, gate_id))
         # so is content that changed after its review (the reserved request counts itself)
@@ -5031,7 +5037,7 @@ class OrchestrationService:
             if report is not None:
                 payload = {key: value for key, value in work_report_payload(report).items() if value not in (None, [], {})}
                 excerpt = json.dumps(payload, indent=2, ensure_ascii=False)
-            elif marker is None:
+            elif await self._finished_without_session(db, report_task):
                 excerpt = "[no producer report: the work finished without a completed agent session]"
             artifact_ids = []
             for value in source_contract.get("artifact_ids") or []:
@@ -10433,6 +10439,8 @@ class OrchestrationService:
         if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
             created += await self._reverify_gate_revisions(db, goal, run)
         if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
+            created += await self._retry_held_verifications(db, goal, run)
+        if run.status in LLM_DECISION_RUN_STATUSES and goal.status in {"active", "blocked"}:
             created += await self._rebind_reviewed_identities(db, goal, run)
         await db.flush()
         return created
@@ -10492,6 +10500,71 @@ class OrchestrationService:
             return f"{REVIEW_INPUT_MISSING}: {current.get('reason')}", False
         return (IDENTITY_MISSING_REASON if state == CONFIRMED_MISSING else IDENTITY_CHANGED_REASON), False
 
+    async def _verification_retry_key(
+        self, db: AsyncSession, run_id: uuid.UUID, base: str, *, immediate: bool = False,
+    ) -> str:
+        """Key for a verification request under a fixed ``base`` key: the latest one of its family, unless that was
+        held on its inputs and the wait backoff passed (``immediate``: the input is back), then a fresh key so the
+        gate is classified again."""
+        family = list(await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "request_verification",
+            or_(OrchestrationAction.idempotency_key == base,
+                OrchestrationAction.idempotency_key.startswith(f"{base}:held:", autoescape=True)),
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id)))
+        if not family:
+            return base
+        latest = family[-1]
+        if not self._routed(latest) or (not immediate and self._held_reverification(family)):
+            return latest.idempotency_key
+        return f"{base}:held:{len(family)}"
+
+    async def _retry_held_verifications(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
+        """Request each verification held on its inputs again once they may be back: at once when the producer's
+        report correction landed, otherwise after the wait backoff. Never while the owner's ask about the input is
+        pending or the report's correction is still open, and never for a missing deliverable (its revision is
+        re-verified)."""
+        from huddleroom.services.orchestration_budget_service import BudgetMeasurementError
+
+        if await self._result_correction_stale(db, run) is not None:
+            return 0
+        latest: dict[str, OrchestrationAction] = {}
+        for action in await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_verification",
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id)):
+            latest[str((action.request or {}).get("gate_id"))] = action
+        created = 0
+        for gate_id, action in latest.items():
+            routed = self._json_object_or_empty((action.request or {}).get("routed")) if self._routed(action) else {}
+            gate = await db.get(OrchestrationGate, self._event_uuid(gate_id)) if routed else None
+            if gate is None or gate.run_id != run.id or gate.status == "accepted":
+                continue
+            if routed.get("state") == CONFIRMED_MISSING or await self._input_ask_pending(db, run, gate.id):
+                continue
+            immediate, item = False, str(routed.get("item") or "")
+            if item.startswith("report:"):
+                marker = await self._existing_action_for_key(
+                    db, run.id, f"run:{run.id}:kind:report_consumed:task:{item.removeprefix('report:')}",
+                )
+                ledger = self._json_object_or_empty(self._json_object_or_empty(
+                    marker.request if marker else {}
+                ).get("result_correction"))
+                if await self._report_correction_open(db, ledger):
+                    continue
+                immediate = ledger.get("status") == "corrected"
+            base = re.sub(r":held:\d+$", "", action.idempotency_key)
+            key = await self._verification_retry_key(db, run.id, base, immediate=immediate)
+            if key == action.idempotency_key:
+                continue
+            try:
+                await self.execute_request_verification_action(db, run.id, {
+                    "action_type": "request_verification", "gate_id": gate_id,
+                    "work_function": (action.request or {}).get("work_function") or "validation",
+                }, key)
+            except (HTTPException, BudgetMeasurementError):
+                continue  # the failed action is the record; the LLM or a later tick asks again
+            created += 1
+        return created
+
     async def _classify_review_inputs(
         self, db: AsyncSession, run: OrchestrationRun | None, gate: OrchestrationGate, source_task: Task | None,
     ) -> dict[str, Any] | None:
@@ -10515,21 +10588,18 @@ class OrchestrationService:
             contract and gate.gate_type not in {PLAN_GATE_TYPE, "roadmap_plan_approval"}
             and expected_result_kind(contract, True) == WORK_REPORT
         ):
-            _marker, report, (ledger, clarification, markers) = await self._effective_report(db, run.id, report_task)
-            # finished with no completed agent session (by hand, by a child goal): no report exists to read
-            sessionless = report is None and markers[0] is None and report_task.status == "done" and await db.scalar(
-                select(Session.id).where(Session.task_id == report_task.id, Session.status == "completed").limit(1)
-            ) is None
+            _marker, report, (ledger, _clarification, markers) = await self._effective_report(db, run.id, report_task)
+            sessionless = report is None and await self._finished_without_session(db, report_task)
             if report is None and markers[0] is None and report_task.status == "done" and not sessionless:
                 try:  # finished but not consumed yet: HuddleRoom restores the report through the normal consumer
                     await self.consume_canonical_report(db, run, report_task)
                 except HTTPException:
                     pass  # no canonical session to consume: unreadable
-                _marker, report, (ledger, clarification, markers) = await self._effective_report(
+                _marker, report, (ledger, _clarification, markers) = await self._effective_report(
                     db, run.id, report_task,
                 )
             if report is None and not sessionless:
-                restoring = bool(ledger) or clarification is not None or report_task.status != "done"
+                restoring = report_task.status != "done" or await self._report_correction_open(db, ledger)
                 return {
                     "state": UNINSPECTABLE, "reason": PRODUCER_REPORT_UNREADABLE, "item": f"report:{report_task.id}",
                     "detail": f"the report of task {report_task.id} cannot be read",
@@ -10544,12 +10614,21 @@ class OrchestrationService:
                 Artifact.status != "deleted", Artifact.linked_task_id.in_({source_task.id, report_task.id}),
             )),
         ).order_by(Artifact.created_at, Artifact.id)))
-        found = {row.id for row in rows}
+        found = {row.id: row for row in rows}
+        producer_tasks = {source_task.id, report_task.id, *(task.id for _item, task in revisions)}
         records = [
             *({"artifact_id": str(value), "state": CONFIRMED_MISSING, "reason": None}
               for value in required if value not in found),
             *await bind_artifacts(db, source_task.project_id, rows),
         ]
+        for record in records:  # only the producer can restore what the producer made
+            row = found.get(self._event_uuid(record["artifact_id"]))
+            produced = row is not None and (row.linked_task_id in producer_tasks or (
+                row.created_by_user is None and row.created_by_agent is not None
+                and row.created_by_agent == source_task.assigned_to
+            ))
+            if record["state"] == CONFIRMED_MISSING and not produced:
+                record.update(state=UNINSPECTABLE, reason=SUPPLIED_INPUT_MISSING)
         for state in (CONFIRMED_MISSING, UNINSPECTABLE):
             record = next((item for item in records if item["state"] == state), None)
             if record is None:
@@ -10564,7 +10643,8 @@ class OrchestrationService:
                 }
             return {
                 "state": state, "reason": record["reason"], "item": f"artifact:{artifact_id}",
-                "detail": f"artifact {artifact_id} cannot be inspected",
+                "detail": f"artifact {artifact_id}, supplied to the producer, is missing"
+                if record["reason"] == SUPPLIED_INPUT_MISSING else f"artifact {artifact_id} cannot be inspected",
                 "category": self._input_escalation_category(record["reason"]),
             }
         return None
@@ -10572,6 +10652,39 @@ class OrchestrationService:
     @staticmethod
     def _input_escalation_category(reason: Any) -> str:
         return "permission_required" if reason == PERMISSION_DENIED else "capability_unavailable"
+
+    @staticmethod
+    async def _finished_without_session(db: AsyncSession, task: Task) -> bool:
+        """Done with no completed agent session (finished by hand or by a child goal): no report exists to read."""
+        return task.status == "done" and await db.scalar(
+            select(Session.id).where(Session.task_id == task.id, Session.status == "completed").limit(1)
+        ) is None
+
+    @staticmethod
+    async def _report_correction_open(db: AsyncSession, ledger: Mapping[str, Any]) -> bool:
+        """The report's correction is still running, or stopped and waiting on the owner's pending answer."""
+        if ledger.get("status") in {"pending", "correcting"}:
+            return True
+        decision_id = OrchestrationService._event_uuid(ledger.get("decision_id"))
+        decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
+        return ledger.get("status") in {"exhausted", "unavailable"} and decision is not None and (
+            decision.status == "pending"
+        )
+
+    @staticmethod
+    async def _input_ask_pending(db: AsyncSession, run: OrchestrationRun, gate_id: Any) -> bool:
+        """The owner has a pending ask about one of this gate's inputs (decided by the ask, not its blocker)."""
+        prefixes = (f"gate:{gate_id}:artifact:", f"gate:{gate_id}:report:")
+        for item in run.active_blockers or []:
+            if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
+                    and item.get("category") in {"permission_required", "capability_unavailable"}
+                    and str(item.get("scope", "")).startswith(prefixes)):
+                continue
+            decision_id = OrchestrationService._event_uuid(item.get("decision_id"))
+            decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
+            if decision is not None and decision.status == "pending":
+                return True
+        return False
 
     async def _route_review_input(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, gate: OrchestrationGate,
@@ -10679,9 +10792,9 @@ class OrchestrationService:
             OrchestrationAction.run_id == run.id,
             or_(OrchestrationAction.idempotency_key == key,
                 OrchestrationAction.idempotency_key.startswith(f"{key}:attempt:", autoescape=True)),
-        )))
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id)))
         if any(action.status != "failed" and not self._routed(action) for action in attempts) or (
-            self._held_reverification(attempts)
+            self._held_reverification(attempts) or await self._input_ask_pending(db, run, gate.id)
         ):
             return 0
         spent = [a for a in attempts if a.status == "failed" and not self._reverification_budget_failure(a.error)]
@@ -10696,8 +10809,22 @@ class OrchestrationService:
             await self.execute_request_verification_action(db, run.id, {
                 "action_type": "request_verification", "gate_id": str(gate.id), "work_function": work_function,
             }, key + (f":attempt:{len(attempts)}" if attempts else ""))
-        except (HTTPException, BudgetMeasurementError):
-            return 0  # the failed action is the record; a later tick retries under the next attempt key
+        except (HTTPException, BudgetMeasurementError) as exc:
+            # the failed action is the record; a later tick retries under the next attempt key
+            detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+            if self._reverification_budget_failure(detail):  # a funding wait asks the owner, never silently
+                await self._escalate_owner(
+                    db, goal, run, "budget_exhausted", f"gate:{gate.id}:reverify:{item.id}",
+                    [f"verification failed: {action.error}" for action in attempts] + [f"verification failed: {detail}"],
+                    f"Cannot fund verifying gate {gate.id} again after its reviewed content changed: {detail}.",
+                )
+            return 0
+        run.active_blockers = [  # dispatched: the subject's funding ask no longer blocks it
+            blocker for blocker in run.active_blockers
+            if not (isinstance(blocker, Mapping) and blocker.get("kind") == "owner_escalation"
+                    and blocker.get("category") == "budget_exhausted"
+                    and blocker.get("scope") == f"gate:{gate.id}:reverify:{item.id}")
+        ]
         return 1
 
     async def _reverify_gate_revisions(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
@@ -10725,7 +10852,7 @@ class OrchestrationService:
             failures = [action for action in attempts if action.status == "failed"]
             if (any(action.status == "completed" and not self._routed(action) for action in attempts)
                     or (await self._effective_report(db, run.id, revision))[1] is None
-                    or self._held_reverification(attempts)):
+                    or self._held_reverification(attempts) or await self._input_ask_pending(db, run, gate.id)):
                 continue
             # Only capability failures spend attempts. Each answered owner ask re-arms REVERIFICATION_ATTEMPTS more;
             # the next ask of a re-armed cycle has its own subject so it can be raised again.
@@ -11246,7 +11373,7 @@ class OrchestrationService:
         run: OrchestrationRun,
         gate: OrchestrationGate,
     ) -> int:
-        key = f"run:{run.id}:kind:request_verification:stale_gate:{gate.id}"
+        key = await self._verification_retry_key(db, run.id, f"run:{run.id}:kind:request_verification:stale_gate:{gate.id}")
         if await self._existing_action_for_key(db, run.id, key) is not None:
             return 0
         try:
@@ -11432,6 +11559,8 @@ class OrchestrationService:
                 return 0  # one revision at a time: its re-verification judges the latest work
         source = await self._gate_revision_source(db, goal, gate)
         if cause != "deliverable_missing":  # the missing-deliverable caller has classified the inputs already
+            if await self._input_ask_pending(db, run, gate.id):
+                return 0  # the owner is restoring an input: nothing to classify or revise until they answer
             found = await self._classify_review_inputs(db, run, gate, source)
             if found is not None and found["state"] == UNINSPECTABLE:
                 # nobody can inspect what a revision would change: the gate waits for the input, not the producer
@@ -12887,7 +13016,9 @@ class OrchestrationService:
                     action = await self.execute_request_verification_action(
                         db, run.id,
                         {"action_type": "request_verification", "gate_id": str(approval.id), "work_function": "validation"},
-                        f"run:{run.id}:kind:request_verification:roadmap_plan:{approval.id}", decision_id=decision.id,
+                        await self._verification_retry_key(
+                            db, run.id, f"run:{run.id}:kind:request_verification:roadmap_plan:{approval.id}",
+                        ), decision_id=decision.id,
                     )
                     return {"step": "waiting_plan_authority", "action_id": str(action.id)}
             try:
