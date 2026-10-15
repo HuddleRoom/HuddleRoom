@@ -4779,10 +4779,14 @@ class OrchestrationService:
             OrchestrationGate.id.in_(gate_ids), OrchestrationGate.run_id == run.id, OrchestrationGate.status == "failed",
         )))
 
-    async def verification_attempt_suffix(self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any) -> str:
+    async def verification_attempt_suffix(
+        self, db: AsyncSession, run_id: uuid.UUID, gate_id: Any, *, reuse_held: bool = False,
+    ) -> str:
         """Key suffix that makes a verification retryable: one attempt per prior FAILED or input-routed
         request_verification for the gate, plus one per automatic gate revision. Attempt 0 with no revision has no
-        suffix (legacy keys unchanged)."""
+        suffix (legacy keys unchanged). Monotonic by default (the verifier delegation key: a new dispatch never
+        gets an earlier verifier task back); ``reuse_held`` is only for a request action's own key, so a repeated
+        request while its input is held reuses the held action instead of writing one more."""
         rows = (await db.execute(
             select(OrchestrationAction.status, OrchestrationAction.request, OrchestrationAction.created_at).where(
                 OrchestrationAction.run_id == run_id,
@@ -4794,9 +4798,10 @@ class OrchestrationService:
         # a held request counts once its backoff passed and no owner ask about its input is pending, so repeated
         # requests while it waits reuse the held action instead of classifying and writing one more
         cutoff = _naive_utc(_utcnow()) - timedelta(seconds=REVIEW_INPUT_WAIT_SECONDS)
-        waiting = run is not None and await self._input_ask_pending(db, run, gate_id)
+        waiting = reuse_held and run is not None and await self._input_ask_pending(db, run, gate_id)
         failed = sum(1 for status, req, at in rows if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id)
-                     and (status == "failed" or (req.get("routed") and not waiting and _naive_utc(at) <= cutoff)))
+                     and (status == "failed" or (req.get("routed") and not (
+                         reuse_held and (waiting or _naive_utc(at) > cutoff)))))
         # each automatic revision is re-verified under a fresh key
         revisions = len(await self._gate_revision_entries(db, run_id, gate_id))
         # so is content that changed after its review (the reserved request counts itself)
@@ -10514,7 +10519,8 @@ class OrchestrationService:
         if not family:
             return base
         latest = family[-1]
-        if not self._routed(latest) or (not immediate and self._held_reverification(family)):
+        waited = self._routed(latest) or (latest.status == "failed" and self._reverification_budget_failure(latest.error))
+        if not waited or (not immediate and self._held_reverification(family)):
             return latest.idempotency_key
         return f"{base}:held:{len(family)}"
 
@@ -10535,7 +10541,10 @@ class OrchestrationService:
         created = 0
         for gate_id, action in latest.items():
             routed = self._json_object_or_empty((action.request or {}).get("routed")) if self._routed(action) else {}
-            gate = await db.get(OrchestrationGate, self._event_uuid(gate_id)) if routed else None
+            retry_failed = ":held:" in action.idempotency_key and action.status == "failed" and (
+                self._reverification_budget_failure(action.error)
+            )  # a held retry that waited on funding stays in the sweep; its failed action shows in progress
+            gate = await db.get(OrchestrationGate, self._event_uuid(gate_id)) if routed or retry_failed else None
             if gate is None or gate.run_id != run.id or gate.status == "accepted":
                 continue
             if routed.get("state") == CONFIRMED_MISSING or await self._input_ask_pending(db, run, gate.id):

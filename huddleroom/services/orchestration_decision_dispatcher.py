@@ -207,7 +207,7 @@ class OrchestrationDecisionDispatcher:
         else:
             action_key = self.action_key(run.id, action_type, request)
             if action_type == "request_verification":
-                action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"))
+                action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"), reuse_held=True)
         if not recovery:
             action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
             if capped is not None:

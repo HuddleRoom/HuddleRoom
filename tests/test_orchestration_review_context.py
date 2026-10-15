@@ -1462,6 +1462,12 @@ async def test_fixed_key_verification_is_keyed_again_only_after_its_hold_backoff
     held.created_at = held.created_at - timedelta(hours=1)
     assert await service._verification_retry_key(db, run.id, base) == f"{base}:held:1"
     assert await service._verification_retry_key(db, run.id, base, immediate=True) == f"{base}:held:1"
+    # a held retry that waited on funding stays retryable after the backoff instead of dropping out
+    retry = await service.reserve_action(db, run.id, f"{base}:held:1", "request_verification", {"gate_id": str(gate.id)})
+    await service.mark_action_failed(db, retry, "budget_wait")
+    assert await service._verification_retry_key(db, run.id, base) == f"{base}:held:1"  # inside the backoff
+    retry.created_at = retry.created_at - timedelta(hours=1)
+    assert await service._verification_retry_key(db, run.id, base) == f"{base}:held:2"
 
 
 @pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
@@ -1495,3 +1501,25 @@ async def test_funding_wait_for_changed_content_asks_the_owner_and_clears_once_d
     await service.tick(db, run.id)
     actions = await _verification_actions(db, run, gate)
     assert actions[-1].target_type == "task" and _owner_asks(run, "budget_exhausted") == []
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+@needs_permissions
+async def test_input_restored_before_the_owner_answers_gets_a_fresh_verifier(db_session, test_project):
+    db = db_session
+    app = Path(test_project.workspace_path) / "app"
+    app.mkdir()
+    (app / "login.py").write_text("def login(): ...\n")
+    service, run, gate, _work_task, _artifact, _verifier, first = await _verifier_for_db_only_report(
+        db, test_project, artifact_fields={"path": "app/login.py"},
+    )
+    app.chmod(0)
+    try:
+        held = await _request(service, db, run, gate, "while-unreadable")
+    finally:
+        app.chmod(0o700)  # access restored; the permission ask is still pending
+    assert held.target_type == "gate" and len(_owner_asks(run, "permission_required")) == 1
+
+    again = await _request(service, db, run, gate, "after-restore")
+
+    assert again.target_type == "task" and again.target_id != first.id  # never the earlier verifier task back
