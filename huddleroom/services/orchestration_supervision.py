@@ -607,6 +607,12 @@ class OrchestrationSupervisionService:
                     if sibling.status == "open" and (sibling.owner or {}).get("type") == _ORCH_OWNER and _same_owner(sibling.owner, wait.owner):
                         sibling.status, sibling.cleared_at = "cleared", now
             fallback = dict(wait.fallback or {})
+            owner = wait.owner or {}
+            # A session wait's warning carries the condition it stood for, so it clears when the session ends.
+            condition = (
+                {"condition": {"condition": "session_running", "subject": str(owner["task_id"])}}
+                if owner.get("type") == "session" and owner.get("task_id") else {}
+            )
             action = await (
                 self.orchestration.execute_noop_action(
                     db, run.id,
@@ -617,7 +623,7 @@ class OrchestrationSupervisionService:
                 else self.orchestration.execute_record_warning_action(
                     db, run.id,
                     {"action_type": "record_warning", "warning_type": "supervision_attention", "severity": "warning",
-                     "message": str(fallback.get("reason") or "Wait recheck is due")},
+                     "message": str(fallback.get("reason") or "Wait recheck is due"), **condition},
                     f"run:{run.id}:wait:{wait.id}:fallback",
                 )
             )

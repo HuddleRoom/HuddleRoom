@@ -64,6 +64,9 @@ from huddleroom.schemas.orchestration import (
 )
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
+from huddleroom.services.orchestration_condition import (
+    GATE_UNVERIFIED, PLAN_MISSING, SESSION_RUNNING, VALID_RESULT_MISSING, ConditionError, is_reconcilable, validate_condition,
+)
 from huddleroom.services.orchestration_artifact_identity import (
     CONFIRMED_MISSING, PERMISSION_DENIED, UNINSPECTABLE, bind_artifacts, cited_artifact_ids, one_line, recheck_binding,
 )
@@ -5336,7 +5339,18 @@ class OrchestrationService:
                 for field, value in optional_id_values.items()
                 if field != "run_id"
             },
+            **self._canonical_condition(request_obj),
         }
+
+    @staticmethod
+    def _canonical_condition(request_obj: Mapping[str, Any]) -> dict[str, Any]:
+        """The optional typed condition that lets the item auto-resolve; absent keeps legacy keys unchanged."""
+        if request_obj.get("condition") is None:
+            return {}
+        try:
+            return {"condition": validate_condition(request_obj["condition"])}
+        except ConditionError as exc:
+            raise HTTPException(status_code=422, detail=f"condition invalid: {exc}") from exc
 
     def _canonical_delegation_task_request(self, request: Any) -> dict[str, Any]:
         request_obj = self._json_object_or_empty(request)
@@ -7797,6 +7811,7 @@ class OrchestrationService:
             canonical["continuation"] = self._json_object_or_empty(request_obj["continuation"])
         if isinstance(request_obj.get("options"), list):
             canonical["options"] = request_obj["options"]
+        canonical.update(self._canonical_condition(request_obj))
         return canonical
 
     def _canonical_suggest_agent_request(self, request: Any) -> dict[str, Any]:
@@ -10420,6 +10435,86 @@ class OrchestrationService:
                 },
             )
         return created
+
+    RECONCILE_CONDITIONS_LIMIT = 50
+
+    async def _reconcile_conditions(self, db: AsyncSession, run: OrchestrationRun) -> int:
+        """Resolve open warnings and cancel pending questions whose own declared condition now holds.
+
+        Only items whose every originating record_warning/ask_human action declares a reconcilable condition
+        (never an owner decision, judged with the action's own kind and category) are touched."""
+        warnings = list((await db.scalars(select(OrchestrationWarning).where(
+            OrchestrationWarning.run_id == run.id, OrchestrationWarning.active.is_(True),
+        ).order_by(OrchestrationWarning.created_at).limit(self.RECONCILE_CONDITIONS_LIMIT))).all())
+        questions = list((await db.scalars(select(OrchestrationAuthorityDecision).where(
+            OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending",
+        ).order_by(OrchestrationAuthorityDecision.asked_at).limit(self.RECONCILE_CONDITIONS_LIMIT))).all())
+        items = {item.id: item for item in (*warnings, *questions)}
+        if not items:
+            return 0
+        actions: dict[uuid.UUID, list[OrchestrationAction]] = {}
+        for action in (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+            OrchestrationAction.action_type.in_(("record_warning", "ask_human")),
+            OrchestrationAction.target_type.in_(("warning", "authority_decision")),
+            OrchestrationAction.target_id.in_(list(items)),
+        ))).all():
+            actions.setdefault(action.target_id, []).append(action)
+        resolved = 0
+        for item_id, origins in actions.items():
+            item = items[item_id]
+            held = []
+            for action in origins:
+                request = self._json_object_or_empty(action.request)
+                category = request.get("warning_type") if action.action_type == "record_warning" else request.get("reason")
+                raw = request.get("condition")
+                if not is_reconcilable(raw, action_kind=action.action_type, category=category):
+                    break
+                if not await self._condition_holds(db, run, raw):
+                    break
+                held.append(raw["condition"])
+            else:
+                reason = f"Condition satisfied: {', '.join(sorted(set(held)))}"
+                try:
+                    if isinstance(item, OrchestrationWarning):
+                        await OrchestrationWarningService().resolve_warning(db, item, resolved_by="system", reason=reason)
+                    else:
+                        await OrchestrationAuthorityDecisionService().cancel_decision(db, item, reason=reason)
+                except ValueError:
+                    continue  # resolved concurrently, or owned by a recovery flow that cancels it itself
+                resolved += 1
+        if resolved:
+            await db.flush()
+        return resolved
+
+    async def _condition_holds(self, db: AsyncSession, run: OrchestrationRun, raw: Mapping[str, Any]) -> bool:
+        condition, subject = raw["condition"], raw["subject"]
+        if condition == PLAN_MISSING:
+            run_part, _, version = subject.partition(":")
+            plan_state = self._json_object_or_empty(run.plan_state)
+            if run_part != str(run.id) or plan_state.get("status") != "accepted":
+                return False
+            # A later accepted version also settles an earlier version's missing plan.
+            return not version or (version.isdigit() and int(plan_state.get("planning_version") or 0) >= int(version))
+        try:
+            subject_id = uuid.UUID(subject)
+        except ValueError:
+            return False
+        if condition == GATE_UNVERIFIED:
+            gate = await db.get(OrchestrationGate, subject_id)
+            return gate is not None and gate.run_id == run.id and gate.status == "accepted"
+        task = await db.get(Task, subject_id)
+        orchestration = self._json_object_or_empty(self._json_object_or_empty(task.metadata_ if task else {}).get("orchestration"))
+        if task is None or orchestration.get("run_id") != str(run.id):
+            return False
+        if condition == SESSION_RUNNING:
+            statuses = set((await db.scalars(select(Session.status).where(Session.task_id == task.id))).all())
+            return bool(statuses) and not statuses & {"pending", "running"}
+        if condition == VALID_RESULT_MISSING:
+            # Only an accepted consumed result counts: a rejected output, or one still under correction, does not.
+            _marker, report, _rest = await self._effective_report(db, run.id, task)
+            return report is not None
+        return False
 
     async def recover_run(self, db: AsyncSession, run_id: uuid.UUID, baseline_ready: bool = False) -> int:
         run = await db.get(OrchestrationRun, run_id)
@@ -13736,6 +13831,7 @@ class OrchestrationService:
             await self._sweep_result_corrections(db, run)
             await self._reconcile_outcome_gate_acceptance(db, goal, run)
             gates_validated = await self.validate_open_gates(db, run.id)
+            await self._reconcile_conditions(db, run)
             # Keep deterministic evidence ingestion above, but stop before any
             # recovery, review, release, or LLM work if accepted authority is bad.
             if (

@@ -9,10 +9,12 @@ GATE_UNVERIFIED = "gate_unverified"
 
 CONDITIONS = frozenset({SESSION_RUNNING, VALID_RESULT_MISSING, PLAN_MISSING, GATE_UNVERIFIED})
 
-# Owner decisions are never auto-cancelled, whatever condition they declare.
-OWNER_DECISION_SUBJECTS = frozenset(
-    {"budget", "permission", "provider", "owner_decision", "budget_exhausted", "permission_required"}
-)
+# Owner decisions (including every owner-escalation category) are never auto-cancelled,
+# whatever condition they declare.
+OWNER_DECISION_SUBJECTS = frozenset({
+    "budget", "permission", "provider", "owner_decision", "budget_exhausted", "permission_required",
+    "capability_unavailable", "result_correction_exhausted", "revision_exhausted", "review_input_missing",
+})
 
 
 class ConditionError(ValueError):
