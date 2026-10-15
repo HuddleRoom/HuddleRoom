@@ -10470,7 +10470,13 @@ class OrchestrationService:
                 raw = request.get("condition")
                 if not is_reconcilable(raw, action_kind=action.action_type, category=category):
                     break
-                if not await self._condition_holds(db, run, raw):
+                try:
+                    holds = await self._condition_holds(db, run, raw)
+                except (HTTPException, ValueError, TypeError, KeyError):
+                    # One malformed item (e.g. a corrupt correction ledger) must never abort the tick.
+                    logger.warning("condition check failed for %s on run %s", item_id, run.id, exc_info=True)
+                    holds = False
+                if not holds:
                     break
                 held.append(raw["condition"])
             else:

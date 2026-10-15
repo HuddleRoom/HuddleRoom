@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 
 from huddleroom.services.orchestration_condition import (
@@ -7,12 +9,14 @@ from huddleroom.services.orchestration_condition import (
     validate_condition,
 )
 
+T1 = "6f1c1f0e-1d2b-4c3a-9e8f-0a1b2c3d4e5f"
+
 
 @pytest.mark.parametrize("condition", sorted(CONDITIONS))
 def test_valid_condition_is_normalized(condition):
-    assert validate_condition({"condition": condition, "subject": " t1 "}) == {
+    assert validate_condition({"condition": condition, "subject": f" {T1.upper()} "}) == {
         "condition": condition,
-        "subject": "t1",
+        "subject": T1,
     }
 
 
@@ -21,7 +25,7 @@ def test_valid_condition_is_normalized(condition):
     [
         None,
         "session_running",
-        {"condition": "whenever", "subject": "t1"},
+        {"condition": "whenever", "subject": T1},
         {"condition": "session_running"},
         {"condition": "plan_missing", "subject": "  "},
         {"condition": "gate_unverified", "subject": 3},
@@ -33,9 +37,30 @@ def test_invalid_condition_rejected(raw):
     assert not is_reconcilable(raw)
 
 
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ({"condition": "session_running", "subject": "t1"}, "session_running subject must be a UUID"),
+        ({"condition": "valid_result_missing", "subject": "task 7"}, "valid_result_missing subject must be a UUID"),
+        ({"condition": "gate_unverified", "subject": "gate:x"}, "gate_unverified subject must be a UUID"),
+        ({"condition": "plan_missing", "subject": "run-1"}, "plan_missing subject run must be a UUID"),
+        ({"condition": "plan_missing", "subject": f"{T1}:v2"}, "version must be digits"),
+        ({"condition": "plan_missing", "subject": f"{T1}:"}, "version must be digits"),
+    ],
+)
+def test_never_holding_subject_is_rejected_with_its_reason(raw, message):
+    with pytest.raises(ConditionError, match=message):
+        validate_condition(raw)
+
+
+def test_plan_subject_accepts_a_run_with_an_optional_version():
+    assert validate_condition({"condition": "plan_missing", "subject": T1})["subject"] == T1
+    assert validate_condition({"condition": "plan_missing", "subject": f"{T1.upper()}:03"})["subject"] == f"{T1}:3"
+
+
 @pytest.mark.parametrize("kind", ["budget", "permission", "provider", "Owner_Decision"])
 def test_owner_decisions_never_reconcilable(kind):
-    raw = {"condition": "session_running", "subject": "t1", "kind": kind}
+    raw = {"condition": "session_running", "subject": T1, "kind": kind}
     assert not is_reconcilable(raw)
 
 
@@ -47,7 +72,7 @@ def test_owner_decision_subject_rejected(subject):
 
 @pytest.mark.parametrize("kw", [{"action_kind": "budget"}, {"category": "permission_required"}])
 def test_reconcile_time_action_context_blocks_owner_decisions(kw):
-    stored = validate_condition({"condition": "valid_result_missing", "subject": "t1"})
+    stored = validate_condition({"condition": "valid_result_missing", "subject": T1})
     assert is_reconcilable(stored)
     assert not is_reconcilable(stored, **kw)
     assert is_reconcilable(stored, action_kind="record_warning", category="other")
@@ -56,7 +81,6 @@ def test_reconcile_time_action_context_blocks_owner_decisions(kw):
 # --- Reconciliation through the real record/ask actions, ingestion and ticks ---
 
 import json  # noqa: E402
-import uuid  # noqa: E402
 from datetime import timedelta  # noqa: E402
 
 from sqlalchemy import select  # noqa: E402
@@ -101,10 +125,12 @@ async def _ask(service, db, run, question, condition=None, reason=None):
 
 def test_decision_validator_accepts_only_declared_conditions():
     base = {"action_type": "record_warning", "warning_type": "x", "severity": "warning", "message": "m"}
-    assert validate_orchestration_decision({**base, "condition": {"condition": "plan_missing", "subject": "r"}}).accepted
-    assert not validate_orchestration_decision({**base, "condition": {"condition": "soon", "subject": "r"}}).accepted
+    assert validate_orchestration_decision({**base, "condition": {"condition": "plan_missing", "subject": T1}}).accepted
+    assert not validate_orchestration_decision({**base, "condition": {"condition": "soon", "subject": T1}}).accepted
+    rejected = validate_orchestration_decision({**base, "condition": {"condition": "plan_missing", "subject": "r"}})
+    assert not rejected.accepted and "must be a UUID" in rejected.rejection_reason
     ask = {"action_type": "ask_human", "question": "q"}
-    assert validate_orchestration_decision({**ask, "condition": {"condition": "gate_unverified", "subject": "g"}}).accepted
+    assert validate_orchestration_decision({**ask, "condition": {"condition": "gate_unverified", "subject": T1}}).accepted
     assert not validate_orchestration_decision({**ask, "condition": {"condition": "gate_unverified", "subject": "budget"}}).accepted
 
 
@@ -211,3 +237,31 @@ async def test_gate_condition_clears_only_on_acceptance_and_shared_undeclared_it
     await db_session.refresh(cleared)
     await db_session.refresh(shared)
     assert not cleared.active and shared.active
+
+
+async def test_one_malformed_item_is_skipped_and_the_rest_still_reconcile(db_session, test_project):
+    service, goal, run, _agent, task = await _setup(db_session, test_project)
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="done", gate_type="work_completed", status="accepted")
+    db_session.add(gate)
+    await db_session.flush()
+    broken = await _warn(
+        service, db_session, run, "No result yet.", {"condition": "valid_result_missing", "subject": str(task.id)},
+        "result_missing",
+    )
+    cleared = await _warn(
+        service, db_session, run, "Gate not verified.", {"condition": "gate_unverified", "subject": str(gate.id)},
+        "gate_unverified",
+    )
+    # A corrupt correction ledger on the task's consumed marker makes its result check raise.
+    marker = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"run:{run.id}:kind:report_consumed:task:{task.id}", action_type="report_consumed",
+        status="completed", request={"result_correction": {"status": "corrected", "correction_task_ids": ["not-a-uuid"]}},
+    )
+    db_session.add(marker)
+    await db_session.flush()
+
+    await service.tick(db_session, run.id)
+
+    await db_session.refresh(broken)
+    await db_session.refresh(cleared)
+    assert broken.active and not cleared.active

@@ -240,3 +240,29 @@ def test_follow_up_rejects_bad_optional_delegation_fields():
         with pytest.raises(ValueError, match=field):
             parse_supervision_assessment(_assessment({
                 "action_type": "follow_up", "request": _valid_request("follow_up", **{field: bad})}))
+
+
+@pytest.mark.asyncio
+async def test_assess_repairs_malformed_ask_human_condition_before_it_reaches_the_ledger():
+    calls = []
+    bad = {"question": "Ship?", "condition": {"condition": "gate_unverified", "subject": "the release gate"}}
+    good = {"question": "Ship?", "condition": {"condition": "gate_unverified", "subject": UUID_A}}
+    responses = [json.dumps(_assessment({"action_type": "ask_human", "request": r})) for r in (bad, good)]
+
+    async def completion_fn(**request):
+        calls.append(request)
+        return {"choices": [{"message": {"content": responses[len(calls) - 1]}}]}
+
+    result = await OrchestrationSupervisionAnalyzer(completion_fn=completion_fn).assess({"goal": {}})
+
+    assert len(calls) == 2
+    assert any("condition invalid" in str(m["content"]) for m in calls[1]["messages"] if m["role"] == "user")
+    assert result.disposition["request"]["condition"] == {"condition": "gate_unverified", "subject": UUID_A}
+
+
+def test_both_prompts_document_the_condition_shape():
+    from huddleroom.services.orchestration_condition import CONDITION_PROMPT
+    from huddleroom.services.orchestration_llm_decision_adapter import build_orchestration_decision_messages
+
+    assert CONDITION_PROMPT in _system_text(OrchestrationSupervisionAnalyzer.build_request({}))
+    assert CONDITION_PROMPT in build_orchestration_decision_messages({})[0]["content"]

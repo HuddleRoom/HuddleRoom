@@ -17,6 +17,7 @@ from huddleroom.services.orchestration_decision_validator import (
     OPTIONAL_ACTION_FIELDS,
     validate_orchestration_decision,
 )
+from huddleroom.services.orchestration_condition import CONDITION_PROMPT
 from huddleroom.services.orchestration_wake_when import normalize_wake_when, wake_when_prompt_table
 from huddleroom.services.secret_redaction import redact_secrets
 
@@ -177,6 +178,8 @@ def build_orchestration_decision_messages(context: Mapping[str, Any], *, project
         + shape
         + "\n\n"
         + wake_when
+        + "\n\n"
+        + CONDITION_PROMPT
         + "\n\n"
         + f"Allowed action schemas: {json.dumps(allowed_actions, sort_keys=True)}"
     )

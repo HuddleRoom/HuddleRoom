@@ -7,6 +7,7 @@ from typing import Any
 
 from huddleroom.config import settings
 from huddleroom.services.orchestration_completion import get_orchestration_completion
+from huddleroom.services.orchestration_condition import CONDITION_PROMPT, ConditionError, validate_condition
 from huddleroom.services.llm_structured_repair import complete_with_repair
 from huddleroom.services.orchestration_agent_definition_analyzer import _unfence_json, redact_semantic_payload
 from huddleroom.services.orchestration_decision_validator import (
@@ -47,6 +48,11 @@ def _validate_request(kind: str, request: Mapping[str, Any]) -> None:
         ids = request["participant_agent_ids"]
         if not isinstance(ids, list) or not all(_is_uuid_string(i) for i in ids):
             raise ValueError(f"{kind} disposition participant_agent_ids must be a list of UUIDs")
+    if request.get("condition") is not None:
+        try:
+            validate_condition(request["condition"])
+        except ConditionError as exc:
+            raise ValueError(f"{kind} disposition condition invalid: {exc}") from exc
     if kind == "follow_up" and (error := delegation_optional_field_error(request)):
         raise ValueError(f"{kind} disposition {error}")
 
@@ -111,7 +117,7 @@ class OrchestrationSupervisionAnalyzer:
                     "changes, risks, useful_learning, criterion_progress (arrays of objects), and disposition. "
                     "Disposition has action_type, origin, reason, expected_result, contract_version, "
                     "and optional object request. Allowed action_type values and their request fields:\n"
-                    + _disposition_prompt() + "\n"
+                    + _disposition_prompt() + "\n" + CONDITION_PROMPT + "\n"
                     "Choose one safe, evidence-grounded action. "
                     "The continue disposition requires request.wake_when shaped "
                     '{"events":[{"event_type":"<event>","matcher":{"<key>":"<uuid>"}}],'
