@@ -240,6 +240,7 @@ test('projects every durable supervision condition and its complete readable fac
   await page.setViewportSize({ width: 1440, height: 900 })
 
   const badges: Record<OrchestrationSupervisionCondition, string> = {
+    unknown: 'Unknown',
     working: 'Working', waiting: 'Waiting', needs_you: 'Needs you', needs_attention: 'Needs attention',
     paused: 'Paused', stopped: 'Stopped', cancelled: 'Cancelled', completed: 'Completed',
   }

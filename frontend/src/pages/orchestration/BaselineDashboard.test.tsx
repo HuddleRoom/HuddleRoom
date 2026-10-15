@@ -69,6 +69,8 @@ vi.mock('@/api/meetings', () => ({ useUpdateActionItem: () => meetingMutation })
 
 import { BaselineActionForm, BaselineDashboard } from './BaselineDashboard'
 import { GoalAnnouncerProvider } from './goalAnnouncer'
+import { CurrentOperationStatus } from './CurrentOperationStatus.tsx'
+import type { OrchestrationStatusLine } from '@/lib/types'
 
 const ISO = {
   started: '2026-08-05T08:00:00Z',
@@ -3768,5 +3770,59 @@ it('threads current live meeting commitments into Needs You', async () => {
   try {
     expect(textOf(view.container)).toContain('Live meeting obligation')
     expect(() => getButton(view.container, 'Waive')).not.toThrow()
+  } finally { view.cleanup() }
+})
+
+
+it('SPR188 keeps a real existing answer form as the single human-answer message owner beside compact status', async () => {
+  const pending = task4RuntimeQuestion(1)
+  api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  const onMessage = vi.fn()
+  const answered = { ...pending, status: 'answered' as const, selected_option: 'acknowledge', reason: 'Use the reviewed region.', decided_at: ISO.answered }
+  api.answer.mutate.mockImplementation((_variables, callbacks) => {
+    callbacks.onSuccess?.({ decision: answered, process: null, continuation_applied: false })
+    callbacks.onSettled?.()
+  })
+  const status = (kind = 'human_question'): OrchestrationStatusLine => ({ current_state: { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }, attention_summary: null,
+    last_material_event: { key: kind, kind, summary: 'COMPACT HUMAN MUST STAY SILENT', subject: null, occurred_at: kind === 'human_question' ? ISO.asked : ISO.answered } })
+  const render = (line = status()) => <MemoryRouter><GoalAnnouncerProvider>
+    <CurrentOperationStatus statusLine={line} condition="needs_you" activeProjectId="project-1" dataUpdatedAt={Date.parse(ISO.started)} isFetching={false} isError={false} goalKey={goal().id} onRevealSource={() => undefined} />
+    <BaselineDashboard projectId="project-1" goalId={goal().id} goal={goal()} run={run()} gates={[]} mutationBusy={false} acquireMutation={() => true} releaseMutation={() => undefined} onMessage={onMessage} queueAnnouncementScope="human" />
+  </GoalAnnouncerProvider></MemoryRouter>
+  const view = await mountWithTestDom(() => render(), act)
+  try {
+    const row = queueRow(view.container, pending.title)
+    await act(async () => getButton(row, 'Answer').click())
+    await act(async () => changeControl(getByLabel(row, 'Answer', 'textarea'), 'Use the reviewed region.'))
+    await act(async () => { formSubmit(row).click(); await Promise.resolve() })
+    expect(api.answer.mutate).toHaveBeenCalledTimes(1)
+    expect(onMessage.mock.calls.filter(([message]) => message === 'Answer received.')).toHaveLength(1)
+    api.dashboard = dashboardData({ decisions: query([answered]), checkpoint: query({ goal_id: goal().id, items: [], deferred_count: 0, max_questions: 3 }) })
+    await view.rerender(() => render(status('human_answer')))
+    expect(descendants(view.container).filter((node) => node.getAttribute('aria-live') === 'polite').map(textOf)).not.toContain('COMPACT HUMAN MUST STAY SILENT')
+    expect(onMessage.mock.calls.filter(([message]) => message === 'Answer received.')).toHaveLength(1)
+  } finally { view.cleanup() }
+})
+
+
+it('SPR188 a locally submitted partial adaptive answer does not announce again after durable refresh', async () => {
+  const owner = process({ id: 'partial-adaptive', process_type: 'goal_definition' })
+  const questions = [0, 1].map((i) => decision({ id: `partial-${i}`, decision_key: `goal_definition:adaptive:1:${i}:objective`,
+    title: `Question ${i}`, question: `Question ${i}?`, context: 'Clarify objective.', options: [], recommendation: null, source_process_run_id: owner.id }))
+  api.dashboard = dashboardData({ processes: query([owner]), checkpoint: query({ goal_id: goal().id, items: questions, deferred_count: 0, max_questions: 3 }) })
+  const onMessage = vi.fn()
+  api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(); callbacks.onSettled?.() })
+  const view = await mountDashboard({ queueAnnouncementScope: 'human', onMessage })
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
+  try {
+    expect(textOf(live())).toBe('')
+    await act(async () => changeControl(getByLabel(view.container, 'Answer', 'textarea'), 'First local answer'))
+    await act(async () => { getButton(view.container, 'Next').click(); await Promise.resolve() })
+    expect(onMessage.mock.calls.filter(([message]) => message === 'Answer received.')).toHaveLength(1)
+    const answered = { ...questions[0], status: 'answered' as const, selected_option: 'First local answer', decided_at: ISO.answered }
+    api.dashboard = dashboardData({ processes: query([owner]), decisions: query([answered, questions[1]]), checkpoint: query({ goal_id: goal().id, items: [questions[1]], deferred_count: 0, max_questions: 3 }) })
+    await view.rerender()
+    expect(textOf(live())).toBe('')
+    expect(onMessage.mock.calls.filter(([message]) => message === 'Answer received.')).toHaveLength(1)
   } finally { view.cleanup() }
 })

@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 type Announcement = { text: string; seq: number }
 
@@ -27,7 +27,24 @@ export function useGoalAnnouncer() {
 export function GoalAnnouncerProvider({ children }: { children: ReactNode }) {
   const [queueMsg, setQueueMsg] = useState<Announcement>({ text: '', seq: 0 })
   const [errorMsg, setErrorMsg] = useState<Announcement>({ text: '', seq: 0 })
-  const announceQueue = useCallback((text: string) => setQueueMsg((prev) => ({ text, seq: prev.seq + 1 })), [])
+  const pendingQueue = useRef<string[]>([])
+  const queued = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false; pendingQueue.current = [] }
+  }, [])
+  const announceQueue = useCallback((text: string) => {
+    pendingQueue.current.push(text)
+    if (queued.current) return
+    queued.current = true
+    queueMicrotask(() => {
+      queued.current = false
+      const messages = pendingQueue.current
+      pendingQueue.current = []
+      if (mounted.current && messages.length) setQueueMsg((prev) => ({ text: messages.join(' '), seq: prev.seq + 1 }))
+    })
+  }, [])
   const announceError = useCallback((text: string) => setErrorMsg((prev) => ({ text, seq: prev.seq + 1 })), [])
   const value = useMemo(() => ({ active: true, announceQueue, announceError }), [announceQueue, announceError])
   return <GoalAnnouncerContext.Provider value={value}>

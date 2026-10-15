@@ -1,5 +1,4 @@
 import uuid
-from types import SimpleNamespace
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -96,6 +95,7 @@ from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionErro
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_supersession import OrchestrationSupersessionService
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+from huddleroom.services.orchestration_status_presenter import build_orchestration_status_line
 from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
 from huddleroom.services.orchestration_conversation_service import OrchestrationConversationService
 from huddleroom.services.orchestration_conversation_service import ConversationDomainError, ConversationTurn
@@ -531,6 +531,7 @@ async def _detail(
     agent_suggestions = []
     supervision = None
     roadmap_summary = None
+    roadmap_budget_status = None
     direction = None
     pending_direction = None
     gate_models = []
@@ -550,9 +551,10 @@ async def _detail(
             .where(OrchestrationAction.run_id == run.id)
             .order_by(OrchestrationAction.created_at.asc(), OrchestrationAction.id.asc())
         )
+        action_models = action_rows.scalars().all()
         actions = [
             OrchestrationActionResponse.model_validate(action)
-            for action in action_rows.scalars().all()
+            for action in action_models
         ]
 
         gate_rows = await db.execute(
@@ -611,8 +613,9 @@ async def _detail(
         direction = await db.scalar(
             select(OrchestrationAuthorityDecision)
             .where(OrchestrationAuthorityDecision.run_id == run.id,
-                   OrchestrationAuthorityDecision.status == "pending")
-            .order_by(OrchestrationAuthorityDecision.asked_at.asc(), OrchestrationAuthorityDecision.id.asc())
+                   OrchestrationAuthorityDecision.status == "pending",
+                   OrchestrationAuthorityDecision.authority == "human")
+            .order_by(OrchestrationAuthorityDecision.asked_at.desc(), OrchestrationAuthorityDecision.id.asc())
         )
         accepted_evidence = [item for item in evidence if item.verdict == "accepted"]
         gate = next((item for item in gates if item.status == "accepted"), None)
@@ -632,20 +635,26 @@ async def _detail(
             .order_by(Session.created_at.asc(), Session.id.asc())
         )
         workers = []
+        worker_facts = []
         recovery_service = OrchestrationRecoveryService()
+        action_ids = {action.id for action in action_models}
         for session, task in worker_rows.all():
             owned = await recovery_service.resolve_owned_session(db, session.id)
-            if owned is None or owned.action_id not in {action.id for action in actions}:
+            if owned is None or owned.action_id not in action_ids:
                 continue
             entry = recovery_sessions.get(str(session.id), {}) if isinstance(recovery_sessions, dict) else {}
             entry = entry if isinstance(entry, dict) else {}
-            workers.append({
+            worker_fact = {
                 "session_id": str(session.id), "task_id": str(task.id), "agent_id": str(session.agent_id),
+                "action_id": str(owned.action_id),
                 "task_title": task.title, "session_status": session.status,
                 "observed_liveness": entry.get("classification", "unknown"),
                 "runner_id": entry.get("current_runner_id", entry.get("current_runner_task_id", owned.runner_task_id)),
                 "observed_at": entry.get("assessed_at"), "started_at": session.started_at,
-            })
+                "ended_at": session.ended_at,
+            }
+            workers.append(worker_fact)
+            worker_facts.append(worker_fact)
         recovery_history = [{
             "session_id": str(session_id), "classification": entry.get("classification"),
             "disposition": entry.get("disposition"),
@@ -656,9 +665,8 @@ async def _detail(
         recovery_history.sort(key=lambda item: (str(item["assessed_at"] or ""), item["session_id"]))
 
         supervision_state = deepcopy(run.supervision_state or {})
-        budget_run = SimpleNamespace(id=run.id, budget_state=deepcopy(run.budget_state or {}))
         try:
-            snapshot = await OrchestrationBudgetService().snapshot_for_run(db, goal, budget_run)
+            snapshot, _ = await OrchestrationBudgetService().project_snapshot_for_run(db, goal, run)
             budget = {
                 key: {dimension: value for dimension, value in snapshot[key].items() if value != "0"}
                 for key in ("consumed", "committed", "reserved")
@@ -668,90 +676,34 @@ async def _detail(
             budget = {}
 
         if goal.goal_type == "roadmap":
-            roadmap_summary = await OrchestrationRoadmapService(service).remaining_or_block(db, goal, run)
+            roadmap_summary = await OrchestrationRoadmapService(service).read_budget_summary(db, goal)
+            roadmap_budget_status = "available" if roadmap_summary is not None else "unavailable"
 
         state = supervision_state if isinstance(supervision_state, dict) else {}
         verified_progress = [dict(item) for item in state.get("verified_progress", []) if isinstance(item, dict)]
-        continuous_stopped_at = (
-            (goal.continuous_state or {}).get("stopped_at")
-            if goal.goal_type == "continuous" and isinstance(goal.continuous_state, dict)
-            else None
+        status_line, condition = await build_orchestration_status_line(
+            db, project_id=goal.project_id, goal=goal, run=run,
+            actions=action_models, gates=gate_models, evidence=evidence_models,
+            open_waits=open_waits, worker_facts=tuple(worker_facts),
         )
-        if goal.status == "completed":
-            condition, operation, next_action, rationale = "completed", "Completed", "No action", "Goal completed"
-        elif goal.status == "cancelled":
-            condition, operation, next_action, rationale = "cancelled", "Cancelled", "No action", "Goal cancelled"
-        elif continuous_stopped_at:
-            condition, operation, next_action, rationale = "stopped", "Stopped", "No action", "Continuous policy stopped"
-        elif goal.status == "paused" or run.status == "paused":
-            condition, operation, next_action, rationale = "paused", "Paused", "Resume goal", "Goal is paused"
-        elif direction is not None:
-            condition, operation, next_action, rationale = (
-                "needs_you", direction.title, "Answer pending direction", direction.question,
-            )
-        elif run.active_blockers:
-            blocker = next((item for item in run.active_blockers if isinstance(item, dict)), {})
-            reason = blocker.get("reason") or blocker.get("kind") or "A durable blocker is open"
-            condition, operation, next_action, rationale = "needs_attention", "Needs attention", "Resolve blocker", str(reason)
-        elif waits:
-            condition, operation, next_action, rationale = (
-                "waiting", f"Awaiting {waits[0]['event']}", f"Await {waits[0]['event']}",
-                str(waits[0]["fallback"].get("reason", "Waiting for durable event")),
-            )
-        elif workers:
-            condition, operation, next_action, rationale = "working", "Work in progress", "Await worker result", "An owned worker has durable supervision"
-        else:
-            condition, operation, next_action, rationale = "working", "Work in progress", "Continue execution", "No durable wait or direction"
-        transition = None
-        if condition in {"completed", "cancelled", "paused", "stopped"}:
-            transition = {
-                "id": str(goal.id), "key": f"goal_control:{goal.id}:{condition}", "kind": condition,
-                "message": operation, "occurred_at": continuous_stopped_at or goal.updated_at,
-            }
-        elif condition == "needs_you" and direction is not None:
-            transition = {
-                "id": str(direction.id), "key": f"pending_direction:{direction.id}",
-                "kind": "pending_direction", "message": direction.title, "occurred_at": direction.asked_at,
-            }
-        else:
-            failed_gate = next((item for item in reversed(gates) if item.status == "failed"), None)
-            failed_action = next((item for item in reversed(actions) if item.status == "failed"), None)
-            blocker = next((item for item in run.active_blockers if isinstance(item, dict)), None)
-            recovery_event = next((item for item in reversed(recovery_history)
-                                   if item.get("action_id") or item.get("wait_id")), None)
-            if failed_gate is not None:
-                transition = {
-                    "id": str(failed_gate.id), "key": f"gate:{failed_gate.id}:failed", "kind": "failed_gate",
-                    "message": failed_gate.failure_reason or failed_gate.success_criterion_key,
-                    "occurred_at": failed_gate.failed_at or failed_gate.updated_at,
-                }
-            elif failed_action is not None:
-                transition = {
-                    "id": str(failed_action.id), "key": f"action:{failed_action.id}:failed", "kind": "failed_action",
-                    "message": failed_action.error or failed_action.action_type, "occurred_at": failed_action.updated_at,
-                }
-            elif blocker is not None:
-                blocker_kind = str(blocker.get("kind", "attention"))
-                blocker_reason = str(blocker.get("reason", blocker_kind))
-                transition = {
-                    "id": f"blocker:{run.id}:{blocker_kind}:{blocker_reason}",
-                    "key": f"blocker:{run.id}:{blocker_kind}:{blocker_reason}", "kind": "attention_blocker",
-                    "message": blocker_reason, "occurred_at": run.updated_at,
-                }
-            elif recovery_event is not None:
-                recovery_id = recovery_event.get("action_id") or recovery_event.get("wait_id")
-                transition = {
-                    "id": recovery_id, "key": f"recovery:{recovery_event['session_id']}:{recovery_id}",
-                    "kind": "recovery_action" if recovery_event.get("action_id") else "recovery_wait",
-                    "message": str(recovery_event.get("disposition") or "recovery"),
-                    "occurred_at": recovery_event.get("assessed_at"),
-                }
-            elif accepted_evidence:
-                accepted = accepted_evidence[-1]
-                transition = {
-                    "id": str(accepted.id), "key": f"evidence:{accepted.id}:accepted", "kind": "accepted_evidence",
-                    "message": accepted.source_type, "occurred_at": accepted.created_at,
-                }
+        operation = status_line.current_state.summary
+        attention = status_line.attention_summary
+        next_action = (
+            "Answer pending direction" if condition == "needs_you" else
+            "Resolve current blocker" if condition == "needs_attention" else
+            ("Wait for scheduled check" if attention and attention.next_check_at else "Await recorded event")
+            if condition == "waiting" else
+            "Resume goal" if condition == "paused" else
+            "Await worker result" if condition == "working" else "No action"
+        )
+        rationale = attention.summary if attention and condition not in {
+            "completed", "cancelled", "stopped", "paused"
+        } else operation
+        latest = status_line.last_material_event
+        transition = ({
+            "id": latest.key, "key": latest.key, "kind": latest.kind,
+            "message": latest.summary, "occurred_at": latest.occurred_at,
+        } if latest else None)
         if condition == "needs_you" and direction:
             safe_direction = await present_decision_response(db, direction)
             pending_direction = (await attach_decision_references(
@@ -763,7 +715,7 @@ async def _detail(
             accepted_evidence=accepted_evidence, workers=workers, waits=waits,
             recovery_history=recovery_history,
             pending_direction=pending_direction,
-            budget=budget, transition=transition,
+            budget=budget, transition=transition, status_line=status_line,
         )
 
     roadmap_version = None
@@ -838,6 +790,7 @@ async def _detail(
         roadmap_items=roadmap_items,
         children=children,
         budget_summary=budget_summary,
+        roadmap_budget_status=roadmap_budget_status,
         supervision=supervision,
         contract_fingerprint=compute_goal_contract_fingerprint(goal),
         runs=await _run_history(db, goal, run) if run is not None else [],

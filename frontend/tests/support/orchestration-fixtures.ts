@@ -118,6 +118,7 @@ export const acceptedSupervision: OrchestrationSupervision = {
 }
 
 export const supervisionPresentation: Record<OrchestrationSupervisionCondition, Pick<OrchestrationSupervision, 'operation' | 'next_action' | 'rationale'>> = {
+  unknown: { operation: 'No active worker confirmed.', next_action: 'No action', rationale: 'Current worker activity is unknown.' },
   working: { operation: 'Validation is running', next_action: 'Await worker result', rationale: 'An owned worker is active.' },
   waiting: { operation: 'Awaiting validation result', next_action: 'Await session.completed', rationale: 'A durable wait is open.' },
   needs_you: { operation: 'Choose deployment direction', next_action: 'Answer pending direction', rationale: 'The release needs an explicit operator decision.' },

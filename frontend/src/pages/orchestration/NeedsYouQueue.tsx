@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { useUpdateActionItem } from '@/api/meetings'
 import { Button, Textarea } from '@/components/common/uiPrimitives'
 import { STATUS_COLORS } from '@/lib/statusColors'
+import { parseUtc } from '@/lib/time'
 import type {
   OrchestrationAuthorityDecisionRecord,
   OrchestrationBaselineProcessType,
@@ -338,6 +339,7 @@ export interface NeedsYouQueueProps {
   renderBlockerRecovery?: (blocker: OrchestrationBlocker, register: (element: HTMLButtonElement | null) => void, onSuccessFocus?: () => void) => ReactNode
   onReleaseRetainedEdit?: (decisionIds: readonly string[], mode: 'dismiss' | 'review') => void
   suppressAnnouncement?: boolean
+  announcementScope?: 'all' | 'human' | 'none'
 }
 
 type RetainedQueueEdit = {
@@ -831,7 +833,7 @@ export function NeedsYouQueue({
   onSelectProcess, onRevealSource, openAction, onOpenAction, onActionTrigger, renderActionForm, renderAgentDefinitionReviewBatch, renderTeamHierarchyProposal,
   onAcceptDecision, onAnswerGoalDefinitionQuestion,
   retryPending, retryError, onRetryProcess, onApproveStaleInputs, onDismissStaleInputs, onAcknowledgeWarning,
-  renderBlockerRecovery, onReleaseRetainedEdit, suppressAnnouncement = false,
+  renderBlockerRecovery, onReleaseRetainedEdit, suppressAnnouncement = false, announcementScope,
 }: NeedsYouQueueProps) {
   const [justResolvedIds, setJustResolvedIds] = useState<Set<string>>(new Set())
   const [retainedEdit, setRetainedEdit] = useState<RetainedQueueEdit | null>(null)
@@ -845,6 +847,7 @@ export function NeedsYouQueue({
   const rowOrderRef = useRef<string[]>([])
   const headingRef = useRef<HTMLHeadingElement>(null)
   const { announceQueue } = useGoalAnnouncer()
+  const scope = announcementScope ?? (suppressAnnouncement ? 'none' : 'all')
 
   const criteriaByKey = new Map(goal.success_criteria.filter((criterion) => criterion.key).map((criterion) => [criterion.key as string, criterion.description]))
   const referenceMetadata = Array.isArray(needsYouReferences) ? needsYouReferences : []
@@ -855,6 +858,43 @@ export function NeedsYouQueue({
     ))
     : selectedRows
   const rows = allRows.filter((row) => !justResolvedIds.has(row.key))
+  const humanDecisions = allRows.flatMap((row) => {
+    if (row.kind === 'answer' || row.kind === 'recovery-proposal') return [row.decision]
+    if (row.kind === 'answer-batch' || row.kind === 'goal-definition-questions') return row.decisions
+    return []
+  }).filter((decision) => decision.authority === 'human' && decision.status === 'pending')
+  const humanIds = [...new Set(humanDecisions.map((decision) => decision.id))].sort()
+  const humanSignature = humanIds.join('|')
+  const seenHumanIds = useRef<Set<string> | null>(null)
+  const seenAnsweredIds = useRef<Set<string> | null>(null)
+  const newestQuestionAt = useRef<number | null>(null)
+  const newestAnswerAt = useRef<number | null>(null)
+  const locallyAnsweredIds = useRef(new Set<string>())
+  const answeredIds = allDecisions.filter((decision) => decision.authority === 'human' && decision.status === 'answered' && decision.decided_at)
+    .map((decision) => decision.id).sort()
+  const answeredSignature = answeredIds.join('|')
+  useEffect(() => {
+    if (scope !== 'human' || queriesUnready || queriesErrored || !authorityReady) return
+    const questionTimes = new Map(humanDecisions.map((decision) => [decision.id, parseUtc(decision.asked_at).getTime()]))
+    const answerTimes = new Map(allDecisions.map((decision) => [decision.id, decision.decided_at ? parseUtc(decision.decided_at).getTime() : NaN]))
+    if (!seenHumanIds.current) {
+      seenHumanIds.current = new Set(humanIds)
+      seenAnsweredIds.current = new Set(answeredIds)
+      newestQuestionAt.current = Math.max(...[...questionTimes.values()].filter(Number.isFinite), -Infinity)
+      newestAnswerAt.current = Math.max(...[...answerTimes.values()].filter(Number.isFinite), -Infinity)
+      return
+    }
+    const arriving = humanIds.filter((id) => !seenHumanIds.current!.has(id)
+      && (!Number.isFinite(questionTimes.get(id)) || questionTimes.get(id)! >= (newestQuestionAt.current ?? -Infinity)))
+    for (const id of humanIds) seenHumanIds.current!.add(id)
+    newestQuestionAt.current = Math.max(newestQuestionAt.current ?? -Infinity, ...[...questionTimes.values()].filter(Number.isFinite))
+    if (arriving.length) announceQueue(`${arriving.length} new question${arriving.length === 1 ? '' : 's'} need${arriving.length === 1 ? 's' : ''} you.`)
+    const resolved = answeredIds.filter((id) => !seenAnsweredIds.current!.has(id) && !locallyAnsweredIds.current.has(id)
+      && (!Number.isFinite(answerTimes.get(id)) || answerTimes.get(id)! >= (newestAnswerAt.current ?? -Infinity)))
+    for (const id of answeredIds) seenAnsweredIds.current!.add(id)
+    newestAnswerAt.current = Math.max(newestAnswerAt.current ?? -Infinity, ...[...answerTimes.values()].filter(Number.isFinite))
+    if (resolved.length) announceQueue(`${resolved.length} question${resolved.length === 1 ? '' : 's'} answered.`)
+  }, [scope, queriesUnready, queriesErrored, authorityReady, humanSignature, answeredSignature, announceQueue])
   rowOrderRef.current = rows.map((row) => row.key)
   // Terminal read-only recovery history needs no action, so it isn't announced as "needs you".
   const actionableCount = rows.filter((row) => editState(row) !== 'terminal'
@@ -897,22 +937,22 @@ export function NeedsYouQueue({
   // length alone, so the ordinary 0→N transition on first data load must not
   // be mistaken for a live arrival (review round 1, finding 1).
   useEffect(() => {
-    if (!checkpointLoaded || suppressAnnouncement) return
+    if (!checkpointLoaded || scope !== 'all') return
     const previous = checkpointCountRef.current
     if (previous !== null && checkpointItems.length > previous) toast('The orchestrator has questions about your goal')
     checkpointCountRef.current = checkpointItems.length
-  }, [checkpointLoaded, checkpointItems.length, suppressAnnouncement])
+  }, [checkpointLoaded, checkpointItems.length, scope])
 
   // Debounced (~500ms) sr-only aria-live announcing net queue changes — kept
   // separate from the existing per-action aria-live regions (BaselineActionForm
   // errors, header lifecycle message), which stay authoritative/immediate.
   useEffect(() => {
-    if (suppressAnnouncement || queriesUnready || queriesErrored) return
+    if (scope !== 'all' || queriesUnready || queriesErrored) return
     const timer = setTimeout(() => {
       setAnnouncement(actionableCount === 0 ? 'Queue clear.' : `${actionableCount} item${actionableCount === 1 ? '' : 's'} need${actionableCount === 1 ? 's' : ''} you.`)
     }, QUEUE_ANNOUNCE_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [actionableCount, queriesErrored, queriesUnready, suppressAnnouncement])
+  }, [actionableCount, queriesErrored, queriesUnready, scope])
 
   // Flow announcement through the shared goal announcer's queue region.
   useEffect(() => {
@@ -920,6 +960,11 @@ export function NeedsYouQueue({
   }, [announcement, announceQueue])
 
   function markResolved(key: string) {
+    const resolved = selectedRows.find((row) => row.key === key)
+    if (resolved?.kind === 'answer' || resolved?.kind === 'recovery-proposal') locallyAnsweredIds.current.add(resolved.decision.id)
+    if (resolved?.kind === 'answer-batch' || resolved?.kind === 'goal-definition-questions') {
+      for (const decision of resolved.decisions) locallyAnsweredIds.current.add(decision.id)
+    }
     setJustResolvedIds((current) => {
       const next = new Set(current)
       next.add(key)
@@ -1202,7 +1247,10 @@ export function NeedsYouQueue({
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
           below = <div className="mt-2">
             <GoalDefinitionQuestionCard key={formKey}
-              decisions={row.decisions} activeDecisionId={activeDecisionId} mutationBusy={mutationBusy} reviewLocked={editBlocked} onAnswer={onAnswerGoalDefinitionQuestion}
+              decisions={row.decisions} activeDecisionId={activeDecisionId} mutationBusy={mutationBusy} reviewLocked={editBlocked}
+              onAnswer={(decision, answerText, callbacks) => onAnswerGoalDefinitionQuestion(decision, answerText, {
+                ...callbacks, onSuccess: () => { locallyAnsweredIds.current.add(decision.id); callbacks.onSuccess() },
+              })}
               displayReferences={presentation.references}
               onActiveDecisionChange={(decisionId) => setActiveDecision(row.key, decisionId)}
               onAllAnswered={() => { releaseEdit(); markResolved(row.key); successToast('Answers received.'); focusNextRow(row.key) }}

@@ -1,7 +1,6 @@
-import { useEffect, useRef, type ReactNode } from 'react'
+import { type ReactNode } from 'react'
 import { StatusBadge, type StatusVariant } from '@/components/common/uiPrimitives'
 import type { OrchestrationSupervision, OrchestrationSupervisionCondition } from '@/lib/types'
-import { useGoalAnnouncer } from './goalAnnouncer'
 
 function entries(value: Record<string, string> | undefined) {
   return Object.entries(value ?? {}).filter(([, amount]) => amount !== '0')
@@ -35,15 +34,11 @@ function objectField(item: Record<string, unknown>, key: string, allowed: readon
 
 const CONDITION_BADGES: Record<OrchestrationSupervisionCondition, { status: StatusVariant; label: string }> = {
   working: { status: 'running', label: 'Working' }, waiting: { status: 'ready', label: 'Waiting' },
+  unknown: { status: 'idle', label: 'Unknown' },
   needs_you: { status: 'needs-you', label: 'Needs you' }, needs_attention: { status: 'blocked', label: 'Needs attention' },
   paused: { status: 'paused', label: 'Paused' }, stopped: { status: 'idle', label: 'Stopped' },
   cancelled: { status: 'cancelled', label: 'Cancelled' }, completed: { status: 'completed', label: 'Completed' },
 }
-
-const MATERIAL_TRANSITIONS = new Set([
-  'completed', 'cancelled', 'paused', 'stopped', 'failed_gate', 'failed_action',
-  'attention_blocker', 'recovery_action', 'recovery_wait', 'accepted_evidence',
-])
 
 function Fact({ label: name, children, mono = false }: { label: string; children: string; mono?: boolean }) {
   return <span><span className="text-huddleroom-text-muted">{name}: </span><span className={mono ? 'font-mono break-all text-huddleroom-text-primary' : 'text-huddleroom-text-primary'}>{children}</span></span>
@@ -59,24 +54,6 @@ function FactList({ title, items, render }: { title: string; items: readonly Rec
 }
 
 export function ExecutionSupervision({ supervision }: { supervision: OrchestrationSupervision | null }) {
-  const initialized = useRef(false)
-  const baselineKey = useRef<string | null>(null)
-  const { announceQueue } = useGoalAnnouncer()
-  useEffect(() => {
-    const transition = supervision?.transition
-    if (!initialized.current) {
-      initialized.current = true
-      baselineKey.current = transition?.key ?? null
-      return
-    }
-    if (!transition || transition.key === baselineKey.current || transition.kind === 'tick' || transition.kind === 'heartbeat') {
-      baselineKey.current = transition?.key ?? baselineKey.current
-      return
-    }
-    baselineKey.current = transition.key
-    if (supervision.condition === 'needs_you') announceQueue(`Needs your direction: ${transition.message}`)
-    else if (MATERIAL_TRANSITIONS.has(transition.kind)) announceQueue(transition.message)
-  }, [supervision?.condition, supervision?.transition, announceQueue])
   if (!supervision) return null
   const budget = supervision.budget
   const badge = CONDITION_BADGES[supervision.condition]

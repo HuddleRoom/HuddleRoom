@@ -87,6 +87,7 @@ export interface BaselineDashboardProps {
   onViewActivity?: () => void
   onRevealSource?: (target: NeedsYouSourceTarget) => void
   suppressQueueAnnouncement?: boolean
+  queueAnnouncementScope?: 'all' | 'human' | 'none'
   // The goal_definition_clarification_limit recovery action (Proceed / Ask
   // another round) is owned by the page (shares its mutation-owner
   // coordination with lifecycle/gate-override controls) and rendered here as
@@ -606,7 +607,7 @@ function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: rea
   </section>
 }
 
-export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], needsYouReferences = [], sourceActionIds = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, onRevealSource, renderBlockerRecovery, suppressQueueAnnouncement, getMutationGeneration }: BaselineDashboardProps) {
+export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], needsYouReferences = [], sourceActionIds = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, onRevealSource, renderBlockerRecovery, suppressQueueAnnouncement, queueAnnouncementScope, getMutationGeneration }: BaselineDashboardProps) {
   const health = useOrchestrationHealth()
   const answer = useAnswerOrchestrationDecision(projectId)
   const answerAgentDefinitionBatch = useAnswerAgentDefinitionReviewBatch(projectId)
@@ -1230,7 +1231,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
           setFormErrorSource(null)
           if (mode === 'dismiss') setOpenAction(null)
         }}
-        renderBlockerRecovery={renderBlockerRecovery} suppressAnnouncement={suppressQueueAnnouncement}
+        renderBlockerRecovery={renderBlockerRecovery} suppressAnnouncement={suppressQueueAnnouncement} announcementScope={queueAnnouncementScope}
       />
       <ProcessFocus selectedProcessType={effectiveProcessType} process={selectedProcess} goal={goal} decisions={decisions} decisionsUnready={dashboard.decisions.isLoading || dashboard.decisions.isError} warnings={warnings} reviews={dashboard.agentReviews.data ?? []} debug={debug} canSkip={!!selectedProcess && goal.status !== 'completed' && goal.status !== 'cancelled' && (selectedProcess.status === 'running' || selectedProcess.status === 'waiting_decision')} mutationBusy={mutationBusy} canRun={canRunSelected} canRerun={canRerunSelected} runPending={runStep.isPending} rerunPending={rerun.isPending} runRerunError={runRerunError} onRun={(trigger) => mutateChain(effectiveProcessType, 'run', trigger)} onRerun={(trigger) => mutateChain(effectiveProcessType, 'rerun', trigger)} retryPending={retry.isPending} retryError={retryError} onRetry={(trigger) => retryProcess(effectiveProcessType, trigger)} openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }} headingRef={focusHeadingRef} renderActionForm={renderActionForm} onViewActivity={onViewActivity} />
     </>}

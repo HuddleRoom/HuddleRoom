@@ -285,6 +285,13 @@ class OrchestrationRoadmapService:
                 if not (isinstance(blocker, dict) and blocker.get("scope") == f"claim:{goal.id}")
             ]
 
+    async def read_budget_summary(self, db, goal):
+        """Project the parent budget without reconciling execution blockers."""
+        try:
+            return await OrchestrationBudgetService().remaining(db, goal)
+        except BudgetMeasurementError:
+            return None
+
     async def remaining_or_block(self, db, goal, run):
         """A missing parent measurement is an attention state, never free budget."""
         try:

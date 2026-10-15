@@ -378,8 +378,9 @@ async def test_parent_missing_telemetry_blocks_tick_then_recovers_without_spendi
     get_detail = await get_goal(project_id=test_project.id, goal_id=goal.id, db=db_session)
     assert get_detail.budget_summary is None
     assert get_detail.supervision.budget == {}
-    assert get_detail.supervision.condition == "needs_attention"
-    assert any(item["scope"] == f"parent:{goal.id}" for item in get_detail.run.active_blockers)
+    assert get_detail.supervision.condition == "unknown"
+    assert get_detail.roadmap_budget_status == "unavailable"
+    assert not any(item.get("scope") == f"parent:{goal.id}" for item in get_detail.run.active_blockers)
 
     blocked = await service.tick(db_session, run.id)
     assert blocked["authorized_execution"] == {"step": "waiting", "reason": "needs_attention"}
@@ -396,9 +397,10 @@ async def test_parent_missing_telemetry_blocks_tick_then_recovers_without_spendi
     assert recovered["authorized_execution"] == {"step": "release_item", "item_key": "build", "unit_type": "goal"}
     assert not any(item["kind"] == "budget_measurement" and "item_key" not in item for item in run.active_blockers)
     session.metadata_ = {}
+    blockers_before_pause = list(run.active_blockers)
     paused = await pause_goal(project_id=test_project.id, goal_id=goal.id, db=db_session)
     assert paused.budget_summary is None
-    assert any(item["scope"] == f"parent:{goal.id}" for item in paused.run.active_blockers)
+    assert paused.run.active_blockers == blockers_before_pause
 
 
 async def test_measurement_blockers_keep_parent_and_child_scopes_on_replay(db_session, test_project):
@@ -409,3 +411,78 @@ async def test_measurement_blockers_keep_parent_and_child_scopes_on_replay(db_se
     for blocker in (parent, child, unrelated, parent, child):
         service._upsert_active_blocker(run, blocker)
     assert run.active_blockers == [unrelated, parent, child]
+
+
+@pytest.mark.parametrize("measured,existing", [(False, False), (False, True), (True, True)])
+async def test_repeated_roadmap_get_is_pure_across_committed_sessions(test_engine, monkeypatch, tmp_path, measured, existing):
+    """Commit request sessions so autoflush writes cannot hide behind fixture rollback."""
+    from copy import deepcopy
+    from httpx import AsyncClient, ASGITransport
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from huddleroom.main import create_app
+    from huddleroom.database import get_db
+    from huddleroom.dependencies import get_current_user, _ANON_USER
+    from huddleroom.models.project import Project
+    from huddleroom.models.base import Base
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as db:
+        project = Project(name="Read purity", workspace_path=str(tmp_path))
+        db.add(project); await db.flush()
+        _, goal, run, _ = await _approved_roadmap(db, project, [child_item("build")])
+        agent = _agent("measurement", ["implementation"])
+        db.add(agent); await db.flush()
+        task = Task(project_id=project.id, title="Measured work", assigned_to=agent.id, status="done",
+                    metadata_={"orchestration": {"run_id": str(run.id)}})
+        db.add(task); await db.flush()
+        db.add(OrchestrationAction(run_id=run.id, idempotency_key="measurement-source",
+            action_type="create_delegation_task", request={}, target_type="task", target_id=task.id, status="completed"))
+        db.add(Session(task_id=task.id, agent_id=agent.id, project_id=project.id, adapter_type="test", status="completed",
+            started_at=run.started_at, ended_at=run.started_at + timedelta(minutes=1),
+            metadata_={"token_count_in": 1, "token_count_out": 2} if measured else {}))
+        if existing:
+            run.active_blockers = [{"kind": "budget_measurement", "scope": f"parent:{goal.id}"},
+                {"kind": "budget_measurement", "scope": f"claim:{goal.id}"},
+                {"kind": "budget_measurement", "scope": "parent:unrelated"}]
+        ids = project.id, goal.id
+        await db.commit()
+    async def snapshot():
+        async with factory() as db:
+            return {table.name: [dict(row) for row in (await db.execute(select(table))).mappings()]
+                    for table in Base.metadata.sorted_tables}
+    before = await snapshot()
+    app = create_app()
+    async def request_db():
+        async with factory() as db:
+            yield db
+            await db.commit()
+    async def anon():
+        return _ANON_USER
+    app.dependency_overrides[get_db] = request_db
+    app.dependency_overrides[get_current_user] = anon
+    dml, flushes = [], []
+    def sql(conn, cursor, statement, parameters, context, many):
+        if statement.lstrip().split()[0].upper() in {"INSERT", "UPDATE", "DELETE", "REPLACE"}:
+            dml.append(statement)
+    from sqlalchemy.orm import Session as SyncSession
+    def flushed(session, context, instances):
+        flushes.append(True)
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("GET must not call provider or execution reconciliation")
+    monkeypatch.setattr(OrchestrationRoadmapService, "remaining_or_block", forbidden)
+    monkeypatch.setattr(OrchestrationService, "request_llm_decision", forbidden)
+    event.listen(test_engine.sync_engine, "before_cursor_execute", sql)
+    event.listen(SyncSession, "before_flush", flushed)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for _ in range(2):
+                response = await client.get(f"/api/v1/projects/{ids[0]}/orchestration/goals/{ids[1]}")
+                assert response.status_code == 200, response.text
+                if not measured:
+                    assert response.json()["roadmap_budget_status"] == "unavailable"
+                assert await snapshot() == before
+        assert dml == []
+        assert flushes == []
+    finally:
+        event.remove(test_engine.sync_engine, "before_cursor_execute", sql)
+        event.remove(SyncSession, "before_flush", flushed)

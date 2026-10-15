@@ -1068,6 +1068,7 @@ export interface OrchestrationGoalDetail {
   agent_suggestions: OrchestrationAgentSuggestion[]
   timeline: unknown[]
   supervision: OrchestrationSupervision | null
+  roadmap_budget_status?: 'available' | 'unavailable' | null
   contract_fingerprint: string | null
   runs: OrchestrationRunSummary[]
   child_goals: OrchestrationChildGoal[]
@@ -1204,11 +1205,53 @@ export interface GoalTypeCorrectionPreview {
 }
 
 export type OrchestrationSupervisionCondition =
-  | 'working' | 'waiting' | 'needs_you' | 'needs_attention'
+  | 'working' | 'unknown' | 'waiting' | 'needs_you' | 'needs_attention'
   | 'paused' | 'stopped' | 'cancelled' | 'completed'
+
+export interface OrchestrationStatusActivity {
+  key: string
+  state: 'reported_active' | 'liveness_unknown'
+  summary: string
+  subject: NeedsYouReference | null
+  actor: NeedsYouReference | null
+  observed_at: string | null
+}
+
+export interface OrchestrationStatusCurrentState {
+  kind: 'working' | 'unknown' | 'paused' | 'stopped' | 'cancelled' | 'completed'
+  summary: string
+  activities: OrchestrationStatusActivity[]
+}
+
+export interface OrchestrationStatusAttention {
+  key: string
+  kind: 'needs_you' | 'needs_attention' | 'waiting'
+  summary: string
+  subject: NeedsYouReference | null
+  unblock_actor: 'owner' | 'worker' | 'maintainer' | 'system' | 'unknown'
+  unblock_actor_label: string
+  next_check_at: string | null
+  occurred_at: string | null
+  additional_count: number
+}
+
+export interface OrchestrationStatusEvent {
+  key: string
+  kind: string
+  summary: string
+  subject: NeedsYouReference | null
+  occurred_at: string
+}
+
+export interface OrchestrationStatusLine {
+  current_state: OrchestrationStatusCurrentState
+  attention_summary: OrchestrationStatusAttention | null
+  last_material_event: OrchestrationStatusEvent | null
+}
 
 export interface OrchestrationSupervision {
   condition: OrchestrationSupervisionCondition
+  status_line?: OrchestrationStatusLine | null
   operation: string
   next_action: string
   rationale: string

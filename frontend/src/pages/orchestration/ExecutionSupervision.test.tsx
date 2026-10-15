@@ -70,7 +70,7 @@ describe('ExecutionSupervision', () => {
     expect((html.match(/—/g) ?? [])).toHaveLength(4)
   })
 
-  it('keeps passive snapshots silent and announces each new direction or material transition once', async () => {
+  it('keeps all Debug snapshots silent because the compact surface owns status announcements', async () => {
     const working = snapshot({ condition: 'working', transition: null })
     const view = await mountSupervision(working)
     try {
@@ -88,20 +88,20 @@ describe('ExecutionSupervision', () => {
 
       const direction = snapshot({ transition: { key: 'deployment.finished:1', kind: 'pending_direction', message: 'Deployment finished' } })
       await view.rerender(direction)
-      expect(textOf(live())).toBe('Needs your direction: Deployment finished')
+      expect(textOf(live())).toBe('')
       await view.rerender(direction)
-      expect(textOf(live())).toBe('Needs your direction: Deployment finished')
+      expect(textOf(live())).toBe('')
 
       const material = snapshot({ condition: 'working', transition: { key: 'evidence:1:accepted', kind: 'accepted_evidence', message: 'Test report accepted' } })
       await view.rerender(material)
-      expect(textOf(live())).toBe('Test report accepted')
+      expect(textOf(live())).toBe('')
       await view.rerender(material)
-      expect(textOf(live())).toBe('Test report accepted')
+      expect(textOf(live())).toBe('')
 
       vi.useFakeTimers()
       await act(async () => { vi.advanceTimersByTime(10_000) })
       await view.rerender(material)
-      expect(textOf(live())).toBe('Test report accepted')
+      expect(textOf(live())).toBe('')
     } finally {
       vi.useRealTimers()
       view.cleanup()
@@ -113,7 +113,7 @@ describe('ExecutionSupervision', () => {
   })
 
   it.each([
-    ['working', 'Working'], ['waiting', 'Waiting'], ['needs_you', 'Needs you'], ['needs_attention', 'Needs attention'],
+    ['unknown', 'Unknown'], ['working', 'Working'], ['waiting', 'Waiting'], ['needs_you', 'Needs you'], ['needs_attention', 'Needs attention'],
     ['paused', 'Paused'], ['stopped', 'Stopped'], ['cancelled', 'Cancelled'], ['completed', 'Completed'],
   ] as const)('maps %s to its semantic status badge', (condition, badge) => {
     const html = renderToStaticMarkup(<ExecutionSupervision supervision={snapshot({ condition })} />)

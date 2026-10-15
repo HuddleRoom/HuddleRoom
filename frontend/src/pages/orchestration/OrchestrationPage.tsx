@@ -58,6 +58,7 @@ import { authorizationReasonLabel, budgetLeftText, correctionAuthorityLabel, err
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
+import { CurrentOperationStatus } from './CurrentOperationStatus.tsx'
 import { RoomPanel, type RoomPanelAgentRow, type RoomPanelMeetingRow } from './RoomPanel'
 import { absolute } from '@/lib/time'
 import { GoalAnnouncerProvider, useGoalAnnouncer } from './goalAnnouncer'
@@ -1607,13 +1608,6 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
             </Callout>
           ) : null}
 
-          {/* Freshness cue (reuses react-query dataUpdatedAt/isFetching) */}
-          {query.dataUpdatedAt ? (
-            <p className={`mt-1 text-label ${query.isError ? 'text-huddleroom-status-amber' : 'text-huddleroom-text-muted'}`}>
-              Data as of {absolute(query.dataUpdatedAt)}
-              {query.isError ? ' · not updating' : query.isFetching ? ' · refreshing…' : ''}
-            </p>
-          ) : null}
         </div>
         <div className="mt-2 min-h-5 text-xs text-huddleroom-text-secondary">{lastMessageOwner?.startsWith('override:') ? '' : message}</div>
         {commandError && <p className="text-xs text-huddleroom-status-red">{commandError}</p>}
@@ -1714,6 +1708,17 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         </div>
       )}
 
+      <CurrentOperationStatus
+        statusLine={detail.supervision?.status_line ?? null}
+        condition={detail.supervision?.condition ?? 'unknown'}
+        activeProjectId={projectId}
+        dataUpdatedAt={query.dataUpdatedAt}
+        isFetching={query.isFetching}
+        isError={query.isError}
+        onRevealSource={(target) => detailsTabsRef.current?.showSourceRecord(target)}
+        goalKey={goalId}
+      />
+
       <BaselineDashboard
         key={`${goalId}:${run?.id ?? "none"}`}
         projectId={projectId}
@@ -1733,7 +1738,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         onViewActivity={() => detailsTabsRef.current?.showStepActivity()}
         onRevealSource={(target) => detailsTabsRef.current?.showSourceRecord(target)}
         renderBlockerRecovery={renderBlockerRecovery}
-        suppressQueueAnnouncement
+        queueAnnouncementScope="human"
       />
 
       <DetailsTabs

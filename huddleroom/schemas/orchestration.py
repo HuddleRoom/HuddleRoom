@@ -1165,13 +1165,58 @@ class OrchestrationRoadmapBudgetResponse(BaseModel):
     remaining: dict[str, str]
 
 
+OrchestrationSupervisionCondition = Literal[
+    "working", "waiting", "needs_you", "needs_attention", "unknown", "paused",
+    "stopped", "cancelled", "completed",
+]
+
+
+class OrchestrationStatusActivity(BaseModel):
+    key: str
+    state: Literal["reported_active", "liveness_unknown"]
+    summary: str
+    subject: "NeedsYouReference | None" = None
+    actor: "NeedsYouReference | None" = None
+    observed_at: datetime | None = None
+
+
+class OrchestrationStatusCurrentState(BaseModel):
+    kind: Literal["working", "unknown", "paused", "stopped", "cancelled", "completed"]
+    summary: str
+    activities: list[OrchestrationStatusActivity] = Field(default_factory=list)
+
+
+class OrchestrationStatusAttention(BaseModel):
+    key: str
+    kind: Literal["needs_you", "needs_attention", "waiting"]
+    summary: str
+    subject: "NeedsYouReference | None" = None
+    unblock_actor: Literal["owner", "worker", "maintainer", "system", "unknown"]
+    unblock_actor_label: str
+    next_check_at: datetime | None = None
+    occurred_at: datetime | None = None
+    additional_count: int = 0
+
+
+class OrchestrationStatusEvent(BaseModel):
+    key: str
+    kind: str
+    summary: str
+    subject: "NeedsYouReference | None" = None
+    occurred_at: datetime
+
+
+class OrchestrationStatusLine(BaseModel):
+    current_state: OrchestrationStatusCurrentState
+    attention_summary: OrchestrationStatusAttention | None = None
+    last_material_event: OrchestrationStatusEvent | None = None
+
+
 class OrchestrationSupervisionResponse(BaseModel):
     """Read-only, durable execution facts for the goal detail surface."""
 
-    condition: Literal[
-        "working", "waiting", "needs_you", "needs_attention", "paused",
-        "stopped", "cancelled", "completed",
-    ]
+    condition: OrchestrationSupervisionCondition
+    status_line: OrchestrationStatusLine | None = None
     operation: str
     next_action: str
     rationale: str
@@ -1270,6 +1315,7 @@ class OrchestrationGoalDetailResponse(BaseModel):
     roadmap_items: list[OrchestrationRoadmapItemResponse] | None = None
     children: list[uuid.UUID] | None = None
     budget_summary: OrchestrationRoadmapBudgetResponse | None = None
+    roadmap_budget_status: Literal["available", "unavailable"] | None = None
     supervision: OrchestrationSupervisionResponse | None = None
     contract_fingerprint: str | None = None
     runs: list[OrchestrationRunSummaryResponse] = Field(default_factory=list)

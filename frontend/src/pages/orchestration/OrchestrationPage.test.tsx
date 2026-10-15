@@ -2,6 +2,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
+import { NeedsYouQueue as RealQueue } from './NeedsYouQueue'
 import type { OrchestrationGoalDetail, OrchestrationProcessRunRecord, Task } from '@/lib/types'
 
 const state = vi.hoisted(() => ({
@@ -10,6 +11,9 @@ const state = vi.hoisted(() => ({
   goals: [] as Array<Record<string, unknown>>,
   detail: undefined as OrchestrationGoalDetail | undefined,
   detailError: false,
+  detailFetching: false,
+  realQueueForwarding: false,
+  queueDecisions: [] as import('@/lib/types').OrchestrationAuthorityDecisionRecord[],
   detailErrorObj: null as unknown,
   dataUpdatedAt: 0 as number,
   tasks: [] as Task[],
@@ -91,7 +95,7 @@ vi.mock('@/api/orchestration', () => ({
     error: state.detailErrorObj,
     refetch: vi.fn(),
     dataUpdatedAt: state.dataUpdatedAt,
-    isFetching: false,
+    isFetching: state.detailFetching,
   }),
   useOrchestrationGoalCommand: () => state.commandMutation,
   useOverrideOrchestrationGate: () => ({ isPending: false, mutate: vi.fn() }),
@@ -169,8 +173,20 @@ vi.mock('@tanstack/react-query', () => ({
 // Gates, Delegations, Suggestions) is owned by GoalDetailView itself and is
 // exercised directly by these tests, same as before this phase's restructure.
 vi.mock('./BaselineDashboard', () => ({
-  BaselineDashboard: ({ goalId, run, acquireMutation, onRevealSource, onSelectedProcessTypeChange, onViewActivity }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean; onRevealSource?: (target: { kind: 'gate' | 'process' | 'action'; id: string; goalId: string }) => void; onSelectedProcessTypeChange?: (type: 'team_hierarchy') => void; onViewActivity?: () => void }) => (
-    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => acquireMutation("baseline:run:goal_definition")}>Mock run</button><button onClick={() => acquireMutation("baseline:answer:decision-1")}>Mock answer</button><button onClick={() => onRevealSource?.({ kind: 'gate', id: 'gate-1', goalId })}>Reveal source gate</button><button onClick={() => onRevealSource?.({ kind: 'process', id: 'process-old', goalId })}>Reveal superseded process</button><button onClick={() => { onSelectedProcessTypeChange?.('team_hierarchy'); onViewActivity?.() }}>View current step activity</button></div>
+  isManagerSelectionDecision: () => false,
+  decisionOptionKey: (option: unknown) => typeof option === 'string' ? option : '',
+  normalizeDecisionOption: (option: unknown) => ({ key: typeof option === 'string' ? option : '', label: typeof option === 'string' ? option : '' }),
+  parseManagerComparison: () => null,
+  BaselineDashboard: ({ goalId, run, acquireMutation, onRevealSource, onSelectedProcessTypeChange, onViewActivity, suppressQueueAnnouncement, queueAnnouncementScope }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean; onRevealSource?: (target: { kind: 'gate' | 'process' | 'action'; id: string; goalId: string }) => void; onSelectedProcessTypeChange?: (type: 'team_hierarchy') => void; onViewActivity?: () => void; suppressQueueAnnouncement?: boolean; queueAnnouncementScope?: 'all' | 'human' | 'none' }) => (
+    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => acquireMutation("baseline:run:goal_definition")}>Mock run</button><button onClick={() => acquireMutation("baseline:answer:decision-1")}>Mock answer</button><button onClick={() => onRevealSource?.({ kind: 'gate', id: 'gate-1', goalId })}>Reveal source gate</button><button onClick={() => onRevealSource?.({ kind: 'process', id: 'process-old', goalId })}>Reveal superseded process</button><button onClick={() => { onSelectedProcessTypeChange?.('team_hierarchy'); onViewActivity?.() }}>View current step activity</button>{state.realQueueForwarding && state.detail && <RealQueue
+      goal={state.detail.goal} run={state.detail.run} gates={[]} processes={[]} warnings={[]}
+      checkpointItems={state.queueDecisions} allDecisions={state.queueDecisions} authorityReady checkpointLoaded
+      queriesErrored={false} queriesUnready={false} deferredCount={0} isWorking={false} mutationBusy={false}
+      openAction={null} onOpenAction={() => undefined} onActionTrigger={() => undefined} onSelectProcess={() => undefined}
+      renderActionForm={() => null} renderAgentDefinitionReviewBatch={() => null} renderTeamHierarchyProposal={() => null}
+      onAcceptDecision={() => undefined} onAnswerGoalDefinitionQuestion={() => undefined}
+      suppressAnnouncement={suppressQueueAnnouncement} announcementScope={queueAnnouncementScope}
+    />}</div>
   ),
   currentProcesses: (processes: unknown[] | null | undefined) => (processes ?? []).filter((process) => (process as { superseded_by_id: string | null }).superseded_by_id === null),
 }))
@@ -329,6 +345,9 @@ beforeEach(() => {
   state.goals = []
   state.detail = undefined
   state.detailError = false
+  state.detailFetching = false
+  state.realQueueForwarding = false
+  state.queueDecisions = []
   state.detailErrorObj = null
   state.dataUpdatedAt = 0
   state.tasks = []
@@ -865,7 +884,7 @@ describe('OrchestrationPage', () => {
   it('shows freshness cue in amber with "not updating" when query has error and cached data', async () => {
     state.activeProjectId = 'project-1'
     state.goalId = 'goal-1'
-    state.detail = richDetail
+    state.detail = { ...richDetail, supervision: minimalSupervision }
     state.detailError = true
     state.dataUpdatedAt = new Date('2026-09-16T10:30:00Z').getTime()
 
@@ -874,12 +893,13 @@ describe('OrchestrationPage', () => {
 
     expect(markup).toContain('text-huddleroom-status-amber')
     expect(markup).toContain('· not updating')
-    expect(markup).toContain('mt-1 text-label text-huddleroom-status-amber')
+    expect((markup.match(/Data as of/g) ?? [])).toHaveLength(1)
     expect(markup).not.toContain('· refreshing…')
   })
 
   const minimalSupervision = {
     condition: 'working' as const,
+    status_line: { current_state: { kind: 'unknown' as const, summary: 'No active worker confirmed.', activities: [] }, attention_summary: null, last_material_event: null },
     operation: 'Validating release evidence',
     next_action: 'Wait for reviewer output',
     rationale: 'Independent verification is required before completion.',
@@ -990,7 +1010,7 @@ describe('OrchestrationPage', () => {
       expect(resetIndex).toBeGreaterThan(debugPanelStart)
     })
 
-    it('hides ExecutionSupervision "Current operation" from the main body and shows it only in the Debug tabpanel when debug is enabled', async () => {
+    it('shows compact Current operation in the normal page while full supervision remains Debug-only', async () => {
       state.activeProjectId = 'project-1'
       state.goalId = 'goal-1'
       state.detail = { ...richDetail, supervision: minimalSupervision }
@@ -998,7 +1018,9 @@ describe('OrchestrationPage', () => {
 
       const { OrchestrationPage } = await import('./OrchestrationPage')
       const withoutDebug = renderToStaticMarkup(<OrchestrationPage />)
-      expect(withoutDebug).not.toContain('Current operation')
+      expect(withoutDebug).toContain('Current operation')
+      expect(withoutDebug).not.toContain('Recovery linkage')
+      expect((withoutDebug.match(/Data as of/g) ?? [])).toHaveLength(1)
 
       state.healthDebugEnabled = true
       const withDebug = renderToStaticMarkup(<OrchestrationPage />)
@@ -1006,7 +1028,8 @@ describe('OrchestrationPage', () => {
       const debugPanelStart = withDebug.indexOf('id="details-panel-debug"')
       const supervisionIndex = withDebug.indexOf('Current operation')
       expect(debugPanelStart).toBeGreaterThan(-1)
-      expect(supervisionIndex).toBeGreaterThan(debugPanelStart)
+      expect(supervisionIndex).toBeLessThan(debugPanelStart)
+      expect(withDebug.indexOf('Recovery linkage')).toBeGreaterThan(debugPanelStart)
     })
   })
 })
@@ -1512,4 +1535,117 @@ describe('authoritative baseline run replacement', () => {
       expect(getButton(view.container, 'Pause goal').getAttribute('disabled') !== null).toBe(stillBusy)
     } finally { view.cleanup() }
   })
+})
+
+
+describe('SPR188 query freshness integration', () => {
+  it.each([{ fetching: true, error: false, cue: 'refreshing' }, { fetching: false, error: true, cue: 'not updating' }, { fetching: false, error: false, cue: 'Data as of' }])('uses one last-success cue for $cue', async ({ fetching, error, cue }) => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'
+    state.dataUpdatedAt = Date.parse('2026-10-14T12:00:00Z')
+    state.detailFetching = fetching; state.detailError = error
+    state.detail = { ...richDetail, supervision: {
+      condition: 'unknown', operation: 'No active worker confirmed.', next_action: 'No action', rationale: 'Unknown',
+      criterion: null, verified_progress: [], useful_learning: [], accepted_evidence: [], workers: [], waits: [], recovery_history: [], pending_direction: null, budget: {}, transition: null,
+      status_line: { current_state: { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }, attention_summary: null, last_material_event: null },
+    } }
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const html = renderToStaticMarkup(<OrchestrationPage />)
+    expect(html).toContain('No active worker confirmed.')
+    expect(html).toContain(cue)
+    expect((html.match(/Data as of/g) ?? [])).toHaveLength(1)
+  })
+  it('keeps initial failure in the existing error state without fabricated status', async () => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = undefined; state.detailError = true
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const html = renderToStaticMarkup(<OrchestrationPage />)
+    expect(html).not.toContain('Current operation')
+    expect(html).not.toContain('No active worker confirmed.')
+  })
+})
+
+
+it('SPR188 ordinary page forwards a new generic human question to exactly one real queue owner', async () => {
+  vi.useFakeTimers()
+  state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.realQueueForwarding = true
+  const statusLine: import('@/lib/types').OrchestrationStatusLine = { current_state: { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }, attention_summary: null, last_material_event: null }
+  state.detail = { ...richDetail, supervision: { condition: 'unknown', operation: 'Unknown', next_action: 'No action', rationale: 'Unknown', criterion: null, verified_progress: [], useful_learning: [], accepted_evidence: [], workers: [], waits: [], recovery_history: [], pending_direction: null, budget: {}, transition: null, status_line: statusLine } }
+  const { OrchestrationPage } = await import('./OrchestrationPage')
+  const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status' && node.getAttribute('aria-live') === 'polite')!
+  try {
+    await React.act(async () => { vi.advanceTimersByTime(500) })
+    expect(textOf(live())).toBe('')
+    state.queueDecisions = [pageHumanQuestion()]
+    state.detail = { ...state.detail!, supervision: { ...state.detail!.supervision!, status_line: { ...statusLine, last_material_event: { key: 'question:1', kind: 'human_question', summary: 'COMPACT HUMAN SILENT', subject: null, occurred_at: '2026-10-14T12:00:00Z' } } } }
+    await view.rerender(() => <OrchestrationPage />)
+    await React.act(async () => { vi.advanceTimersByTime(500) })
+    expect(textOf(live())).toBe('1 new question needs you.')
+    const once = live().textContent
+    await view.rerender(() => <OrchestrationPage />)
+    await React.act(async () => { vi.advanceTimersByTime(500) })
+    expect(live().textContent).toBe(once)
+    const originalQuestion = state.queueDecisions[0]
+    state.queueDecisions = [{ ...originalQuestion, id: 'human:2', asked_at: '2026-10-14T12:05:00Z' }]
+    await view.rerender(() => <OrchestrationPage />)
+    expect(textOf(live())).toBe('1 new question needs you.')
+    expect(live().textContent).not.toBe(once)
+    const replacementOnce = live().textContent
+    await view.rerender(() => <OrchestrationPage />)
+    expect(live().textContent).toBe(replacementOnce)
+    state.queueDecisions = [{ ...state.queueDecisions[0], status: 'answered', decided_at: '2026-10-14T12:10:00Z' }]
+    await view.rerender(() => <OrchestrationPage />)
+    expect(textOf(live())).toBe('1 question answered.')
+    const externalAnswerOnce = live().textContent
+    await view.rerender(() => <OrchestrationPage />)
+    expect(live().textContent).toBe(externalAnswerOnce)
+    state.queueDecisions = [originalQuestion]
+    await view.rerender(() => <OrchestrationPage />)
+    expect(live().textContent).toBe(externalAnswerOnce)
+    state.detail = { ...state.detail!, supervision: { ...state.detail!.supervision!, status_line: { ...statusLine, last_material_event: { key: 'evidence:2', kind: 'accepted_evidence', summary: 'New verification accepted.', subject: null, occurred_at: '2026-10-14T13:00:00Z' } } } }
+    await view.rerender(() => <OrchestrationPage />)
+    expect(textOf(live())).toBe('New verification accepted.')
+    const evidenceOnce = live().textContent
+    await view.rerender(() => <OrchestrationPage />)
+    expect(live().textContent).toBe(evidenceOnce)
+  } finally { view.cleanup(); vi.useRealTimers() }
+})
+
+function pageHumanQuestion(): import('@/lib/types').OrchestrationAuthorityDecisionRecord {
+  return { id: 'human:1', goal_id: 'goal-1', run_id: 'run-1', decision_key: 'runtime:question', title: 'Choose the deployment region', status: 'pending', authority: 'human', authority_agent_id: null, source_process_run_id: null, question: 'Where should Checkout deploy?', context: null, options: [], recommendation: null, consequences: null, selected_option: null, reason: null, decided_by_user_id: null, decided_by_agent_id: null, overrides_recommendation: false, created_warning_id: null, related_gate_id: null, related_action_id: null, asked_at: '2026-10-14T12:00:00Z', decided_at: null, created_at: '2026-10-14T12:00:00Z', updated_at: '2026-10-14T12:00:00Z' }
+}
+
+
+it('SPR188 ordinary page silently establishes initial and goal-switch human baselines', async () => {
+  state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.realQueueForwarding = true
+  state.queueDecisions = [pageHumanQuestion()]; state.detail = richDetail
+  const { OrchestrationPage } = await import('./OrchestrationPage')
+  const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status' && node.getAttribute('aria-live') === 'polite')!
+  try {
+    expect(textOf(live())).toBe('')
+    state.goalId = 'goal-2'; state.detail = { ...richDetail, goal: { ...richDetail.goal, id: 'goal-2' }, run: { ...richDetail.run!, goal_id: 'goal-2', id: 'run-2' } }
+    state.queueDecisions = [{ ...pageHumanQuestion(), id: 'goal2-question', goal_id: 'goal-2', run_id: 'run-2' }]
+    await view.rerender(() => <OrchestrationPage />)
+    expect(textOf(live())).toBe('')
+  } finally { view.cleanup() }
+})
+
+
+it('SPR188 ordinary page delivers a simultaneous human question and material event without overwriting either owner', async () => {
+  state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.realQueueForwarding = true
+  const statusLine: import('@/lib/types').OrchestrationStatusLine = { current_state: { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }, attention_summary: null, last_material_event: null }
+  state.detail = { ...richDetail, supervision: { condition: 'unknown', operation: 'Unknown', next_action: 'No action', rationale: 'Unknown', criterion: null, verified_progress: [], useful_learning: [], accepted_evidence: [], workers: [], waits: [], recovery_history: [], pending_direction: null, budget: {}, transition: null, status_line: statusLine } }
+  const { OrchestrationPage } = await import('./OrchestrationPage')
+  const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+  try {
+    state.queueDecisions = [pageHumanQuestion()]
+    state.detail = { ...state.detail!, supervision: { ...state.detail!.supervision!, status_line: { ...statusLine, last_material_event: { key: 'material:simultaneous', kind: 'accepted_evidence', summary: 'Checkout verification accepted.', subject: null, occurred_at: '2026-10-14T13:00:00Z' } } } }
+    await view.rerender(() => <OrchestrationPage />)
+    const live = descendants(view.container).find((node) => node.getAttribute('role') === 'status' && node.getAttribute('aria-live') === 'polite')!
+    expect(textOf(live)).toContain('1 new question needs you.')
+    expect(textOf(live)).toContain('Checkout verification accepted.')
+    const once = live.textContent
+    await view.rerender(() => <OrchestrationPage />)
+    expect(live.textContent).toBe(once)
+  } finally { view.cleanup() }
 })

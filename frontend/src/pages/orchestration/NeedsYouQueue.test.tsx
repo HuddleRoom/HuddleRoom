@@ -25,6 +25,8 @@ import { buildQueueRows, NeedsYouQueue, type NeedsYouQueueProps } from './NeedsY
 import type { BaselineFocusAction } from './BaselineDashboard'
 import { GoalAnnouncerProvider } from './goalAnnouncer'
 import { queueOccurrence } from './needsYouPresentation'
+import { CurrentOperationStatus } from './CurrentOperationStatus.tsx'
+import type { OrchestrationStatusLine } from '@/lib/types'
 
 const ISO = { started: '2026-08-05T08:00:00Z' }
 
@@ -1808,4 +1810,95 @@ it.each([
 ])('labels aggregate %s state truthfully', async (state, label) => {
   const view = await mountQueue({ meetingCommitments: [{ ...meetingObligation, state }] })
   try { expect(textOf(view.container)).toContain(label) } finally { view.cleanup() }
+})
+
+
+it('SPR188 shares one announcer with the real NeedsYou queue and keeps human updates with that owner', async () => {
+  vi.useFakeTimers()
+  const status = (kind = 'accepted_evidence', key = 'baseline', occurred_at = '2026-08-05T08:00:00Z'): OrchestrationStatusLine => ({
+    current_state: { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }, attention_summary: null,
+    last_material_event: { key, kind, occurred_at, subject: null, summary: kind.startsWith('human_') ? 'COMPACT HUMAN MUST STAY SILENT' : 'New evidence accepted.' },
+  })
+  const render = (items: OrchestrationAuthorityDecisionRecord[], line: OrchestrationStatusLine) => <MemoryRouter><GoalAnnouncerProvider>
+    <CurrentOperationStatus statusLine={line} condition="unknown" activeProjectId="project-1" dataUpdatedAt={Date.parse(ISO.started)} isFetching={false} isError={false} goalKey="goal-1" onRevealSource={() => undefined} />
+    <QueueHarness checkpointItems={items} allDecisions={items} />
+  </GoalAnnouncerProvider></MemoryRouter>
+  const view = await mountWithTestDom(() => render([], status()), act)
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
+  try {
+    await act(async () => { vi.advanceTimersByTime(500) })
+    const pending = decision({ asked_at: '2026-08-05T09:00:00Z' })
+    await view.rerender(() => render([pending], status('human_question', 'question:1', '2026-08-05T09:00:00Z')))
+    await act(async () => { vi.advanceTimersByTime(500) })
+    expect(textOf(live())).toBe('1 item needs you.')
+    const once = live().textContent
+    await view.rerender(() => render([pending], status('human_question', 'question:1', '2026-08-05T09:00:00Z')))
+    await act(async () => { vi.advanceTimersByTime(500) })
+    expect(live().textContent).toBe(once)
+    const answered = { ...pending, status: 'answered', decided_at: '2026-08-05T10:00:00Z' }
+    await view.rerender(() => render([answered], status('human_answer', 'answer:1', '2026-08-05T10:00:00Z')))
+    await act(async () => { vi.advanceTimersByTime(500) })
+    expect(textOf(live())).not.toContain('COMPACT HUMAN')
+    await view.rerender(() => render([answered], status('accepted_evidence', 'evidence:2', '2026-08-05T11:00:00Z')))
+    expect(textOf(live())).toBe('New evidence accepted.')
+    const evidenceOnce = live().textContent
+    await view.rerender(() => render([answered], status('accepted_evidence', 'evidence:2', '2026-08-05T11:00:00Z')))
+    expect(live().textContent).toBe(evidenceOnce)
+  } finally { view.cleanup(); vi.useRealTimers() }
+})
+
+
+it('SPR188 human announcement scope silently baselines goal changes and remembers older question identities', async () => {
+  const first = decision({ id: 'first', asked_at: '2026-08-05T08:00:00Z' })
+  const next = decision({ id: 'next', asked_at: '2026-08-05T09:00:00Z' })
+  const p = (item: OrchestrationAuthorityDecisionRecord) => ({ checkpointItems: [item], allDecisions: [item], announcementScope: 'human' as const })
+  const view = await mountQueue(p(first))
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
+  try {
+    expect(textOf(live())).toBe('')
+    await view.rerender(p(next)); expect(textOf(live())).toBe('1 new question needs you.')
+    const once = live().textContent
+    await view.rerender(p(first)); expect(live().textContent).toBe(once)
+    await view.rerender(p(next)); expect(live().textContent).toBe(once)
+  } finally { view.cleanup() }
+})
+
+it('SPR188 external durable human answers announce once across older pending snapshots', async () => {
+  const pending = decision()
+  const answered = { ...pending, status: 'answered' as const, decided_at: ISO.started }
+  const view = await mountQueue({ checkpointItems: [pending], allDecisions: [pending], announcementScope: 'human' })
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
+  try {
+    await view.rerender({ checkpointItems: [], allDecisions: [answered], announcementScope: 'human' })
+    expect(textOf(live())).toBe('1 question answered.')
+    const once = live().textContent
+    await view.rerender({ checkpointItems: [pending], allDecisions: [pending], announcementScope: 'human' })
+    expect(live().textContent).toBe(once)
+    await view.rerender({ checkpointItems: [], allDecisions: [answered], announcementScope: 'human' })
+    expect(live().textContent).toBe(once)
+  } finally { view.cleanup() }
+})
+
+it('SPR188 human announcement scope excludes agent authority and terminal recovery history', async () => {
+  const view = await mountQueue({ announcementScope: 'human' })
+  const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
+  try {
+    const agent = decision({ authority: 'agent', id: 'agent-only' })
+    await view.rerender({ checkpointItems: [agent], allDecisions: [agent], announcementScope: 'human' })
+    expect(textOf(live())).toBe('')
+    const terminal = recoveryDecision('terminal-history', 'resolved')
+    await view.rerender({ recoveryDecisions: [terminal], allDecisions: [terminal], announcementScope: 'human' })
+    expect(textOf(live())).toBe('')
+  } finally { view.cleanup() }
+})
+
+
+it('SPR188 terminal recovery history is never a new human question', async () => {
+  const view = await mountQueue({ announcementScope: 'human' })
+  try {
+    const terminal = recoveryDecision('terminal-history-only', 'resolved')
+    await view.rerender({ recoveryDecisions: [terminal], allDecisions: [terminal], announcementScope: 'human' })
+    const live = descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
+    expect(textOf(live)).toBe('')
+  } finally { view.cleanup() }
 })

@@ -288,6 +288,15 @@ class OrchestrationBudgetService:
 
     async def snapshot_for_run(self, db, goal: OrchestrationGoal, run: OrchestrationRun) -> dict:
         """Reconcile durable session, reservation and action facts into one run snapshot."""
+        snapshot, usage_state = await self.project_snapshot_for_run(db, goal, run)
+        state = dict(run.budget_state or {})
+        run.budget_state = {**state, **snapshot, "usage_state": usage_state}
+        self.apply_overage(run, snapshot)
+        await db.flush()
+        return snapshot
+
+    async def project_snapshot_for_run(self, db, goal: OrchestrationGoal, run: OrchestrationRun) -> tuple[dict, str]:
+        """Calculate the execution snapshot without changing durable state."""
         parent = await self.roadmap_parent(db, goal) or await self.continuous_parent(db, goal)
         state_caps = (run.budget_state or {}).get("caps") if isinstance(run.budget_state, dict) else None
         caps = canonical_amounts(state_caps, allowed=ROADMAP_BUDGET_DIMENSIONS) if state_caps else (
@@ -365,11 +374,7 @@ class OrchestrationBudgetService:
         snapshot["reserved"] = self._format_amounts(reserved)
         snapshot["committed"] = self._format_amounts(committed)
         self._refresh_snapshot(snapshot)
-        state = dict(run.budget_state or {})
-        run.budget_state = {**state, **snapshot, "usage_state": usage_state}
-        self.apply_overage(run, snapshot)
-        await db.flush()
-        return snapshot
+        return snapshot, usage_state
 
     @staticmethod
     def _require_budget_action_control(goal: OrchestrationGoal, run: OrchestrationRun) -> None:

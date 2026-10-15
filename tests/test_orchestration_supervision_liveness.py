@@ -452,7 +452,7 @@ async def test_goal_detail_projects_read_only_supervision_from_durable_sources(
     assert set(supervision) == {
         "condition", "operation", "next_action", "rationale", "criterion", "verified_progress",
         "useful_learning", "accepted_evidence", "workers", "waits", "recovery_history",
-        "pending_direction", "budget", "transition",
+        "pending_direction", "budget", "transition", "status_line",
     }
     assert supervision["condition"] == "needs_you"
     assert supervision["verified_progress"] == [{"criterion_key": "ship", "status": "verified"}]
@@ -463,10 +463,11 @@ async def test_goal_detail_projects_read_only_supervision_from_durable_sources(
     assert [item["id"] for item in supervision["waits"]] == [str(oldest_wait.id), str(newest_wait.id)]
     assert supervision["waits"][0]["event"] == "session.completed"
     assert supervision["waits"][0]["matcher"] == {"session_id": str(session.id)}
-    assert supervision["pending_direction"]["id"] == str(oldest_direction.id)
+    assert supervision["pending_direction"]["id"] == str(newest_direction.id)
     assert supervision["workers"] == [{
         "session_id": str(session.id), "task_id": str(task.id), "agent_id": str(test_agent.id),
         "task_title": task.title, "session_status": "running", "observed_liveness": "live",
+        "action_id": str(action.id), "ended_at": None,
         "runner_id": "runner-live", "observed_at": now.isoformat(), "started_at": now.isoformat().replace("+00:00", "Z"),
     }]
     assert supervision["recovery_history"] == [{
@@ -477,18 +478,16 @@ async def test_goal_detail_projects_read_only_supervision_from_durable_sources(
     assert supervision["budget"] == {
         "consumed": {"max_tokens": "3"}, "committed": {}, "reserved": {}, "remaining": {"max_tokens": "7"},
     }
-    assert supervision["transition"] == {
-        "id": str(oldest_direction.id), "key": f"pending_direction:{oldest_direction.id}",
-        "kind": "pending_direction", "message": oldest_direction.title,
-        "occurred_at": (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
-    }
+    event = supervision["status_line"]["last_material_event"]
+    assert supervision["transition"]["key"] == event["key"]
+    assert supervision["transition"]["occurred_at"] == event["occurred_at"]
     assert run.budget_state == before["budget"]
     assert run.supervision_state == before["state"]
     assert run.active_blockers == before["blockers"]
 
 
 @pytest.mark.parametrize("state,expected", [
-    ("working", "working"), ("waiting", "waiting"), ("needs_you", "needs_you"),
+    ("working", "unknown"), ("waiting", "waiting"), ("needs_you", "needs_you"),
     ("needs_attention", "needs_attention"), ("paused", "paused"), ("stopped", "stopped"),
     ("cancelled", "cancelled"), ("completed", "completed"),
 ])
@@ -533,8 +532,7 @@ async def test_goal_detail_http_projects_each_durable_supervision_condition(
     assert detail.status_code == 200, detail.text
     supervision = detail.json()["supervision"]
     assert supervision["condition"] == expected
-    if state == "waiting":
-        assert supervision["transition"] is None
+    assert supervision["status_line"]["current_state"]["kind"] == (state if state in {"paused", "stopped", "cancelled", "completed"} else "unknown")
 
 
 async def test_goal_detail_http_prioritizes_pending_direction_and_keeps_transition_stable(
@@ -595,9 +593,10 @@ async def test_goal_detail_http_control_state_outranks_stale_pending_direction(
     second = await client.get(f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal_id}")
     assert first.status_code == second.status_code == 200
     supervision = first.json()["supervision"]
-    assert (supervision["condition"], supervision["operation"], supervision["next_action"]) == (state, operation, next_action)
+    assert (supervision["condition"], supervision["operation"].rstrip("."), supervision["next_action"]) == (state, operation, next_action)
     assert supervision["pending_direction"] is None
-    assert supervision["transition"]["kind"] == state
+    assert supervision["status_line"]["current_state"]["kind"] == state
+    assert supervision["transition"]["key"] == supervision["status_line"]["last_material_event"]["key"]
     assert supervision["transition"] == second.json()["supervision"]["transition"]
 
 
