@@ -1523,3 +1523,26 @@ async def test_input_restored_before_the_owner_answers_gets_a_fresh_verifier(db_
     again = await _request(service, db, run, gate, "after-restore")
 
     assert again.target_type == "task" and again.target_id != first.id  # never the earlier verifier task back
+
+
+def test_consecutive_waits_back_off_exponentially_up_to_an_hour():
+    from datetime import datetime, timedelta, timezone
+
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def waits(count, newest_age):
+        rows = [SimpleNamespace(status="failed", error="budget_wait", request={},
+                                created_at=now - timedelta(hours=10 + count - n)) for n in range(count - 1)]
+        return rows + [SimpleNamespace(status="failed", error="budget_wait", request={},
+                                       created_at=now - timedelta(seconds=newest_age))]
+
+    held = OrchestrationService()._held_reverification
+    assert held(waits(1, 30)) and not held(waits(1, 90))  # first wait: 60s
+    assert held(waits(2, 90)) and not held(waits(2, 150))  # each further wait doubles it
+    assert held(waits(4, 400)) and not held(waits(4, 500))
+    assert held(waits(20, 3500)) and not held(waits(20, 3700))  # capped at one hour
+    # a capability failure between waits restarts the backoff
+    crashed = SimpleNamespace(status="failed", error="verifier crashed", request={}, created_at=now - timedelta(hours=9))
+    assert held([*waits(3, 1)[:2], crashed, *waits(1, 30)]) and not held([*waits(3, 1)[:2], crashed, *waits(1, 90)])

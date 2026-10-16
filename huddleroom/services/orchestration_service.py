@@ -203,7 +203,8 @@ IDENTITY_CACHE_KEY = "orchestration_identity_cache"  # db.info slot: one recompu
 MAX_LISTED_ARTIFACTS = 10  # artifacts named in a citation error
 PRODUCER_REPORT_UNREADABLE = "producer_report_unreadable"
 SUPPLIED_INPUT_MISSING = "supplied_input_missing"  # a missing input its producer did not make: no revision
-REVIEW_INPUT_WAIT_SECONDS = 60  # ponytail: fixed backoff for a re-verification held by funding or its inputs
+REVIEW_INPUT_WAIT_SECONDS = 60  # backoff after the first wait of a re-verification held by funding or its inputs
+REVIEW_INPUT_WAIT_MAX_SECONDS = 3600  # each consecutive wait doubles the backoff up to this cap
 REVERIFICATION_ATTEMPTS = 3  # ponytail: fixed retry budget per revision; an answered owner ask re-arms it
 
 
@@ -10569,15 +10570,20 @@ class OrchestrationService:
         return action.status == "completed" and bool((action.request or {}).get("routed"))
 
     def _held_reverification(self, attempts: Sequence[OrchestrationAction]) -> bool:
-        """The newest attempt waited on funding or on its inputs moments ago: wait out the backoff rather than
-        record one more waiting action every tick."""
-        latest = attempts[-1] if attempts else None
-        waited = latest is not None and (self._routed(latest) or (
-            latest.status == "failed" and self._reverification_budget_failure(latest.error)
-        ))
-        return waited and _naive_utc(latest.created_at) > _naive_utc(_utcnow()) - timedelta(
-            seconds=REVIEW_INPUT_WAIT_SECONDS,
-        )
+        """The newest attempt waited on funding or on its inputs within the backoff: wait it out rather than record
+        one more waiting action every tick. The backoff doubles with each consecutive wait (60s up to an hour), so
+        a wait no owner ask covers adds a bounded number of rows."""
+        waits = 0
+        for action in reversed(attempts):
+            if not (self._routed(action) or (
+                action.status == "failed" and self._reverification_budget_failure(action.error)
+            )):
+                break
+            waits += 1
+        if not waits:
+            return False
+        backoff = min(REVIEW_INPUT_WAIT_SECONDS * 2 ** min(waits - 1, 16), REVIEW_INPUT_WAIT_MAX_SECONDS)
+        return _naive_utc(attempts[-1].created_at) > _naive_utc(_utcnow()) - timedelta(seconds=backoff)
 
     async def _reverification_actions(
         self, db: AsyncSession, run_id: uuid.UUID, revision_task_id: Any,
