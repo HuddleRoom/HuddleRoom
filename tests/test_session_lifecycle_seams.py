@@ -595,6 +595,46 @@ async def test_resumed_cli_collector_failure_is_labelled_resume_failed(test_engi
         assert (await _reload(factory, Session, session.id)).metadata_["resume_outcome"] == "resume_failed"
 
 
+async def _resume_from(factory, session_id):
+    async with factory() as db:
+        row = await db.get(Session, session_id)
+        row.provider_session_id = "prov-old"
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_resumed_cli_watcher_failure_is_labelled_resume_failed(test_engine, tmp_path, monkeypatch):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        await _resume_from(factory, session.id)
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch.object(CliAdapter, "_terminate_process_group", new=AsyncMock()), \
+                patch.object(CliAdapter, "_watch_project_status", new=AsyncMock(return_value="archived")), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(return_value=_StreamProc())):
+            await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed" and stored.error.startswith("project_status_watcher_failed")
+        assert stored.metadata_["resume_outcome"] == "resume_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spawn_error", [FileNotFoundError("claude"), OSError("fork failed")])
+async def test_resumed_cli_spawn_failure_is_labelled_resume_failed(test_engine, tmp_path, monkeypatch, spawn_error):
+    from huddleroom.adapters.cli_adapter import CliAdapter
+
+    async with _world(test_engine, tmp_path, monkeypatch, adapter="cli") as (factory, _project, _agent, _task, session):
+        await _resume_from(factory, session.id)
+        with patch.object(CliAdapter, "_setup_sandbox", return_value=None), \
+                patch("huddleroom.adapters.cli_adapter.asyncio.create_subprocess_exec",
+                      new=AsyncMock(side_effect=spawn_error)):
+            await asyncio.wait_for(session_tasks.execute_cli_session(str(session.id), "runner-1"), timeout=10)
+        stored = await _reload(factory, Session, session.id)
+        assert stored.status == "failed" and stored.resumable is True
+        assert stored.metadata_["resume_outcome"] == "resume_failed"
+
+
 @pytest.mark.asyncio
 async def test_owner_cancel_emits_no_failed_task_event_but_manual_cancel_does(test_engine, tmp_path, monkeypatch):
     async def failed_events(factory, project_id):

@@ -541,6 +541,8 @@ class CliAdapter:
             session.status = "failed"
             session.error = f"command_not_found: {cmd[0]}"
             session.resumable = session.provider_session_id is not None
+            if used_resume_id:  # the resume was attempted and never ran
+                session.metadata_ = {**(session.metadata_ or {}), "resume_outcome": "resume_failed"}
             session.ended_at = datetime.now(timezone.utc)
             self._store_roadmap_elapsed(session)
             if not await finish_if_owned():
@@ -566,6 +568,8 @@ class CliAdapter:
             session.status = "failed"
             session.error = redact_secrets(str(e))
             session.resumable = session.provider_session_id is not None
+            if used_resume_id:  # the resume was attempted and never ran
+                session.metadata_ = {**(session.metadata_ or {}), "resume_outcome": "resume_failed"}
             session.ended_at = datetime.now(timezone.utc)
             self._store_roadmap_elapsed(session)
             if not await finish_if_owned():
