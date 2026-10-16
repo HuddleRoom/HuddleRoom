@@ -79,12 +79,6 @@ async def test_unknown_category_rejected(db_session, test_project):
         await service._escalate_owner(db_session, goal, run, "bogus", "s", [], "Q")
 
 
-async def test_permission_and_capability_subject_formats():
-    tid = uuid.uuid4()
-    assert OrchestrationService.escalation_subject("permission_required", tid, "shell") == f"task:{tid}:permission:shell"
-    assert OrchestrationService.escalation_subject("capability_unavailable", tid, "browser") == f"task:{tid}:capability:browser"
-
-
 async def test_unrelated_ready_delegation_still_dispatches_after_escalation(db_session, test_project):
     agent = Agent(name=f"dev-{uuid.uuid4()}", role="developer", provider="openai", model="gpt-4o-mini",
                   adapter_type="api", capabilities=["implementation"], config={}, is_active=True)
@@ -93,7 +87,7 @@ async def test_unrelated_ready_delegation_still_dispatches_after_escalation(db_s
     service, goal, run = await _make_run(db_session, test_project.id)
     await service._escalate_owner(
         db_session, goal, run, "capability_unavailable",
-        service.escalation_subject("capability_unavailable", uuid.uuid4(), "browser"), ["no agent"], "Need browser.",
+        f"task:{uuid.uuid4()}:capability:browser", ["no agent"], "Need browser.",
     )
     action = await service.execute_create_delegation_task_action(
         db_session, run.id,

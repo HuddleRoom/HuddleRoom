@@ -36,12 +36,12 @@ async def _current_hash(db: AsyncSession, artifact: Artifact) -> str | None:
     Display and events only: review and verification recompute identity from content when they need it. The
     same containment as identity checks applies (no paths outside the workspace, regular files only)."""
     from huddleroom.models.project import Project
-    from huddleroom.services.orchestration_artifact_identity import PRESENT, _classify_path
+    from huddleroom.services.orchestration_artifact_identity import PRESENT, classify_path
 
     project = await db.get(Project, artifact.project_id)
     if project is None or not project.workspace_path:
         return None
-    found = await asyncio.to_thread(_classify_path, artifact.path, project.workspace_path)
+    found = await asyncio.to_thread(classify_path, artifact.path, project.workspace_path)
     return found.identity if found.state == PRESENT else None
 
 

@@ -493,31 +493,6 @@ class OrchestrationRoadmapService:
         await db.flush()
         return approval
 
-    async def _verdict_correction_open(self, db, run, task) -> bool:
-        """The verifier's verdict is still being corrected, or its blocked/failed report awaits the owner, so it
-        remains the active verifier."""
-        marker = await self.orchestration._existing_action_for_key(
-            db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
-        )
-        ledger = self.orchestration._json_object_or_empty(
-            self.orchestration._json_object_or_empty(marker.request if marker else {}).get("result_correction")
-        )
-        for status in ("blocked", "failed"):  # the verifier could not verify: wait for the owner's answer
-            ask = await self.orchestration._existing_action_for_key(
-                db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:task:{task.id}:verifier_{status}",
-            )
-            decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
-            if decision is not None and decision.status == "pending":
-                return True
-        if ledger.get("kind") != "verification_verdict":
-            return False
-        if ledger.get("status") in {"pending", "correcting"}:
-            return True
-        # stopped with an open owner ask: wait for the owner rather than dispatching a second verifier
-        decision_id = self.orchestration._event_uuid(ledger.get("decision_id"))
-        decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
-        return ledger.get("status") in {"exhausted", "unavailable"} and decision is not None and decision.status == "pending"
-
     async def has_active_bound_verifier(self, db, run) -> bool:
         actions = list((await db.scalars(select(OrchestrationAction).where(
             OrchestrationAction.run_id == run.id,
@@ -533,7 +508,7 @@ class OrchestrationRoadmapService:
             if (
                 task is not None and gate is not None and gate.run_id == run.id and gate.status == "open"
                 and (task.status in {"backlog", "ready", "in_progress", "blocked"}
-                     or await self._verdict_correction_open(db, run, task))
+                     or await self.orchestration._verdict_correction_open(db, run, task))
                 and await self.orchestration._outcome_verification_action_for_task(db, run, gate, task) == action
             ):
                 return True

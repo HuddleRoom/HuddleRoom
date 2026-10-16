@@ -923,7 +923,7 @@ def test_verification_report_returns_exact_errors_and_findings():
     ]
 
 
-async def _verifier_setup(db, project):
+async def _verifier_setup(db, project, *, dispatcher_key=False):
     from tests.test_orchestration_runtime_e2e import _agent as _runtime_agent
     from tests.test_orchestration_runtime_e2e import _complete_task_session, _seed_accepted_plan, _tasks_for_run
 
@@ -943,11 +943,24 @@ async def _verifier_setup(db, project):
                      if service._task_work_function(task) == "implementation")
     gate = await db.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
     await _complete_task_session(db, project.id, work_task, producer.id, json.dumps(VALID))
-    action = await service.execute_request_verification_action(
-        db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
-        f"run:{run.id}:kind:verdict-correction",
-    )
+    if dispatcher_key:
+        action = await _request_verification(service, db, run, gate)
+    else:
+        action = await service.execute_request_verification_action(
+            db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
+            f"run:{run.id}:kind:verdict-correction",
+        )
     return service, run, gate, await db.get(Task, action.target_id)
+
+
+async def _request_verification(service, db, run, gate):
+    """Request verification under the key the decision dispatcher computes."""
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+    request = {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"}
+    key = OrchestrationDecisionDispatcher.action_key(run.id, "request_verification", request)
+    key += await service.verification_attempt_suffix(db, run.id, gate.id, reuse_held=True)
+    return await service.execute_request_verification_action(db, run.id, request, key)
 
 
 async def _verification_evidence(db, gate):
@@ -984,6 +997,34 @@ async def test_well_formed_blocked_or_failed_verifier_report_escalates_once_and_
     assert any("No access." in line for line in escalation["history"])
     await db_session.refresh(gate)
     assert gate.status != "accepted"
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_answered_blocked_verifier_lets_the_next_request_dispatch_a_new_verifier(
+    db_session, test_project, test_user,
+):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    service, run, gate, first = await _verifier_setup(db_session, test_project, dispatcher_key=True)
+    action_id = first.metadata_["orchestration"]["verification_action_id"]
+    assert str((await _request_verification(service, db_session, run, gate)).id) == action_id  # still in flight
+    await _complete(db_session, service, run, first, json.dumps({"status": "blocked", "notes": "No access."}))
+    assert str((await _request_verification(service, db_session, run, gate)).id) == action_id  # owner not answered
+
+    [blocker] = _escalations(run, "capability_unavailable")
+    decision = await db_session.get(OrchestrationAuthorityDecision, uuid.UUID(blocker["decision_id"]))
+    option = decision.options[0] if isinstance(decision.options[0], str) else decision.options[0]["key"]
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option=option, reason=None, decided_by_user_id=test_user.id,
+    )
+
+    retry = await _request_verification(service, db_session, run, gate)
+    assert str(retry.id) != action_id and retry.status == "completed" and retry.target_id != first.id
+    second = await db_session.get(Task, retry.target_id)
+    assert second.metadata_["orchestration"]["verification_action_id"] == str(retry.id)
+    assert first.metadata_["orchestration"]["verification_action_id"] == action_id
+    assert str((await _request_verification(service, db_session, run, gate)).id) == str(retry.id)
 
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
@@ -1145,7 +1186,9 @@ async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exh
 
 
 @pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
-async def test_contract_change_after_a_summary_correction_stopped_starts_one_fresh_cycle(db_session, test_project):
+async def test_contract_change_after_a_summary_correction_stopped_keeps_it_with_the_replacement_recovery(
+    db_session, test_project,
+):
     service, goal, run, task, gate = await _summary_setup(db_session, test_project)
     await _complete(db_session, service, run, task, "not json")
     await service.tick(db_session, run.id)
@@ -1160,11 +1203,10 @@ async def test_contract_change_after_a_summary_correction_stopped_starts_one_fre
     for _ in range(2):
         await service.tick(db_session, run.id)
 
-    # a new owner contract resets the count once (ticks do not restart it again); nothing else is asked
+    # the stopped summary correction already went to the replacement-summary recovery: no fresh cycle
     ledger = await _ledger(service, db_session, run, task)
-    assert ledger["cycle"] == 2 and ledger["status"] == "correcting" and ledger["version"] != settled["version"]
-    assert ledger["previous_attempts"] == settled["attempts"]
-    assert len(await _corrections(db_session, task)) == 2
+    assert ledger.get("cycle", 1) == 1 and ledger["status"] == "exhausted" and ledger["attempts"] == settled["attempts"]
+    assert len(await _corrections(db_session, task)) == 1
     assert len(await _summary_triggers(db_session, run)) == 1
     assert await _non_recovery_asks(db_session, run) == []
 

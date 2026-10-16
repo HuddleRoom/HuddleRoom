@@ -858,6 +858,21 @@ async def test_review_outcome_uses_only_latest_turn_per_reviewer(db_session, tes
     assert (resolution, outcome["resolution_kind"]) == ("resolved", "approved")
 
 
+def test_review_outcome_is_unresolved_while_a_required_reviewer_has_no_turn():
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    approver, silent, author = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    turns = [
+        MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=approver, content="Fine.\nVERDICT: APPROVE", references=[]),
+        MeetingTurn(turn_number=2, round_number=1, speaker_agent_id=silent, content="  ", references=[]),
+        MeetingTurn(turn_number=3, round_number=1, speaker_agent_id=author, content="Thanks.", references=[]),
+    ]
+    roles = {str(approver): "reviewer", str(silent): "security", str(author): "developer"}
+    resolution, outcome = MeetingRunner()._review_outcome(turns, roles)
+    assert (resolution, outcome["resolution_kind"]) == ("unresolved", "verdict_missing")
+
+
 @pytest.mark.asyncio
 async def test_review_outcome_ignores_severities_superseded_by_reviewers_later_turn(db_session, test_agent):
     from huddleroom.models.agent import Agent

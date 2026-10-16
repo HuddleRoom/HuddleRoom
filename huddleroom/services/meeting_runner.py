@@ -1856,7 +1856,10 @@ class MeetingRunner:
 
     def _review_outcome(self, turns: list[MeetingTurn], agent_roles: dict[str, str]) -> tuple[str, dict]:
         last_severities: dict[str, list[str]] = {}  # each speaker's latest turn only: later turns supersede
-        last_verdict: dict[str, str | None] = {}  # each required reviewer's latest turn only
+        # each required reviewer's latest turn only; a reviewer who never spoke has no verdict
+        last_verdict: dict[str, str | None] = {
+            agent_id: None for agent_id, role in agent_roles.items() if role.lower() in {"security", "reviewer"}
+        }
         summary_lines: list[str] = []
         for turn in turns:
             content = (turn.content or "").strip()

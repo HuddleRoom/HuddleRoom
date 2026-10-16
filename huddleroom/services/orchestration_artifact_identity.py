@@ -89,7 +89,7 @@ def _hash_dir(root: Path, directory: Path) -> str:
     return digest.hexdigest()
 
 
-def _classify_path(path: str, workspace_root: str) -> InputAvailability:
+def classify_path(path: str, workspace_root: str) -> InputAvailability:
     try:
         root = Path(workspace_root).resolve()
         if not root.is_dir():
@@ -156,7 +156,7 @@ def classify_input(artifact, workspace_root: str) -> InputAvailability:
         return _missing()
     metadata = artifact.metadata_ or {}
     if artifact.path:
-        return _classify_path(artifact.path, workspace_root)
+        return classify_path(artifact.path, workspace_root)
     if artifact.url:
         return _classify_url(artifact.url, metadata, workspace_root)
     if artifact.artifact_type == "plan":

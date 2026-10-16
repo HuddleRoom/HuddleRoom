@@ -71,7 +71,7 @@ from huddleroom.services.orchestration_artifact_identity import (
     CONFIRMED_MISSING, PERMISSION_DENIED, UNINSPECTABLE, bind_artifacts, cited_artifact_ids, one_line, recheck_binding,
 )
 from huddleroom.services.orchestration_review_brief import (
-    MAX_ARTIFACTS, STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief, defang_fence_marks,
+    STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief, defang_fence_marks,
 )
 from huddleroom.services.orchestration_plan_ingestion import (
     BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
@@ -4799,6 +4799,7 @@ class OrchestrationService:
             )
         )).all()
         run = await db.get(OrchestrationRun, run_id)
+        settled = await self._settled_verifier_attempts(db, run, gate_id) if run is not None else 0
         # a held request counts once its backoff passed and no owner ask about its input is pending, so repeated
         # requests while it waits reuse the held action instead of classifying and writing one more
         cutoff = _naive_utc(_utcnow()) - timedelta(seconds=REVIEW_INPUT_WAIT_SECONDS)
@@ -4813,8 +4814,50 @@ class OrchestrationService:
             OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "request_verification",
             OrchestrationAction.idempotency_key.contains(IDENTITY_KEY_MARK, autoescape=True),
         ))).scalars().all() if isinstance(req, dict) and str(req.get("gate_id")) == str(gate_id))
+        failed += settled
         return ((f":attempt:{failed}" if failed else "") + (f":revision:{revisions}" if revisions else "")
                 + (f":changed:{changed}" if changed else ""))
+
+    async def _settled_verifier_attempts(self, db: AsyncSession, run: OrchestrationRun, gate_id: Any) -> int:
+        """Dispatched verifiers for the gate that ended without a verdict still in play (e.g. a blocked/failed
+        report the owner answered, or a dismissed verdict correction): each is a spent attempt, so the next
+        request dispatches a new verifier. A verifier still running or awaiting the owner is not counted."""
+        count = 0
+        for action in await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_verification",
+            OrchestrationAction.status == "completed", OrchestrationAction.target_type == "task",
+        )):
+            if str(self._json_object_or_empty(action.request).get("gate_id")) != str(gate_id):
+                continue
+            task = await db.get(Task, action.target_id)
+            if task is not None and task.status not in {"backlog", "ready", "in_progress", "blocked"} and not (
+                await self._verdict_correction_open(db, run, task)
+            ):
+                count += 1
+        return count
+
+    async def _verdict_correction_open(self, db: AsyncSession, run: OrchestrationRun, task: Task) -> bool:
+        """The verifier's verdict is still being corrected, or its blocked/failed report awaits the owner, so it
+        remains the active verifier."""
+        marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+        ledger = self._json_object_or_empty(self._json_object_or_empty(marker.request if marker else {}).get(
+            "result_correction"
+        ))
+        for status in ("blocked", "failed"):  # the verifier could not verify: wait for the owner's answer
+            ask = await self._existing_action_for_key(
+                db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:task:{task.id}:verifier_{status}",
+            )
+            decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
+            if decision is not None and decision.status == "pending":
+                return True
+        if ledger.get("kind") != VERIFICATION_VERDICT:
+            return False
+        if ledger.get("status") in {"pending", "correcting"}:
+            return True
+        # stopped with an open owner ask: wait for the owner rather than dispatching a second verifier
+        decision_id = self._event_uuid(ledger.get("decision_id"))
+        decision = await db.get(OrchestrationAuthorityDecision, decision_id) if decision_id else None
+        return ledger.get("status") in {"exhausted", "unavailable"} and decision is not None and decision.status == "pending"
 
     async def _task_has_active_session(self, db: AsyncSession, task_id: uuid.UUID) -> bool:
         result = await db.execute(
@@ -5062,11 +5105,10 @@ class OrchestrationService:
                 )
                 .order_by(Artifact.created_at, Artifact.id)
             ))
-        # the verdict binds to these identities; the verifier is given the same pinned references
-        # only the artifacts the brief shows are bound (the rest are truncated out of it)
-        shown, hidden = artifacts[:MAX_ARTIFACTS], artifacts[MAX_ARTIFACTS:]
-        identities = await bind_artifacts(db, source_task.project_id, shown) if source_task is not None else []
-        artifacts = [self._pinned_artifact(artifact, record) for artifact, record in zip(shown, identities)] + hidden
+        # the verdict binds to every linked artifact's identity, so a change to one the brief truncates away still
+        # drops the approval; the verifier is given the same pinned references
+        identities = await bind_artifacts(db, source_task.project_id, artifacts) if source_task is not None else []
+        artifacts = [self._pinned_artifact(artifact, record) for artifact, record in zip(artifacts, identities)]
         return {**build_review_inputs(
             str(source_contract.get("scope") or ""),
             str(source_contract.get("deliverable") or ""),
@@ -8232,7 +8274,10 @@ class OrchestrationService:
             await self._new_result_correction_cycle(db, run, parent, ledger, version)
             ledger["status"] = "superseded"
             return
-        if ledger.get("version", version) != version:
+        handed_over = ledger["kind"] == FINAL_SUMMARY and ledger.get("status") in {"exhausted", "unavailable"} and not (
+            ledger.get("decision_id")
+        )  # a stopped summary correction already went to the replacement-summary recovery
+        if ledger.get("version", version) != version and not handed_over:
             # A new owner contract or plan version resets the count.
             await self._new_result_correction_cycle(db, run, parent, ledger, version)
         if ledger.get("status") in {"exhausted", "unavailable"}:
@@ -8504,11 +8549,8 @@ class OrchestrationService:
             status="correcting", correction_task_id=str(correction.id), correction_session_id=None,
             correction_task_ids=[*dispatched, str(correction.id)] if str(correction.id) not in dispatched else dispatched,
         )
-        run.active_blockers = [  # funding returned: the subject's budget ask no longer blocks it
-            item for item in run.active_blockers
-            if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
-                    and item.get("category") == "budget_exhausted" and item.get("scope") == subject)
-        ]
+        # funding returned: the subject's budget ask no longer blocks it
+        self._drop_owner_escalations(run, {"budget_exhausted"}, subject)
         await self._reopen_invalid_report_gate(db, run, parent, await self._existing_action_for_key(
             db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent.id}",
         ))
@@ -10845,7 +10887,7 @@ class OrchestrationService:
             reason = gate.failure_reason or ""
             if reason not in {IDENTITY_CHANGED_REASON, IDENTITY_MISSING_REASON} and not reason.startswith(
                 f"{REVIEW_INPUT_MISSING}:"
-            ):
+            ) or await self._input_ask_pending(db, run, gate.id):  # the owner is deciding about an input
                 continue
             dropped = None
             for item in reversed(self._latest_evidence_by_source(await self._evidence_for_gate(db, gate))):
@@ -10916,10 +10958,13 @@ class OrchestrationService:
             self._held_reverification(attempts) or await self._input_ask_pending(db, run, gate.id)
         ):
             return 0
-        spent = [a for a in attempts if a.status == "failed" and not self._reverification_budget_failure(a.error)]
+        spent, subject = await self._rearmed_reverification_failures(
+            db, run, [a for a in attempts if a.status == "failed" and not self._reverification_budget_failure(a.error)],
+            f"gate:{gate.id}:reverify:{item.id}", f"gate:{gate.id}:reverify:{item.id}:cycle:",
+        )
         if len(spent) >= REVERIFICATION_ATTEMPTS:
             await self._escalate_owner(
-                db, goal, run, "capability_unavailable", f"gate:{gate.id}:reverify:{item.id}",
+                db, goal, run, "capability_unavailable", subject,
                 [f"verification failed: {action.error}" for action in spent],
                 f"Cannot verify gate {gate.id} again after its reviewed content changed.",
             )
@@ -10938,13 +10983,40 @@ class OrchestrationService:
                     f"Cannot fund verifying gate {gate.id} again after its reviewed content changed: {detail}.",
                 )
             return 0
-        run.active_blockers = [  # dispatched: the subject's funding ask no longer blocks it
-            blocker for blocker in run.active_blockers
-            if not (isinstance(blocker, Mapping) and blocker.get("kind") == "owner_escalation"
-                    and blocker.get("category") == "budget_exhausted"
-                    and blocker.get("scope") == f"gate:{gate.id}:reverify:{item.id}")
-        ]
+        # dispatched: the subject's funding or dispatch asks no longer block it
+        self._drop_owner_escalations(run, {"budget_exhausted", "capability_unavailable"},
+                                     f"gate:{gate.id}:reverify:{item.id}", prefix=True)
         return 1
+
+    async def _rearmed_reverification_failures(
+        self, db: AsyncSession, run: OrchestrationRun, spent: list[OrchestrationAction], subject: str, cycle_prefix: str,
+    ) -> tuple[list[OrchestrationAction], str]:
+        """Failures that still count, and the subject of the next owner ask: each answered capability ask on the
+        subject re-arms REVERIFICATION_ATTEMPTS more, and the next ask of a re-armed cycle has its own subject
+        (``cycle_prefix`` + cycle) so it can be raised again."""
+        cycle = 0
+        while True:
+            ask = await self._existing_action_for_key(
+                db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:{subject}",
+            )
+            decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
+            if decision is None or decision.status != "answered" or decision.decided_at is None:
+                return spent, subject
+            answered_at = _naive_utc(decision.decided_at)
+            spent = [action for action in spent if _naive_utc(action.created_at) > answered_at]
+            cycle += 1
+            subject = f"{cycle_prefix}{cycle}"
+
+    @staticmethod
+    def _drop_owner_escalations(run: OrchestrationRun, categories: set[str], scope: str, *, prefix: bool = False) -> None:
+        """Drop the run's owner-escalation blockers of these categories on one subject (``prefix``: on every
+        subject under it)."""
+        run.active_blockers = [
+            item for item in run.active_blockers or []
+            if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
+                    and item.get("category") in categories
+                    and (str(item.get("scope", "")).startswith(scope) if prefix else item.get("scope") == scope))
+        ]
 
     async def _reverify_gate_revisions(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Each finished revision with a valid report gets one independent re-verification of its gate (only the
@@ -10975,19 +11047,10 @@ class OrchestrationService:
                 continue
             # Only capability failures spend attempts. Each answered owner ask re-arms REVERIFICATION_ATTEMPTS more;
             # the next ask of a re-armed cycle has its own subject so it can be raised again.
-            spent = [action for action in failures if not self._reverification_budget_failure(action.error)]
-            cycle, subject = 0, f"gate:{gate.id}:revision"
-            while True:
-                ask = await self._existing_action_for_key(
-                    db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:{subject}",
-                )
-                decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
-                if decision is None or decision.status != "answered" or decision.decided_at is None:
-                    break
-                answered_at = _naive_utc(decision.decided_at)
-                spent = [action for action in spent if _naive_utc(action.created_at) > answered_at]
-                cycle += 1
-                subject = f"gate:{gate.id}:revision:reverify:{cycle}"
+            spent, subject = await self._rearmed_reverification_failures(
+                db, run, [action for action in failures if not self._reverification_budget_failure(action.error)],
+                f"gate:{gate.id}:revision", f"gate:{gate.id}:revision:reverify:",
+            )
             if len(spent) >= REVERIFICATION_ATTEMPTS:
                 continue  # waits for the owner's answer to this cycle's ask
             history = [f"revision task {revision.id} finished", *(f"re-verification failed: {a.error}" for a in failures)]
@@ -11018,12 +11081,9 @@ class OrchestrationService:
                     )
                 continue
             created += 1
-            run.active_blockers = [  # dispatched: the subject's funding or dispatch asks no longer block it
-                item for item in run.active_blockers
-                if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
-                        and item.get("category") in {"budget_exhausted", "capability_unavailable"}
-                        and str(item.get("scope", "")).startswith(f"gate:{gate.id}:revision"))
-            ]
+            # dispatched: the subject's funding or dispatch asks no longer block it
+            self._drop_owner_escalations(run, {"budget_exhausted", "capability_unavailable"},
+                                         f"gate:{gate.id}:revision", prefix=True)
         return created
 
     async def _recover_failed_tasks(
@@ -11492,7 +11552,10 @@ class OrchestrationService:
         run: OrchestrationRun,
         gate: OrchestrationGate,
     ) -> int:
-        key = await self._verification_retry_key(db, run.id, f"run:{run.id}:kind:request_verification:stale_gate:{gate.id}")
+        settled = await self._settled_verifier_attempts(db, run, gate.id)
+        key = await self._verification_retry_key(
+            db, run.id, f"run:{run.id}:kind:request_verification:stale_gate:{gate.id}" + (f":attempt:{settled}" if settled else ""),
+        )
         if await self._existing_action_for_key(db, run.id, key) is not None:
             return 0
         try:
@@ -11544,12 +11607,6 @@ class OrchestrationService:
         "result_correction_exhausted", "revision_exhausted", "review_input_missing",
     )
 
-    @staticmethod
-    def escalation_subject(category: str, task_id: Any, detail: str) -> str:
-        """Subject for per-task escalations, e.g. `task:<id>:permission:<tool>` or `task:<id>:capability:<name>`."""
-        label = {"permission_required": "permission", "capability_unavailable": "capability"}.get(category, category)
-        return f"task:{task_id}:{label}:{detail}"
-
     async def _escalate_owner(
         self,
         db: AsyncSession,
@@ -11561,7 +11618,8 @@ class OrchestrationService:
         question: str,
         options: Sequence[Mapping[str, str]] | None = None,
     ) -> OrchestrationAction:
-        """Ask the owner about one subject and block only that subject; the run keeps dispatching other work."""
+        """Ask the owner about one subject and record a blocker on that subject only. Deterministic work on other
+        subjects continues, but the LLM's proactive work pauses while any owner ask is pending (known limit)."""
         if category not in self._ESCALATION_CATEGORIES:
             raise ValueError(f"Unknown escalation category: {category}")
         attempts = [str(item) for item in history][-10:]  # ponytail: keep only the latest attempts
@@ -11791,12 +11849,8 @@ class OrchestrationService:
             "source_id": source_id, "revision_task_id": str(task.id), "at": _utcnow().isoformat(),
             **({"reason": reason} if evidence is None and reason else {}),
         }]}
-        run.active_blockers = [  # dispatched: the subject's funding or dispatch ask no longer blocks it
-            item for item in run.active_blockers
-            if not (isinstance(item, Mapping) and item.get("kind") == "owner_escalation"
-                    and item.get("category") in {"budget_exhausted", "capability_unavailable"}
-                    and item.get("scope") == subject)
-        ]
+        # dispatched: the subject's funding or dispatch ask no longer blocks it
+        self._drop_owner_escalations(run, {"budget_exhausted", "capability_unavailable"}, subject)
         await db.flush()
         return 1
 

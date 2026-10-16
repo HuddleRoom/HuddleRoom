@@ -1337,6 +1337,24 @@ async def _request(service, db, run, gate, key):
 
 
 @pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_every_linked_artifact_is_bound_even_beyond_those_the_brief_shows(db_session, test_project):
+    db = db_session
+    service, run, gate, work_task, _artifact, _verifier, first = await _verifier_for_db_only_report(db, test_project)
+    first.status = "cancelled"  # the next request dispatches a new verifier with a new brief
+    for index in range(rb.MAX_ARTIFACTS):
+        (Path(test_project.workspace_path) / f"extra{index}.py").write_text(f"X = {index}\n")
+        db.add(Artifact(project_id=test_project.id, name=f"extra{index}.py", artifact_type="file",
+                        linked_task_id=work_task.id, path=f"extra{index}.py"))
+    await db.flush()
+
+    action = await _request(service, db, run, gate, "many-artifacts")
+
+    assert len(action.request["artifact_identity"]) == rb.MAX_ARTIFACTS + 1
+    task = await db.get(Task, action.target_id)
+    assert task.id != first.id and f"[Artifacts truncated: showing {rb.MAX_ARTIFACTS} of {rb.MAX_ARTIFACTS + 1}]" in task.description
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
 @pytest.mark.parametrize("producer_made", [True, False])
 async def test_missing_contract_artifact_revises_only_what_the_producer_made(db_session, test_project, producer_made):
     db = db_session
@@ -1523,6 +1541,36 @@ async def test_funding_wait_for_changed_content_asks_the_owner_and_clears_once_d
     await service.tick(db, run.id)
     actions = await _verification_actions(db, run, gate)
     assert actions[-1].target_type == "task" and _owner_asks(run, "budget_exhausted") == []
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_answered_ask_after_failed_changed_content_verifications_re_arms_another_attempt(
+    db_session, test_project, test_user,
+):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+    from tests.test_orchestration_result_correction import _complete
+
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
+    (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): return True\n")
+    await _complete(db, service, run, verifier_task, ACCEPTED)
+    with patch.object(service, "_best_recovery_agent", AsyncMock(return_value=None)):  # no verifier fits
+        for _ in range(4):
+            await service.tick(db, run.id)
+    assert [a.status for a in (await _verification_actions(db, run, gate))[1:]] == ["failed"] * 3
+    [ask] = _owner_asks(run, "capability_unavailable")
+    assert ask["scope"].startswith(f"gate:{gate.id}:reverify:")
+
+    decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(ask["decision_id"]))
+    option = decision.options[0] if isinstance(decision.options[0], str) else decision.options[0]["key"]
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option=option, reason=None, decided_by_user_id=test_user.id,
+    )
+    await service.tick(db, run.id)
+
+    actions = await _verification_actions(db, run, gate)
+    assert len(actions) == 5 and actions[-1].status == "completed" and actions[-1].target_type == "task"
 
 
 @pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
