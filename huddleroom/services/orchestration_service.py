@@ -71,7 +71,7 @@ from huddleroom.services.orchestration_artifact_identity import (
     CONFIRMED_MISSING, PERMISSION_DENIED, UNINSPECTABLE, bind_artifacts, cited_artifact_ids, one_line, recheck_binding,
 )
 from huddleroom.services.orchestration_review_brief import (
-    MAX_ARTIFACTS, STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief,
+    MAX_ARTIFACTS, STALE_EVIDENCE_REASON, bound_findings, build_review_inputs, build_revision_brief, defang_fence_marks,
 )
 from huddleroom.services.orchestration_plan_ingestion import (
     BUDGET_REQUIRED_CODE, BUDGET_REQUIRED_MESSAGE,
@@ -8143,8 +8143,11 @@ class OrchestrationService:
             Artifact.project_id == task.project_id, Artifact.status != "deleted",
             Artifact.linked_task_id.in_({task.id, owner}),
         ).order_by(Artifact.created_at, Artifact.id).limit(MAX_LISTED_ARTIFACTS)))
+        # artifact names are agent-controlled: quoted as data, unable to break the correction brief's fences
         listing = "; ".join(
-            f"artifact:{row.id} ({one_line(row.path or row.url or row.name, 100)})" for row in registered
+            f"artifact:{row.id} "
+            + json.dumps(defang_fence_marks(one_line(row.path or row.url or row.name, 100)), ensure_ascii=False)
+            for row in registered
         ) or "none"
         return [
             f"cited artifact:{value} is not a registered artifact of this project; "

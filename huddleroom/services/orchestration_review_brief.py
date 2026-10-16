@@ -95,12 +95,16 @@ def bound_findings(evidence: Iterable[Any], notes: Any, label: str) -> dict[str,
 _FENCE_MARK = re.compile(r"<<<(?=[A-Z_])|(?<=[A-Z_])>>>")
 
 
+def defang_fence_marks(text: str) -> str:
+    """Untrusted text that can neither open nor close a `<<<TAG ... TAG>>>` fence."""
+    return _FENCE_MARK.sub(lambda m: m.group(0)[0] + "\\" + m.group(0)[1:], text)
+
+
 def fenced(tag: str, body: str) -> str:
     """Untrusted agent text between `<<<TAG` and `TAG>>>`, as verifier and revision briefs embed it. The result
     correction brief's FAILED_OUTPUT block is deliberately not built here: it returns the producer's own output
     verbatim to the same producer."""
-    body = _FENCE_MARK.sub(lambda m: m.group(0)[0] + "\\" + m.group(0)[1:], body)
-    return f"<<<{tag}\n{body}\n{tag}>>>"
+    return f"<<<{tag}\n{defang_fence_marks(body)}\n{tag}>>>"
 
 
 def _section(title: str, lines: list[str], note: str | None) -> str:
