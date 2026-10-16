@@ -4,6 +4,7 @@ import type {
   OrchestrationBlocker,
   OrchestrationGate,
   OrchestrationDecisionAnswerResult,
+  OrchestrationAnswerSubmission,
   OrchestrationMeetingCommitment,
   OrchestrationProcessRunRecord,
   OrchestrationWarningRecord,
@@ -49,6 +50,18 @@ export interface NeedsYouEditSnapshot {
 
 function sameValue(left: unknown, right: unknown) {
   return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function sameCanonicalValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (Array.isArray(left) || Array.isArray(right)) return Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length && left.every((value, index) => sameCanonicalValue(value, right[index]))
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  const keys = Object.keys(leftRecord).sort()
+  return sameValue(keys, Object.keys(rightRecord).sort())
+    && keys.every((key) => sameCanonicalValue(leftRecord[key], rightRecord[key]))
 }
 
 export function validateNeedsYouEdit(
@@ -103,6 +116,31 @@ export function validateRuntimeAnswerReceipt(
     && persisted.reason === normalizedReason
     ? 'accepted'
     : 'stale'
+}
+
+export function validateOrdinaryAnswerResult(
+  reviewed: OrchestrationAuthorityDecisionRecord,
+  submission: OrchestrationAnswerSubmission,
+  result: OrchestrationDecisionAnswerResult,
+): boolean {
+  const persisted = result.decision
+  const answer = submission.answers[submission.decision_ids.indexOf(reviewed.id)]
+  if (!persisted || !answer || persisted.status !== 'answered' || !persisted.decided_at
+    || persisted.id !== reviewed.id || persisted.goal_id !== reviewed.goal_id
+    || persisted.run_id !== reviewed.run_id || persisted.source_process_run_id !== reviewed.source_process_run_id
+    || persisted.decision_key !== reviewed.decision_key || persisted.authority !== 'human'
+    || persisted.decided_by_user_id !== submission.actor_user_id || persisted.decided_by_agent_id != null
+    || persisted.selected_option !== answer.selected_option
+    || (persisted.contract_version ?? null) !== (reviewed.contract_version ?? null)
+    || !sameValue(persisted.options, reviewed.options)) return false
+  if (persisted.reason === answer.reason) return true
+  if (!reviewed.decision_key.startsWith('team_hierarchy:agent:') || !persisted.reason) return false
+  try {
+    const metadata = JSON.parse(persisted.reason)
+    return typeof metadata.created_agent_id === 'string'
+      && (metadata.reason ?? null) === (answer.reason ?? null)
+      && (answer.selected_option !== 'edit' || sameCanonicalValue(metadata.edited_agent, answer.edited_agent))
+  } catch { return false }
 }
 
 const DEFAULT_TITLES: Record<QueueRow['kind'], string> = {

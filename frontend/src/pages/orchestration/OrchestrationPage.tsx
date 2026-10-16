@@ -7,6 +7,8 @@ import { useAgents } from '@/api/agents'
 import { meetingKeys, useMeetingDecisions } from '@/api/meetings'
 import { ApiError, apiFetch } from '@/lib/api-client'
 import {
+  pauseOrchestrationControl,
+  fetchOrchestrationPauseControl,
   useApplyGoalTypeCorrection,
   useBaselineDashboard,
   useCreateOrchestrationGoal,
@@ -48,6 +50,7 @@ import type {
   OrchestrationGateOverrideDecision,
   OrchestrationGoalDetail,
   OrchestrationGoalType,
+  OrchestrationPauseReceipt,
   GoalTypeCorrectionPreview,
   Task,
 } from '@/lib/types'
@@ -1223,7 +1226,62 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
   const detailsTabsRef = useRef<DetailsTabsHandle>(null)
   const [activityStepType, setActivityStepType] = useState<OrchestrationBaselineProcessType | null>(null)
   const [pauseConfirming, setPauseConfirming] = useState(false)
+  type PauseRequest = { projectId: string; goalId: string; runId: string; expectedControlVersion: number; requestId: string }
+  const pauseRequestRef = useRef<PauseRequest | null>(null)
+  const pauseScopeRef = useRef('')
+  const pauseVersionRef = useRef(0)
+  pauseVersionRef.current = query.data?.run?.control_version ?? 0
+  const pauseFocusReturn = useRef(false)
+  const pauseRecheck = useRef<(() => void) | null>(null)
+  pauseScopeRef.current = `${projectId}:${goalId}:${query.data?.run?.id ?? ''}`
+  const pauseInFlight = useRef(false)
+  const [pauseControl, setPauseControl] = useState<{ request: PauseRequest; phase: 'requesting' | 'checking' | 'confirmed' | 'rejected'; receipt?: OrchestrationPauseReceipt; error?: string } | null>(null)
+  const pauseScope = `${projectId}:${goalId}:${query.data?.run?.id ?? ''}`
+  const scopedPause = pauseControl && pauseControl.request.projectId === projectId && pauseControl.request.goalId === goalId ? pauseControl : null
+  const pauseRunMatches = scopedPause?.request.runId === query.data?.run?.id
+  const pauseRequestBusy = scopedPause?.phase === 'requesting' || pauseInFlight.current
+  const pauseBusy = pauseRequestBusy || mutationOwner === 'reset' || reset.isPending
+  const pauseMessage = !scopedPause ? '' : scopedPause.phase === 'requesting' ? 'Requesting pause…'
+    : scopedPause.phase === 'checking' ? 'Checking pause request…'
+      : scopedPause.phase === 'rejected' ? scopedPause.error ?? 'Pause was rejected. Review the current run and try again.'
+      : !pauseRunMatches && scopedPause.receipt ? 'Pause was accepted for an earlier run.'
+      : scopedPause.receipt?.state === 'resumed' ? 'Pause was accepted. Work has since resumed.'
+        : scopedPause.receipt?.state === 'superseded' ? 'Pause was accepted for an earlier run.'
+          : 'Pause accepted. Existing work may finish.'
+
   const { announceQueue, announceError } = useGoalAnnouncer()
+  useEffect(() => { if (pauseMessage) announceQueue(pauseMessage) }, [pauseMessage, announceQueue])
+  useEffect(() => {
+    if (pauseBusy || !pauseFocusReturn.current) return
+    pauseFocusReturn.current = false
+    const active = document.activeElement
+    if (active !== goalHeader.current && active !== document.body) return
+    const replacement = lifecycleButton.current
+    if (replacement && !replacement.disabled) replacement.focus()
+    else goalHeader.current?.focus()
+  }, [pauseBusy, scopedPause?.phase])
+
+  useEffect(() => {
+    const request = pauseRequestRef.current
+    if (request && `${request.projectId}:${request.goalId}:${request.runId}` !== pauseScope) {
+      const sameGoal = request.projectId === projectId && request.goalId === goalId
+      pauseRequestRef.current = null
+      pauseInFlight.current = false
+      pauseFocusReturn.current = false
+      setPauseControl((current) => sameGoal && current?.receipt ? current : null)
+      setPauseConfirming(false)
+    }
+  }, [pauseScope, projectId, goalId])
+  useEffect(() => {
+    const control = scopedPause
+    if (control?.phase !== 'confirmed' || !pauseRunMatches || !control.receipt
+        || pauseVersionRef.current <= control.receipt.current_control_version) return
+    // A newer authoritative version changes the current meaning of this accepted history.
+    // Reconcile the original request; never issue another Pause or touch baseline ownership.
+    setPauseControl({ request: control.request, phase: 'checking' })
+    pauseRecheck.current?.()
+  }, [pauseScope, query.data?.run?.control_version, scopedPause, pauseRunMatches])
+
 
   // Override-owned messages announce from GatesPanel itself (it owns the
   // per-gate text); every other header message announces here.
@@ -1265,7 +1323,9 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
   const gateOverrideBusy = (_gateId: string) => globalBusy
   const baselineBusy = globalBusy
 
-  const lifecycleCommand = query.data?.goal.status === 'paused'
+  const pauseIsCurrent = pauseRunMatches && scopedPause?.phase === 'confirmed' && scopedPause.receipt?.state === 'applied'
+    && (query.data?.run?.control_version ?? 0) <= scopedPause.receipt.current_control_version
+  const lifecycleCommand = pauseIsCurrent || query.data?.goal.status === 'paused'
     ? 'resume'
     : query.data?.goal.status === 'active' || query.data?.goal.status === 'blocked'
       ? 'pause'
@@ -1372,11 +1432,70 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
     setMutationOwner(null)
   }
 
+  function validPauseReceipt(receipt: OrchestrationPauseReceipt | null, request: PauseRequest) {
+    return receipt != null && typeof receipt === 'object' && receipt.project_id === request.projectId && receipt.goal_id === request.goalId
+      && receipt.run_id === request.runId && receipt.request_id === request.requestId
+      && receipt.accepted_control_version === request.expectedControlVersion + 1
+      && receipt.current_control_version >= receipt.accepted_control_version
+      && receipt.current_control_version >= pauseVersionRef.current
+      && (receipt.state === 'resumed' || receipt.state === 'superseded'
+        || receipt.current_control_version === receipt.accepted_control_version)
+      && (receipt.state !== 'applied' || receipt.goal_status === 'paused' && receipt.run_status === 'paused')
+  }
+
+  async function requestPause(recheck = false) {
+    if (pauseInFlight.current || mutationOwnerRef.current === 'reset' || reset.isPending) return
+    const currentRun = query.data?.run
+    if (!currentRun) return
+    const request = recheck ? pauseRequestRef.current : {
+      projectId, goalId, runId: currentRun.id, expectedControlVersion: currentRun.control_version ?? 0,
+      requestId: crypto.randomUUID(),
+    }
+    if (!request || `${request.projectId}:${request.goalId}:${request.runId}` !== pauseScopeRef.current) return
+    pauseRequestRef.current = request
+    pauseInFlight.current = true
+    const isCurrent = () => pauseRequestRef.current === request
+      && `${request.projectId}:${request.goalId}:${request.runId}` === pauseScopeRef.current
+    setPauseControl({ request, phase: recheck ? 'checking' : 'requesting' })
+    try {
+      let receipt: OrchestrationPauseReceipt | null = null
+      if (!recheck) {
+        try { receipt = await pauseOrchestrationControl(projectId, goalId, request) } catch (error) {
+          if (isCurrent() && error instanceof ApiError && [400, 401, 403, 404, 409, 422].includes(error.status)) {
+            setPauseControl({ request, phase: 'rejected', error: errorText(error) })
+            void Promise.resolve(query.refetch()).catch(() => undefined)
+            return
+          }
+          // Transport/projection failures cannot prove whether acceptance committed.
+        }
+      }
+      if (!isCurrent()) return
+      if (!validPauseReceipt(receipt, request)) {
+        setPauseControl({ request, phase: 'checking' })
+        try { receipt = await fetchOrchestrationPauseControl(projectId, goalId, request.requestId) } catch { receipt = null }
+      }
+      if (!isCurrent()) return
+      setPauseControl(validPauseReceipt(receipt, request)
+        ? { request, phase: 'confirmed', receipt: receipt! }
+        : { request, phase: 'checking' })
+      if (receipt && validPauseReceipt(receipt, request)) void Promise.resolve(query.refetch()).catch(() => undefined)
+    } finally {
+      if (isCurrent()) {
+        pauseInFlight.current = false
+        // A separate lane never consumes the baseline owner or generation.
+        setPauseControl((current) => current ? { ...current } : current)
+      }
+    }
+  }
+
+  pauseRecheck.current = () => { void requestPause(true) }
+
   function runCommand(nextCommand: 'pause' | 'resume') {
+    if (nextCommand === 'pause') { void requestPause(); return }
     const owner: MutationOwner = `lifecycle:${nextCommand}`
     if (!acquireMutation(owner)) return
     setCommandError(null)
-    setMessage(nextCommand === 'pause' ? 'Pausing goal…' : 'Resuming goal…')
+    setMessage('Resuming goal…')
     setLastMessageOwner(owner)
     lifecycleFocusIntent.current = true
     command.mutate({ goalId, command: nextCommand }, {
@@ -1610,12 +1729,14 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
 
         </div>
         <div className="mt-2 min-h-5 text-xs text-huddleroom-text-secondary">{lastMessageOwner?.startsWith('override:') ? '' : message}</div>
+        {pauseMessage && <p className="mt-2 text-sm text-huddleroom-text-secondary">{pauseMessage}</p>}
+        {scopedPause?.phase === 'checking' && <Button size="sm" variant="secondary" className="mt-2 min-h-11" disabled={pauseBusy} onClick={() => { void requestPause(true) }}>Check pause request</Button>}
         {commandError && <p className="text-xs text-huddleroom-status-red">{commandError}</p>}
       </header>
 
       {!terminal && (
         <div className="mt-3 flex items-center justify-between">
-          <div aria-busy={lifecycleBusy} className="flex flex-wrap items-center gap-2">
+          <div aria-busy={lifecycleCommand === 'pause' ? pauseBusy : lifecycleBusy} className="flex flex-wrap items-center gap-2">
             {lifecycleCommand && (
               lifecycleCommand === 'pause' && pauseConfirming ? (
                 <div className="flex flex-wrap items-center gap-2">
@@ -1624,12 +1745,24 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                     size="sm"
                     variant="secondary"
                     className="min-h-11"
-                    disabled={lifecycleBusy}
-                    onClick={() => { setPauseConfirming(false); runCommand(lifecycleCommand) }}
+                    disabled={pauseBusy || scopedPause?.phase === 'checking'}
+                    onClick={(event) => {
+                      const restoreFocus = document.activeElement === event.currentTarget
+                      pauseFocusReturn.current = restoreFocus
+                      const scope = pauseScopeRef.current
+                      setPauseConfirming(false)
+                      runCommand(lifecycleCommand)
+                      if (restoreFocus) queueMicrotask(() => {
+                        if (scope !== pauseScopeRef.current) return
+                        const next = lifecycleButton.current
+                        if (next && !next.disabled) next.focus()
+                        else goalHeader.current?.focus()
+                      })
+                    }}
                   >
-                    {mutationOwner === 'lifecycle:pause' ? 'Pausing…' : 'Confirm pause'}
+                    {pauseRequestBusy ? 'Requesting pause…' : 'Confirm pause'}
                   </Button>
-                  <Button size="sm" variant="ghost" className="min-h-11" disabled={lifecycleBusy} onClick={() => setPauseConfirming(false)}>
+                  <Button size="sm" variant="ghost" className="min-h-11" disabled={pauseBusy} onClick={() => { setPauseConfirming(false); queueMicrotask(() => lifecycleButton.current?.focus()) }}>
                     Cancel
                   </Button>
                 </div>
@@ -1639,11 +1772,11 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                   size="sm"
                   variant="secondary"
                   className="min-h-11"
-                  disabled={lifecycleBusy}
+                  disabled={lifecycleCommand === 'pause' ? pauseBusy || scopedPause?.phase === 'checking' : lifecycleBusy}
                   onClick={() => (lifecycleCommand === 'pause' ? setPauseConfirming(true) : runCommand(lifecycleCommand))}
                 >
-                  {mutationOwner === 'lifecycle:pause'
-                    ? 'Pausing…'
+                  {pauseRequestBusy
+                    ? 'Requesting pause…'
                     : mutationOwner === 'lifecycle:resume'
                       ? 'Resuming…'
                       : lifecycleCommand === 'pause' ? 'Pause goal' : 'Resume goal'}

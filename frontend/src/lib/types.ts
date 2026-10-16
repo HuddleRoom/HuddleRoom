@@ -469,6 +469,7 @@ export interface OrchestrationBlocker extends Record<string, unknown> {
 }
 
 export interface OrchestrationGoal {
+  control_version?: number
   id: string
   project_id: string
   objective: string
@@ -708,6 +709,7 @@ export interface ProjectAdvisorHistory {
 }
 
 export interface OrchestrationRun {
+  control_version?: number
   id: string
   goal_id: string
   status: OrchestrationRunStatus
@@ -957,6 +959,43 @@ export interface OrchestrationAuthorityDecisionRecord {
 export interface OrchestrationDecisionAnswerResult {
   decision: OrchestrationAuthorityDecisionRecord
   process?: OrchestrationProcessRunRecord | null
+  continuation_applied?: boolean
+  answer_receipt?: OrchestrationAnswerReceipt | null
+}
+
+export interface OrchestrationAnswerSubmission {
+  kind: 'single' | 'batch'
+  actor_user_id: string
+  decision_ids: string[]
+  source_process_run_id: string | null
+  run_id: string | null
+  answers: Record<string, unknown>[]
+  contracts: Record<string, unknown>[]
+}
+
+export interface OrchestrationAnswerReceipt {
+  action_id: string | null
+  decision_ids: string[]
+  actor_user_id: string
+  source_process_run_id: string | null
+  run_id: string | null
+  submission: OrchestrationAnswerSubmission
+  contracts: Record<string, unknown>[]
+  application_state: string
+  reason: string | null
+}
+
+export interface OrchestrationPauseReceipt {
+  project_id: string
+  goal_id: string
+  run_id: string
+  request_id: string
+  accepted_at: string
+  accepted_control_version: number
+  current_control_version: number
+  state: 'accepted' | 'applied' | 'resumed' | 'superseded'
+  goal_status: string
+  run_status: string
 }
 
 export interface OrchestrationCheckpoint {

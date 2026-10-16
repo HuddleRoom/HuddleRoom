@@ -1,4 +1,6 @@
+import { env as fixtureEnvironment } from 'node:process'
 import React from 'react'
+import { ApiError } from '@/lib/api-client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
@@ -12,6 +14,11 @@ const state = vi.hoisted(() => ({
   detail: undefined as OrchestrationGoalDetail | undefined,
   detailError: false,
   detailFetching: false,
+  pauseControl: vi.fn(),
+  pauseReadback: vi.fn(),
+  detailRefetch: vi.fn().mockResolvedValue({}),
+  finishBaseline: null as null | (() => void),
+  capturedGeneration: null as number | null,
   realQueueForwarding: false,
   queueDecisions: [] as import('@/lib/types').OrchestrationAuthorityDecisionRecord[],
   detailErrorObj: null as unknown,
@@ -77,7 +84,10 @@ vi.mock('@/stores/ui', () => ({
     selector({ activeProjectId: state.activeProjectId }),
 }))
 
-vi.mock('@/api/orchestration', () => ({
+vi.mock('@/api/orchestration', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/api/orchestration')>(),
+  pauseOrchestrationControl: (...args: unknown[]) => state.pauseControl(...args),
+  fetchOrchestrationPauseControl: (...args: unknown[]) => state.pauseReadback(...args),
   useCreateOrchestrationGoal: () => state.createMutation,
   useOrchestrationGoals: () => ({
     data: { pages: [{ items: state.goals, next_cursor: null }] },
@@ -93,7 +103,7 @@ vi.mock('@/api/orchestration', () => ({
     isLoading: false,
     isError: state.detailError,
     error: state.detailErrorObj,
-    refetch: vi.fn(),
+    refetch: state.detailRefetch,
     dataUpdatedAt: state.dataUpdatedAt,
     isFetching: state.detailFetching,
   }),
@@ -177,8 +187,8 @@ vi.mock('./BaselineDashboard', () => ({
   decisionOptionKey: (option: unknown) => typeof option === 'string' ? option : '',
   normalizeDecisionOption: (option: unknown) => ({ key: typeof option === 'string' ? option : '', label: typeof option === 'string' ? option : '' }),
   parseManagerComparison: () => null,
-  BaselineDashboard: ({ goalId, run, acquireMutation, onRevealSource, onSelectedProcessTypeChange, onViewActivity, suppressQueueAnnouncement, queueAnnouncementScope }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean; onRevealSource?: (target: { kind: 'gate' | 'process' | 'action'; id: string; goalId: string }) => void; onSelectedProcessTypeChange?: (type: 'team_hierarchy') => void; onViewActivity?: () => void; suppressQueueAnnouncement?: boolean; queueAnnouncementScope?: 'all' | 'human' | 'none' }) => (
-    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => acquireMutation("baseline:run:goal_definition")}>Mock run</button><button onClick={() => acquireMutation("baseline:answer:decision-1")}>Mock answer</button><button onClick={() => onRevealSource?.({ kind: 'gate', id: 'gate-1', goalId })}>Reveal source gate</button><button onClick={() => onRevealSource?.({ kind: 'process', id: 'process-old', goalId })}>Reveal superseded process</button><button onClick={() => { onSelectedProcessTypeChange?.('team_hierarchy'); onViewActivity?.() }}>View current step activity</button>{state.realQueueForwarding && state.detail && <RealQueue
+  BaselineDashboard: ({ goalId, run, acquireMutation, releaseMutation, getMutationGeneration, onRevealSource, onSelectedProcessTypeChange, onViewActivity, suppressQueueAnnouncement, queueAnnouncementScope }: { goalId: string; run: { id: string } | null; acquireMutation: (owner: string) => boolean; releaseMutation: (owner: string) => void; getMutationGeneration: () => number; onRevealSource?: (target: { kind: 'gate' | 'process' | 'action'; id: string; goalId: string }) => void; onSelectedProcessTypeChange?: (type: 'team_hierarchy') => void; onViewActivity?: () => void; suppressQueueAnnouncement?: boolean; queueAnnouncementScope?: 'all' | 'human' | 'none' }) => (
+    <div data-testid="baseline-dashboard" data-goal-id={goalId} data-run-id={run?.id ?? 'none'}><button onClick={() => { const owner = "baseline:run:goal_definition"; if (acquireMutation(owner)) { const generation = getMutationGeneration(); state.capturedGeneration = generation; state.finishBaseline = () => { if (getMutationGeneration() === generation) releaseMutation(owner) } } }}>Mock run</button><button onClick={() => { const owner = "baseline:answer:decision-1"; if (acquireMutation(owner)) { const generation = getMutationGeneration(); state.capturedGeneration = generation; state.finishBaseline = () => { if (getMutationGeneration() === generation) releaseMutation(owner) } } }}>Mock answer</button><button onClick={() => state.finishBaseline?.()}>Finish deferred baseline</button><button onClick={() => onRevealSource?.({ kind: 'gate', id: 'gate-1', goalId })}>Reveal source gate</button><button onClick={() => onRevealSource?.({ kind: 'process', id: 'process-old', goalId })}>Reveal superseded process</button><button onClick={() => { onSelectedProcessTypeChange?.('team_hierarchy'); onViewActivity?.() }}>View current step activity</button>{state.realQueueForwarding && state.detail && <RealQueue
       goal={state.detail.goal} run={state.detail.run} gates={[]} processes={[]} warnings={[]}
       checkpointItems={state.queueDecisions} allDecisions={state.queueDecisions} authorityReady checkpointLoaded
       queriesErrored={false} queriesUnready={false} deferredCount={0} isWorking={false} mutationBusy={false}
@@ -346,6 +356,11 @@ beforeEach(() => {
   state.detail = undefined
   state.detailError = false
   state.detailFetching = false
+  state.pauseControl.mockReset().mockRejectedValue(new Error('No fixture response supplied'))
+  state.pauseReadback.mockReset().mockResolvedValue(null)
+  state.detailRefetch.mockReset().mockResolvedValue({})
+  state.finishBaseline = null
+  state.capturedGeneration = null
   state.realQueueForwarding = false
   state.queueDecisions = []
   state.detailErrorObj = null
@@ -949,7 +964,7 @@ describe('OrchestrationPage', () => {
       }
     })
 
-    it('clicking Confirm pause calls the command mutation with pause', async () => {
+    it('clicking Confirm pause calls the lightweight frozen control API', async () => {
       state.activeProjectId = 'project-1'
       state.goalId = 'goal-1'
       state.detail = richDetail
@@ -960,10 +975,11 @@ describe('OrchestrationPage', () => {
         await React.act(async () => getButton(view.container, 'Pause goal').click())
         await React.act(async () => getButton(view.container, 'Confirm pause').click())
 
-        expect(state.commandMutation.mutate).toHaveBeenCalledTimes(1)
-        expect(state.commandMutation.mutate).toHaveBeenCalledWith(
-          { goalId: 'goal-1', command: 'pause' }, expect.any(Object),
-        )
+        expect(state.commandMutation.mutate).not.toHaveBeenCalled()
+        expect(state.pauseControl).toHaveBeenCalledOnce()
+        expect(state.pauseControl).toHaveBeenCalledWith('project-1', 'goal-1', expect.objectContaining({
+          runId: richDetail.run!.id, expectedControlVersion: richDetail.run!.control_version ?? 0, requestId: expect.any(String),
+        }))
       } finally {
         view.cleanup()
       }
@@ -1647,5 +1663,214 @@ it('SPR188 ordinary page delivers a simultaneous human question and material eve
     const once = live.textContent
     await view.rerender(() => <OrchestrationPage />)
     expect(live.textContent).toBe(once)
+  } finally { view.cleanup() }
+})
+
+describe('SPR230 independent Pause ownership', () => {
+  it.each(['Mock run', 'Mock answer'])('keeps Pause usable while %s remains deferred', async (pendingOperation) => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = richDetail
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, pendingOperation).click())
+      const pause = getButton(view.container, 'Pause goal')
+      expect(pause.getAttribute('disabled')).toBeNull()
+      await React.act(async () => pause.click())
+      expect(getButton(view.container, 'Confirm pause').getAttribute('disabled')).toBeNull()
+    } finally { view.cleanup() }
+  })
+})
+
+function spr230PauseReceipt(input: { runId: string; expectedControlVersion: number; requestId: string }, extra = {}) {
+  return { project_id: 'project-1', goal_id: 'goal-1', run_id: input.runId, request_id: input.requestId,
+    accepted_at: '2026-10-16T12:00:00Z', accepted_control_version: input.expectedControlVersion + 1,
+    current_control_version: input.expectedControlVersion + 1, state: 'accepted', goal_status: 'paused', run_status: 'paused', ...extra }
+}
+
+describe('SPR230 scoped Pause reconciliation', () => {
+  it.each(['Mock run', 'Mock answer'])('retains deferred %s callback ownership while Pause settles independently', async (operation) => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    let resolvePause: (() => void) | undefined
+    state.pauseControl.mockImplementation((_p, _g, input) => new Promise((resolve) => { resolvePause = () => resolve(spr230PauseReceipt(input)) }))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, operation).click())
+      const originalGeneration = state.capturedGeneration!
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      expect(textOf(view.container)).toContain('Requesting pause')
+      await exportG1OfflineFixture('pause-requesting', view.container)
+      expect(state.commandMutation.mutate).not.toHaveBeenCalled()
+      await React.act(async () => resolvePause?.())
+      expect(textOf(view.container)).toContain('Pause accepted')
+      await exportG1OfflineFixture('pause-accepted', view.container)
+      const live = descendants(view.container).find((node) => node.getAttribute('role') === 'status' && textOf(node).includes('Pause accepted'))
+      expect(live?.getAttribute('aria-live')).toBe('polite')
+      expect(descendants(view.container).filter((node) => node.getAttribute('role') === 'status' && node.getAttribute('aria-live') === 'polite' && textOf(node).includes('Pause accepted'))).toHaveLength(1)
+      await React.act(async () => getButton(view.container, 'Finish deferred baseline').click())
+      await React.act(async () => getButton(view.container, operation).click())
+      expect(state.capturedGeneration).toBe(originalGeneration + 1)
+      expect(textOf(view.container)).toContain('Pause accepted')
+    } finally { view.cleanup() }
+  })
+
+  it.each([false, true])('reconciles uncertain POST using the frozen request and retains Checking after unavailable=%s', async (unavailable) => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    let input: Parameters<typeof spr230PauseReceipt>[0]
+    state.pauseControl.mockImplementation((_p, _g, request) => { input = request; return Promise.reject(new Error('response lost')) })
+    state.pauseReadback.mockImplementation(() => unavailable ? Promise.reject(new Error('readback unavailable')) : Promise.resolve(spr230PauseReceipt(input)))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => { getButton(view.container, 'Confirm pause').click(); await Promise.resolve() })
+      expect(state.pauseReadback).toHaveBeenCalledWith('project-1', 'goal-1', input!.requestId)
+      expect(state.pauseControl).toHaveBeenCalledOnce()
+      if (unavailable) {
+        expect(textOf(view.container)).toContain('Checking pause request')
+        await exportG1OfflineFixture('pause-checking', view.container)
+        expect(textOf(view.container)).not.toContain('Pause accepted')
+        state.pauseReadback.mockResolvedValue(spr230PauseReceipt(input!))
+        await React.act(async () => getButton(view.container, 'Check pause request').click())
+        expect(state.pauseControl).toHaveBeenCalledOnce()
+        expect(state.pauseReadback).toHaveBeenLastCalledWith('project-1', 'goal-1', input!.requestId)
+      }
+      expect(textOf(view.container)).toContain('Pause accepted')
+    } finally { view.cleanup() }
+  })
+
+  it('ignores old-goal Pause completion after navigation', async () => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    let resolvePause: (() => void) | undefined
+    state.pauseControl.mockImplementation((_p, _g, input) => new Promise((resolve) => { resolvePause = () => resolve(spr230PauseReceipt(input)) }))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      state.goalId = 'goal-2'
+      state.detail = { ...richDetail, goal: { ...richDetail.goal, id: 'goal-2' }, run: { ...richDetail.run!, id: 'run-2', goal_id: 'goal-2' } }
+      await view.rerender(() => <OrchestrationPage />)
+      await React.act(async () => resolvePause?.())
+      expect(textOf(view.container)).not.toContain('Pause accepted')
+      expect(getButton(view.container, 'Pause goal').getAttribute('disabled')).toBeNull()
+    } finally { view.cleanup() }
+  })
+})
+
+describe('SPR230 historical and stale Pause outcomes', () => {
+  it.each(['resumed', 'superseded'])('shows historical %s acceptance without claiming the current goal is paused', async (history) => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    state.pauseControl.mockImplementation((_p, _g, input) => Promise.resolve(spr230PauseReceipt(input, {
+      state: history, current_control_version: input.expectedControlVersion + 2, goal_status: 'active', run_status: 'running',
+    })))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      expect(textOf(view.container)).toContain(history === 'resumed' ? 'Work has since resumed' : 'earlier run')
+      expect(textOf(view.container)).not.toContain('Existing work may finish')
+      expect(state.commandMutation.mutate).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('does not confirm a stale applied receipt after a newer control version is observed', async () => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    let complete: (() => void) | undefined
+    state.pauseControl.mockImplementation((_p, _g, input) => new Promise((resolve) => { complete = () => resolve(spr230PauseReceipt(input, { state: 'applied' })) }))
+    state.pauseReadback.mockRejectedValue(new Error('newer outcome unavailable'))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      state.detail = { ...richDetail, run: { ...richDetail.run!, control_version: 2, status: 'running' } }
+      await view.rerender(() => <OrchestrationPage />)
+      await React.act(async () => complete?.())
+      expect(textOf(view.container)).not.toContain('Pause accepted. Existing work may finish.')
+      expect(textOf(view.container)).toContain('Checking pause request')
+    } finally { view.cleanup() }
+  })
+
+  it('returns keyboard focus from disappearing Confirm pause to its current control', async () => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    let complete: (() => void) | undefined
+    state.pauseControl.mockImplementation((_p, _g, input) => new Promise((resolve) => { complete = () => resolve(spr230PauseReceipt(input)) }))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      const pause = getButton(view.container, 'Pause goal')
+      expect(pause.getAttribute('class')).toContain('min-h-11')
+      await React.act(async () => pause.click())
+      const confirm = getButton(view.container, 'Confirm pause')
+      confirm.focus()
+      await React.act(async () => confirm.click())
+      await React.act(async () => complete?.())
+      expect(view.document.activeElement === getButton(view.container, 'Pause goal')).toBe(true)
+    } finally { view.cleanup() }
+  })
+})
+
+describe('SPR230 definitive Pause rejection', () => {
+  it.each([400, 409])('shows authoritative %s rejection and permits a fresh reviewed request', async (status) => {
+    state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+    state.pauseControl.mockRejectedValue(new ApiError(status, 'Reviewed run is stale.', { message: 'Reviewed run is stale.' }))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      expect(textOf(view.container)).toContain('Reviewed run is stale.')
+      expect(textOf(view.container)).not.toContain('Checking pause request')
+      expect(state.pauseReadback).not.toHaveBeenCalled()
+      const firstRequest = state.pauseControl.mock.calls[0][2].requestId
+      expect(getButton(view.container, 'Pause goal').disabled).toBe(false)
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      expect(state.pauseControl.mock.calls[1][2].requestId).not.toBe(firstRequest)
+    } finally { view.cleanup() }
+  })
+})
+
+
+async function exportG1OfflineFixture(name: string, root: import('../../../tests/support/dom').TestNode) {
+  const directory = fixtureEnvironment.G1_UI_FIXTURE_DIR
+  if (!directory) return
+  const escape = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;')
+  const serialize = (node: import('../../../tests/support/dom').TestNode): string => {
+    if (node.nodeType === 3) return escape(node.textContent ?? '')
+    const element = node as import('../../../tests/support/dom').TestElement
+    if (!element.tagName) return node.childNodes.map(serialize).join('')
+    const attrs = [...element.attributes].map(([key, value]) => ` ${key}="${escape(value)}"`).join('')
+    const value = element.tagName === 'TEXTAREA' ? escape(element.value) : node.childNodes.map(serialize).join('')
+    return `<${element.tagName.toLowerCase()}${attrs}>${value}</${element.tagName.toLowerCase()}>`
+  }
+  const { mkdir, writeFile } = await import('node:fs/promises')
+  await mkdir(directory, { recursive: true })
+  await writeFile(`${directory}/${name}.html`, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="g1-ux.css"><title>G1 isolated fixture ${name}</title></head><body><main class="mx-auto max-w-5xl p-3">${serialize(root)}</main></body></html>`)
+}
+
+
+it('SPR230 reconciles already rendered Pause acceptance after authoritative Resume advances version', async () => {
+  state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = richDetail
+  let input: Parameters<typeof spr230PauseReceipt>[0]
+  state.pauseControl.mockImplementation((_p, _g, submitted) => { input = submitted; return Promise.resolve(spr230PauseReceipt(submitted)) })
+  state.pauseReadback.mockImplementation(() => Promise.resolve(spr230PauseReceipt(input!, { state: 'resumed', current_control_version: 2, goal_status: 'active', run_status: 'running' })))
+  const { OrchestrationPage } = await import('./OrchestrationPage')
+  const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+  try {
+    await React.act(async () => getButton(view.container, 'Pause goal').click())
+    await React.act(async () => getButton(view.container, 'Confirm pause').click())
+    expect(textOf(view.container)).toContain('Pause accepted. Existing work may finish.')
+    state.detail = { ...richDetail, goal: { ...richDetail.goal, status: 'active' }, run: { ...richDetail.run!, control_version: 2, status: 'running' } }
+    await view.rerender(() => <OrchestrationPage />)
+    expect(textOf(view.container)).not.toContain('Pause accepted. Existing work may finish.')
+    expect(textOf(view.container)).toContain('Work has since resumed')
+    expect(state.pauseControl).toHaveBeenCalledOnce()
+    expect(state.pauseReadback).toHaveBeenCalledWith('project-1', 'goal-1', input!.requestId)
   } finally { view.cleanup() }
 })

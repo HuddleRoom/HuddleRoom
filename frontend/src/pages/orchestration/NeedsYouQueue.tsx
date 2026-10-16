@@ -1226,9 +1226,9 @@ export function NeedsYouQueue({
           const managerComparison = isManagerSelectionDecision(row.decision.decision_key) ? parseManagerComparison(row.decision.context) : null
           if (managerComparison) {
             below = <dl className="mt-2 grid gap-1 rounded border border-huddleroom-border p-2 text-xs text-huddleroom-text-secondary"><div><dt className="inline font-medium text-huddleroom-text-muted">Deterministic: </dt><dd className="inline">{safeNeedsYouText(managerComparison.deterministic, presentation.references)}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">LLM: </dt><dd className="inline">{safeNeedsYouText(managerComparison.llm, presentation.references)}</dd></div><div><dt className="inline font-medium text-huddleroom-text-muted">Rationale: </dt><dd className="inline">{safeNeedsYouText(managerComparison.rationale, presentation.references)}</dd></div></dl>
-            action = <div className="flex shrink-0 items-center gap-2"><Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => onAcceptDecision(row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>Accept: {safeNeedsYouText(recommendationLabel(row.decision), presentation.references)}</Button><Button ref={(element) => onActionTrigger(focusAction, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => { beginEdit(row); onOpenAction(focusAction) }}>Choose differently…</Button></div>
+            action = <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2"><Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => onAcceptDecision(row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>Accept: {safeNeedsYouText(recommendationLabel(row.decision), presentation.references)}</Button><Button ref={(element) => onActionTrigger(focusAction, element)} type="button" variant="secondary" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => { beginEdit(row); onOpenAction(focusAction) }}>Choose differently…</Button></div>
           } else if (row.decision.recommendation !== null) {
-            action = <div className="flex shrink-0 items-center gap-2">
+            action = <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
               <Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy || editBlocked} onClick={() => onAcceptDecision(row.decision, () => { releaseEdit(); markResolved(row.key); successToast('Answer received.'); focusNextRow(row.key) })}>
                 Accept: {safeNeedsYouText(recommendationLabel(row.decision), presentation.references)}
               </Button>
@@ -1261,7 +1261,7 @@ export function NeedsYouQueue({
         } else if (staleInputsProcessType(row.warning.warning_type)) {
           const processType = staleInputsProcessType(row.warning.warning_type)!
           tag = <OwningStepTag process={row.process} onSelectProcess={onSelectProcess} />
-          action = <div className="flex shrink-0 items-center gap-2">
+          action = <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
             <Button ref={(element) => registerRowRef(row.key, element)} type="button" className="min-h-11" disabled={mutationBusy} onClick={() => onApproveStaleInputs(row.warning, processType, () => { markResolved(row.key); focusNextRow(row.key) })}>Approve</Button>
             <Button type="button" variant="secondary" className="min-h-11" disabled={mutationBusy} onClick={() => onDismissStaleInputs(row.warning, () => { markResolved(row.key); focusNextRow(row.key) })}>Dismiss</Button>
           </div>
@@ -1296,7 +1296,7 @@ export function NeedsYouQueue({
                 {tag && <div className="mt-0.5">{tag}</div>}
               </div>
             </div>
-            {action && <div className="flex shrink-0 items-center">{action}</div>}
+            {action && <div className="flex min-w-0 max-w-full items-center sm:shrink-0">{action}</div>}
           </div>
           {below}
           {reviewStatus}

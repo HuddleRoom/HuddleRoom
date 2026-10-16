@@ -26,6 +26,9 @@ import type {
   OrchestrationWarningRecord,
   OrchestrationAuthorityDecisionRecord,
   OrchestrationDecisionAnswerResult,
+  OrchestrationAnswerSubmission,
+  OrchestrationAnswerReceipt,
+  OrchestrationPauseReceipt,
   OrchestrationCheckpoint,
   OrchestrationConversationHistory,
   OrchestrationConversationFeedback,
@@ -53,7 +56,99 @@ export interface AgentDefinitionReviewBatchAnswerInput {
 
 export interface AgentDefinitionReviewBatchAnswerResult {
   decisions: OrchestrationAuthorityDecisionRecord[]
-  process: OrchestrationProcessRunRecord
+  process?: OrchestrationProcessRunRecord | null
+  answer_receipt?: OrchestrationAnswerReceipt | null
+}
+
+export interface OrchestrationAnswerInput extends AgentDefinitionReviewBatchAnswerInput {
+  editedAgent?: AgentCreatePayload
+  contractVersion?: string | null
+}
+
+// Match Python json.dumps used for the persisted batch-edit reason, including non-ASCII escapes.
+function batchEditReason(description: string, persona: string) {
+  const strip = (value: string) => value.replace(
+    /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, '',
+  )
+  const quote = (value: string) => JSON.stringify(strip(value)).replace(/[\u007f-\uffff]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)
+  return `{"description": ${quote(description)}, "persona": ${quote(persona)}}`
+}
+
+export function createOrchestrationAnswerSubmission(
+  decisions: readonly OrchestrationAuthorityDecisionRecord[],
+  actorUserId: string,
+  answers: readonly OrchestrationAnswerInput[],
+  kind: 'single' | 'batch' = 'single',
+  runId?: string | null,
+): OrchestrationAnswerSubmission {
+  return {
+    kind,
+    actor_user_id: actorUserId,
+    decision_ids: decisions.map((decision) => decision.id),
+    source_process_run_id: decisions[0]?.source_process_run_id ?? null,
+    run_id: runId === undefined ? decisions[0]?.run_id ?? null : runId,
+    answers: answers.map((answer) => ({
+      decision_id: answer.decisionId,
+      selected_option: answer.selectedOption,
+      reason: kind === 'batch' && answer.selectedOption === 'edit'
+        ? batchEditReason(answer.editedDescription ?? '', answer.editedPersona ?? '')
+        : answer.reason.trim() || null,
+      ...(kind === 'single' ? {
+        contract_version: answer.contractVersion ?? null,
+        edited_agent: answer.editedAgent ? {
+          ...answer.editedAgent,
+          description: answer.editedAgent.description ?? null,
+          system_prompt: answer.editedAgent.system_prompt ?? null,
+          adapter_type: answer.editedAgent.adapter_type ?? 'api',
+          cli_runtime: answer.editedAgent.cli_runtime ?? null,
+          capabilities: answer.editedAgent.capabilities ?? [],
+          config: answer.editedAgent.config ?? {},
+        } : null,
+      } : {}),
+    })),
+    contracts: decisions.map((decision) => ({
+      id: decision.id, key: decision.decision_key, options: decision.options,
+      authority: decision.authority, authority_agent_id: decision.authority_agent_id ?? '',
+      source_process_run_id: decision.source_process_run_id ?? '', run_id: decision.run_id ?? '',
+      contract_version: decision.contract_version ?? null,
+    })),
+  }
+}
+
+function sameCanonicalValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => sameCanonicalValue(value, right[index]))
+  }
+  if (left && right && typeof left === 'object' && typeof right === 'object'
+      && !Array.isArray(left) && !Array.isArray(right)) {
+    const a = left as Record<string, unknown>
+    const b = right as Record<string, unknown>
+    return Object.keys(a).length === Object.keys(b).length
+      && Object.keys(a).every((key) => Object.prototype.hasOwnProperty.call(b, key) && sameCanonicalValue(a[key], b[key]))
+  }
+  return false
+}
+
+export function validateSavedAnswerReceipt(
+  receipt: OrchestrationAnswerReceipt | null | undefined,
+  expected: OrchestrationAnswerSubmission,
+): boolean {
+  if (!receipt || !expected.actor_user_id || !expected.decision_ids.length
+      || expected.answers.length !== expected.decision_ids.length
+      || expected.contracts.length !== expected.decision_ids.length
+      || (expected.kind === 'single' && expected.decision_ids.length !== 1)
+      || expected.answers.some((answer, index) => answer.decision_id !== expected.decision_ids[index])
+      || !sameCanonicalValue(receipt.submission, expected)
+      || !sameCanonicalValue(receipt.decision_ids, expected.decision_ids)
+      || !sameCanonicalValue(receipt.contracts, expected.contracts)
+      || receipt.actor_user_id !== expected.actor_user_id
+      || receipt.source_process_run_id !== expected.source_process_run_id
+      || receipt.run_id !== expected.run_id) return false
+  if (expected.run_id) return !!receipt.action_id
+  return receipt.action_id === null && expected.kind === 'single'
+    && expected.source_process_run_id === null && receipt.application_state === 'applied'
 }
 
 const root = (projectId: string) =>
@@ -186,6 +281,25 @@ export function fetchOrchestrationWarnings(projectId: string, goalId: string) {
 
 export function fetchOrchestrationDecisions(projectId: string, goalId: string) {
   return apiFetch<OrchestrationAuthorityDecisionRecord[]>(`${root(projectId)}/${goalId}/decisions`)
+}
+
+export function fetchOrchestrationDecision(projectId: string, goalId: string, decisionId: string) {
+  return apiFetch<OrchestrationDecisionAnswerResult>(`${root(projectId)}/${goalId}/decisions/${decisionId}`)
+}
+
+export function pauseOrchestrationControl(
+  projectId: string,
+  goalId: string,
+  input: { runId: string; expectedControlVersion: number; requestId: string },
+) {
+  return apiFetch<OrchestrationPauseReceipt>(`${root(projectId)}/${goalId}/pause-control`, {
+    method: 'POST',
+    body: JSON.stringify({ run_id: input.runId, expected_control_version: input.expectedControlVersion, request_id: input.requestId }),
+  })
+}
+
+export function fetchOrchestrationPauseControl(projectId: string, goalId: string, requestId: string) {
+  return apiFetch<OrchestrationPauseReceipt | null>(`${root(projectId)}/${goalId}/pause-control/${requestId}`)
 }
 
 export function fetchOrchestrationCheckpoint(projectId: string, goalId: string) {
@@ -594,6 +708,9 @@ function syncAnsweredDecisionCache(
   goalId: string,
   result: OrchestrationDecisionAnswerResult,
 ) {
+  queryClient.setQueryData(
+    ['orchestration-goal', projectId, goalId, 'decision', result.decision.id], result,
+  )
   const updateDecision = (decision: OrchestrationAuthorityDecisionRecord) =>
     decision.id === result.decision.id ? result.decision : decision
   const key = orchestrationBaselineKey(projectId, goalId)
@@ -663,32 +780,44 @@ export function useAnswerOrchestrationDecision(projectId: string | null) {
     }) => answerOrchestrationDecision(
       projectId!, goalId, decisionId, selectedOption, reason, editedAgent, contractVersion, runtimeIdentity,
     ),
-    onSuccess: (data, { goalId, runtimeIdentity }) => {
-      // Runtime HTTP 200 may be an inert stale-contract receipt. Its caller
-      // validates the exact persisted answer before refreshing any cache.
-      if (runtimeIdentity) return
-      syncAnsweredDecisionCache(queryClient, projectId, goalId, data)
-      return invalidateGoalAndBaseline(queryClient, projectId, goalId)
-    },
+    // The caller validates its frozen canonical receipt before accepting any cache change.
   })
   return {
     ...mutation,
     acceptRuntimeResult: (goalId: string, result: OrchestrationDecisionAnswerResult) => {
       syncAnsweredDecisionCache(queryClient, projectId, goalId, result)
-      return invalidateGoalAndBaseline(queryClient, projectId, goalId)
+      void invalidateGoalAndBaseline(queryClient, projectId, goalId).catch(() => {})
+    },
+    acceptResult: (goalId: string, result: OrchestrationDecisionAnswerResult, expected: OrchestrationAnswerSubmission) => {
+      if (!validateSavedAnswerReceipt(result.answer_receipt, expected)
+          || expected.kind !== 'single' || result.decision.id !== expected.decision_ids[0]
+          || result.decision.goal_id !== goalId) return false
+      syncAnsweredDecisionCache(queryClient, projectId, goalId, result)
+      void invalidateGoalAndBaseline(queryClient, projectId, goalId).catch(() => {})
+      return true
     },
   }
 }
 
 export function useAnswerAgentDefinitionReviewBatch(projectId: string | null) {
   const queryClient = useQueryClient()
-  return useMutation({
+  const acceptResult = (goalId: string, result: AgentDefinitionReviewBatchAnswerResult, expected: OrchestrationAnswerSubmission) => {
+    if (!validateSavedAnswerReceipt(result.answer_receipt, expected) || expected.kind !== 'batch'
+        || !sameCanonicalValue(result.decisions.map((decision) => decision.id), expected.decision_ids)
+        || result.decisions.some((decision) => decision.goal_id !== goalId)) return false
+    for (const decision of result.decisions) {
+      syncAnsweredDecisionCache(queryClient, projectId, goalId, { decision, process: result.process, answer_receipt: result.answer_receipt })
+    }
+    void invalidateGoalAndBaseline(queryClient, projectId, goalId).catch(() => {})
+    return true
+  }
+  const mutation = useMutation({
     mutationFn: ({ goalId, answers }: {
       goalId: string
       answers: readonly AgentDefinitionReviewBatchAnswerInput[]
     }) => answerAgentDefinitionReviewBatch(projectId!, goalId, answers),
-    onSuccess: (_data, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
   })
+  return { ...mutation, acceptResult }
 }
 
 export function useStepOrchestrationBaseline(projectId: string | null) {

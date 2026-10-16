@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearToken } from '@/lib/api-client'
 import type { OrchestrationGoalDetail } from '@/lib/types'
 import { useWSStore } from '@/stores/ws'
+import * as orchestrationApi from './orchestration'
 import {
   acknowledgeOrchestrationWarning,
   answerAgentDefinitionReviewBatch,
@@ -66,6 +67,8 @@ import {
   submitProjectChat,
   projectChatKey,
   useSubmitProjectChat,
+  createOrchestrationAnswerSubmission,
+  validateSavedAnswerReceipt,
 } from './orchestration'
 
 describe('unified project conversation', () => {
@@ -185,6 +188,93 @@ afterEach(() => {
 })
 
 describe('orchestration API', () => {
+  it('SPR230 posts lightweight Pause with its frozen run/version/request identity', async () => {
+    const receipt = {
+      project_id: 'project-1', goal_id: 'goal-1', run_id: 'run-1', request_id: 'pause-1',
+      accepted_at: '2026-10-16T12:00:00Z', accepted_control_version: 4, current_control_version: 4,
+      state: 'applied', goal_status: 'paused', run_status: 'paused',
+    }
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(okJson(receipt)))
+    vi.stubGlobal('fetch', fetchMock)
+    const api = orchestrationApi as unknown as {
+      pauseOrchestrationControl: (project: string, goal: string, input: {
+        runId: string; expectedControlVersion: number; requestId: string
+      }) => Promise<unknown>
+    }
+    const input = { runId: 'run-1', expectedControlVersion: 3, requestId: 'pause-1' }
+    await expect(api.pauseOrchestrationControl('project-1', 'goal-1', input)).resolves.toEqual(receipt)
+    await api.pauseOrchestrationControl('project-1', 'goal-1', input)
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/projects/project-1/orchestration/goals/goal-1/pause-control',
+      '/api/v1/projects/project-1/orchestration/goals/goal-1/pause-control',
+    ])
+    for (const [, request] of fetchMock.mock.calls) {
+      expect(request.method).toBe('POST')
+      expect(JSON.parse(request.body)).toEqual({ run_id: 'run-1', expected_control_version: 3, request_id: 'pause-1' })
+    }
+  })
+
+  it('SPR230 reconciles only the exact Pause receipt, preserving resumed or missing outcomes', async () => {
+    const receipt = {
+      project_id: 'project-1', goal_id: 'goal-1', run_id: 'run-1', request_id: 'pause-1',
+      accepted_at: '2026-10-16T12:00:00Z', accepted_control_version: 4, current_control_version: 5,
+      state: 'resumed', goal_status: 'active', run_status: 'running',
+    }
+    const fetchMock = vi.fn().mockResolvedValueOnce(okJson(receipt)).mockResolvedValueOnce(okJson(null))
+    vi.stubGlobal('fetch', fetchMock)
+    const api = orchestrationApi as unknown as {
+      fetchOrchestrationPauseControl: (project: string, goal: string, requestId: string) => Promise<unknown>
+    }
+    await expect(api.fetchOrchestrationPauseControl('project-1', 'goal-1', 'pause-1')).resolves.toEqual(receipt)
+    await expect(api.fetchOrchestrationPauseControl('project-1', 'goal-1', 'pause-missing')).resolves.toBeNull()
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/v1/projects/project-1/orchestration/goals/goal-1/pause-control/pause-1',
+      '/api/v1/projects/project-1/orchestration/goals/goal-1/pause-control/pause-missing',
+    ])
+  })
+
+  it('SPR231 reads the frozen decision identity directly, including Saved/application receipt', async () => {
+    const result = { decision: { id: 'reviewed-decision', status: 'answered' }, process: null,
+      answer_receipt: { action_id: 'application-1', decision_ids: ['reviewed-decision'], application_state: 'pending' } }
+    const fetchMock = vi.fn().mockResolvedValue(okJson(result))
+    vi.stubGlobal('fetch', fetchMock)
+    const api = orchestrationApi as unknown as {
+      fetchOrchestrationDecision: (project: string, goal: string, decisionId: string) => Promise<unknown>
+    }
+    await expect(api.fetchOrchestrationDecision('project-1', 'goal-1', 'reviewed-decision')).resolves.toEqual(result)
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/v1/projects/project-1/orchestration/goals/goal-1/decisions/reviewed-decision')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('SPR230 preserves unknown Pause outcome on transport failure without an automatic second POST', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('response disconnected'))
+    vi.stubGlobal('fetch', fetchMock)
+    const api = orchestrationApi as unknown as {
+      pauseOrchestrationControl: (project: string, goal: string, input: {
+        runId: string; expectedControlVersion: number; requestId: string
+      }) => Promise<unknown>
+    }
+    await expect(api.pauseOrchestrationControl('project-1', 'goal-1', {
+      runId: 'run-1', expectedControlVersion: 3, requestId: 'pause-1',
+    })).rejects.toThrow('response disconnected')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('SPR230/SPR231 propagates exact receipt readback failures instead of inventing confirmed state', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(
+      JSON.stringify({ detail: 'Readback unavailable' }), { status: 502, headers: { 'Content-Type': 'application/json' } },
+    )))
+    vi.stubGlobal('fetch', fetchMock)
+    const api = orchestrationApi as unknown as {
+      fetchOrchestrationPauseControl: (project: string, goal: string, requestId: string) => Promise<unknown>
+      fetchOrchestrationDecision: (project: string, goal: string, decisionId: string) => Promise<unknown>
+    }
+    await expect(api.fetchOrchestrationPauseControl('project-1', 'goal-1', 'pause-1')).rejects.toThrow()
+    await expect(api.fetchOrchestrationDecision('project-1', 'goal-1', 'reviewed-decision')).rejects.toThrow()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   it('preserves form-normalized runtime FEFF text through actual JSON and identical retry', async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(okJson({})))
     vi.stubGlobal('fetch', fetchMock)
@@ -823,18 +913,17 @@ describe('orchestration API', () => {
     const setQueryData = vi.fn()
     vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
     const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
-      onSuccess: (data: unknown, variables: {
-        goalId: string
-        decisionId: string
-        selectedOption: string
-        reason: string
-      }) => Promise<void>
+      acceptResult: (goalId: string, data: unknown, expected: unknown) => boolean
     }
-
-    await mutation.onSuccess(
-      { decision: { id: 'decision-1', source_process_run_id: 'process-1' }, process: null },
-      { goalId: 'goal-1', decisionId: 'decision-1', selectedOption: 'approve', reason: 'reason' },
-    )
+    const decision = { id: 'decision-1', goal_id: 'goal-1', source_process_run_id: 'process-1', run_id: 'run-1',
+      decision_key: 'approval', options: ['approve'], authority: 'human', authority_agent_id: null, contract_version: null }
+    const expected = createOrchestrationAnswerSubmission([decision as never], 'user-1', [{
+      decisionId: 'decision-1', selectedOption: 'approve', reason: 'reason',
+    }])
+    const result = { decision, process: null, answer_receipt: { action_id: 'application-1', decision_ids: ['decision-1'],
+      actor_user_id: 'user-1', run_id: 'run-1', source_process_run_id: 'process-1', submission: expected,
+      contracts: expected.contracts, application_state: 'pending', reason: null } }
+    expect(mutation.acceptResult('goal-1', result, expected)).toBe(true)
 
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
@@ -851,7 +940,7 @@ describe('orchestration API', () => {
     const setQueryData = vi.fn()
     vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
     const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
-      onSuccess: (data: unknown, variables: {
+      onSuccess?: (data: unknown, variables: {
         goalId: string
         decisionId: string
         selectedOption: string
@@ -860,7 +949,7 @@ describe('orchestration API', () => {
       }) => Promise<void> | void
     }
 
-    await mutation.onSuccess(
+    await mutation.onSuccess?.(
       {
         decision: {
           id: 'unrelated-or-malformed-runtime-receipt',
@@ -894,7 +983,9 @@ describe('orchestration API', () => {
 
     await answer.acceptRuntimeResult('goal-1', accepted)
 
-    expect(setQueryData).toHaveBeenCalledTimes(2)
+    expect(setQueryData).toHaveBeenCalledWith(
+      ['orchestration-goal', 'project-1', 'goal-1', 'decision', 'runtime-q1'], accepted,
+    )
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: ['orchestration-goal', 'project-1', 'goal-1'],
       exact: true,
@@ -902,6 +993,53 @@ describe('orchestration API', () => {
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: orchestrationBaselineKey('project-1', 'goal-1'),
     })
+  })
+
+  it('SPR231 leaves malformed or stale ordinary HTTP 200 receipts inert until validated acceptance', () => {
+    const invalidateQueries = vi.fn().mockResolvedValue(undefined)
+    const setQueryData = vi.fn()
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
+    const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
+      onSuccess?: (data: unknown, variables: unknown) => unknown
+      acceptResult: (goalId: string, data: unknown, expected: unknown) => boolean
+    }
+    const expected = createOrchestrationAnswerSubmission([{ id: 'decision-1', goal_id: 'goal-1', run_id: 'run-1',
+      source_process_run_id: 'process-1', decision_key: 'approval', options: ['approve'], authority: 'human' } as never],
+    'user-1', [{ decisionId: 'decision-1', selectedOption: 'approve', reason: 'Reviewed.' }])
+    for (const returned of [
+      { decision: { id: 'decision-1', status: 'answered' }, answer_receipt: null },
+      { decision: { id: 'other-goal-question', status: 'answered' }, answer_receipt: { actor_user_id: 'other-user' } },
+    ]) {
+      mutation.onSuccess?.(returned, { goalId: 'goal-1', decisionId: 'decision-1', selectedOption: 'approve', reason: 'Reviewed.' })
+      expect(mutation.acceptResult('goal-1', returned, expected)).toBe(false)
+    }
+    expect(setQueryData).not.toHaveBeenCalled()
+    expect(invalidateQueries).not.toHaveBeenCalled()
+  })
+
+  it('SPR231 publishes validated Saved immediately despite a failing background refresh', async () => {
+    const invalidateQueries = vi.fn().mockRejectedValue(new Error('background refresh unavailable'))
+    const setQueryData = vi.fn()
+    vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
+    const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
+      acceptResult: (goalId: string, data: unknown, expected: unknown) => boolean
+    }
+    const decision = { id: 'decision-1', goal_id: 'goal-1', run_id: 'run-1', source_process_run_id: 'process-1',
+      decision_key: 'approval', options: ['approve'], authority: 'human', authority_agent_id: null,
+      contract_version: null, status: 'answered', selected_option: 'approve', reason: 'Reviewed.' }
+    const expected = createOrchestrationAnswerSubmission([decision as never], 'user-1', [{
+      decisionId: 'decision-1', selectedOption: 'approve', reason: 'Reviewed.',
+    }])
+    const result = { decision, process: null, answer_receipt: { action_id: 'application-1', decision_ids: ['decision-1'],
+      actor_user_id: 'user-1', source_process_run_id: 'process-1', run_id: 'run-1', submission: expected,
+      contracts: expected.contracts, application_state: 'pending', reason: null } }
+    expect(validateSavedAnswerReceipt(result.answer_receipt, expected)).toBe(true)
+    expect(mutation.acceptResult('goal-1', result, expected)).toBe(true)
+    expect(setQueryData).toHaveBeenCalledWith(['orchestration-goal', 'project-1', 'goal-1', 'decision', 'decision-1'], result)
+    expect(invalidateQueries).toHaveBeenCalledTimes(2)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(setQueryData).toHaveBeenCalledTimes(3)
   })
 
   it('replaces exact detail state and invalidates the project list after a control', async () => {
@@ -914,6 +1052,121 @@ describe('orchestration API', () => {
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: ['orchestration-goals', 'project-1'],
     })
+  })
+})
+
+describe('SPR231 saved answer receipt identity', () => {
+  const reviewed = {
+    id: 'decision-1', goal_id: 'goal-1', run_id: 'run-1', source_process_run_id: 'process-1',
+    decision_key: 'goal_definition:approval', options: ['approve', 'request_changes'],
+    authority: 'human', authority_agent_id: null, contract_version: 'review:1',
+  }
+  const expected = {
+    kind: 'single' as const, actor_user_id: 'user-1', decision_ids: ['decision-1'],
+    source_process_run_id: 'process-1', run_id: 'run-1',
+    answers: [{ decision_id: 'decision-1', selected_option: 'request_changes', reason: 'Keep the reviewed scope.',
+      contract_version: 'review:1', edited_agent: null }],
+    contracts: [{ id: 'decision-1', key: 'goal_definition:approval', options: ['approve', 'request_changes'],
+      authority: 'human', authority_agent_id: '', source_process_run_id: 'process-1', run_id: 'run-1',
+      contract_version: 'review:1' }],
+  }
+  const receipt = () => ({
+    action_id: 'application-1', actor_user_id: 'user-1', decision_ids: ['decision-1'],
+    source_process_run_id: 'process-1', run_id: 'run-1', submission: structuredClone(expected),
+    contracts: structuredClone(expected.contracts), application_state: 'pending', reason: null,
+  })
+
+  it('builds the expected payload from the prewrite actor and reviewed contract rather than returned receipt', () => {
+    expect(createOrchestrationAnswerSubmission([reviewed as never], 'user-1', [{
+      decisionId: 'decision-1', selectedOption: 'request_changes', reason: '  Keep the reviewed scope.  ',
+      contractVersion: 'review:1',
+    }])).toEqual(expected)
+  })
+
+  it.each(['pending', 'applied', 'blocked', 'failed'])('confirms Saved independently of application %s', (state) => {
+    expect(validateSavedAnswerReceipt({ ...receipt(), application_state: state }, expected)).toBe(true)
+  })
+
+  it.each([
+    ['actor', (value: ReturnType<typeof receipt>) => { value.actor_user_id = 'another-user' }],
+    ['decision identity', (value: ReturnType<typeof receipt>) => { value.decision_ids = ['newest-question'] }],
+    ['source', (value: ReturnType<typeof receipt>) => { value.source_process_run_id = 'replacement-process' }],
+    ['run', (value: ReturnType<typeof receipt>) => { value.run_id = 'replacement-run' }],
+    ['selected option', (value: ReturnType<typeof receipt>) => { value.submission.answers[0].selected_option = 'approve' }],
+    ['reason', (value: ReturnType<typeof receipt>) => { value.submission.answers[0].reason = 'Different text.' }],
+    ['submission actor', (value: ReturnType<typeof receipt>) => { value.submission.actor_user_id = 'another-user' }],
+    ['contract', (value: ReturnType<typeof receipt>) => { value.contracts[0].contract_version = 'review:2' }],
+    ['submitted contract', (value: ReturnType<typeof receipt>) => { value.submission.contracts[0].options = ['approve'] }],
+  ])('rejects a mismatching %s even when HTTP succeeded', (_label, mutate) => {
+    const returned = receipt()
+    mutate(returned)
+    expect(validateSavedAnswerReceipt(returned, expected)).toBe(false)
+  })
+
+  it('does not accept a missing receipt or infer the expected actor from returned metadata', () => {
+    expect(validateSavedAnswerReceipt(null, expected)).toBe(false)
+    expect(validateSavedAnswerReceipt(undefined, expected)).toBe(false)
+    expect(validateSavedAnswerReceipt(receipt(), { ...expected, actor_user_id: '' })).toBe(false)
+  })
+
+  it('normalizes typed batch edits exactly while preserving frozen member order', () => {
+    const second = { ...reviewed, id: 'decision-2', decision_key: 'agent_definition_review:proposal:two' }
+    const submission = createOrchestrationAnswerSubmission([reviewed as never, second as never], 'user-1', [{
+      decisionId: 'decision-1', selectedOption: 'edit', reason: '',
+      editedDescription: '  Define café scope.  ', editedPersona: '  Report evidence.  ',
+    }, { decisionId: 'decision-2', selectedOption: 'approve', reason: ' Reviewed. ' }], 'batch')
+    expect(submission.answers).toEqual([
+      { decision_id: 'decision-1', selected_option: 'edit',
+        reason: '{"description": "Define caf\\u00e9 scope.", "persona": "Report evidence."}' },
+      { decision_id: 'decision-2', selected_option: 'approve', reason: 'Reviewed.' },
+    ])
+    const returned = { ...receipt(), submission, decision_ids: ['decision-1', 'decision-2'], contracts: submission.contracts }
+    expect(validateSavedAnswerReceipt(returned, submission)).toBe(true)
+    expect(validateSavedAnswerReceipt({ ...returned, decision_ids: ['decision-2', 'decision-1'] }, submission)).toBe(false)
+    expect(validateSavedAnswerReceipt({ ...returned, submission: { ...submission, answers: [...submission.answers].reverse() } }, submission)).toBe(false)
+    expect(validateSavedAnswerReceipt({ ...returned, submission: { ...submission, decision_ids: ['decision-1'] } }, submission)).toBe(false)
+  })
+
+  it.each([
+    ['FEFF retained', '\uFEFFscope\uFEFF', '\\ufeffscope\\ufeff'],
+    ['NEL stripped', '\u0085scope\u0085', 'scope'],
+    ['Python control separators stripped', '\u001c\u001d\u001escope\u001f', 'scope'],
+  ])('matches backend Python strip for typed batch edits: %s', (_label, raw, normalized) => {
+    const submission = createOrchestrationAnswerSubmission([reviewed as never], 'user-1', [{
+      decisionId: 'decision-1', selectedOption: 'edit', reason: '',
+      editedDescription: raw, editedPersona: raw,
+    }], 'batch')
+    expect(submission.answers[0].reason).toBe(`{"description": "${normalized}", "persona": "${normalized}"}`)
+  })
+
+  it('binds the entire typed hierarchy agent edit without including newly generated agent identity', () => {
+    const editedAgent = { name: 'Reviewed helper', role: 'specialist', provider: 'openai', model: 'gpt-4o-mini',
+      description: 'Scoped support', system_prompt: 'Report concrete evidence.', adapter_type: 'api' as const,
+      cli_runtime: null, capabilities: ['implementation'], config: { temperature: 0 } }
+    const submission = createOrchestrationAnswerSubmission([reviewed as never], 'user-1', [{
+      decisionId: 'decision-1', selectedOption: 'edit', reason: 'Reviewed.', editedAgent,
+    }])
+    expect(submission.answers[0].edited_agent).toEqual(editedAgent)
+    expect(JSON.stringify(submission)).not.toContain('created_agent_id')
+    const returned = { ...receipt(), submission, contracts: submission.contracts }
+    expect(validateSavedAnswerReceipt(returned, submission)).toBe(true)
+    const changed = structuredClone(returned)
+    changed.submission.answers[0].edited_agent!.name = 'Changed helper'
+    expect(validateSavedAnswerReceipt(changed, submission)).toBe(false)
+  })
+
+  it('permits nullable action/run only for an exact source-free applied single answer', () => {
+    const runless = createOrchestrationAnswerSubmission([
+      { ...reviewed, run_id: null, source_process_run_id: null } as never,
+    ], 'user-1', [{ decisionId: 'decision-1', selectedOption: 'approve', reason: '' }])
+    const returned = { ...receipt(), action_id: null, run_id: null, source_process_run_id: null,
+      application_state: 'applied', submission: runless, contracts: runless.contracts }
+    expect(validateSavedAnswerReceipt(returned, runless)).toBe(true)
+    expect(validateSavedAnswerReceipt({ ...returned, application_state: 'pending' }, runless)).toBe(false)
+    expect(validateSavedAnswerReceipt({ ...returned, action_id: 'invented-action' }, runless)).toBe(false)
+    expect(validateSavedAnswerReceipt({ ...returned, source_process_run_id: 'process-1' }, runless)).toBe(false)
+    expect(validateSavedAnswerReceipt({ ...returned, submission: { ...runless, kind: 'batch' } }, runless)).toBe(false)
+    expect(validateSavedAnswerReceipt({ ...receipt(), action_id: null }, expected)).toBe(false)
   })
 })
 
@@ -999,12 +1252,13 @@ describe('blocker recovery proposals', () => {
     const setQueryData = vi.fn()
     vi.mocked(useQueryClient).mockReturnValue({ invalidateQueries, setQueryData } as never)
     const mutation = useAnswerOrchestrationDecision('project-1') as unknown as {
-      onSuccess: (data: unknown, variables: { goalId: string }) => Promise<void>
+      acceptRuntimeResult: (goalId: string, data: unknown) => void
     }
     const answered = { id: 'decision-1', source_process_run_id: null, recovery: { ...recovery, status: 'applying' } }
-    await mutation.onSuccess({ decision: answered, process: null }, { goalId: 'goal-1' })
-    const updaters = setQueryData.mock.calls.map(([, updater]) => updater as (value: unknown) => unknown)
-    const decisionsUpdater = updaters[0]
+    mutation.acceptRuntimeResult('goal-1', { decision: answered, process: null })
+    const decisionsUpdater = setQueryData.mock.calls.find(([key]) =>
+      JSON.stringify(key) === JSON.stringify([...orchestrationBaselineKey('project-1', 'goal-1'), 'decisions']),
+    )?.[1] as (value: unknown) => unknown
     expect(decisionsUpdater([{ id: 'decision-1', recovery }, { id: 'other' }])).toEqual([answered, { id: 'other' }])
   })
 })

@@ -1,3 +1,4 @@
+import { env as fixtureEnvironment } from 'node:process'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import React, { act, type ComponentProps } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -20,8 +21,9 @@ const api = vi.hoisted(() => ({
   dashboard: null as unknown,
   health: { data: { debug_enabled: false } } as unknown,
   memorySection: { data: undefined, isLoading: false, isError: false, refetch: vi.fn() },
-  answer: { isPending: false, mutate: vi.fn(), acceptRuntimeResult: vi.fn() },
-  answerAgentDefinitionBatch: { isPending: false, mutate: vi.fn() },
+  answer: { isPending: false, mutate: vi.fn(), acceptRuntimeResult: vi.fn(), acceptResult: vi.fn() },
+  fetchDecision: vi.fn(),
+  answerAgentDefinitionBatch: { isPending: false, mutate: vi.fn(), acceptResult: vi.fn() },
   skip: { isPending: false, mutate: vi.fn() },
   acknowledge: { isPending: false, mutate: vi.fn() },
   resolve: { isPending: false, mutate: vi.fn() },
@@ -46,7 +48,11 @@ vi.mock('reactflow', () => ({
   Position: { Top: 'top', Bottom: 'bottom' },
 }))
 
-vi.mock('@/api/orchestration', () => ({
+vi.mock('@/api/auth', () => ({ useCurrentUser: () => ({ data: { id: '10000000-0000-4000-8000-000000000001' }, isLoading: false, isError: false }) }))
+
+vi.mock('@/api/orchestration', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/api/orchestration')>(),
+  fetchOrchestrationDecision: (...args: unknown[]) => api.fetchDecision(...args),
   useBaselineDashboard: () => api.dashboard,
   useOrchestrationHealth: () => api.health,
   useOrchestrationMemorySection: () => api.memorySection,
@@ -294,6 +300,9 @@ beforeEach(() => {
     mutation.mutate.mockReset()
   }
   api.answer.acceptRuntimeResult.mockReset()
+  api.answer.acceptResult.mockReset().mockReturnValue(true)
+  api.answerAgentDefinitionBatch.acceptResult.mockReset().mockReturnValue(true)
+  api.fetchDecision.mockReset()
 })
 
 describe('Baseline dashboard D3 composition', () => {
@@ -1690,7 +1699,7 @@ describe('Baseline dashboard D3 composition', () => {
       const betaApprove = getButton(betaRow, 'Approve')
       await act(async () => getButton(alphaRow, 'Approve').click())
       try {
-        await act(async () => { callbacks?.onSuccess?.({ decision: alpha }) })
+        await act(async () => { callbacks?.onSuccess?.(await spr231OrdinaryResult(alpha, 'approve')) })
       } catch (error) { throw new Error((error as Error).stack) }
       expect(toast.success).toHaveBeenCalledWith('Proposal decision received.')
       const refreshedBeta = descendants(view.container).find((node) => node.tagName === 'LI' && textOf(node).includes('Review Beta'))!
@@ -1728,7 +1737,7 @@ describe('Baseline dashboard D3 composition', () => {
       checkpoint: query({ goal_id: 'goal-00000000-0000-4000-8000-000000000001', items: [recommended], deferred_count: 0, max_questions: 5 }),
     })
     api.answer.mutate.mockImplementation((_variables, callbacks) => {
-      callbacks.onError?.(new Error('Answer rejected by validator.'))
+      callbacks.onError?.(new ApiError(400, 'Answer rejected by validator.'))
       callbacks.onSettled?.()
     })
     const onMessage = vi.fn()
@@ -1751,7 +1760,7 @@ describe('Baseline dashboard D3 composition', () => {
     // openAction-closing/clearing logic the regression targets — a mock that
     // never calls back would let an unconditional close/clear slip through
     // undetected.
-    api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(); callbacks.onSettled?.() })
+    api.answer.mutate.mockImplementation(async (variables, callbacks) => { callbacks.onSuccess?.(await spr231OrdinaryResult(decisionB, variables.selectedOption)); callbacks.onSettled?.() })
     const view = await mountDashboard()
     try {
       const rowA = () => descendants(view.container).find((node) => node.tagName === 'LI' && textOf(node).includes('Decision A'))!
@@ -1793,7 +1802,7 @@ describe('Baseline dashboard D3 composition', () => {
       processes: query([goalDefinitionProcess]),
       checkpoint: query({ goal_id: 'goal-00000000-0000-4000-8000-000000000001', items: questions, deferred_count: 0, max_questions: 5 }),
     })
-    api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(); callbacks.onSettled?.() })
+    api.answer.mutate.mockImplementation(async (variables, callbacks) => { callbacks.onSuccess?.(await spr231OrdinaryResult(questions.find((q) => q.id === variables.decisionId)!, variables.selectedOption)); callbacks.onSettled?.() })
     const view = await mountDashboard()
     try {
       expect(textOf(view.container)).toContain('2 goal clarification questions need an answer.')
@@ -2823,7 +2832,7 @@ describe('Baseline action form regressions', () => {
       await act(async () => { getButton(view.container, 'Next').click(); await Promise.resolve() })
       expect(api.answer.mutate).toHaveBeenCalledTimes(1)
       await act(async () => {
-        callbacks[0]?.onSuccess?.({ decision: firstAnswered, process: null, continuation_applied: false })
+        callbacks[0]?.onSuccess?.(await spr231OrdinaryResult(first, 'First answer'))
         callbacks[0]?.onSettled?.()
       })
 
@@ -3469,6 +3478,27 @@ describe('Baseline dashboard recovery FIX PROPOSAL card', () => {
     return node!
   }
 
+  it('SPR231 validated nonruntime recovery result refreshes its specialized cache without ordinary receipt', async () => {
+    const pending = recoveryDecision('rec-refresh', 'pending_approval')
+    const decisions = query([pending])
+    const processes = query<OrchestrationProcessRunRecord[]>([])
+    const checkpoint = query({ goal_id: GOAL_ID, items: [pending], deferred_count: 0, max_questions: 3 })
+    api.dashboard = dashboardData({ decisions, processes, checkpoint })
+    const answered = { ...pending, status: 'answered' as const, selected_option: 'approve_fix', reason: null,
+      decided_by_user_id: '10000000-0000-4000-8000-000000000001', decided_at: ISO.answered,
+      recovery: { ...pending.recovery!, status: 'applying' } }
+    api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.({ decision: answered, process: null, continuation_applied: false }); callbacks.onSettled?.() })
+    const view = await mountDashboard()
+    try {
+      await act(async () => { getButton(cardOf(view.container), 'Approve fix').click(); await Promise.resolve() })
+      expect(api.answer.acceptRuntimeResult).toHaveBeenCalledWith(GOAL_ID, expect.objectContaining({ decision: answered }))
+      expect(api.answer.acceptResult).not.toHaveBeenCalled()
+      expect(decisions.refetch).toHaveBeenCalled()
+      expect(checkpoint.refetch).toHaveBeenCalled()
+      expect(processes.refetch).toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
   it('renders_a_simple_recovery_proposal_and_submits_approval_once', async () => {
     api.dashboard = withDecisions([recoveryDecision('rec-1', 'pending_approval')])
     const view = await mountDashboard()
@@ -3811,18 +3841,268 @@ it('SPR188 a locally submitted partial adaptive answer does not announce again a
     title: `Question ${i}`, question: `Question ${i}?`, context: 'Clarify objective.', options: [], recommendation: null, source_process_run_id: owner.id }))
   api.dashboard = dashboardData({ processes: query([owner]), checkpoint: query({ goal_id: goal().id, items: questions, deferred_count: 0, max_questions: 3 }) })
   const onMessage = vi.fn()
-  api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(); callbacks.onSettled?.() })
+  api.answer.mutate.mockImplementation(async (variables, callbacks) => { callbacks.onSuccess?.(await spr231OrdinaryResult(questions[0], variables.selectedOption)); callbacks.onSettled?.() })
   const view = await mountDashboard({ queueAnnouncementScope: 'human', onMessage })
   const live = () => descendants(view.container).find((node) => node.getAttribute('role') === 'status')!
   try {
     expect(textOf(live())).toBe('')
     await act(async () => changeControl(getByLabel(view.container, 'Answer', 'textarea'), 'First local answer'))
     await act(async () => { getButton(view.container, 'Next').click(); await Promise.resolve() })
-    expect(onMessage.mock.calls.filter(([message]) => message === 'Answer received.')).toHaveLength(1)
+    expect(onMessage.mock.calls.filter(([message]) => /^Saved[.!]/.test(message))).toHaveLength(1)
     const answered = { ...questions[0], status: 'answered' as const, selected_option: 'First local answer', decided_at: ISO.answered }
     api.dashboard = dashboardData({ processes: query([owner]), decisions: query([answered, questions[1]]), checkpoint: query({ goal_id: goal().id, items: [questions[1]], deferred_count: 0, max_questions: 3 }) })
     await view.rerender()
     expect(textOf(live())).toBe('')
-    expect(onMessage.mock.calls.filter(([message]) => message === 'Answer received.')).toHaveLength(1)
+    expect(onMessage.mock.calls.filter(([message]) => /^Saved[.!]/.test(message))).toHaveLength(1)
+  } finally { view.cleanup() }
+})
+
+async function spr231OrdinaryResult(pending: OrchestrationAuthorityDecisionRecord, selectedOption: string, reason: string | null = null) {
+  const { createOrchestrationAnswerSubmission } = await import('@/api/orchestration')
+  const actor = '10000000-0000-4000-8000-000000000001'
+  const submission = createOrchestrationAnswerSubmission([pending], actor, [{ decisionId: pending.id, selectedOption, reason: reason ?? '', contractVersion: pending.contract_version }], 'single', pending.run_id ?? undefined)
+  return {
+    decision: { ...pending, status: 'answered' as const, selected_option: selectedOption, reason, decided_by_user_id: actor, decided_at: ISO.answered },
+    process: null, continuation_applied: false,
+    answer_receipt: { action_id: '20000000-0000-4000-8000-000000000001', decision_ids: [pending.id], actor_user_id: actor,
+      source_process_run_id: pending.source_process_run_id, run_id: pending.run_id,
+      submission, contracts: submission.contracts, application_state: 'pending' as const, reason: null },
+  }
+}
+
+describe('SPR231 retained ordinary Saved receipts', () => {
+  it.each(['approve', 'request_changes'])('confirms %s Saved before pending application and keeps it across row removal and failed refresh', async (selectedOption) => {
+    const pending = decision({ recommendation: selectedOption, options: ['approve', 'request_changes'] })
+    api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+    const onMessage = vi.fn()
+    const releaseMutation = vi.fn()
+    let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, next) => { callbacks = next })
+    const view = await mountDashboard({ onMessage, releaseMutation })
+    try {
+      await act(async () => { getButton(view.container, `Accept: ${selectedOption}`).click(); await Promise.resolve() })
+      expect(api.answer.mutate).toHaveBeenCalledOnce()
+      const result = await spr231OrdinaryResult(pending, selectedOption)
+      await act(async () => { callbacks?.onSuccess?.(result); callbacks?.onSettled?.() })
+      expect(onMessage.mock.calls.some(([message]) => /Saved/i.test(message) && /application pending/i.test(message))).toBe(true)
+      expect(releaseMutation).toHaveBeenCalledOnce()
+      api.dashboard = dashboardData({ decisions: query([], { isError: true, isFetching: true }), checkpoint: query({ goal_id: goal().id, items: [], deferred_count: 0, max_questions: 3 }, { isError: true }) })
+      await view.rerender()
+      await exportG1OfflineFixture('answer-saved-row-removed', view.container)
+      expect(onMessage.mock.calls.some(([message]) => /answered elsewhere|unconfirmed|not saved/i.test(message))).toBe(false)
+      expect(api.answer.mutate).toHaveBeenCalledOnce()
+    } finally { view.cleanup() }
+  })
+
+  it('never confirms a missing ordinary receipt as Saved', async () => {
+    const pending = decision()
+    api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+    const onMessage = vi.fn()
+    api.answer.mutate.mockImplementation((_variables, callbacks) => {
+      callbacks.onSuccess?.({ decision: { ...pending, status: 'answered', selected_option: 'approve' }, process: null })
+      callbacks.onSettled?.()
+    })
+    const view = await mountDashboard({ onMessage })
+    try {
+      await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
+      expect(onMessage.mock.calls.map(([message]) => message).filter((message) => /^Saved[.!]|^Answer received[.!]/i.test(message))).toEqual([])
+    } finally { view.cleanup() }
+  })
+})
+
+describe('SPR231 exact uncertain answer readback', () => {
+  it.each(['saved', 'unavailable', 'wrong-goal', 'wrong-actor', 'wrong-reason', 'wrong-run', 'fake-runless'])('handles %s without repeating the answer write', async (outcome) => {
+    const pending = decision()
+    api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+    const result = await spr231OrdinaryResult(pending, 'approve')
+    if (outcome === 'wrong-goal') result.decision.goal_id = 'another-goal'
+    if (outcome === 'wrong-actor') result.answer_receipt.actor_user_id = 'another-user'
+    if (outcome === 'wrong-reason') result.answer_receipt.submission.answers[0].reason = 'Changed reason'
+    if (outcome === 'wrong-run') result.answer_receipt.run_id = 'another-run'
+    if (outcome === 'fake-runless') Object.assign(result.answer_receipt, { run_id: null, action_id: null, application_state: 'applied' })
+    api.fetchDecision.mockImplementation(() => outcome === 'unavailable' ? Promise.reject(new Error('readback unavailable')) : Promise.resolve(result))
+    let callbacks: { onError?: (error: unknown) => void; onSettled?: () => void } | undefined
+    api.answer.mutate.mockImplementation((_variables, next) => { callbacks = next })
+    const onMessage = vi.fn()
+    const view = await mountDashboard({ onMessage })
+    try {
+      await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
+      await act(async () => { callbacks?.onError?.(new TypeError('Network response lost')); callbacks?.onSettled?.(); await Promise.resolve() })
+      expect(api.fetchDecision).toHaveBeenCalledWith('project-1', goal().id, pending.id)
+      expect(api.answer.mutate).toHaveBeenCalledOnce()
+      const messages = onMessage.mock.calls.map(([message]) => message).join(' ')
+      if (outcome === 'saved') expect(messages).toMatch(/Saved/i)
+      else expect(messages).not.toMatch(/Saved[.!]|Answer received/i)
+      if (outcome === 'unavailable') {
+        expect(textOf(view.container) + messages).toMatch(/Checking/i)
+        await exportG1OfflineFixture('answer-checking', view.container)
+        api.fetchDecision.mockResolvedValue(result)
+        const recheck = descendants(view.container).find((node) => node.tagName === 'BUTTON' && /check.*answer/i.test(textOf(node)))
+        expect(recheck).toBeDefined()
+        await act(async () => recheck!.click())
+        expect(api.answer.mutate).toHaveBeenCalledOnce()
+        expect(api.fetchDecision).toHaveBeenLastCalledWith('project-1', goal().id, pending.id)
+      }
+    } finally { view.cleanup() }
+  })
+})
+
+it('SPR231 background fetching does not revoke fresh pre-submit authority', async () => {
+  const pending = decision()
+  const authority = query([pending], { isFetching: true })
+  authority.refetch.mockResolvedValue({ data: [pending], isSuccess: true, isError: false })
+  api.dashboard = dashboardData({ decisions: authority, checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  const view = await mountDashboard()
+  try {
+    const accept = getButton(view.container, 'Accept: approve')
+    expect(accept.disabled).toBe(false)
+    await act(async () => { accept.click(); await Promise.resolve() })
+    expect(authority.refetch).toHaveBeenCalled()
+    expect(api.answer.mutate).toHaveBeenCalledOnce()
+  } finally { view.cleanup() }
+})
+
+it('SPR231 accepts a null action/run receipt only for exact applied legacy runless answer', async () => {
+  const pending = decision({ run_id: null })
+  api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  const result = await spr231OrdinaryResult(pending, 'approve')
+  Object.assign(result.answer_receipt, { action_id: null, run_id: null, application_state: 'applied' })
+  api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(result); callbacks.onSettled?.() })
+  const onMessage = vi.fn()
+  const view = await mountDashboard({ run: null, onMessage })
+  try {
+    await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
+    expect(onMessage.mock.calls.some(([message]) => /Saved/i.test(message))).toBe(true)
+    expect(textOf(view.container)).toContain('Saved')
+  } finally { view.cleanup() }
+})
+
+it.each(['applied', 'failed'] as const)('SPR231 retains Saved while exact application status advances to %s', async (applicationState) => {
+  const pending = decision()
+  api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  const result = await spr231OrdinaryResult(pending, 'approve')
+  api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(result); callbacks.onSettled?.() })
+  const view = await mountDashboard()
+  try {
+    await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
+    expect(textOf(view.container)).toContain('Application pending')
+    const updated = { ...result, answer_receipt: { ...result.answer_receipt, application_state: applicationState, reason: applicationState === 'failed' ? 'Native source no longer applies.' : null } }
+    api.fetchDecision.mockResolvedValue(updated)
+    api.dashboard = dashboardData({ decisions: query([result.decision]), checkpoint: query({ goal_id: goal().id, items: [], deferred_count: 0, max_questions: 3 }) })
+    await view.rerender()
+    expect(api.fetchDecision).toHaveBeenCalledWith('project-1', goal().id, pending.id)
+    expect(textOf(view.container)).toContain('Saved')
+    expect(textOf(view.container)).not.toContain('Application pending')
+    expect(textOf(view.container)).toMatch(applicationState === 'failed' ? /Native source no longer applies/ : /applied|complete/i)
+    api.fetchDecision.mockRejectedValue(new Error('background unavailable'))
+    api.dashboard = dashboardData({ decisions: query([], { isError: true }), checkpoint: query({ goal_id: goal().id, items: [], deferred_count: 0, max_questions: 3 }, { isError: true }) })
+    await view.rerender()
+    expect(textOf(view.container)).toContain('Saved')
+    expect(textOf(view.container)).not.toContain('Application pending')
+  } finally { view.cleanup() }
+})
+
+
+async function exportG1OfflineFixture(name: string, root: import('../../../tests/support/dom').TestNode) {
+  const directory = fixtureEnvironment.G1_UI_FIXTURE_DIR
+  if (!directory) return
+  const escape = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;')
+  const serialize = (node: import('../../../tests/support/dom').TestNode): string => {
+    if (node.nodeType === 3) return escape(node.textContent ?? '')
+    const element = node as import('../../../tests/support/dom').TestElement
+    if (!element.tagName) return node.childNodes.map(serialize).join('')
+    const attrs = [...element.attributes].map(([key, value]) => ` ${key}="${escape(value)}"`).join('')
+    const value = element.tagName === 'TEXTAREA' ? escape(element.value) : node.childNodes.map(serialize).join('')
+    return `<${element.tagName.toLowerCase()}${attrs}>${value}</${element.tagName.toLowerCase()}>`
+  }
+  const { mkdir, writeFile } = await import('node:fs/promises')
+  await mkdir(directory, { recursive: true })
+  await writeFile(`${directory}/${name}.html`, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="g1-ux.css"><title>G1 isolated fixture ${name}</title></head><body><main class="mx-auto max-w-5xl p-3">${serialize(root)}</main></body></html>`)
+}
+
+it('SPR231 freezes the ordinary draft during uncertain readback without stealing edit focus', async () => {
+  const pending = decision({ options: ['approve', 'request_changes'] })
+  const authority = query([pending])
+  api.dashboard = dashboardData({ decisions: authority, checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  api.fetchDecision.mockRejectedValue(new Error('readback unavailable'))
+  let callbacks: { onError?: (error: unknown) => void; onSettled?: () => void } | undefined
+  api.answer.mutate.mockImplementation((_variables, next) => { callbacks = next })
+  const view = await mountDashboard()
+  try {
+    await act(async () => getButton(view.container, 'Choose differently…').click())
+    const revise = descendants(view.container).find((node) => node.tagName === 'INPUT' && node.value === 'request_changes')!
+    await act(async () => changeControl(revise, 'request_changes'))
+    const reason = getByLabel(view.container, 'Reason (required when overriding the recommendation)', 'textarea')
+    await act(async () => changeControl(reason, 'Keep my reviewed revision draft.'))
+    focusControl(reason)
+    await act(async () => { getButton(view.container, 'Submit answer').click(); await Promise.resolve() })
+    await act(async () => { callbacks?.onError?.(new TypeError('network response lost')); callbacks?.onSettled?.(); await Promise.resolve() })
+    expect(textOf(view.container)).toContain('Checking saved answer')
+    expect(getByLabel(view.container, 'Reason (required when overriding the recommendation)', 'textarea')).toBe(reason)
+    expect(reason.value).toBe('Keep my reviewed revision draft.')
+    expect(formFieldset(view.container).disabled).toBe(true)
+    expect(api.answer.mutate).toHaveBeenCalledOnce()
+    await exportG1OfflineFixture('answer-frozen-draft-checking', view.container)
+    api.dashboard = dashboardData({ decisions: query([pending], { isFetching: true }), checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+    await view.rerender()
+    expect(getByLabel(view.container, 'Reason (required when overriding the recommendation)', 'textarea')).toBe(reason)
+    expect(reason.value).toBe('Keep my reviewed revision draft.')
+    expect(api.answer.mutate).toHaveBeenCalledOnce()
+  } finally { view.cleanup() }
+})
+
+it.each([false, true])('SPR231 frozen batch receipt rejects changed ordered membership=%s', async (changedOrder) => {
+  const owner = process({ id: 'frozen-review', process_type: 'agent_definition_review', status: 'waiting_decision' })
+  const reviews = ['alpha', 'beta'].map((id) => decision({ id, decision_key: `agent_definition_review:proposal:${id}`, source_process_run_id: owner.id, options: ['approve', 'edit', 'reject'] }))
+  api.dashboard = dashboardData({ processes: query([owner]), decisions: query(reviews), checkpoint: query({ goal_id: goal().id, items: reviews, deferred_count: 0, max_questions: 5 }) })
+  let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+  api.answerAgentDefinitionBatch.mutate.mockImplementation((_variables, next) => { callbacks = next })
+  api.fetchDecision.mockRejectedValue(new Error('readback unavailable'))
+  const view = await mountDashboard()
+  try {
+    await act(async () => { getButton(view.container, 'Approve all remaining (2)').click(); await Promise.resolve() })
+    const variables = api.answerAgentDefinitionBatch.mutate.mock.calls[0][0]
+    const { createOrchestrationAnswerSubmission } = await import('@/api/orchestration')
+    const actor = '10000000-0000-4000-8000-000000000001'
+    const submission = createOrchestrationAnswerSubmission(reviews, actor, variables.answers, 'batch', run().id)
+    const receipt = { action_id: '20000000-0000-4000-8000-000000000002', decision_ids: reviews.map((d) => d.id), actor_user_id: actor,
+      source_process_run_id: owner.id, run_id: run().id, submission, contracts: submission.contracts, application_state: 'pending', reason: null }
+    if (changedOrder) receipt.decision_ids.reverse()
+    const result = { decisions: reviews.map((d) => ({ ...d, status: 'answered', selected_option: 'approve', reason: null, decided_by_user_id: actor, decided_at: ISO.answered })), process: null, answer_receipt: receipt }
+    await act(async () => { callbacks?.onSuccess?.(result); callbacks?.onSettled?.() })
+    expect(api.answerAgentDefinitionBatch.mutate).toHaveBeenCalledOnce()
+    expect(textOf(view.container).includes('Saved.')).toBe(!changedOrder)
+    if (changedOrder) expect(api.answerAgentDefinitionBatch.acceptResult).not.toHaveBeenCalled()
+    else expect(api.answerAgentDefinitionBatch.acceptResult).toHaveBeenCalledWith(goal().id, result, expect.objectContaining({ decision_ids: ['alpha', 'beta'] }))
+  } finally { view.cleanup() }
+})
+
+it.each([false, true])('SPR231 typed edit confirms only matching frozen edited payload mismatch=%s', async (changedEdit) => {
+  const owner = process({ id: 'typed-hierarchy', process_type: 'team_hierarchy', status: 'waiting_decision' })
+  const definition = { name: 'Alpha', role: 'worker', description: 'Build changes.', provider: 'openai', model: 'gpt-5', system_prompt: 'Full prompt.', adapter_type: 'api', cli_runtime: null, capabilities: ['build'], config: {} }
+  const pending = decision({ id: 'typed-alpha', decision_key: 'team_hierarchy:agent:alpha', title: 'Review Alpha', source_process_run_id: owner.id, options: ['approve', 'edit', 'reject'], context: JSON.stringify({ proposal: { definition } }) })
+  api.dashboard = dashboardData({ processes: query([owner]), checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  let callbacks: { onSuccess?: (result: unknown) => void; onSettled?: () => void } | undefined
+  api.answer.mutate.mockImplementation((_variables, next) => { callbacks = next })
+  api.fetchDecision.mockRejectedValue(new Error('readback unavailable'))
+  const view = await mountDashboard()
+  try {
+    const row = queueRow(view.container, pending.title)
+    await act(async () => getButton(row, 'Edit').click())
+    await act(async () => changeControl(getByLabel(row, 'Name', 'input'), 'Edited Alpha'))
+    await act(async () => { getButton(row, 'Submit edit').click(); await Promise.resolve() })
+    const input = api.answer.mutate.mock.calls[0][0]
+    const { createOrchestrationAnswerSubmission } = await import('@/api/orchestration')
+    const actor = '10000000-0000-4000-8000-000000000001'
+    const submission = createOrchestrationAnswerSubmission([pending], actor, [{ decisionId: pending.id, selectedOption: 'edit', reason: '', editedAgent: input.editedAgent }], 'single', run().id)
+    // Native backend audit serializes edited_agent with sort_keys=True.
+    const nativeEdited = Object.fromEntries(Object.entries(input.editedAgent).sort(([left], [right]) => left.localeCompare(right)))
+    const edited = changedEdit ? { ...nativeEdited, name: 'Different Alpha' } : nativeEdited
+    const result = { decision: { ...pending, status: 'answered', selected_option: 'edit', reason: JSON.stringify({ reason: null, edited_agent: edited, created_agent_id: '30000000-0000-4000-8000-000000000001' }), decided_by_user_id: actor, decided_at: ISO.answered }, process: null,
+      answer_receipt: { action_id: '20000000-0000-4000-8000-000000000003', decision_ids: [pending.id], actor_user_id: actor, source_process_run_id: owner.id, run_id: run().id, submission, contracts: submission.contracts, application_state: 'pending', reason: null } }
+    await act(async () => { callbacks?.onSuccess?.(result); callbacks?.onSettled?.() })
+    expect(textOf(view.container).includes('Saved.')).toBe(!changedEdit)
+    expect(api.answer.mutate).toHaveBeenCalledOnce()
+    if (changedEdit) expect(api.answer.acceptResult).not.toHaveBeenCalled()
   } finally { view.cleanup() }
 })

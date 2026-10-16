@@ -1,8 +1,13 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { ApiError } from '@/lib/api-client'
+import { useCurrentUser } from '@/api/auth'
 import {
+  createOrchestrationAnswerSubmission,
+  validateSavedAnswerReceipt,
+  fetchOrchestrationDecision,
   useAcknowledgeOrchestrationWarning,
   type AgentDefinitionReviewBatchAnswerInput,
+  type AgentDefinitionReviewBatchAnswerResult,
   useAnswerAgentDefinitionReviewBatch,
   useAnswerOrchestrationDecision,
   useAuthorizeOrchestrationBaseline,
@@ -23,6 +28,8 @@ import type {
   OrchestrationBaselineProcessType,
   OrchestrationBlocker,
   OrchestrationDecisionAnswerResult,
+  OrchestrationAnswerReceipt,
+  OrchestrationAnswerSubmission,
   OrchestrationAgentReviewRecord,
   OrchestrationDecisionOption,
   OrchestrationGate,
@@ -43,6 +50,7 @@ import {
   safeNeedsYouText,
   validateNeedsYouEdit,
   validateRuntimeAnswerReceipt,
+  validateOrdinaryAnswerResult,
   type NeedsYouEditSnapshot,
   type NeedsYouSourceTarget,
 } from './needsYouPresentation'
@@ -285,7 +293,7 @@ export function BaselineActionForm({
               </div>}
             </div>
           })()}
-          {textAnswer ? <Textarea ref={reasonRef} label="Answer" value={reason} readOnly={reviewLocked} onChange={(event) => onReasonChange(event.target.value)} rows={3} required /> : freeText ? <Textarea ref={answerRef} label="Answer" value={selectedOption ?? ''} readOnly={reviewLocked} onChange={(event) => onSelectedOptionChange(event.target.value)} rows={3} /> : (
+          {textAnswer ? <Textarea ref={reasonRef} label="Answer" value={reason} readOnly={reviewLocked || submitting} onChange={(event) => onReasonChange(event.target.value)} rows={3} required /> : freeText ? <Textarea ref={answerRef} label="Answer" value={selectedOption ?? ''} readOnly={reviewLocked || submitting} onChange={(event) => onSelectedOptionChange(event.target.value)} rows={3} /> : (
             <div className="mt-2 space-y-2">
               {options.map(({ option, key }, index) => key === null ? <p key={index} className="text-sm text-huddleroom-text-secondary">Unavailable option</p> : (
                 <label key={key} className="flex min-h-11 items-center gap-2 text-sm text-huddleroom-text-primary">
@@ -296,7 +304,7 @@ export function BaselineActionForm({
             </div>
           )}
         </>}
-        {target.kind === 'answer' && !textAnswer && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} readOnly={reviewLocked} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
+        {target.kind === 'answer' && !textAnswer && <Textarea ref={reasonRef} label={target.decision.recommendation === null ? 'Reason (optional)' : 'Reason (required when overriding the recommendation)'} value={reason} readOnly={reviewLocked || submitting} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
         {target.kind !== 'answer' && <Textarea ref={reasonRef} label={target.kind === 'skip' ? 'Reason (required)' : 'Reason (optional)'} value={reason} onChange={(event) => onReasonChange(event.target.value)} rows={3} required={requiresReason} />}
         {reasonTooLong && <p role="alert" className="mt-2 text-xs text-huddleroom-status-red">Answer or reason must be at most 4,000 Unicode characters.</p>}
         {error && <p className="mt-2 text-xs text-huddleroom-status-red">{error}</p>}
@@ -460,14 +468,14 @@ function AgentDefinitionReviewBatchForm({
               <Button type="button" variant="secondary" className="min-h-11" aria-pressed={answer.choice === 'edit'} disabled={disabled || reviewLocked} onClick={() => update(decision.id, { choice: answer.choice === 'edit' ? null : 'edit' })}>Edit</Button>
             </div>
             {answer.choice === 'reject' && <div className="mt-2">
-              <Textarea label="Reason (required)" value={answer.reason} readOnly={reviewLocked} onChange={(event) => update(decision.id, { reason: event.target.value })} rows={2} required />
+              <Textarea label="Reason (required)" value={answer.reason} readOnly={reviewLocked || submitting} onChange={(event) => update(decision.id, { reason: event.target.value })} rows={2} required />
               <div className="mt-2 flex justify-end">
                 <Button type="button" className="min-h-11" disabled={disabled || reviewLocked || !canSubmitReason(answer.reason)} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: 'reject' })}>Confirm reject</Button>
               </div>
             </div>}
             {answer.choice === 'edit' && <div className="mt-2">
-              <Textarea label="Description" value={answer.editedDescription} readOnly={reviewLocked} onChange={(event) => update(decision.id, { editedDescription: event.target.value })} rows={3} required />
-              <Textarea label="Persona" value={answer.editedPersona} readOnly={reviewLocked} onChange={(event) => update(decision.id, { editedPersona: event.target.value })} rows={3} required />
+              <Textarea label="Description" value={answer.editedDescription} readOnly={reviewLocked || submitting} onChange={(event) => update(decision.id, { editedDescription: event.target.value })} rows={3} required />
+              <Textarea label="Persona" value={answer.editedPersona} readOnly={reviewLocked || submitting} onChange={(event) => update(decision.id, { editedPersona: event.target.value })} rows={3} required />
               <div className="mt-2 flex justify-end">
                 <Button type="button" className="min-h-11" disabled={disabled || reviewLocked || !answer.editedDescription.trim() || !answer.editedPersona.trim()} onClick={() => decideAndMaybeSubmit(decision.id, { selectedOption: 'edit' })}>Confirm edit</Button>
               </div>
@@ -542,7 +550,7 @@ function TeamHierarchyProposalForm({ decision, disabled, reviewLocked = false, s
   }
 
   const field = (label: string, key: keyof AgentCreatePayload, required = false) => <label className="block text-xs text-huddleroom-text-secondary">{label}
-    <input className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2 text-sm text-huddleroom-text-primary" required={required} readOnly={reviewLocked} value={String(draft[key] ?? '')} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))} />
+    <input className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2 text-sm text-huddleroom-text-primary" required={required} readOnly={reviewLocked || submitting} value={String(draft[key] ?? '')} onChange={(event) => setDraft((current) => ({ ...current, [key]: event.target.value }))} />
   </label>
   const capabilities = Array.isArray(definition.capabilities)
     ? definition.capabilities.filter((capability): capability is string => typeof capability === 'string' && capability.trim().length > 0)
@@ -571,9 +579,9 @@ function TeamHierarchyProposalForm({ decision, disabled, reviewLocked = false, s
       {field('Name', 'name', true)}{field('Role', 'role', true)}{field('Description', 'description')}{field('Provider', 'provider', true)}{field('Model', 'model', true)}
       <label className="block text-xs text-huddleroom-text-secondary">Adapter type<select className="mt-1 min-h-11 w-full rounded border border-huddleroom-border bg-huddleroom-surface px-2" disabled={reviewLocked} value={draft.adapter_type ?? 'api'} onChange={(event) => setDraft((current) => ({ ...current, adapter_type: event.target.value as AgentCreatePayload['adapter_type'] }))}><option value="api">api</option><option value="cli">cli</option><option value="routine">routine</option></select></label>
       {field('CLI runtime', 'cli_runtime')}
-      <Textarea label="Capabilities (one per line)" value={(draft.capabilities ?? []).join('\n')} readOnly={reviewLocked} onChange={(event) => setDraft((current) => ({ ...current, capabilities: event.target.value.split('\n').filter(Boolean) }))} rows={3} />
-      <Textarea label="System prompt" value={draft.system_prompt ?? ''} readOnly={reviewLocked} onChange={(event) => setDraft((current) => ({ ...current, system_prompt: event.target.value }))} rows={8} />
-      <Textarea label="Config (JSON object)" value={config} readOnly={reviewLocked} onChange={(event) => setConfig(event.target.value)} rows={5} />
+      <Textarea label="Capabilities (one per line)" value={(draft.capabilities ?? []).join('\n')} readOnly={reviewLocked || submitting} onChange={(event) => setDraft((current) => ({ ...current, capabilities: event.target.value.split('\n').filter(Boolean) }))} rows={3} />
+      <Textarea label="System prompt" value={draft.system_prompt ?? ''} readOnly={reviewLocked || submitting} onChange={(event) => setDraft((current) => ({ ...current, system_prompt: event.target.value }))} rows={8} />
+      <Textarea label="Config (JSON object)" value={config} readOnly={reviewLocked || submitting} onChange={(event) => setConfig(event.target.value)} rows={5} />
       {(validation || error) && <p className="text-xs text-huddleroom-status-red">{validation || error}</p>}
       <div className="flex justify-end gap-2"><Button type="button" variant="secondary" disabled={disabled} onClick={() => { setEditing(false); setDraft({ ...definition, capabilities: definition.capabilities ?? [], config: definition.config ?? {} }); setConfig(JSON.stringify(definition.config ?? {}, null, 2)); setValidation(null); if (!onCancelEdit?.()) queueMicrotask(() => editRef.current?.focus()) }}>Cancel</Button><Button type="submit" disabled={disabled || reviewLocked}>{submitting ? 'Submitting…' : 'Submit edit'}</Button></div>
     </form>}
@@ -609,6 +617,7 @@ function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: rea
 
 export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], needsYouReferences = [], sourceActionIds = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, onRevealSource, renderBlockerRecovery, suppressQueueAnnouncement, queueAnnouncementScope, getMutationGeneration }: BaselineDashboardProps) {
   const health = useOrchestrationHealth()
+  const currentUser = useCurrentUser()
   const answer = useAnswerOrchestrationDecision(projectId)
   const answerAgentDefinitionBatch = useAnswerAgentDefinitionReviewBatch(projectId)
   const skip = useSkipOrchestrationProcess(projectId)
@@ -638,6 +647,24 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   const [formError, setFormError] = useState<string | null>(null)
   const [formErrorSource, setFormErrorSource] = useState<'action' | 'batch' | null>(null)
   const [invalidatedDecisions, setInvalidatedDecisions] = useState<Record<string, 'terminal' | 'stale' | 'unavailable'>>({})
+  type FrozenAnswer = {
+    submission: OrchestrationAnswerSubmission
+    reviewed: OrchestrationAuthorityDecisionRecord[]
+    owner: BaselineMutationOwner
+    finish: () => void
+    scope: string
+  }
+  const [savedAnswers, setSavedAnswers] = useState<OrchestrationAnswerReceipt[]>([])
+  const [checkingAnswer, setCheckingAnswer] = useState<FrozenAnswer | null>(null)
+  const [ordinarySubmitting, setOrdinarySubmitting] = useState(false)
+  const checkingAnswerRef = useRef<FrozenAnswer | null>(null)
+  const savedContexts = useRef(new Map<string, FrozenAnswer>())
+  const savedAnswersRef = useRef(savedAnswers)
+  savedAnswersRef.current = savedAnswers
+  const answerScopeRef = useRef('')
+  answerScopeRef.current = `${projectId}:${goalId}:${run?.id ?? ''}`
+  const ordinaryBusy = ordinarySubmitting || checkingAnswer !== null
+
   const [runRerunError, setRunRerunError] = useState<string | null>(null)
   const [retryError, setRetryError] = useState<string | null>(null)
   const [authorizeError, setAuthorizeError] = useState<string | null>(null)
@@ -650,7 +677,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   const reasonRef = useRef<HTMLTextAreaElement>(null)
   const submitRef = useRef<HTMLButtonElement>(null)
   const processes = currentProcesses(dashboard.processes.data)
-  const decisions = dashboard.decisions.data ?? []
+  const decisions = useMemo(() => dashboard.decisions.data ?? [], [dashboard.decisions.data])
   const warnings = dashboard.warnings.data ?? []
   const checkpointItems = dashboard.checkpoint.data?.items ?? []
   const deferredCount = dashboard.checkpoint.data?.deferred_count ?? 0
@@ -663,7 +690,29 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   const queueQueriesErrored = queueQueries.some((query) => query.isError)
   const queueQueriesUnready = queueQueries.some((query) => query.isLoading || query.data === undefined)
   const authorityReady = !dashboard.decisions.isLoading && !dashboard.decisions.isError
-    && dashboard.decisions.data !== undefined && !dashboard.decisions.isFetching
+    && dashboard.decisions.data !== undefined
+  const savedIdentity = savedAnswers.map((receipt) => receipt.action_id ?? receipt.decision_ids.join(':')).join('|')
+  useEffect(() => {
+    let current = true
+    for (const receipt of savedAnswersRef.current) {
+      const key = receipt.action_id ?? receipt.decision_ids.join(':')
+      const frozen = savedContexts.current.get(key)
+      if (!frozen || frozen.scope !== answerScopeRef.current) continue
+      // Follow the existing authority refresh, but reconcile only this immutable saved identity.
+      void Promise.resolve().then(() => fetchOrchestrationDecision(projectId, goalId, frozen.reviewed[0].id)).then((result) => {
+        if (!current || frozen.scope !== answerScopeRef.current || !result
+            || !validateSavedAnswerReceipt(result.answer_receipt, frozen.submission)
+            || !validateOrdinaryAnswerResult(frozen.reviewed[0], frozen.submission, result)) return
+        const updated = result.answer_receipt!
+        setSavedAnswers((existing) => existing.map((item) => {
+          const itemKey = item.action_id ?? item.decision_ids.join(':')
+          return itemKey === key && JSON.stringify(item) !== JSON.stringify(updated) ? updated : item
+        }))
+      }).catch(() => undefined) // A failed background read never revokes confirmed Saved.
+    }
+    return () => { current = false }
+  }, [projectId, goalId, savedIdentity, dashboard.decisions.data, dashboard.decisions.dataUpdatedAt, dashboard.checkpoint.data, dashboard.checkpoint.dataUpdatedAt])
+
 
   useEffect(() => {
     if (!authorityReady) return
@@ -678,7 +727,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
       }
       return changed ? next : current
     })
-  }, [authorityReady, dashboard.decisions.data])
+  }, [authorityReady, decisions])
   const effectiveProcessType = selectedProcessType ?? preferredProcessType(processes)
   const selectedProcess = processes.find((process) => process.process_type === effectiveProcessType)
   const debug = health.data?.debug_enabled === true
@@ -786,14 +835,126 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     return false
   }
 
-  function refreshAfterAcceptedRuntimeAnswer(result: OrchestrationDecisionAnswerResult) {
+  function refreshAfterAcceptedSpecializedAnswer(result: OrchestrationDecisionAnswerResult) {
     void answer.acceptRuntimeResult(goalId, result)
     void Promise.all([
       dashboard.decisions.refetch(),
       dashboard.checkpoint.refetch(),
       dashboard.processes.refetch(),
       dashboard.warnings.refetch(),
-    ])
+    ]).catch(() => undefined)
+  }
+
+  function publishSaved(frozen: FrozenAnswer, result: OrchestrationDecisionAnswerResult) {
+    if (frozen.scope !== answerScopeRef.current || !validateSavedAnswerReceipt(result.answer_receipt, frozen.submission)) return false
+    const receipt = result.answer_receipt!
+    savedContexts.current.set(receipt.action_id ?? receipt.decision_ids.join(':'), frozen)
+    setSavedAnswers((current) => [...current.filter((item) => JSON.stringify(item.decision_ids) !== JSON.stringify(receipt.decision_ids)), receipt])
+    checkingAnswerRef.current = null
+    setCheckingAnswer(null)
+    clearReviewState(receipt.decision_ids)
+    onMessage(`Saved. ${receipt.application_state === 'pending' ? 'Application pending.'
+      : receipt.application_state === 'failed' || receipt.application_state === 'blocked' ? `Application ${receipt.application_state}${receipt.reason ? `: ${receipt.reason}` : '.'}` : 'Application complete.'}`)
+    frozen.finish()
+    return true
+  }
+
+  async function reconcileAnswer(frozen: FrozenAnswer) {
+    if (frozen.scope !== answerScopeRef.current) return false
+    checkingAnswerRef.current = frozen
+    setCheckingAnswer(frozen)
+    onMessage('Checking saved answer…')
+    try {
+      const results = await Promise.all(frozen.reviewed.map((decision) => fetchOrchestrationDecision(projectId, goalId, decision.id)))
+      if (frozen.scope !== answerScopeRef.current) return false
+      if (results.every((result, index) => validateSavedAnswerReceipt(result.answer_receipt, frozen.submission)
+          && validateOrdinaryAnswerResult(frozen.reviewed[index], frozen.submission, result))) {
+        if (frozen.submission.kind === 'batch') answerAgentDefinitionBatch.acceptResult(goalId,
+          { decisions: results.map((result) => result.decision), answer_receipt: results[0].answer_receipt }, frozen.submission)
+        else answer.acceptResult(goalId, results[0], frozen.submission)
+        return publishSaved(frozen, results[0])
+      }
+      if (results.some((result) => result.decision?.status !== 'pending')) {
+        checkingAnswerRef.current = null
+        setCheckingAnswer(null)
+        setReviewState(frozen.submission.decision_ids, 'stale')
+        const text = 'The saved outcome does not match this draft. Review the refreshed decision before answering.'
+        setFormError(text)
+        setFormErrorSource(frozen.submission.kind === 'batch' ? 'batch' : 'action')
+        onMessage(text)
+      }
+    } catch { /* An unavailable readback leaves the frozen draft in Checking. */ }
+    return false
+  }
+
+  async function checkFrozenAnswer() {
+    const frozen = checkingAnswerRef.current
+    if (!frozen || frozen.scope !== answerScopeRef.current) return
+    const isCurrent = beginMutation(frozen.owner)
+    if (!isCurrent) return
+    setOrdinarySubmitting(true)
+    try { await reconcileAnswer(frozen) } finally {
+      if (isCurrent()) releaseMutation(frozen.owner)
+      setOrdinarySubmitting(false)
+    }
+  }
+
+  async function submitOrdinary(
+    reviewedInput: readonly OrchestrationAuthorityDecisionRecord[],
+    inputs: Parameters<typeof createOrchestrationAnswerSubmission>[2],
+    kind: 'single' | 'batch',
+    post: (callbacks: { onSuccess: (result: OrchestrationDecisionAnswerResult | AgentDefinitionReviewBatchAnswerResult) => void; onError: (error: unknown) => void; onSettled: () => void }) => void,
+    finish: () => void,
+  ) {
+    if (!currentUser.data?.id || currentUser.isError || checkingAnswerRef.current) {
+      onMessage('The current human actor could not be confirmed. Refresh before answering.')
+      return
+    }
+    const reviewed = structuredClone([...reviewedInput])
+    const submission = createOrchestrationAnswerSubmission(reviewed, currentUser.data.id, structuredClone(inputs), kind, run?.id ?? null)
+    const owner: BaselineMutationOwner = kind === 'batch' ? 'baseline:answer:agent-definition-review-batch' : `baseline:answer:${reviewed[0].id}`
+    const isCurrent = beginMutation(owner)
+    if (!isCurrent) return
+    const frozen: FrozenAnswer = { submission, reviewed, owner, finish, scope: answerScopeRef.current }
+    setOrdinarySubmitting(true)
+    const targetsOpenForm = kind === 'batch' || openAction?.kind === 'answer' && submission.decision_ids.includes(openAction.id)
+    if (targetsOpenForm) { setFormError(null); setFormErrorSource(null) }
+    try {
+      if (!await preflightDecisions(reviewed, isCurrent) || !isCurrent()) return
+      let result: OrchestrationDecisionAnswerResult | AgentDefinitionReviewBatchAnswerResult
+      try {
+        result = await new Promise<OrchestrationDecisionAnswerResult | AgentDefinitionReviewBatchAnswerResult>((resolveResult, reject) => post({ onSuccess: resolveResult, onError: reject, onSettled: () => undefined }))
+      } catch (error) {
+        if (isCurrent() && kind === 'batch' && error instanceof ApiError && error.status === 409) {
+          void Promise.all([dashboard.decisions.refetch(), dashboard.processes.refetch(), dashboard.warnings.refetch()]).catch(() => undefined)
+          setReviewState(submission.decision_ids, 'stale')
+          onMessage('The proposals changed and were reloaded — please review the updated agent-definition proposals.')
+        } else if (isCurrent() && error instanceof ApiError && [400, 401, 403, 404, 409, 422].includes(error.status)) {
+          if (error.status === 409) setReviewState(submission.decision_ids, 'stale')
+          if (targetsOpenForm) { setFormError(actionError(error)); setFormErrorSource('action') }
+          onMessage(actionError(error))
+        } else if (isCurrent()) await reconcileAnswer(frozen)
+        return
+      }
+      if (!isCurrent()) return
+      if (!result || typeof result !== 'object') { await reconcileAnswer(frozen); return }
+      if (kind === 'batch' && 'decisions' in result) {
+        if (validateSavedAnswerReceipt(result.answer_receipt, submission)
+            && result.decisions.length === reviewed.length
+            && result.decisions.every((decision, index) => validateOrdinaryAnswerResult(reviewed[index], submission,
+              { decision, answer_receipt: result.answer_receipt }))) {
+          answerAgentDefinitionBatch.acceptResult(goalId, result, submission)
+          publishSaved(frozen, { decision: result.decisions[0], answer_receipt: result.answer_receipt })
+        } else await reconcileAnswer(frozen)
+      } else if ('decision' in result && validateSavedAnswerReceipt(result.answer_receipt, submission)
+          && validateOrdinaryAnswerResult(reviewed[0], submission, result)) {
+        answer.acceptResult(goalId, result, submission)
+        publishSaved(frozen, result)
+      } else await reconcileAnswer(frozen)
+    } finally {
+      if (isCurrent()) releaseMutation(owner)
+      setOrdinarySubmitting(false)
+    }
   }
 
   function runMutation<T>(action: BaselineFocusAction, mutate: (callbacks: { onSuccess: (data: T) => void; onError: (error: unknown) => void; onSettled: () => void }) => void, success: string, onSuccessFocus?: () => void, acceptResult?: (data: T) => boolean) {
@@ -837,10 +998,25 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     onSuccessFocus?: () => void,
     editedAgent?: AgentCreatePayload,
   ) {
+    if (!decision.runtime_identity && !decision.recovery) {
+      const frozenAgent = editedAgent ? structuredClone(editedAgent) : undefined
+      const payload = { goalId, decisionId: decision.id, selectedOption,
+        reason: submitReason, contractVersion: decision.contract_version, editedAgent: frozenAgent }
+      const targetsOpenForm = openAction?.kind === 'answer' && openAction.id === decision.id
+      await submitOrdinary([decision], [payload], 'single',
+        (callbacks) => answer.mutate(payload, callbacks),
+        () => { if (targetsOpenForm) setOpenAction(null); (onSuccessFocus ?? (() => restoreSuccessFocus({ kind: 'answer', id: decision.id })))() })
+      return
+    }
     const preflightGeneration = generation()
     const preflightGoalId = goalId
     const reviewed = decision
     const submitted = { selectedOption, reason: reviewed.runtime_identity ? submitReason || null : submitReason.trim() || null }
+    const recoverySubmission = reviewed.recovery && currentUser.data?.id
+      ? createOrchestrationAnswerSubmission([structuredClone(reviewed)], currentUser.data.id,
+        [{ decisionId: reviewed.id, selectedOption, reason: submitReason, contractVersion: reviewed.contract_version }], 'single', run?.id ?? null)
+      : null
+    if (reviewed.recovery && !recoverySubmission) { onMessage('The current human actor could not be confirmed. Refresh before answering.'); return }
     if (!await preflightDecisions([reviewed], () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
       || generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) return
     const action: BaselineFocusAction = { kind: 'answer', id: reviewed.id }
@@ -854,7 +1030,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
       editedAgent,
     }, callbacks), success, onSuccessFocus, reviewed.runtime_identity ? (result) => {
       if (validateRuntimeAnswerReceipt(reviewed, submitted, result) === 'accepted') {
-        refreshAfterAcceptedRuntimeAnswer(result)
+        refreshAfterAcceptedSpecializedAnswer(result)
         return true
       }
       setReviewState([reviewed.id], 'stale')
@@ -863,6 +1039,14 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
       setFormError(message)
       setFormErrorSource('action')
       onMessage(message)
+      return false
+    } : reviewed.recovery ? (result) => {
+      if (recoverySubmission && validateOrdinaryAnswerResult(reviewed, recoverySubmission, result)) {
+        refreshAfterAcceptedSpecializedAnswer(result)
+        return true
+      }
+      setReviewState([reviewed.id], 'stale')
+      onMessage('The decision changed while the answer was being recorded. Review the refreshed decision before answering.')
       return false
     } : undefined)
   }
@@ -887,8 +1071,8 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     else if (action.kind === 'acknowledge' || action.kind === 'resolve') target = { kind: action.kind, action, warning: record as OrchestrationWarningRecord }
     if (!target) return null
     return <BaselineActionForm key={formKey ?? (target.kind === 'answer' ? `${target.decision.id}:${target.decision.contract_version ?? target.decision.runtime_identity ?? 'legacy'}` : `${target.kind}:${target.action.id}`)}
-      target={target} mutationBusy={mutationBusy}
-      submitting={action.kind === 'answer' ? answer.isPending : action.kind === 'skip' ? skip.isPending : action.kind === 'acknowledge' ? acknowledge.isPending : resolve.isPending}
+      target={target} mutationBusy={mutationBusy || ordinaryBusy}
+      submitting={action.kind === 'answer' ? answer.isPending || ordinaryBusy : action.kind === 'skip' ? skip.isPending : action.kind === 'acknowledge' ? acknowledge.isPending : resolve.isPending}
       selectedOption={selectedOption} reason={reason} error={formErrorSource === 'action' ? formError : null}
       firstOptionRef={firstOptionRef} reasonRef={reasonRef} submitRef={submitRef}
       onAnswer={(decision, option, submitReason) => { void submitDecision(decision, option, submitReason, 'Answer received.', onSuccessFocus) }}
@@ -922,6 +1106,12 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     answerText: string,
     callbacks: { onSuccess: () => void; onError: (error: unknown) => void; onSettled: () => void },
   ) {
+    if (!decision.runtime_identity) {
+      const payload = { goalId, decisionId: decision.id, selectedOption: answerText, reason: '', contractVersion: decision.contract_version }
+      await submitOrdinary([decision], [payload], 'single', (handlers) => answer.mutate(payload, handlers), callbacks.onSuccess)
+      callbacks.onSettled()
+      return
+    }
     const preflightGeneration = generation()
     const preflightGoalId = goalId
     const reviewed = decision
@@ -952,7 +1142,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
           onMessage(staleError.message)
           return
         }
-      if (reviewed.runtime_identity) refreshAfterAcceptedRuntimeAnswer(result)
+      if (reviewed.runtime_identity) refreshAfterAcceptedSpecializedAnswer(result)
         onMessage('Answer received.')
         callbacks.onSuccess()
       },
@@ -980,6 +1170,15 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     const preflightGoalId = goalId
     const reviewed = decision
     const submitted = { selectedOption: option, reason: reviewed.runtime_identity ? reason || null : reason.trim() || null }
+    const recoverySubmission = currentUser.data?.id
+      ? createOrchestrationAnswerSubmission([structuredClone(reviewed)], currentUser.data.id,
+        [{ decisionId: reviewed.id, selectedOption: option, reason, contractVersion: reviewed.contract_version }], 'single', run?.id ?? null)
+      : null
+    if (!reviewed.runtime_identity && !recoverySubmission) {
+      callbacks.onError(new Error('The current human actor could not be confirmed. Refresh before answering.'))
+      callbacks.onSettled()
+      return
+    }
     const preflightCurrent = await preflightDecisions([reviewed], () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
     if (generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) {
       callbacks.onSettled()
@@ -1006,7 +1205,12 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
           onMessage(staleError.message)
           return
         }
-      if (reviewed.runtime_identity) refreshAfterAcceptedRuntimeAnswer(result)
+        if (!reviewed.runtime_identity && (!recoverySubmission || !validateOrdinaryAnswerResult(reviewed, recoverySubmission, result))) {
+          setReviewState([reviewed.id], 'stale')
+          callbacks.onError(new Error('The decision changed. Review the refreshed decision before answering.'))
+          return
+        }
+        refreshAfterAcceptedSpecializedAnswer(result)
         onMessage(option === 'approve_fix' ? 'Fix approved.' : option === 'reject' ? 'Fix rejected.' : 'Marked as provided. Re-diagnosing the blocker…')
         callbacks.onSuccess()
       },
@@ -1022,35 +1226,10 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   }
 
   async function submitAgentDefinitionReviewBatch(reviewed: readonly OrchestrationAuthorityDecisionRecord[], answers: AgentDefinitionReviewBatchAnswerInput[], onSuccessFocus?: () => void) {
-    const preflightGeneration = generation()
-    const preflightGoalId = goalId
-    if (!await preflightDecisions(reviewed, () => generation() === preflightGeneration && currentGoalId.current === preflightGoalId)
-      || generation() !== preflightGeneration || currentGoalId.current !== preflightGoalId) return
-    const owner: BaselineMutationOwner = 'baseline:answer:agent-definition-review-batch'
-    const isCurrent = beginMutation(owner)
-    if (!isCurrent) return
-    setFormError(null)
-    setFormErrorSource(null)
-    answerAgentDefinitionBatch.mutate({ goalId, answers }, {
-      onSuccess: () => {
-        if (!isCurrent()) return
-        setOpenAction(null)
-        onMessage('Agent-definition review completed.')
-        guardedMicrotask(onSuccessFocus ?? (() => focusHeadingRef.current?.focus()))
-      },
-      onError: (error) => {
-        if (!isCurrent()) return
-        if (error instanceof ApiError && error.status === 409) {
-          void Promise.all([dashboard.decisions.refetch(), dashboard.processes.refetch(), dashboard.warnings.refetch()])
-          onMessage('The proposals changed and were reloaded — please review the updated agent-definition proposals.')
-          guardedMicrotask(() => focusHeadingRef.current?.focus())
-        } else {
-          setFormError(actionError(error))
-          setFormErrorSource('batch')
-        }
-      },
-      onSettled: () => { if (isCurrent()) { releaseMutation(owner) } },
-    })
+    const frozenAnswers = structuredClone(answers)
+    await submitOrdinary(reviewed, frozenAnswers.map((item) => ({ ...item, reason: item.reason ?? '' })), 'batch',
+      (callbacks) => answerAgentDefinitionBatch.mutate({ goalId, answers: frozenAnswers }, callbacks),
+      () => { setOpenAction(null); guardedMicrotask(onSuccessFocus ?? (() => focusHeadingRef.current?.focus())) })
   }
 
   function answerTeamProposal(decision: OrchestrationAuthorityDecisionRecord, selectedOption: string, editedAgent: AgentCreatePayload | undefined, onSuccess?: () => void) {
@@ -1204,20 +1383,28 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
     <TeamHierarchyStatus decisions={decisions} reviews={dashboard.agentReviews.data ?? []} processId={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)?.id ?? null} />
     <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
     {processState === 'ready' && <>
+      {savedAnswers.length > 0 && <section aria-label="Saved answers" className="mb-3 space-y-2">{savedAnswers.map((receipt) => <p key={receipt.action_id ?? receipt.decision_ids.join(':')} className="break-words rounded border border-huddleroom-border p-3 text-sm">
+        <strong>Saved.</strong> {receipt.application_state === 'pending' ? 'Application pending.'
+          : receipt.application_state === 'failed' || receipt.application_state === 'blocked' ? `Application ${receipt.application_state}${receipt.reason ? `: ${receipt.reason}` : '.'}` : 'Application complete.'}
+      </p>)}</section>}
+      {checkingAnswer && <div className="mb-3 rounded border border-huddleroom-border p-3 text-sm">
+        <p>Checking saved answer… Your frozen draft is retained.</p>
+        <Button type="button" variant="secondary" className="mt-2 min-h-11" disabled={ordinarySubmitting || mutationBusy} onClick={() => { void checkFrozenAnswer() }}>Check saved answer</Button>
+      </div>}
       <NeedsYouQueue
         goal={goal} run={run} processes={processes} sourceProcesses={dashboard.processes.data ?? []} warnings={warnings} gates={gates} meetingCommitments={meetingCommitments}
         checkpointItems={checkpointItems} allDecisions={decisions} authorityReady={authorityReady} invalidatedDecisions={invalidatedDecisions} needsYouReferences={needsYouReferences} sourceActionIds={sourceActionIds}
         recoveryDecisions={decisions} onAnswerRecoveryProposal={answerRecoveryProposal} checkpointLoaded={dashboard.checkpoint.isSuccess}
         queriesErrored={queueQueriesErrored} queriesUnready={queueQueriesUnready}
         deferredCount={deferredCount} isWorking={isWorking}
-        mutationBusy={mutationBusy} onSelectProcess={setSelectedProcessType}
+        mutationBusy={mutationBusy || ordinaryBusy} onSelectProcess={setSelectedProcessType}
         onRevealSource={onRevealSource}
         openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }}
         renderActionForm={renderActionForm}
-        renderAgentDefinitionReviewBatch={(batchDecisions, onSuccessFocus, batchKey, displayReferences, editState = 'current') => <AgentDefinitionReviewBatchForm key={batchKey} decisions={batchDecisions} mutationBusy={mutationBusy} reviewLocked={editState !== 'current'} submitting={answerAgentDefinitionBatch.isPending} error={formErrorSource === 'batch' ? formError : null} onSubmit={(answers) => { void submitAgentDefinitionReviewBatch(batchDecisions, answers, onSuccessFocus) }} displayReferences={displayReferences} />}
+        renderAgentDefinitionReviewBatch={(batchDecisions, onSuccessFocus, batchKey, displayReferences, editState = 'current') => <AgentDefinitionReviewBatchForm key={batchKey} decisions={batchDecisions} mutationBusy={mutationBusy || ordinaryBusy} reviewLocked={editState !== 'current'} submitting={answerAgentDefinitionBatch.isPending || ordinaryBusy} error={formErrorSource === 'batch' ? formError : null} onSubmit={(answers) => { void submitAgentDefinitionReviewBatch(batchDecisions, answers, onSuccessFocus) }} displayReferences={displayReferences} />}
         renderTeamHierarchyProposal={(decision, onSuccess, registerPrimary, displayReferences, editState = 'current', formKey, onReleaseEdit, onBeginEdit) => {
           const isActive = openAction?.kind === 'answer' && openAction?.id === decision.id
-          return <TeamHierarchyProposalForm key={formKey} decision={decision} disabled={mutationBusy} reviewLocked={editState !== 'current'} submitting={answer.isPending} error={isActive && formErrorSource === 'action' ? formError : null} onSubmit={(option, editedAgent) => answerTeamProposal(decision, option, editedAgent, onSuccess)} onCancelEdit={onReleaseEdit} onBeginEdit={onBeginEdit} primaryRef={registerPrimary} displayReferences={displayReferences} />
+          return <TeamHierarchyProposalForm key={formKey} decision={decision} disabled={mutationBusy || ordinaryBusy} reviewLocked={editState !== 'current'} submitting={answer.isPending || ordinaryBusy} error={isActive && formErrorSource === 'action' ? formError : null} onSubmit={(option, editedAgent) => answerTeamProposal(decision, option, editedAgent, onSuccess)} onCancelEdit={onReleaseEdit} onBeginEdit={onBeginEdit} primaryRef={registerPrimary} displayReferences={displayReferences} />
         }}
         onAcceptDecision={acceptRecommendation} onAnswerGoalDefinitionQuestion={answerGoalDefinitionQuestion}
         retryPending={retry.isPending} retryError={retryError} onRetryProcess={retryProcess}
@@ -1233,7 +1420,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
         }}
         renderBlockerRecovery={renderBlockerRecovery} suppressAnnouncement={suppressQueueAnnouncement} announcementScope={queueAnnouncementScope}
       />
-      <ProcessFocus selectedProcessType={effectiveProcessType} process={selectedProcess} goal={goal} decisions={decisions} decisionsUnready={dashboard.decisions.isLoading || dashboard.decisions.isError} warnings={warnings} reviews={dashboard.agentReviews.data ?? []} debug={debug} canSkip={!!selectedProcess && goal.status !== 'completed' && goal.status !== 'cancelled' && (selectedProcess.status === 'running' || selectedProcess.status === 'waiting_decision')} mutationBusy={mutationBusy} canRun={canRunSelected} canRerun={canRerunSelected} runPending={runStep.isPending} rerunPending={rerun.isPending} runRerunError={runRerunError} onRun={(trigger) => mutateChain(effectiveProcessType, 'run', trigger)} onRerun={(trigger) => mutateChain(effectiveProcessType, 'rerun', trigger)} retryPending={retry.isPending} retryError={retryError} onRetry={(trigger) => retryProcess(effectiveProcessType, trigger)} openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }} headingRef={focusHeadingRef} renderActionForm={renderActionForm} onViewActivity={onViewActivity} />
+      <ProcessFocus selectedProcessType={effectiveProcessType} process={selectedProcess} goal={goal} decisions={decisions} decisionsUnready={dashboard.decisions.isLoading || dashboard.decisions.isError} warnings={warnings} reviews={dashboard.agentReviews.data ?? []} debug={debug} canSkip={!!selectedProcess && goal.status !== 'completed' && goal.status !== 'cancelled' && (selectedProcess.status === 'running' || selectedProcess.status === 'waiting_decision')} mutationBusy={mutationBusy || ordinaryBusy} canRun={canRunSelected} canRerun={canRerunSelected} runPending={runStep.isPending} rerunPending={rerun.isPending} runRerunError={runRerunError} onRun={(trigger) => mutateChain(effectiveProcessType, 'run', trigger)} onRerun={(trigger) => mutateChain(effectiveProcessType, 'rerun', trigger)} retryPending={retry.isPending} retryError={retryError} onRetry={(trigger) => retryProcess(effectiveProcessType, trigger)} openAction={openAction} onOpenAction={openForm} onActionTrigger={(action, element) => { actionTriggers.current[`${action.kind}:${action.id}`] = element }} headingRef={focusHeadingRef} renderActionForm={renderActionForm} onViewActivity={onViewActivity} />
     </>}
   </div>
 }
