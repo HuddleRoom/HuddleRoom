@@ -10501,7 +10501,7 @@ class OrchestrationService:
             if run_part != str(run.id) or plan_state.get("status") != "accepted":
                 return False
             # A later accepted version also settles an earlier version's missing plan.
-            return not version or (version.isdigit() and int(plan_state.get("planning_version") or 0) >= int(version))
+            return not version or (version.isascii() and version.isdigit() and int(plan_state.get("planning_version") or 0) >= int(version))
         try:
             subject_id = uuid.UUID(subject)
         except ValueError:

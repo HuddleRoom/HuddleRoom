@@ -46,6 +46,7 @@ def test_invalid_condition_rejected(raw):
         ({"condition": "plan_missing", "subject": "run-1"}, "plan_missing subject run must be a UUID"),
         ({"condition": "plan_missing", "subject": f"{T1}:v2"}, "version must be digits"),
         ({"condition": "plan_missing", "subject": f"{T1}:"}, "version must be digits"),
+        ({"condition": "plan_missing", "subject": f"{T1}:\u00b2"}, "version must be digits"),
     ],
 )
 def test_never_holding_subject_is_rejected_with_its_reason(raw, message):

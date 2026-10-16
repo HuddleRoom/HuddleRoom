@@ -46,7 +46,7 @@ def _normalized_subject(condition: str, subject: str) -> str:
     if condition != PLAN_MISSING:
         return _uuid(subject, f"{condition} subject")
     run_part, sep, version = subject.partition(":")
-    if sep and not version.isdigit():
+    if sep and not (version.isascii() and version.isdigit()):
         raise ConditionError(f"plan_missing subject version must be digits, got {version!r}")
     return _uuid(run_part, "plan_missing subject run") + (f":{int(version)}" if sep else "")
 
