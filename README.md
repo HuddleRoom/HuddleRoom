@@ -527,3 +527,32 @@ From a browser already admitted by your tunnel, open `/docs`, expand
 `POST /api/system/restart`, choose **Try it out**, enter `restart` in
 `X-HuddleRoom-Confirm`, and execute. Disabled mode returns 404; unsupported launch
 modes return 503. There is no separate reset login or UI.
+
+### Optional raw database export
+
+Database export is disabled by default and independent of backend restart.
+Set `allow_db_export = true` in `~/.huddleroom/config.toml` or
+`HUDDLEROOM_ALLOW_DB_EXPORT=true` in the environment / `.env` (environment wins).
+Enable it only behind your **authenticated ngrok tunnel**, with direct backend
+access restricted. The endpoint adds no separate login/token: when application
+authentication is disabled, anyone who can reach it can download the database.
+
+Open `/docs`, expand `POST /api/system/database/export`, choose **Try it out**,
+enter `export` in `X-HuddleRoom-Confirm`, execute, and download the binary response.
+This constant header prevents accidental requests; it is not authentication.
+Browser requests must be same-origin; nonbrowser clients may omit Origin.
+
+The download is a **raw complete database**, including prompts, messages and any
+sensitive material stored in database rows. It is not sanitized. It does not
+include workspace files, provider environment files or other external files.
+Store and share it accordingly. The online SQLite backup includes committed WAL
+content without copying the live database files; uncommitted work is excluded.
+Only the configured ordinary file-backed SQLite database is supported: no caller
+path, in-memory database, PostgreSQL or SQLite URI/query options. Disabled returns
+404; unavailable/unsupported database or backup timeout returns 503.
+
+The server creates a private temporary snapshot, sends it as `huddleroom.sqlite3`
+with `Cache-Control: no-store`, then removes the server-side snapshot after
+completion, cancellation or transfer failure. The backup has a 30-second deadline;
+large/busy databases can fail instead of downloading. No backend restart or goal
+resume is needed to export.

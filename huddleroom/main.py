@@ -325,6 +325,10 @@ async def lifespan(_app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="HuddleRoom", lifespan=lifespan)
 
+    from huddleroom.services.database_export import SnapshotResponse, export_database
+    app.add_api_route("/api/system/database/export", export_database, methods=["POST"], response_class=SnapshotResponse,
+                      responses={200: {"content": {"application/vnd.sqlite3": {"schema": {"type": "string", "format": "binary"}}}}})
+
     from huddleroom.services.backend_restart import request_restart
     app.add_api_route("/api/system/restart", request_restart, methods=["POST"], status_code=202)
     from huddleroom.services.backend_restart import DrainMiddleware

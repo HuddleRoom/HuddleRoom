@@ -165,6 +165,7 @@ class Settings(BaseSettings):
     debug: bool = False
     log_file: str | None = None
     allow_api_reset: bool = False
+    allow_db_export: bool = False
     auth_enabled: bool = False
     api_base_url: str = "http://localhost:8000"
     embedding_model: str = "text-embedding-3-small"
