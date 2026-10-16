@@ -7,6 +7,8 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision
@@ -19,6 +21,46 @@ from huddleroom.services.orchestration_blocker_recovery import (
 from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
 
 SHA = "a" * 64
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine):
+    """SPR230/SPR231 this persistence suite owns its preparation session."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as owned:
+        yield owned
+        await owned.rollback()
+
+
+@pytest_asyncio.fixture
+async def owned_recovery_setup(test_engine, tmp_path, monkeypatch):
+    """Own preparation only for reset tests that need persisted recovery history."""
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    async with AsyncSession(test_engine, expire_on_commit=False) as owned:
+        project, user = await seed_project_user(owned, tmp_path)
+        await owned.commit()
+        owned.expunge(project)
+        owned.expunge(user)
+        original = OrchestrationBlockerRecoveryService.diagnose
+        async def diagnose(service, db, trigger_id, **kwargs):
+            if db is owned:
+                await db.flush()
+                await db.commit()
+            return await original(service, db, trigger_id, **kwargs)
+        monkeypatch.setattr(OrchestrationBlockerRecoveryService, "diagnose", diagnose)
+        yield owned, project, user
+
+
+@pytest.fixture(autouse=True)
+def _owned_diagnosis_setup(monkeypatch, db_session):
+    original = OrchestrationBlockerRecoveryService.diagnose
+    async def diagnose(service, db, trigger_id, **kwargs):
+        if db is db_session:
+            # This test fixture owns staged setup, then enters actual diagnosis
+            # with a fresh owned transaction; caller-contract tests live separately.
+            await db.flush()
+            await db.commit()
+        return await original(service, db, trigger_id, **kwargs)
+    monkeypatch.setattr(OrchestrationBlockerRecoveryService, "diagnose", diagnose)
 
 
 def trigger_for(goal, run, *, fingerprint=SHA, source_id=None):

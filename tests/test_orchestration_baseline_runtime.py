@@ -5,7 +5,8 @@ import uuid
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from contextlib import asynccontextmanager
 
 from huddleroom.models.base import Base
 from huddleroom.models.project import Project
@@ -17,6 +18,23 @@ from huddleroom.services.orchestration_process_service import OrchestrationProce
 from huddleroom.services.orchestration_baseline_runtime import await_baseline_completion
 
 pytestmark = pytest.mark.asyncio
+
+
+@asynccontextmanager
+async def _owned_provider_operation(fixture_db, goal_id):
+    """SPR230/SPR231 actual provider tests need a valid run and independently owned transaction."""
+    from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+    async with AsyncSession(fixture_db.bind, expire_on_commit=False) as owned:
+        project = Project(name="Owned provider boundary")
+        owned.add(project)
+        await owned.flush()
+        goal = OrchestrationGoal(id=goal_id, project_id=project.id, objective="Provider boundary")
+        owned.add(goal)
+        await owned.flush()
+        owned.add(OrchestrationRun(goal_id=goal_id, status="running", baseline_authorized=True))
+        await owned.commit()
+        async with baseline_operation(owned, goal_id, owns_transaction=True):
+            yield owned
 
 @pytest.mark.parametrize("operation_kind", ["step", "rerun", "retry", "tick"])
 @pytest.mark.parametrize("provider_error", [False, True])
@@ -120,7 +138,7 @@ async def test_reset_wins_simultaneous_completion_and_explicit_transaction_owner
         await release.wait()
         return "discard me"
     async def action():
-        async with baseline_operation(db_session, goal_id, owns_transaction=False):
+        async with _owned_provider_operation(db_session, goal_id):
             return await await_baseline_completion(provider, {})
     task = asyncio.create_task(action())
     await entered.wait()
@@ -134,13 +152,18 @@ async def test_reset_wins_simultaneous_completion_and_explicit_transaction_owner
 
 async def test_explicit_transaction_provider_boundary_never_commits(db_session, monkeypatch):
     from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+    outer = db_session.get_transaction()
     async def forbidden_commit():
         pytest.fail("caller transaction was committed")
     monkeypatch.setattr(db_session, "commit", forbidden_commit)
     async def provider(**request):
-        return "ok"
-    async with baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
-        assert await await_baseline_completion(provider, {}) == "ok"
+        pytest.fail("provider admitted within caller-owned transaction")
+    with pytest.raises(HTTPException) as conflict:
+        async with baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+            await await_baseline_completion(provider, {})
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail["conflict"] == "orchestration_transaction_shape"
+    assert db_session.get_transaction() is outer and db_session.in_transaction()
 
 
 @pytest.mark.parametrize("with_invocation", [False, True])
@@ -181,7 +204,7 @@ async def test_real_repair_boundary_discards_late_provider_without_application_c
     parse, observe = Mock(side_effect=json.loads), Mock()
     goal_id = uuid.uuid4()
     async def action():
-        async with runtime.baseline_operation(db_session, goal_id, owns_transaction=False):
+        async with _owned_provider_operation(db_session, goal_id):
             return await complete_with_repair(provider, {"messages": []}, parse,
                                               invocation=invocation, response_observer=observe)
     task = asyncio.create_task(action())
@@ -371,7 +394,7 @@ async def test_observations_cross_empty_context_and_stop_immediately_on_reset(db
     async def action():
         token = sentinel.set("parent")
         try:
-            async with runtime.baseline_operation(db_session, goal_id, owns_transaction=False):
+            async with _owned_provider_operation(db_session, goal_id):
                 await runtime.await_baseline_completion(provider, {}, observer=observer)
         finally:
             sentinel.reset(token)
@@ -401,7 +424,7 @@ async def test_observer_is_not_forwarded_to_unadvertised_injected_completion(db_
         return "final"
     async def observer(*_args):
         pytest.fail("nonobservable completion emitted an update")
-    async with runtime.baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+    async with _owned_provider_operation(db_session, uuid.uuid4()):
         assert await runtime.await_baseline_completion(provider, {"messages": []}, observer=observer) == "final"
     assert received == [{"messages": []}]
 
@@ -430,7 +453,7 @@ async def test_observation_queue_overflow_drops_display_without_blocking_final(d
         InvocationContext(uuid.uuid4(), "system", "test", None, "api", "test", "model"), publish=publish)
     call = invocation.call(messages=[])
     async with call:
-        async with runtime.baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+        async with _owned_provider_operation(db_session, uuid.uuid4()):
             assert await asyncio.wait_for(runtime.await_baseline_completion(provider, {}, observer=call.output), 1) is final
     outputs = [event for event in records if event.event_type == "agent_response.output"]
     assert 0 < len(outputs) <= 32
@@ -475,7 +498,7 @@ async def test_default_api_iteration_and_reconstruction_are_provider_owned(db_se
     async def action():
         token = sentinel.set("parent")
         try:
-            async with runtime.baseline_operation(db_session, uuid.uuid4(), owns_transaction=False):
+            async with _owned_provider_operation(db_session, uuid.uuid4()):
                 return await runtime.await_baseline_completion(completion.orchestration_completion,
                     {"messages": []}, observer=observe)
         finally:

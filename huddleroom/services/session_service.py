@@ -4,7 +4,7 @@ import uuid
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
-from sqlalchemy import select, update, and_
+from sqlalchemy import select, update, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import SessionTransactionOrigin
 from fastapi import HTTPException
@@ -22,6 +22,60 @@ from huddleroom.services.project_service import ProjectService
 
 STALE_RUNNING_SESSION_ERROR = "stale_running_session: exceeded recovery timeout before watchdog pass"
 STALE_PENDING_SESSION_ERROR = "stale_pending_session: never started before recovery timeout"
+
+
+def _session_dispatch_after_commit(session) -> None:
+    root = session.get_transaction()
+    scope = session.get_nested_transaction() or root
+    pending = session.info.get("pending_session_dispatches", [])
+    if scope is not None and scope.nested:
+        for entry in pending:
+            if entry["scope"] is scope:
+                entry["scope"] = scope.parent
+        return
+    publish = [entry for entry in pending if entry["root"] is root]
+    retained = [entry for entry in pending if entry["root"] is not root]
+    if retained:
+        session.info["pending_session_dispatches"] = retained
+    else:
+        session.info.pop("pending_session_dispatches", None)
+        session.info.pop("pending_session_dispatch_listener", None)
+    from huddleroom.config import settings
+    seen = set()
+    for entry in publish:
+        session_id, project_id, adapter_type, task_id = entry["dispatch"]
+        if entry["dispatch"] in seen:
+            continue
+        seen.add(entry["dispatch"])
+        if settings.is_sqlite:
+            from huddleroom.workers.task_runner import register_session, is_task_live
+            if not is_task_live(task_id):
+                register_session(str(session_id), adapter_type, project_id, task_id=task_id)
+        else:
+            from huddleroom.workers.session_tasks import run_api_session, run_cli_session
+            task = run_api_session if adapter_type == "api" else run_cli_session
+            task.apply_async(args=[str(session_id)], task_id=task_id)
+
+
+def _session_dispatch_transaction_ended(session, transaction) -> None:
+    if transaction.parent is not None and not transaction.nested:
+        return
+    pending = session.info.get("pending_session_dispatches", [])
+    def keep(entry):
+        if transaction.parent is None:
+            return entry["root"] is not transaction
+        scope = entry["scope"]
+        while scope is not None:
+            if scope is transaction:
+                return False
+            scope = scope.parent
+        return True
+    retained = [entry for entry in pending if keep(entry)]
+    if retained:
+        session.info["pending_session_dispatches"] = retained
+    else:
+        session.info.pop("pending_session_dispatches", None)
+        session.info.pop("pending_session_dispatch_listener", None)
 
 
 class SessionClaimAttention(HTTPException):
@@ -515,31 +569,22 @@ class SessionService:
         adapter_type: str,
         task_id: str,
     ) -> None:
-        """Dispatch only after commit so background workers can read the session row."""
+        """Publish this registration only after its owning root transaction commits."""
         sync_session = db.sync_session
+        root = sync_session.get_transaction()
+        scope = sync_session.get_nested_transaction() or root
         pending = sync_session.info.setdefault("pending_session_dispatches", [])
-        pending.append((session_id, project_id, adapter_type, task_id))
-
-        if sync_session.info.get("pending_session_dispatch_listener"):
+        dispatch = (session_id, project_id, adapter_type, task_id)
+        if any(entry["root"] is root and entry["scope"] is scope and entry["dispatch"] == dispatch
+               for entry in pending):
             return
+        pending.append({"dispatch": dispatch, "root": root, "scope": scope})
         sync_session.info["pending_session_dispatch_listener"] = True
-
-        from sqlalchemy import event as _sa_event
-
-        @_sa_event.listens_for(sync_session, "after_commit", once=True)
-        def _dispatch_pending(committed_session) -> None:
-            from huddleroom.config import settings
-
-            committed_session.info.pop("pending_session_dispatch_listener", None)
-            dispatches = committed_session.info.pop("pending_session_dispatches", [])
-            for dispatch_session_id, dispatch_project_id, dispatch_adapter_type, dispatch_task_id in dispatches:
-                if settings.is_sqlite:
-                    from huddleroom.workers.task_runner import register_session
-                    register_session(str(dispatch_session_id), dispatch_adapter_type, dispatch_project_id, task_id=dispatch_task_id)
-                else:
-                    from huddleroom.workers.session_tasks import run_api_session, run_cli_session
-                    task = run_api_session if dispatch_adapter_type == "api" else run_cli_session
-                    task.apply_async(args=[str(dispatch_session_id)], task_id=dispatch_task_id)
+        if not sync_session.info.get("session_dispatch_hooks_installed"):
+            from sqlalchemy import event as _sa_event
+            _sa_event.listen(sync_session, "after_commit", _session_dispatch_after_commit)
+            _sa_event.listen(sync_session, "after_transaction_end", _session_dispatch_transaction_ended)
+            sync_session.info["session_dispatch_hooks_installed"] = True
 
     def _resolve_adapter_type(self, agent: Agent, task: Task | None, override: str | None) -> str:
         if override:
@@ -548,7 +593,8 @@ class SessionService:
             return task.adapter_type_override
         return agent.adapter_type
 
-    async def _orchestration_authorization(self, db: AsyncSession, task: Task | None) -> None:
+    async def _orchestration_authorization(self, db: AsyncSession, task: Task | None,
+                                         *, final_admission: bool = True) -> None:
         """Refuse claims of orchestration tasks whose run lacks effective authority."""
         if task is None:
             return
@@ -560,8 +606,14 @@ class SessionService:
         run_id = OrchestrationService._optional_uuid(orchestration.get("run_id"), "run_id")
         if run_id is None:
             return
-        run = await db.get(OrchestrationRun, run_id)
-        goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
+        if final_admission:
+            from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+            try:
+                await require_control_admission(db, run_id)
+            except BaselinePaused:
+                raise HTTPException(409, detail="authorization_denied: run_not_active") from None
+        run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+        goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True) if run is not None else None
         if run is None or goal is None:
             raise HTTPException(status_code=409, detail="authorization_denied: lineage_invalid")
         result = await effective_authorization(db, goal, run, task)
@@ -606,7 +658,7 @@ class SessionService:
             )
         limits = await self._orchestration_budget_limits(db, task, agent)
         await self._validate_budget_adapter(db, task, limits, context, adapter_type)
-        await self._orchestration_authorization(db, task)
+        await self._orchestration_authorization(db, task, final_admission=False)
 
     async def create(self, db: AsyncSession, data: SessionCreate) -> Session:
         project_service = ProjectService()
@@ -783,6 +835,24 @@ class SessionService:
         })
         return session
 
+    async def redispatch_pending_orchestration(self, db: AsyncSession, run_id: uuid.UUID) -> None:
+        """Re-publish the existing unclaimed reservation after explicit runnable recovery."""
+        sessions = list((await db.scalars(select(Session).join(Task, Task.id == Session.task_id).where(
+            Task.metadata_["orchestration"]["run_id"].as_string() == str(run_id),
+            Session.status == "pending", Session.started_at.is_(None), Session.runner_task_id.is_not(None),
+        ))).all())
+        for session in sessions:
+            task = await db.get(Task, session.task_id, populate_existing=True)
+            try:
+                await self._orchestration_authorization(db, task)
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                continue
+            self._schedule_dispatch_after_commit(
+                db, session.id, session.project_id, session.adapter_type, session.runner_task_id,
+            )
+
     async def get(self, db: AsyncSession, session_id: uuid.UUID) -> Session | None:
         result = await db.execute(select(Session).where(Session.id == session_id))
         return result.scalar_one_or_none()
@@ -836,11 +906,16 @@ class SessionService:
             next_cursor = f"{last.created_at.isoformat()}__{last.id}"
         return items, next_cursor
 
-    async def cancel(self, db: AsyncSession, session_id: uuid.UUID, *, sync_task: bool = True) -> Session:
+    async def cancel(self, db: AsyncSession, session_id: uuid.UUID, *, sync_task: bool = True,
+                     expected_identity: tuple[uuid.UUID | None, str | None] | None = None) -> Session:
         """Cancel a session. Callers that own the task outcome pass sync_task=False."""
         pending_writes = bool(db.new or db.dirty or db.deleted)
         with db.no_autoflush:
             session = await self.get_or_404(db, session_id)
+            if expected_identity is not None:
+                await db.refresh(session)
+                if (session.task_id, session.runner_task_id) != expected_identity:
+                    raise HTTPException(409, detail="planning_replacement_session_changed")
         if session.status in ("completed", "failed", "cancelled"):
             raise HTTPException(status_code=409, detail=f"Session already {session.status}")
 
@@ -849,7 +924,7 @@ class SessionService:
             from huddleroom.workers.task_runner import cancel_task
             from huddleroom.services.orchestration_service import OrchestrationService
 
-            runner_id = session.runner_task_id
+            runner_id = expected_identity[1] if expected_identity is not None else session.runner_task_id
             transaction = db.sync_session.get_transaction()
             if (pending_writes or db.new or db.dirty or db.deleted or db.in_nested_transaction()
                     or transaction is None or transaction.origin != SessionTransactionOrigin.AUTOBEGIN
@@ -857,7 +932,17 @@ class SessionService:
                 raise HTTPException(status_code=409, detail={"code": "cli_cancel_transaction_conflict"})
             # The worker's cancel branch skips the task sync when the caller owns the task outcome.
             # Always overwrite so a stale flag from an earlier failed owner cancel can't leak.
-            session.metadata_ = {**(session.metadata_ or {}), "cancel_owner_managed": not sync_task}
+            if expected_identity is None:
+                session.metadata_ = {**(session.metadata_ or {}), "cancel_owner_managed": not sync_task}
+            else:
+                claim = await db.execute(update(Session).where(
+                    Session.id == session_id, Session.task_id == expected_identity[0],
+                    Session.runner_task_id == runner_id, Session.status.in_(("pending", "running")),
+                ).values(metadata_=func.json_set(
+                    Session.metadata_, "$.cancel_owner_managed", func.json("false" if sync_task else "true"),
+                )).execution_options(synchronize_session=False))
+                if not claim.rowcount:
+                    raise HTTPException(409, detail="planning_replacement_session_changed")
             await db.commit()  # release only a proven clean read before the independent worker write
             error = None
             acknowledged = False
@@ -869,6 +954,8 @@ class SessionService:
             # cached row and observe its independently committed transaction.
             db.expire(session)
             session = await self.get_or_404(db, session_id)
+            if expected_identity is not None and (session.task_id, session.runner_task_id) != expected_identity:
+                raise HTTPException(409, detail="planning_replacement_session_changed")
             if session.status == "cancelled" and session.ended_at is not None:
                 return session
             if session.status in ("completed", "failed"):

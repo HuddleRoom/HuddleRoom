@@ -228,6 +228,7 @@ class TaskService:
         agent = await db.get(Agent, task.assigned_to)
         if agent is not None:
             await SessionService().preflight_claim(db, task, agent, adapter_type_override)
+        await SessionService()._orchestration_authorization(db, task)
         # Transition to in_progress if not already
         now = datetime.now(timezone.utc)
         if task.status not in ("in_progress",):
@@ -274,7 +275,9 @@ class TaskService:
             return
         from huddleroom.services.session_service import SessionClaimAttention, SessionService
         try:
+            await SessionService().preflight_claim(db, task, agent)
             async with db.begin_nested():
+                await SessionService()._orchestration_authorization(db, task)
                 if task.status == "backlog":
                     await self.transition_status(db, task.project_id, task.id, "ready")
                 else:

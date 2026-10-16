@@ -148,6 +148,8 @@ class OrchestrationChatActionService:
             await db.refresh(run)
         state = {"goal_status": goal.status, "run_id": str(run.id) if run else None,
                  "run_status": run.status if run else None, "phase": run.phase if run else None}
+        if action.operation == "pause":
+            state["control_version"] = run.control_version if run else None
         if action.operation in CONFIRM_OPERATIONS or action.operation == "start_baseline":
             state["contract"] = {key: getattr(goal, key, None) for key in (
                 "goal_type", "planning_mode", "objective", "constraints", "budget", "authority_model",
@@ -181,7 +183,8 @@ class OrchestrationChatActionService:
                 OrchestrationGoal.project_id == action.project_id, OrchestrationGoal.objective == named))).all()) if named else []
             if not named or named.casefold() not in turn.content.casefold() or named != title or matches != [action.goal_id]:
                 raise conflict("chat_invalid_target", "Named target must match the submitted goal explicitly")
-        async with self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id):
+        preparation_lock = no_goal_lock() if action.operation == "pause" else self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id)
+        async with preparation_lock:
             if submission_validation is not None:
                 await submission_validation(db)
             _, run, state = await self._snapshot(db, action)
@@ -190,6 +193,8 @@ class OrchestrationChatActionService:
             prepared = action.model_copy(deep=True)
             prepared.run_id = run.id if run else None
             prepared.frozen_versions = {"state": fingerprint(state)}
+            if action.operation == "pause" and run is not None:
+                prepared.frozen_versions["control_version"] = str(run.control_version)
             prepared.requires_confirmation = action.operation in CONFIRM_OPERATIONS
             prepared.status = "awaiting_confirmation" if prepared.requires_confirmation else "prepared"
             if prepared.requires_confirmation:
@@ -209,7 +214,7 @@ class OrchestrationChatActionService:
         async with lock:
             transaction = db.sync_session.get_transaction()
             owns = transaction is None or transaction.origin == SessionTransactionOrigin.AUTOBEGIN
-            goal_lock = no_goal_lock() if action.operation in DECISION_OPERATIONS else self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id)
+            goal_lock = no_goal_lock() if action.operation in DECISION_OPERATIONS | {"pause"} else self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id)
             async with goal_lock:
                 await db.refresh(turn)
                 receipt = await self._execute_locked(db, turn, action, confirmed=confirmed, owns_transaction=owns)
@@ -248,8 +253,11 @@ class OrchestrationChatActionService:
         if action.requires_confirmation and not confirmed:
             return ChatActionReceipt(action_id=action.action_id, operation=action.operation, project_id=action.project_id,
                 goal_id=action.goal_id, run_id=action.run_id, status="pending", message="Review and confirm this action.")
-        goal_lock = no_goal_lock() if action.operation in DECISION_OPERATIONS else self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id)
+        goal_lock = no_goal_lock() if action.operation in DECISION_OPERATIONS | {"pause"} else self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id)
         async with goal_lock:
+            if action.operation == "pause" and action.run_id is not None:
+                from huddleroom.services.orchestration_control import acquire_control_writer
+                await acquire_control_writer(db, action.run_id)
             await db.refresh(persisted)
             if persisted.action_receipt:
                 return ChatActionReceipt.model_validate(persisted.action_receipt)
@@ -261,6 +269,8 @@ class OrchestrationChatActionService:
                     refreshed = action.model_copy(deep=True)
                     refreshed.action_id = uuid.uuid4()
                     refreshed.frozen_versions = {"state": fingerprint(state)}
+                    if action.operation == "pause" and run is not None:
+                        refreshed.frozen_versions["control_version"] = str(run.control_version)
                     refreshed.summary = "Limits changed. Review and confirm these current limits.\n" + json.dumps(state, sort_keys=True, default=str)
                     if len(refreshed.summary) > 12000:
                         raise conflict("chat_review_too_large", "Use the existing control to review these limits")
@@ -323,7 +333,10 @@ class OrchestrationChatActionService:
         elif op in {"start_execution", "restart_execution"}:
             await self._orchestration.start_run(db, project_id, goal_id, actor=f"human:{user.id}", commit=False)
         elif op == "pause":
-            await self._orchestration.pause_goal(db, project_id, goal_id, commit=False)
+            await self._orchestration.pause_goal(
+                db, project_id, goal_id, commit=False, actor_user_id=user.id, run_id=action.run_id,
+                expected_control_version=int(action.frozen_versions["control_version"]), request_id=action.action_id,
+            )
         elif op == "resume":
             await self._orchestration.resume_goal(db, project_id, goal_id)
         elif op == "cancel":

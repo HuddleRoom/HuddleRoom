@@ -33,7 +33,7 @@ async def _diagnosis_ticks(db_session, test_engine, conversation_goal_run, monke
         "huddleroom.services.orchestration_blocker_recovery.OrchestrationBlockerRecoveryService",
         lambda: real_service(analyzer=RecoveryAnalyzer(completion_fn=completion)),
     )
-    async def baseline(self, db, run_id, *, local_only=False):
+    async def baseline(self, db, run_id, *, local_only=False, owns_transaction=False):
         return {"status": "probe_baseline_stub"}
     monkeypatch.setattr(OrchestrationService, "_tick_baseline_impl", baseline)
     factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
@@ -250,18 +250,36 @@ async def test_public_diagnosis_reset_invalidation_releases_flight_and_publishes
     assert calls == 2
 
 
+async def _approved_owned_setup(test_engine, tmp_path, monkeypatch, *, retry=False):
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as setup:
+        project, user = await seed_project_user(setup, tmp_path)
+        rows = await seed(setup, project)
+        original_diagnose = OrchestrationBlockerRecoveryService.diagnose
+        async def setup_diagnose(service, db, trigger_id, **kwargs):
+            if db is setup:
+                await db.flush()
+                await db.commit()
+            return await original_diagnose(service, db, trigger_id, **kwargs)
+        monkeypatch.setattr(OrchestrationBlockerRecoveryService, "diagnose", setup_diagnose)
+        calls = [verify_call(rows)] + ([retry_task_call(rows)] if retry else [])
+        flow = await approved(setup, rows, user, *calls)
+        monkeypatch.setattr(OrchestrationBlockerRecoveryService, "diagnose", original_diagnose)
+        await setup.commit()
+    return rows, flow
+
+
 @pytest.mark.asyncio
 async def test_concurrent_public_ticks_serialize_recovery_through_commit(
-    db_session, test_engine, test_project, test_user, monkeypatch, caplog,
+    test_engine, tmp_path, monkeypatch, caplog,
 ):
-    rows = await seed(db_session, test_project)
-    flow = await approved(db_session, rows, test_user, verify_call(rows), retry_task_call(rows))
+    rows, flow = await _approved_owned_setup(test_engine, tmp_path, monkeypatch, retry=True)
     executors = Executors(monkeypatch, rows)
-    await db_session.commit()
 
     # Isolate the confirmed recovery race from baseline model/project work while
     # retaining both real public tick recovery passes.
-    async def baseline_tick(self, db, run_id, *, local_only=False):
+    async def baseline_tick(self, db, run_id, *, local_only=False, owns_transaction=False):
         return {"run_id": str(run_id), "status": "probe_baseline_stub"}
 
     monkeypatch.setattr(OrchestrationService, "_tick_baseline_impl", baseline_tick)
@@ -348,7 +366,7 @@ async def test_concurrent_ticks_without_recovery_are_clean_control(
     rows = await seed(db_session, test_project)
     await db_session.commit()
 
-    async def baseline_tick(self, db, run_id, *, local_only=False):
+    async def baseline_tick(self, db, run_id, *, local_only=False, owns_transaction=False):
         return {"run_id": str(run_id), "status": "probe_baseline_stub"}
 
     monkeypatch.setattr(OrchestrationService, "_tick_baseline_impl", baseline_tick)
@@ -375,12 +393,10 @@ async def test_concurrent_ticks_without_recovery_are_clean_control(
 
 @pytest.mark.asyncio
 async def test_recovery_driver_preserves_explicit_caller_transaction(
-    db_session, test_engine, test_project, test_user, monkeypatch,
+    test_engine, tmp_path, monkeypatch,
 ):
-    rows = await seed(db_session, test_project)
-    flow = await approved(db_session, rows, test_user, verify_call(rows))
+    rows, flow = await _approved_owned_setup(test_engine, tmp_path, monkeypatch)
     Executors(monkeypatch, rows)
-    await db_session.commit()
     factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
     async with factory() as session:

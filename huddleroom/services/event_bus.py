@@ -91,31 +91,67 @@ def _to_bus_event(log_entry: EventLog) -> BusEvent:
     )
 
 
+def _bus_after_commit(session) -> None:
+    root = session.get_transaction()
+    scope = session.get_nested_transaction() or root
+    pending = session.info.get("pending_bus_events", [])
+    if scope is not None and scope.nested:
+        for entry in pending:
+            if entry["scope"] is scope:
+                entry["scope"] = scope.parent
+        return
+    publish = [entry for entry in pending if entry["root"] is root]
+    retained = [entry for entry in pending if entry["root"] is not root]
+    if retained:
+        session.info["pending_bus_events"] = retained
+    else:
+        session.info.pop("pending_bus_events", None)
+    for entry in publish:
+        ev, bus = entry["event"], entry["bus"]
+        try:
+            from huddleroom.services.orchestration_supervision_scheduler import SUPPORTED_EVENTS
+            is_sqlite = session.bind is not None and session.bind.dialect.name == "sqlite"
+            if is_sqlite:
+                bus.put(ev)
+            elif ev.event_type in SUPPORTED_EVENTS:
+                from huddleroom.workers.orchestration_tasks import request_supervision_wakeup
+                request_supervision_wakeup(ev.id)
+        except Exception:
+            logger.exception("Unable to request orchestration supervision wakeup for %s", ev.id)
+
+
+def _bus_transaction_ended(session, transaction) -> None:
+    if transaction.parent is not None and not transaction.nested:
+        return  # Internal flush scopes do not own a publication queue.
+    pending = session.info.get("pending_bus_events", [])
+    def keep(entry):
+        if transaction.parent is None:
+            return entry["root"] is not transaction
+        scope = entry["scope"]
+        while scope is not None:
+            if scope is transaction:
+                return False
+            scope = scope.parent
+        return True
+    retained = [entry for entry in pending if keep(entry)]
+    if retained:
+        session.info["pending_bus_events"] = retained
+    else:
+        session.info.pop("pending_bus_events", None)
+
+
 def _defer_bus_put(db: AsyncSession, bus_event: BusEvent, bus: EventBusService) -> None:
-    # Defer put to after commit so consumers never see events for rolled-back txns.
     sync_session = db.sync_session
-    if "pending_bus_events" not in sync_session.info:
-        sync_session.info["pending_bus_events"] = []
-
+    root = sync_session.get_transaction()
+    scope = sync_session.get_nested_transaction() or root
+    sync_session.info.setdefault("pending_bus_events", []).append(
+        {"event": bus_event, "bus": bus, "root": root, "scope": scope},
+    )
+    if not sync_session.info.get("bus_publication_hooks_installed"):
         from sqlalchemy import event as _sa_event
-
-        @_sa_event.listens_for(sync_session, "after_commit", once=True)
-        def _dispatch_pending(session):
-            for ev, b in session.info.pop("pending_bus_events", []):
-                try:
-                    from huddleroom.services.orchestration_supervision_scheduler import SUPPORTED_EVENTS
-                    is_sqlite = session.bind is not None and session.bind.dialect.name == "sqlite"
-                    # SQLite has one process and uses the in-memory bus. Postgres
-                    # must cross the process boundary only through Celery.
-                    if is_sqlite:
-                        b.put(ev)
-                    elif ev.event_type in SUPPORTED_EVENTS:
-                        from huddleroom.workers.orchestration_tasks import request_supervision_wakeup  # pylint: disable=cyclic-import
-                        request_supervision_wakeup(ev.id)
-                except Exception:
-                    logger.exception("Unable to request orchestration supervision wakeup for %s", ev.id)
-
-    sync_session.info["pending_bus_events"].append((bus_event, bus))
+        _sa_event.listen(sync_session, "after_commit", _bus_after_commit)
+        _sa_event.listen(sync_session, "after_transaction_end", _bus_transaction_ended)
+        sync_session.info["bus_publication_hooks_installed"] = True
 
 
 async def emit_event_once(

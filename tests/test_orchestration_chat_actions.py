@@ -83,6 +83,11 @@ async def test_mandatory_confirmation_and_duplicate_receipt_converge(sessions, t
     assert stored_goal.status == stored_run.status == terminal
     if operation == "pause":
         assert stored_run.baseline_authorized is False
+        assert stored_run.pause_requested is True and stored_run.control_version == 1
+        async with sessions() as fresh:
+            controls = (await fresh.scalars(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "pause_control"))).all()
+            assert len(controls) == 1
     async with sessions() as db:
         row = await db.get(ProjectChatTurn, turn.id)
         assert row.action_receipt["action_id"] == str(action.action_id)
@@ -259,7 +264,10 @@ async def test_pause_effect_and_receipt_rollback_together_before_commit(sessions
         await _service(sessions, orchestration=FailedPublication()).confirm(project.id, user.id, action.action_id, uuid.uuid4())
     stored_goal, stored_run = await _states(sessions, goal, run)
     assert stored_goal.status == "active" and stored_run.status == "running"
+    assert stored_run.pause_requested is False and stored_run.control_version == 0
     async with sessions() as db:
+        assert (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "pause_control"))).all() == []
         assert (await db.get(ProjectChatTurn, turn.id)).action_receipt is None
     # Verified rollback permits the same prepared request to execute once.
     await _service(sessions).confirm(project.id, user.id, action.action_id, uuid.uuid4())
@@ -579,7 +587,19 @@ async def test_owned_effect_and_receipt_commit_before_goal_lock_releases(session
                     self.depth -= 1
 
     await _service(sessions, orchestration=ObservedLock()).confirm(project.id, user.id, action.action_id, uuid.uuid4())
-    assert observed == [True]
+    if operation == "pause":
+        # SPR230/SPR231 Pause deliberately bypasses the long transition lock.
+        assert observed == []
+        async with sessions() as fresh:
+            row = await fresh.get(ProjectChatTurn, turn.id)
+            stored_goal = await fresh.get(OrchestrationGoal, goal.id)
+            assert row.action_receipt["action_id"] == str(action.action_id)
+            assert stored_goal.status == "paused"
+            controls = (await fresh.scalars(select(OrchestrationAction).where(
+                OrchestrationAction.action_type == "pause_control"))).all()
+            assert len(controls) == 1
+    else:
+        assert observed == [True]
 
 
 @pytest.mark.parametrize("operation", ["answer_runtime_question", "answer_authority"])
@@ -620,7 +640,7 @@ async def test_recovery_answer_links_one_reserved_wrapper_without_effects(sessio
         db.add(agent)
         await db.flush()
         _, _, proposal, decision = await diagnosed(db, await db.get(OrchestrationGoal, goal.id),
-            await db.get(OrchestrationRun, run.id), agent)
+            await db.get(OrchestrationRun, run.id), agent, owns_setup=True)
         await db.commit()
     turn, action = await _prepare(sessions, user, goal, "approve_recovery", target_id=decision.id,
         content=f"Approve {decision.id} approve_fix", payload={"selected_option": "approve_fix"})

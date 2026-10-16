@@ -1,13 +1,17 @@
 """Event-first, provider-free scheduling for authorized orchestration runs."""
 from __future__ import annotations
 
+from sqlalchemy.orm import SessionTransactionOrigin
+
 import asyncio
 import logging
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from typing import Any
 from uuid import UUID, uuid4
 
+from fastapi import HTTPException
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -56,6 +60,10 @@ class OrchestrationSupervisionScheduler:
         if self._tick_impl is not None:
             return await self._tick_impl(db, run_id, local_only=local_only)
         from huddleroom.services.orchestration_service import OrchestrationService
+        transaction = db.sync_session.get_transaction()
+        if (not db.in_nested_transaction() and (transaction is None
+                or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)):
+            await db.commit()  # This worker owns its preflight transaction before a new goal mutex.
         return await OrchestrationService().tick(db, run_id, local_only=local_only)
 
     @staticmethod
@@ -135,6 +143,17 @@ class OrchestrationSupervisionScheduler:
                 canonical_payload, fingerprint = await self._judgment_payload(
                     db, service, context, goal, run,
                 )
+                from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+                try:
+                    await require_control_admission(db, run_id)
+                except BaselinePaused:
+                    await db.commit()
+                    return None
+                await db.refresh(run)
+                state = dict(run.supervision_state or {})
+                if self._claim_live(state, now):
+                    await db.commit()
+                    return None
                 token = uuid4().hex
                 claimed = _utcnow()  # injected `now` is only for due/liveness comparison
                 state.update({
@@ -148,6 +167,12 @@ class OrchestrationSupervisionScheduler:
                     ).isoformat(),
                 })
                 run.supervision_state = state
+                db.add(OrchestrationAction(
+                    run_id=run.id, action_type="admit_control_call", status="completed",
+                    idempotency_key=f"run:{run.id}:judgment_call:{token}",
+                    request={"judgment_claim_token": token, "fingerprint": fingerprint},
+                    target_type="orchestration_run", target_id=run.id,
+                ))
                 payload = context.provider_snapshot(canonical_payload)
                 await db.commit()
                 return {
@@ -185,6 +210,13 @@ class OrchestrationSupervisionScheduler:
                         and not state.get("judgment_dirty")
                         and not service._budget_is_exhausted(run)  # pylint: disable=protected-access
                     )
+                    admitted = await db.scalar(select(OrchestrationAction).where(
+                        OrchestrationAction.run_id == claim["run_id"],
+                        OrchestrationAction.idempotency_key == f"run:{claim['run_id']}:judgment_call:{claim['token']}",
+                    ))
+                    if admitted is not None:
+                        admitted.dispatch_contract = {**(admitted.dispatch_contract or {}),
+                                                      "result": asdict(assessment), "applied": allowed}
                     if allowed:
                         # apply_disposition rechecks current control and contract
                         # while this reentrant goal lock is held.
@@ -305,12 +337,20 @@ class OrchestrationSupervisionScheduler:
             if claim is None:
                 return 0
             try:
-                assessment = await asyncio.wait_for(
-                    self._judge(claim["payload"]),
-                    timeout=settings.orchestration_judgment_timeout_seconds,
-                )
+                from huddleroom.database import AsyncSessionLocal
+                from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+                async with AsyncSessionLocal() as provider_db:
+                    async with baseline_operation(provider_db, claim["goal_id"], owns_transaction=True,
+                                                  register=False, run_id=claim["run_id"]):
+                        assessment = await asyncio.wait_for(
+                            self._judge(claim["payload"]),
+                            timeout=settings.orchestration_judgment_timeout_seconds,
+                        )
                 return int(await self._finish_judgment(claim, assessment))
             except (Exception, asyncio.CancelledError) as exc:  # pylint: disable=broad-exception-caught
+                if isinstance(exc, HTTPException) and exc.detail == "Orchestration admission paused":
+                    await self._update_judgment_failure(run_id, failure=False, token=claim["token"])
+                    return 0
                 # Each retry obtains a new local snapshot in a new transaction.
                 try:
                     await asyncio.shield(self._update_judgment_failure(run_id, failure=True, token=claim["token"]))

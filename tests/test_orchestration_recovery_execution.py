@@ -183,9 +183,12 @@ class Executors:
 # --------------------------------------------------------------------------- flow helpers
 
 
-async def propose(db, rows, analyzer, trigger_model=None):
+async def propose(db, rows, analyzer, trigger_model=None, *, owns_setup=False):
     svc = OrchestrationBlockerRecoveryService(analyzer=analyzer)
     trigger_action = await svc.create_trigger(db, trigger_model or trigger(rows))
+    if owns_setup:
+        await db.flush()
+        await db.commit()
     proposal = await svc.diagnose(db, trigger_action.id)
     return svc, proposal
 
@@ -202,9 +205,9 @@ async def approve(db, svc, proposal, user):
     return decision
 
 
-async def approved(db, rows, user, *calls, analyzer=None):
+async def approved(db, rows, user, *calls, analyzer=None, owns_setup=False):
     analyzer = analyzer or ScriptedAnalyzer(draft(rows, *calls))
-    svc, proposal = await propose(db, rows, analyzer)
+    svc, proposal = await propose(db, rows, analyzer, owns_setup=owns_setup)
     decision = await approve(db, svc, proposal, user)
     return SimpleNamespace(svc=svc, proposal=proposal, decision=decision, analyzer=analyzer,
                            pid=proposal.request["proposal_id"])

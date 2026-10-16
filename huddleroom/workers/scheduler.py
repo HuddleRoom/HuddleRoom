@@ -1,3 +1,4 @@
+from sqlalchemy.orm import SessionTransactionOrigin
 import logging
 import asyncio
 from collections import deque
@@ -193,6 +194,10 @@ async def reconcile_orchestration_runs_async(db) -> int:
     reconciled = 0
     for run_id in run_ids:
         try:
+            transaction = db.sync_session.get_transaction()
+            if (not db.in_nested_transaction() and (transaction is None
+                    or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)):
+                await db.commit()  # Publish this worker's preflight before acquiring goal locks.
             await service.tick(db, run_id)
             reconciled += 1
         except Exception as exc:  # one bad run must not stop the sweep

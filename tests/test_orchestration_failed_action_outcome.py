@@ -5,6 +5,7 @@ import uuid
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationWait
 from huddleroom.models.session import Session
@@ -12,8 +13,41 @@ from huddleroom.services.orchestration_decision_dispatcher import OrchestrationD
 from huddleroom.services.orchestration_decision_validator import validate_orchestration_decision
 from tests.test_orchestration_basic_recovery import _actions, _agent, _blocked_setup, _make_gate, _make_orchestrated_task
 from tests.test_orchestration_act_until_wait import _setup
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """These dispatcher outcome drivers own their persisted preparation."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _owned_dispatch_preparation(db_session, monkeypatch):
+    from huddleroom.services.orchestration_service import OrchestrationService
+    original_dispatch, original_tick = OrchestrationDecisionDispatcher.dispatch, OrchestrationService.tick
+
+    async def prepare(db):
+        root = db.sync_session.get_transaction()
+        if (db is db_session and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await db.flush()
+            await db.commit()
+
+    async def dispatch(self, db, *args, **kwargs):
+        await prepare(db)
+        return await original_dispatch(self, db, *args, **kwargs)
+
+    async def tick(self, db, *args, **kwargs):
+        await prepare(db)
+        return await original_tick(self, db, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationDecisionDispatcher, "dispatch", dispatch)
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
 
 
 @pytest.fixture
@@ -345,26 +379,47 @@ async def test_budget_wait_keeps_state_written_before_it_was_raised(db_session, 
 
 
 @pytest.mark.usefixtures("dispatch_without_corrective_interception")
-async def test_4xx_rollback_drops_queued_bus_events_and_dispatches(db_session, test_project, monkeypatch):
+async def test_4xx_rollback_drops_queued_bus_events_and_dispatches(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.event_log import EventLog
+    from huddleroom.models.orchestration import OrchestrationRun
     from huddleroom.services.orchestration_service import OrchestrationService
     from huddleroom.services.task_service import TaskService
-    _goal, run = await _setup(db_session, test_project)
-    task, _ = await _task_in(db_session, test_project, run, "failed")
-    decision = await _decision(db_session, run, {"action_type": "retry_task", "task_id": str(task.id)})
-    info = db_session.sync_session.info
-    info["pending_bus_events"] = []
-    info["pending_session_dispatches"] = []
-
-    async def emit_then_409(self, db, *_a, **_k):
-        db.sync_session.info["pending_bus_events"].append(("ev", None))
-        db.sync_session.info["pending_session_dispatches"].append(("d",))
+    from huddleroom.services.session_service import SessionService
+    from huddleroom.services.event_bus import EventBusService, emit_event_once
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    async with sessions() as setup:
+        project, _ = await seed_project_user(setup, tmp_path)
+        goal, run = await _setup(setup, project)
+        task, agent = await _task_in(setup, project, run, "failed")
+        decision = await _decision(setup, run, {"action_type": "retry_task", "task_id": str(task.id)})
+        await setup.commit()
+    bus, published, registered, abandoned = EventBusService(), [], [], {}
+    monkeypatch.setattr(bus, "put", lambda event: published.append(event.id))
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: registered.append(args))
+    async def emit_then_409(self, db, *_args, **_kwargs):
+        event, _ = await emit_event_once(db, project.id, "test.rolled_back", {}, _bus=bus)
+        pending = Session(project_id=project.id, task_id=task.id, agent_id=agent.id,
+                          adapter_type="api", status="pending", runner_task_id=str(uuid.uuid4()))
+        db.add(pending)
+        await db.flush()
+        SessionService()._schedule_dispatch_after_commit(db, pending.id, project.id, "api", pending.runner_task_id)
+        abandoned.update(event_id=event.id, session_id=pending.id)
         raise HTTPException(status_code=409, detail="cannot run")
-
     monkeypatch.setattr(TaskService, "run", emit_then_409)
-    action = await OrchestrationDecisionDispatcher(OrchestrationService()).dispatch(db_session, run, decision)
-
-    assert action.status == "failed"
-    assert info["pending_bus_events"] == [] and info["pending_session_dispatches"] == []
+    service = OrchestrationService()
+    async with sessions() as caller:
+        async with service._lock_goal_for_baseline_transition(caller, goal.id):
+            current = await caller.get(OrchestrationRun, run.id)
+            accepted = await caller.get(OrchestrationDecision, decision.id)
+            outer, _ = await emit_event_once(caller, project.id, "test.outer", {}, _bus=bus)
+            action = await OrchestrationDecisionDispatcher(service).dispatch(caller, current, accepted)
+            assert action.status == "failed"
+            assert published == [] and registered == []
+            await caller.commit()
+    assert published == [outer.id] and registered == []
+    async with sessions() as fresh:
+        assert await fresh.scalar(select(EventLog).where(EventLog.id == abandoned["event_id"])) is None
+        assert await fresh.get(Session, abandoned["session_id"]) is None
 
 
 async def test_steering_versions_changed_keeps_failed_row(db_session, test_project):
@@ -505,3 +560,9 @@ async def test_model_corrective_action_after_durable_failure_creates_one_trigger
     recovery_triggers = await _actions(db_session, run.id, "recovery_trigger")
     assert len(recovery_triggers) == 1
     assert recovery_triggers[0].request["run_id"] == str(run.id)
+
+
+def test_spr230_structured_transaction_conflict_is_not_misread_as_wait():
+    from huddleroom.services.orchestration_service import OrchestrationService
+    conflict = HTTPException(409, detail={"conflict": "orchestration_transaction_shape"})
+    assert OrchestrationService._waiting_step_for_http_error(conflict) is None

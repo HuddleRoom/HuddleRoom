@@ -1,8 +1,11 @@
 from datetime import timedelta
+from contextvars import ContextVar
+import json
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, null, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import (
     OrchestrationAction,
@@ -28,6 +31,46 @@ from tests.test_orchestration_roadmap_integration import (
 from tests.test_orchestration_roadmap_task_items import roadmap_task
 from tests.test_orchestration_runtime_e2e import _agent, _authorized_run
 from huddleroom.services.orchestration_service import OrchestrationService
+from huddleroom.dependencies import _ANON_USER
+from huddleroom.schemas.session import SessionCreate
+from huddleroom.services.session_service import SessionService
+from huddleroom.services.task_service import TaskService
+from huddleroom.services.session_sync import sync_task_from_session
+from huddleroom.services.event_bus import emit_event
+from huddleroom.workers.session_tasks import _require_runnable_session, mark_attempt_effect_started
+
+_owned_roadmap_setup = ContextVar("owned_roadmap_controls_setup", default=None)
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """SPR230/SPR231 native control tests own their committed setup."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+        # Committed Roadmap fixtures contain intentional RESTRICT lineage cycles.
+        # Break those only after assertions, on this isolated test engine.
+        await db.execute(update(OrchestrationGoal).values(parent_goal_id=None, roadmap_version_id=None,
+            roadmap_item_key=None, parent_contract_snapshot=null(), goal_delta=null(), continuous_origin_key=None))
+        await db.commit()
+
+
+@pytest.fixture(autouse=True)
+def _owned_tick_setup(db_session, monkeypatch):
+    original = OrchestrationService.tick
+
+    async def tick(self, db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if ((db is db_session or db is _owned_roadmap_setup.get())
+                and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            # Publish only this module's lexical setup before the real provider-capable tick.
+            # Explicit/nested transactions and HTTP/snapshot sessions retain their own boundaries.
+            await db.flush()
+            await db.commit()
+        return await original(self, db, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +82,58 @@ def _manual_task_start(monkeypatch):
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _complete_child_across_parent_pause(db, project, roadmap, row, actors, monkeypatch):
+    """SPR230 admit every child step before Pause; retain its final in-flight result."""
+    from tests import test_orchestration_roadmap_integration as integration
+
+    original = integration._record_measured_completion
+    paused = False
+
+    class RetainedFinalResult(Exception):
+        pass
+
+    async def complete(db, project_id, run, task, agent_id, output):
+        nonlocal paused
+        is_summary = "summary" in json.loads(output)
+        if is_summary:
+            assert not paused
+            await db.commit()
+            _, session_id = await TaskService().run(db, project_id, task.id)
+            await db.commit()
+            session = await db.get(Session, session_id)
+            runner_id = session.runner_task_id
+            assert await _require_runnable_session(db, session_id, runner_id)
+            assert await mark_attempt_effect_started(db, session_id, runner_id)
+            await roadmap.orchestration.pause_goal(db, project.id, row.goal_id)
+            paused = True
+            session = await SessionService().update_status(db, session_id, "completed", output=output,
+                metadata={**session.metadata_, "token_count_in": 1, "token_count_out": 1})
+            session.started_at = session.ended_at - timedelta(minutes=1)
+            await emit_event(db, project_id, "session.completed", {
+                "session_id": str(session_id), "task_id": str(task.id),
+            })
+            await sync_task_from_session(db, session)
+            await db.commit()
+            raise RetainedFinalResult(session.id)
+        return await original(db, project_id, run, task, agent_id, output)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(integration, "_record_measured_completion", complete)
+        with pytest.raises(RetainedFinalResult) as retained:
+            await _complete_child(db, project, roadmap, row, *actors)
+    assert paused
+    session = await db.get(Session, retained.value.args[0])
+    assert session.status == "completed" and "summary" in json.loads(session.output)
+    child_run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
+    before = await _snapshot(db, (OrchestrationAction, Task, Session))
+    with pytest.raises(HTTPException, match="authorization_denied: run_not_active") as denied:
+        await SessionService().create(db, SessionCreate(
+            project_id=project.id, task_id=session.task_id, agent_id=session.agent_id))
+    assert denied.value.status_code == 409
+    assert await _snapshot(db, (OrchestrationAction, Task, Session)) == before
+    return child_run, session
 
 
 async def test_start_authorizes_ready_roadmap_but_still_rejects_continuous(db_session, test_project):
@@ -75,9 +170,9 @@ async def test_pause_stops_new_release_while_active_child_may_finish(
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
 
-    await roadmap.orchestration.pause_goal(db_session, test_project.id, parent.id)
     assert child.status == "active" and child_run.status == "running"
-    await _complete_child(db_session, test_project, roadmap, row, planner, producer, verifier, summarizer)
+    await _complete_child_across_parent_pause(db_session, test_project, roadmap, row,
+        (planner, producer, verifier, summarizer), monkeypatch)
     before = await _snapshot(db_session, (OrchestrationBudgetReservation, OrchestrationRoadmapItem, OrchestrationEvidence))
     await service.tick(db_session, run.id)
     assert await _snapshot(db_session, (OrchestrationBudgetReservation, OrchestrationRoadmapItem, OrchestrationEvidence)) == before
@@ -100,9 +195,18 @@ async def test_resume_settles_finished_child_and_continues(
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "rollout"))
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
-    await roadmap.orchestration.pause_goal(db_session, test_project.id, parent.id)
-    await _complete_child(db_session, test_project, roadmap, row, planner, producer, verifier, summarizer)
+    child_run, retained = await _complete_child_across_parent_pause(db_session, test_project, roadmap, row,
+        (planner, producer, verifier, summarizer), monkeypatch)
+    retained_id, retained_task_id, retained_output = retained.id, retained.task_id, retained.output
     await roadmap.orchestration.resume_goal(db_session, test_project.id, parent.id)
+    await service.tick(db_session, child_run.id)
+    await db_session.refresh(child)
+    assert child.status == "completed"
+    once = await _snapshot(db_session, (OrchestrationAction, OrchestrationEvidence, Task, Session))
+    await service.tick(db_session, child_run.id)
+    assert await _snapshot(db_session, (OrchestrationAction, OrchestrationEvidence, Task, Session)) == once
+    assert list(await db_session.scalars(select(Session.id).where(Session.task_id == retained_task_id))) == [retained_id]
+    assert (await db_session.get(Session, retained_id)).output == retained_output
     first = (await service.tick(db_session, run.id))["authorized_execution"]
     reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
         OrchestrationBudgetReservation.roadmap_item_id == row.id
@@ -232,9 +336,10 @@ async def test_reset_allows_fresh_roadmap_without_immutable_lineage(db_session, 
     roadmap.planning_mode = "roadmap"
     await db_session.flush()
 
+    original_run_id = run.id
     _, replacement = await service.reset_goal(db_session, test_project.id, roadmap.id)
 
-    assert replacement.id != run.id
+    assert replacement.id != original_run_id
     assert await db_session.scalar(select(OrchestrationRoadmapVersion.id).where(
         OrchestrationRoadmapVersion.goal_id == roadmap.id,
     )) is None
@@ -398,7 +503,7 @@ async def test_parent_missing_telemetry_blocks_tick_then_recovers_without_spendi
     assert not any(item["kind"] == "budget_measurement" and "item_key" not in item for item in run.active_blockers)
     session.metadata_ = {}
     blockers_before_pause = list(run.active_blockers)
-    paused = await pause_goal(project_id=test_project.id, goal_id=goal.id, db=db_session)
+    paused = await pause_goal(project_id=test_project.id, goal_id=goal.id, user=_ANON_USER, db=db_session)
     assert paused.budget_summary is None
     assert paused.run.active_blockers == blockers_before_pause
 
@@ -429,7 +534,11 @@ async def test_repeated_roadmap_get_is_pure_across_committed_sessions(test_engin
     async with factory() as db:
         project = Project(name="Read purity", workspace_path=str(tmp_path))
         db.add(project); await db.flush()
-        _, goal, run, _ = await _approved_roadmap(db, project, [child_item("build")])
+        setup_token = _owned_roadmap_setup.set(db)
+        try:
+            _, goal, run, _ = await _approved_roadmap(db, project, [child_item("build")])
+        finally:
+            _owned_roadmap_setup.reset(setup_token)
         agent = _agent("measurement", ["implementation"])
         db.add(agent); await db.flush()
         task = Task(project_id=project.id, title="Measured work", assigned_to=agent.id, status="done",

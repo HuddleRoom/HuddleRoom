@@ -84,7 +84,9 @@ class OrchestrationSupervisionContextBuilder:
     ) -> dict:
         if run.goal_id != goal.id:
             raise ValueError("orchestration run does not belong to goal")
-        actions = list((await db.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == run.id).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all())
+        actions = list((await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type != "admit_control_call",
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id))).all())
         action_task_ids = [row.target_id for row in actions if row.target_type == "task" and row.target_id]
         tasks = list((await db.scalars(select(Task).where(
             Task.id.in_(action_task_ids) if action_task_ids else False,

@@ -374,8 +374,9 @@ async def _fresh_run_state(db_session, goal_id, project_id):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", RECOVERY_RESET_PHASES)
 async def test_reset_during_recovery_phase_prevents_old_run_writes_in_the_fresh_run(
-    db_session, test_project, test_user, monkeypatch, phase,
+    owned_recovery_setup, monkeypatch, phase,
 ):
+    db_session, test_project, test_user = owned_recovery_setup
     from fastapi import HTTPException
 
     from huddleroom.schemas.orchestration_recovery import EvidenceV1
@@ -390,6 +391,11 @@ async def test_reset_during_recovery_phase_prevents_old_run_writes_in_the_fresh_
         old_decision = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
             OrchestrationAuthorityDecision.related_action_id == old_proposal.id))).one()
     calls_before = len(flow.executors.calls)
+    # This fixture owns preparation; preserve primitive stale-object snapshots
+    # across real reset rollback/commit rather than implicitly refreshing deleted rows.
+    await db_session.flush()
+    await db_session.commit()
+    db_session.expunge_all()
 
     _goal, fresh = await OrchestrationService().reset_goal(db_session, test_project.id, flow.goal.id)
     assert fresh.id != old_run_id
@@ -397,6 +403,7 @@ async def test_reset_during_recovery_phase_prevents_old_run_writes_in_the_fresh_
     assert baseline["runs"] == [fresh.id] and baseline["actions"] == 0 and baseline["authority"] == 0
 
     if flow.task is not None:  # the delegated task outlives the run and finishes afterwards
+        db_session.add(flow.task)
         flow.task.status = "done"
         await db_session.flush()
     stale = (ValueError, HTTPException, RecoveryProposalStale, LookupError)
@@ -424,3 +431,7 @@ async def test_reset_during_recovery_phase_prevents_old_run_writes_in_the_fresh_
 
     assert await _fresh_run_state(db_session, flow.goal.id, test_project.id) == baseline
     assert len(flow.executors.calls) == calls_before, "no old-run effect or retry after the reset"
+
+
+# SPR230/SPR231 only explicit recovery setup cases use this independently owned fixture.
+from tests.test_orchestration_recovery_persistence import owned_recovery_setup  # noqa: E402,F401 -- fixture

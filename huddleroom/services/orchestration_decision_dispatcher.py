@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.schemas.orchestration_recovery import (
-    CorrectiveDisposition, RecoveryDispatchContext, RecoveryProposalV1,
+    CorrectiveDisposition, RecoveryApplyDispatchContext, RecoveryDispatchContext, RecoveryProposalV1,
 )
 from huddleroom.services.orchestration_steering import (
     SteeringVersionsChanged,
@@ -70,6 +70,16 @@ class OrchestrationDecisionDispatcher:
         self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision, *,
         recovery_context: RecoveryDispatchContext | None = None,
     ) -> OrchestrationAction | None:
+        owns = await self._service._prepare_control_operation(db, goal_id=run.goal_id)
+        async with self._service._lock_goal_for_baseline_transition(db, run.goal_id):
+            return await self._dispatch_prepared(
+                db, run, decision, recovery_context=recovery_context, owns_transaction=owns,
+            )
+
+    async def _dispatch_prepared(
+        self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision, *,
+        recovery_context: RecoveryDispatchContext | None = None, owns_transaction=False,
+    ) -> OrchestrationAction | None:
         action_type = (decision.parsed_decision or {}).get("action_type")
         if decision.validator_status == "accepted" and action_type == "request_plan_revision":
             with db.no_autoflush:
@@ -81,15 +91,18 @@ class OrchestrationDecisionDispatcher:
                     key = self.action_key(run.id, "request_plan_revision", request)
                     existing = await self._service._existing_action_for_key(db, run.id, key)
                     if existing is None or existing.status == "reserved":
+                        await self._service._publish_owned_planning_preparation(
+                            db, run.id, owns_transaction=owns_transaction,
+                        )
                         await self._service._assert_sqlite_replacement_transaction(db)
-                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context, owns_transaction=owns_transaction)
         if decision.validator_status != "accepted" or action_type != "request_plan":
-            return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+            return await self._dispatch(db, run, decision, recovery_context=recovery_context, owns_transaction=owns_transaction)
         with db.no_autoflush:
-            return await self._dispatch_plan_generation(db, run, decision, recovery_context=recovery_context)
+            return await self._dispatch_plan_generation(db, run, decision, recovery_context=recovery_context, owns_transaction=owns_transaction)
 
     async def _dispatch_plan_generation(
-        self, db, run, decision, *, recovery_context=None,
+        self, db, run, decision, *, recovery_context=None, owns_transaction=False,
     ):
         from huddleroom.services.orchestration_service import PlanGenerationChanged, _plan_generation_seal
 
@@ -102,10 +115,10 @@ class OrchestrationDecisionDispatcher:
             applies_id, rejection = (await self._resolve_applied_decision(db, run, parsed["applies_decision_id"])
                                      if "applies_decision_id" in parsed else (None, None))
             if rejection is not None:
-                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context, owns_transaction=owns_transaction)
             recovery = await self._recovery_dispatch_context(db, run, applies_id, recovery_context, request)
             if recovery is False or (recovery is None and recovery_context is not None):
-                return await self._dispatch(db, run, decision, recovery_context=recovery_context)
+                return await self._dispatch(db, run, decision, recovery_context=recovery_context, owns_transaction=owns_transaction)
         key = (recovery_effect_key(recovery_context) if recovery_context
                else self.action_key(run.id, "request_plan", request))
         snapshot = getattr(decision, "input_snapshot", {}) or {}
@@ -131,10 +144,14 @@ class OrchestrationDecisionDispatcher:
         expected = _plan_generation_seal(snapshot_run.get("id"), snapshot_run["plan_state"])
         async with self._service._lock_goal_for_baseline_transition(db, run.goal_id):
             if await self._service._sqlite_cli_planning_replacement_session(db, run) is not None:
+                await self._service._publish_owned_planning_preparation(
+                    db, run.id, owns_transaction=owns_transaction,
+                )
                 await self._service._assert_sqlite_replacement_transaction(db)
             current = await self._service._assert_current_plan_generation(db, run.id, expected)
             return await self._dispatch(
                 db, current, decision, recovery_context=recovery_context, expected_plan_generation=expected,
+                owns_transaction=owns_transaction,
             )
 
     async def _dispatch(
@@ -145,6 +162,7 @@ class OrchestrationDecisionDispatcher:
         *,
         recovery_context: RecoveryDispatchContext | None = None,
         expected_plan_generation: dict | None = None,
+        owns_transaction=False,
     ) -> OrchestrationAction | None:
         if decision.validator_status != "accepted":
             return None
@@ -208,10 +226,30 @@ class OrchestrationDecisionDispatcher:
             action_key = self.action_key(run.id, action_type, request)
             if action_type == "request_verification":
                 action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"), reuse_held=True)
+        sqlite_cli_replacement = (
+            (action_type == "request_plan" and expected_plan_generation is not None
+             or action_type == "request_plan_revision")
+            and await self._service._sqlite_cli_planning_replacement_session(db, run) is not None
+            and not (action_type == "request_plan_revision" and (run.plan_state or {}).get("pending_replan"))
+        )
+        from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+        async def final_admission():
+            try:
+                await require_control_admission(
+                    db, run.id, require_baseline_authorization=not bool(
+                        isinstance(recovery_context, RecoveryApplyDispatchContext)
+                        and recovery_context.baseline_repair_admission
+                    ),
+                )
+            except BaselinePaused:
+                raise HTTPException(409, detail="Orchestration admission paused") from None
+        if not sqlite_cli_replacement:
+            await final_admission()
         if not recovery:
             action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
             if capped is not None:
                 # Rejected too often without progress: a durable failure without its own successful recovery.
+                await final_admission()
                 await self._service.create_recovery_trigger(
                     db, run, source_kind="failed_action", source_id=capped.id, blocker_code="action_rejected",
                     summary=f"{action_type} was rejected repeatedly: {capped.error or 'rejected'}",
@@ -236,12 +274,12 @@ class OrchestrationDecisionDispatcher:
         call = lambda: method(  # noqa: E731
             db, run_id=run_id, request=request, idempotency_key=action_key, decision_id=decision_id, **extra,
         )
-        sqlite_cli_replacement = (
-            (action_type == "request_plan" and expected_plan_generation is not None
-             or action_type == "request_plan_revision")
-            and await self._service._sqlite_cli_planning_replacement_session(db, run) is not None
-            and not (action_type == "request_plan_revision" and (run.plan_state or {}).get("pending_replan"))
-        )
+        if sqlite_cli_replacement:
+            await self._service._publish_owned_planning_preparation(
+                db, run.id, owns_transaction=owns_transaction,
+            )
+        else:
+            await final_admission()
         if action_type in self._OWN_RECOVERY_ACTION_TYPES or sqlite_cli_replacement:
             if action_type == "request_roadmap_replan" and await self._service._existing_action_for_key(
                 db, run_id, action_key

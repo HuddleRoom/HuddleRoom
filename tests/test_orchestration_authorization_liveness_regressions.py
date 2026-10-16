@@ -9,6 +9,7 @@ from huddleroom.services.orchestration_progress_view import OrchestrationProgres
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionService
 from tests.test_orchestration_progress_view import _run_with_criteria, _task
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 pytestmark = pytest.mark.asyncio
 
@@ -181,16 +182,20 @@ async def test_paused_claim_recovery_fails_action_without_raising(db_session, te
     assert "run_not_active" in str(action.error)
 
 
-async def test_tick_sweeps_cancelled_task_authorization_blocker(db_session, test_project):
+async def test_tick_sweeps_cancelled_task_authorization_blocker(sessions, tmp_path):
     from tests.test_orchestration_authorization import _started_with_backlog_task
+    from tests.test_orchestration_roster_mutation import seed_project_user
 
-    service, goal, run, task = await _started_with_backlog_task(db_session, test_project)
-    task.status = "cancelled"
-    scope = f"authorization:{task.id}"
-    run.active_blockers = [{"kind": "authorization", "scope": scope, "reason_code": "start_required"}]
-    await db_session.flush()
-    await service.tick(db_session, run.id)
-    assert not any(b.get("scope") == scope for b in run.active_blockers)
+    async with sessions() as db:
+        project, _ = await seed_project_user(db, tmp_path)
+        service, goal, run, task = await _started_with_backlog_task(db, project, owns_setup=True)
+        task.status = "cancelled"
+        scope = f"authorization:{task.id}"
+        run.active_blockers = [{"kind": "authorization", "scope": scope, "reason_code": "start_required"}]
+        await db.commit()  # Owned setup, then the real final-admission tick.
+        await service.tick(db, run.id)
+        await db.refresh(run)
+        assert not any(b.get("scope") == scope for b in run.active_blockers)
 
 
 async def test_discovery_failed_source_never_reaches_the_retry_claim(db_session, test_project, test_agent, monkeypatch):

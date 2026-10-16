@@ -43,6 +43,32 @@ from huddleroom.services.orchestration_work_report import parse_work_report
 
 from tests.conftest import complete_baseline_processes, heal_baseline_drift_for_test
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for native end-to-end invocations."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _owned_tick_setup(db_session, monkeypatch):
+    original = OrchestrationService.tick
+
+    async def tick(self, db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if (db is db_session and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            # Only this test-owned setup boundary. The actual production tick
+            # still performs all ownership, writer and final-admission checks.
+            await db.flush()
+            await db.commit()
+        return await original(self, db, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +95,7 @@ def _agent(name_prefix: str, capabilities: list[str]) -> Agent:
     )
 
 
-async def _authorized_run(db_session, test_project, success_criteria=None):
+async def _authorized_run(db_session, test_project, success_criteria=None, *, owns_setup=False):
     """Create a goal, drive its baseline to terminal with the conftest Safe*
     analyzers (no real LLM -- see complete_baseline_processes), tick it to
     phase=ready, then explicitly Start it (phase=authorized). Any active
@@ -94,6 +120,9 @@ async def _authorized_run(db_session, test_project, success_criteria=None):
     )
     run.baseline_authorized = True
     await complete_baseline_processes(db_session, goal, run)
+    if owns_setup:
+        await db_session.flush()
+        await db_session.commit()
     await service.tick(db_session, run.id)
     await db_session.refresh(run)
     assert run.phase == "ready"
@@ -795,10 +824,13 @@ async def test_tick_replay_deduplicates_regenerated_follow_up_decisions(
 
     assert first_tick["authorized_execution"]["step"] == "next_action"
     assert second_tick["authorized_execution"]["step"] == "next_action"
-    assert len(actions_after_first) - len(actions_before) <= 1
-    assert len(actions_after_second) - len(actions_after_first) <= 1
+    logical = lambda actions: [a for a in actions if a.action_type != "admit_control_call"]
+    assert len(logical(actions_after_first)) - len(logical(actions_before)) <= 1
+    assert len(logical(actions_after_second)) - len(logical(actions_after_first)) <= 1
     assert len({decision.id for decision in decisions}) == 2
     assert len(followup_actions) == 1
+    admissions = [a for a in actions_after_second if a.action_type == "admit_control_call"]
+    assert len({a.idempotency_key for a in admissions}) == len(admissions)
     assert len(followups) == 1
 
 
@@ -920,6 +952,7 @@ async def test_committed_regenerated_decisions_replay_once_across_fresh_services
         )
         assert decision.validator_status == "accepted"
         loaded_run = await db.get(OrchestrationRun, run.id)
+        await db.commit()  # This replay driver owns its recorded decision preparation.
         return await OrchestrationDecisionDispatcher(OrchestrationService()).dispatch(
             db, loaded_run, decision
         )
@@ -948,7 +981,7 @@ async def test_committed_regenerated_decisions_replay_once_across_fresh_services
     await db_session.commit()
 
     sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-    async with sessions.begin() as replay_db:
+    async with sessions() as replay_db:
         replayed_delegation = {
             **delegation,
             "inputs": [],
@@ -1683,7 +1716,7 @@ async def test_legacy_accepted_multi_criterion_plan_blocks_once_without_releasin
     await db_session.commit()
 
     sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-    async with sessions.begin() as first_tick_db:
+    async with sessions() as first_tick_db:
         persisted_artifact = await first_tick_db.get(Artifact, artifact.id)
         persisted_goal_before_tick = await first_tick_db.get(OrchestrationGoal, goal.id)
         persisted_run_before_tick = await first_tick_db.get(OrchestrationRun, run.id)
@@ -1697,6 +1730,7 @@ async def test_legacy_accepted_multi_criterion_plan_blocks_once_without_releasin
         monkeypatch.setattr(OrchestrationService, "recover_run", forbidden)
         monkeypatch.setattr(EffectivenessReviewProcess, "advance", forbidden)
         stub_decision(lambda _ctx: pytest.fail("snapshot integrity must stop before LLM work"))
+        await first_tick_db.commit()  # End the observer reads owned by this driver.
         first = await OrchestrationService().tick(first_tick_db, run.id)
         persisted_goal = await first_tick_db.get(OrchestrationGoal, goal.id)
         persisted_run = await first_tick_db.get(OrchestrationRun, run.id)
@@ -1716,7 +1750,7 @@ async def test_legacy_accepted_multi_criterion_plan_blocks_once_without_releasin
             if OrchestrationService._task_work_function(task) == "implementation"
         ]
 
-    async with sessions.begin() as replay_db:
+    async with sessions() as replay_db:
         replay = await OrchestrationService().tick(replay_db, run.id)
         persisted_run = await replay_db.get(OrchestrationRun, run.id)
         assert persisted_run is not None
@@ -1938,14 +1972,15 @@ async def test_reconciliation_repair_survives_restart_and_emits_one_audit_event(
         await setup_db.flush()
         project_id, goal_id, run_id, gate_id = project.id, goal.id, run.id, gate.id
 
-    async with sessions.begin() as repair_db:
+    async with sessions() as repair_db:
         project = await repair_db.get(Project, project_id)
         goal = await repair_db.get(OrchestrationGoal, goal_id)
         run = await repair_db.get(OrchestrationRun, run_id)
         assert project is not None and goal is not None and run is not None
         assert await OrchestrationService()._reconcile_outcome_gate_acceptance(repair_db, goal, run) == 1
+        await repair_db.commit()
 
-    async with sessions.begin() as replay_db:
+    async with sessions() as replay_db:
         goal = await replay_db.get(OrchestrationGoal, goal_id)
         run = await replay_db.get(OrchestrationRun, run_id)
         gate = await replay_db.get(OrchestrationGate, gate_id)
@@ -1984,12 +2019,12 @@ async def test_paused_tick_open_gate_normalization_persists_across_sessions(test
         await setup_db.flush()
         run_id, gate_id = run.id, gate.id
 
-    async with sessions.begin() as repair_db:
+    async with sessions() as repair_db:
         await OrchestrationService().tick(repair_db, run_id)
         async with sessions() as observer_db:
             gate = await observer_db.get(OrchestrationGate, gate_id)
             assert gate is not None
-            assert gate.required_evidence["required_source_types"] == ["task"]
+            assert gate.required_evidence["required_source_types"] == ["task", "verification"]
 
     async with sessions() as verify_db:
         gate = await verify_db.get(OrchestrationGate, gate_id)
@@ -2596,7 +2631,7 @@ async def test_runtime_recovery_triggers_then_escalates_needs_attention(
     ))).all())
     await db_session.commit()
     sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-    async with sessions.begin() as restart_db:
+    async with sessions() as restart_db:
         replay = await OrchestrationService().tick(restart_db, run.id)
         replay_run = await restart_db.get(OrchestrationRun, run.id)
         replay_goal = await restart_db.get(OrchestrationGoal, goal.id)
@@ -2964,3 +2999,122 @@ async def test_malformed_planning_output_requires_revision_then_accepts_valid_en
     assert run.plan_state["status"] == "accepted"
     accepted = await db_session.get(Artifact, uuid.UUID(run.plan_state["accepted_artifact_id"]))
     assert accepted.linked_task_id == revised_task.id
+
+
+@pytest.mark.parametrize("replacement", ["request_plan", "request_plan_revision"])
+@pytest.mark.parametrize("pause_position", [None, "before_cancel", "during_cancel", "runner_before_marker", "runner_after_marker"])
+async def test_spr230_dispatcher_cli_plan_replacement_preserves_owning_transaction(sessions, tmp_path, monkeypatch, replacement, pause_position):
+    """SPR230/SPR231 trusted final-admission writer must not look like unrelated caller writes."""
+    from unittest.mock import AsyncMock
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    from tests.conftest import bind_plan_author_team
+    from huddleroom.schemas.orchestration_recovery import CorrectiveDisposition
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+    async with sessions() as setup:
+        project, _ = await seed_project_user(setup, tmp_path)
+        planner = _agent("cli-replacement", ["planning"])
+        setup.add(planner)
+        await setup.flush()
+        service, goal, run = await _authorized_run(setup, project, owns_setup=True)
+        await bind_plan_author_team(setup, goal, planner)
+        await setup.commit()
+        action = await service.execute_request_plan_action(setup, run.id, {
+            "action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Initial plan"},
+            f"initial-plan:{run.id}")
+        old_task = await setup.get(Task, action.target_id)
+        old_task.status = "in_progress"
+        previous = Session(project_id=project.id, task_id=old_task.id, agent_id=planner.id,
+                           adapter_type="cli", status="pending", runner_task_id=str(uuid.uuid4()))
+        setup.add(previous)
+        await setup.flush()
+        request = {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Replacement plan"}
+        if replacement == "request_plan_revision":
+            request = {"action_type": replacement, "plan_task_id": str(old_task.id), "revision_request": "Revise plan", "reason": "Reviewed revision"}
+        decision = OrchestrationDecision(run_id=run.id, decision_type="execution", validator_status="accepted",
+            input_snapshot={"run": {"id": str(run.id), "plan_state": dict(run.plan_state)}}, parsed_decision=request)
+        setup.add(decision)
+        await setup.commit()
+        goal_id, run_id, decision_id, old_session_id = goal.id, run.id, decision.id, previous.id
+    import asyncio
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_terminalize = OrchestrationService._terminalize_sqlite_planning_replacement
+    async def before_cancel(service, *args, **kwargs):
+        if pause_position in {"before_cancel", "runner_before_marker"}:
+            entered.set()
+            await release.wait()
+        return await original_terminalize(service, *args, **kwargs)
+    monkeypatch.setattr(OrchestrationService, "_terminalize_sqlite_planning_replacement", before_cancel)
+    from huddleroom.services.session_service import SessionService
+    original_cancel = SessionService.cancel
+    async def gated_cancel(self, *args, **kwargs):
+        if pause_position == "runner_after_marker":
+            entered.set()
+            await release.wait()
+        return await original_cancel(self, *args, **kwargs)
+    monkeypatch.setattr(SessionService, "cancel", gated_cancel)
+    cancellations = []
+    async def acknowledge_runner_cancel(runner_task_id):
+        # Fake the test runner acknowledgment, preserving the real service's
+        # independent terminal-fact readback and immutable runner ownership.
+        if pause_position == "during_cancel":
+            entered.set()
+            await release.wait()
+        async with sessions() as worker:
+            old = await worker.get(Session, old_session_id)
+            assert old.runner_task_id == runner_task_id
+            old.status, old.ended_at = "cancelled", _utcnow()
+            await worker.commit()
+        cancellations.append(runner_task_id)
+        return True
+    monkeypatch.setattr("huddleroom.workers.task_runner.cancel_task", acknowledge_runner_cancel)
+    service = OrchestrationService()
+    service.classify_corrective_action = AsyncMock(return_value=CorrectiveDisposition.ORDINARY)
+    async def dispatch():
+        async with sessions() as owner:
+            async with service._lock_goal_for_baseline_transition(owner, goal_id):
+                current = await owner.get(OrchestrationRun, run_id)
+                decision = await owner.get(OrchestrationDecision, decision_id)
+                result = await OrchestrationDecisionDispatcher(service).dispatch(owner, current, decision)
+                assert result.status == "completed"
+                await owner.commit()
+                return result
+    if pause_position is None:
+        result = await dispatch()
+        async with sessions() as fresh:
+            assert (await fresh.get(Session, old_session_id)).status == "cancelled"
+            assert len(cancellations) == 1
+            state = (await fresh.get(OrchestrationRun, run_id)).plan_state
+            assert state["planning_task_id"] != str(old_task.id)
+            if replacement == "request_plan":
+                assert state["planning_task_id"] == str(result.target_id)
+    else:
+        pending = asyncio.create_task(dispatch())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            changed_runner = str(uuid.uuid4())
+            async with sessions() as pause:
+                if pause_position.startswith("runner_"):
+                    changed = await pause.get(Session, old_session_id)
+                    changed.runner_task_id = changed_runner
+                    await pause.commit()
+                else:
+                    await OrchestrationService().pause_goal(pause, project.id, goal_id)
+            release.set()
+            outcomes = await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 3)
+            if isinstance(outcomes[0], Exception):
+                assert isinstance(outcomes[0], HTTPException) and outcomes[0].status_code == 409
+            assert len(cancellations) == int(pause_position == "during_cancel")
+            async with sessions() as fresh:
+                persisted = await fresh.get(OrchestrationRun, run_id)
+                if pause_position.startswith("runner_"):
+                    current_session = await fresh.get(Session, old_session_id)
+                    assert current_session.runner_task_id == changed_runner
+                    assert current_session.status == "pending"
+                else:
+                    assert persisted.pause_requested is True and persisted.status == "paused"
+                    assert (await fresh.get(Session, old_session_id)).status == (
+                        "pending" if pause_position == "before_cancel" else "cancelled")
+                assert persisted.plan_state["planning_task_id"] == str(old_task.id)
+        finally:
+            release.set()
+            await asyncio.gather(pending, return_exceptions=True)

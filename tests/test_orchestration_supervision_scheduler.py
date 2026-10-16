@@ -129,6 +129,12 @@ async def test_goal_resumed_event_runs_one_full_tick_after_coalescing_without_lo
         return 0
 
     class FakeDb:
+        from types import SimpleNamespace
+        sync_session = SimpleNamespace(get_transaction=lambda: None)
+
+        def in_nested_transaction(self):
+            return False
+
         async def commit(self):
             pass
 
@@ -182,12 +188,10 @@ async def test_goal_resumed_event_runs_one_full_tick_and_no_local_evaluation(db_
     db_session.add(event)
     await db_session.flush()
 
-    class _Session:
-        async def __aenter__(self):
-            return db_session
-
-        async def __aexit__(self, *exc):
-            return False
+    # SPR230/SPR231 a native worker owns a fresh transaction, not fixture's caller BEGIN.
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    await db_session.commit()
+    sessions = async_sessionmaker(db_session.bind, expire_on_commit=False)
 
     ticks, evaluations = [], []
 
@@ -198,7 +202,7 @@ async def test_goal_resumed_event_runs_one_full_tick_and_no_local_evaluation(db_
         evaluations.append(run_id)
         return 0
 
-    monkeypatch.setattr(orchestration_tasks, "AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(orchestration_tasks, "AsyncSessionLocal", sessions)
     monkeypatch.setattr(orchestration_tasks, "settings", SimpleNamespace(orchestration_event_coalesce_seconds=0))
     monkeypatch.setattr(orchestration_service.OrchestrationService, "tick", fake_tick)
     monkeypatch.setattr(orchestration_tasks.OrchestrationSupervisionScheduler, "evaluate_run", fake_evaluate_run)
@@ -209,6 +213,12 @@ async def test_goal_resumed_event_runs_one_full_tick_and_no_local_evaluation(db_
 
 
 class _Spr213Session:
+    from types import SimpleNamespace
+    sync_session = SimpleNamespace(get_transaction=lambda: None)
+
+    def in_nested_transaction(self):
+        return False
+
     def __init__(self, commits=None, rollbacks=None):
         self.commits = commits if commits is not None else []
         self.rollbacks = rollbacks if rollbacks is not None else []

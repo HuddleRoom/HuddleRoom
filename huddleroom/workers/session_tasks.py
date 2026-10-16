@@ -31,7 +31,7 @@ async def orchestration_lineage_state(db, session: SessionModel) -> bool | None:
         session_orchestration = None
     if session.task_id is None:
         return False if session_orchestration is not None else None
-    task = await db.get(Task, session.task_id)
+    task = await db.get(Task, session.task_id, populate_existing=True)
     task_metadata = task.metadata_ if task is not None and isinstance(task.metadata_, dict) else {}
     task_orchestration = task_metadata.get("orchestration")
     if not isinstance(task_orchestration, dict):
@@ -43,9 +43,9 @@ async def orchestration_lineage_state(db, session: SessionModel) -> bool | None:
         return False
     if session_orchestration is not None and str(session_orchestration.get("action_id")) != str(action_id):
         return False
-    action = await db.get(OrchestrationAction, action_id)
-    run = await db.get(OrchestrationRun, run_id)
-    goal = await db.get(OrchestrationGoal, run.goal_id) if run is not None else None
+    action = await db.get(OrchestrationAction, action_id, populate_existing=True)
+    run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+    goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True) if run is not None else None
     if (task is None or action is None or run is None or goal is None or action.run_id != run.id
             or goal.project_id != session.project_id
             or task.project_id != session.project_id or task.assigned_to != session.agent_id
@@ -165,6 +165,28 @@ async def _require_runnable_session_once(db, session_id: uuid.UUID, runner_task_
         failure_error = f"project_not_runnable: {detail['reason']}"
         await _fail_pending_session(db, session, failure_error, runner_task_id)
         return exc if session.status == "failed" else False
+    from huddleroom.models.agent import Agent
+    from huddleroom.services.session_service import SessionService, SessionClaimAttention
+    task = await db.get(Task, session.task_id, populate_existing=True) if session.task_id else None
+    agent = await db.get(Agent, session.agent_id)
+    try:
+        if task is not None and agent is not None:
+            await SessionService().preflight_claim(db, task, agent, session.adapter_type)
+        await ProjectService().lock_workspace_boundary(db, session.project_id)
+        await db.refresh(session)
+        if task is not None:
+            await db.refresh(task)
+        if await orchestration_lineage_state(db, session) is False:
+            return await _fail_pending_session(db, session, "orchestration_lineage_invalid", runner_task_id)
+        await ProjectService().require_runnable_project(db, session.project_id)
+        await SessionService()._orchestration_authorization(db, task)
+    except SessionClaimAttention as exc:
+        await SessionService.persist_claim_attention(db, exc)
+        return False
+    except HTTPException as exc:
+        if exc.status_code == 409 and str(exc.detail).startswith("authorization_denied:"):
+            return False  # Keep the existing pending reservation recoverable after Resume.
+        raise
     if runner_task_id is None:
         claim = await db.execute(
             update(SessionModel).where(

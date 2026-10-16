@@ -954,6 +954,35 @@ def planning_envelope_report_schema(plan_kind: str) -> dict[str, Any]:
     return {"schema_version": 1, "plan_kind": plan_kind, "summary": "str (nonblank)", "plan_items": [fields]}
 
 
+class PauseControlRequest(BaseModel):
+    run_id: uuid.UUID
+    expected_control_version: int = Field(ge=0)
+    request_id: uuid.UUID
+
+
+class ControlSnapshot(BaseModel):
+    project_id: uuid.UUID
+    goal_id: uuid.UUID
+    run_id: uuid.UUID
+    control_version: int
+    pause_requested: bool
+    goal_status: str
+    run_status: str
+
+
+class PauseReceipt(BaseModel):
+    project_id: uuid.UUID
+    goal_id: uuid.UUID
+    run_id: uuid.UUID
+    request_id: uuid.UUID
+    accepted_at: datetime
+    accepted_control_version: int
+    current_control_version: int
+    state: Literal["accepted", "applied", "resumed", "superseded"]
+    goal_status: str
+    run_status: str
+
+
 class OrchestrationRunResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -962,6 +991,8 @@ class OrchestrationRunResponse(BaseModel):
     status: str
     phase: str
     baseline_authorized: bool = True
+    pause_requested: bool = False
+    control_version: int = 0
     cycle_key: str | None = None
     supersedes_run_id: uuid.UUID | None = None
     terminal_reason: str | None = None
@@ -1071,6 +1102,8 @@ class OrchestrationEvidenceResponse(BaseModel):
 
 class OrchestrationRunSummaryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    control_version: int = 0
 
     id: uuid.UUID
     status: str

@@ -319,7 +319,7 @@ async def test_due_judgment_calls_provider_and_applies_its_valid_disposition(db_
         assert await scheduler.evaluate_run(worker, run.id, now=now) == 1
     async with sessions() as observer:
         action = await observer.scalar(__import__("sqlalchemy").select(OrchestrationAction).where(
-            OrchestrationAction.run_id == run.id
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type != "admit_control_call",
         ))
         run = await observer.get(OrchestrationRun, run.id)
     assert observed and "memory" in observed[0]["context"]
@@ -609,7 +609,7 @@ async def test_provider_disposition_is_fenced_off_when_its_context_changes(
         assert await pending == 0
     async with sessions() as observer:
         assert await observer.scalar(__import__("sqlalchemy").select(OrchestrationAction).where(
-            OrchestrationAction.run_id == run.id
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type != "admit_control_call",
         )) is None
 
 
@@ -1018,7 +1018,9 @@ async def test_escalation_blocker_does_not_block_goal_completion(
     monkeypatch.setattr(orchestration_service.GoalCloseoutProcess, "advance", closeout)
     monkeypatch.setattr(service, "_run_ready_for_completion", completion_not_ready)
 
-    await service.tick(db_session, run.id)
+    sessions = await _fresh_sessions(db_session, monkeypatch)
+    async with sessions() as worker:
+        await service.tick(worker, run.id)
 
     finish_calls = ["final_summary", "closeout_preconditions", "closeout", "completion"]
     assert [c for c in calls if c in finish_calls] == (finish_calls if finish_expected else [])

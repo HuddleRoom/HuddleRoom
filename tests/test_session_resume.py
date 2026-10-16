@@ -424,7 +424,7 @@ async def test_session_resume_atomic_claim_redispatches_and_second_call_409s(
     assert resumed.runner_task_id != old_runner_task_id
     # A fresh dispatch was queued for after-commit delivery (mock-healthy re-drive).
     pending = db_session.sync_session.info.get("pending_session_dispatches", [])
-    assert any(item[0] == session.id for item in pending)
+    assert any(item["dispatch"][0] == session.id for item in pending)
 
     # Second concurrent resume on the same (now-pending) session must 409 --
     # the atomic UPDATE finds 0 rows because status is no longer "failed".

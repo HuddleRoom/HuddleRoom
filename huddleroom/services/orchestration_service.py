@@ -896,6 +896,47 @@ class OrchestrationService:
                 return True
         return False
 
+    async def _prepare_control_operation(
+        self, db, *, goal_id=None, run_id=None, request_owns_transaction=False,
+    ) -> bool:
+        """Decide lexical ownership before reads or a new long mutex."""
+        transaction = db.sync_session.get_transaction()
+        if transaction is None:
+            return True
+        if (request_owns_transaction and transaction.origin == SessionTransactionOrigin.AUTOBEGIN
+                and not db.in_nested_transaction()):
+            await db.commit()
+            return True
+        if goal_id is None:
+            goal_id = await db.scalar(select(OrchestrationRun.goal_id).where(OrchestrationRun.id == run_id))
+        root_id = await root_goal_id(db, goal_id) if goal_id is not None else None
+        required = {goal_id, root_id}
+        current = asyncio.current_task()
+        if (db.get_bind().dialect.name != "sqlite" or None in required or any(
+                _SQLITE_GOAL_LOCKS.get(item) is None
+                or _SQLITE_GOAL_LOCKS[item]._owner_task is not current for item in required)):
+            raise HTTPException(409, detail={"conflict": "orchestration_transaction_shape",
+                                            "message": "End caller work before acquiring goal transition locks"})
+        return False
+
+    async def _admitted_decision_adapter(self, db, goal_id, adapter, context, project_ctx, goal_ctx, *, owns, run_id):
+        from huddleroom.services.orchestration_baseline_runtime import (
+            baseline_operation, current_baseline_operation, await_baseline_completion,
+        )
+
+        async def invoke():
+            if isinstance(adapter, OrchestrationDecisionAdapter):
+                # The native adapter records every actual repair/provider attempt.
+                return await adapter.decide(context, project=project_ctx, goal=goal_ctx)
+            async def opaque_adapter(**_request):
+                return await adapter.decide(context, project=project_ctx, goal=goal_ctx)
+            return await await_baseline_completion(opaque_adapter, {})
+
+        if current_baseline_operation() is not None:
+            return await invoke()
+        async with baseline_operation(db, goal_id, owns_transaction=owns, run_id=run_id):
+            return await invoke()
+
     async def request_llm_decision(
         self,
         db: AsyncSession,
@@ -912,6 +953,10 @@ class OrchestrationService:
         cannot see it.
         """
         from huddleroom.models.project import Project
+        from huddleroom.services.orchestration_baseline_runtime import current_baseline_operation
+        operation = current_baseline_operation()
+        owns_provider_transaction = (operation.owns_transaction if operation is not None else
+                                     db.sync_session.get_transaction() is None)
 
         current_run = await db.get(OrchestrationRun, run_id)
         if current_run is not None:
@@ -959,7 +1004,20 @@ class OrchestrationService:
                         return latest_decision
 
         if context is not None:
-            adapter_result = await decision_adapter.decide(context, project=project_ctx, goal=goal_ctx)
+            if not owns_provider_transaction:
+                raise HTTPException(409, detail={"conflict": "orchestration_transaction_shape",
+                                                "message": "Commit caller work before model continuation"})
+            if operation is not None:
+                adapter_result = await self._admitted_decision_adapter(
+                    db, current_run.goal_id, decision_adapter, context, project_ctx, goal_ctx,
+                    owns=True, run_id=run_id,
+                )
+            else:
+                async with AsyncSessionLocal() as admission_db:
+                    adapter_result = await self._admitted_decision_adapter(
+                        admission_db, current_run.goal_id, decision_adapter, context, project_ctx, goal_ctx,
+                        owns=True, run_id=run_id,
+                    )
             async with AsyncSessionLocal() as write_db:
                 write_run = await self._lock_run_for_committed_decision(
                     write_db,
@@ -1011,7 +1069,10 @@ class OrchestrationService:
         await self._ensure_baseline_processes_ready(db, goal.id)
         context = await self._decision_context(db, goal, run)
         project_ctx, goal_ctx = _orch_decide_ctx(await db.get(Project, goal.project_id), goal)
-        adapter_result = await decision_adapter.decide(context, project=project_ctx, goal=goal_ctx)
+        adapter_result = await self._admitted_decision_adapter(
+            db, run.goal_id, decision_adapter, context, project_ctx, goal_ctx,
+            owns=owns_provider_transaction, run_id=run.id,
+        )
         return await self.record_validated_decision(
             db,
             run_id=run.id,
@@ -1576,6 +1637,10 @@ class OrchestrationService:
         for key, size in marks.items():
             if key in info:
                 del info[key][size:]
+                if not info[key]:
+                    info.pop(key, None)
+                    if key == "pending_session_dispatches":
+                        info.pop("pending_session_dispatch_listener", None)
         try:
             await db.refresh(run)
             await db.get(OrchestrationGoal, run.goal_id, populate_existing=True)
@@ -2203,6 +2268,22 @@ class OrchestrationService:
                 detail=f"plan_author_mismatch: request_plan agent_id must be the selected plan author {author}",
             )
 
+    async def _publish_owned_planning_preparation(self, db, run_id, *, owns_transaction=False):
+        """Only a lexical owner may end preparation before CLI cancellation awaits."""
+        from huddleroom.services.orchestration_baseline_runtime import (
+            current_baseline_operation, publish_baseline_transaction,
+        )
+        operation = current_baseline_operation()
+        owns = owns_transaction or bool(operation is not None and operation.owns_transaction)
+        if not owns or db.in_nested_transaction():
+            return
+        if db.new or db.dirty or db.deleted or await self._sqlite_transaction_has_writes(db):
+            from huddleroom.services.orchestration_control import apply_pause_status
+            if operation is None:
+                await apply_pause_status(db, run_id)
+            await publish_baseline_transaction(db)
+            await db.get(OrchestrationRun, run_id, populate_existing=True)
+
     async def execute_request_plan_action(
         self, db: AsyncSession, run_id: uuid.UUID, request: dict, idempotency_key: str,
         decision_id: uuid.UUID | None = None, plan_dispatch_request: dict | None = None,
@@ -2258,9 +2339,45 @@ class OrchestrationService:
 
     async def _terminalize_sqlite_planning_replacement(self, db, run_id, expected, old_session) -> None:
         session_id, task_id = old_session.id, old_session.task_id
+        expected_runner_id = old_session.runner_task_id
         await self._assert_sqlite_replacement_transaction(db)
-        await db.commit()
-        await SessionService().cancel(db, session_id, sync_task=False)
+        from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+        from huddleroom.services.orchestration_control import acquire_control_writer
+        await acquire_control_writer(db, run_id)
+        await db.refresh(old_session)
+        intended_task = await db.get(Task, task_id, populate_existing=True) if task_id is not None else None
+        if (intended_task is None or intended_task.project_id != old_session.project_id
+                or old_session.task_id != task_id or old_session.runner_task_id != expected_runner_id
+                or old_session.status not in {"pending", "running"}):
+            raise HTTPException(409, detail="planning_replacement_session_changed")
+        current = await self._assert_current_plan_generation(db, run_id, expected)
+        source_action_id = self._optional_uuid(expected.get("request_action_id"), "request_action_id")
+        source_action = (await db.get(OrchestrationAction, source_action_id, populate_existing=True)
+                         if source_action_id is not None else None)
+        if (source_action is None or source_action.run_id != run_id
+                or source_action.target_type != "task" or source_action.target_id != task_id):
+            raise HTTPException(409, detail="planning_replacement_lineage_invalid")
+        admitted = self._json_object_or_empty(source_action.dispatch_contract).get("replacement_cancellation")
+        identity = {"session_id": str(session_id), "runner_task_id": expected_runner_id,
+                    "generation": expected}
+        if admitted is not None:
+            if any(admitted.get(key) != value for key, value in identity.items()):
+                raise HTTPException(409, detail="planning_replacement_cancellation_conflict")
+        else:
+            try:
+                await require_control_admission(db, run_id)
+            except BaselinePaused:
+                raise HTTPException(409, detail="Orchestration admission paused") from None
+            source_action.dispatch_contract = {
+                **(source_action.dispatch_contract or {}),
+                "replacement_cancellation": {**identity, "control_version": current.control_version,
+                                             "accepted_at": _utcnow().isoformat()},
+            }
+            await db.flush()
+        await db.commit()  # Native cancellation admission is durable before the writer-free runner await.
+        await SessionService().cancel(
+            db, session_id, sync_task=False, expected_identity=(task_id, expected_runner_id),
+        )
         await self._assert_current_plan_generation(db, run_id, expected)
         old_task = await db.get(Task, task_id, populate_existing=True)
         if old_task is not None and "cancelled" in Task.VALID_TRANSITIONS.get(old_task.status, set()):
@@ -2378,6 +2495,11 @@ class OrchestrationService:
                     },
                 }
 
+        from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+        try:
+            await require_control_admission(db, run_id)
+        except BaselinePaused:
+            raise HTTPException(409, detail="Orchestration admission paused") from None
         action = await self.reserve_action(
             db,
             run_id=run_id,
@@ -2574,6 +2696,11 @@ class OrchestrationService:
                     },
                 }
 
+        from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+        try:
+            await require_control_admission(db, run_id)
+        except BaselinePaused:
+            raise HTTPException(409, detail="Orchestration admission paused") from None
         action = await self.reserve_action(
             db,
             run_id=run_id,
@@ -8943,6 +9070,10 @@ class OrchestrationService:
             *running, OrchestrationRun.phase == "baseline",
         ).values(baseline_authorized=False))
         await db.execute(update(OrchestrationRun).where(*running).values(status="paused"))
+        await db.execute(update(OrchestrationRun).where(
+            OrchestrationRun.goal_id.in_(nonterminal_goals),
+            OrchestrationRun.status == "paused", OrchestrationRun.pause_requested.is_(False),
+        ).values(pause_requested=True, control_version=OrchestrationRun.control_version + 1))
         await db.execute(update(OrchestrationGoal).where(
             OrchestrationGoal.status.in_(("active", "blocked")),
         ).values(status="paused"))
@@ -8954,25 +9085,45 @@ class OrchestrationService:
         goal_id: uuid.UUID,
         *,
         commit: bool = True,
+        actor_user_id: uuid.UUID | None = None,
+        run_id: uuid.UUID | None = None,
+        expected_control_version: int | None = None,
+        request_id: uuid.UUID | None = None,
     ) -> tuple[OrchestrationGoal, OrchestrationRun | None]:
-        transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = not commit or transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
-        async with self._lock_goal_for_baseline_transition(db, goal_id):
-            goal = await self.get_goal(db, project_id, goal_id)
-            if goal is None:
-                raise HTTPException(status_code=404, detail="Orchestration goal not found")
-            if goal.status not in ("active", "blocked"):
-                raise HTTPException(status_code=409, detail=f"Cannot pause goal in status '{goal.status}'")
-            goal.status = "paused"
-            run = await self.get_active_run_for_goal(db, project_id, goal_id)
-            if run is not None and run.status in ("running", "blocked"):
-                run.status = "paused"
-                if run.phase == "baseline":
-                    run.baseline_authorized = False
-            await db.flush()
-            if not caller_owns_transaction:
-                await db.commit()
-            return goal, run
+        from huddleroom.services.orchestration_control import accept_pause
+        owns = commit and db.sync_session.get_transaction() is None
+        goal = await self.get_goal(db, project_id, goal_id)
+        if goal is None:
+            raise HTTPException(status_code=404, detail="Orchestration goal not found")
+        run = await self.get_active_run_for_goal(db, project_id, goal_id)
+        if run is None:
+            raise HTTPException(status_code=409, detail="Goal has no active run")
+        # Freeze before waiting for the writer; an old request cannot pause a replacement.
+        target_run_id = run_id or run.id
+        version = run.control_version if expected_control_version is None else expected_control_version
+        pause_request_id = request_id or uuid.uuid4()
+        actor = actor_user_id or uuid.UUID(int=0)
+        for attempt in range(2):
+            try:
+                await accept_pause(db, project_id, goal_id, target_run_id, version,
+                                   pause_request_id, actor, commit=False)
+                if owns:
+                    await db.commit()
+                break
+            except HTTPException as exc:
+                snapshot_retry = (isinstance(exc.detail, dict)
+                                  and exc.detail.get("conflict") == "orchestration_control_snapshot_retry")
+                if owns:
+                    await db.rollback()
+                if not owns or not snapshot_retry or attempt:
+                    raise
+            except BaseException:
+                if owns:
+                    await db.rollback()
+                raise
+        await db.refresh(goal)
+        await db.refresh(run)
+        return goal, run
 
     async def resume_goal(
         self,
@@ -8989,15 +9140,20 @@ class OrchestrationService:
             if goal is None:
                 raise HTTPException(status_code=404, detail="Orchestration goal not found")
             await ProjectService().lock_workspace_boundary(db, project_id)
+            await db.refresh(goal)
             await ProjectService().require_runnable_project(db, project_id)
             if goal.status != "paused":
                 raise HTTPException(status_code=409, detail=f"Cannot resume goal in status '{goal.status}'")
             goal.status = "active"
             run = await self.get_active_run_for_goal(db, project_id, goal_id)
+            if run is not None:
+                await db.refresh(run)
             # ponytail: resume always returns the run to 'running'; blocker re-detection
             # is the tick loop's job (later phase), not this endpoint's.
             if run is not None and run.status == "paused":
                 run.status = "running"
+                run.pause_requested = False
+                run.control_version += 1
             await db.flush()
             # Committed with the status change; the worker ticks after commit, never here.
             await emit_event_once(
@@ -13122,6 +13278,11 @@ class OrchestrationService:
         """Dispatch one runtime decision, recording a wait when it cannot act."""
         from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 
+        from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+        try:
+            await require_control_admission(db, run.id)
+        except BaselinePaused:
+            raise HTTPException(409, detail="Orchestration admission paused") from None
         dispatcher = OrchestrationDecisionDispatcher(self)
         try:
             action = await dispatcher.dispatch(db, run, decision)
@@ -13207,6 +13368,12 @@ class OrchestrationService:
         result: dict = {}
         hit_cap = False
         while iterations < cap:
+            from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+            try:
+                await require_control_admission(db, run.id)
+            except BaselinePaused:
+                result = {"step": "paused", "reason": "run_not_active"}
+                break
             iterations += 1
             result = await step_once(db, goal, run)
             if result.get("reused"):
@@ -13289,7 +13456,8 @@ class OrchestrationService:
 
         if isinstance(exc, RoadmapReplanMeasurementAttention):
             return {"step": "waiting", "reason": "needs_attention"}
-        if exc.status_code == 409 and exc.detail in {"budget_wait", "needs_attention"}:
+        if (exc.status_code == 409 and isinstance(exc.detail, str)
+                and exc.detail in {"budget_wait", "needs_attention"}):
             return {"step": "waiting", "reason": exc.detail}
         return None
 
@@ -13368,6 +13536,11 @@ class OrchestrationService:
                     )
                     return {"step": "waiting_plan_authority", "action_id": str(action.id)}
             try:
+                from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+                try:
+                    await require_control_admission(db, run.id)
+                except BaselinePaused:
+                    return {"step": "waiting", "reason": "paused"}
                 action = await self._dispatch_execution_decision(db, run, decision)
             except HTTPException as exc:
                 if (waiting := self._waiting_step_for_http_error(exc)) is not None:
@@ -13427,6 +13600,11 @@ class OrchestrationService:
         # meeting / wait). noop/ask_human/pause_run IS the explicit wait/escalation.
         try:
             decision = await self.request_llm_decision(db, run.id)
+            from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+            try:
+                await require_control_admission(db, run.id)
+            except BaselinePaused:
+                return {"step": "waiting", "reason": "paused"}
             action = await self._dispatch_execution_decision(db, run, decision)
         except HTTPException as exc:
             if (waiting := self._waiting_step_for_http_error(exc)) is not None:
@@ -13592,16 +13770,20 @@ class OrchestrationService:
             or scoped_tasks[blocker["scope"]] in waiting_ids
         ]
 
-    async def tick(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False) -> dict:
+    async def tick(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False,
+                   request_owns_transaction: bool = False) -> dict:
         from huddleroom.services.orchestration_roster_mutation import RosterHandoffRequired
+        owns = await self._prepare_control_operation(
+            db, run_id=run_id, request_owns_transaction=request_owns_transaction,
+        )
 
         try:
-            if not local_only:
+            if not local_only and owns:
                 # B1: an approved fix progresses (apply/verify/retry) before the decision loop can re-select the
                 # blocked action; new triggers are diagnosed after the tick, below.
                 await self._drive_recovery(db, run_id, diagnose=False)
             try:
-                result = await self._tick_baseline_impl(db, run_id, local_only=local_only)
+                result = await self._tick_baseline_impl(db, run_id, local_only=local_only, owns_transaction=owns)
             except RosterHandoffRequired as handoff:
                 # The reservation was published under the goal lock, which is now
                 # released: apply roster-first, then a fresh tick resumes the goal.
@@ -13609,13 +13791,16 @@ class OrchestrationService:
 
                 result = await complete_roster_handoff(
                     db, handoff.prepared,
-                    lambda _prepared: self._tick_baseline_impl(db, run_id, local_only=local_only),
+                    lambda _prepared: self._tick_baseline_impl(db, run_id, local_only=local_only, owns_transaction=owns),
                 )
         except HTTPException as exc:
             if exc.status_code == 409 and exc.detail == "Baseline operation discarded by reset":
                 return {"run_id": str(run_id), "status": "interrupted", "interrupted": True}
+            if exc.status_code == 409 and exc.detail == "Orchestration admission paused":
+                run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+                return self._tick_noop_result(run)
             raise
-        if not local_only:  # local-only passes are provider-free by contract
+        if not local_only and owns:  # local-only/caller-owned passes are provider-free by contract
             await self._drive_recovery(db, run_id)
         return result
 
@@ -13759,16 +13944,12 @@ class OrchestrationService:
             if owns:
                 await db.commit()  # the tick leaves no transaction open behind it
 
-    async def _tick_baseline_impl(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False) -> dict:
+    async def _tick_baseline_impl(self, db: AsyncSession, run_id: uuid.UUID, *, local_only: bool = False,
+                                  owns_transaction: bool | None = None) -> dict:
         """No-op control-loop tick: consume new events, advance cursor, emit once."""
-        # Preserve a caller's explicit transaction, but own SQLAlchemy's implicit
-        # AUTOBEGIN transaction (including route preflight reads) so commit stays
-        # inside the goal lock.
-        transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = (
-            transaction is not None
-            and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
-        )
+        if owns_transaction is None:
+            owns_transaction = await self._prepare_control_operation(db, run_id=run_id)
+        caller_owns_transaction = not owns_transaction
 
         # Fetch goal_id cheaply first to acquire lock before trusting run/goal status (fix #5).
         run_temp = await db.get(OrchestrationRun, run_id)
@@ -13776,7 +13957,9 @@ class OrchestrationService:
             raise HTTPException(status_code=404, detail="Orchestration run not found")
         goal_id = run_temp.goal_id
 
-        from huddleroom.services.orchestration_baseline_runtime import baseline_operation, require_baseline_available
+        from huddleroom.services.orchestration_baseline_runtime import (
+            baseline_operation, require_baseline_available, publish_baseline_transaction,
+        )
         from huddleroom.services.orchestration_roster_mutation import commit_before_roster_handoff
         require_baseline_available(goal_id)
         # Lock goal-level to serialize concurrent ticks and force-starts on the same goal.
@@ -13786,7 +13969,8 @@ class OrchestrationService:
             goal_id,
             tick_owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(),
         ), baseline_operation(
-            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(), tick=True
+            db, goal_id, owns_transaction=not caller_owns_transaction and not db.in_nested_transaction(),
+            tick=True, run_id=run_id
         ), commit_before_roster_handoff(
             db, not caller_owns_transaction and not db.in_nested_transaction()
         ):
@@ -13828,7 +14012,7 @@ class OrchestrationService:
                 run.supervision_state = state
                 await db.flush()
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return {
                     **self._tick_noop_result(run), "local_liveness": local_liveness, "local_only": True,
                     "steering": {
@@ -13875,11 +14059,14 @@ class OrchestrationService:
                         )
                         await db.flush()
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return self._tick_noop_result(
                     run, effectiveness_review_process, goal_closeout_process
                 )
 
+            from huddleroom.services.orchestration_baseline_runtime import require_control_admission
+            await require_control_admission(db, run.id)
+            await SessionService().redispatch_pending_orchestration(db, run.id)
             if await self._hard_stop_active(db, goal.id):
                 return self._tick_noop_result(run)
 
@@ -13887,19 +14074,19 @@ class OrchestrationService:
                 self._json_object_or_empty(run.plan_state).get("child_delta_baseline")
             ).get("status") == "pending_renewal":
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return self._tick_noop_result(run)
 
             if goal.goal_type == "continuous" and run.phase in {"waiting_activation", "authorized"}:
                 if run.phase == "waiting_activation":
                     if not caller_owns_transaction:
-                        await db.commit()
+                        await publish_baseline_transaction(db)
                     return self._tick_noop_result(run)
                 from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
                 authorized_execution = await OrchestrationContinuousService(self).advance(db, goal, run)
                 await db.flush()
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return {
                     **self._tick_noop_result(run),
                     "authorized_execution": authorized_execution,
@@ -13908,7 +14095,7 @@ class OrchestrationService:
 
             if self._has_active_blocker(run, "repeated_failure"):
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return self._tick_noop_result(run)
 
             if any(
@@ -13952,7 +14139,7 @@ class OrchestrationService:
                 run.event_cursor = new_cursor
                 await db.flush()
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return {
                     "run_id": run_id,
                     "status": run.status,
@@ -13998,6 +14185,7 @@ class OrchestrationService:
             if goal_definition_ready and not child_delta_ready:
                 await ProjectService().lock_workspace_boundary(db, project_id)
                 await ProjectService().require_runnable_project(db, project_id)
+                await require_control_admission(db, run.id)
                 manager_selection_process = await ManagerSelectionProcess().advance(db, goal, run)
             manager_selection_ready = self._process_terminal(manager_selection_process)
             agent_definition_review_process = {"status": "skipped"} if child_delta_ready else None
@@ -14011,6 +14199,7 @@ class OrchestrationService:
 
                 await ProjectService().lock_workspace_boundary(db, project_id)
                 await ProjectService().require_runnable_project(db, project_id)
+                await require_control_admission(db, run.id)
                 agent_definition_review_process = await AgentDefinitionReviewProcess().advance(
                     db, goal, run
                 )
@@ -14021,6 +14210,7 @@ class OrchestrationService:
             if agent_definition_review_ready and not child_delta_ready:
                 await ProjectService().lock_workspace_boundary(db, project_id)
                 await ProjectService().require_runnable_project(db, project_id)
+                await require_control_admission(db, run.id)
                 team_hierarchy_process = await TeamHierarchyProcess().advance(
                     db, goal, run
                 )
@@ -14032,6 +14222,7 @@ class OrchestrationService:
             # authority_interview is cross-cutting, not a gated process.
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
+            await require_control_admission(db, run.id)
             authority_interview_summary = await self._sync_agent_authority_decisions(db, goal, run)
             pending_for_checkpoint = await OrchestrationAuthorityDecisionService().list_decisions(
                 db, goal.id, status="pending"
@@ -14088,7 +14279,7 @@ class OrchestrationService:
             if self._has_active_blocker(run, "plan_criterion_integrity") or self._has_active_blocker(run, BUDGET_REQUIRED_CODE):
                 await db.flush()
                 if not caller_owns_transaction:
-                    await db.commit()
+                    await publish_baseline_transaction(db)
                 return self._tick_noop_result(run)
             recoveries_created = await self.recover_run(db, run.id, baseline_ready=baseline_ready)
             await db.refresh(run)
@@ -14253,7 +14444,7 @@ class OrchestrationService:
             # controls commit/rollback, so we skip commit here to avoid InvalidRequestError.
             if not caller_owns_transaction:
                 # Caller did not pre-begin transaction; safe to commit before releasing lock
-                await db.commit()
+                await publish_baseline_transaction(db)
             # else: caller owns the transaction context; skip explicit commit
 
         return {

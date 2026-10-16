@@ -293,6 +293,8 @@ class OrchestrationRun(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     goal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orchestration_goals.id", ondelete="CASCADE"), nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="running")
+    pause_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    control_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     event_cursor: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
     plan_state: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     active_blockers: Mapped[list] = mapped_column(JSON, nullable=False, default=list)

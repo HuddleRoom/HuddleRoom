@@ -102,13 +102,15 @@ async def test_unregistered_nested_transaction_is_never_published(db_session, mo
     async def forbidden_commit():
         pytest.fail("unregistered savepoint was published")
     async def provider(**request):
-        return "ok"
-    async with baseline_operation(db_session, uuid.uuid4(), owns_transaction=True):
-        nested = await db_session.begin_nested()
+        pytest.fail("provider admitted through caller savepoint")
+    async with db_session.begin_nested() as nested:
         monkeypatch.setattr(db_session, "commit", forbidden_commit)
-        assert await await_baseline_completion(provider, {}) == "ok"
+        with pytest.raises(HTTPException) as conflict:
+            async with baseline_operation(db_session, uuid.uuid4(), owns_transaction=True):
+                await await_baseline_completion(provider, {})
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail["conflict"] == "orchestration_transaction_shape"
         assert nested.is_active
-        await nested.rollback()
 
 async def test_rejected_reset_never_signals_baseline(db_session, test_project, monkeypatch):
     goal = OrchestrationGoal(project_id=test_project.id, objective="terminal", status="completed")
@@ -214,8 +216,9 @@ async def _recovery_rows(db, run_id):
 
 @pytest.mark.parametrize("phase", ("diagnose", "answer", "apply", "verify", "retry"))
 async def test_reset_reservation_fences_every_recovery_phase_before_any_effect(
-    db_session, test_project, test_user, monkeypatch, phase,
+    owned_recovery_setup, monkeypatch, phase,
 ):
+    db_session, test_project, test_user = owned_recovery_setup
     flow = await _recovery_at(db_session, test_project, test_user, monkeypatch, phase)
     rows = flow.rows
     before = await _recovery_rows(db_session, rows.run.id)
@@ -254,7 +257,8 @@ async def test_reset_signalled_during_a_recovery_effect_discards_it_before_the_f
     async with sessions() as s:
         project, user = await seed_project_user(s, tmp_path)
         rows = await seed(s, project)
-        flow = await approved(s, rows, user, verify_call(rows), analyzer=ScriptedAnalyzer(draft(rows, verify_call(rows))))
+        flow = await approved(s, rows, user, verify_call(rows),
+                              analyzer=ScriptedAnalyzer(draft(rows, verify_call(rows))), owns_setup=True)
         await s.commit()
         goal_id, run_id, proposal_id = rows.goal.id, rows.run.id, flow.proposal.id
         wrapper_key = f"recovery:{flow.pid}:apply:call-1"
@@ -344,3 +348,7 @@ async def test_reset_during_recovery_diagnosis_discards_the_analyzer_result(sess
         assert (await s.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == fresh_id))).all() == []
         assert (await s.scalars(select(OrchestrationAuthorityDecision).where(
             OrchestrationAuthorityDecision.goal_id == goal_id))).all() == []
+
+
+# SPR230/SPR231 only explicit recovery setup cases use this independently owned fixture.
+from tests.test_orchestration_recovery_persistence import owned_recovery_setup  # noqa: E402,F401 -- fixture

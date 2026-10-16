@@ -822,12 +822,14 @@ async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_
 
 # --- activation hook (activate_ready is_blocked) ---
 
-async def _started_with_backlog_task(db, project):
+async def _started_with_backlog_task(db, project, *, owns_setup=False):
     from huddleroom.models.task import Task
     from tests.test_orchestration_runtime_e2e import _agent
 
     svc = OrchestrationService()
     goal, run = await _seed_baseline_terminal_run(db, project)
+    if owns_setup:
+        await db.commit()
     await svc.tick(db, run.id)
     await svc.start_run(db, project.id, goal.id, actor="human:a")
     agent = _agent("activation", ["implementation"])

@@ -34,6 +34,10 @@ async def test_startup_pause_is_durable_preserves_work_and_allows_resume(db_sess
             run = await restarted.get(OrchestrationRun, run_id)
             assert goal.status == ("paused" if old_goal in ("active", "blocked") else old_goal)
             assert run.status == ("paused" if old_goal in ("active", "blocked", "paused") and old_run in ("running", "blocked") else old_run)
+            # SPR230/SPR231: startup commits the scalar fence before recovery.
+            fenced = old_goal in ("active", "blocked", "paused") and old_run in ("running", "blocked", "paused")
+            assert run.pause_requested is fenced
+            assert run.control_version == int(fenced)
             assert goal.budget == {"max_turns": 8}
             assert (run.phase, run.event_cursor, run.plan_state, run.budget_state) == (
                 "baseline" if old_goal == "blocked" else "authorized", 42, {"draft": "keep"}, {"used": 3})

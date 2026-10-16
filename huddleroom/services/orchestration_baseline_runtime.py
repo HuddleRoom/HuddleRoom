@@ -1,23 +1,65 @@
 """Interruptible provider boundary for local baseline operations."""
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from fastapi import HTTPException
 from sqlalchemy import select, update, delete
-from huddleroom.models.orchestration import OrchestrationRun
+from huddleroom.models.orchestration import OrchestrationRun, OrchestrationGoal, OrchestrationAction
 from huddleroom.models.orchestration_process import OrchestrationProcessRun, OrchestrationAuthorityDecision
 
 class BaselineInterrupted(asyncio.CancelledError):
     """Reset cancellation bypasses analyzer error/repair handling."""
+
+class BaselinePaused(asyncio.CancelledError):
+    """A normal durable pause boundary bypasses analyzer error and repair handling."""
+
+
+class BaselineTransactionConflict(asyncio.CancelledError):
+    """Provider work cannot consume or publish a caller-owned transaction."""
+
+
+async def require_control_admission(db, run_id, *, require_baseline_authorization=True):
+    from huddleroom.services.orchestration_control import acquire_control_writer
+    await acquire_control_writer(db, run_id)
+    with db.no_autoflush:
+        row = (await db.execute(select(
+            OrchestrationRun.pause_requested, OrchestrationRun.status, OrchestrationRun.phase,
+            OrchestrationRun.baseline_authorized, OrchestrationGoal.id,
+            OrchestrationGoal.status, OrchestrationGoal.parent_goal_id,
+        ).join(OrchestrationGoal, OrchestrationGoal.id == OrchestrationRun.goal_id).where(
+            OrchestrationRun.id == run_id,
+        ))).one_or_none()
+        if row is None or row[0] or row[1] not in {"running", "blocked"} or row[5] not in {"active", "blocked"}:
+            raise BaselinePaused()
+        if require_baseline_authorization and row[2] == "baseline" and not row[3]:
+            raise BaselinePaused()
+        parent = row[6]
+        seen = {row[4]}
+        while parent is not None:
+            if parent in seen:
+                raise BaselinePaused()
+            seen.add(parent)
+            ancestor = (await db.execute(select(OrchestrationGoal.status, OrchestrationGoal.parent_goal_id).where(
+                OrchestrationGoal.id == parent,
+            ))).one_or_none()
+            if ancestor is None or ancestor[0] not in {"active", "blocked"}:
+                raise BaselinePaused()
+            parent = ancestor[1]
+
 
 @dataclass
 class Operation:
     db: Any
     owns_transaction: bool
     run_id: Any = None
+    tick: bool = False
+    source_action_id: Any = None
+    cancel_provider_on_cancel: bool = False
     savepoint: Any = None
+    operation_id: Any = field(default_factory=uuid.uuid4)
     interrupted: asyncio.Event = field(default_factory=asyncio.Event)
     finished: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -36,19 +78,43 @@ def require_baseline_available(goal_id):
         raise HTTPException(status_code=409, detail="Baseline operation discarded by reset")
 
 @asynccontextmanager
-async def baseline_operation(db, goal_id, *, owns_transaction, tick=False):
+async def baseline_operation(db, goal_id, *, owns_transaction, tick=False, register=True,
+                             run_id=None, source_action_id=None, cancel_provider_on_cancel=False):
     require_baseline_available(goal_id)
-    operation = Operation(db, owns_transaction)
+    operation = Operation(db, owns_transaction, run_id=run_id, tick=tick, source_action_id=source_action_id,
+                          cancel_provider_on_cancel=cancel_provider_on_cancel)
     token = _current.set(operation)
-    _active[goal_id] = operation
+    if register:
+        _active[goal_id] = operation
     try:
-        operation.run_id = await db.scalar(
-            select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id)
-            .order_by(OrchestrationRun.created_at.desc()).limit(1)
-        )
+        if operation.run_id is None:
+            operation.run_id = await db.scalar(
+                select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id)
+                .order_by(OrchestrationRun.created_at.desc()).limit(1)
+            )
         yield
+        from huddleroom.services.orchestration_control import apply_pause_status
+        if operation.run_id is not None and not operation.interrupted.is_set():
+            snapshot = await apply_pause_status(db, operation.run_id)
+            if snapshot.pause_requested:
+                await db.flush()
+            if owns_transaction:
+                await db.commit()
         if operation.interrupted.is_set():
             raise BaselineInterrupted()
+    except BaselineTransactionConflict:
+        raise HTTPException(409, detail={
+            "conflict": "orchestration_transaction_shape",
+            "message": "Commit the caller transaction before provider continuation",
+        }) from None
+    except BaselinePaused:
+        from huddleroom.services.orchestration_control import apply_pause_status
+        if operation.run_id is not None:
+            await apply_pause_status(db, operation.run_id)
+            await db.flush()
+        if owns_transaction:
+            await db.commit()
+        raise HTTPException(status_code=409, detail="Orchestration admission paused") from None
     except BaselineInterrupted:
         await db.rollback()
         raise HTTPException(status_code=409, detail="Baseline operation discarded by reset") from None
@@ -57,6 +123,19 @@ async def baseline_operation(db, goal_id, *, owns_transaction, tick=False):
         if _active.get(goal_id) is operation:
             _active.pop(goal_id, None)
         operation.finished.set()
+
+async def publish_baseline_transaction(db):
+    operation = _current.get()
+    if operation is not None and operation.run_id is not None:
+        from huddleroom.services.orchestration_control import apply_pause_status
+        await apply_pause_status(db, operation.run_id)
+    await db.flush()
+    await db.commit()
+
+
+def current_baseline_operation():
+    return _current.get()
+
 
 async def interrupt_baseline(goal_id):
     operation = _active.get(goal_id)
@@ -85,18 +164,34 @@ async def await_baseline_completion(completion_fn, request, *, observer=None):
         return await completion_fn(**request)
     if operation.interrupted.is_set():
         raise BaselineInterrupted()
-    if operation.owns_transaction:
-        nested = operation.db.get_nested_transaction()
-        registered = operation.savepoint
-        if nested and (registered is None or nested is not registered.nested):
-            # A nested transaction introduced by the caller/process is not ours.
-            pass
-        else:
-            if nested:
-                await nested.commit()
-                registered.published = True
-            await operation.db.flush()
-            await operation.db.commit()
+    if not operation.owns_transaction:
+        raise BaselineTransactionConflict()
+    nested = operation.db.get_nested_transaction()
+    registered = operation.savepoint
+    if nested and (registered is None or nested is not registered.nested):
+        raise BaselineTransactionConflict()
+    await require_control_admission(
+        operation.db, operation.run_id, require_baseline_authorization=operation.tick,
+    )
+    call_id = uuid.uuid4()
+    source = await operation.db.scalar(select(OrchestrationProcessRun.id).where(
+        OrchestrationProcessRun.run_id == operation.run_id,
+        OrchestrationProcessRun.status == "running",
+        OrchestrationProcessRun.superseded_by_id.is_(None),
+    ).order_by(OrchestrationProcessRun.created_at.desc()).limit(1))
+    operation.db.add(OrchestrationAction(
+        id=call_id, run_id=operation.run_id, action_type="admit_control_call", status="completed",
+        idempotency_key=f"run:{operation.run_id}:control_call:{call_id}",
+        request={"operation_id": str(operation.operation_id), "call_id": str(call_id),
+                 "source_process_id": str(source) if source else None,
+                 "source_action_id": str(operation.source_action_id) if operation.source_action_id else None},
+        target_type="process" if source else "orchestration_run", target_id=source or operation.run_id,
+    ))
+    if nested:
+        await nested.commit()
+        registered.published = True
+    await operation.db.flush()
+    await operation.db.commit()
     # Provider-only task: application writes and streaming output stay in parent.
     values = {key: value for key, value in request.items() if key != "stream"}
     # The provider closure retains only bounded transport state, never the call
@@ -167,7 +262,27 @@ async def await_baseline_completion(completion_fn, request, *, observer=None):
             finally:
                 joined.cancel()
                 await asyncio.gather(joined, return_exceptions=True)
-        return provider.result()
+        response = provider.result()
+        from huddleroom.services.orchestration_control import acquire_control_writer
+        await acquire_control_writer(operation.db, operation.run_id)
+        admission = await operation.db.get(OrchestrationAction, call_id)
+        if admission is not None:
+            usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+            safe_usage = {}
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2 ** 63:
+                    safe_usage[key] = value
+            audit_call = getattr(getattr(observer, "__self__", None), "call_id", None)
+            admission.dispatch_contract = {"provider_completed": True, "usage": safe_usage,
+                                           "audit_call_id": str(audit_call) if audit_call else None}
+            await operation.db.flush()
+        return response
+    except asyncio.CancelledError:
+        if operation.cancel_provider_on_cancel and not operation.interrupted.is_set():
+            provider.cancel()
+            await asyncio.gather(provider, return_exceptions=True)
+        raise
     finally:
         state["active"] = False
         if observation_drain:

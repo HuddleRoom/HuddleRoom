@@ -140,6 +140,19 @@ async def activate_ready(
             break
         if refused:  # a refused start rolled back a savepoint, which expires every loaded task
             await db.refresh(task)
+        from fastapi import HTTPException
+        from huddleroom.services.session_service import SessionService, SessionClaimAttention
+        try:
+            await SessionService()._orchestration_authorization(db, task)
+        except SessionClaimAttention as exc:
+            await SessionService.persist_claim_attention(db, exc)
+            refused = True
+            continue
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            refused = True
+            continue
         await TaskService().auto_start(db, task)
         if task.status == "in_progress":  # ponytail: local decrement is valid under the root lock
             started.append(task)

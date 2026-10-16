@@ -72,7 +72,10 @@ ANALYSIS_EVIDENCE_FAILED = "analysis_evidence_failed"
 ANALYSIS_EVIDENCE_LIMIT = "analysis_evidence_limit"
 ADMISSION_REJECTED = "baseline_repair_admission_rejected"
 _ANALYZER_FAILURES = (ANALYSIS_CONTRACT_REJECTED, ANALYSIS_EVIDENCE_LIMIT)
-_NOT_A_REFUSAL = (ANALYSIS_FAILED, ANALYSIS_PROVIDER_FAILED, ANALYSIS_EVIDENCE_FAILED, ADMISSION_REJECTED)
+_NOT_A_REFUSAL = (
+    ANALYSIS_FAILED, ANALYSIS_PROVIDER_FAILED, ANALYSIS_EVIDENCE_FAILED,
+    ADMISSION_REJECTED, "paused_after_admitted_result",
+)
 _WRAPPER_TYPES = ("recovery_apply", "recovery_verify", "recovery_retry")
 _GAP_KEY_PREFIX = RECOVERY_GAP_DECISION_KEY_PREFIX
 _WARNING_TYPE = registry_module.RECOVERY_WARNING_TYPE
@@ -203,10 +206,15 @@ class OrchestrationBlockerRecoveryService:
     async def diagnose(
         self, db: AsyncSession, trigger_action_id: UUID, *, tick_owns_transaction: bool = False,
     ) -> OrchestrationAction:
+        transaction = db.sync_session.get_transaction()
+        owns = transaction is None or (tick_owns_transaction
+            and transaction.origin == SessionTransactionOrigin.AUTOBEGIN and not db.in_nested_transaction())
         trigger_action = await db.get(OrchestrationAction, trigger_action_id, populate_existing=True)
         if trigger_action is None or trigger_action.action_type != "recovery_trigger":
             raise HTTPException(status_code=404, detail="Recovery trigger not found")
         trigger = RecoveryTriggerV1.model_validate(trigger_action.request)
+        if not owns:
+            await self.orchestration._prepare_control_operation(db, goal_id=trigger.goal_id)
         await self._require_diagnosis_runnable(db, trigger.goal_id, trigger.run_id)
         if trigger_action.status != "reserved":
             return await self._diagnosed_result(db, trigger_action)
@@ -279,15 +287,29 @@ class OrchestrationBlockerRecoveryService:
             return RecoveryDiagnosisFailed(trigger_action.id, row.id, code)
 
         async def before_completion() -> None:
-            transaction = db.sync_session.get_transaction()
-            if (tick_owns_transaction and transaction is not None
-                    and transaction.origin == SessionTransactionOrigin.AUTOBEGIN
-                    and not db.in_nested_transaction()
-                    and not (db.new or db.dirty or db.deleted)):
-                # Only this tick's read transaction ends; never commit caller work.
+            if owns and not db.in_nested_transaction() and not (db.new or db.dirty or db.deleted):
                 await db.commit()
-            # This fresh admission is the final await before the provider starts.
             await self._require_diagnosis_runnable(db, goal.id, run.id)
+
+        async def after_completion() -> None:
+            # Accepted output may land while paused; reset still invalidates its run.
+            await self._require_run_current(db, goal.id, trigger.run_id)
+
+        async def completion_boundary(completion_fn, values):
+            from huddleroom.services.orchestration_baseline_runtime import baseline_operation, await_baseline_completion
+            if not owns:
+                raise _RunFenced(409, detail={"conflict": "orchestration_transaction_shape",
+                                             "message": "Commit caller work before recovery continuation"})
+            observer = values.get("observer")
+            request = {key: value for key, value in values.items() if key != "observer"}
+            try:
+                async with baseline_operation(
+                    db, trigger.goal_id, owns_transaction=True, register=False,
+                    run_id=trigger.run_id, source_action_id=trigger_action_id, cancel_provider_on_cancel=True,
+                ):
+                    return await await_baseline_completion(completion_fn, request, observer=observer)
+            except HTTPException as exc:
+                raise _RunFenced(exc.status_code, detail=exc.detail) from None
 
         if escalation is not None:
             assessment = escalation
@@ -301,12 +323,21 @@ class OrchestrationBlockerRecoveryService:
                         and parameter.kind in {inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
                 ) for parameter in parameters):
                     analyzer_options["before_completion"] = before_completion
+                names = inspect.signature(self.analyzer.analyze).parameters
+                if "completion_boundary" in names:
+                    analyzer_options["completion_boundary"] = completion_boundary
+                if "after_completion" in names:
+                    analyzer_options["after_completion"] = after_completion
             try:
                 assessment = await self.analyzer.analyze(
                     snapshot, project_id=goal.project_id, evidence_query=recorded_query, on_raw=raw_outputs.append,
                     **analyzer_options,
                 )
-            except _RunFenced:
+            except _RunFenced as exc:
+                if owns and raw_outputs and exc.detail != "Baseline operation discarded by reset":
+                    exchange(rejection="paused_after_admitted_result")
+                    await db.flush()
+                    await db.commit()
                 raise
             except Exception as exc:
                 await self._require_diagnosis_runnable(db, goal.id, run.id)
@@ -334,9 +365,18 @@ class OrchestrationBlockerRecoveryService:
                     }
                 trigger_action.dispatch_contract = updated
                 raise await rejected(None, _redact_secrets(f"{code}: {exc}")[:4_000]) from None
-        # Pause or reset during a provider call discards the assessment.
-        await self._require_diagnosis_runnable(db, goal.id, run.id)
-
+        # Preserve admitted evidence even when Pause prevents applying its assessment.
+        await self._require_run_current(db, goal.id, run.id)
+        try:
+            await self._require_diagnosis_runnable(db, goal.id, run.id)
+        except _RunFenced:
+            if owns:
+                exchange(assessment, rejection="paused_after_admitted_result")
+                await db.flush()
+                await db.commit()
+            raise
+        if owns:
+            await db.commit()  # Release result/preflight writer before the application mutex.
         async with self.orchestration._lock_goal_for_baseline_transition(db, goal.id):
             await self._require_diagnosis_runnable(db, goal.id, run.id)
             trigger_action = await db.get(OrchestrationAction, trigger_action.id, populate_existing=True)

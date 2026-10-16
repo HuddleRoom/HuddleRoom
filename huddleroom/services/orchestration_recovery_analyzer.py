@@ -120,6 +120,8 @@ class RecoveryAnalyzer:
         evidence_query: Callable[[RecoveryEvidenceQueryV1], Awaitable[EvidenceV1]],
         on_raw: Callable[[str], None] | None = None,
         before_completion: Callable[[], Awaitable[None]] | None = None,
+        completion_boundary: Callable[..., Awaitable[Any]] | None = None,
+        after_completion: Callable[[], Awaitable[None]] | None = None,
     ) -> RecoveryAssessmentV1:
         """`on_raw` receives each redacted, bounded raw model output (for audit storage)."""
         evidence: list[EvidenceV1] = []
@@ -156,7 +158,10 @@ class RecoveryAnalyzer:
                 if before_completion is not None:
                     await before_completion()
                 try:
-                    response = await self._completion_fn(**values)
+                    response = (await completion_boundary(self._completion_fn, values)
+                                if completion_boundary is not None else await self._completion_fn(**values))
+                except RecoveryAnalysisFenced:
+                    raise
                 except Exception as exc:
                     if not observation_seen and (observing or values.get("stream") is True) and AgentResponseCall._streaming_unsupported(exc):
                         raise
@@ -193,8 +198,9 @@ class RecoveryAnalyzer:
                 )
             except ValueError as exc:
                 raise RecoveryContractRejected(_redact_secrets(str(exc))) from None
-            if before_completion is not None:
-                await before_completion()
+            landing_check = after_completion or before_completion
+            if landing_check is not None:
+                await landing_check()
             if getattr(result, "kind", None) not in {"run_state", "action", "process", "team_configuration", "task", "gate", "waits", "warning", "agent_execution"}:
                 return result
             if rounds == MAX_RECOVERY_EVIDENCE_ROUNDS:

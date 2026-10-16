@@ -70,9 +70,12 @@ async def actions_of(db, run, action_type):
     ))).all()
 
 
-async def diagnosed(db, goal, run, agent):
+async def diagnosed(db, goal, run, agent, *, owns_setup=False):
     svc = service_for(agent)
     trigger = await svc.create_trigger(db, trigger_for(goal, run))
+    if owns_setup:
+        await db.flush()
+        await db.commit()
     proposal = await svc.diagnose(db, trigger.id)
     decision = (await db.scalars(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.related_action_id == proposal.id,

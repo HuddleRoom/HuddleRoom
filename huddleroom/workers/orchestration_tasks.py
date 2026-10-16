@@ -1,6 +1,8 @@
 """Shared asyncio/Celery entry points for orchestration supervision."""
 from __future__ import annotations
 
+from sqlalchemy.orm import SessionTransactionOrigin
+
 import asyncio
 import logging
 from datetime import timedelta, timezone
@@ -63,6 +65,10 @@ async def evaluate_supervision_event_async(event_id) -> int:
                 # Resume needs one decision-capable full tick, not a local judgment sweep.
                 if not event.payload.get("run_id"):
                     return 0
+                transaction = db.sync_session.get_transaction()
+                if (not db.in_nested_transaction() and (transaction is None
+                        or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)):
+                    await db.commit()  # The worker owns this event-read transaction.
                 await OrchestrationService().tick(
                     db, UUID(str(event.payload["run_id"])), local_only=False
                 )
@@ -129,6 +135,10 @@ async def run_orchestration_event_supervisor(
             async with AsyncSessionLocal() as db:
                 for run_id in resumed:
                     try:
+                        transaction = db.sync_session.get_transaction()
+                        if (not db.in_nested_transaction() and (transaction is None
+                                or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)):
+                            await db.commit()  # End owned preflight before a new transition lock.
                         await OrchestrationService().tick(db, run_id, local_only=False)
                         await db.commit()
                     except Exception:

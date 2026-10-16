@@ -15,6 +15,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
 )
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 
 async def _setup(db, project, *, accepted=True, goal_type="outcome"):
@@ -419,3 +420,54 @@ async def test_recover_blocker_stops_loop_without_post_action_wait(db_session, t
     waits = (await db_session.scalars(select(OrchestrationWait).where(
         OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"))).all()
     assert [w for w in waits if (w.owner or {}).get("type") == "orchestrator_decision"] == []
+
+
+async def test_pause_after_admitted_decision_model_prevents_answer_triggered_dispatch(sessions, tmp_path, monkeypatch):
+    """SPR230/SPR231 a landed model answer cannot admit a fresh native action after Pause."""
+    import asyncio
+    from huddleroom.services.orchestration_baseline_runtime import baseline_operation, await_baseline_completion
+    from huddleroom.services.orchestration_control import accept_pause
+    from tests.test_orchestration_chat_actions import _seed
+    project, _, goal, run = await _seed(sessions, tmp_path, phase="authorized")
+    async with sessions() as setup:
+        saved = await setup.get(OrchestrationRun, run.id)
+        saved.plan_state = {"status": "accepted"}
+        await setup.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    dispatches, results = [], []
+    service = OrchestrationService()
+    async def provider(**request):
+        entered.set()
+        await release.wait()
+        return "landed decision"
+    async def decide(db, run_id):
+        results.append(await await_baseline_completion(provider, {"messages": []}))
+        return types.SimpleNamespace(id=uuid.uuid4(), parsed_decision={"action_type": "noop"})
+    async def dispatch(*args, **kwargs):
+        dispatches.append(True)
+        return types.SimpleNamespace(id=uuid.uuid4(), action_type="noop", status="completed")
+    async def no_release(*args, **kwargs):
+        return 0
+    monkeypatch.setattr(service, "request_llm_decision", decide)
+    monkeypatch.setattr(service, "_dispatch_execution_decision", dispatch)
+    monkeypatch.setattr(service, "_release_ready_work", no_release)
+    async def action():
+        async with sessions() as db:
+            current_goal, current_run = await db.get(OrchestrationGoal, goal.id), await db.get(OrchestrationRun, run.id)
+            async with baseline_operation(db, goal.id, owns_transaction=True):
+                return await service._advance_authorized_execution(db, current_goal, current_run)
+    task = asyncio.create_task(action())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        async with sessions() as pause:
+            await accept_pause(pause, project.id, goal.id, run.id, 0, uuid.uuid4(), uuid.UUID(int=0))
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
+        assert results == ["landed decision"]
+        assert dispatches == []
+        async with sessions() as fresh:
+            saved = await fresh.get(OrchestrationRun, run.id)
+            assert saved.pause_requested is True and saved.status == "paused"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

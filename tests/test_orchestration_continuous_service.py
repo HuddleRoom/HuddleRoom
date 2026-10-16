@@ -3,14 +3,13 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import uuid
-from types import SimpleNamespace
 
 import pytest
+from tests.test_orchestration_recovery_persistence import owned_recovery_setup  # noqa: F401 -- fixture
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationBudgetReservation, OrchestrationContinuousCandidate,
@@ -217,7 +216,7 @@ async def test_stop_direct_unclaimed_successor_does_not_create_budget_integrity(
 
 
 @pytest.mark.asyncio
-async def test_pause_autobegin_commits_before_returning(db_session, test_project, monkeypatch):
+async def test_pause_preserves_existing_caller_transaction(db_session, test_project, monkeypatch):
     goal, _ = await started_continuous(db_session, test_project)
     commits = []
     original_commit = db_session.commit
@@ -227,12 +226,11 @@ async def test_pause_autobegin_commits_before_returning(db_session, test_project
         await original_commit()
 
     monkeypatch.setattr(db_session, "commit", record_commit)
-    monkeypatch.setattr(
-        db_session.sync_session, "get_transaction",
-        lambda: SimpleNamespace(origin=SessionTransactionOrigin.AUTOBEGIN),
-    )
+    original_root = db_session.sync_session.get_transaction()
     await OrchestrationService().pause_goal(db_session, test_project.id, goal.id)
-    assert commits == [True]
+    assert commits == []
+    assert db_session.sync_session.get_transaction() is original_root
+    assert original_root.is_active
 
 
 @pytest.mark.asyncio
@@ -2192,13 +2190,18 @@ async def _active_recovery_warnings(db, run):
 
 @pytest.mark.parametrize("verification_pending", [False, True])
 async def test_discovery_consume_resolves_an_approved_retry_lineage(
-    db_session, test_project, test_agent, test_user, monkeypatch, verification_pending,
+    owned_recovery_setup, monkeypatch, verification_pending,
 ):
     """I1: a real approved retry_task lineage; discovery's valid consume drives verify + retry:1 and resolves it."""
     from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
     from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
     from tests.test_orchestration_recovery_activation import _Scripted, _retry_draft
+    from tests.test_orchestration_roster_mutation import make_agent
 
+    db_session, test_project, test_user = owned_recovery_setup
+    test_agent = make_agent(name=f"discovery-retry-{uuid.uuid4()}", capabilities=["implementation"])
+    db_session.add(test_agent)
+    await db_session.flush()
     goal, run, task, session, continuous = await dispatched_discovery_source(
         db_session, test_project, test_agent, monkeypatch,
     )

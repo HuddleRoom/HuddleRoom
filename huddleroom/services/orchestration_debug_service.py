@@ -6,7 +6,6 @@ from copy import deepcopy
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
@@ -24,7 +23,7 @@ from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES,
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 from huddleroom.services.project_service import ProjectService
-from huddleroom.services.orchestration_baseline_runtime import baseline_operation, BaselineSavepoint, require_baseline_available
+from huddleroom.services.orchestration_baseline_runtime import baseline_operation, BaselineSavepoint, require_baseline_available, require_control_admission, publish_baseline_transaction
 from huddleroom.services.orchestration_roster_mutation import (
     RosterHandoffRequired,
     commit_before_roster_handoff,
@@ -53,15 +52,15 @@ class OrchestrationDebugService:
     the run/goal -- tick() stays the only place that does all of that together.
     """
 
-    async def step(self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str) -> dict:
+    async def step(self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str,
+                   *, request_owns_transaction: bool = False) -> dict:
         if process_type not in SUPPORTED_PROCESS_TYPES:
             raise HTTPException(status_code=400, detail=f"Unsupported process type '{process_type}'")
 
         orchestration_service = OrchestrationService()
 
-        transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = (
-            transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+        caller_owns_transaction = not await OrchestrationService()._prepare_control_operation(
+            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
         )
 
         if await orchestration_service.get_goal(db, project_id, goal_id) is None:
@@ -112,6 +111,7 @@ class OrchestrationDebugService:
 
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
+            await require_control_admission(db, run.id, require_baseline_authorization=False)
 
             current = await OrchestrationProcessService().get_current(db, goal.id, process_type)
             if current is not None and isinstance((current.outputs or {}).get("_lm_retry"), dict):
@@ -132,20 +132,20 @@ class OrchestrationDebugService:
 
             await db.flush()
             if not caller_owns_transaction:
-                await db.commit()
+                await publish_baseline_transaction(db)
 
         return {"goal_id": goal.id, "run_id": run.id, "process_type": process_type, "process": process_summary}
 
     async def retry_failed(
-        self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str
+        self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str,
+        *, request_owns_transaction: bool = False,
     ) -> dict:
         """Retry one persisted LM request while holding the baseline goal lock."""
         if process_type not in SUPPORTED_PROCESS_TYPES:
             raise HTTPException(status_code=400, detail=f"Unsupported process type '{process_type}'")
 
-        transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = (
-            transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+        caller_owns_transaction = not await OrchestrationService()._prepare_control_operation(
+            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
         )
         try:
             return await self._retry_locked(db, project_id, goal_id, process_type, caller_owns_transaction)
@@ -180,6 +180,8 @@ class OrchestrationDebugService:
                 await db.refresh(current)
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
+            if run is not None:
+                await require_control_admission(db, run.id, require_baseline_authorization=False)
             checkpoint = (current.outputs or {}).get("_lm_retry") if current is not None else None
             expected_kind = {
                 "goal_definition": "goal_analysis",
@@ -226,7 +228,7 @@ class OrchestrationDebugService:
 
             await db.flush()
             if not caller_owns_transaction:
-                await db.commit()
+                await publish_baseline_transaction(db)
 
         return {
             "goal_id": goal.id,
@@ -236,7 +238,8 @@ class OrchestrationDebugService:
         }
 
     async def rerun_last(
-        self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str | None = None
+        self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str | None = None,
+        *, request_owns_transaction: bool = False,
     ) -> dict:
         """Rerun a waiting baseline process, or the latest terminal one when
         none is waiting. The create+advance is one savepoint: any failure
@@ -256,9 +259,8 @@ class OrchestrationDebugService:
 
         orchestration_service = OrchestrationService()
 
-        transaction = db.sync_session.get_transaction()
-        caller_owns_transaction = (
-            transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
+        caller_owns_transaction = not await OrchestrationService()._prepare_control_operation(
+            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
         )
 
         if await orchestration_service.get_goal(db, project_id, goal_id) is None:
@@ -305,6 +307,7 @@ class OrchestrationDebugService:
 
             await ProjectService().lock_workspace_boundary(db, project_id)
             await ProjectService().require_runnable_project(db, project_id)
+            await require_control_admission(db, run.id, require_baseline_authorization=False)
 
             nested = await BaselineSavepoint.create(db, goal_id)
             try:
@@ -385,7 +388,7 @@ class OrchestrationDebugService:
 
             await db.flush()
             if not caller_owns_transaction:
-                await db.commit()
+                await publish_baseline_transaction(db)
 
         return {
             "goal_id": goal.id,

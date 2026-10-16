@@ -3,6 +3,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+import pytest_asyncio
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func, inspect as sa_inspect, select
 
@@ -21,6 +22,7 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import AuthorizationResult
 from huddleroom.services.orchestration_service import OrchestrationService
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 # SQLAlchemy's dynamic function namespace is not statically callable to pylint.
 # pylint: disable=not-callable
@@ -66,6 +68,29 @@ async def test_get_run_for_goal_returns_latest_run(db_session, test_project):
     assert await service.get_run_for_goal(db_session, uuid.uuid4(), goal.id) is None
     # Unknown goal returns None
     assert await service.get_run_for_goal(db_session, test_project.id, uuid.uuid4()) is None
+
+
+@pytest_asyncio.fixture
+async def owned_projection_setup(client, sessions, tmp_path, monkeypatch):
+    """SPR230/SPR231 legacy projections prepare committed setup before a real owned tick."""
+    from huddleroom.database import get_db
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    async with sessions() as owned:
+        project, _ = await seed_project_user(owned, tmp_path)
+        await owned.commit()
+        original_tick = OrchestrationService.tick
+        async def setup_tick(service, db, run_id, **kwargs):
+            if db is owned:
+                # This fixture owns this session and all setup writes; end preparation,
+                # then exercise the actual guarded service from a fresh transaction.
+                await db.flush()
+                await db.commit()
+            return await original_tick(service, db, run_id, **kwargs)
+        monkeypatch.setattr(OrchestrationService, "tick", setup_tick)
+        async def request_db():
+            yield owned
+        client._transport.app.dependency_overrides[get_db] = request_db
+        yield owned, project
 
 
 def _goal_payload(objective="Ship it"):
@@ -797,7 +822,8 @@ async def test_detail_evidence_semantics_are_derived_for_legacy_rows(client, db_
 
 
 @pytest.mark.asyncio
-async def test_detail_lists_released_roadmap_child_with_private_key_set(client, db_session, test_project):
+async def test_detail_lists_released_roadmap_child_with_private_key_set(client, owned_projection_setup):
+    db_session, test_project = owned_projection_setup
     from tests.test_orchestration_roadmap_children import goal_item, release
 
     _, parent, _, _, _ = await release(db_session, test_project, goal_item("alpha"))
@@ -920,7 +946,8 @@ async def test_detail_plan_is_lenient_and_absent_without_artifact(client, db_ses
 
 
 @pytest.mark.asyncio
-async def test_detail_roadmap_plan_joins_released_items_and_hides_private_snapshot(client, db_session, test_project):
+async def test_detail_roadmap_plan_joins_released_items_and_hides_private_snapshot(client, owned_projection_setup):
+    db_session, test_project = owned_projection_setup
     from tests.test_orchestration_roadmap_children import goal_item, release
 
     _, parent, _, _, _ = await release(db_session, test_project, goal_item("alpha"))
@@ -940,7 +967,8 @@ async def test_detail_roadmap_plan_joins_released_items_and_hides_private_snapsh
 
 
 @pytest.mark.asyncio
-async def test_detail_roadmap_plan_unreleased_item_is_queued(client, db_session, test_project):
+async def test_detail_roadmap_plan_unreleased_item_is_queued(client, owned_projection_setup):
+    db_session, test_project = owned_projection_setup
     from tests.test_orchestration_roadmap_children import accepted_goal_roadmap, goal_item
 
     _, parent, _, _ = await accepted_goal_roadmap(db_session, test_project, goal_item("beta"))
@@ -1018,7 +1046,8 @@ async def test_detail_task_reports_never_expose_raw_session_output(client, db_se
 
 
 @pytest.mark.asyncio
-async def test_detail_exposes_authorization_wait_for_stale_start_queued_task(client, db_session, test_project):
+async def test_detail_exposes_authorization_wait_for_stale_start_queued_task(client, owned_projection_setup):
+    db_session, test_project = owned_projection_setup
     from tests.test_orchestration_authorization import _started_with_backlog_task
 
     svc, goal, run, task = await _started_with_backlog_task(db_session, test_project)
@@ -1079,7 +1108,8 @@ async def test_detail_proposed_roadmap_plan_shows_item_key_items_queued(client, 
 
 
 @pytest.mark.asyncio
-async def test_detail_ignores_malformed_authorization_wait(client, db_session, test_project):
+async def test_detail_ignores_malformed_authorization_wait(client, owned_projection_setup):
+    db_session, test_project = owned_projection_setup
     from tests.test_orchestration_authorization import _started_with_backlog_task
 
     _, goal, _, task = await _started_with_backlog_task(db_session, test_project)
@@ -1206,3 +1236,196 @@ async def test_resume_persists_one_goal_resumed_event_and_repeat_resume_adds_non
     )).all()
     assert len(rows) == 1
     assert rows[0].payload["goal_id"] == str(goal_id)
+
+
+# SPR230/SPR231 receipt acceptance is independent of full goal projection.
+@pytest.mark.asyncio
+async def test_pause_control_lightweight_replay_and_version(client, sessions, tmp_path, monkeypatch):
+    from huddleroom.routers import orchestration_goals
+    from huddleroom.database import get_db
+    from tests.test_orchestration_chat_actions import _seed
+    project, _, goal, run = await _seed(sessions, tmp_path)
+    async def independent_db():
+        async with sessions() as db:
+            yield db
+            await db.commit()
+    client._transport.app.dependency_overrides[get_db] = independent_db
+    goal_id, run_id = str(goal.id), str(run.id)
+    base = f"/api/v1/projects/{project.id}/orchestration/goals/{goal_id}"
+    request_id = str(uuid.uuid4())
+    payload = {"run_id": run_id, "expected_control_version": 0, "request_id": request_id}
+    original = orchestration_goals._detail
+    async def broken_detail(*args, **kwargs):
+        raise RuntimeError("projection unavailable")
+    monkeypatch.setattr(orchestration_goals, "_detail", broken_detail)
+    accepted = await client.post(f"{base}/pause-control", json=payload)
+    assert accepted.status_code == 200, accepted.text
+    receipt = accepted.json()
+    assert receipt["state"] in {"accepted", "applied"}
+    assert receipt["request_id"] == request_id and receipt["run_id"] == run_id
+    assert receipt["accepted_control_version"] == receipt["current_control_version"] == 1
+    assert receipt["accepted_at"]
+    async with sessions() as fresh:
+        persisted = await fresh.get(OrchestrationRun, uuid.UUID(run_id))
+        assert persisted.pause_requested is True and persisted.control_version == 1
+        assert persisted.baseline_authorized is False
+    assert (await client.get(f"{base}/pause-control/{request_id}")).json() == receipt
+    assert (await client.post(f"{base}/pause-control", json=payload)).json() == receipt
+    monkeypatch.setattr(orchestration_goals, "_detail", original)
+    assert (await client.post(f"{base}/resume")).status_code == 200
+    replay = await client.post(f"{base}/pause-control", json=payload)
+    assert replay.status_code == 200 and replay.json()["state"] == "resumed"
+    assert replay.json()["accepted_control_version"] == 1
+    assert replay.json()["current_control_version"] == 2
+    stale = await client.post(f"{base}/pause-control", json={**payload, "request_id": str(uuid.uuid4())})
+    assert stale.status_code == 409
+    conflict = await client.post(f"{base}/pause-control", json={**payload, "expected_control_version": 2})
+    assert conflict.status_code == 409
+    wrong = await client.post(f"{base}/pause-control", json={**payload, "run_id": str(uuid.uuid4())})
+    assert wrong.status_code in {404, 409}
+    async with sessions() as fresh:
+        current = await fresh.get(OrchestrationRun, uuid.UUID(run_id))
+        assert current.pause_requested is False and current.status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["rollback", "close"])
+async def test_pause_control_staged_rollback_releases_writer(db_session, test_engine, test_project, outcome):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from huddleroom.services.orchestration_control import accept_pause, read_pause_receipt
+    from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+    goal, run = await OrchestrationService().create_goal(
+        db_session, project_id=test_project.id,
+        data=OrchestrationGoalCreate(objective="Control rollback", success_criteria=[]), created_by_user_id=None)
+    await db_session.commit()
+    project_id, goal_id, run_id, actor = test_project.id, goal.id, run.id, uuid.UUID(int=0)
+    request_id = uuid.uuid4()
+    staged = AsyncSession(test_engine, expire_on_commit=False)
+    try:
+        await accept_pause(staged, project_id, goal_id, run_id, 0, request_id, actor, commit=False)
+        async with AsyncSession(test_engine) as fresh:
+            assert await read_pause_receipt(fresh, project_id, goal_id, request_id, actor) is None
+        await getattr(staged, outcome)()
+        await staged.commit()
+        async with AsyncSession(test_engine) as fresh:
+            assert await read_pause_receipt(fresh, project_id, goal_id, request_id, actor) is None
+            current = await fresh.get(OrchestrationRun, run_id)
+            assert current.pause_requested is False and current.control_version == 0
+        async with AsyncSession(test_engine) as retry:
+            assert await accept_pause(retry, project_id, goal_id, run_id, 0, request_id, actor) is not None
+    finally:
+        await staged.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_control_actor_scope_and_legacy_share_receipt_fence(sessions, tmp_path):
+    from fastapi import HTTPException
+    from huddleroom.services.orchestration_control import accept_pause, read_pause_receipt
+    from tests.test_orchestration_chat_actions import _seed
+    project, _, goal, run = await _seed(sessions, tmp_path)
+    actor, request_id = uuid.uuid4(), uuid.uuid4()
+    project_id, goal_id, run_id = project.id, goal.id, run.id
+    async with sessions() as db:
+        await accept_pause(db, project_id, goal_id, run_id, 0, request_id, actor)
+    async with sessions() as db:
+        with pytest.raises(HTTPException) as conflict:
+            await accept_pause(db, project_id, goal_id, run_id, 0, request_id, uuid.uuid4())
+        assert conflict.value.status_code == 409
+    async with sessions() as db:
+        with pytest.raises(HTTPException) as foreign:
+            await read_pause_receipt(db, uuid.uuid4(), goal_id, request_id, actor)
+        assert foreign.value.status_code == 404
+    async with sessions() as db:
+        await OrchestrationService().resume_goal(db, project_id, goal_id)
+        await db.commit()
+    async with sessions() as db:
+        await OrchestrationService().pause_goal(db, project_id, goal_id)
+        await db.commit()
+    async with sessions() as db:
+        current = await db.get(OrchestrationRun, run_id)
+        assert current.pause_requested is True and current.baseline_authorized is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested_outcome", ["commit", "rollback"])
+async def test_pause_control_savepoint_never_escapes_outer_outcome(
+    db_session, test_engine, test_project, nested_outcome,
+):
+    from sqlalchemy import update
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from huddleroom.services.orchestration_control import accept_pause, read_pause_receipt
+    from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+    goal, run = await OrchestrationService().create_goal(
+        db_session, project_id=test_project.id,
+        data=OrchestrationGoalCreate(objective="Nested control", success_criteria=[]), created_by_user_id=None)
+    await db_session.commit()
+    project_id, goal_id, run_id, actor = test_project.id, goal.id, run.id, uuid.UUID(int=0)
+    request_id = uuid.uuid4()
+    async with AsyncSession(test_engine) as caller:
+        # Establish real outer SQLite writer before SAVEPOINT (not a standalone SAVEPOINT).
+        await caller.execute(update(OrchestrationRun).where(OrchestrationRun.id == run_id)
+                             .values(control_version=OrchestrationRun.control_version))
+        nested = await caller.begin_nested()
+        await accept_pause(caller, project_id, goal_id, run_id, 0, request_id, actor, commit=False)
+        await getattr(nested, nested_outcome)()
+        async with AsyncSession(test_engine) as fresh:
+            assert await read_pause_receipt(fresh, project_id, goal_id, request_id, actor) is None
+        await (caller.rollback() if nested_outcome == "commit" else caller.commit())
+    async with AsyncSession(test_engine) as fresh:
+        assert await read_pause_receipt(fresh, project_id, goal_id, request_id, actor) is None
+        persisted = await fresh.get(OrchestrationRun, run_id)
+        assert persisted.pause_requested is False and persisted.control_version == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject", [False, True])
+async def test_pause_control_default_preserves_preflushed_autobegin_work(sessions, tmp_path, reject):
+    from sqlalchemy import update
+    from fastapi import HTTPException
+    from huddleroom.models.project import Project
+    from huddleroom.services.orchestration_control import accept_pause, read_pause_receipt
+    from tests.test_orchestration_chat_actions import _seed
+    project, _, goal, run = await _seed(sessions, tmp_path)
+    original_name, request_id, actor = project.name, uuid.uuid4(), uuid.UUID(int=0)
+    async with sessions() as caller:
+        await caller.execute(update(Project).where(Project.id == project.id).values(name="caller staging"))
+        await caller.flush()
+        transaction = caller.get_transaction()
+        if reject:
+            with pytest.raises(HTTPException):
+                await accept_pause(caller, project.id, goal.id, run.id, 999, request_id, actor)
+        else:
+            await accept_pause(caller, project.id, goal.id, run.id, 0, request_id, actor)
+        assert caller.in_transaction() and caller.get_transaction() is transaction
+        assert await caller.scalar(select(Project.name).where(Project.id == project.id)) == "caller staging"
+        async with sessions() as fresh:
+            assert await fresh.scalar(select(Project.name).where(Project.id == project.id)) == original_name
+            assert await read_pause_receipt(fresh, project.id, goal.id, request_id, actor) is None
+        await caller.rollback()
+    async with sessions() as fresh:
+        assert await fresh.scalar(select(Project.name).where(Project.id == project.id)) == original_name
+        assert await read_pause_receipt(fresh, project.id, goal.id, request_id, actor) is None
+        persisted = await fresh.get(OrchestrationRun, run.id)
+        assert persisted.pause_requested is False and persisted.control_version == 0
+
+
+@pytest.mark.asyncio
+async def test_control_writer_is_true_noop_for_runtime_timestamp(sessions, tmp_path):
+    """SPR230/SPR231 writer ordering must not mutate semantic context freshness."""
+    from huddleroom.services.orchestration_control import acquire_control_writer
+    from tests.test_orchestration_chat_actions import _seed
+    _, _, _, run = await _seed(sessions, tmp_path)
+    async with sessions() as before:
+        original = (await before.execute(select(
+            OrchestrationRun.updated_at, OrchestrationRun.control_version,
+            OrchestrationRun.pause_requested, OrchestrationRun.status,
+        ).where(OrchestrationRun.id == run.id))).one()
+    async with sessions() as writer:
+        await acquire_control_writer(writer, run.id)
+        await writer.commit()
+    async with sessions() as fresh:
+        persisted = (await fresh.execute(select(
+            OrchestrationRun.updated_at, OrchestrationRun.control_version,
+            OrchestrationRun.pause_requested, OrchestrationRun.status,
+        ).where(OrchestrationRun.id == run.id))).one()
+        assert persisted == original

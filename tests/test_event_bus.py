@@ -3,11 +3,12 @@ import pytest_asyncio
 import asyncio
 from datetime import datetime, timezone
 import uuid
-from sqlalchemy import text, select
+from sqlalchemy import text, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from huddleroom.models.event_log import EventLog
 from huddleroom.schemas.event import EventEmit, EventResponse
-from huddleroom.services.event_bus import EventBusService, BusEvent, get_event_bus, emit_event
+from huddleroom.services.event_bus import EventBusService, BusEvent, get_event_bus, emit_event, emit_event_once
+from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 
 @pytest.mark.asyncio
@@ -188,12 +189,88 @@ async def test_emit_event_puts_on_bus(db_session, test_project):
         _bus=bus,  # inject bus for testing
     )
 
-    # Fixture rolls back instead of committing, so after_commit never fires.
-    # Simulate post-commit dispatch manually.
-    sync = db_session.sync_session
-    for ev, b in sync.info.pop("pending_bus_events", []):
-        b.put(ev)
+    # Exercise the actual root outcome rather than draining private queue storage.
+    await db_session.commit()
 
     await asyncio.wait_for(task, timeout=1.0)
     assert len(received) == 1
     assert received[0].event_type == "task.created"
+
+
+@pytest.mark.asyncio
+async def test_resolution_wakeup_waits_for_outer_transaction_outcome(sessions, tmp_path, monkeypatch):
+    """SPR230/SPR231 releasing a SAVEPOINT cannot publish a rolled-back resolution."""
+    from huddleroom.models.project import Project
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    async with sessions() as setup:
+        project, _ = await seed_project_user(setup, tmp_path)
+        await setup.commit()
+    bus, published = EventBusService(), []
+    monkeypatch.setattr(bus, "put", lambda event: published.append(event.id))
+    async with sessions() as caller:
+        await caller.execute(update(Project).where(Project.id == project.id).values(name="outer writer"))
+        nested = await caller.begin_nested()
+        event, created = await emit_event_once(caller, project.id, "authority.decision_resolved",
+            {"decision_id": str(uuid.uuid4())}, _bus=bus)
+        assert created and published == []
+        await nested.commit()
+        assert published == [], "SAVEPOINT commit published before the outer outcome"
+        await caller.rollback()
+        await caller.commit()  # reuse must not revive rolled-back queued work
+    assert published == []
+    async with sessions() as fresh:
+        assert await fresh.scalar(select(EventLog).where(EventLog.id == event.id)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["nested_rollback", "rollback_reuse", "close_reuse", "commit_once"])
+async def test_resolution_publication_tracks_outer_transaction_scope(sessions, tmp_path, monkeypatch, outcome):
+    """SPR230/SPR231 only durable scoped resolution events wake consumers, once."""
+    import sqlite3
+    from huddleroom.models.project import Project
+    from tests.test_orchestration_roster_mutation import seed_project_user
+    async with sessions() as setup:
+        project, _ = await seed_project_user(setup, tmp_path)
+        await setup.commit()
+    bus, published, visible = EventBusService(), [], []
+    def publish(event):
+        published.append(event.id)
+        with sqlite3.connect(sessions.kw["bind"].url.database) as reader:
+            visible.append(reader.execute("SELECT count(*) FROM event_log WHERE id=?", (event.id.hex,)).fetchone()[0])
+    monkeypatch.setattr(bus, "put", publish)
+    caller = sessions()
+    try:
+        await caller.execute(update(Project).where(Project.id == project.id).values(name="outer writer"))
+        outer, _ = await emit_event_once(caller, project.id, "authority.decision_resolved",
+            {"decision_id": str(uuid.uuid4())}, dedup_key=f"outer:{uuid.uuid4()}", _bus=bus)
+        if outcome == "nested_rollback":
+            nested = await caller.begin_nested()
+            dropped, _ = await emit_event_once(caller, project.id, "authority.decision_resolved",
+                {"decision_id": str(uuid.uuid4())}, dedup_key=f"nested:{uuid.uuid4()}", _bus=bus)
+            assert published == []
+            await nested.rollback()
+            await caller.commit()
+            expected, missing = [outer.id], [dropped.id]
+        elif outcome in {"rollback_reuse", "close_reuse"}:
+            await (caller.rollback() if outcome == "rollback_reuse" else caller.close())
+            await caller.commit()  # unrelated commit must not revive old event
+            assert published == []
+            await caller.execute(update(Project).where(Project.id == project.id).values(name="reused writer"))
+            reused, _ = await emit_event_once(caller, project.id, "authority.decision_resolved",
+                {"decision_id": str(uuid.uuid4())}, dedup_key=f"reused:{uuid.uuid4()}", _bus=bus)
+            await caller.commit()
+            expected, missing = [reused.id], [outer.id]
+        else:
+            assert published == []
+            await caller.commit()
+            await caller.commit()
+            expected, missing = [outer.id], []
+        assert published == expected and visible == [1] * len(expected)
+        assert not caller.sync_session.info.get("pending_bus_events")
+        async with sessions() as fresh:
+            for event_id in expected:
+                assert await fresh.scalar(select(EventLog).where(EventLog.id == event_id)) is not None
+            for event_id in missing:
+                assert await fresh.scalar(select(EventLog).where(EventLog.id == event_id)) is None
+    finally:
+        await caller.close()

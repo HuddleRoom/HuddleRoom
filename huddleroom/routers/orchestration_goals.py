@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.config import settings
 from huddleroom.database import get_db
@@ -29,6 +30,8 @@ from huddleroom.models.task import Task
 from huddleroom.models.user import User
 from huddleroom.schemas.common import CursorPage
 from huddleroom.schemas.orchestration import (
+    PauseControlRequest,
+    PauseReceipt,
     OrchestrationActionResponse,
     OrchestrationAgentSuggestionResponse,
     OrchestrationAuthorizationWaitResponse,
@@ -1117,14 +1120,69 @@ async def stop_continuous_goal(
     return await _detail(db, goal, run)
 
 
+async def _accept_pause_request(db, project_id, goal_id, data, actor_user_id):
+    """The HTTP request owns its transaction; retry only its frozen SQLite snapshot."""
+    from huddleroom.services.orchestration_control import accept_pause
+    transaction = db.sync_session.get_transaction()
+    owns = db.sync_session.get_nested_transaction() is None and (
+        transaction is None or transaction.origin == SessionTransactionOrigin.AUTOBEGIN
+    )
+    for attempt in range(2):
+        try:
+            receipt = await accept_pause(db, project_id, goal_id, data.run_id,
+                                         data.expected_control_version, data.request_id,
+                                         actor_user_id, commit=False)
+            if owns:
+                await db.commit()
+            return receipt
+        except HTTPException as exc:
+            snapshot_retry = (isinstance(exc.detail, dict)
+                              and exc.detail.get("conflict") == "orchestration_control_snapshot_retry")
+            if owns:
+                await db.rollback()
+            if not owns or not snapshot_retry or attempt:
+                raise
+        except BaseException:
+            if owns:
+                await db.rollback()
+            raise
+
+
+@router.post("/goals/{goal_id}/pause-control", response_model=PauseReceipt)
+async def pause_control(
+    project_id: uuid.UUID, goal_id: uuid.UUID, data: PauseControlRequest,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    return await _accept_pause_request(db, project_id, goal_id, data, user.id)
+
+
+@router.get("/goals/{goal_id}/pause-control/{request_id}", response_model=PauseReceipt | None)
+async def get_pause_control(
+    project_id: uuid.UUID, goal_id: uuid.UUID, request_id: uuid.UUID,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    from huddleroom.services.orchestration_control import read_pause_receipt
+    return await read_pause_receipt(db, project_id, goal_id, request_id, user.id)
+
+
 @router.post("/goals/{goal_id}/pause", response_model=OrchestrationGoalDetailResponse)
 async def pause_goal(
     project_id: uuid.UUID,
     goal_id: uuid.UUID,
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    goal, run = await service.pause_goal(db, project_id, goal_id)
+    goal = await service.get_goal(db, project_id, goal_id)
+    if goal is None:
+        raise HTTPException(404, "Orchestration goal not found")
+    run = await service.get_active_run_for_goal(db, project_id, goal_id)
+    if run is None:
+        raise HTTPException(409, "Goal has no active run")
+    data = PauseControlRequest(run_id=run.id, expected_control_version=run.control_version,
+                               request_id=uuid.uuid4())
+    await _accept_pause_request(db, project_id, goal_id, data, user.id)
+    await db.refresh(goal)
+    await db.refresh(run)
     return await _detail(db, goal, run)
 
 
@@ -1276,7 +1334,7 @@ async def force_tick(
 ):
     await ensure_project_exists(db, project_id)
     await service.ensure_run_in_project(db, project_id, run_id)
-    result = await service.tick(db, run_id)
+    result = await service.tick(db, run_id, request_owns_transaction=True)
     return OrchestrationTickResponse(**result)
 
 
@@ -1294,7 +1352,7 @@ async def baseline_step(
     db: AsyncSession = Depends(get_db),
 ):
     await ensure_project_exists(db, project_id)
-    result = await debug_service.step(db, project_id, goal_id, data.process_type)
+    result = await debug_service.step(db, project_id, goal_id, data.process_type, request_owns_transaction=True)
     return OrchestrationDebugActionResponse(action="step", **result)
 
 
@@ -1307,7 +1365,7 @@ async def baseline_rerun(
     db: AsyncSession = Depends(get_db),
 ):
     await ensure_project_exists(db, project_id)
-    result = await debug_service.rerun_last(db, project_id, goal_id, data.process_type)
+    result = await debug_service.rerun_last(db, project_id, goal_id, data.process_type, request_owns_transaction=True)
     return OrchestrationDebugActionResponse(action="rerun_last", **result)
 
 
@@ -1320,7 +1378,7 @@ async def baseline_retry(
     db: AsyncSession = Depends(get_db),
 ):
     await ensure_project_exists(db, project_id)
-    result = await debug_service.retry_failed(db, project_id, goal_id, data.process_type)
+    result = await debug_service.retry_failed(db, project_id, goal_id, data.process_type, request_owns_transaction=True)
     return OrchestrationDebugActionResponse(action="retry", **result)
 
 
@@ -1349,7 +1407,7 @@ async def debug_baseline_step(
 ):
     _require_debug_enabled()
     await ensure_project_exists(db, project_id)
-    result = await debug_service.step(db, project_id, goal_id, data.process_type)
+    result = await debug_service.step(db, project_id, goal_id, data.process_type, request_owns_transaction=True)
     return OrchestrationDebugActionResponse(action="step", **result)
 
 
@@ -1363,5 +1421,5 @@ async def debug_baseline_rerun_last(
 ):
     _require_debug_enabled()
     await ensure_project_exists(db, project_id)
-    result = await debug_service.rerun_last(db, project_id, goal_id, data.process_type if data else None)
+    result = await debug_service.rerun_last(db, project_id, goal_id, data.process_type if data else None, request_owns_transaction=True)
     return OrchestrationDebugActionResponse(action="rerun_last", **result)
