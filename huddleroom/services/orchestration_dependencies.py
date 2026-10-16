@@ -44,6 +44,41 @@ def evidence_semantics(
     return {"evidence_role": role, "review_stage": stage, "acceptance_verdict": verdict}
 
 
+def non_final_gate(gate: OrchestrationGate) -> bool:
+    """Discovery/readiness or preliminary-stage gate: it satisfies its own item but never covers a criterion."""
+    sem = evidence_semantics(gate.gate_type, gate.required_evidence, None, "accepted", None)
+    return sem["evidence_role"] in {"discovery", "readiness"} or sem["review_stage"] == "preliminary"
+
+
+def accepted_plan_items(plan_state: Any) -> list[dict]:
+    """Items of the accepted plan snapshot; empty when no plan is accepted."""
+    state = _obj(plan_state)
+    items = _obj(state.get("accepted_plan_snapshot")).get("items") if state.get("status") == "accepted" else None
+    return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+
+
+def criterion_state(key: str, plan_items: list[dict], gates: list[OrchestrationGate]) -> str:
+    """`accepted` or `pending`; the one acceptance predicate shared by the progress view and the final manifest.
+
+    Accepted needs every plan item mapped to the criterion satisfied by its own accepted gate (an unreleased
+    item has no gate), every gate linked to the criterion accepted, and at least one accepted final-stage
+    gate among them: readiness/discovery evidence alone never makes a criterion accepted.
+    """
+    by_key = {g.success_criterion_key: g for g in gates}
+    for item in plan_items:
+        if key in (item.get("success_criterion_keys") or []):
+            gate = by_key.get(f"plan_item:{item.get('id')}")
+            if gate is None or gate.status != "accepted":
+                return "pending"
+    linked = [
+        g for g in gates
+        if g.success_criterion_key == key or key in (_obj(g.required_evidence).get("success_criterion_keys") or [])
+    ]
+    if linked and all(g.status == "accepted" for g in linked) and any(not non_final_gate(g) for g in linked):
+        return "accepted"
+    return "pending"
+
+
 def plan_in_flight(plan_state: Any) -> bool:
     return isinstance(plan_state, dict) and plan_state.get("status") in PLAN_IN_FLIGHT_STATUSES
 

@@ -1,6 +1,7 @@
 """Execute current, authorized supervision dispositions through the action ledger."""
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from huddleroom.services.orchestration_decision_validator import (
 from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, root_goal_id
 from huddleroom.services.orchestration_progress_view import unreleased_plan_item_ids
 
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
 UNCHANGED_WAKE_LIMIT = 3
 VERIFICATION_ATTEMPT_LIMIT = 3
 SYSTEM_WAIT_OWNER_TYPES = frozenset({"session", "task", "authority_decision", "child_run"})
@@ -302,24 +304,36 @@ class OrchestrationSupervisionService:
             **({"unreleased_plan_item_ids": sorted(unreleased_items)} if unreleased_items else {}),
         })
         unchanged = dict(state.get("unchanged") or {})
-        # Any open owner question means the run is waiting on a human: neither count nor ask again.
+        interval = timedelta(seconds=settings.orchestration_wake_max_seconds * 2 ** min(int(state.get("no_progress_asks") or 0), 4))
+
+        def _elapsed_since(at):
+            """True when `interval` has passed since `at`; a missing/invalid timestamp counts as elapsed."""
+            def _utc(value):
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            try:
+                return _utc(now) - _utc(datetime.fromisoformat(str(at))) >= interval
+            except ValueError:
+                return True
+
+        # An open owner question blocks only the work it covers (held); independent work keeps going,
+        # but never counts toward or raises the no-progress ask while the owner is already being asked.
         if await db.scalar(select(OrchestrationAuthorityDecision.id).where(
             OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending").limit(1)) is not None:
             if unchanged:
                 state["unchanged"] = {}  # counting restarts after the answer
                 run.supervision_state = state
+            seen = dict(state.get("pending_seen") or {})
+            if (follow_ups or no_work or commitments or unreleased_items) and (
+                seen.get("digest") != digest or _elapsed_since(seen.get("at"))
+            ):  # re-wake on changed work or once per interval, not every tick
+                state["pending_seen"] = {"digest": digest, "at": now.isoformat()}
+                run.supervision_state = state
+                return {"outcome": "continue"}
             return None
         prev = int(unchanged.get("n") or 0) if unchanged.get("digest") == digest else 0
         if prev < UNCHANGED_WAKE_LIMIT:
             if unchanged.get("digest") == digest:
-                def _utc(value):
-                    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-                try:
-                    elapsed = _utc(now) - _utc(datetime.fromisoformat(str(unchanged.get("at"))))
-                except ValueError:
-                    elapsed = None  # missing/invalid timestamp counts as elapsed
-                interval = timedelta(seconds=settings.orchestration_wake_max_seconds * 2 ** min(int(state.get("no_progress_asks") or 0), 4))
-                if elapsed is not None and elapsed < interval:
+                if not _elapsed_since(unchanged.get("at")):
                     return {"outcome": "continue"}
             state["unchanged"] = {"digest": digest, "n": prev + 1, "at": now.isoformat()}
             state["last_assessment"] = {"at": now.isoformat(), "outcome": "continue"}
@@ -607,6 +621,12 @@ class OrchestrationSupervisionService:
                     if sibling.status == "open" and (sibling.owner or {}).get("type") == _ORCH_OWNER and _same_owner(sibling.owner, wait.owner):
                         sibling.status, sibling.cleared_at = "cleared", now
             fallback = dict(wait.fallback or {})
+            owner = wait.owner or {}
+            # A session wait's warning carries the condition it stood for, so it clears when the session ends.
+            condition = (
+                {"condition": {"condition": "session_running", "subject": str(owner["task_id"])}}
+                if owner.get("type") == "session" and owner.get("task_id") else {}
+            )
             action = await (
                 self.orchestration.execute_noop_action(
                     db, run.id,
@@ -617,7 +637,7 @@ class OrchestrationSupervisionService:
                 else self.orchestration.execute_record_warning_action(
                     db, run.id,
                     {"action_type": "record_warning", "warning_type": "supervision_attention", "severity": "warning",
-                     "message": str(fallback.get("reason") or "Wait recheck is due")},
+                     "message": str(fallback.get("reason") or "Wait recheck is due"), **condition},
                     f"run:{run.id}:wait:{wait.id}:fallback",
                 )
             )
@@ -634,9 +654,12 @@ class OrchestrationSupervisionService:
             OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending"))).all()
         held |= {str(g) for _, g in pending if g is not None}
         if pending:
-            held |= {str((a.request or {}).get("gate_id")) for a in (await db.scalars(select(OrchestrationAction).where(
+            asks = (await db.scalars(select(OrchestrationAction).where(
                 OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "ask_human",
-                OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()} - {"None", ""}
+                OrchestrationAction.target_id.in_([d for d, _ in pending])))).all()
+            held |= {str((a.request or {}).get("gate_id")) for a in asks} - {"None", ""}
+            # _escalate_owner asks name their gate/task only in the subject ("{category}:gate:{id}:..." / "...:task:{id}").
+            held |= {u for a in asks for u in _UUID_RE.findall(str((a.request or {}).get("subject") or ""))}
         future = [wait for wait in waits if not is_due(wait) or recovery_owned(wait)]
         has_slot = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id)) > 0
         unreleased_items = unreleased_plan_item_ids(run)
@@ -764,7 +787,7 @@ class OrchestrationSupervisionService:
             if kind == "ask_human" and answered:
                 key += f":{answered}"
             if kind == "verify":
-                key += await self.orchestration.verification_attempt_suffix(db, run.id, canonical.get("gate_id"))
+                key += await self.orchestration.verification_attempt_suffix(db, run.id, canonical.get("gate_id"), reuse_held=True)
         if kind == "replan" and await self.orchestration._existing_action_for_key(db, run.id, key) is None:
             await self.orchestration._require_plan_author(db, goal, run, canonical.get("agent_id"))
         action = await self.orchestration.reserve_action(db, run_id=run.id, idempotency_key=key, action_type=action_type, request=canonical)

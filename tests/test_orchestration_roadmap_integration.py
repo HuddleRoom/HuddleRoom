@@ -29,6 +29,9 @@ from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadm
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
+DONE_REPORT = json.dumps({"status": "done", "changes": ["Delivered."], "evidence": ["Delivered."], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None})  # a complete work report: no correction holds the verifier
+
+
 @pytest.fixture(autouse=True)
 def _manual_task_start(monkeypatch):
     # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
@@ -108,12 +111,19 @@ async def _record_measured_completion(db, project_id, run, task, agent_id, outpu
     return session
 
 
+# A complete canonical work report: an incomplete one would (correctly) start a result correction.
+PRODUCER_REPORT = json.dumps({
+    "status": "done", "changes": [], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [],
+    "open_questions": [], "next_step": "verify", "collaboration_need": None,
+})
+
+
 async def _complete_roadmap_task(db, project_id, service, run, row, verifier_id, *, complete_producer=True):
     task = await db.get(Task, row.task_id)
     producer = None
     if complete_producer:
         producer = await _record_measured_completion(
-            db, project_id, run, task, task.assigned_to, json.dumps({"status": "done"}),
+            db, project_id, run, task, task.assigned_to, PRODUCER_REPORT,
         )
     verification = await service.execute_request_verification_action(
         db, run.id,
@@ -152,7 +162,7 @@ async def test_integration_decision_commits_authority_wait(db_session, test_proj
     service = roadmap.orchestration
     task = await db_session.get(Task, row.task_id)
     await _record_measured_completion(
-        db_session, test_project.id, run, task, task.assigned_to, json.dumps({"status": "done"}),
+        db_session, test_project.id, run, task, task.assigned_to, DONE_REPORT,
     )
     verification = await service.execute_request_verification_action(
         db_session, run.id,
@@ -200,7 +210,7 @@ async def _complete_child(db, project, roadmap, row, planner, producer, verifier
     work_gate = await db.get(OrchestrationGate, uuid.UUID(work_task.metadata_["orchestration"]["plan_item_gate_id"]))
     producer_session = await _record_measured_completion(
         db, project.id, child_run, work_task, producer.id,
-        json.dumps({"status": "done", "changes": ["child delivered"]}),
+        json.dumps({"status": "done", "changes": ["child delivered"], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     verification = await service.execute_request_verification_action(
         db, child_run.id,
@@ -398,7 +408,7 @@ async def test_terminal_child_without_completed_outcome_does_not_unlock_parent(d
                 if roadmap.orchestration._task_work_function(task) == "implementation")
     await _record_measured_completion(
         db_session, test_project.id, child_run, task, producer.id,
-        json.dumps({"status": "done", "changes": ["terminal task only"]}),
+        json.dumps({"status": "done", "changes": ["terminal task only"], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     assert child.status == "active"
@@ -741,7 +751,7 @@ async def test_integration_gate_waits_for_every_current_item_gate(db_session, te
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "two",
     ))
     task = await db_session.get(Task, two.task_id)
-    await _record_measured_completion(db_session, test_project.id, run, task, builder.id, json.dumps({"status": "done"}))
+    await _record_measured_completion(db_session, test_project.id, run, task, builder.id, DONE_REPORT)
     await service.tick(db_session, run.id)
     assert await _integration_gate(db_session, roadmap, parent, run, version) is None
 
@@ -1112,3 +1122,169 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
     assert len([item for item in actions if item.action_type == "request_verification" and item.request.get("gate_id") == str(gate.id)]) == 1
     assert len([item for item in actions if item.action_type == "request_final_summary"]) == 1
     assert len([item for item in actions if item.action_type == "complete_run"]) == 1
+
+
+@pytest.mark.parametrize("fixed", [True, False])
+async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
+    db_session, test_project, monkeypatch, safe_effectiveness_review_continue, fixed,
+):
+    builder = _agent("verdict-correction-builder", ["implementation"])
+    verifier = _agent("verdict-correction-verifier", ["validation"])
+    db_session.add_all([builder, verifier])
+    await db_session.flush()
+    roadmap, parent, run, _version = await accepted_goal_roadmap(db_session, test_project, [
+        {**roadmap_task("only", mutates_shared_state=False), "agent_id": str(builder.id)},
+    ])
+    service = roadmap.orchestration
+    _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await service.tick(db_session, run.id)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    task = await db_session.get(Task, row.task_id)
+    await _record_measured_completion(db_session, test_project.id, run, task, task.assigned_to, PRODUCER_REPORT)
+    verification = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(row.gate_id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:roadmap_item:{row.item_key}",
+    )
+    verifier_task = await db_session.get(Task, verification.target_id)
+
+    async def ingest():
+        events = await service._new_events(db_session, test_project.id, run.event_cursor)
+        await service._ingest_evidence_from_events(db_session, run, events)
+
+    await _record_measured_completion(db_session, test_project.id, run, verifier_task, verifier.id, "Verified, all good.")
+    await ingest()
+    [correction] = (await db_session.scalars(select(Task).where(Task.parent_id == verifier_task.id))).all()
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True
+    tick = await service.tick(db_session, run.id)
+    assert tick["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
+    assert len([a for a in await _run_actions(db_session, run.id) if a.action_type == "request_verification"]) == 1
+
+    await _record_measured_completion(
+        db_session, test_project.id, run, correction, verifier.id,
+        json.dumps({"status": "done", "verdict": "accepted", "evidence": ["independent check"]})
+        if fixed else "Verified, all good.",
+    )
+    await ingest()
+    # an exhausted correction with a pending owner ask still holds the verifier slot: the roadmap waits for the owner
+    assert await roadmap.has_active_bound_verifier(db_session, run) is not fixed
+
+
+async def test_blocked_verifier_awaiting_the_owner_holds_the_verifier_slot(
+    db_session, test_project, test_user, monkeypatch, safe_effectiveness_review_continue,
+):
+    builder = _agent("blocked-verifier-builder", ["implementation"])
+    verifier = _agent("blocked-verifier-verifier", ["validation"])
+    db_session.add_all([builder, verifier])
+    await db_session.flush()
+    roadmap, parent, run, _version = await accepted_goal_roadmap(db_session, test_project, [
+        {**roadmap_task("only", mutates_shared_state=False), "agent_id": str(builder.id)},
+    ])
+    service = roadmap.orchestration
+    _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await service.tick(db_session, run.id)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    task = await db_session.get(Task, row.task_id)
+    await _record_measured_completion(db_session, test_project.id, run, task, task.assigned_to, PRODUCER_REPORT)
+    verification = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(row.gate_id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:roadmap_item:{row.item_key}",
+    )
+    verifier_task = await db_session.get(Task, verification.target_id)
+    await _record_measured_completion(
+        db_session, test_project.id, run, verifier_task, verifier.id,
+        json.dumps({"status": "blocked", "notes": "No access to the staging environment."}),
+    )
+    events = await service._new_events(db_session, test_project.id, run.event_cursor)
+    await service._ingest_evidence_from_events(db_session, run, events)
+
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True
+    tick = await service.tick(db_session, run.id)
+    assert tick["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
+    assert len([a for a in await _run_actions(db_session, run.id) if a.action_type == "request_verification"]) == 1
+
+    [blocker] = [b for b in run.active_blockers if b.get("scope") == f"task:{verifier_task.id}:verifier_blocked"]
+    decision = await db_session.get(OrchestrationAuthorityDecision, uuid.UUID(blocker["decision_id"]))
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option=decision.options[0] if isinstance(decision.options[0], str)
+        else decision.options[0]["key"], reason=None, decided_by_user_id=test_user.id,
+    )
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False
+
+
+async def _dispatched_roadmap_verifier(db_session, test_project, monkeypatch, prefix):
+    builder = _agent(f"{prefix}-builder", ["implementation"])
+    verifier = _agent(f"{prefix}-verifier", ["validation"])
+    db_session.add_all([builder, verifier])
+    await db_session.flush()
+    roadmap, parent, run, _version = await accepted_goal_roadmap(db_session, test_project, [
+        {**roadmap_task("only", mutates_shared_state=False), "agent_id": str(builder.id)},
+    ])
+    service = roadmap.orchestration
+    _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await service.tick(db_session, run.id)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    task = await db_session.get(Task, row.task_id)
+    await _record_measured_completion(db_session, test_project.id, run, task, task.assigned_to, PRODUCER_REPORT)
+    verification = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(row.gate_id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:roadmap_item:{row.item_key}",
+    )
+    return roadmap, service, run, await db_session.get(Task, verification.target_id), verifier
+
+
+async def test_cancelled_blocked_verifier_ask_releases_the_verifier_slot(
+    db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
+):
+    roadmap, service, run, verifier_task, verifier = await _dispatched_roadmap_verifier(
+        db_session, test_project, monkeypatch, "cancelled-verifier",
+    )
+    await _record_measured_completion(
+        db_session, test_project.id, run, verifier_task, verifier.id,
+        json.dumps({"status": "blocked", "notes": "No access to the staging environment."}),
+    )
+    await service._ingest_evidence_from_events(
+        db_session, run, await service._new_events(db_session, test_project.id, run.event_cursor),
+    )
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True
+
+    scope = f"task:{verifier_task.id}:verifier_blocked"
+    [blocker] = [b for b in run.active_blockers if b.get("scope") == scope]
+    decision = await db_session.get(OrchestrationAuthorityDecision, uuid.UUID(blocker["decision_id"]))
+    await OrchestrationAuthorityDecisionService().cancel_decision(db_session, decision, reason="superseded")
+
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False
+    assert not [b for b in run.active_blockers if b.get("scope") == scope]
+
+
+async def test_dismissed_exhausted_verdict_correction_releases_the_verifier_slot(
+    db_session, test_project, test_user, monkeypatch, safe_effectiveness_review_continue,
+):
+    roadmap, service, run, verifier_task, verifier = await _dispatched_roadmap_verifier(
+        db_session, test_project, monkeypatch, "dismissed-verifier",
+    )
+
+    async def finish(task):
+        await _record_measured_completion(db_session, test_project.id, run, task, verifier.id, "Verified, all good.")
+        await service._ingest_evidence_from_events(
+            db_session, run, await service._new_events(db_session, test_project.id, run.event_cursor),
+        )
+
+    await finish(verifier_task)
+    [correction] = (await db_session.scalars(select(Task).where(Task.parent_id == verifier_task.id))).all()
+    await finish(correction)
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True  # exhausted, the owner is asked
+
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{verifier_task.id}",
+    )
+    decision = await db_session.get(
+        OrchestrationAuthorityDecision, uuid.UUID(marker.request["result_correction"]["decision_id"]),
+    )
+    await OrchestrationAuthorityDecisionService().answer_runtime_question(
+        db_session, decision, "dismiss", actor_user_id=test_user.id, contract_version=decision.contract_version,
+    )
+
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False

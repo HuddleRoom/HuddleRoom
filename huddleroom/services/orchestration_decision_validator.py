@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from huddleroom.models.orchestration_process import WARNING_SEVERITIES, WARNING_SEVERITY_VALUES
 from huddleroom.schemas.orchestration import AuthorizationScope
 from huddleroom.services.orchestration_dependencies import ADHOC_GATED_WORK_FUNCTIONS, plan_in_flight
+from huddleroom.services.orchestration_condition import ConditionError, validate_condition
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
 
@@ -68,6 +69,7 @@ OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
             "required_capabilities",
             "candidate_agent_ids",
             "gate_id",
+            "condition",
         }
     ),
     "suggest_agent": frozenset(
@@ -80,7 +82,7 @@ OPTIONAL_ACTION_FIELDS: dict[str, frozenset[str]] = {
         }
     ),
     "record_warning": frozenset(
-        {"run_id", "source_process_run_id", "related_gate_id", "related_action_id", "related_agent_id"}
+        {"run_id", "source_process_run_id", "related_gate_id", "related_action_id", "related_agent_id", "condition"}
     ),
     "retry_task": frozenset({"timeout", "max_tokens"}),
 }
@@ -170,6 +172,12 @@ def validate_orchestration_decision(decision: Mapping[str, Any]) -> DecisionVali
             False,
             f"Decision 'record_warning' severity must be one of: {', '.join(WARNING_SEVERITY_VALUES)}",
         )
+
+    if action_type in {"ask_human", "record_warning"} and decision.get("condition") is not None:
+        try:
+            validate_condition(decision["condition"])
+        except ConditionError as exc:
+            return DecisionValidationResult(False, f"Decision '{action_type}' condition invalid: {exc}")
 
     if action_type == "create_delegation_task":
         error = delegation_optional_field_error(decision)

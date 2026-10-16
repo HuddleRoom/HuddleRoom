@@ -252,7 +252,11 @@ async def _real_planning_expansion_run(db_session, project_id, planner: Agent, d
         project_id=project_id,
         adapter_type="api",
         status="completed",
-        output=json.dumps({"status": "done", "changes": ["Implemented the accepted plan item."]}),
+        output=json.dumps({  # a complete work report: no correction holds the verifier
+            "status": "done", "changes": ["Implemented the accepted plan item."], "evidence": [],
+            "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify",
+            "collaboration_need": None,
+        }),
         metadata_={"orchestration": dict(expanded_task.metadata_["orchestration"])},
         origin="auto",
     )
@@ -1461,13 +1465,27 @@ async def _gate_triggers(db_session, run_id):
     ))).all() if action.request["blocker_code"] == "final_summary_invalid"]
 
 
+async def _repeat_failure_in_correction(db_session, service, run, task, output):
+    """The summary's output-only correction re-emits the same invalid output, which stops the correction."""
+    [correction] = [row for row in (await db_session.scalars(select(Task).where(Task.parent_id == task.id))).all()
+                    if (row.metadata_ or {}).get("result_correction_parent_task_id") == str(task.id)]
+    session = Session(agent_id=correction.assigned_to, task_id=correction.id, project_id=correction.project_id,
+                      adapter_type="api", status="completed", output=output, metadata_={}, origin="auto")
+    db_session.add(session)
+    await db_session.flush()
+    await emit_event_once(db_session, correction.project_id, "session.completed",
+                          {"session_id": str(session.id), "task_id": str(correction.id)},
+                          dedup_key=f"summary-correction-repeat:{session.id}")
+    return session, await service.tick(db_session, run.id)
+
+
 @pytest.mark.asyncio
 async def test_invalid_summary_creates_one_recovery_trigger_not_a_replacement(
     db_session,
     test_project,
 ):
-    """a replacement summary task is a corrective fix -> one recovery trigger (owner approval),
-    never an automatic replacement delegation."""
+    """a replacement summary task is a corrective fix -> one recovery trigger (owner approval) once the
+    output-only correction stopped, never an automatic replacement delegation."""
     service, goal, run, writer, task, gate = await _request_summary(db_session, test_project)
     goal.weight = "trivial"
     await heal_baseline_drift_for_test(db_session, goal, run)
@@ -1492,7 +1510,11 @@ async def test_invalid_summary_creates_one_recovery_trigger_not_a_replacement(
     )
     tasks_before = await db_session.scalar(select(func.count(Task.id)))
 
-    failed_tick = await service.tick(db_session, run.id)
+    correction_tick = await service.tick(db_session, run.id)
+    assert correction_tick["recoveries_created"] == 0 and await _gate_triggers(db_session, run.id) == []
+    assert await db_session.scalar(select(func.count(Task.id))) == tasks_before + 1  # the output-only correction
+    tasks_before += 1
+    invalid_session, failed_tick = await _repeat_failure_in_correction(db_session, service, run, task, "not json")
 
     failed_evidence = (
         await db_session.execute(
@@ -1537,6 +1559,8 @@ async def test_recovery_trigger_is_stable_per_failed_summary_evidence(db_session
         await service.tick(db_session, run.id)
 
     await invalid("bad one")
+    assert await _gate_triggers(db_session, run.id) == []  # an output-only correction comes first
+    await _repeat_failure_in_correction(db_session, service, run, task, "bad one")
     first = await _gate_triggers(db_session, run.id)
     await _complete_goal_definition(db_session, _goal, run)
     await service.tick(db_session, run.id)

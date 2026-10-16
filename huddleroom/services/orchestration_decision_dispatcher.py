@@ -207,7 +207,7 @@ class OrchestrationDecisionDispatcher:
         else:
             action_key = self.action_key(run.id, action_type, request)
             if action_type == "request_verification":
-                action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"))
+                action_key += await self._service.verification_attempt_suffix(db, run.id, request.get("gate_id"), reuse_held=True)
         if not recovery:
             action_key, capped = await self._attempt_key(db, run.id, action_key, decision.id, versions is not None)
             if capped is not None:
@@ -467,7 +467,7 @@ class OrchestrationDecisionDispatcher:
         pending, or the action an open lineage's sealed retry re-runs, reuses that trigger instead of starting
         another."""
         basis = {"action_type": action_type, "request": {k: v for k, v in request.items() if k != "reason"}}
-        fingerprint = hashlib.sha256(json.dumps(basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        fingerprint = self._service._recovery_fingerprint(basis)
         existing = (await self._service.open_recovery_trigger(db, run.id, fingerprint)
                     or await self._service.open_recovery_trigger_for_action(db, run.id, action_type, request))
         if existing is not None:

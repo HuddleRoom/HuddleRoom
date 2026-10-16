@@ -30,6 +30,21 @@ def _detect_breaking_change(artifact: Artifact, old_hash: str | None, new_hash: 
     return old_hash != new_hash
 
 
+async def _current_hash(db: AsyncSession, artifact: Artifact) -> str | None:
+    """Content hash of the artifact's workspace file; None when it is absent, outside the workspace or unreadable.
+
+    Display and events only: review and verification recompute identity from content when they need it. The
+    same containment as identity checks applies (no paths outside the workspace, regular files only)."""
+    from huddleroom.models.project import Project
+    from huddleroom.services.orchestration_artifact_identity import PRESENT, classify_path
+
+    project = await db.get(Project, artifact.project_id)
+    if project is None or not project.workspace_path:
+        return None
+    found = await asyncio.to_thread(classify_path, artifact.path, project.workspace_path)
+    return found.identity if found.state == PRESENT else None
+
+
 class ArtifactService:
     async def create(
         self,
@@ -55,6 +70,8 @@ class ArtifactService:
             created_by_agent=created_by_agent,
             created_by_user=created_by_user,
         )
+        if path:
+            artifact.content_hash = await _current_hash(db, artifact)
         db.add(artifact)
         await db.flush()
         await emit_event(db, project_id, "artifact.created", {
@@ -112,6 +129,11 @@ class ArtifactService:
         if not changed:
             return artifact
         await db.flush()
+        version = artifact.version
+        if artifact.path:
+            await self.update_content_hash(db, artifact)
+        if artifact.version != version:
+            return artifact  # update_content_hash already announced the new content
         await emit_event(db, artifact.project_id, "artifact.content_changed", {
             "artifact_id": str(artifact.id),
             "artifact_type": artifact.artifact_type,
@@ -122,9 +144,8 @@ class ArtifactService:
     async def update_content_hash(self, db: AsyncSession, artifact: Artifact) -> Artifact:
         if not artifact.path:
             return artifact
-        loop = asyncio.get_running_loop()
-        new_hash = await loop.run_in_executor(None, _hash_file, artifact.path)
-        if new_hash == artifact.content_hash:
+        new_hash = await _current_hash(db, artifact)
+        if new_hash is None or new_hash == artifact.content_hash:
             return artifact
 
         old_hash = artifact.content_hash

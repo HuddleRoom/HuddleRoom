@@ -145,6 +145,9 @@ class ActionExecutor:
 
         task_title = await self._r(db, action.get("task_title", "Graph session"), run)
         task_description = await self._r(db, action.get("task_description"), run)
+        identity = None
+        if run.artifact_id is not None:
+            task_description, identity = await self._bind_review_identity(db, run, task_description)
         task = Task(
             project_id=run.project_id,
             title=task_title,
@@ -152,9 +155,12 @@ class ActionExecutor:
             assigned_to=assigned_to,
             graph_run_id=run.id,
             status="ready",
+            metadata_={"review_identity": identity} if identity is not None else {},
         )
         db.add(task)
         await db.flush()
+        if identity is not None:  # this session is now the run's current review binding
+            run.context = {**(run.context or {}), "review_task_id": str(task.id)}
 
         result = {"action_type": "create_session", "task_id": str(task.id)}
         session = await SessionService().create(
@@ -169,6 +175,29 @@ class ActionExecutor:
         )
         result["session_id"] = str(session.id)
         return result
+
+    async def _bind_review_identity(self, db: AsyncSession, run: GraphRun, description: str) -> tuple[str, dict | None]:
+        """The identity of the run's artifact as the new session sees it, with its pinned reference added to the
+        description: that session's approval applies only while this identity holds."""
+        from huddleroom.models.artifact import Artifact
+        from huddleroom.services.orchestration_artifact_identity import bind_artifacts
+
+        artifact = await db.get(Artifact, run.artifact_id)
+        if artifact is None:
+            return description, None
+        [identity] = await bind_artifacts(db, run.project_id, [artifact])
+        reference = identity["reference"]
+        run.context = {
+            **(run.context or {}),
+            "review_identity": identity,
+            "review_reference": reference or f"no pinned content ({identity['reason'] or identity['state']})",
+        }
+        if reference:
+            note = f"Review exactly this pinned content: {reference}"
+        else:
+            note = (f"No pinned content is available ({identity['reason'] or identity['state']}); "
+                    "an approval cannot apply until the artifact names an immutable revision.")
+        return (f"{description}\n\n{note}" if description else note), identity
 
     async def _post_message(self, db: AsyncSession, action: dict, run: GraphRun) -> dict:
         from huddleroom.schemas.channel import ChannelCreate

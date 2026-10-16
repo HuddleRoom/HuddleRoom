@@ -244,7 +244,7 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
         adapter_type="api",
         status="completed",
         input_context={},
-        output="APPROVED",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -257,7 +257,7 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
         {
             "session_id": str(session.id),
             "task_id": str(task.id),
-            "review_outcome": {"verdict": "approved", "raw_output": "APPROVED"},
+            "review_outcome": {"verdict": "approved", "raw_output": "VERDICT: APPROVE"},
             "project_id": str(test_project.id),
         },
         dedup_key=f"phase13-review-approved:{session.id}",
@@ -273,6 +273,39 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
     assert rows[0].producer_agent_id == reviewer.id
     assert rows[0].verdict == "candidate"
     assert rows[0].evidence_metadata["review_verdict"] == "approved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [("review.approved", "candidate"), ("review.changes_requested", "rejected")],
+)
+async def test_manual_review_event_without_outcome_maps_by_event_type(db_session, test_project, event_type, expected):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, gate_type="review_accepted")
+    reviewer = _agent("reviewer", "reviewer", ["review"])
+    db_session.add(reviewer)
+    await db_session.flush()
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, reviewer.id, "review")
+    session = Session(
+        project_id=test_project.id, task_id=task.id, agent_id=reviewer.id, adapter_type="api", status="completed",
+        input_context={}, output="Handler swallows errors.", metadata_={}, origin="manual",
+    )
+    db_session.add(session)
+    await db_session.flush()
+    # a manually emitted review event carries no parsed review outcome
+    await emit_event_once(
+        db_session, test_project.id, event_type,
+        {"session_id": str(session.id), "task_id": str(task.id), "project_id": str(test_project.id)},
+        dedup_key=f"manual-review:{session.id}",
+    )
+
+    await service.tick(db_session, run.id)
+
+    [row] = await _evidence_rows(db_session, run.id)
+    assert (row.source_type, row.verdict) == ("review", expected)
+    assert row.evidence_metadata["review_verdict"] is None
+    assert ("findings" in row.evidence_metadata) is (expected == "rejected")
 
 
 @pytest.mark.asyncio
@@ -313,7 +346,7 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
             adapter_type="api",
             status="completed",
             input_context={},
-            output="APPROVED",
+            output="VERDICT: APPROVE",
             metadata_={},
             origin="graph",
         )
@@ -369,7 +402,7 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
             adapter_type="api",
             status="completed",
             input_context={},
-            output="APPROVED",
+            output="VERDICT: APPROVE",
             metadata_={},
             origin="graph",
         )
@@ -502,6 +535,71 @@ async def test_tick_ingests_meeting_decision_evidence_from_concluded_meeting(db_
     assert rows[0].verdict == "candidate"
     assert rows[0].evidence_metadata["meeting_id"] == str(meeting.id)
     assert rows[0].evidence_metadata["decision_id"] == str(decision.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["meeting.concluded", "meeting.decision_recorded"])
+@pytest.mark.parametrize(
+    ("resolution_kind", "item_status", "expected"),
+    [
+        ("approved", "resolved", "candidate"),
+        ("approved_with_followups", "resolved", "candidate"),
+        (None, "resolved", "candidate"),  # human override
+        ("changes_requested", "unresolved", "rejected"),
+        ("verdict_missing", "unresolved", "rejected"),
+        ("rejected", "unresolved", "rejected"),
+        (None, "active", None),
+        ("majority", "resolved", None),
+        ("deferred", "deferred", None),
+    ],
+)
+async def test_review_meeting_evidence_requires_approved_review(
+    db_session, test_project, event_type, resolution_kind, item_status, expected
+):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, gate_type="meeting_decision_accepted")
+    facilitator = _agent("facilitator", "facilitator", ["meeting"])
+    db_session.add(facilitator)
+    await db_session.flush()
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, facilitator.id, "meeting")
+    meeting = Meeting(
+        project_id=test_project.id,
+        title="Review the change",
+        meeting_type="review",
+        status="concluded",
+        participant_agent_ids=[],
+        participant_user_ids=[],
+        source_task_id=task.id,
+        organizer_agent_id=facilitator.id,
+    )
+    db_session.add(meeting)
+    await db_session.flush()
+    item = MeetingAgendaItem(
+        meeting_id=meeting.id, order=1, title="Review item",
+        status=item_status, resolution_kind=resolution_kind,
+    )
+    db_session.add(item)
+    await db_session.flush()
+    payload = {"meeting_id": str(meeting.id), "project_id": str(test_project.id)}
+    if event_type == "meeting.decision_recorded":
+        decision = MeetingDecision(
+            meeting_id=meeting.id, agenda_item_id=item.id, title="Review item",
+            question="Approve?", chosen_option="Accept", rationale="r", decided_by="consensus",
+        )
+        db_session.add(decision)
+        await db_session.flush()
+        payload.update(decision_id=str(decision.id), gate_id=str(gate.id))
+    await emit_event_once(
+        db_session, test_project.id, event_type, payload,
+        dedup_key=f"review-meeting-evidence:{meeting.id}",
+    )
+
+    await service.tick(db_session, run.id)
+
+    rows = await _evidence_rows(db_session, run.id)
+    assert [row.verdict for row in rows if row.source_type.startswith("meeting")] == (
+        [expected] if expected else []
+    )
 
 
 @pytest.mark.asyncio

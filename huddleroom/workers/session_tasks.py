@@ -327,6 +327,42 @@ async def mark_attempt_project_not_runnable(db, session_id: uuid.UUID, runner_ta
     return True
 
 
+async def _terminalize_escaped_failure(session_id: uuid.UUID, runner_task_id: str | None, exc: Exception) -> None:
+    """Fail a session whose handler raised, in its own transaction, so it never waits for the orphan reaper.
+
+    The attempt's effect_state is left untouched: a failure after the effect started stays an
+    unknown effect for the existing recovery path, which never auto-retries it.
+    """
+    from huddleroom.services.secret_redaction import redact_secrets
+    from huddleroom.services.session_sync import sync_task_from_session
+
+    reason = redact_secrets(f"{type(exc).__name__}: {exc}")[:200]  # redact first: a cut must not split a secret
+    try:
+        async with AsyncSessionLocal() as db:
+            session = await db.get(SessionModel, session_id)
+            if session is None or session.status not in {"pending", "running"}:
+                return
+            session.status = "failed"
+            session.error = reason
+            # API sessions have no provider id and were always resumable; CLI only with a captured id.
+            session.resumable = session.adapter_type == "api" or session.provider_session_id is not None
+            session.ended_at = datetime.now(timezone.utc)
+            if not await _mark_attempt_result(db, session_id, runner_task_id):
+                await db.rollback()
+                return
+            await emit_event(db, session.project_id, "session.failed", {
+                "session_id": str(session.id),
+                "task_id": str(session.task_id) if session.task_id else None,
+                "error": reason,
+                "project_id": str(session.project_id),
+                "resumable": session.resumable,
+            })
+            await sync_task_from_session(db, session)
+            await db.commit()
+    except Exception:
+        logger.exception("Could not terminalize failed session %s", session_id)
+
+
 async def execute_api_session(session_id: str, runner_task_id: str) -> None:
     """Run an API adapter session."""
     from huddleroom.adapters.api_adapter import ApiAdapter
@@ -351,6 +387,7 @@ async def execute_api_session(session_id: str, runner_task_id: str) -> None:
         except Exception as e:
             logger.error("API session %s failed: %s", session_id, e)
             await db.rollback()
+            await _terminalize_escaped_failure(sid, runner_task_id, e)
             raise
 
 
@@ -387,6 +424,7 @@ async def execute_cli_session(session_id: str, runner_task_id: str) -> None:
         except Exception as e:
             logger.error("CLI session %s failed: %s", session_id, e)
             await db.rollback()
+            await _terminalize_escaped_failure(sid, runner_task_id, e)
             raise
 
 

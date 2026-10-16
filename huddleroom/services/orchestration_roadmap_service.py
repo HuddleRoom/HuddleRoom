@@ -514,7 +514,8 @@ class OrchestrationRoadmapService:
             ))
             if (
                 task is not None and gate is not None and gate.run_id == run.id and gate.status == "open"
-                and task.status in {"backlog", "ready", "in_progress", "blocked"}
+                and (task.status in {"backlog", "ready", "in_progress", "blocked"}
+                     or await self.orchestration._verdict_correction_open(db, run, task))
                 and await self.orchestration._outcome_verification_action_for_task(db, run, gate, task) == action
             ):
                 return True
@@ -1096,6 +1097,7 @@ class OrchestrationRoadmapService:
                 db, run.id,
                 delegation_request,
                 f"run:{run.id}:kind:create_delegation_task:roadmap_item:{item.item_key}",
+                gate_bound=True,
             )
             task = await db.get(Task, delegation.target_id)
         original_metadata = task.metadata_
@@ -1429,7 +1431,9 @@ class OrchestrationRoadmapService:
                 action = await self.orchestration.execute_request_verification_action(
                     db, run.id,
                     {"action_type": "request_verification", "gate_id": str(approval.id), "work_function": "validation"},
-                    f"run:{run.id}:kind:request_verification:roadmap_plan:{approval.id}", decision_id=decision.id,
+                    await self.orchestration._verification_retry_key(
+                        db, run.id, f"run:{run.id}:kind:request_verification:roadmap_plan:{approval.id}",
+                    ), decision_id=decision.id,
                 )
                 return {"step": "waiting_plan_authority", "action_id": str(action.id)}
 

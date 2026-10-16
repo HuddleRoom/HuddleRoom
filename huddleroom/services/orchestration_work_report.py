@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -31,6 +31,7 @@ class WorkReport:
 class ReportValidation:
     report: WorkReport | None
     errors: tuple[str, ...] = ()
+    normalized: str | None = None
 
 
 class _DuplicateReportKey(ValueError):
@@ -47,8 +48,20 @@ def _report_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def validate_work_report(output: str | None) -> ReportValidation:
+    from huddleroom.services.orchestration_result_contract import normalize_result_output
+
+    text, how = output or "", None
     try:
-        data = json.loads(output or "", object_pairs_hook=_report_object)
+        text, how = normalize_result_output(text)
+    except ValueError:
+        pass  # ambiguous or malformed: the strict parse below reports the precise error
+    result = _validate_report_text(text)
+    return replace(result, normalized=how) if result.report else result
+
+
+def _validate_report_text(output: str) -> ReportValidation:
+    try:
+        data = json.loads(output, object_pairs_hook=_report_object)
     except _DuplicateReportKey as exc:
         return ReportValidation(None, (f"report contains duplicate key: {exc}",))
     except (TypeError, ValueError):

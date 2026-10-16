@@ -41,7 +41,11 @@ class TaskService:
             "assigned_to": data.assigned_to,
             "adapter_type_override": data.adapter_type_override,
             "trigger": data.trigger,
-            "metadata_": data.metadata,
+            # a review session's binding is system-owned: graph review tasks get it from the executor, never a caller
+            "metadata_": (
+                {key: value for key, value in data.metadata.items() if key != "review_identity"}
+                if isinstance(data.metadata, dict) else data.metadata
+            ),
             "due_at": data.due_at,
             "parent_id": data.parent_id,
             "depends_on": [str(d) for d in deps] or None,
@@ -136,6 +140,10 @@ class TaskService:
             for key in ("orchestration", "orchestration_contract"):
                 if key in (task.metadata_ or {}):
                     metadata[key] = task.metadata_[key]
+            # a review session's binding is system-owned: it can be neither replaced, removed nor injected
+            metadata.pop("review_identity", None)
+            if "review_identity" in (task.metadata_ or {}):
+                metadata["review_identity"] = task.metadata_["review_identity"]
             task.metadata_ = metadata
         if data.due_at is not None:
             task.due_at = data.due_at

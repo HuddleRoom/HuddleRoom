@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import AsyncMock, patch
 from datetime import datetime, timezone
 
 import pytest
@@ -639,6 +640,111 @@ async def test_recover_run_requests_verification_for_stale_gate(db_session, test
 
 
 @pytest.mark.asyncio
+async def test_second_verification_request_does_not_rebind_an_active_verifier(db_session, test_project):
+    """SPR 227: a second request_verification that gets the running verifier back leaves its action binding alone."""
+    developer = _agent("developer", "developer", ["implementation"])
+    validator = _agent("validator", "validator", ["validation", "testing"])
+    db_session.add_all([developer, validator])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, status="failed", failure_reason="Evidence is stale")
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id, status="done")
+    await _add_gate_evidence(
+        db_session, run.id, gate.id, source_type="task", source_id=task.id,
+        producer_agent_id=developer.id, verdict="accepted", event_seq=20,
+    )
+    await _refresh_baseline_processes(db_session, goal, run)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    [first] = await _actions(db_session, run.id, "request_verification")
+
+    second = await service.execute_request_verification_action(
+        db_session, run.id, dict(first.request), f"{first.idempotency_key}:again",
+    )
+
+    assert second.id != first.id and second.target_id == first.target_id
+    verifier = await db_session.get(Task, first.target_id)
+    assert verifier.metadata_["orchestration"]["verification_action_id"] == str(first.id)
+
+
+@pytest.mark.asyncio
+async def test_second_verification_request_rebinds_when_bound_action_failed(db_session, test_project):
+    developer = _agent("developer", "developer", ["implementation"])
+    validator = _agent("validator", "validator", ["validation", "testing"])
+    db_session.add_all([developer, validator])
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, status="failed", failure_reason="Evidence is stale")
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, developer.id, status="done")
+    await _add_gate_evidence(
+        db_session, run.id, gate.id, source_type="task", source_id=task.id,
+        producer_agent_id=developer.id, verdict="accepted", event_seq=20,
+    )
+    await _refresh_baseline_processes(db_session, goal, run)
+    await service.recover_run(db_session, run.id, baseline_ready=True)
+    [first] = await _actions(db_session, run.id, "request_verification")
+    first.status = "failed"  # fails after the second request already read its attempt count: same verifier returned
+    await db_session.flush()
+
+    with patch.object(service, "verification_attempt_suffix", AsyncMock(return_value="")):
+        second = await service.execute_request_verification_action(
+            db_session, run.id, dict(first.request), f"{first.idempotency_key}:again",
+        )
+
+    assert second.id != first.id and second.target_id == first.target_id
+    verifier = await db_session.get(Task, first.target_id)
+    assert verifier.metadata_["orchestration"]["verification_action_id"] == str(second.id)
+
+
+@pytest.mark.asyncio
+async def test_verifier_task_and_session_evidence_is_not_producer_evidence(db_session, test_project):
+    """SPR 219: a stale-gate verifier's own task/session evidence must not exclude it from re-verifying."""
+    producer = _agent("developer", "developer", ["implementation"])
+    verifier = _agent("validator", "validator", ["validation"])
+    db_session.add_all([producer, verifier])
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, status="failed", failure_reason="Evidence is stale")
+    work = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, producer.id, status="done")
+    verifier_task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, verifier.id, status="done")
+    verifier_task.metadata_ = {"orchestration": {
+        **verifier_task.metadata_["orchestration"], "recovery_kind": "stale_gate_verification"}}
+    session = await _add_failed_session(db_session, verifier_task, verifier.id)
+    await _add_gate_evidence(db_session, run.id, gate.id, source_type="task", source_id=work.id,
+                             producer_agent_id=producer.id, verdict="accepted", event_seq=1)
+    await _add_gate_evidence(db_session, run.id, gate.id, source_type="task", source_id=verifier_task.id,
+                             producer_agent_id=verifier.id, verdict="accepted", event_seq=2)
+    await _add_gate_evidence(db_session, run.id, gate.id, source_type="session", source_id=session.id,
+                             producer_agent_id=verifier.id, verdict="accepted", event_seq=3)
+
+    assert await service._producer_agent_ids_for_gate(db_session, gate) == {producer.id}
+
+
+@pytest.mark.asyncio
+async def test_independence_check_ignores_the_verifiers_own_task_evidence(db_session, test_project):
+    """SPR 219: the verifier's own task evidence is not work evidence, so it does not collide with its verdict."""
+    producer = _agent("developer", "developer", ["implementation"])
+    verifier = _agent("validator", "validator", ["validation"])
+    db_session.add_all([producer, verifier])
+    await db_session.flush()
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, status="failed", failure_reason="Evidence is stale")
+    work = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, producer.id, status="done")
+    verifier_task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, verifier.id, status="done")
+    verifier_task.metadata_ = {"orchestration": {
+        **verifier_task.metadata_["orchestration"], "recovery_kind": "stale_gate_verification"}}
+    evidence = [
+        await _add_gate_evidence(db_session, run.id, gate.id, source_type=kind, source_id=source,
+                                 producer_agent_id=agent, verdict="accepted", event_seq=seq)
+        for seq, (kind, source, agent) in enumerate(
+            [("task", work.id, producer.id), ("task", verifier_task.id, verifier.id),
+             ("verification", uuid.uuid4(), verifier.id)], start=1)
+    ]
+
+    assert await service._independence_failure_reason(
+        db_session, gate, evidence, required_evidence={"requires_independent_agent": True}) is None
+
+
+@pytest.mark.asyncio
 async def test_tick_reports_recoveries_created(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     db_session.add(developer)
@@ -663,7 +769,7 @@ async def test_tick_reports_recoveries_created(db_session, test_project):
 
 
 @pytest.mark.asyncio
-async def test_recover_run_escalates_review_fix_when_source_unresolvable(db_session, test_project):
+async def test_recover_run_asks_the_owner_when_a_rejected_review_has_no_producer(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     reviewer = _agent("reviewer", "reviewer", ["review"])
     db_session.add_all([developer, reviewer])
@@ -685,11 +791,13 @@ async def test_recover_run_escalates_review_fix_when_source_unresolvable(db_sess
     ask_actions = await _actions(db_session, run.id, "ask_human")
 
     assert created == 1
-    assert run.status == "blocked"
-    assert goal.status == "blocked"
-    assert run.active_blockers[0]["kind"] == "review_fix_required"
+    # only the gate's revision subject is blocked; the run keeps dispatching other work
+    assert run.status == "running" and goal.status == "active"
+    assert [(b["kind"], b["category"], b["scope"]) for b in run.active_blockers] == [
+        ("owner_escalation", "capability_unavailable", f"gate:{gate.id}:revision"),
+    ]
     assert len(ask_actions) == 1
-    assert ask_actions[0].request["question"].startswith("Rejected review needs a fix")
+    assert "No producer task or assignee can revise" in ask_actions[0].request["question"]
 
     replay_created = await service.recover_run(db_session, run.id, baseline_ready=True)
     assert replay_created == 0
@@ -1504,7 +1612,7 @@ async def test_legacy_recover_run_cannot_reassign_failed_task_without_approval(d
 
 
 @pytest.mark.asyncio
-async def test_legacy_rejected_review_fix_creates_trigger_not_replacement_task(db_session, test_project):
+async def test_rejected_review_revises_the_producer_without_a_recovery_trigger(db_session, test_project):
     developer = _agent("developer", "developer", ["implementation"])
     reviewer = _agent("reviewer", "reviewer", ["review"])
     db_session.add_all([developer, reviewer])
@@ -1527,9 +1635,11 @@ async def test_legacy_rejected_review_fix_creates_trigger_not_replacement_task(d
     await service.recover_run(db_session, run.id, baseline_ready=True)
     await service.recover_run(db_session, run.id, baseline_ready=True)
 
-    assert await _actions(db_session, run.id, "create_delegation_task") == []
-    assert await db_session.scalar(select(count(Task.id))) == tasks_before
-    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+    [revision_action] = await _actions(db_session, run.id, "create_delegation_task")
+    revision = await db_session.get(Task, revision_action.target_id)
+    assert await db_session.scalar(select(count(Task.id))) == tasks_before + 1
+    assert revision.assigned_to == developer.id and revision.parent_id == task.id
+    assert await _actions(db_session, run.id, "recovery_trigger") == []
     assert gate.status == "failed"
 
 

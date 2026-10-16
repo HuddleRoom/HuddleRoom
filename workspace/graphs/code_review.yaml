@@ -73,7 +73,7 @@ nodes:
       - action_type: create_session
         actor: reviewer
         task_title: "Review PR: {{artifact.name}}"
-        task_description: "Review the pull request at branch {{artifact.metadata.branch}}. Approve, request changes, or comment."
+        task_description: "Review the pull request from branch {{artifact.metadata.branch}}: review the pinned content (commit) named below, not the branch, which may have moved. Review it, then end your response with a final line that is exactly one of: VERDICT: APPROVE, VERDICT: REQUEST_CHANGES, or VERDICT: COMMENT."
     edges:
       - name: approved
         to: approved
@@ -112,11 +112,16 @@ nodes:
     on_enter:
       - action_type: notify_actor
         actor: merger
-        message: "PR {{artifact.name}} is approved and ready to merge."
+        message: "PR {{artifact.name}} is approved and ready to merge. Merge exactly the reviewed content: {{review_reference}}."
     edges:
       - name: merged
         to: merged
         trigger_event: code.pr_merged
+        guard:
+          artifact_id: "{{graph_run.artifact_id}}"
+      - name: updated_after_approval
+        to: ready_for_review
+        trigger_event: code.pr_updated
         guard:
           artifact_id: "{{graph_run.artifact_id}}"
 

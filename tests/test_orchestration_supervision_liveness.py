@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from huddleroom.config import settings
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationEvidence, OrchestrationGoal, OrchestrationGate, OrchestrationRoadmapVersion, OrchestrationRun, OrchestrationWait
 from huddleroom.models.session import Session
@@ -906,3 +907,68 @@ async def test_reconcile_local_capacity_wait_is_typed_wait_without_provider_call
     assert run.supervision_state["needs_judgment"] is False
     assert list(run.active_blockers or []) == blockers_before
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationDecision)) == 0
+
+
+async def _pending_owner_ask(db, goal, run):
+    ask = await OrchestrationService().supervision.apply_disposition(
+        db, goal, run, _assessment(action_type="ask_human", request={"question": "Which way?"}))
+    return ask
+
+
+async def test_pending_owner_ask_does_not_stall_independent_follow_up(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    await _pending_owner_ask(db_session, goal, run)
+    supervision = OrchestrationService().supervision
+    follow_up = {"id": "t-free", "kind": "stalled_task", "summary": "free"}
+    held_up = {"id": "t-held", "kind": "stalled_task", "summary": "held"}
+    state = {"unchanged": {"digest": "old", "n": 2, "at": _utcnow().isoformat()}}
+
+    result = await supervision._proactive_outcome(
+        db_session, run, SimpleNamespace(untracked_follow_ups=[follow_up], progress_view=[]), set(), state, _utcnow())
+    assert result == {"outcome": "continue"}
+    assert state["unchanged"] == {}
+    assert len(await _ask_actions(db_session, run)) == 1  # no no_progress ask
+
+    state = {}
+    assert await supervision._proactive_outcome(
+        db_session, run, SimpleNamespace(untracked_follow_ups=[held_up], progress_view=[]), {"t-held"}, state, _utcnow()) is None
+
+
+async def test_pending_owner_ask_throttles_no_work_wakes(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    await _pending_owner_ask(db_session, goal, run)
+    supervision = OrchestrationService().supervision
+    situation = SimpleNamespace(untracked_follow_ups=[], progress_view=[{"criterion_key": "k", "state": "no_work"}])
+    state = {}
+    now = _utcnow()
+
+    assert await supervision._proactive_outcome(db_session, run, situation, set(), state, now) == {"outcome": "continue"}
+    assert await supervision._proactive_outcome(db_session, run, situation, set(), state, now + timedelta(seconds=1)) is None
+    assert not state.get("unchanged")
+    assert len(await _ask_actions(db_session, run)) == 1  # no new ask_human
+
+    later = now + timedelta(seconds=settings.orchestration_wake_max_seconds + 1)
+    assert await supervision._proactive_outcome(db_session, run, situation, set(), state, later) == {"outcome": "continue"}
+
+
+async def test_reconcile_local_holds_gate_named_in_pending_owner_ask_subject(db_session, test_project, monkeypatch):
+    goal, run = await _run(db_session, test_project)
+    run.plan_state = {"status": "accepted", "version": 1}
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="k", gate_type="work_completed")
+    db_session.add(gate)
+    await db_session.flush()
+    ask = await _pending_owner_ask(db_session, goal, run)
+    ask.request = {**ask.request, "subject": f"capability_unavailable:gate:{gate.id}:verifier"}
+    await db_session.flush()
+    seen = {}
+    service = OrchestrationService()
+    cls = type(service.supervision)
+    real = cls._has_proactive_work
+
+    async def spy(self, getter, held=frozenset(), has_slot=True):
+        seen["held"] = set(held)
+        return await real(self, getter, held, has_slot)
+
+    monkeypatch.setattr(cls, "_has_proactive_work", spy)
+    result = await service.supervision.reconcile_local(db_session, goal, run)
+    assert str(gate.id) in seen.get("held", ()), result

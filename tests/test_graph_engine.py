@@ -888,7 +888,7 @@ async def test_engine_completes_graph_on_merge(db_session, test_project, monkeyp
         project_id=test_project.id,
         name="merge-pr",
         artifact_type="pull_request",
-        url="http://example.com",
+        url=f"https://github.com/org/repo/commit/{'a' * 40}",  # only pinned content can be merged
         metadata_={"branch": "feature/merge"},
     )
     linked_task = Task(project_id=test_project.id, title="Ship PR", status="in_progress")
@@ -1089,8 +1089,8 @@ async def test_engine_session_metadata_takes_precedence_over_linked_task_metadat
 @pytest.mark.parametrize(
     ("output", "expected_verdict"),
     [
-        ("APPROVE", "approved"),
-        ("CHANGES_REQUESTED", "changes_requested"),
+        ("VERDICT: APPROVE", "approved"),
+        ("VERDICT: REQUEST_CHANGES", "changes_requested"),
         ("Looks mostly fine, but I left comments.", "commented"),
         ("DO NOT APPROVE", "commented"),
     ],
@@ -1166,23 +1166,25 @@ async def test_engine_enriches_graph_review_session_completed(db_session, test_p
     assert captured["payload"]["review_outcome"] == {
         "verdict": expected_verdict,
         "raw_output": output,
+        "reason": None if output.startswith("VERDICT:") else "verdict_missing",
     }
 
 
 @pytest.mark.parametrize(
     ("raw_output", "expected_verdict"),
     [
-        ("APPROVED", "approved"),
-        ("REQUEST CHANGES", "changes_requested"),
-        ("REQUESTED CHANGES", "changes_requested"),
+        ("verdict: approve", "approved"),
+        ("Notes.\n\n  Verdict: Request_Changes  \n\n", "changes_requested"),
+        ("VERDICT: COMMENT", "commented"),
     ],
 )
-def test_engine_review_outcome_parser_recognizes_conservative_variants(raw_output, expected_verdict):
+def test_engine_review_outcome_parser_reads_final_line_verdict(raw_output, expected_verdict):
     from huddleroom.services.graph_engine import GraphEngineService
 
     assert GraphEngineService()._parse_review_outcome(raw_output) == {
         "verdict": expected_verdict,
         "raw_output": raw_output,
+        "reason": None,
     }
 
 
@@ -1231,7 +1233,7 @@ async def test_engine_does_not_enrich_non_code_review_session_completed_with_rev
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -1303,7 +1305,7 @@ async def test_engine_does_not_enrich_non_graph_origin_code_review_session_compl
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="api",
     )
@@ -1392,7 +1394,7 @@ async def test_engine_does_not_enrich_or_auto_emit_review_for_wrong_assigned_act
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVED",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin="graph",
     )
@@ -1461,7 +1463,7 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_run(db
         project_id=test_project.id,
         name="auto-approved-pr",
         artifact_type="pull_request",
-        url="http://example.com/pr/approved",
+        url=f"https://github.com/org/repo/commit/{'b' * 40}",  # only pinned content can be approved
         metadata_={"branch": "feature/approved"},
     )
     task = Task(project_id=test_project.id, title="Review auto approved PR", status="in_progress")
@@ -1481,21 +1483,13 @@ async def test_engine_auto_emits_review_approved_and_advances_code_review_run(db
     db_session.add(run)
     await db_session.flush()
 
-    session = Session(
-        agent_id=reviewer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        graph_run_id=run.id,
-        adapter_type="api",
-        status="completed",
-        output="APPROVE",
-        metadata_={},
-        origin="graph",
-    )
-    db_session.add(session)
+    engine = GraphEngineService()
+    # the graph creates the review session, bound to the artifact's pinned identity
+    await engine._execute_on_enter(db_session, proto.definition["nodes"]["ready_for_review"], run)
+    session = (await db_session.execute(select(Session).where(Session.graph_run_id == run.id))).scalar_one()
+    session.status, session.output = "completed", "VERDICT: APPROVE"
     await db_session.flush()
 
-    engine = GraphEngineService()
     completion_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,
@@ -1572,7 +1566,7 @@ async def test_engine_auto_emits_review_changes_requested_and_advances_code_revi
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="CHANGES_REQUESTED",
+        output="VERDICT: REQUEST_CHANGES",
         metadata_={},
         origin="graph",
     )
@@ -1625,7 +1619,7 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
         project_id=test_project.id,
         name="auto-dedup-pr",
         artifact_type="pull_request",
-        url="http://example.com/pr/dedup",
+        url=f"https://github.com/org/repo/commit/{'b' * 40}",  # only pinned content can be approved
         metadata_={"branch": "feature/dedup"},
     )
     task = Task(project_id=test_project.id, title="Review auto dedup PR", status="in_progress")
@@ -1645,21 +1639,13 @@ async def test_engine_auto_review_deduplicates_persisted_event_when_session_comp
     db_session.add(run)
     await db_session.flush()
 
-    session = Session(
-        agent_id=reviewer.id,
-        task_id=task.id,
-        project_id=test_project.id,
-        graph_run_id=run.id,
-        adapter_type="api",
-        status="completed",
-        output="APPROVE",
-        metadata_={},
-        origin="graph",
-    )
-    db_session.add(session)
+    engine = GraphEngineService()
+    # the graph creates the review session, bound to the artifact's pinned identity
+    await engine._execute_on_enter(db_session, proto.definition["nodes"]["ready_for_review"], run)
+    session = (await db_session.execute(select(Session).where(Session.graph_run_id == run.id))).scalar_one()
+    session.status, session.output = "completed", "VERDICT: APPROVE"
     await db_session.flush()
 
-    engine = GraphEngineService()
     completion_event = BusEvent(
         id=uuid.uuid4(),
         project_id=test_project.id,
@@ -1831,7 +1817,7 @@ async def test_engine_does_not_auto_emit_review_events_for_non_qualifying_sessio
         graph_run_id=run.id,
         adapter_type="api",
         status="completed",
-        output="APPROVE",
+        output="VERDICT: APPROVE",
         metadata_={},
         origin=origin,
     )

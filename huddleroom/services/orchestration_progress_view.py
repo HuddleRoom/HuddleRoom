@@ -27,7 +27,9 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_capacity import available_slots, root_goal_id
-from huddleroom.services.orchestration_dependencies import NON_BLOCKING_GATE_TYPES, dependency_ids, gate_satisfies, task_gate_id
+from huddleroom.services.orchestration_dependencies import (
+    NON_BLOCKING_GATE_TYPES, accepted_plan_items, criterion_state, dependency_ids, gate_satisfies, task_gate_id,
+)
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
 
 logger = logging.getLogger(__name__)
@@ -434,9 +436,24 @@ async def _follow_up_rows(
         if gate.status != "open" or gate.gate_type in NON_BLOCKING_GATE_TYPES or gate_id in producer_gate_ids:
             continue
         verification = latest_verification.get(gate_id)
-        if verification is not None and verification.status != "failed":
+        held = (verification.request or {}).get("routed") if verification is not None and (
+            verification.status == "completed") else None
+        if verification is not None and verification.status != "failed" and not held:
             continue
+        if held and await _report_correction_running(db, run, held):
+            continue  # the producer's report correction is the visible work; the verifier follows it
         title = plan_titles.get(gate_id)
+        if held:
+            subject = f"{title} ({gate.gate_type} gate)" if title else f"{gate.gate_type} gate for {gate.success_criterion_key}"
+            rows.append((RANK_UNVERIFIED_GATE, _naive_utc(gate.created_at), gate_id, {
+                "kind": "unverified_gate",
+                "id": gate_id,
+                "summary": f"{subject} verification held: {held.get('reason')} ({held.get('detail')})"[
+                    :FOLLOW_UP_SUMMARY_MAX
+                ],
+                "suggested_actions": [],
+            }))
+            continue
         if verification is None:
             summary = (
                 f"{title} ({gate.gate_type} gate) awaiting verification" if title
@@ -453,6 +470,19 @@ async def _follow_up_rows(
             "suggested_actions": ["request_verification"],
         }))
     return rows
+
+
+async def _report_correction_running(db: AsyncSession, run: OrchestrationRun, held: dict) -> bool:
+    """A verification held on the producer's report while that report's correction is pending or running."""
+    item = str(held.get("item") or "")
+    if not item.startswith("report:"):
+        return False
+    marker = await db.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+        OrchestrationAction.idempotency_key == f"run:{run.id}:kind:report_consumed:task:{item.removeprefix('report:')}",
+    ))
+    ledger = ((marker.request or {}) if marker is not None else {}).get("result_correction") or {}
+    return isinstance(ledger, dict) and ledger.get("status") in {"pending", "correcting"}
 
 
 async def _run_tasks(db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> list[Task]:
@@ -560,6 +590,7 @@ class OrchestrationProgressView:
                     task_links[tag[len("criterion:"):]].add(str(action.target_id))
 
         task_by_id = {str(task.id): task for task in tasks}
+        snapshot_items = accepted_plan_items(run.plan_state)
         entries = []
         for key, description in criteria:
             linked_task_ids = [tid for tid in (str(t.id) for t in tasks) if tid in task_links[key]]
@@ -569,7 +600,7 @@ class OrchestrationProgressView:
                 or key in _string_list((gate.required_evidence or {}).get("success_criterion_keys"))
             ]
             in_flight = any(task_by_id[tid].status in ACTIVE_TASK_STATUSES for tid in linked_task_ids)
-            if linked_gates and all(gate.status == "accepted" for gate in linked_gates):
+            if criterion_state(key, snapshot_items, gates) == "accepted":
                 state = "accepted"
             elif not in_flight and any(gate.status in ("open", "failed") for gate in linked_gates):
                 state = "evidence_pending"

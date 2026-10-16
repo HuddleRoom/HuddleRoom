@@ -2813,8 +2813,8 @@ async def test_c3_action_completion_requires_immutable_receipt_wrapper_effect_an
 @pytest.mark.parametrize(("source", "changed"), (
     ("resource", "matching"), ("call", "matching"),
     *(("resource", item) for item in ("unbound", "content", "type", "receipt_content", "receipt_target",
-                                      "foreign_goal", "foreign_run", "foreign_project")),
-    ("call", "unbound"), ("call", "content"),
+                                      "foreign_goal", "foreign_run", "foreign_project", "deleted")),
+    ("call", "unbound"), ("call", "content"), ("call", "deleted"),
 ))
 async def test_c3_artifact_requires_exact_receipt_content_and_linked_task_goal_project_run(
     db_session, test_project, source, changed,
@@ -2830,6 +2830,8 @@ async def test_c3_artifact_requires_exact_receipt_content_and_linked_task_goal_p
         artifact.content_hash = "b" * 64
     elif changed == "type":
         artifact.artifact_type = "report"
+    elif changed == "deleted":
+        artifact.status = "deleted"
     elif changed in {"receipt_content", "receipt_target"}:
         contract = deepcopy(wrapper.dispatch_contract)
         if changed == "receipt_content":

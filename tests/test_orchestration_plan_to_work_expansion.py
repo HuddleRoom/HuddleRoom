@@ -1100,10 +1100,13 @@ async def test_expanding_adopted_item_replays_terminal_task_evidence_and_consume
     assert sorted((e.source_type, e.source_id) for e in evidence) == sorted(
         [("task", audit.id), ("session", session.id)]
     )
-    assert await service._existing_action_for_key(
+    marker = await service._existing_action_for_key(
         db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{audit.id}"
-    ) is not None
-    assert await _task_count(db_session, test_project.id) == tasks_before
+    )
+    assert marker is not None
+    # Adoption creates no work; the prose report gets exactly one output-only correction task.
+    assert await _task_count(db_session, test_project.id) == tasks_before + 1
+    assert marker.request["result_correction"]["status"] == "correcting"
 
 
 @pytest.mark.asyncio

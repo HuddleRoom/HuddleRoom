@@ -101,7 +101,7 @@ async def test_repair_runtime_failure_terminalizes_running_cli_session(test_engi
         session = await db.get(Session, session_id)
 
     assert session.status == "failed"
-    assert session.resumable is True
+    assert session.resumable is False  # no provider session id was captured
     assert session.ended_at is not None
     assert session.metadata_["_roadmap_turn_count"] == 2
 
@@ -169,7 +169,7 @@ async def test_timeout_kills_pipe_owning_child_after_group_leader_exits(test_eng
         assert session.status == "failed"
         assert session.error == "timeout"
         assert session.ended_at is not None
-        assert session.resumable is True  # SPR #85: timeout branch is resumable
+        assert session.resumable is False  # no provider session id was captured, so there is nothing to resume
         assert events.count("session.failed") == 1
     finally:
         if launched_proc is not None:
@@ -273,7 +273,7 @@ async def test_watcher_failure_fails_session_instead_of_reporting_reset(test_eng
     assert session.status == "failed"
     assert session.error == "project_status_watcher_failed: watcher database failed"
     assert session.ended_at is not None
-    assert session.resumable is True  # SPR #85: watcher-failure branch is resumable
+    assert session.resumable is False  # no provider session id was captured
     assert events.count("session.failed") == 1
 
 

@@ -545,3 +545,91 @@ async def test_capability_answer_is_fenced_by_a_reset_reservation(db_session, te
     assert exc.value.status_code == 409
     await db_session.refresh(decision)
     assert decision.status == "pending"
+
+
+# --------------------------------------------------------------------------- reported-blocker lineage
+
+
+@pytest.mark.asyncio
+async def test_reported_blockers_with_different_evidence_get_separate_lineages_and_repeats_join(
+    db_session, test_project,
+):
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_recovery_activation import _actions, _authorized_goal, _decision
+
+    _goal, run = await _authorized_goal(db_session, test_project)
+    tasks = [Task(project_id=test_project.id, title=f"Blocked {i}", status="blocked",
+                  metadata_={"orchestration": {"run_id": str(run.id)}}) for i in range(2)]
+    db_session.add_all(tasks)
+    await db_session.flush()
+    dispatcher = OrchestrationDecisionDispatcher(OrchestrationService())
+
+    async def report(task, reason):
+        decision = await _decision(db_session, run, {
+            "action_type": "recover_blocker", "reason": reason,
+            "evidence_refs": [{"kind": "task", "id": str(task.id)}],
+        })
+        await dispatcher.dispatch(db_session, run, decision)
+
+    await report(tasks[0], "First gate is stuck.")
+    await report(tasks[1], "Second, unrelated gate is stuck.")
+    await report(tasks[0], "First gate is still stuck.")
+
+    triggers = await _actions(db_session, run.id, "recovery_trigger")
+    assert len(triggers) == 2
+    assert len({t.request["source_fingerprint"] for t in triggers}) == 2
+
+
+@pytest.mark.asyncio
+async def test_reported_blocker_evidence_variants_join_the_same_lineage(db_session, test_project):
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_recovery_activation import _actions, _authorized_goal, _decision
+
+    _goal, run = await _authorized_goal(db_session, test_project)
+    task = Task(project_id=test_project.id, title="Blocked", status="blocked",
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db_session.add(task)
+    await db_session.flush()
+    ref = {"kind": "task", "id": str(task.id)}
+    variants = [
+        [ref],
+        [ref, ref],
+        [{**ref, "note": "extra"}],
+        [{"kind": " Task ", "id": f" {str(task.id).upper()} "}],
+    ]
+    dispatcher = OrchestrationDecisionDispatcher(OrchestrationService())
+    for refs in variants:
+        decision = await _decision(db_session, run, {
+            "action_type": "recover_blocker", "reason": "Stuck.", "evidence_refs": refs})
+        await dispatcher.dispatch(db_session, run, decision)
+
+    assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_reported_blocker_evidence_refs_are_ignored_not_fatal(db_session, test_project):
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_recovery_activation import _actions, _authorized_goal, _decision
+
+    _goal, run = await _authorized_goal(db_session, test_project)
+    task = Task(project_id=test_project.id, title="Blocked", status="blocked",
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db_session.add(task)
+    await db_session.flush()
+    ref = {"kind": "task", "id": str(task.id)}
+    dispatcher = OrchestrationDecisionDispatcher(OrchestrationService())
+    reports = []
+    for refs in ([ref], [ref, f"task:{task.id}", None, 7, ["task", str(task.id)]]):
+        decision = await _decision(db_session, run, {
+            "action_type": "recover_blocker", "reason": "Stuck.", "evidence_refs": refs})
+        reports.append(await dispatcher.dispatch(db_session, run, decision))
+
+    # non-object refs neither crash the report nor split its lineage
+    [trigger] = await _actions(db_session, run.id, "recovery_trigger")
+    assert [(item.status, item.target_id) for item in reports] == [("completed", trigger.id)] * 2

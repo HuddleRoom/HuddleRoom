@@ -836,7 +836,8 @@ class SessionService:
             next_cursor = f"{last.created_at.isoformat()}__{last.id}"
         return items, next_cursor
 
-    async def cancel(self, db: AsyncSession, session_id: uuid.UUID) -> Session:
+    async def cancel(self, db: AsyncSession, session_id: uuid.UUID, *, sync_task: bool = True) -> Session:
+        """Cancel a session. Callers that own the task outcome pass sync_task=False."""
         pending_writes = bool(db.new or db.dirty or db.deleted)
         with db.no_autoflush:
             session = await self.get_or_404(db, session_id)
@@ -854,6 +855,9 @@ class SessionService:
                     or transaction is None or transaction.origin != SessionTransactionOrigin.AUTOBEGIN
                     or await OrchestrationService._sqlite_transaction_has_writes(db)):
                 raise HTTPException(status_code=409, detail={"code": "cli_cancel_transaction_conflict"})
+            # The worker's cancel branch skips the task sync when the caller owns the task outcome.
+            # Always overwrite so a stale flag from an earlier failed owner cancel can't leak.
+            session.metadata_ = {**(session.metadata_ or {}), "cancel_owner_managed": not sync_task}
             await db.commit()  # release only a proven clean read before the independent worker write
             error = None
             acknowledged = False
@@ -883,13 +887,18 @@ class SessionService:
             except Exception:
                 pass
 
+        from datetime import datetime, timezone
+        from huddleroom.services.session_sync import sync_task_from_session
         session.status = "cancelled"
+        session.ended_at = datetime.now(timezone.utc)
         await db.flush()
         await emit_event(db, session.project_id, "session.cancelled", {
             "session_id": str(session.id),
             "task_id": str(session.task_id) if session.task_id else None,
             "project_id": str(session.project_id),
         })
+        if sync_task:
+            await sync_task_from_session(db, session)
         return session
 
     async def resume(self, db: AsyncSession, session_id: uuid.UUID) -> Session:
@@ -968,6 +977,18 @@ class SessionService:
 
         # Refresh session to get updated values from the atomic UPDATE
         session = await self.get_or_404(db, session_id)
+        if task is not None:
+            await db.refresh(task)
+        if task is not None and task.status == "failed":
+            task.status = "in_progress"
+            await db.flush()
+            await emit_event(db, task.project_id, "task.status_changed", {
+                "task_id": str(task.id),
+                "status": "in_progress",
+                "previous_status": "failed",
+                "source": "session_resume",
+                "project_id": str(task.project_id),
+            })
         if budget_limits:
             config = dict((session.metadata_ or {}).get("_run_config", {}))
             config["_roadmap_budget_enforced"] = True

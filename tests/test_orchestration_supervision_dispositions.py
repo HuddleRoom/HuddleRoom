@@ -31,7 +31,7 @@ EXPECTED_FIELDS = {
     "replan": (frozenset({"agent_id", "scope"}), frozenset()),
     "ask_human": (
         frozenset({"question"}),
-        frozenset({"work_function", "required_capabilities", "candidate_agent_ids", "gate_id"}),
+        frozenset({"work_function", "required_capabilities", "candidate_agent_ids", "gate_id", "condition"}),
     ),
     "attention": (frozenset(), frozenset()),
 }

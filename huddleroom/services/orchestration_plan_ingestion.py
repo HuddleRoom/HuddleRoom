@@ -19,6 +19,7 @@ from huddleroom.models.task import Task
 
 from huddleroom.schemas.orchestration import PLANNING_ENVELOPE_ADAPTER
 from huddleroom.services.orchestration_budget_service import parent_caps
+from huddleroom.services.orchestration_result_contract import PLANNING_ENVELOPE
 from huddleroom.services.orchestration_roadmap_service import parse_roadmap_items
 from huddleroom.services.orchestration_work_report import _DuplicateReportKey, _report_object
 
@@ -32,12 +33,16 @@ BUDGET_REQUIRED_MESSAGE = (
 
 
 class PlanIngestionError(ValueError):
+    """``correctable``: the output itself is wrong (format, schema, keys), so an output-only correction can fix it.
+    Stale and provenance rejections are never correctable."""
+
     def __init__(self, reason: str, *, stale: bool = False, code: str | None = None,
-                 diagnostics: list[str] | None = None):
+                 diagnostics: list[str] | None = None, correctable: bool = True):
         super().__init__(reason)
         self.reason, self.stale = reason, stale
         self.code = code
         self.diagnostics = diagnostics or []
+        self.correctable = correctable and not stale and code is None
 
 
 def plan_artifact_id(task_id, planning_version) -> uuid.UUID:
@@ -102,12 +107,41 @@ def parse_envelope(output: str | None, expected_kind: str, goal: Any) -> dict:
     }
 
 
+async def linked_correction_session(db, run, task, session, plan_version) -> bool:
+    """True only for the recorded session of ``task``'s current planning result correction.
+
+    The planning task's ledger must name that exact correction task as current and have recorded this session, the
+    correction must point back to the planning task, and the ledger must belong to ``plan_version``."""
+    from huddleroom.models.orchestration import OrchestrationAction  # circular at import time
+
+    marker = await db.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+        OrchestrationAction.idempotency_key == f"run:{run.id}:kind:report_consumed:task:{task.id}",
+    ))
+    request = marker.request if marker is not None and isinstance(marker.request, dict) else {}
+    ledger = request.get("result_correction") if isinstance(request.get("result_correction"), dict) else {}
+    version = ledger.get("version") if isinstance(ledger.get("version"), dict) else {}
+    correction = await db.get(Task, session.task_id) if session.task_id is not None else None
+    return (
+        correction is not None
+        and ledger.get("kind") == PLANNING_ENVELOPE
+        and ledger.get("status") in {"correcting", "corrected"}
+        and ledger.get("correction_task_id") == str(correction.id)
+        and ledger.get("correction_session_id") == str(session.id)
+        and version.get("planning_version") == plan_version
+        and (correction.metadata_ or {}).get("result_correction_parent_task_id") == str(task.id)
+        and session.status == "completed"
+    )
+
+
 def check_disposition(normalized: dict, required_task_ids) -> None:
     adopted = {str(item.get("adopt_task_id")) for item in normalized["plan_items"]}
     for task_id in required_task_ids:
         if str(task_id) not in adopted and str(task_id) not in normalized["summary"]:
+            # Deciding what happens to live pre-plan work is planning, not a format fix: a revision handles it.
             raise PlanIngestionError(
-                f"pre-plan task {task_id} is neither adopted (adopt_task_id) nor explained in summary"
+                f"pre-plan task {task_id} is neither adopted (adopt_task_id) nor explained in summary",
+                correctable=False,
             )
 
 
@@ -124,12 +158,14 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
         raise PlanIngestionError(f"planning version {plan_version} is superseded", stale=True)
 
     session = await db.get(Session, winning_session_id) if winning_session_id else None
-    if winning_session_id and (session is None or session.task_id != task.id):
-        raise PlanIngestionError("winning session does not belong to the planning task")
+    if winning_session_id and (session is None or (
+        session.task_id != task.id and not await linked_correction_session(db, run, task, session, plan_version)
+    )):
+        raise PlanIngestionError("winning session does not belong to the planning task", correctable=False)
     author = session.agent_id if session is not None else task.assigned_to
     expected_author = state.get("plan_author_agent_id")
     if author is None or author != task.assigned_to or (expected_author and str(author) != str(expected_author)):
-        raise PlanIngestionError("plan output author is not the assigned planning agent")
+        raise PlanIngestionError("plan output author is not the assigned planning agent", correctable=False)
 
     report_schema = ((task.metadata_ or {}).get("orchestration_contract") or {}).get("report_schema") or {}
     from huddleroom.services.orchestration_service import OrchestrationService, plan_kind_for  # circular at import time
@@ -199,7 +235,7 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
             else:
                 await nested.commit()
     if (artifact.metadata_ or {}).get("output_hash") != output_hash:
-        raise PlanIngestionError("conflicting plan output for task/version")
+        raise PlanIngestionError("conflicting plan output for task/version", correctable=False)
     run.plan_state = {**state, "plan_artifact_id": str(artifact_id), "plan_output_hash": output_hash}
     return artifact
 

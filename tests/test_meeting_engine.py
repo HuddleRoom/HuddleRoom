@@ -771,6 +771,160 @@ async def test_review_round_complete_records_structured_rejection(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reviewer_text", "expected_kind", "expected_status", "has_followup"),
+    [
+        ("Do not ship: leaks credentials.", "verdict_missing", "unresolved", True),
+        ("I cannot open the artifact, so the review cannot be completed.", "verdict_missing", "unresolved", True),
+        ("Looks fine.\nVERDICT: APPROVE", "approved", "resolved", False),
+        ("- [severity: nit] naming: rename -> rename\nVERDICT: APPROVE", "approved_with_followups", "resolved", True),
+        ("Needs work.\nVERDICT: CHANGES", "changes_requested", "unresolved", True),
+        ("Unsafe.\nVERDICT: BLOCK", "rejected", "unresolved", True),
+    ],
+)
+async def test_review_round_outcome_requires_explicit_reviewer_verdict(
+    db_session, test_project, test_agent, reviewer_text, expected_kind, expected_status, has_followup
+):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import Meeting, MeetingAgendaItem, MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"security-{uuid.uuid4()}",
+        role="security",
+        provider="openai",
+        model="gpt-4o-mini",
+        adapter_type="api",
+        capabilities=[],
+        config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    meeting = Meeting(
+        project_id=test_project.id,
+        title="Security review",
+        meeting_type="review",
+        participant_agent_ids=[str(reviewer.id), str(test_agent.id)],
+        status="active",
+    )
+    db_session.add(meeting)
+    await db_session.flush()
+    item = MeetingAgendaItem(meeting_id=meeting.id, order=1, title="Review", status="active", max_rounds=1)
+    db_session.add(item)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            MeetingTurn(
+                meeting_id=meeting.id, agenda_item_id=item.id, turn_number=1, round_number=1,
+                speaker_agent_id=reviewer.id, content=reviewer_text, references=[],
+            ),
+            MeetingTurn(
+                meeting_id=meeting.id, agenda_item_id=item.id, turn_number=2, round_number=1,
+                speaker_agent_id=test_agent.id, content="Acknowledged.", references=[],
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    runner = MeetingRunner()
+    with patch.object(runner._svc, "is_round_complete", new_callable=AsyncMock) as mock_complete:
+        mock_complete.return_value = True
+        assert await runner.evaluate_round_if_complete(db=db_session, meeting=meeting, item=item) is True
+
+    assert item.resolution_kind == expected_kind
+    assert item.status == expected_status
+    assert bool(item.required_followup) is has_followup
+
+
+@pytest.mark.asyncio
+async def test_review_outcome_uses_only_latest_turn_per_reviewer(db_session, test_project, test_agent):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    rid = reviewer.id
+    turns = [
+        MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=rid, content="Still reading.", references=[]),
+        MeetingTurn(turn_number=2, round_number=1, speaker_agent_id=test_agent.id, content="Ok.", references=[]),
+        MeetingTurn(turn_number=3, round_number=2, speaker_agent_id=rid, content="Fine.\nVERDICT: APPROVE", references=[]),
+    ]
+    resolution, outcome = MeetingRunner()._review_outcome(turns, {str(rid): "reviewer"})
+    assert (resolution, outcome["resolution_kind"]) == ("resolved", "approved")
+
+
+def test_review_outcome_is_unresolved_while_a_required_reviewer_has_no_turn():
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    approver, silent, author = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    turns = [
+        MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=approver, content="Fine.\nVERDICT: APPROVE", references=[]),
+        MeetingTurn(turn_number=2, round_number=1, speaker_agent_id=silent, content="  ", references=[]),
+        MeetingTurn(turn_number=3, round_number=1, speaker_agent_id=author, content="Thanks.", references=[]),
+    ]
+    roles = {str(approver): "reviewer", str(silent): "security", str(author): "developer"}
+    resolution, outcome = MeetingRunner()._review_outcome(turns, roles)
+    assert (resolution, outcome["resolution_kind"]) == ("unresolved", "verdict_missing")
+
+
+@pytest.mark.asyncio
+async def test_review_outcome_ignores_severities_superseded_by_reviewers_later_turn(db_session, test_agent):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    rid = reviewer.id
+    turns = [
+        MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=rid,
+                    content="- [severity: blocker] auth: Basic Auth enabled\nVERDICT: BLOCK", references=[]),
+        MeetingTurn(turn_number=2, round_number=1, speaker_agent_id=test_agent.id, content="Fixed.", references=[]),
+        MeetingTurn(turn_number=3, round_number=2, speaker_agent_id=rid, content="Fixed now.\nVERDICT: APPROVE", references=[]),
+    ]
+    resolution, outcome = MeetingRunner()._review_outcome(turns, {str(rid): "reviewer"})
+    assert (resolution, outcome["resolution_kind"]) == ("resolved", "approved")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("last_line", "expected_kind"),
+    [
+        ("**VERDICT: APPROVE**", "approved"),
+        ("`VERDICT: APPROVE`", "approved"),
+        ("VERDICT: APPROVE.", "approved"),
+        ("**VERDICT:** CHANGES.", "changes_requested"),
+        ("**VERDICT: APPROVE, mostly**", "verdict_missing"),
+    ],
+)
+async def test_review_outcome_tolerates_markdown_around_final_verdict(db_session, last_line, expected_kind):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    turns = [MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=reviewer.id,
+                         content=f"Reviewed.\n{last_line}", references=[])]
+    _resolution, outcome = MeetingRunner()._review_outcome(turns, {str(reviewer.id): "reviewer"})
+    assert outcome["resolution_kind"] == expected_kind
+
+
+@pytest.mark.asyncio
 async def test_standup_round_complete_advances_without_consensus_check(
     db_session, test_project, test_agent
 ):

@@ -564,8 +564,39 @@ def decoder_for_runtime(runtime: str) -> CliStreamDecoder:
     return CliStreamDecoder(runtime)
 
 
+def parse_partial_cli(runtime: str, stdout: bytes) -> tuple[str, str | None]:
+    """Best-effort (output, provider session id) from stdout of a CLI that never finished."""
+    text = stdout.decode("utf-8", errors="ignore")
+    if runtime == "claude_code":
+        session_id, parts = None, []
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if isinstance(record.get("session_id"), str):
+                session_id = session_id or record["session_id"]
+            message = record.get("message")
+            if record.get("type") == "assistant" and isinstance(message, dict) and isinstance(message.get("content"), list):
+                parts.extend(b["text"] for b in message["content"]
+                             if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+        return "\n".join(parts), session_id
+    if runtime in {"codex", "copilot", "opencode", "pi"}:
+        try:
+            return parse_jsonl_final(text, runtime)
+        except ValueError:
+            try:
+                return "", parse_jsonl_session_id(text, runtime)
+            except ValueError:
+                return "", None
+    return text, None
+
+
 async def collect_cli_process(
-    proc: Any, *, runtime: str, call: Any
+    proc: Any, *, runtime: str, call: Any, partial: dict[str, bytes] | None = None,
+    on_provider_id: Any = None,
 ) -> CollectedCliOutput:
     """Collect CLI subprocess output concurrently, routing updates through call.
 
@@ -573,6 +604,9 @@ async def collect_cli_process(
         proc: asyncio subprocess.Popen-like object with stdout, stderr, wait()
         runtime: CLI runtime identifier (claude_code, codex, aider, custom)
         call: AgentResponseCall to route updates through
+        partial: optional dict kept current with the stdout seen so far (key "stdout"),
+            so a caller that abandons the collection can still recover early output
+        on_provider_id: optional async callable awaited once, when the provider session id is first seen
 
     Returns:
         CollectedCliOutput with exact bytes and decoded content
@@ -608,28 +642,48 @@ async def collect_cli_process(
             elif update.kind == "tool_finished":
                 await call.tool_finished(update.tool_name or "unknown", update.outcome, update.value)
 
-    async def read_stream(stream: Any, feed_fn) -> bytes:
+    reported_id = False
+
+    async def read_stream(stream: Any, feed_fn, is_stdout: bool = False) -> bytes:
         """Read concurrently, retaining exact transport bytes and completed boundaries."""
+        nonlocal reported_id
         accumulated = b""
         while True:
             chunk = await stream.read(4096)
             if not chunk:
                 break
             accumulated += chunk
+            if is_stdout and partial is not None:
+                partial["stdout"] = accumulated
+            if is_stdout and on_provider_id is not None and not reported_id:
+                early_id = parse_partial_cli(runtime, accumulated)[1]
+                if early_id:
+                    reported_id = True  # once only: a failing write must not be retried on every chunk
+                    try:
+                        await on_provider_id(early_id)
+                    except Exception:
+                        logger.warning("Could not persist early provider session id", exc_info=True)
             await route(feed_fn(chunk))
         await route(feed_fn(b"\n"))
         return accumulated
 
     # Read both streams concurrently
     stdout_task = asyncio.create_task(
-        read_stream(proc.stdout, decoder.feed_stdout)
+        read_stream(proc.stdout, decoder.feed_stdout, True)
     )
     stderr_task = asyncio.create_task(
         read_stream(proc.stderr, decoder.feed_stderr)
     )
 
     # Wait for both readers to reach EOF
-    stdout_bytes, stderr_bytes = await asyncio.gather(stdout_task, stderr_task)
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.gather(stdout_task, stderr_task)
+    except BaseException:
+        # A failed or cancelled reader must not leave its sibling reading a dead pipe.
+        for reader in (stdout_task, stderr_task):
+            reader.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        raise
 
     # Now wait for process to exit
     returncode = await proc.wait()

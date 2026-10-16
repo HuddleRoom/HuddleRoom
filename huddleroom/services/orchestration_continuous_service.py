@@ -469,7 +469,7 @@ class OrchestrationContinuousService:
                     Session.task_id == task.id, Session.status.in_(("pending", "running")),
                 ))).all())
                 for session in active_sessions:
-                    await sessions.cancel(db, session.id)
+                    await sessions.cancel(db, session.id, sync_task=False)
                 if task.status not in {"completed", "cancelled", "failed", "done"}:
                     await tasks.cancel(db, goal.project_id, task.id)
             reservation = await db.scalar(select(OrchestrationBudgetReservation).where(

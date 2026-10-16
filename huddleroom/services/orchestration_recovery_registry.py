@@ -855,7 +855,7 @@ class RecoveryToolRegistry:
                                     observed = receipt.observed_post_state
                                     expected = {"artifact_id": ref["id"], "artifact_type": arguments.artifact_type,
                                                 "content_hash": arguments.content_hash}
-                                    if (row and row.project_id == goal.project_id and row.artifact_type == arguments.artifact_type
+                                    if (row and row.status != "deleted" and row.project_id == goal.project_id and row.artifact_type == arguments.artifact_type
                                             and row.content_hash == arguments.content_hash and isinstance(observed, dict)
                                             and all(observed.get(key) == value for key, value in expected.items())
                                             and await self._artifact_from_effect(db, row, effect, goal, run)):

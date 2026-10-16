@@ -163,7 +163,10 @@ def _metadata(goal_id: uuid.UUID, run_id: uuid.UUID, action_id: uuid.UUID, reque
             "action_id": str(action_id),
             "work_function": request["work_function"],
         },
-        "orchestration_contract": _contract(goal_id, run_id, action_id, request).model_dump(mode="json"),
+        "orchestration_contract": {
+            **_contract(goal_id, run_id, action_id, request).model_dump(mode="json"),
+            "expected_result": "work_report",
+        },
     }
 
 
@@ -972,6 +975,22 @@ async def test_adhoc_defaults_keep_legacy_request_and_unknown_artifact_creates_n
     before = await _task_count(db_session, test_project.id)
     with pytest.raises(HTTPException) as exc:
         await _delegate(service, run, agent, "bad-art", db=db_session, artifact_ids=[str(uuid.uuid4())])
+    assert exc.value.status_code == 409 and exc.value.detail.startswith("artifact_invalid:")
+    assert await _task_count(db_session, test_project.id) == before
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_artifact_is_artifact_invalid_and_creates_nothing(db_session, test_project):
+    from huddleroom.models.artifact import Artifact
+
+    service, run, agent = await _adhoc_dep_setup(db_session, test_project)
+    artifact = Artifact(project_id=test_project.id, name="gone", artifact_type="document", status="deleted")
+    db_session.add(artifact)
+    await db_session.flush()
+
+    before = await _task_count(db_session, test_project.id)
+    with pytest.raises(HTTPException) as exc:
+        await _delegate(service, run, agent, "deleted-art", db=db_session, artifact_ids=[str(artifact.id)])
     assert exc.value.status_code == 409 and exc.value.detail.startswith("artifact_invalid:")
     assert await _task_count(db_session, test_project.id) == before
 
