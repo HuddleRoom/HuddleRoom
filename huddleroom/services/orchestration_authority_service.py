@@ -583,6 +583,13 @@ class OrchestrationAuthorityDecisionService:
         if result.rowcount != 1:
             raise ValueError("cannot cancel decision: it was concurrently modified")
         await db.refresh(decision)
+        run = await db.get(OrchestrationRun, decision.run_id) if decision.run_id else None
+        if run is not None and run.active_blockers:  # a cancelled owner ask no longer blocks its subject
+            run.active_blockers = [
+                blocker for blocker in run.active_blockers
+                if not (isinstance(blocker, dict) and blocker.get("kind") == "owner_escalation"
+                        and blocker.get("decision_id") == str(decision.id))
+            ]
         goal = await db.get(OrchestrationGoal, decision.goal_id)
         await emit_event_once(
             db, goal.project_id, "authority.decision_resolved",
