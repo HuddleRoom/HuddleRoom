@@ -5624,6 +5624,8 @@ class OrchestrationService:
         db: AsyncSession,
         run: OrchestrationRun,
         plan_task_id: uuid.UUID,
+        *,
+        accepted: bool = False,
     ) -> Task:
         project_id = await self._project_id_for_run(db, run.id)
         task = await TaskService().get(db, project_id, plan_task_id)
@@ -5634,13 +5636,27 @@ class OrchestrationService:
         orchestration = self._json_object_or_empty(task_metadata.get("orchestration"))
         if orchestration.get("run_id") != str(run.id):
             raise HTTPException(status_code=409, detail="Planning task does not belong to this run")
+        if accepted and orchestration.get("goal_id") != str(run.goal_id):
+            raise HTTPException(status_code=409, detail="Planning task does not belong to this goal")
         if orchestration.get("work_function") != PLAN_WORK_FUNCTION:
             raise HTTPException(status_code=409, detail="Task is not a planning task")
         plan_state = self._json_object_or_empty(run.plan_state)
-        pending = self._json_object_or_empty(plan_state.get("pending_replan"))
+        pending = {} if accepted else self._json_object_or_empty(plan_state.get("pending_replan"))
         current_plan_task_id = self._required_uuid(
             pending.get("task_id") if pending else plan_state.get("planning_task_id"), "planning_task_id"
         )
+        if accepted:
+            request_action = await db.get(OrchestrationAction, self._required_uuid(
+                orchestration.get("action_id"), "request_action_id"
+            ))
+            if (
+                task.id != current_plan_task_id or request_action is None or request_action.run_id != run.id
+                or request_action.action_type not in {"request_plan", "request_roadmap_replan"}
+                or request_action.status != "completed" or request_action.target_type != "task"
+                or request_action.target_id != task.id
+            ):
+                raise HTTPException(status_code=409, detail="Accepted planning task request is invalid")
+            return task
         request_action_id = self._required_uuid(
             pending.get("action_id") if pending else plan_state.get("request_action_id"), "request_action_id"
         )
@@ -5729,6 +5745,8 @@ class OrchestrationService:
         db: AsyncSession,
         run: OrchestrationRun,
         artifact_id: uuid.UUID,
+        *,
+        accepted: bool = False,
     ) -> Artifact:
         artifact = await db.get(Artifact, artifact_id)
         project_id = await self._project_id_for_run(db, run.id)
@@ -5736,23 +5754,34 @@ class OrchestrationService:
             raise HTTPException(status_code=404, detail="Plan artifact not found")
         if artifact.artifact_type != "plan":
             raise HTTPException(status_code=409, detail="Artifact must have artifact_type 'plan'")
+        if accepted and artifact.status == "deleted":
+            raise HTTPException(status_code=409, detail="Accepted plan artifact was deleted")
 
         plan_state = self._json_object_or_empty(run.plan_state)
-        pending = self._json_object_or_empty(plan_state.get("pending_replan"))
+        pending = {} if accepted else self._json_object_or_empty(plan_state.get("pending_replan"))
         plan_task_id = self._required_uuid(
             pending.get("task_id") if pending else plan_state.get("planning_task_id"), "planning_task_id"
         )
         if artifact.linked_task_id != plan_task_id:
             raise HTTPException(status_code=409, detail="Plan artifact is not linked to the current planning task")
-        planning_task = await self._planning_task_for_run(db, run, plan_task_id)
+        planning_task = await self._planning_task_for_run(db, run, plan_task_id, accepted=accepted)
         if artifact.created_by_agent is None or artifact.created_by_agent != planning_task.assigned_to:
             raise HTTPException(status_code=409, detail="Plan artifact must be created by the assigned planning agent")
         metadata = self._json_object_or_empty(artifact.metadata_)
         # The server-held plan_artifact_id keeps the binding even if the Artifact's metadata is rewritten.
         if metadata.get("source") == INGESTION_SOURCE or str(artifact.id) == plan_state.get("plan_artifact_id"):
-            if metadata.get("planning_version") != plan_state.get("planning_version"):
+            planning_version = self._json_object_or_empty(
+                self._json_object_or_empty(planning_task.metadata_).get("orchestration_plan")
+            ).get("planning_version") if accepted else plan_state.get("planning_version")
+            if metadata.get("planning_version") != planning_version:
                 raise HTTPException(status_code=409, detail="Plan artifact is from a superseded planning version")
-            if ingested_plan_hash(metadata) != plan_state.get("plan_output_hash"):
+            output_hash = ingested_plan_hash(metadata)
+            if accepted and (output_hash != artifact.content_hash or output_hash != metadata.get("output_hash")):
+                raise HTTPException(status_code=409, detail="Accepted plan artifact ingestion hash is invalid")
+            if (
+                (not accepted or str(artifact.id) == plan_state.get("plan_artifact_id"))
+                and output_hash != plan_state.get("plan_output_hash")
+            ):
                 raise HTTPException(status_code=409, detail="Plan artifact content does not match the ingested planning output")
         return artifact
 
@@ -10492,12 +10521,43 @@ class OrchestrationService:
 
         Only items whose every originating record_warning/ask_human action declares a reconcilable condition
         (never an owner decision, judged with the action's own kind and category) are touched."""
-        warnings = list((await db.scalars(select(OrchestrationWarning).where(
-            OrchestrationWarning.run_id == run.id, OrchestrationWarning.active.is_(True),
-        ).order_by(OrchestrationWarning.created_at).limit(self.RECONCILE_CONDITIONS_LIMIT))).all())
-        questions = list((await db.scalars(select(OrchestrationAuthorityDecision).where(
-            OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending",
-        ).order_by(OrchestrationAuthorityDecision.asked_at).limit(self.RECONCILE_CONDITIONS_LIMIT))).all())
+        state = dict(self._json_object_or_empty(run.supervision_state))
+        cursors = dict(self._json_object_or_empty(state.get("condition_reconciliation")))
+        batches = {}
+        for kind, model, timestamp, open_condition in (
+            ("warnings", OrchestrationWarning, OrchestrationWarning.created_at, OrchestrationWarning.active.is_(True)),
+            ("questions", OrchestrationAuthorityDecision, OrchestrationAuthorityDecision.asked_at,
+             OrchestrationAuthorityDecision.status == "pending"),
+        ):
+            query = select(model).where(model.run_id == run.id, open_condition)
+            cursor = self._json_object_or_empty(cursors.get(kind))
+            cursor_time = cursor_id = None
+            try:
+                if isinstance(cursor.get("timestamp"), str) and isinstance(cursor.get("id"), str):
+                    cursor_time = datetime.fromisoformat(cursor["timestamp"])
+                    cursor_id = uuid.UUID(cursor["id"])
+            except ValueError:
+                cursor_time = cursor_id = None
+            after_cursor = query
+            if cursor_time is not None and cursor_id is not None:
+                after_cursor = query.where(or_(
+                    timestamp > cursor_time,
+                    and_(timestamp == cursor_time, model.id > cursor_id),
+                ))
+            rows = list((await db.scalars(after_cursor.order_by(timestamp, model.id).limit(
+                self.RECONCILE_CONDITIONS_LIMIT,
+            ))).all())
+            if not rows and cursor_time is not None and cursor_id is not None:
+                # An empty tail wraps once; retained rows must not starve later items.
+                rows = list((await db.scalars(query.order_by(timestamp, model.id).limit(
+                    self.RECONCILE_CONDITIONS_LIMIT,
+                ))).all())
+            cursors[kind] = {
+                "timestamp": getattr(rows[-1], timestamp.key).isoformat(), "id": str(rows[-1].id),
+            } if rows else None
+            batches[kind] = rows
+        run.supervision_state = {**state, "condition_reconciliation": cursors}
+        warnings, questions = batches["warnings"], batches["questions"]
         items = {item.id: item for item in (*warnings, *questions)}
         if not items:
             return 0
@@ -10549,8 +10609,41 @@ class OrchestrationService:
             plan_state = self._json_object_or_empty(run.plan_state)
             if run_part != str(run.id) or plan_state.get("status") != "accepted":
                 return False
-            # A later accepted version also settles an earlier version's missing plan.
-            return not version or (version.isascii() and version.isdigit() and int(plan_state.get("planning_version") or 0) >= int(version))
+            artifact_id = self._required_uuid(plan_state.get("accepted_artifact_id"), "accepted_artifact_id")
+            artifact = await self._plan_artifact_for_run(db, run, artifact_id, accepted=True)
+            planning_task = await db.get(Task, artifact.linked_task_id)
+            accepted_generation = self._json_object_or_empty(
+                self._json_object_or_empty(planning_task.metadata_).get("orchestration_plan")
+            ).get("planning_version")
+            if version and (
+                not version.isascii() or not version.isdigit() or accepted_generation != int(version)
+            ):
+                return False
+            acceptance = await db.get(OrchestrationAction, self._required_uuid(
+                plan_state.get("accept_action_id"), "accept_action_id"
+            ))
+            if (
+                acceptance is None or acceptance.run_id != run.id or acceptance.action_type != "accept_plan"
+                or acceptance.status != "completed" or acceptance.target_type != "artifact"
+                or acceptance.target_id != artifact.id
+                or self._json_object_or_empty(acceptance.request).get("plan_artifact_id") != str(artifact.id)
+            ):
+                return False
+            goal = await db.get(OrchestrationGoal, run.goal_id)
+            if goal is not None and goal.goal_type == "roadmap":
+                from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+
+                roadmap = OrchestrationRoadmapService(self)
+                accepted_version = await roadmap.current_version(db, goal.id)
+                return (
+                    accepted_version is not None and accepted_version.run_id == run.id
+                    and accepted_version.goal_id == goal.id and accepted_version.plan_artifact_id == artifact.id
+                    and plan_state.get("roadmap_version_id") == str(accepted_version.id)
+                    and plan_state.get("roadmap_version") == accepted_version.version
+                    and plan_state.get("accepted_plan_fingerprint") == accepted_version.fingerprint
+                )
+            await self._accepted_plan_items(db, run)
+            return True
         try:
             subject_id = uuid.UUID(subject)
         except ValueError:
