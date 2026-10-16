@@ -4,6 +4,7 @@ import json
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review")
 
@@ -11,6 +12,26 @@ from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.task import Task
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _owned_tick_setup(db_session, monkeypatch):
+    original = OrchestrationService.tick
+    async def tick(self, db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if (db is db_session and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await db.flush()
+            await db.commit()
+        return await original(self, db, *args, **kwargs)
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
 
 
 def _agent(name_prefix: str = "manager", *, is_active: bool = True) -> Agent:
@@ -617,7 +638,13 @@ async def test_answer_endpoint_ticks_only_the_answered_baseline_process(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["decision"]["status"] == "answered"
-    assert body["process"]["status"] in {"completed", "waiting_decision"}
+    assert body["process"] is None and body["answer_receipt"]["application_state"] == "pending"
+    await db_session.commit()  # Request fixture owns setup and accepted staged writes.
+    from huddleroom.services.orchestration_decision_application import drain_answer_applications
+    await drain_answer_applications(db_session, run.id)
+    await db_session.commit()
+    await db_session.refresh(source_process)
+    assert source_process.status in {"completed", "waiting_decision"}
     manager_selection = await process_service.get_current(db_session, goal.id, "manager_selection")
     assert manager_selection is None
 
@@ -665,14 +692,16 @@ async def test_answer_endpoint_does_not_advance_a_stale_source_process(client, d
         supersede_waiting=True,
     )
     await db_session.flush()
+    await db_session.commit()  # Persist owned preparation before the request-owned rejection.
 
     response = await client.post(
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/decisions/{decision.id}/answer",
         json={"selected_option": "ship_now"},
     )
 
-    assert response.status_code == 200, response.text
-    assert response.json()["process"] is None
+    assert response.status_code == 409, response.text
+    await db_session.refresh(decision)
+    assert decision.status == "pending" and decision.selected_option is None
     await db_session.refresh(replacement)
     assert replacement.status == "running"
 
@@ -1445,6 +1474,7 @@ async def test_tick_syncs_pending_manager_decisions_and_reports_summary(db_sessi
         created_by_user_id=None,
     )
 
+    run.baseline_authorized = True  # This tick wiring driver explicitly authorizes its baseline setup.
     result = await service.tick(db_session, run.id)
     assert result["authority_interview"] == {"delegated": 0, "recorded": 0, "escalated": 0}
 

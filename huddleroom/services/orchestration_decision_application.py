@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.user import User
 from huddleroom.schemas.orchestration import (
     OrchestrationAgentDefinitionReviewBatchAnswer,
@@ -23,24 +23,11 @@ from huddleroom.services.orchestration_recovery_presenter import (
     GAP_PREFIX, is_recovery_decision, present_decision_response, present_decision_responses,
 )
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
-from huddleroom.services.orchestration_debug_service import OrchestrationDebugService, SUPPORTED_PROCESS_TYPES
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
-from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES, OrchestrationService
-from huddleroom.services.orchestration_team_hierarchy import (
-    PROPOSAL_RESOLUTION_RERUN_SENTINEL,
-    TeamHierarchyProcess,
-)
-from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+from huddleroom.services.orchestration_service import OrchestrationService
+from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
 from huddleroom.services.orchestration_team_hierarchy_analyzer import canonical_agent_create
-from huddleroom.services.agent_service import AgentService, complete_roster_handoff
-from huddleroom.services.orchestration_roster_mutation import (
-    RosterHandoffRequired,
-    commit_before_roster_handoff,
-    publish_roster_reservation,
-    revalidate_roster_handoff,
-    transaction_shape,
-)
-from huddleroom.services.project_service import ProjectService
+from huddleroom.services.agent_service import AgentService
 
 orchestration_service = OrchestrationService()
 decision_service = OrchestrationAuthorityDecisionService()
@@ -115,103 +102,37 @@ async def answer_agent_review_batch(
     reservation_callback=None,
     validation_callback=None,
     completion_callback=None,
+    request_owns_transaction=False,
 ) -> OrchestrationAgentDefinitionReviewBatchAnswerResponse:
-    goal = await _goal_or_404(db, project_id, goal_id)
-    owns_transaction = transaction_shape(db) in {"none", "autobegin"}
-    async with orchestration_service._lock_goal_for_baseline_transition(db, goal.id):
-        if validation_callback is not None:
-            await validation_callback(db)
-        await db.refresh(goal)
-        active_run = await orchestration_service.get_active_run_for_goal(db, project_id, goal_id)
-        if goal.status not in {"active", "blocked"} or active_run is None:
-            raise HTTPException(status_code=409, detail="agent-definition review cannot advance")
-        await db.refresh(active_run)
-        if active_run.status not in LLM_DECISION_RUN_STATUSES:
-            raise HTTPException(status_code=409, detail="agent-definition review cannot advance")
-        await ProjectService().lock_workspace_boundary(db, project_id)
-        await ProjectService().require_runnable_project(db, project_id)
-        current = await OrchestrationProcessService().get_current(
-            db, goal.id, "agent_definition_review"
-        )
-        if current is None or current.status != "waiting_decision":
-            raise HTTPException(status_code=409, detail="agent-definition review is not awaiting a batch")
-        pending_by_id = {
-            decision.id: decision
-            for decision in await decision_service.list_decisions(db, goal.id, status="pending")
-            if decision.source_process_run_id == current.id
-            and decision.decision_key.startswith("agent_definition_review:proposal:")
-        }
-        submitted_ids = [item.decision_id for item in data.answers]
-        if len(submitted_ids) != len(set(submitted_ids)):
-            raise HTTPException(status_code=400, detail="decision IDs must be unique")
-        if set(submitted_ids) != set(pending_by_id):
-            raise HTTPException(status_code=409, detail="pending proposal set changed")
-        for item in data.answers:
-            decision = pending_by_id[item.decision_id]
-            if item.selected_option not in decision.options:
-                raise HTTPException(status_code=400, detail="selected option is not offered")
-            edit_fields = {"edited_description", "edited_persona"} & item.model_fields_set
-            if item.selected_option == "edit":
-                if edit_fields != {"edited_description", "edited_persona"} or not all(
-                    isinstance(value, str) and value.strip()
-                    for value in (item.edited_description, item.edited_persona)
-                ):
-                    raise HTTPException(status_code=400, detail="edit requires description and persona")
-            elif edit_fields:
-                raise HTTPException(status_code=400, detail="edited fields require edit")
-        prepared = None
-        try:
-            async with db.begin_nested():
-                answered = [await decision_service.answer_decision(
-                    db,
-                    pending_by_id[item.decision_id],
-                    selected_option=item.selected_option,
-                    reason=_batch_answer_reason(item),
-                    decided_by_user_id=user.id,
-                ) for item in data.answers]
-                try:
-                    process = await OrchestrationDebugService().advance_process(
-                        db, goal, active_run, "agent_definition_review"
-                    )
-                except RosterHandoffRequired as handoff:
-                    prepared = handoff.prepared  # keep the answers: they are the reservation
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if prepared is None:
-            response = OrchestrationAgentDefinitionReviewBatchAnswerResponse(
-                decisions=await _present(db, answered), process=process
-            )
-            if completion_callback is not None:
-                await completion_callback(db, response)
-            return response
-        if reservation_callback is not None:
-            await reservation_callback(db, {"kind": "roster", "process_id": str(prepared.process_id),
-                "run_id": str(prepared.origin_run_id), "decision_ids": [str(value) for value in prepared.decision_ids]})
-        await publish_roster_reservation(db, prepared, owns_transaction)
+    from huddleroom.services.orchestration_answer_receipts import accept_answer, acceptance_owns, canonical_answer_submission
+    owns = acceptance_owns(db, request_owns_transaction)
+    await _goal_or_404(db, project_id, goal_id)
+    submitted_ids = [item.decision_id for item in data.answers]
+    if len(submitted_ids) != len(set(submitted_ids)):
+        raise HTTPException(400, "decision IDs must be unique")
+    decisions = [await _decision_or_404(db, goal_id, value) for value in submitted_ids]
+    answers = []
+    for item in data.answers:
+        edit_fields = {"edited_description", "edited_persona"} & item.model_fields_set
+        if item.selected_option == "edit":
+            if edit_fields != {"edited_description", "edited_persona"} or not all(
+                isinstance(value, str) and value.strip() for value in (item.edited_description, item.edited_persona)
+            ):
+                raise HTTPException(400, "edit requires description and persona")
+        elif edit_fields:
+            raise HTTPException(400, "edited fields require edit")
+        answers.append({"decision_id": str(item.decision_id), "selected_option": item.selected_option,
+                        "reason": _batch_answer_reason(item)})
 
-    async def resume(prepared):
-        async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), \
-                commit_before_roster_handoff(db, owns_transaction):
-            await db.refresh(goal)
-            if goal.status not in {"active", "blocked"}:
-                raise HTTPException(status_code=409, detail="agent-definition review cannot advance")
-            run = await revalidate_roster_handoff(db, prepared)
-            await ProjectService().lock_workspace_boundary(db, project_id)
-            await ProjectService().require_runnable_project(db, project_id)
-            try:
-                process = await OrchestrationDebugService().advance_process(
-                    db, goal, run, "agent_definition_review"
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            for item in answered:
-                await db.refresh(item)
-            response = OrchestrationAgentDefinitionReviewBatchAnswerResponse(decisions=await _present(db, answered), process=process)
-            if completion_callback is not None:
-                await completion_callback(db, response)
-            return response
-
-    return await complete_roster_handoff(db, prepared, resume)
+    submission = canonical_answer_submission(decisions, data, user.id)
+    if owns:
+        await db.commit()  # End only this invocation's preflight before the acceptance primitive owns its root.
+    try:
+        return await accept_answer(db, project_id, goal_id, submission, user,
+            validation_callback=validation_callback, reservation_callback=reservation_callback,
+            completion_callback=completion_callback)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 async def answer_decision(
@@ -225,8 +146,11 @@ async def answer_decision(
     reservation_callback=None,
     validation_callback=None,
     completion_callback=None,
+    request_owns_transaction=False,
 ) -> OrchestrationDecisionAnswerResponse:
-    goal = await _goal_or_404(db, project_id, goal_id)
+    from huddleroom.services.orchestration_answer_receipts import accept_answer, acceptance_owns, canonical_answer_submission
+    owns = acceptance_owns(db, request_owns_transaction)
+    await _goal_or_404(db, project_id, goal_id)
     decision = await _decision_or_404(db, goal_id, decision_id)
     if is_recovery_decision(decision):
         async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id):
@@ -280,137 +204,53 @@ async def answer_decision(
                 return response
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if decision.status != "pending":
-        raise HTTPException(status_code=409, detail=f"cannot answer decision in status '{decision.status}'")
-    if decision.authority != "human":
-        if decision.authority_agent_id is None:
-            # Phase 2 carry-over guard: the agent this decision awaits was
-            # deleted (FK SET NULL) after the decision was raised. It can
-            # never be answered as-is -- surface cancel instead of a bare
-            # validation error so the source process can re-raise it fresh.
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "the agent this decision awaits was deleted; cancel it via "
-                    "the cancel endpoint so its source process can re-raise a fresh decision"
-                ),
-            )
-        raise HTTPException(
-            status_code=409,
-            detail=f"decision authority is '{decision.authority}'; it is answered through its agent's decision report",
-        )
-    owns_transaction = transaction_shape(db) in {"none", "autobegin"}
-
-    async def advance_source_process():
-        if answered_decision.source_process_run_id is None:
-            return None
-        source_process = await db.get(OrchestrationProcessRun, answered_decision.source_process_run_id)
-        if source_process is None or source_process.process_type not in SUPPORTED_PROCESS_TYPES:
-            return None
-        current = await OrchestrationProcessService().get_current(db, goal.id, source_process.process_type)
-        if current is None or current.id != source_process.id:
-            return None
-        await db.refresh(goal)
-        active_run = await orchestration_service.get_active_run_for_goal(db, project_id, goal_id)
-        if goal.status not in {"active", "blocked"} or active_run is None:
-            return None
-        await db.refresh(active_run)
-        if active_run.status not in LLM_DECISION_RUN_STATUSES:
-            return None
-        try:
-            await ProjectService().lock_workspace_boundary(db, project_id)
-            await ProjectService().require_runnable_project(db, project_id)
-        except HTTPException:
-            return None
-        return await OrchestrationDebugService().advance_process(
-            db, goal, active_run, source_process.process_type
-        )
-
+    submission = canonical_answer_submission([decision], data, user.id)
+    if owns:
+        await db.commit()
     try:
-        async with OrchestrationService()._lock_goal_for_baseline_transition(db, decision.goal_id):
-            if validation_callback is not None:
-                await validation_callback(db)
-            answer_reason = data.reason
-            if is_hierarchy_agent:
-                current = await OrchestrationProcessService().get_current(db, goal.id, "team_hierarchy")
-                if current is None or current.id != decision.source_process_run_id:
-                    raise HTTPException(status_code=409, detail="team hierarchy proposal is no longer current")
-                hierarchy = TeamHierarchyProcess()
-                await db.refresh(goal)
-                fingerprint = hierarchy._semantic_fingerprint(hierarchy._strip_volatile(await hierarchy._analysis_input(db, goal)))
-                if current.input_snapshot.get("fingerprint") != fingerprint:
-                    # Item 3, orchestrator override: a pending decision must
-                    # never be cancelled just because inputs changed -- it
-                    # stays parked. This answer attempt targets a stale
-                    # snapshot, so it's rejected (409) without touching the
-                    # decision; a one-time suggestion is raised (idempotent
-                    # per process run) so the human sees it on the queue and
-                    # can explicitly approve a rerun instead.
-                    await OrchestrationWarningService().suggest_stale_inputs(
-                        db,
-                        goal.id,
-                        process_type="team_hierarchy",
-                        process_run_id=current.id,
-                        step_label="team hierarchy",
-                        run_id=current.run_id,
-                    )
-                    await db.commit()
-                    raise HTTPException(status_code=409, detail="team hierarchy proposal inputs changed")
-                if data.selected_option == "edit":
-                    # Reserve the agent under the goal lock; the hierarchy process
-                    # creates it roster-first after this lock is released.
-                    edited_agent = canonical_agent_create(data.edited_agent)
-                    AgentService.validate_create(edited_agent)
-                    answer_reason = json.dumps({
-                        "reason": data.reason, "created_agent_id": str(uuid.uuid4()),
-                        "edited_agent": edited_agent.model_dump(mode="json"),
-                    }, sort_keys=True)
-            answered_decision = await decision_service.answer_decision(
-                db,
-                decision,
-                selected_option=data.selected_option,
-                reason=answer_reason,
-                decided_by_user_id=user.id,
-            )
-            if is_hierarchy_agent and data.selected_option in {"edit", "reject"}:
-                # Resolving one proposal in a batch obsoletes the rest --
-                # this is a deliberate continuation of the same
-                # decision-making process the human is already in, not a
-                # background "inputs drifted" staleness (item 3's
-                # one-time-suggestion rule doesn't apply here). The sentinel
-                # fingerprint forces _advance_orchestrated's mismatch branch
-                # to fire on the next advance_process() call below, which
-                # recognizes it and reruns unconditionally instead of
-                # raising a suggestion.
-                current = await OrchestrationProcessService().get_current(db, goal.id, "team_hierarchy")
-                await TeamHierarchyProcess()._cancel_pending_for_run(db, goal.id, current.id)
-                current.input_snapshot = {"fingerprint": PROPOSAL_RESOLUTION_RERUN_SENTINEL}
-            try:
-                process = await advance_source_process()
-            except RosterHandoffRequired as handoff:
-                prepared = handoff.prepared
-                if reservation_callback is not None:
-                    await reservation_callback(db, {"kind": "roster", "process_id": str(prepared.process_id),
-                        "run_id": str(prepared.origin_run_id), "decision_ids": [str(value) for value in prepared.decision_ids]})
-                await publish_roster_reservation(db, prepared, owns_transaction)
-            else:
-                response = OrchestrationDecisionAnswerResponse(decision=await _present_one(db, answered_decision), process=process)
-                if completion_callback is not None:
-                    await completion_callback(db, response)
-                return response
-
-        async def resume(prepared):
-            async with OrchestrationService()._lock_goal_for_baseline_transition(db, goal_id), \
-                    commit_before_roster_handoff(db, owns_transaction):
-                await revalidate_roster_handoff(db, prepared)
-                await db.refresh(answered_decision)
-                process = await advance_source_process()
-                response = OrchestrationDecisionAnswerResponse(decision=await _present_one(db, answered_decision), process=process)
-                if completion_callback is not None:
-                    await completion_callback(db, response)
-                return response
-
-        return await complete_roster_handoff(db, prepared, resume)
+        return await accept_answer(db, project_id, goal_id, submission, user,
+            validation_callback=validation_callback, reservation_callback=reservation_callback,
+            completion_callback=completion_callback)
     except (ValueError, ValidationError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(400, str(exc)) from exc
 
+
+async def validate_ordinary_submission(db, goal, decisions, submission, answers):
+    """Fresh domain guards for the canonical ordinary acceptance writer transaction."""
+    for decision in decisions:
+        if is_recovery_decision(decision) or decision.runtime_identity is not None:
+            raise HTTPException(409, "decision requires its specialized answer path")
+        if decision.authority != "human":
+            if decision.authority_agent_id is None:
+                raise HTTPException(409, "the agent this decision awaits was deleted; cancel it via the cancel endpoint so its source process can re-raise a fresh decision")
+            raise HTTPException(409, "decision must be answered through its designated agent")
+    if submission.kind == "batch":
+        current = await OrchestrationProcessService().get_current(db, goal.id, "agent_definition_review")
+        if current is None or current.status != "waiting_decision":
+            raise HTTPException(409, "agent-definition review is not awaiting a batch")
+        pending = [d for d in await decision_service.list_decisions(db, goal.id, status="pending")
+                   if d.source_process_run_id == current.id
+                   and d.decision_key.startswith("agent_definition_review:proposal:")]
+        if set(submission.decision_ids) != {d.id for d in pending}:
+            raise HTTPException(409, "pending proposal set changed")
+    for decision, answer in zip(decisions, answers):
+        if not decision.decision_key.startswith("team_hierarchy:agent:"):
+            continue
+        current = await OrchestrationProcessService().get_current(db, goal.id, "team_hierarchy")
+        if current is None or current.id != decision.source_process_run_id:
+            raise HTTPException(409, "team hierarchy proposal is no longer current")
+        hierarchy = TeamHierarchyProcess()
+        fingerprint = hierarchy._semantic_fingerprint(hierarchy._strip_volatile(await hierarchy._analysis_input(db, goal)))
+        if current.input_snapshot.get("fingerprint") != fingerprint:
+            raise HTTPException(409, "team hierarchy proposal inputs changed")
+        if answer["selected_option"] == "edit":
+            from huddleroom.schemas.agent import AgentCreate
+            edited_agent = canonical_agent_create(AgentCreate.model_validate(answer["edited_agent"]))
+            AgentService.validate_create(edited_agent)
+            answer["answer_reason"] = json.dumps({"reason": answer.get("reason"), "created_agent_id": str(uuid.uuid4()),
+                "edited_agent": edited_agent.model_dump(mode="json")}, sort_keys=True)
+
+
+from huddleroom.services.orchestration_answer_receipts import (  # noqa: E402
+    accept_answer, canonical_answer_submission, drain_answer_applications, record_answer_effect, retry_answer_application,
+)

@@ -13777,6 +13777,9 @@ class OrchestrationService:
             db, run_id=run_id, request_owns_transaction=request_owns_transaction,
         )
 
+        if not local_only and owns:
+            from huddleroom.services.orchestration_answer_receipts import drain_answer_applications
+            await drain_answer_applications(db, run_id)
         try:
             if not local_only and owns:
                 # B1: an approved fix progresses (apply/verify/retry) before the decision loop can re-select the

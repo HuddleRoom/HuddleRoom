@@ -41,6 +41,28 @@ def request_supervision_evaluation(run_id) -> None:
         evaluate_supervision_run.delay(str(run_id))
 
 
+async def _drain_answer_event(db, event_type, payload):
+    if event_type != "authority.decision_resolved" or not payload.get("decision_id"):
+        return
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    from huddleroom.services.orchestration_answer_receipts import drain_answer_applications
+    decision = await db.get(OrchestrationAuthorityDecision, UUID(str(payload["decision_id"])))
+    run_id = decision.run_id if decision else None
+    if decision is not None and decision.continuation_action_id is not None:
+        from huddleroom.models.orchestration import OrchestrationAction
+        action = await db.get(OrchestrationAction, decision.continuation_action_id)
+        if action is not None and action.action_type == "apply_authority_answer":
+            run_id = action.run_id
+    if run_id is None and decision is not None and decision.source_process_run_id is not None:
+        from huddleroom.models.orchestration_process import OrchestrationProcessRun
+        source = await db.get(OrchestrationProcessRun, decision.source_process_run_id)
+        run_id = source.run_id if source else None
+    await db.commit()  # End the worker-owned event lookup before consumer goal locks.
+    if run_id:
+        await drain_answer_applications(db, run_id)
+        await db.commit()
+
+
 async def evaluate_supervision_run_async(run_id) -> int:
     async with AsyncSessionLocal() as db:
         try:
@@ -74,6 +96,7 @@ async def evaluate_supervision_event_async(event_id) -> int:
                 )
                 await db.commit()
                 return 1
+            await _drain_answer_event(db, event.event_type, event.payload)
             scheduler = OrchestrationSupervisionScheduler()
             run_ids = await scheduler.record_event(
                 db, event.event_type, event.payload, event_id=event.id,
@@ -99,6 +122,15 @@ async def evaluate_supervision_event_async(event_id) -> int:
 async def supervise_orchestration_async() -> int:
     async with AsyncSessionLocal() as db:
         try:
+            from huddleroom.models.orchestration import OrchestrationAction
+            from huddleroom.services.orchestration_answer_receipts import drain_answer_applications
+            pending_answers = list(await db.scalars(select(OrchestrationAction.run_id).where(
+                OrchestrationAction.action_type == "apply_authority_answer", OrchestrationAction.status == "reserved"
+            ).distinct().limit(settings.orchestration_sweep_goal_limit)))
+            await db.commit()
+            for run_id in pending_answers:
+                await drain_answer_applications(db, run_id)
+                await db.commit()
             # Import here so deployments/tests can replace the durable scheduler.
             scheduler = OrchestrationSupervisionScheduler()
             due_run_ids = await scheduler.sweep(
@@ -165,6 +197,7 @@ async def run_orchestration_event_supervisor(
                 continue
             async with AsyncSessionLocal() as db:
                 try:
+                    await _drain_answer_event(db, event.event_type, event.payload)
                     run_ids = await OrchestrationSupervisionScheduler().record_event(
                         db, event.event_type, event.payload, event_id=event.id, now=event.emitted_at,
                         project_id=event.project_id,

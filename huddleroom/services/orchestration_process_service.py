@@ -66,7 +66,20 @@ class OrchestrationProcessService:
             )
         return f"Process '{process_type}' was skipped by {skipped_by}: {reason}"
 
-    async def start_process(
+    async def start_process(self, db, goal_id, **kwargs):
+        from huddleroom.services.orchestration_answer_receipts import _application, record_current_answer_effect
+        previous = await self.get_current(db, goal_id, kwargs["process_type"]) if _application.get() is not None else None
+        row = await self._start_process_impl(db, goal_id, **kwargs)
+        if _application.get() is not None and (previous is None or previous.id != row.id):
+            await record_current_answer_effect(db, f"source_successor:{row.process_type}", "process", row.id)
+            previous_ids = list(await db.scalars(select(OrchestrationProcessRun.id).where(
+                OrchestrationProcessRun.superseded_by_id == row.id, OrchestrationProcessRun.id != row.id,
+            )))
+            for previous_id in previous_ids:
+                await record_current_answer_effect(db, f"supersede_process:{previous_id}", "process", row.id)
+        return row
+
+    async def _start_process_impl(
         self,
         db: AsyncSession,
         goal_id: uuid.UUID,
@@ -626,6 +639,8 @@ class OrchestrationProcessService:
         if result.rowcount != 1:
             raise ValueError(f"cannot complete process run in status {process_run.status!r}")
         await db.refresh(process_run)
+        from huddleroom.services.orchestration_answer_receipts import record_current_answer_effect
+        await record_current_answer_effect(db, f"complete_process:{process_run.id}", "process", process_run.id)
         return process_run
 
     async def recovery_provenance(

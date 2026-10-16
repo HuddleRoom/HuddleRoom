@@ -237,6 +237,9 @@ async def test_runtime_scheduler_uses_supervision_settings_for_intervals_and_bou
     @asynccontextmanager
     async def session_context():
         class FakeDb:
+            async def scalars(self, _query):
+                return []  # No pending saved-answer applications in this scheduler-settings test.
+
             async def commit(self):
                 return None
 

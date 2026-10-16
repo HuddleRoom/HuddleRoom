@@ -1512,10 +1512,40 @@ class OrchestrationAuthorityDecisionResponse(BaseModel):
     needs_you_references: list[NeedsYouReference] | None = None
 
 
+class AnswerSubmission(BaseModel):
+    kind: Literal["single", "batch"] = "single"
+    actor_user_id: uuid.UUID
+    decision_ids: list[uuid.UUID]
+    source_process_run_id: uuid.UUID | None = None
+    run_id: uuid.UUID | None
+    answers: list[dict]
+    contracts: list[dict]
+
+
+class AnswerReceipt(BaseModel):
+    action_id: uuid.UUID | None
+    decision_ids: list[uuid.UUID]
+    actor_user_id: uuid.UUID
+    source_process_run_id: uuid.UUID | None = None
+    run_id: uuid.UUID | None
+    submission: dict
+    contracts: list[dict]
+    application_state: str = "pending"
+    reason: str | None = None
+
+
+class AnswerApplicationPass(BaseModel):
+    applied: list[uuid.UUID] = Field(default_factory=list)
+    pending: list[uuid.UUID] = Field(default_factory=list)
+    failed: list[uuid.UUID] = Field(default_factory=list)
+    reasons: dict[str, str] = Field(default_factory=dict)
+
+
 class OrchestrationDecisionAnswerResponse(BaseModel):
     decision: OrchestrationAuthorityDecisionResponse
     process: dict | None = None
     continuation_applied: bool = False
+    answer_receipt: AnswerReceipt | None = None
 
 
 class OrchestrationCheckpointResponse(BaseModel):
@@ -1554,7 +1584,8 @@ class OrchestrationAgentDefinitionReviewBatchAnswerRequest(BaseModel):
 
 class OrchestrationAgentDefinitionReviewBatchAnswerResponse(BaseModel):
     decisions: list[OrchestrationAuthorityDecisionResponse]
-    process: dict
+    process: dict | None = None
+    answer_receipt: AnswerReceipt | None = None
 
 
 class OrchestrationDecisionCancelRequest(BaseModel):

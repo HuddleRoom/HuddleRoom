@@ -427,6 +427,7 @@ class OrchestrationAuthorityDecisionService:
         reason: str | None = None,
         decided_by_user_id: uuid.UUID | None = None,
         decided_by_agent_id: uuid.UUID | None = None,
+        control_writer: bool = False,
     ) -> OrchestrationAuthorityDecision:
         # Recovery approvals must pass the proposal drift check first (spec: answer handling
         # recognizes the recovery key prefix); the generic path can never approve one.
@@ -435,6 +436,7 @@ class OrchestrationAuthorityDecisionService:
         return await self._answer(
             db, decision, selected_option=selected_option, reason=reason,
             decided_by_user_id=decided_by_user_id, decided_by_agent_id=decided_by_agent_id,
+            control_writer=control_writer,
         )
 
     async def _answer(
@@ -446,6 +448,7 @@ class OrchestrationAuthorityDecisionService:
         reason: str | None,
         decided_by_user_id: uuid.UUID | None,
         decided_by_agent_id: uuid.UUID | None,
+        control_writer: bool = False,
     ) -> OrchestrationAuthorityDecision:
         if decision.status != "pending":
             raise ValueError(f"cannot answer decision in status {decision.status!r}")
@@ -477,7 +480,17 @@ class OrchestrationAuthorityDecisionService:
         from huddleroom.services.orchestration_service import OrchestrationService
         from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 
-        async with OrchestrationService()._lock_goal_for_baseline_transition(db, decision.goal_id):
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def answer_boundary():
+            if control_writer:
+                yield
+            else:
+                async with OrchestrationService()._lock_goal_for_baseline_transition(db, decision.goal_id):
+                    yield
+
+        async with answer_boundary():
             # Status-conditional UPDATE (not a load-then-write) so two concurrent
             # answer/cancel calls on the same pending decision can't both
             # succeed: only the first to land wins the row, the second sees

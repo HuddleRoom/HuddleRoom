@@ -339,6 +339,8 @@ async def publish_roster_reservation(
         if owns_transaction:
             await db.rollback()
         raise HTTPException(status_code=409, detail="Baseline operation discarded by reset")
+    from huddleroom.services.orchestration_answer_receipts import record_current_answer_effect
+    await record_current_answer_effect(db, f"roster_reservation:{prepared.process_id}", "process", prepared.process_id)
     if owns_transaction:
         await db.commit()
 
@@ -430,6 +432,16 @@ async def _require_origin_unchanged(db: AsyncSession, origin_goal_id, origin_run
         OrchestrationRun.goal_id == origin_goal_id, OrchestrationRun.status.in_(ACTIVE_RUN_STATUSES),
     ).limit(1)) != origin_run_id:
         raise RosterStateChanged("origin run changed")
+    if origin_run_id is not None:
+        from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+        from huddleroom.services.orchestration_answer_receipts import _application
+        try:
+            # Roster-first/root locks and the native SQLite writer are already held.
+            # Approved recovery keeps its separate repair authority; every origin still honors Pause.
+            await require_control_admission(db, origin_run_id,
+                require_baseline_authorization=_application.get() is not None)
+        except BaselinePaused:
+            raise HTTPException(409, "Orchestration admission paused") from None
 
 
 def _root_open(db: AsyncSession, root) -> bool:
@@ -458,6 +470,9 @@ class AgentRosterMutationCoordinator:
         async with self._guard(db, delta, expected_plan, origin_goal_id, "coordinator", origin_run_id) as locked:
             value = await mutation(db, locked.delta, locked.plan)
             await self.invalidate_collateral(db, locked.plan, provenance)
+            from huddleroom.services.orchestration_answer_receipts import record_current_answer_effect
+            for agent_id in value if isinstance(value, list) else []:
+                await record_current_answer_effect(db, f"roster_agent:{agent_id}", "agent", agent_id)
         affected = set(locked.plan.affected_goal_ids)
         return RosterMutationResult(
             value, tuple(sorted(affected, key=str)),

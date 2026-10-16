@@ -97,7 +97,7 @@ async def answer_agent_definition_review_batch(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    return await decision_application.answer_agent_review_batch(db, project_id, goal_id, data, user)
+    return await decision_application.answer_agent_review_batch(db, project_id, goal_id, data, user, request_owns_transaction=True)
 
 
 @router.post(
@@ -112,7 +112,7 @@ async def answer_decision(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    return await decision_application.answer_decision(db, project_id, goal_id, decision_id, data, user)
+    return await decision_application.answer_decision(db, project_id, goal_id, decision_id, data, user, request_owns_transaction=True)
 
 
 @router.post(
@@ -133,3 +133,15 @@ async def cancel_decision(
         return await _present_one(db, await decision_service.cancel_decision(db, decision, reason=data.reason))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/goals/{goal_id}/decisions/{decision_id}", response_model=OrchestrationDecisionAnswerResponse)
+async def get_decision(project_id: uuid.UUID, goal_id: uuid.UUID, decision_id: uuid.UUID,
+                       _: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await _goal_or_404(db, project_id, goal_id)
+    decision = await _decision_or_404(db, goal_id, decision_id)
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.services.orchestration_answer_receipts import receipt, runless_receipt
+    action = await db.get(OrchestrationAction, decision.continuation_action_id) if decision.continuation_action_id else None
+    return OrchestrationDecisionAnswerResponse(decision=await _present_one(db, decision),
+        answer_receipt=receipt(action) if action and action.action_type == "apply_authority_answer" else runless_receipt(decision))

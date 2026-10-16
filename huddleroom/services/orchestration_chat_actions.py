@@ -321,11 +321,11 @@ class OrchestrationChatActionService:
             await session.flush()
         async def completion_callback(session, result):
             receipt.status = "recorded"
-            receipt.message = "Answer recorded." if getattr(result, "continuation_applied", None) is not False else "Answer recorded without continuation."
+            receipt.message = "Answer saved; continuation pending." if getattr(result, "answer_receipt", None) is not None else "Answer recorded." if getattr(result, "continuation_applied", None) is not False else "Answer recorded without continuation."
             turn.action_receipt = receipt.model_dump(mode="json")
             turn.status = "completed"
             await session.flush()
-            if owns_transaction:
+            if owns_transaction and getattr(result, "answer_receipt", None) is None:
                 await session.commit()
         project_id, goal_id = action.project_id, action.goal_id
         if op == "start_baseline":
@@ -391,7 +391,7 @@ class OrchestrationChatActionService:
                 raise conflict("chat_invalid_operation", "Runtime question requires its specialized action")
             result = await decisions.answer_decision(db, project_id, goal_id, action.target_id, data, user, reservation_callback=reservation_callback, validation_callback=validation_callback, completion_callback=completion_callback)
             receipt.status = "recorded"
-            receipt.message = "Answer recorded." if result.continuation_applied is not False else "Answer recorded without continuation."
+            receipt.message = "Answer saved; continuation pending." if result.answer_receipt is not None else "Answer recorded." if result.continuation_applied is not False else "Answer recorded without continuation."
         else:
             raise conflict("chat_unsupported", "Use the existing control for this operation")
 

@@ -6,10 +6,11 @@ from contextlib import asynccontextmanager
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from huddleroom.config import settings
 from huddleroom.models import User
+from huddleroom.models.event_log import EventLog
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_chat import ProjectChatTurn
 from huddleroom.schemas.orchestration_chat import ChatActionDraft, ChatInterpretation
@@ -440,6 +441,13 @@ async def _loaded_goal_user(sessions, seeded):
         return await db.get(OrchestrationGoal, seeded.goal_id), await db.get(User, seeded.user_id)
 
 
+async def _drain_saved_answer(sessions, run_id):
+    from huddleroom.services.orchestration_decision_application import drain_answer_applications
+    async with sessions() as consumer:
+        await drain_answer_applications(consumer, run_id)
+        await consumer.commit()
+
+
 async def test_agent_batch_production_handoff_releases_chat_goal_lock(sessions, tmp_path, approve_semantic_reviews, lock_tracer):
     seeded = await seed_definition_proposal(sessions, tmp_path)
     goal, user = await _loaded_goal_user(sessions, seeded)
@@ -451,6 +459,8 @@ async def test_agent_batch_production_handoff_releases_chat_goal_lock(sessions, 
         receipt = await _service(sessions).execute(db, await db.get(ProjectChatTurn, turn.id), action)
         await db.commit()
     assert receipt.status == "recorded"
+    # Saved acknowledgment precedes the fresh native roster consumer.
+    await _drain_saved_answer(sessions, seeded.run_id)
     assert_entry_handoff(lock_tracer, goal.id)
     single_agent_write(lock_tracer, agent_id=seeded.agent_id)
     assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
@@ -469,6 +479,8 @@ async def test_hierarchy_production_handoff_releases_chat_goal_lock(sessions, tm
         receipt = await _service(sessions).execute(db, await db.get(ProjectChatTurn, turn.id), action)
         await db.commit()
     assert receipt.status == "recorded"
+    # Saved acknowledgment precedes the fresh native roster consumer.
+    await _drain_saved_answer(sessions, seeded.run_id)
     assert_entry_handoff(lock_tracer, goal.id)
     single_agent_write(lock_tracer, name=seeded.proposal_name)
 
@@ -515,6 +527,7 @@ async def test_hierarchy_typed_edit_interpretation_to_production_action(sessions
             receipt = await _service(sessions).execute(db, turn, action)
             await db.commit()
             assert receipt.status == "recorded"
+        await _drain_saved_answer(sessions, seeded.run_id)
     else:
         assert parsed.intent != "instruction"
     async with sessions() as db:
@@ -534,24 +547,36 @@ async def test_roster_reservation_crash_is_linked_and_never_redispatched(
         content=f"Answer {seeded.decision_id} approve", payload={"answers": [
             {"decision_id": str(seeded.decision_id), "selected_option": "approve"}]})
     handoffs = []
+    class ProcessTerminated(BaseException):
+        pass
 
     async def crash(*_args, **_kwargs):
         handoffs.append(True)
-        raise RuntimeError("crash after reservation before roster handoff")
+        raise ProcessTerminated("crash after reservation before roster handoff")
 
-    monkeypatch.setattr(application, "complete_roster_handoff", crash)
+    from huddleroom.services import agent_service
+    original_handoff = agent_service.complete_roster_handoff
+    # Acceptance is already durable; interrupt the real consumer at its native
+    # published roster reservation, before roster application/handoff.
     async with sessions() as db:
-        with pytest.raises(RuntimeError):
-            await _service(sessions).execute(db, await db.get(ProjectChatTurn, turn.id), action)
-        await db.rollback()
+        saved = await _service(sessions).execute(db, await db.get(ProjectChatTurn, turn.id), action)
+        assert saved.status == "recorded"
+    monkeypatch.setattr(agent_service, "complete_roster_handoff", crash)
+    with pytest.raises(ProcessTerminated, match="crash after reservation"):
+        await _drain_saved_answer(sessions, seeded.run_id)
     async with sessions() as db:
         row = await db.get(ProjectChatTurn, turn.id)
-        assert row.action_receipt["status"] == "interrupted_unknown"
+        assert row.action_receipt["status"] == "recorded"
         assert row.frozen_context["action_reservation"]
         replay = await _service(sessions).execute(db, row, action)
         await db.commit()
-    assert replay.status in {"recorded", "interrupted_unknown"}
+    assert replay.status == "recorded"
     assert len(handoffs) == 1
+    monkeypatch.setattr(agent_service, "complete_roster_handoff", original_handoff)
+    await _drain_saved_answer(sessions, seeded.run_id)
+    await _drain_saved_answer(sessions, seeded.run_id)
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
+
 
 
 @pytest.mark.parametrize("operation", ["pause", "cancel", "start_execution"])
@@ -723,7 +748,12 @@ async def test_decision_receipt_publishes_inside_native_lock_or_rolls_back(sessi
                         observed.append(True)
                 depth -= 1
 
-    monkeypatch.setattr(OrchestrationService, "_lock_goal_for_baseline_transition", observed_lock)
+    if runtime is True:
+        monkeypatch.setattr(OrchestrationService, "_lock_goal_for_baseline_transition", observed_lock)
+    else:
+        def forbidden_mutex(*args, **kwargs):
+            pytest.fail("ordinary answer acceptance awaited a long transition mutex")
+        monkeypatch.setattr(OrchestrationService, "_lock_goal_for_baseline_transition", forbidden_mutex)
     if failure:
         application_name = "answer_agent_review_batch" if runtime == "batch" else "answer_decision"
         original_answer = getattr(application, application_name)
@@ -736,6 +766,28 @@ async def test_decision_receipt_publishes_inside_native_lock_or_rolls_back(sessi
             return await original_answer(*args, **kwargs)
         monkeypatch.setattr(application, application_name, failing_answer)
     async with sessions() as db:
+        if runtime is not True and not failure:
+            original_commit = db.commit
+            async def observed_writer_commit():
+                staged = await db.get(OrchestrationAuthorityDecision, decision.id)
+                if staged.status == "answered" and not observed:
+                    # A fresh reader sees neither half until this actual outer
+                    # writer transaction commits the answer+obligation+receipt.
+                    async with sessions() as fresh:
+                        assert (await fresh.get(OrchestrationAuthorityDecision, decision.id)).status == "pending"
+                        assert (await fresh.get(ProjectChatTurn, turn.id)).action_receipt is None
+                    await original_commit()
+                    async with sessions() as fresh:
+                        saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+                        row = await fresh.get(ProjectChatTurn, turn.id)
+                        assert saved.status == "answered"
+                        assert row.status == "completed" and row.action_receipt["status"] == "recorded"
+                        obligation = await fresh.get(OrchestrationAction, saved.continuation_action_id)
+                        assert obligation.action_type == "apply_authority_answer" and obligation.status == "reserved"
+                    observed.append(True)
+                else:
+                    await original_commit()
+            monkeypatch.setattr(db, "commit", observed_writer_commit)
         if failure:
             with pytest.raises(RuntimeError, match="crash after answer"):
                 async with db.begin():
@@ -748,6 +800,51 @@ async def test_decision_receipt_publishes_inside_native_lock_or_rolls_back(sessi
             assert (await fresh.get(ProjectChatTurn, turn.id)).action_receipt is None
             assert (await fresh.scalars(select(OrchestrationAction).where(
                 OrchestrationAction.run_id == run.id,
-                OrchestrationAction.action_type == "decision_continuation"))).all() == []
+                OrchestrationAction.action_type.in_(["decision_continuation", "apply_authority_answer"])))).all() == []
     else:
         assert observed
+
+
+@pytest.mark.parametrize("selected_option", ["approve", "request_changes"])
+async def test_spr231_chat_request_dies_after_answer_obligation_and_receipt_commit(sessions, tmp_path, monkeypatch, selected_option):
+    """SPR230/SPR231 no request coroutine survives; fresh consumer uses the saved obligation."""
+    from tests.test_orchestration_decision_application import _spr231_committed_ordinary
+    from huddleroom.services import orchestration_decision_application as application
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+    turn, action = await _prepare(sessions, user, goal, "answer_authority", target_id=decision.id,
+        content=f"Answer {decision.id} {selected_option}", payload={"selected_option": selected_option})
+    class RequestTerminated(BaseException):
+        pass
+    interrupted = []
+    async with sessions() as submitting:
+        original_commit = submitting.commit
+        async def commit_then_terminate():
+            await original_commit()
+            async with sessions() as fresh:
+                saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+                chat = await fresh.get(ProjectChatTurn, turn.id)
+                if saved.status == "answered" and chat.action_receipt:
+                    interrupted.append(True)
+                    raise RequestTerminated()
+        monkeypatch.setattr(submitting, "commit", commit_then_terminate)
+        with pytest.raises(RequestTerminated):
+            await _service(sessions).execute(submitting, await submitting.get(ProjectChatTurn, turn.id), action)
+    assert interrupted == [True]
+    async with sessions() as fresh:
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+        chat = await fresh.get(ProjectChatTurn, turn.id)
+        assert saved.status == "answered" and saved.selected_option == selected_option
+        assert chat.status == "completed" and chat.action_receipt["status"] == "recorded"
+        obligation_id = saved.continuation_action_id
+        assert (await fresh.get(OrchestrationAction, obligation_id)).status == "reserved"
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, obligation_id)).status == "completed"
+        assert await fresh.scalar(select(func.count()).select_from(EventLog).where(
+            EventLog.dedup_key == f"authority.decision_resolved:{decision.id}")) == 1

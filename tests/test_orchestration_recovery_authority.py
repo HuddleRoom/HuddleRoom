@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
@@ -28,6 +29,27 @@ from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
 from huddleroom.services.orchestration_service import OrchestrationService
 
 SHA = "a" * 64
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This recovery authority suite owns its persisted diagnosis preparation."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _owned_diagnosis_setup(db_session, monkeypatch):
+    original = OrchestrationBlockerRecoveryService.diagnose
+    async def diagnose(self, db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if (db is db_session and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await db.flush()
+            await db.commit()
+        return await original(self, db, *args, **kwargs)
+    monkeypatch.setattr(OrchestrationBlockerRecoveryService, "diagnose", diagnose)
 
 
 def trigger_for(goal, run):
@@ -349,7 +371,7 @@ async def test_concurrent_identical_answers_reserve_exactly_one_wrapper(concurre
     run = OrchestrationRun(goal_id=goal.id, status="running")
     s1.add(run)
     await s1.flush()
-    svc, _, proposal, decision = await diagnosed(s1, goal, run, agent)
+    svc, _, proposal, decision = await diagnosed(s1, goal, run, agent, owns_setup=True)
     await s1.commit()
 
     async def answer(session):
@@ -460,7 +482,7 @@ async def _seed_committed(session, tmp_path):
 async def test_stale_writes_survive_when_caller_commits_after_catching(concurrent_sessions, tmp_path, fail_on_effect):
     s1, s2 = concurrent_sessions
     user, agent, goal, run = await _seed_committed(s1, tmp_path)
-    svc, _, proposal, decision = await diagnosed(s1, goal, run, agent)
+    svc, _, proposal, decision = await diagnosed(s1, goal, run, agent, owns_setup=True)
     await s1.commit()
 
     agent.role = "drifted role"

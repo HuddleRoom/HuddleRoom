@@ -823,6 +823,8 @@ class TeamHierarchyProcess:
                     OrchestrationAuthorityDecision.id == decision.id
                 ).values(reason=json.dumps(metadata, sort_keys=True)))
                 decision.reason = json.dumps(metadata, sort_keys=True)
+            from huddleroom.services.orchestration_answer_receipts import record_current_answer_effect
+            await record_current_answer_effect(db, f"created_agent_id:{decision.id}", "agent", uuid.UUID(created_id))
             created_by_ref[f"proposal:{decision.decision_key.rsplit(':', 1)[-1]}"] = created_id
 
         if created_by_ref:

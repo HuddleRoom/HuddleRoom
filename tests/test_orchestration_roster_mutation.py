@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session as SyncSession
@@ -522,7 +523,7 @@ def stub_prerequisite_processes(monkeypatch, *, definition_review=False, hierarc
         monkeypatch.setattr(TeamHierarchyProcess, "advance", parked)
 
 
-async def act_definition_batch(sessions, seeded):
+async def act_definition_batch(sessions, seeded, *, apply=True, return_application=False):
     from huddleroom.routers.orchestration_decisions import answer_agent_definition_review_batch
     from huddleroom.schemas.orchestration import OrchestrationAgentDefinitionReviewBatchAnswerRequest
 
@@ -535,10 +536,17 @@ async def act_definition_batch(sessions, seeded):
             user, s,
         )
         await s.commit()  # get_db commits after the route returns
+        _spr231_receipt_action(response)
+        if apply:
+            from huddleroom.services.orchestration_decision_application import drain_answer_applications
+            application_pass = await drain_answer_applications(s, seeded.run_id)
+            await s.commit()
+            if return_application:
+                return response, application_pass
         return response
 
 
-async def act_hierarchy_answer(sessions, seeded, option="approve"):
+async def act_hierarchy_answer(sessions, seeded, option="approve", *, apply=True):
     from huddleroom.routers.orchestration_decisions import answer_decision
     from huddleroom.schemas.orchestration import OrchestrationDecisionAnswerRequest
 
@@ -552,6 +560,11 @@ async def act_hierarchy_answer(sessions, seeded, option="approve"):
             OrchestrationDecisionAnswerRequest(**body), user, s,
         )
         await s.commit()
+        _spr231_receipt_action(response)
+        if apply:
+            from huddleroom.services.orchestration_decision_application import drain_answer_applications
+            await drain_answer_applications(s, seeded.run_id)
+            await s.commit()
         return response
 
 
@@ -982,14 +995,18 @@ async def test_reset_between_reserve_and_apply_writes_no_agent(
     lock_tracer.start()
     _set_reset_fence_on_preview(lock_tracer, seeded.goal_id, 2)  # under the roster lock, before goal locks
     try:
-        outcome = await outcome_or_conflict(act_definition_batch(sessions, seeded))
+        outcome = await outcome_or_conflict(act_definition_batch(sessions, seeded, return_application=True))
     finally:
         clear_reset_fence(seeded.goal_id)
 
-    assert getattr(outcome, "status_code", None) == 409
+    response, application_pass = outcome
+    action_id = _spr231_receipt_action(response)
+    assert uuid.UUID(action_id) in application_pass.pending
+    assert "reset" in application_pass.reasons[action_id].lower()
     assert not lock_tracer.of("agent:write"), "a global agent change landed for a discarded baseline"
     assert (await fresh_agent(sessions, seeded.agent_id)).description == before
     assert (await current_process(sessions, seeded.goal_id, "agent_definition_review")).status != "completed"
+    assert _spr231_receipt_action(await act_definition_batch(sessions, seeded, apply=False)) == action_id
 
 
 @pytest.mark.asyncio
@@ -1001,15 +1018,19 @@ async def test_reset_racing_reservation_commit_discards_reservation(
     lock_tracer.start()
     _set_reset_fence_on_preview(lock_tracer, seeded.goal_id, 1)  # during prepare, under the goal lock
     try:
-        outcome = await outcome_or_conflict(act_definition_batch(sessions, seeded))
+        outcome = await outcome_or_conflict(act_definition_batch(sessions, seeded, return_application=True))
     finally:
         clear_reset_fence(seeded.goal_id)
 
-    assert getattr(outcome, "status_code", None) == 409
+    response, application_pass = outcome
+    action_id = _spr231_receipt_action(response)
+    assert uuid.UUID(action_id) in application_pass.pending
+    assert "reset" in application_pass.reasons[action_id].lower()
     assert not lock_tracer.of("roster:acquire") and not lock_tracer.of("agent:write")
     assert (await fresh_agent(sessions, seeded.agent_id)).description == before
     decision = next(item for item in await decisions_for(sessions, seeded.goal_id) if item.id == seeded.decision_id)
-    assert decision.status == "pending", "the reservation was committed despite the reset"
+    assert decision.status == "answered", "reset must not erase the already committed answer acceptance"
+    assert _spr231_receipt_action(await act_definition_batch(sessions, seeded, apply=False)) == action_id
 
 
 @pytest.mark.asyncio
@@ -1106,3 +1127,325 @@ async def test_collateral_invalidated_goal_rebuilds_on_next_tick(
     assert "recovery_invalidation" not in review_row.outputs
     assert hierarchy_row.status in {"waiting_decision", "completed"}, "goal B stalled on the invalidation row"
     assert isinstance(hierarchy_row.outputs.get("analysis"), dict)
+
+
+async def _spr231_batch_submission(sessions, seeded, *, description="Reviewed implementation responsibilities."):
+    """SPR230/SPR231 keep the exact typed batch payload stable across independent requests."""
+    from huddleroom.schemas.orchestration import OrchestrationAgentDefinitionReviewBatchAnswerRequest
+    from huddleroom.services.orchestration_decision_application import answer_agent_review_batch
+
+    data = OrchestrationAgentDefinitionReviewBatchAnswerRequest(answers=[{
+        "decision_id": seeded.decision_id, "selected_option": "edit",
+        "edited_description": description, "edited_persona": "Implement the scoped task and report evidence.",
+    }])
+    async with sessions() as db:
+        user = await db.get(User, seeded.user_id)
+        response = await answer_agent_review_batch(db, seeded.project_id, seeded.goal_id, data, user)
+        await db.commit()
+        return response
+
+
+def _spr231_receipt_action(response):
+    payload = response.model_dump(mode="json")
+    assert payload.get("answer_receipt"), "SPR231 accepted answers require a durable application receipt"
+    return payload["answer_receipt"]["action_id"]
+
+
+@pytest.mark.asyncio
+async def test_spr231_batch_saved_while_paused_replays_frozen_edit_then_applies_once(
+    sessions, tmp_path, monkeypatch, approve_semantic_reviews,
+):
+    """SPR230/SPR231 batch Saved survives requester loss and Pause without a second submission."""
+    from huddleroom.models.event_log import EventLog
+    from huddleroom.services import orchestration_decision_application as application
+
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    original = (await fresh_agent(sessions, seeded.agent_id)).description
+    accepted = await _spr231_batch_submission(sessions, seeded)
+    action_id = _spr231_receipt_action(accepted)
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == original
+    async with sessions() as pausing:
+        await OrchestrationService().pause_goal(pausing, seeded.project_id, seeded.goal_id)
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == original
+    retried = await asyncio.gather(*[_spr231_batch_submission(sessions, seeded) for _ in range(2)])
+    assert [_spr231_receipt_action(item) for item in retried] == [action_id, action_id]
+    with pytest.raises(HTTPException) as conflict:
+        await _spr231_batch_submission(sessions, seeded, description="A conflicting different edit.")
+    assert conflict.value.status_code == 409
+    async with sessions() as resumed:
+        await OrchestrationService().resume_goal(resumed, seeded.project_id, seeded.goal_id)
+        await resumed.commit()
+    # The baseline authorization cleared by Pause is explicitly restored through its native API.
+    async with sessions() as authorized:
+        await OrchestrationService().authorize_baseline(
+            authorized, seeded.project_id, seeded.goal_id, actor="human:test")
+        await authorized.commit()
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+    landed = await fresh_agent(sessions, seeded.agent_id)
+    assert landed.description == "Reviewed implementation responsibilities."
+    updated_at = landed.updated_at
+    async with sessions() as replay:
+        await application.drain_answer_applications(replay, seeded.run_id)
+        await replay.commit()
+        resolutions = list(await replay.scalars(select(EventLog).where(
+            EventLog.event_type == "authority.decision_resolved",
+            EventLog.project_id == seeded.project_id)))
+    assert len(resolutions) == 1
+    assert (await fresh_agent(sessions, seeded.agent_id)).updated_at == updated_at
+
+
+@pytest.mark.asyncio
+async def test_spr231_batch_roster_effect_survives_interrupted_ack_and_concurrent_retry(
+    sessions, tmp_path, monkeypatch, approve_semantic_reviews,
+):
+    """SPR231 committed native roster writes remain linked when the consumer execution disappears."""
+    from huddleroom.models.event_log import EventLog
+    from huddleroom.services import orchestration_decision_application as application
+
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    accepted = await _spr231_batch_submission(sessions, seeded)
+    action_id = _spr231_receipt_action(accepted)
+    coordinator = roster_api().AgentRosterMutationCoordinator
+    original_apply = coordinator.apply
+    committed = []
+
+    async def interrupted(self, *args, **kwargs):
+        result = await original_apply(self, *args, **kwargs)
+        committed.append(result)
+        raise asyncio.CancelledError("SPR231 submitting consumer lost after roster commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(coordinator, "apply", interrupted)
+        async with sessions() as consumer:
+            with pytest.raises(asyncio.CancelledError):
+                await application.drain_answer_applications(consumer, seeded.run_id)
+    assert len(committed) == 1
+    landed = await fresh_agent(sessions, seeded.agent_id)
+    assert landed.description == "Reviewed implementation responsibilities."
+    updated_at = landed.updated_at
+    async with sessions() as durable:
+        application_action = await durable.get(OrchestrationAction, uuid.UUID(action_id))
+        assert application_action.dispatch_contract.get("effects"), "roster commit must carry native effect identity"
+
+    async def recover():
+        async with sessions() as consumer:
+            await application.drain_answer_applications(consumer, seeded.run_id)
+            await consumer.commit()
+
+    results = await asyncio.gather(recover(), *[_spr231_batch_submission(sessions, seeded) for _ in range(2)])
+    assert [_spr231_receipt_action(item) for item in results[1:]] == [action_id, action_id]
+    assert (await fresh_agent(sessions, seeded.agent_id)).updated_at == updated_at
+    with pytest.raises(HTTPException) as conflict:
+        await _spr231_batch_submission(sessions, seeded, description="Different post-effect payload.")
+    assert conflict.value.status_code == 409
+    async with sessions() as check:
+        assert len(list(await check.scalars(select(EventLog).where(
+            EventLog.event_type == "authority.decision_resolved",
+            EventLog.project_id == seeded.project_id)))) == 1
+
+
+@pytest.mark.asyncio
+async def test_spr231_batch_replay_keeps_original_membership_after_pending_set_changes(
+    sessions, tmp_path, approve_semantic_reviews,
+):
+    """SPR231 a saved batch is identified by its submitted members, never the newest pending set."""
+    from huddleroom.schemas.orchestration import OrchestrationAgentDefinitionReviewBatchAnswerRequest
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+    from huddleroom.services.orchestration_decision_application import answer_agent_review_batch
+
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    action_id = _spr231_receipt_action(await _spr231_batch_submission(sessions, seeded))
+    async with sessions() as source:
+        original = await source.get(OrchestrationAuthorityDecision, seeded.decision_id)
+        extra = await OrchestrationAuthorityDecisionService().create_pending(
+            source, seeded.goal_id, decision_key="agent_definition_review:proposal:new-member",
+            title="A new proposal", question="Review separately", authority="human",
+            options=[{"key": "approve"}], source_process_run_id=original.source_process_run_id,
+            run_id=seeded.run_id)
+        await source.commit()
+        extra_id = extra.id
+    assert _spr231_receipt_action(await _spr231_batch_submission(sessions, seeded)) == action_id
+    async with sessions() as changed:
+        user = await changed.get(User, seeded.user_id)
+        data = OrchestrationAgentDefinitionReviewBatchAnswerRequest(answers=[{
+            "decision_id": seeded.decision_id, "selected_option": "edit",
+            "edited_description": "Reviewed implementation responsibilities.",
+            "edited_persona": "Implement the scoped task and report evidence.",
+        }, {"decision_id": extra_id, "selected_option": "approve"}])
+        with pytest.raises(HTTPException) as conflict:
+            await answer_agent_review_batch(changed, seeded.project_id, seeded.goal_id, data, user)
+        assert conflict.value.status_code == 409
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAuthorityDecision, extra_id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_spr231_hierarchy_typed_edit_reuses_generated_agent_id_after_source_advances(
+    sessions, tmp_path, monkeypatch, approve_semantic_reviews,
+):
+    """SPR231 generated effect identity is allocated once, outside the canonical submitted payload."""
+    from huddleroom.services import orchestration_decision_application as application
+
+    seeded = await seed_hierarchy_proposal(sessions, tmp_path, monkeypatch)
+    accepted = await act_hierarchy_answer(sessions, seeded, option="edit", apply=False)
+    action_id = _spr231_receipt_action(accepted)
+    async with sessions() as saved:
+        decision = await saved.get(OrchestrationAuthorityDecision, seeded.decision_id)
+        generated_id = uuid.UUID(json.loads(decision.reason)["created_agent_id"])
+        assert await saved.get(Agent, generated_id) is None
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+    replayed = await asyncio.gather(*[act_hierarchy_answer(sessions, seeded, option="edit", apply=False) for _ in range(2)])
+    assert [_spr231_receipt_action(item) for item in replayed] == [action_id, action_id]
+    async with sessions() as final:
+        decision = await final.get(OrchestrationAuthorityDecision, seeded.decision_id)
+        assert uuid.UUID(json.loads(decision.reason)["created_agent_id"]) == generated_id
+        assert (await final.get(Agent, generated_id)).name == f"edited-{seeded.proposal_name}"
+        assert len(list(await final.scalars(select(Agent.id).where(
+            Agent.name == f"edited-{seeded.proposal_name}")))) == 1
+        await final.commit()
+        await application.drain_answer_applications(final, seeded.run_id)
+        await final.commit()
+
+
+@pytest.mark.asyncio
+async def test_spr231_batch_reset_before_acceptance_rejects_without_saved_answer(
+    sessions, tmp_path, approve_semantic_reviews,
+):
+    """SPR231 the inverse race cannot accept a fresh answer against a reset-fenced source."""
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    before = (await fresh_agent(sessions, seeded.agent_id)).description
+    runtime._resetting[seeded.goal_id] = runtime._resetting.get(seeded.goal_id, 0) + 1
+    try:
+        with pytest.raises(HTTPException) as rejected:
+            await _spr231_batch_submission(sessions, seeded)
+        assert rejected.value.status_code == 409
+    finally:
+        clear_reset_fence(seeded.goal_id)
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAuthorityDecision, seeded.decision_id)).status == "pending"
+        assert not list(await fresh.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == seeded.run_id,
+            OrchestrationAction.action_type == "apply_authority_answer")))
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == before
+
+
+@pytest.mark.asyncio
+async def test_spr230_roster_handoff_pause_keeps_saved_application_pending_until_resume(
+    sessions, tmp_path, monkeypatch, approve_semantic_reviews,
+):
+    """SPR230/SPR231 Pause after reservation publication is retryable, never a failed saved answer."""
+    from huddleroom.services import orchestration_decision_application as application
+
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    original_description = (await fresh_agent(sessions, seeded.agent_id)).description
+    action_id = uuid.UUID(_spr231_receipt_action(await _spr231_batch_submission(sessions, seeded)))
+    entered, release = asyncio.Event(), asyncio.Event()
+    coordinator = roster_api().AgentRosterMutationCoordinator
+    original_apply = coordinator.apply
+
+    async def barrier(self, *args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original_apply(self, *args, **kwargs)
+
+    async def drain():
+        async with sessions() as consumer:
+            result = await application.drain_answer_applications(consumer, seeded.run_id)
+            await consumer.commit()
+            return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(coordinator, "apply", barrier)
+        consuming = asyncio.create_task(drain())
+        try:
+            await asyncio.wait_for(entered.wait(), RACE_TIMEOUT)
+            async with sessions() as durable:
+                reserved = await durable.get(OrchestrationAction, action_id)
+                effects = dict(reserved.dispatch_contract["effects"])
+                reservation = {key: value for key, value in effects.items() if key.startswith("roster_reservation:")}
+                assert len(reservation) == 1
+            async with sessions() as pausing:
+                await asyncio.wait_for(OrchestrationService().pause_goal(
+                    pausing, seeded.project_id, seeded.goal_id), RACE_TIMEOUT)
+            release.set()
+            result = await asyncio.wait_for(consuming, RACE_TIMEOUT)
+        finally:
+            release.set()
+            await asyncio.gather(consuming, return_exceptions=True)
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == original_description
+    assert action_id in result.pending
+    assert "paus" in result.reasons[str(action_id)].lower()
+    async with sessions() as paused:
+        saved = await paused.get(OrchestrationAction, action_id)
+        assert saved.status == "reserved" and saved.dispatch_contract["application_state"] == "pending"
+        assert (await paused.get(OrchestrationAuthorityDecision, seeded.decision_id)).status == "answered"
+        assert (await paused.get(OrchestrationRun, seeded.run_id)).status == "paused"
+    assert uuid.UUID(_spr231_receipt_action(await _spr231_batch_submission(sessions, seeded))) == action_id
+    async with sessions() as resumed:
+        await OrchestrationService().resume_goal(resumed, seeded.project_id, seeded.goal_id)
+        await resumed.commit()
+    async with sessions() as authorized:
+        await OrchestrationService().authorize_baseline(
+            authorized, seeded.project_id, seeded.goal_id, actor="human:test")
+        await authorized.commit()
+    assert action_id in (await drain()).applied
+    changed = await fresh_agent(sessions, seeded.agent_id)
+    assert changed.description == "Reviewed implementation responsibilities."
+    updated_at = changed.updated_at
+    await drain()
+    assert (await fresh_agent(sessions, seeded.agent_id)).updated_at == updated_at
+    async with sessions() as final:
+        completed = await final.get(OrchestrationAction, action_id)
+        assert completed.status == "completed"
+        assert {key: completed.dispatch_contract["effects"][key] for key in reservation} == reservation
+
+
+@pytest.mark.asyncio
+async def test_spr231_native_origin_reset_after_roster_reservation_keeps_saved_application_pending(
+    sessions, tmp_path, monkeypatch, approve_semantic_reviews,
+):
+    """SPR231 exercise real RosterStateChanged reset validation, without substituting its exception."""
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+    from huddleroom.services import orchestration_decision_application as application
+
+    seeded = await seed_definition_proposal(sessions, tmp_path)
+    before = (await fresh_agent(sessions, seeded.agent_id)).description
+    action_id = uuid.UUID(_spr231_receipt_action(await _spr231_batch_submission(sessions, seeded)))
+    module = roster_api()
+    original = module._require_origin_unchanged
+    reached = []
+
+    async def reset_before_native_check(db, origin_goal_id, origin_run_id):
+        if origin_goal_id == seeded.goal_id:
+            async with sessions() as fresh:
+                saved = await fresh.get(OrchestrationAction, action_id)
+                assert any(key.startswith("roster_reservation:") for key in saved.dispatch_contract["effects"])
+            runtime._resetting[seeded.goal_id] = runtime._resetting.get(seeded.goal_id, 0) + 1
+            reached.append(origin_run_id)
+        return await original(db, origin_goal_id, origin_run_id)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "_require_origin_unchanged", reset_before_native_check)
+            async with sessions() as consumer:
+                result = await application.drain_answer_applications(consumer, seeded.run_id)
+                await consumer.commit()
+    finally:
+        clear_reset_fence(seeded.goal_id)
+    assert reached == [seeded.run_id]
+    assert action_id in result.pending and "reset" in result.reasons[str(action_id)].lower()
+    assert (await fresh_agent(sessions, seeded.agent_id)).description == before
+    async with sessions() as fresh:
+        saved = await fresh.get(OrchestrationAction, action_id)
+        assert saved.status == "reserved" and saved.dispatch_contract["application_state"] == "pending"
+        assert (await fresh.get(OrchestrationAuthorityDecision, seeded.decision_id)).status == "answered"
+    assert uuid.UUID(_spr231_receipt_action(await _spr231_batch_submission(sessions, seeded))) == action_id
