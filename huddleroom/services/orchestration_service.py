@@ -8930,6 +8930,23 @@ class OrchestrationService:
     def _start_conflict(self, conflict: str, message: str) -> HTTPException:
         return HTTPException(status_code=409, detail={"conflict": conflict, "message": message})
 
+    async def pause_existing_goals_for_startup(self, db: AsyncSession) -> None:
+        """Fence persisted work before startup recovery; the caller commits atomically."""
+        nonterminal_goals = select(OrchestrationGoal.id).where(
+            OrchestrationGoal.status.in_(("active", "blocked", "paused")),
+        )
+        running = (
+            OrchestrationRun.goal_id.in_(nonterminal_goals),
+            OrchestrationRun.status.in_(("running", "blocked")),
+        )
+        await db.execute(update(OrchestrationRun).where(
+            *running, OrchestrationRun.phase == "baseline",
+        ).values(baseline_authorized=False))
+        await db.execute(update(OrchestrationRun).where(*running).values(status="paused"))
+        await db.execute(update(OrchestrationGoal).where(
+            OrchestrationGoal.status.in_(("active", "blocked")),
+        ).values(status="paused"))
+
     async def pause_goal(
         self,
         db: AsyncSession,

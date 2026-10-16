@@ -57,6 +57,15 @@ async def lifespan(_app: FastAPI):
     register_litellm_debug_logger()
     await init_db()
 
+    # Commit the restart pause before recovery or background workers can admit work.
+    # Fail startup if this fence cannot be persisted.
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from huddleroom.database import engine
+    from huddleroom.services.orchestration_service import OrchestrationService
+    async with AsyncSession(engine) as startup_db:
+        async with startup_db.begin():
+            await OrchestrationService().pause_existing_goals_for_startup(startup_db)
+
     try:
         await orchestration_goals.conversation_service.recover_all()
     except Exception as _exc:
