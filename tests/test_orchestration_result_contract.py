@@ -19,6 +19,7 @@ from huddleroom.services.orchestration_result_contract import (
     ({"report_schema": {"other": 1}}, False, "work_report"),
     ({"expected_result": ["x"], "report_schema": {"verdict": 1}}, False, "verification_verdict"),
     ({"expected_result": {"a": 1}}, False, "work_report"),
+    (["not", "a", "contract"], False, "work_report"),
 ])
 def test_kind_table(contract, gate, expected):
     assert kind(contract, gate) == expected

@@ -1855,23 +1855,25 @@ class MeetingRunner:
         return reviewer_spoke and non_reviewer_responded
 
     def _review_outcome(self, turns: list[MeetingTurn], agent_roles: dict[str, str]) -> tuple[str, dict]:
-        severities: list[str] = []
+        last_severities: dict[str, list[str]] = {}  # each speaker's latest turn only: later turns supersede
         last_verdict: dict[str, str | None] = {}  # each required reviewer's latest turn only
         summary_lines: list[str] = []
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
                 continue
-            for match in _REVIEW_SEVERITY_PATTERN.finditer(content):
-                severities.append(match.group(1).lower())
             speaker = str(turn.speaker_agent_id)
+            last_severities[speaker] = [m.group(1).lower() for m in _REVIEW_SEVERITY_PATTERN.finditer(content)]
             if agent_roles.get(speaker, "").lower() in {"security", "reviewer"}:
-                match = _REVIEW_VERDICT_PATTERN.fullmatch(content.splitlines()[-1].strip())
+                # markdown emphasis/code marks and a trailing period around the verdict line are tolerated
+                last_line = re.sub(r"[*`]", "", content.splitlines()[-1]).strip().rstrip(".").strip()
+                match = _REVIEW_VERDICT_PATTERN.fullmatch(last_line)
                 last_verdict[speaker] = match.group(1).upper() if match else None
             first_line = content.splitlines()[0].strip()
             if first_line:
                 summary_lines.append(first_line)
 
+        severities = [severity for found in last_severities.values() for severity in found]
         verdicts = list(last_verdict.values())
         # Strictest signal wins; a required reviewer without a final-line verdict never approves.
         if "BLOCK" in verdicts or "blocker" in severities:

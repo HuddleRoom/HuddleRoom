@@ -859,6 +859,57 @@ async def test_review_outcome_uses_only_latest_turn_per_reviewer(db_session, tes
 
 
 @pytest.mark.asyncio
+async def test_review_outcome_ignores_severities_superseded_by_reviewers_later_turn(db_session, test_agent):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    rid = reviewer.id
+    turns = [
+        MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=rid,
+                    content="- [severity: blocker] auth: Basic Auth enabled\nVERDICT: BLOCK", references=[]),
+        MeetingTurn(turn_number=2, round_number=1, speaker_agent_id=test_agent.id, content="Fixed.", references=[]),
+        MeetingTurn(turn_number=3, round_number=2, speaker_agent_id=rid, content="Fixed now.\nVERDICT: APPROVE", references=[]),
+    ]
+    resolution, outcome = MeetingRunner()._review_outcome(turns, {str(rid): "reviewer"})
+    assert (resolution, outcome["resolution_kind"]) == ("resolved", "approved")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("last_line", "expected_kind"),
+    [
+        ("**VERDICT: APPROVE**", "approved"),
+        ("`VERDICT: APPROVE`", "approved"),
+        ("VERDICT: APPROVE.", "approved"),
+        ("**VERDICT:** CHANGES.", "changes_requested"),
+        ("**VERDICT: APPROVE, mostly**", "verdict_missing"),
+    ],
+)
+async def test_review_outcome_tolerates_markdown_around_final_verdict(db_session, last_line, expected_kind):
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.meeting import MeetingTurn
+    from huddleroom.services.meeting_runner import MeetingRunner
+
+    reviewer = Agent(
+        name=f"reviewer-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+        adapter_type="api", capabilities=[], config={},
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    turns = [MeetingTurn(turn_number=1, round_number=1, speaker_agent_id=reviewer.id,
+                         content=f"Reviewed.\n{last_line}", references=[])]
+    _resolution, outcome = MeetingRunner()._review_outcome(turns, {str(reviewer.id): "reviewer"})
+    assert outcome["resolution_kind"] == expected_kind
+
+
+@pytest.mark.asyncio
 async def test_standup_round_complete_advances_without_consensus_check(
     db_session, test_project, test_agent
 ):

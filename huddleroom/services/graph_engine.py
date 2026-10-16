@@ -654,7 +654,8 @@ class GraphEngineService:
         lines = [line.strip() for line in (raw_output or "").splitlines() if line.strip()]
         match = re.fullmatch(
             r"VERDICT:\s*(APPROVE|REQUEST_CHANGES|COMMENT)",
-            lines[-1] if lines else "",
+            # markdown emphasis/code marks and a trailing period around the verdict line are tolerated
+            re.sub(r"[*`]", "", lines[-1]).strip().rstrip(".").strip() if lines else "",
             re.IGNORECASE,
         )
         verdict = self._REVIEW_VERDICTS[match.group(1).upper()] if match else "commented"

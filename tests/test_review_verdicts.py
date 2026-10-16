@@ -122,6 +122,27 @@ async def test_final_line_approve_advances(db_session, test_project):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    ["Looks good.\n**VERDICT: APPROVE**", "Looks good.\n`VERDICT: APPROVE`", "Looks good.\nVERDICT: APPROVE.",
+     "Looks good.\n**VERDICT:** APPROVE"],
+)
+async def test_markdown_wrapped_final_verdict_advances(db_session, test_project, output):
+    run, events = await _complete_review(db_session, test_project, output)
+
+    assert run.current_node == "approved"
+    assert events == ["review.approved"]
+
+
+@pytest.mark.asyncio
+async def test_markdown_wrapped_verdict_with_extra_words_does_not_approve(db_session, test_project):
+    run, events = await _complete_review(db_session, test_project, "**VERDICT: APPROVE once tests pass**")
+
+    assert run.current_node == "ready_for_review"
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_final_line_request_changes_awaits_revision(db_session, test_project):
     run, events = await _complete_review(db_session, test_project, "Needs work.\nverdict: request_changes")
 
@@ -550,3 +571,15 @@ async def test_task_update_cannot_replace_remove_or_inject_a_review_binding(db_s
     await db_session.flush()
     await TaskService().update(db_session, test_project.id, plain.id, TaskUpdate(metadata={"review_identity": bound}))
     assert "review_identity" not in plain.metadata_
+
+
+@pytest.mark.asyncio
+async def test_task_create_cannot_inject_a_review_binding(db_session, test_project):
+    from huddleroom.schemas.task import TaskCreate
+    from huddleroom.services.task_service import TaskService
+
+    forged = {"kind": "workspace_path", "path": "app.py", "identity": "0" * 64}
+    task = await TaskService().create(
+        db_session, test_project.id, TaskCreate(title="Forged", metadata={"review_identity": forged, "note": "x"})
+    )
+    assert task.metadata_ == {"note": "x"}
