@@ -1211,3 +1211,80 @@ async def test_blocked_verifier_awaiting_the_owner_holds_the_verifier_slot(
         else decision.options[0]["key"], reason=None, decided_by_user_id=test_user.id,
     )
     assert await roadmap.has_active_bound_verifier(db_session, run) is False
+
+
+async def _dispatched_roadmap_verifier(db_session, test_project, monkeypatch, prefix):
+    builder = _agent(f"{prefix}-builder", ["implementation"])
+    verifier = _agent(f"{prefix}-verifier", ["validation"])
+    db_session.add_all([builder, verifier])
+    await db_session.flush()
+    roadmap, parent, run, _version = await accepted_goal_roadmap(db_session, test_project, [
+        {**roadmap_task("only", mutates_shared_state=False), "agent_id": str(builder.id)},
+    ])
+    service = roadmap.orchestration
+    _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await service.tick(db_session, run.id)
+    row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
+    task = await db_session.get(Task, row.task_id)
+    await _record_measured_completion(db_session, test_project.id, run, task, task.assigned_to, PRODUCER_REPORT)
+    verification = await service.execute_request_verification_action(
+        db_session, run.id,
+        {"action_type": "request_verification", "gate_id": str(row.gate_id), "work_function": "validation"},
+        f"run:{run.id}:kind:request_verification:roadmap_item:{row.item_key}",
+    )
+    return roadmap, service, run, await db_session.get(Task, verification.target_id), verifier
+
+
+async def test_cancelled_blocked_verifier_ask_releases_the_verifier_slot(
+    db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
+):
+    roadmap, service, run, verifier_task, verifier = await _dispatched_roadmap_verifier(
+        db_session, test_project, monkeypatch, "cancelled-verifier",
+    )
+    await _record_measured_completion(
+        db_session, test_project.id, run, verifier_task, verifier.id,
+        json.dumps({"status": "blocked", "notes": "No access to the staging environment."}),
+    )
+    await service._ingest_evidence_from_events(
+        db_session, run, await service._new_events(db_session, test_project.id, run.event_cursor),
+    )
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True
+
+    scope = f"task:{verifier_task.id}:verifier_blocked"
+    [blocker] = [b for b in run.active_blockers if b.get("scope") == scope]
+    decision = await db_session.get(OrchestrationAuthorityDecision, uuid.UUID(blocker["decision_id"]))
+    await OrchestrationAuthorityDecisionService().cancel_decision(db_session, decision, reason="superseded")
+
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False
+    assert not [b for b in run.active_blockers if b.get("scope") == scope]
+
+
+async def test_dismissed_exhausted_verdict_correction_releases_the_verifier_slot(
+    db_session, test_project, test_user, monkeypatch, safe_effectiveness_review_continue,
+):
+    roadmap, service, run, verifier_task, verifier = await _dispatched_roadmap_verifier(
+        db_session, test_project, monkeypatch, "dismissed-verifier",
+    )
+
+    async def finish(task):
+        await _record_measured_completion(db_session, test_project.id, run, task, verifier.id, "Verified, all good.")
+        await service._ingest_evidence_from_events(
+            db_session, run, await service._new_events(db_session, test_project.id, run.event_cursor),
+        )
+
+    await finish(verifier_task)
+    [correction] = (await db_session.scalars(select(Task).where(Task.parent_id == verifier_task.id))).all()
+    await finish(correction)
+    assert await roadmap.has_active_bound_verifier(db_session, run) is True  # exhausted, the owner is asked
+
+    marker = await service._existing_action_for_key(
+        db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{verifier_task.id}",
+    )
+    decision = await db_session.get(
+        OrchestrationAuthorityDecision, uuid.UUID(marker.request["result_correction"]["decision_id"]),
+    )
+    await OrchestrationAuthorityDecisionService().answer_runtime_question(
+        db_session, decision, "dismiss", actor_user_id=test_user.id, contract_version=decision.contract_version,
+    )
+
+    assert await roadmap.has_active_bound_verifier(db_session, run) is False

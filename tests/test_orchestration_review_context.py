@@ -576,7 +576,7 @@ async def test_rejection_from_a_verdict_correction_revises_once_for_the_original
     assert entry["cause"] == "verification_rejected"
 
 
-async def _reviewed_work(db, project, required=("task",), caps=None):
+async def _reviewed_work(db, project, required=("task",), caps=None, gate_type="work_completed"):
     """Non-plan-item work on its own gate, reviewed by a separate reviewer agent, on an authorized run."""
     from tests.test_orchestration_evidence_ingestion import _agent, _make_orchestrated_task
     from tests.test_orchestration_runtime_e2e import _authorized_run
@@ -587,7 +587,7 @@ async def _reviewed_work(db, project, required=("task",), caps=None):
     service, goal, run = await _authorized_run(db, project)
     if caps:
         goal.budget = {"caps": caps}
-    gate = OrchestrationGate(run_id=run.id, success_criterion_key="plan_item:implement-api", gate_type="work_completed",
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="plan_item:implement-api", gate_type=gate_type,
                              required_evidence={"required_source_types": list(required), "min_count": 1})
     db.add(gate)
     await db.flush()
@@ -689,6 +689,28 @@ async def test_re_reviews_of_a_review_rejected_gate_record_review_evidence_and_s
 
     assert [item["cause"] for item in await _revisions(service, db, run, gate)] == ["review_rejected"] * 2
     assert len(await _revision_tasks(db, task)) == 2 and len(_owner_asks(run, "revision_exhausted")) == 1
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+@pytest.mark.parametrize(("gate_type", "expected"), [("work_completed", "review"), ("roadmap_integration", "verification")])
+async def test_independent_re_review_evidence_type_follows_the_gate(db_session, test_project, gate_type, expected):
+    from huddleroom.models.orchestration import OrchestrationEvidence
+
+    db = db_session
+    service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project, gate_type=gate_type)
+    await _review_rejects(db, service, run, task, reviewer, "The handler swallows errors.")
+    [revision] = await _revision_tasks(db, task)
+    await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
+    reviewer_task = await _reverifier(db, service, run, revision)
+    assert reviewer_task is not None
+
+    await _finish(db, service, run, reviewer_task, ACCEPTED)
+
+    # a non-outcome gate records the re-review as review evidence; integration gates keep the verification row
+    [row] = [item for item in await db.scalars(select(OrchestrationEvidence).where(
+        OrchestrationEvidence.gate_id == gate.id)) if item.source_id != task.id
+        and item.producer_agent_id == reviewer.id and item.verdict == "candidate"]
+    assert row.source_type == expected
 
 
 @pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
@@ -1546,3 +1568,73 @@ def test_consecutive_waits_back_off_exponentially_up_to_an_hour():
     # a capability failure between waits restarts the backoff
     crashed = SimpleNamespace(status="failed", error="verifier crashed", request={}, created_at=now - timedelta(hours=9))
     assert held([*waits(3, 1)[:2], crashed, *waits(1, 30)]) and not held([*waits(3, 1)[:2], crashed, *waits(1, 90)])
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_work_finished_after_its_review_gets_a_fresh_verifier_told_the_evidence_is_stale(db_session, test_project):
+    from huddleroom.services.event_bus import emit_event_once
+    from huddleroom.services.graph_engine import GraphEngineService
+    from huddleroom.services.session_sync import sync_task_from_session
+
+    db = db_session
+    from tests.test_orchestration_evidence_ingestion import _agent
+
+    service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project, required=("task", "review"))
+    validator = _agent("validator", "validator", ["validation", "testing"])
+    db.add(validator)
+    # the reviewer approves before the producer's final work lands: that review no longer covers the work
+    output = "Looks right.\nVERDICT: APPROVE"
+    review = Session(project_id=task.project_id, task_id=task.id, agent_id=reviewer.id, adapter_type="api",
+                     status="completed", input_context={}, output=output, metadata_={}, origin="graph")
+    db.add(review)
+    await db.flush()
+    await emit_event_once(db, task.project_id, "review.approved", {
+        "session_id": str(review.id), "task_id": str(task.id),
+        "review_outcome": GraphEngineService()._parse_review_outcome(output),
+    }, dedup_key=f"early-approval:{review.id}")
+    producer = Session(project_id=task.project_id, task_id=task.id, agent_id=task.assigned_to, adapter_type="api",
+                       status="completed", input_context={}, output=json.dumps(VALID_REPORT), metadata_={},
+                       origin="orchestrator")
+    db.add(producer)
+    task.status = "in_progress"
+    await db.flush()
+    await sync_task_from_session(db, producer)
+    await emit_event_once(db, task.project_id, "session.completed", {
+        "session_id": str(producer.id), "task_id": str(task.id),
+    }, dedup_key=f"late-work:{producer.id}")
+    await service.tick(db, run.id)
+    await service.tick(db, run.id)
+
+    await db.refresh(gate)
+    assert gate.failure_reason == rb.STALE_EVIDENCE_REASON
+    [action] = [a for a in await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "request_verification"))
+        if ":stale_gate:" in a.idempotency_key]
+    verifier_task = await db.get(Task, action.target_id)
+    assert verifier_task.assigned_to == validator.id
+    assert rb.FRESH_EVIDENCE_REASON in verifier_task.description
+    assert "<<<PRODUCER_REPORT" in verifier_task.description
+
+
+@pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
+async def test_verifier_brief_failure_fails_the_request_instead_of_leaving_it_reserved(
+    db_session, test_project, monkeypatch,
+):
+    db = db_session
+    service, run, gate, _work_task, _artifact, _verifier, _first = await _verifier_for_db_only_report(db, test_project)
+    tasks_before = len(list(await db.scalars(select(Task))))
+
+    async def broken_brief(*_args, **_kwargs):
+        raise RuntimeError("brief could not be built")
+
+    monkeypatch.setattr(service, "_verification_brief", broken_brief)
+    key = f"run:{run.id}:kind:login-verification:again"
+    with pytest.raises(Exception, match="brief could not be built"):
+        await service.execute_request_verification_action(
+            db, run.id, {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
+            key,
+        )
+
+    action = await service._existing_action_for_key(db, run.id, key)
+    assert (action.status, action.error) == ("failed", "brief could not be built")
+    assert len(list(await db.scalars(select(Task)))) == tasks_before  # no verifier task was created

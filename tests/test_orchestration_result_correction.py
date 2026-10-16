@@ -331,6 +331,32 @@ async def test_owner_retry_answer_starts_new_cycle_with_cycle_subject(db_session
     assert blocker["subject"] == f"task:{task.id}:result_correction:cycle:2"
 
 
+async def test_retry_answer_cancels_the_old_cycles_other_asks_and_drops_their_blockers(
+    db_session, test_project, test_user,
+):
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+    service, goal, run, _agent, task = await _setup(db_session, test_project)
+    await _complete(db_session, service, run, task, MISSING_FIELDS)
+    [first] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, first, MISSING_FIELDS)
+    exhausted = await _ledger(service, db_session, run, task)
+    # a funding ask raised on the same cycle subject is still pending when the owner answers retry
+    funding = await service._escalate_owner(
+        db_session, goal, run, "budget_exhausted", f"task:{task.id}:result_correction", ["capped"], "Raise?",
+    )
+    await _answer(db_session, run, exhausted, "retry", test_user)
+
+    await service.tick(db_session, run.id)
+
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["cycle"] == 2 and ledger["decision_id"] is None
+    assert (await db_session.get(OrchestrationAuthorityDecision, uuid.UUID(exhausted["decision_id"]))).status == "answered"
+    assert (await db_session.get(OrchestrationAuthorityDecision, funding.target_id)).status == "cancelled"
+    assert not [b for b in run.active_blockers if b.get("kind") == "owner_escalation"
+                and b.get("scope") == f"task:{task.id}:result_correction"]
+
+
 async def test_owner_dismiss_answer_closes_the_ledger(db_session, test_project, test_user):
     service, _goal, run, _agent, task = await _setup(db_session, test_project)
     await _complete(db_session, service, run, task, MISSING_FIELDS)
@@ -1116,6 +1142,31 @@ async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exh
     assert task.id not in resumed  # a settled summary ledger leaves the sweep
     await db_session.refresh(gate)
     assert gate.status == "failed"
+
+
+@pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
+async def test_contract_change_after_a_summary_correction_stopped_starts_one_fresh_cycle(db_session, test_project):
+    service, goal, run, task, gate = await _summary_setup(db_session, test_project)
+    await _complete(db_session, service, run, task, "not json")
+    await service.tick(db_session, run.id)
+    [correction] = await _corrections(db_session, task)
+    await _complete(db_session, service, run, correction, "not json")
+    await service.tick(db_session, run.id)
+    settled = await _ledger(service, db_session, run, task)
+    assert settled["status"] == "exhausted" and len(await _summary_triggers(db_session, run)) == 1
+
+    goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await db_session.flush()
+    for _ in range(2):
+        await service.tick(db_session, run.id)
+
+    # a new owner contract resets the count once (ticks do not restart it again); nothing else is asked
+    ledger = await _ledger(service, db_session, run, task)
+    assert ledger["cycle"] == 2 and ledger["status"] == "correcting" and ledger["version"] != settled["version"]
+    assert ledger["previous_attempts"] == settled["attempts"]
+    assert len(await _corrections(db_session, task)) == 2
+    assert len(await _summary_triggers(db_session, run)) == 1
+    assert await _non_recovery_asks(db_session, run) == []
 
 
 @pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")

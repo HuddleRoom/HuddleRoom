@@ -608,3 +608,28 @@ async def test_reported_blocker_evidence_variants_join_the_same_lineage(db_sessi
         await dispatcher.dispatch(db_session, run, decision)
 
     assert len(await _actions(db_session, run.id, "recovery_trigger")) == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_reported_blocker_evidence_refs_are_ignored_not_fatal(db_session, test_project):
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_recovery_activation import _actions, _authorized_goal, _decision
+
+    _goal, run = await _authorized_goal(db_session, test_project)
+    task = Task(project_id=test_project.id, title="Blocked", status="blocked",
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db_session.add(task)
+    await db_session.flush()
+    ref = {"kind": "task", "id": str(task.id)}
+    dispatcher = OrchestrationDecisionDispatcher(OrchestrationService())
+    reports = []
+    for refs in ([ref], [ref, f"task:{task.id}", None, 7, ["task", str(task.id)]]):
+        decision = await _decision(db_session, run, {
+            "action_type": "recover_blocker", "reason": "Stuck.", "evidence_refs": refs})
+        reports.append(await dispatcher.dispatch(db_session, run, decision))
+
+    # non-object refs neither crash the report nor split its lineage
+    [trigger] = await _actions(db_session, run.id, "recovery_trigger")
+    assert [(item.status, item.target_id) for item in reports] == [("completed", trigger.id)] * 2

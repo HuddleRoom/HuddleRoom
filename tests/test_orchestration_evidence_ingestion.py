@@ -277,6 +277,39 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [("review.approved", "candidate"), ("review.changes_requested", "rejected")],
+)
+async def test_manual_review_event_without_outcome_maps_by_event_type(db_session, test_project, event_type, expected):
+    service, _goal, run = await _make_run(db_session, test_project.id)
+    gate = await _make_gate(db_session, run.id, gate_type="review_accepted")
+    reviewer = _agent("reviewer", "reviewer", ["review"])
+    db_session.add(reviewer)
+    await db_session.flush()
+    task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, reviewer.id, "review")
+    session = Session(
+        project_id=test_project.id, task_id=task.id, agent_id=reviewer.id, adapter_type="api", status="completed",
+        input_context={}, output="Handler swallows errors.", metadata_={}, origin="manual",
+    )
+    db_session.add(session)
+    await db_session.flush()
+    # a manually emitted review event carries no parsed review outcome
+    await emit_event_once(
+        db_session, test_project.id, event_type,
+        {"session_id": str(session.id), "task_id": str(task.id), "project_id": str(test_project.id)},
+        dedup_key=f"manual-review:{session.id}",
+    )
+
+    await service.tick(db_session, run.id)
+
+    [row] = await _evidence_rows(db_session, run.id)
+    assert (row.source_type, row.verdict) == ("review", expected)
+    assert row.evidence_metadata["review_verdict"] is None
+    assert ("findings" in row.evidence_metadata) is (expected == "rejected")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "violation_type",
     ["missing_session", "mismatched_session_task", "mismatched_graph_run"],
 )
