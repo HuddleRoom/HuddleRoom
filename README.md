@@ -494,3 +494,36 @@ The legacy `orchestration_conversation_allowance_tokens` and
 `orchestration_advisor_allowance_tokens` settings (including environment aliases) are
 deprecated no-ops accepted for configuration compatibility. Historical allowance failures
 remain visible; send a new message to ask again.
+
+### Optional development backend restart API
+
+Backend restarts are disabled by default. Set `allow_api_reset = true` in
+`~/.huddleroom/config.toml`, or `HUDDLEROOM_ALLOW_API_RESET=true` in the environment
+or `.env` (environment overrides config). Launch `huddleroom serve` without
+`--reload`, using SQLite local workers. Rally root `make serve` includes
+`--reload`, so instead run `.venv/bin/huddleroom serve` from `HuddleRoom/`. This starts a small supervisor which
+restarts only after an API-requested successful graceful shutdown. Direct ASGI,
+`--reload`, and PostgreSQL/Celery launches return 503 without stopping.
+
+```sh
+curl -X POST http://localhost:8000/api/system/restart -H 'X-HuddleRoom-Confirm: restart'
+```
+
+202 acknowledges the request before shutdown; it does not promise completion.
+Duplicate requests return 409. New HTTP/WebSocket work is refused while draining,
+local producers stop, and registered session/meeting workers are cancelled with
+bounded cleanup. Interrupted attempts may become cancelled/failed, not resumed.
+Existing goals stay paused on startup. Shutdown failure prevents automatic
+restart; inspect logs and restart manually after resolving the failure. Ordinary
+exits/crashes do not cause restart loops.
+
+The header is an accident guard, **not authentication**. Existing application
+authentication still applies; auth-disabled development mode permits anyone who
+can reach the enabled endpoint to restart. Protect tunnels/remote exposure
+separately. Browser Origin must match the request origin; nonbrowser requests
+without Origin are permitted. No extra reset login or token is required.
+
+From a browser already admitted by your tunnel, open `/docs`, expand
+`POST /api/system/restart`, choose **Try it out**, enter `restart` in
+`X-HuddleRoom-Confirm`, and execute. Disabled mode returns 404; unsupported launch
+modes return 503. There is no separate reset login or UI.

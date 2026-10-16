@@ -47,6 +47,12 @@ def get_running_meeting_tasks() -> dict[str, asyncio.Task]:
 
 
 def _track_in_process(task_name: str, project_id: str | uuid.UUID, coroutine) -> None:
+    from huddleroom.services.backend_restart import ensure_accepting_work
+    try:
+        ensure_accepting_work()
+    except Exception:
+        coroutine.close()
+        raise
     task_id = str(uuid.uuid4())
     scheduled = asyncio.create_task(coroutine, name=f"meeting:{task_name}")
     _running_meeting_tasks[task_id] = scheduled
@@ -59,6 +65,8 @@ def _track_in_process(task_name: str, project_id: str | uuid.UUID, coroutine) ->
 
 
 def _dispatch_task(task_name: str, task, async_fn, project_id: str | uuid.UUID, *args) -> None:
+    from huddleroom.services.backend_restart import ensure_accepting_work
+    ensure_accepting_work()
     if settings.is_sqlite or task is None:
         _track_in_process(task_name, project_id, async_fn(*args))
         return

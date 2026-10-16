@@ -15,6 +15,8 @@ api_key_prefix = "rly_"
 cors_origins = ["*"]
 debug = false
 # log_file = "logs/huddleroom-debug.log"
+# Development restart API; enabling is not authentication. Requires serve without --reload.
+allow_api_reset = false
 auth_enabled = false
 api_base_url = "http://localhost:8000"
 # Omit this to use ~/.huddleroom/workspace (or an existing local workspace).

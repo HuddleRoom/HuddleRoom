@@ -51,6 +51,9 @@ _RESPONSE_HUB_RESTART_DELAY = 1
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    app_state = getattr(_app, "state", None)
+    from huddleroom.services import backend_restart
+    backend_restart.draining = False
     validate_supported_settings(settings)
     import litellm
     litellm.drop_params = True
@@ -241,7 +244,8 @@ async def lifespan(_app: FastAPI):
 
             def _make_done_callback(cname, cfn):
                 def _on_done(t: asyncio.Task) -> None:
-                    if t.cancelled():
+                    from huddleroom.services.backend_restart import draining
+                    if t.cancelled() or draining:
                         return
                     exc = t.exception()
                     if exc:
@@ -258,46 +262,80 @@ async def lifespan(_app: FastAPI):
             _logger.info("Started %d consumer tasks", len(consumer_tasks))
 
         runtime_ready.set()
+        def stop_restart_producers():
+            if scheduler and scheduler.running:
+                scheduler.pause()
+            for task in (bootstrap, supervision_events):
+                if task is not None and not task.cancelling():
+                    task.cancel()
+            if settings.is_sqlite:
+                from huddleroom.workers.consumers import get_consumer_tasks
+                for task in get_consumer_tasks().values():
+                    if not task.cancelling():
+                        task.cancel()
+        if app_state is not None:
+            app_state.stop_restart_producers = stop_restart_producers
         yield
     finally:
+        from huddleroom.services.backend_restart import stop_tasks
+        controller = getattr(app_state, "backend_restart", None)
+        restarting = bool(controller and controller.requested)
         try:
             if scheduler:
                 from huddleroom.workers.scheduler import stop_scheduler
 
+                if restarting:
+                    from huddleroom.services.backend_restart import drain_scheduler
+                    await drain_scheduler(scheduler)
                 stop_scheduler()
         finally:
             try:
                 startup_tasks = [task for task in (
                     bootstrap, ready_wait, subscription_wait, supervision_events,
                 ) if task is not None]
-                for task in startup_tasks:
-                    task.cancel()
-                if startup_tasks:
-                    await asyncio.gather(*startup_tasks, return_exceptions=True)
+                await stop_tasks(startup_tasks, restarting=restarting)
             finally:
                 try:
                     unsubscribe_agent_responses()
                 finally:
                     try:
-                        response_hub.cancel()
-                        await asyncio.gather(response_hub, return_exceptions=True)
+                        await stop_tasks([response_hub], restarting=restarting)
                     finally:
                         try:
-                            await close_agent_response_relay()
+                            if restarting:
+                                await asyncio.wait_for(close_agent_response_relay(), timeout=5)
+                            else:
+                                await close_agent_response_relay()
                         finally:
                             if settings.is_sqlite:
                                 from huddleroom.workers.consumers import get_consumer_tasks
 
                                 consumer_tasks = get_consumer_tasks()
-                                for task in consumer_tasks.values():
-                                    task.cancel()
-                                if consumer_tasks:
-                                    await asyncio.gather(*consumer_tasks.values(), return_exceptions=True)
+                                await stop_tasks(consumer_tasks.values(), restarting=restarting)
                                 consumer_tasks.clear()
+                                controller = getattr(app_state, "backend_restart", None)
+                                if controller and controller.requested:
+                                    from huddleroom.workers.task_runner import cancel_all_sessions
+                                    await cancel_all_sessions()
+        controller = getattr(app_state, "backend_restart", None)
+        if controller and controller.requested:
+            controller.shutdown_complete = True
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="HuddleRoom", lifespan=lifespan)
+
+    from huddleroom.services.backend_restart import request_restart
+    app.add_api_route("/api/system/restart", request_restart, methods=["POST"], status_code=202)
+    from huddleroom.services.backend_restart import DrainMiddleware
+    app.add_middleware(DrainMiddleware)
+
+    @app.middleware("http")
+    async def restart_drain(request, call_next):
+        controller = getattr(app.state, "backend_restart", None)
+        if controller and controller.requested and request.url.path != "/api/system/restart":
+            return JSONResponse({"detail": "Backend is restarting"}, status_code=503)
+        return await call_next(request)
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException):

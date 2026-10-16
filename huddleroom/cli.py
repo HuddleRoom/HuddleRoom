@@ -446,7 +446,8 @@ def setup(
 @click.option("--host", default="127.0.0.1", help="Bind host")
 @click.option("--port", default=8000, type=int, help="Bind port")
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development")
-def serve(host: str, port: int, reload: bool):
+@click.option("--restart-child", is_flag=True, hidden=True)
+def serve(host: str, port: int, reload: bool, restart_child: bool = False):
     """Start HuddleRoom server (API + task runner + scheduler)."""
     from huddleroom.config import settings as configured_settings
     try:
@@ -464,6 +465,11 @@ def serve(host: str, port: int, reload: bool):
             validate_onecli_context(configured_settings)
         else:
             launch_onecli(configured_settings, host, port, reload)
+    if restart_child and os.environ.get("_HUDDLEROOM_RESTART_PARENT_PID") != str(os.getppid()):
+        raise click.ClickException("Restart child requires its supervising parent")
+    if configured_settings.allow_api_reset and not reload and not restart_child and configured_settings.is_sqlite:
+        from huddleroom.services.backend_restart import supervise
+        raise SystemExit(supervise(host, port))
     settings = _prepare_database(configured_settings)
 
     click.echo(f"Starting HuddleRoom on http://{host}:{port}")
@@ -473,7 +479,22 @@ def serve(host: str, port: int, reload: bool):
 
     import uvicorn
 
-    uvicorn.run(
+    def run_server(app, **options):
+        if not restart_child or not settings.allow_api_reset:
+            return uvicorn.run(app, **options)
+        if not settings.allow_api_reset or reload or not settings.is_sqlite:
+            raise click.ClickException("Unsupported restart child configuration")
+        from huddleroom.main import create_app
+        from huddleroom.services.backend_restart import RestartController
+        application = create_app()
+        options.pop("reload", None)
+        server = uvicorn.Server(uvicorn.Config(application, timeout_graceful_shutdown=10, **options))
+        controller = RestartController(server, lambda: application.state.stop_restart_producers(), parent_pid=os.getppid())
+        application.state.backend_restart = controller
+        server.run()
+        raise SystemExit(controller.exit_code())
+
+    run_server(
         "huddleroom.main:app",
         host=host,
         port=port,

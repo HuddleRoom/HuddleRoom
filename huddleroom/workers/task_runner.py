@@ -33,6 +33,8 @@ def register_session(
     task_id: str | None = None,
 ) -> str:
     """Register a session task on the running event loop."""
+    from huddleroom.services.backend_restart import ensure_accepting_work
+    ensure_accepting_work()
     task_id = task_id or str(uuid.uuid4())
 
     if adapter_type == "api":
@@ -48,6 +50,9 @@ def register_session(
             await coro
         except Exception as e:
             logger.error("Session task %s failed: %s", task_id, e)
+            from huddleroom.services.backend_restart import draining
+            if draining:
+                raise
         finally:
             _running_tasks.pop(task_id, None)
             _task_projects.pop(task_id, None)
@@ -113,6 +118,8 @@ async def retry_api_session(
     max_retries: int = 3,
 ) -> str:
     """Dispatch an API session with retry logic."""
+    from huddleroom.services.backend_restart import ensure_accepting_work
+    ensure_accepting_work()
     task_id = str(uuid.uuid4())
 
     async def _with_retry():
@@ -136,7 +143,9 @@ async def retry_api_session(
         try:
             await _with_retry()
         except Exception:
-            pass
+            from huddleroom.services.backend_restart import draining
+            if draining:
+                raise
         finally:
             _running_tasks.pop(task_id, None)
             _task_projects.pop(task_id, None)
@@ -145,3 +154,23 @@ async def retry_api_session(
     _running_tasks[task_id] = task
     _task_projects[task_id] = str(project_id)
     return task_id
+
+
+async def cancel_all_sessions() -> int:
+    """Bounded cancellation of registered local workers after producers stop."""
+    from huddleroom.workers.meeting_tasks import get_running_meeting_tasks
+    selected = list(_running_tasks.items()) + list(get_running_meeting_tasks().items())
+    for _, task in selected:
+        if not task.cancelling():
+            task.cancel()
+    if selected:
+        done, pending = await asyncio.wait([task for _, task in selected], timeout=PROJECT_CANCELLATION_TIMEOUT_SECONDS)
+        if pending:
+            raise TimeoutError(f"{len(pending)} session task(s) did not stop before restart timeout")
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                raise RuntimeError("Session shutdown failed") from task.exception()
+    for task_id, _ in selected:
+        _running_tasks.pop(task_id, None)
+        _task_projects.pop(task_id, None)
+    return len(selected)
