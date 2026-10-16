@@ -129,8 +129,8 @@ async def test_cancelled_owner_ask_drops_only_its_own_blocker(db_session, test_p
     await OrchestrationAuthorityDecisionService().cancel_decision(db_session, decision, reason="superseded")
     assert [b["scope"] for b in run.active_blockers if b["kind"] == "owner_escalation"] == ["gate:b"]
     again = await service._escalate_owner(db_session, goal, run, "revision_exhausted", "gate:a", ["x"], "Q")
-    assert again.id == cancelled.id  # the cancelled ask stays settled: no blocker is raised again
-    assert [b["scope"] for b in run.active_blockers if b["kind"] == "owner_escalation"] == ["gate:b"]
+    assert again.id != cancelled.id  # SPR 215: a cancelled ask opens a new cycle and raises its blocker again
+    assert sorted(b["scope"] for b in run.active_blockers if b["kind"] == "owner_escalation") == ["gate:a", "gate:b"]
 
 
 async def test_long_subject_key_is_hashed_and_history_capped(db_session, test_project):

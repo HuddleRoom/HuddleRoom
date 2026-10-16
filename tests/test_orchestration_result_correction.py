@@ -161,6 +161,24 @@ async def test_exhausted_budget_escalates_and_dispatches_nothing(db_session, tes
     assert (await _ledger(service, db_session, run, task))["status"] == "pending"
 
 
+async def test_funded_correction_cancels_its_pending_budget_ask(db_session, test_project):
+    """SPR 223a: a dispatch after funding returns closes the budget decision, not only its blocker."""
+    service, goal, run, _agent, task = await _setup(db_session, test_project, caps={"max_tokens": 2})
+    await _complete(db_session, service, run, task, MISSING_FIELDS, tokens=2)
+    [blocker] = _escalations(run, "budget_exhausted")
+    ask = await _decision(db_session, blocker["decision_id"])
+    assert ask.status == "pending"
+
+    goal.budget = {"caps": {"max_tokens": 100}}
+    run.budget_state = {}
+    await service.tick(db_session, run.id)
+
+    assert len(await _corrections(db_session, task)) == 1
+    await db_session.refresh(ask)
+    assert ask.status == "cancelled"
+    assert not _escalations(run, "budget_exhausted")
+
+
 async def test_identical_failure_stops_with_both_attempts_and_ticks_do_not_rearm(db_session, test_project):
     service, _goal, run, _agent, task = await _setup(db_session, test_project)
     first = await _complete(db_session, service, run, task, MISSING_FIELDS)

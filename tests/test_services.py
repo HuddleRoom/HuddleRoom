@@ -1990,7 +1990,8 @@ async def test_api_adapter_prompt_carries_contract(db_session, test_project, pla
     db_session.add(task)
     await db_session.flush()
 
-    with patch("huddleroom.adapters.api_adapter.memory_service_instance.search", new_callable=AsyncMock, return_value=[]):
+    with patch("huddleroom.adapters.api_adapter.memory_service_instance.search", new_callable=AsyncMock, return_value=[]), \
+            patch("huddleroom.adapters.api_adapter.knowledge_service.search", new_callable=AsyncMock, return_value=[]):
         _, task_ctx, _, _ = await ApiAdapter()._build_messages(agent, task, db_session)
 
     if planning:

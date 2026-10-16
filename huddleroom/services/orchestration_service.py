@@ -4844,9 +4844,7 @@ class OrchestrationService:
             "result_correction"
         ))
         for status in ("blocked", "failed"):  # the verifier could not verify: wait for the owner's answer
-            ask = await self._existing_action_for_key(
-                db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:task:{task.id}:verifier_{status}",
-            )
+            ask, _ = await self._latest_owner_ask(db, run, "capability_unavailable", f"task:{task.id}:verifier_{status}")
             decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
             if decision is not None and decision.status == "pending":
                 return True
@@ -5029,17 +5027,22 @@ class OrchestrationService:
             }
             metadata = self._json_object_or_empty(task.metadata_)
             orchestration = self._json_object_or_empty(metadata.get("orchestration"))
-            metadata["orchestration"] = {
-                **orchestration,
-                "plan_item_gate_id": str(gate.id),
-                "recovery_kind": "stale_gate_verification",
-                "verification_action_id": str(action.id),
-                "verification_gate_id": str(gate.id),
-                "source_task_id": str(source_task.id) if source_task is not None else None,
-                "producer_agent_id": str(source_task.assigned_to) if source_task is not None else None,
-                "verifier_agent_id": str(task.assigned_to),
-            }
-            task.metadata_ = metadata
+            bound = orchestration.get("verification_action_id")
+            # SPR 227: a second request that gets the running verifier back must not steal its evidence binding
+            bound_action = await db.get(OrchestrationAction, self._event_uuid(bound)) if bound else None
+            if not (bound and bound != str(action.id) and task.status not in ("done", "failed", "cancelled")
+                    and (bound_action is None or bound_action.status != "failed")):
+                metadata["orchestration"] = {
+                    **orchestration,
+                    "plan_item_gate_id": str(gate.id),
+                    "recovery_kind": "stale_gate_verification",
+                    "verification_action_id": str(action.id),
+                    "verification_gate_id": str(gate.id),
+                    "source_task_id": str(source_task.id) if source_task is not None else None,
+                    "producer_agent_id": str(source_task.assigned_to) if source_task is not None else None,
+                    "verifier_agent_id": str(task.assigned_to),
+                }
+                task.metadata_ = metadata
         await emit_event_once(
             db,
             project_id,
@@ -8550,7 +8553,7 @@ class OrchestrationService:
             correction_task_ids=[*dispatched, str(correction.id)] if str(correction.id) not in dispatched else dispatched,
         )
         # funding returned: the subject's budget ask no longer blocks it
-        self._drop_owner_escalations(run, {"budget_exhausted"}, subject)
+        await self._resolve_budget_ask(db, run, subject, "funding returned; correction dispatched")
         await self._reopen_invalid_report_gate(db, run, parent, await self._existing_action_for_key(
             db, run.id, f"run:{run.id}:kind:report_consumed:task:{parent.id}",
         ))
@@ -10861,17 +10864,14 @@ class OrchestrationService:
         if not found.get("category"):
             return 0
         subject = f"gate:{gate.id}:{found['item']}"
-        existed = await self._existing_action_for_key(
-            db, run.id, f"run:{run.id}:kind:ask_human:{found['category']}:{subject}",
-        ) is not None
-        await self._escalate_owner(
+        _ask, created = await self._escalate_owner_created(
             db, goal, run, found["category"], subject, [f"{REVIEW_INPUT_MISSING}: {found['reason']}"],
             f"HuddleRoom cannot review the work for gate {gate.id}: {found['detail']} ({found['reason']}). "
             + ("Restore read access to it" if found["category"] == "permission_required" else
                "Pin it to an immutable revision (a commit URL, or repo_path and commit metadata) or make it readable")
             + "; the gate stays open until then.",
         )
-        return int(not existed)
+        return int(created)
 
     async def _rebind_reviewed_identities(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
         """Route each open gate whose approval was dropped because its content identity no longer holds: changed
@@ -10984,15 +10984,15 @@ class OrchestrationService:
                 )
             return 0
         # dispatched: the subject's funding or dispatch asks no longer block it
-        self._drop_owner_escalations(run, {"budget_exhausted", "capability_unavailable"},
-                                     f"gate:{gate.id}:reverify:{item.id}", prefix=True)
+        await self._resolve_budget_ask(db, run, f"gate:{gate.id}:reverify:{item.id}", "funding returned; verification dispatched")
+        self._drop_owner_escalations(run, {"capability_unavailable"}, f"gate:{gate.id}:reverify:{item.id}", prefix=True)
         return 1
 
     async def _rearmed_reverification_failures(
         self, db: AsyncSession, run: OrchestrationRun, spent: list[OrchestrationAction], subject: str, cycle_prefix: str,
     ) -> tuple[list[OrchestrationAction], str]:
-        """Failures that still count, and the subject of the next owner ask: each answered capability ask on the
-        subject re-arms REVERIFICATION_ATTEMPTS more, and the next ask of a re-armed cycle has its own subject
+        """Failures that still count, and the subject of the next owner ask: each answered, cancelled or expired capability
+        ask on the subject re-arms REVERIFICATION_ATTEMPTS more, and the next ask of a re-armed cycle has its own subject
         (``cycle_prefix`` + cycle) so it can be raised again."""
         cycle = 0
         while True:
@@ -11000,12 +11000,26 @@ class OrchestrationService:
                 db, run.id, f"run:{run.id}:kind:ask_human:capability_unavailable:{subject}",
             )
             decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
-            if decision is None or decision.status != "answered" or decision.decided_at is None:
+            if decision is None or decision.status not in {"answered", "cancelled", "expired"}:
                 return spent, subject
-            answered_at = _naive_utc(decision.decided_at)
+            settled_at = decision.decided_at or decision.updated_at
+            if settled_at is None:
+                return spent, subject
+            answered_at = _naive_utc(settled_at)
             spent = [action for action in spent if _naive_utc(action.created_at) > answered_at]
             cycle += 1
             subject = f"{cycle_prefix}{cycle}"
+
+    async def _resolve_budget_ask(self, db: AsyncSession, run: OrchestrationRun, subject: str, reason: str) -> None:
+        """Funding returned and the subject dispatched: cancel its pending budget ask and drop the blocker (SPR 223a)."""
+        ask, _cycle = await self._latest_owner_ask(db, run, "budget_exhausted", subject)
+        decision = await db.get(OrchestrationAuthorityDecision, ask.target_id) if ask and ask.target_id else None
+        if decision is not None and decision.status == "pending":
+            try:
+                await OrchestrationAuthorityDecisionService().cancel_decision(db, decision, reason=reason)
+            except ValueError:
+                pass  # concurrently answered or cancelled: the blocker still drops
+        self._drop_owner_escalations(run, {"budget_exhausted"}, subject)
 
     @staticmethod
     def _drop_owner_escalations(run: OrchestrationRun, categories: set[str], scope: str, *, prefix: bool = False) -> None:
@@ -11082,8 +11096,8 @@ class OrchestrationService:
                 continue
             created += 1
             # dispatched: the subject's funding or dispatch asks no longer block it
-            self._drop_owner_escalations(run, {"budget_exhausted", "capability_unavailable"},
-                                         f"gate:{gate.id}:revision", prefix=True)
+            await self._resolve_budget_ask(db, run, f"gate:{gate.id}:revision", "funding returned; re-verification dispatched")
+            self._drop_owner_escalations(run, {"capability_unavailable"}, f"gate:{gate.id}:revision", prefix=True)
         return created
 
     async def _recover_failed_tasks(
@@ -11618,20 +11632,52 @@ class OrchestrationService:
         question: str,
         options: Sequence[Mapping[str, str]] | None = None,
     ) -> OrchestrationAction:
-        """Ask the owner about one subject and record a blocker on that subject only. Deterministic work on other
-        subjects continues, but the LLM's proactive work pauses while any owner ask is pending (known limit)."""
+        """Ask the owner about one subject and record a blocker on that subject only (see _escalate_owner_created).
+        Deterministic work on other subjects continues; the LLM's proactive work pauses while an ask is pending."""
+        return (await self._escalate_owner_created(db, goal, run, category, subject, history, question, options))[0]
+
+    @staticmethod
+    def _owner_ask_base_key(run: OrchestrationRun, category: str, subject: str) -> str:
+        key_subject = subject if len(subject) <= 120 else hashlib.sha256(subject.encode()).hexdigest()
+        return f"run:{run.id}:kind:ask_human:{category}:{key_subject}"
+
+    async def _latest_owner_ask(
+        self, db: AsyncSession, run: OrchestrationRun, category: str, subject: str,
+    ) -> tuple[OrchestrationAction | None, int]:
+        """The newest ask of a subject's cycles (cycle 0 is the bare key, cycle n is ``:c{n}``) and its cycle."""
+        base, latest, n = self._owner_ask_base_key(run, category, subject), None, 0
+        while ask := await self._existing_action_for_key(db, run.id, base + (f":c{n}" if n else "")):
+            latest, n = ask, n + 1
+        return latest, max(n - 1, 0)
+
+    async def _escalate_owner_created(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        category: str,
+        subject: str,
+        history: Sequence[str],
+        question: str,
+        options: Sequence[Mapping[str, str]] | None = None,
+    ) -> tuple[OrchestrationAction, bool]:
+        """(ask, created). A new cycle opens only when the latest ask was cancelled or expired before this call,
+        at most one per call; an answered ask stays terminal and never resurrects its blocker."""
         if category not in self._ESCALATION_CATEGORIES:
             raise ValueError(f"Unknown escalation category: {category}")
         attempts = [str(item) for item in history][-10:]  # ponytail: keep only the latest attempts
         lines = "\n".join(f"{index}. {item}" for index, item in enumerate(attempts, 1)) or "None recorded."
         text = f"[{category}] {subject}\n{question}\nAttempt history:\n{lines}"
-        key_subject = subject if len(subject) <= 120 else hashlib.sha256(subject.encode()).hexdigest()
+        latest, n = await self._latest_owner_ask(db, run, category, subject)
+        latest_decision = await db.get(OrchestrationAuthorityDecision, latest.target_id) if latest and latest.target_id else None
+        created = latest is None or (latest_decision is not None and latest_decision.status in {"cancelled", "expired"})
+        n += 1 if latest is not None and created else 0
         action = await self.execute_ask_human_action(
             db,
             run.id,
             {"question": text, "subject": f"{category}:{subject}", "reason": category,
              **({"options": [dict(option) for option in options]} if options else {})},
-            f"run:{run.id}:kind:ask_human:{category}:{key_subject}",
+            self._owner_ask_base_key(run, category, subject) + (f":c{n}" if n else ""),
         )
         decision = await db.get(OrchestrationAuthorityDecision, action.target_id) if action.target_id else None
         if decision is None or decision.status == "pending":  # an answered ask must not resurrect its blocker
@@ -11642,7 +11688,7 @@ class OrchestrationService:
                 "reason": f"{category}: {subject}", "history": attempts, "decision_id": str(action.target_id) if action.target_id else None,
             })
         await db.flush()
-        return action
+        return action, created
 
     @staticmethod
     def _gate_revision_ledger_key(run_id: uuid.UUID, gate_id: Any) -> str:
@@ -11726,8 +11772,13 @@ class OrchestrationService:
         source_evidence_id = str(evidence.id) if evidence is not None else None
         source_id = source_evidence_id or source_id
         stopped = self._json_object_or_empty(ledger.get("exhausted"))
+        stopped_ask = await db.get(OrchestrationAuthorityDecision, self._event_uuid(stopped.get("decision_id"))) \
+            if stopped.get("decision_id") else None
+        # a cancelled or expired exhausted ask is asked again (answered stays terminal)
+        stopped_id = None if stopped_ask is not None and stopped_ask.status in {"cancelled", "expired"} \
+            else stopped.get("source_id")
         if source_id is not None and source_id in {
-            stopped.get("source_id"), *(item.get("source_id") or item.get("source_evidence_id") for item in revisions),
+            stopped_id, *(item.get("source_id") or item.get("source_evidence_id") for item in revisions),
         }:
             return 0  # a replayed rejection never adds a revision
         if revisions:
@@ -11755,11 +11806,9 @@ class OrchestrationService:
                 self._json_object_or_empty(prior.evidence_metadata if prior else {}).get("findings")
             ) or {"notes": item.get("reason")}))
         history.append(self._findings_line(cause, findings))
-        ask_key = f"run:{run.id}:kind:ask_human:{{category}}:{subject}"
 
         async def ask(category: str, question: str) -> int:
-            created = await self._existing_action_for_key(db, run.id, ask_key.format(category=category)) is None
-            action = await self._escalate_owner(db, goal, run, category, subject, history, question)
+            action, created = await self._escalate_owner_created(db, goal, run, category, subject, history, question)
             if category == "revision_exhausted":
                 marker.request = {**ledger, "exhausted": {
                     "source_evidence_id": source_evidence_id, "source_id": source_id, "findings_hash": findings_hash,
@@ -11850,7 +11899,8 @@ class OrchestrationService:
             **({"reason": reason} if evidence is None and reason else {}),
         }]}
         # dispatched: the subject's funding or dispatch ask no longer blocks it
-        self._drop_owner_escalations(run, {"budget_exhausted", "capability_unavailable"}, subject)
+        await self._resolve_budget_ask(db, run, subject, "funding returned; revision dispatched")
+        self._drop_owner_escalations(run, {"capability_unavailable"}, subject)
         await db.flush()
         return 1
 
@@ -12047,6 +12097,17 @@ class OrchestrationService:
                         return task
         return None
 
+    async def _is_stale_verifier_evidence(self, db: AsyncSession, row: OrchestrationEvidence) -> bool:
+        """SPR 219: task/session evidence of a stale-gate verifier task is the verifier's, not the producer's."""
+        task_id = row.source_id if row.source_type == "task" else None
+        if row.source_type == "session" and row.source_id is not None:
+            session = await db.get(Session, row.source_id)
+            task_id = session.task_id if session is not None else None
+        task = await db.get(Task, task_id) if task_id is not None else None
+        orchestration = self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration")) \
+            if task is not None else {}
+        return orchestration.get("recovery_kind") == "stale_gate_verification"
+
     async def _producer_agent_ids_for_gate(
         self,
         db: AsyncSession,
@@ -12055,7 +12116,8 @@ class OrchestrationService:
         evidence = await self._evidence_for_gate(db, gate)
         # Verifiers and reviewers are not producers: a previous verifier may verify a revision.
         producers = {row.producer_agent_id for row in evidence
-                     if row.producer_agent_id is not None and row.source_type not in {"verification", "review"}}
+                     if row.producer_agent_id is not None and row.source_type not in {"verification", "review"}
+                     and not await self._is_stale_verifier_evidence(db, row)}
         configured = self._event_uuid(
             self._json_object_or_empty(gate.required_evidence).get("work_producer_agent_id")
         )
@@ -12774,7 +12836,8 @@ class OrchestrationService:
             if not any(item.producer_agent_id != producer_agent_id for item in reviewer_evidence):
                 return "Independent verification must come from a different agent"
             return None
-        work_evidence = [item for item in evidence if item.source_type in {"artifact", "task"}]
+        work_evidence = [item for item in evidence if item.source_type in {"artifact", "task"}
+                         and not await self._is_stale_verifier_evidence(db, item)]
         verifier_evidence = [item for item in evidence if item.source_type not in {"artifact", "task"}]
         configured_work_agent_id = self._event_uuid(required_evidence.get("work_producer_agent_id"))
         if not verifier_evidence:
