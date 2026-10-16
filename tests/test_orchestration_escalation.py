@@ -107,6 +107,7 @@ async def _answer(db, action, user):
     decision = await db.get(OrchestrationAuthorityDecision, action.target_id)
     await OrchestrationAuthorityDecisionService().answer_runtime_question(
         db, decision, "acknowledge", actor_user_id=user.id, contract_version=decision.contract_version,
+        reason="Approved.",
     )
 
 
