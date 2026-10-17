@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
 
@@ -16,6 +17,49 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest.fixture(autouse=True)
+def _no_live_native_dispatch(monkeypatch):
+    """Keep committed semantic fixtures from launching real app workers."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Isolate committed native setup, including cyclic roadmap references."""
+    from sqlalchemy import event
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-orchestration.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # Per-test database is discarded whole; no global FK cleanup is changed.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for real service/worker entrypoints."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 def _agent(name_prefix: str, role: str, capabilities: list[str]) -> Agent:
@@ -135,10 +179,16 @@ async def test_tick_ingests_completed_task_evidence_once(db_session, test_projec
         dedup_key=f"phase13-task-done:{task.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     first = await service.tick(db_session, run.id)
     event_log = await _event_log(db_session, event.id)
     run.event_cursor = event_log.seq - 1
     await db_session.flush()
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     second = await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
@@ -176,6 +226,9 @@ async def test_tick_ignores_completed_task_without_orchestration_metadata(db_ses
         dedup_key=f"phase13-plain-task:{plain_task.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     assert result["evidence_created"] == 0
@@ -215,6 +268,9 @@ async def test_tick_ingests_completed_session_evidence(db_session, test_project)
         dedup_key=f"phase13-session-completed:{session.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
@@ -263,6 +319,9 @@ async def test_tick_ingests_review_approved_evidence(db_session, test_project):
         dedup_key=f"phase13-review-approved:{session.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
@@ -300,6 +359,9 @@ async def test_manual_review_event_without_outcome_maps_by_event_type(db_session
         dedup_key=f"manual-review:{session.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     [row] = await _evidence_rows(db_session, run.id)
@@ -422,6 +484,9 @@ async def test_tick_ignores_review_with_violated_link(db_session, test_project, 
             dedup_key=f"phase13-review-mismatched-graph:{session.id}",
         )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     assert result["evidence_created"] == 0
@@ -467,6 +532,9 @@ async def test_tick_ingests_graph_completed_evidence(db_session, test_project):
         dedup_key=f"phase13-graph-completed:{graph_run.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
@@ -524,6 +592,9 @@ async def test_tick_ingests_meeting_decision_evidence_from_concluded_meeting(db_
         dedup_key=f"phase13-meeting-concluded:{meeting.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
@@ -594,6 +665,9 @@ async def test_review_meeting_evidence_requires_approved_review(
         dedup_key=f"review-meeting-evidence:{meeting.id}",
     )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     rows = await _evidence_rows(db_session, run.id)
@@ -701,6 +775,9 @@ async def test_tick_ignores_meeting_decision_with_violated_link(db_session, test
             dedup_key=f"phase13-meeting-wrong-gate:{decision.id}",
         )
 
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     assert result["evidence_created"] == 0
@@ -728,6 +805,9 @@ async def test_goal_detail_lists_gates_and_ingested_evidence(client, db_session,
         },
         dedup_key=f"phase13-detail-task:{task.id}",
     )
+    # This test owns the completed source/event preparation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     response = await client.get(f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}")
@@ -740,3 +820,154 @@ async def test_goal_detail_lists_gates_and_ingested_evidence(client, db_session,
     assert body["evidence"][0]["source_type"] == "task"
     assert body["evidence"][0]["source_id"] == str(task.id)
     assert body["evidence"][0]["observed_event_id"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_terminal_event", [False, True])
+async def test_unauthorized_tick_only_consumes_existing_terminal_evidence_once(db_session, test_project, monkeypatch, with_terminal_event):
+    """SPR230/SPR231 no authority is needed for deterministic retained-result ingestion."""
+    from unittest.mock import AsyncMock
+    from sqlalchemy import func
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+
+    service, goal, run = await _make_run(db_session, test_project.id)
+    if with_terminal_event:
+        agent = _agent("retained", "developer", ["implementation"])
+        db_session.add(agent)
+        await db_session.flush()
+        gate = await _make_gate(db_session, run.id)
+        task = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id)
+        task.status, task.completed_at = "done", datetime.now(timezone.utc)
+        event, _ = await emit_event_once(db_session, test_project.id, "task.status_changed", {
+            "task_id": str(task.id), "status": "done", "previous_status": "in_progress",
+            "project_id": str(test_project.id),
+        }, dedup_key=f"unauthorized-retained:{task.id}")
+    else:
+        run.event_cursor = await db_session.scalar(select(func.max(EventLog.seq)))
+    await db_session.flush()
+    await db_session.commit()
+    blocked_methods = ["_drive_recovery", "_sweep_result_corrections", "recover_run", "request_llm_decision"]
+    spies = [AsyncMock() for _ in blocked_methods]
+    for name, spy in zip(blocked_methods, spies):
+        monkeypatch.setattr(service, name, spy)
+
+    async def counts():
+        return tuple([await db_session.scalar(select(func.count()).select_from(model))
+                      for model in (OrchestrationAction, Task, Session, OrchestrationProcessRun)])
+
+    before_counts = await counts()
+    before_rows = tuple(await db_session.execute(select(*OrchestrationRun.__table__.c).where(OrchestrationRun.id == run.id)))
+    before_goal = tuple(await db_session.execute(select(*OrchestrationGoal.__table__.c).where(OrchestrationGoal.id == goal.id)))
+    await db_session.commit()  # This fixture owns its read-only preflight.
+    result = await service.tick(db_session, run.id)
+    await db_session.commit()
+    assert await counts() == before_counts
+    assert all(spy.await_count == 0 for spy in spies)
+    await db_session.refresh(run)
+    assert run.baseline_authorized is False and run.phase == "baseline"
+    if with_terminal_event:
+        assert result["evidence_created"] == 1 and result["processed_events"] == 1
+        assert len(await _evidence_rows(db_session, run.id)) == 1
+        assert run.event_cursor == (await _event_log(db_session, event.id)).seq
+        await db_session.commit()
+        again = await service.tick(db_session, run.id)
+        assert again["evidence_created"] == 0
+        assert len(await _evidence_rows(db_session, run.id)) == 1
+        assert all(spy.await_count == 0 for spy in spies)
+    else:
+        assert result["processed_events"] == 0
+        after_rows = tuple(await db_session.execute(select(*OrchestrationRun.__table__.c).where(OrchestrationRun.id == run.id)))
+        after_goal = tuple(await db_session.execute(select(*OrchestrationGoal.__table__.c).where(OrchestrationGoal.id == goal.id)))
+        assert after_rows == before_rows and after_goal == before_goal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [True, False])
+async def test_unauthorized_retained_report_defers_correction_before_consumption(db_session, test_project, monkeypatch, valid):
+    """SPR230/SPR231 invalid retained output waits for Continue without losing its event."""
+    import json
+    from unittest.mock import AsyncMock
+    from sqlalchemy import func
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.services.orchestration_goal_definition import GoalDefinitionProcess
+
+    service, goal, run = await _make_run(db_session, test_project.id)
+    agent = _agent("retained-report", "developer", ["planning"])
+    db_session.add(agent)
+    await db_session.flush()
+    report = {"status": "completed", "changes": ["Audited existing state."], "evidence": ["Recorded audit observations."],
+              "criterion_progress": {"work": "candidate"}, "decisions": [], "risks": [], "open_questions": [],
+              "next_step": "Request verification.", "collaboration_need": None}
+    task = Task(project_id=test_project.id, title="Already admitted report", status="done", assigned_to=agent.id,
+        metadata_={"orchestration": {"run_id": str(run.id), "work_function": "planning",
+                     "terminal_output": json.dumps(report) if valid else "invalid retained report"},
+                   "orchestration_contract": {"expected_result": "work_report"}})
+    db_session.add(task)
+    await db_session.flush()
+    owner = OrchestrationAction(run_id=run.id, idempotency_key=f"admitted-report:{task.id}",
+        action_type="request_plan", status="completed", target_type="task", target_id=task.id)
+    db_session.add(owner)
+    await db_session.flush()
+    task.metadata_ = {**task.metadata_, "orchestration": {**task.metadata_["orchestration"], "action_id": str(owner.id)}}
+    prefix_event = None
+    if not valid:
+        # A valid earlier terminal event must survive the deferred suffix.
+        prior_gate = await _make_gate(db_session, run.id)
+        prior_task = await _make_orchestrated_task(db_session, test_project.id, run.id, prior_gate.id, agent.id)
+        prior_task.status, prior_task.completed_at = "done", datetime.now(timezone.utc)
+        prefix_event, _ = await emit_event_once(db_session, test_project.id, "task.status_changed", {
+            "task_id": str(prior_task.id), "status": "done", "previous_status": "in_progress", "project_id": str(test_project.id),
+        }, dedup_key=f"retained-valid-prefix:{prior_task.id}")
+    event, _ = await emit_event_once(db_session, test_project.id, "task.status_changed", {
+        "task_id": str(task.id), "status": "done", "previous_status": "in_progress", "project_id": str(test_project.id),
+    }, dedup_key=f"retained-report-event:{task.id}")
+    await db_session.commit()
+    baseline = (await db_session.scalar(select(func.count()).select_from(Task)),
+                await db_session.scalar(select(func.count()).select_from(Session)))
+    await db_session.commit()
+    recovery = AsyncMock()
+    correction = AsyncMock(wraps=service._dispatch_result_correction)
+    provider = AsyncMock()
+    monkeypatch.setattr(service, "_drive_recovery", recovery)
+    monkeypatch.setattr(service, "_dispatch_result_correction", correction)
+    monkeypatch.setattr(service, "request_llm_decision", provider)
+    await service.tick(db_session, run.id)
+    await db_session.commit()
+    marker_key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
+    markers = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.idempotency_key == marker_key)))
+    native_actions = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.id != owner.id)))
+    assert correction.await_count == recovery.await_count == provider.await_count == 0
+    assert baseline == (await db_session.scalar(select(func.count()).select_from(Task)),
+                        await db_session.scalar(select(func.count()).select_from(Session)))
+    await db_session.refresh(run)
+    assert run.baseline_authorized is False
+    if valid:
+        assert len(markers) == len(native_actions) == 1
+        assert markers[0].action_type == "report_consumed" and markers[0].target_id == task.id
+        assert run.event_cursor == (await _event_log(db_session, event.id)).seq
+        await db_session.commit()
+        await service.tick(db_session, run.id)
+        assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+            OrchestrationAction.idempotency_key == marker_key)) == 1
+        assert correction.await_count == recovery.await_count == provider.await_count == 0
+    else:
+        assert markers == native_actions == []
+        assert prefix_event is not None
+        assert run.event_cursor == (await _event_log(db_session, prefix_event.id)).seq
+        assert len(await _evidence_rows(db_session, run.id)) == 1
+        # Explicit Continue unlocks the normal native invalid-report path.
+        await service.authorize_baseline(db_session, test_project.id, goal.id, actor="human:retained-report")
+        await db_session.commit()
+        monkeypatch.setattr(GoalDefinitionProcess, "advance", AsyncMock(return_value={"status": "waiting_decision"}))
+        await service.tick(db_session, run.id)
+        await db_session.commit()
+        assert correction.await_count == 1
+        markers = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.idempotency_key == marker_key)))
+        assert len(markers) == 1
+        assert run.event_cursor >= (await _event_log(db_session, event.id)).seq
+        await db_session.commit()
+        # Replay observes the consumed report; it does not acknowledge a second marker.
+        await service.tick(db_session, run.id)
+        assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+            OrchestrationAction.idempotency_key == marker_key)) == 1

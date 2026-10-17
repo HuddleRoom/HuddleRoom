@@ -27,7 +27,8 @@ AsyncSessionLocal = async_sessionmaker(  # pylint: disable=invalid-name
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
+    from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
+    async with AsyncSessionLocal() as session, control_operation_owner(session):
         try:
             yield session
             await session.commit()

@@ -35,6 +35,40 @@ from huddleroom.services.orchestration_team_hierarchy_analyzer import (
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 
 
+@pytest.fixture
+async def test_engine(tmp_path):
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-scenario.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
 TEAM_HIERARCHY_SKIP_MESSAGE = (
     "Team hierarchy review was skipped. Work may be delegated without clear "
     "ownership or escalation paths."
@@ -1293,6 +1327,18 @@ async def _persisted_rows(db_session, model, order_by):
     return json.loads(json.dumps([dict(row) for row in rows], default=str))
 
 
+async def _apply_saved_answer(db_session, run_id, response):
+    """Exercise the native durable consumer after this request's acceptance commits."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from huddleroom.services.orchestration_decision_application import drain_answer_applications
+    assert response.json()["answer_receipt"] is not None
+    await db_session.commit()
+    async with async_sessionmaker(db_session.bind, expire_on_commit=False)() as consumer:
+        await drain_answer_applications(consumer, run_id)
+        await consumer.commit()
+    db_session.expire_all()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("answer", "created"), [("edit", True), ("reject", False)])
 async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposing_original(
@@ -1321,7 +1367,10 @@ async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposin
     if answer == "edit":
         body["edited_agent"] = {**original["definition"], "name": edited_name}
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(_answer_url(test_project.id, goal.id, decision.id), json=body)
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 200, response.text
     await db_session.refresh(decision)
@@ -1378,6 +1427,7 @@ async def test_baseline_hierarchy_rerun_uses_fresh_inputs_and_preserves_drift_gu
     goal.objective = "Launch auth migration, then billing, then mobile app"
     await db_session.flush()
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/baseline/rerun",
         json={"process_type": "team_hierarchy"},
@@ -1404,9 +1454,12 @@ async def test_baseline_hierarchy_rerun_uses_fresh_inputs_and_preserves_drift_gu
     if drift_after_analysis:
         goal.objective += " with a new security requirement"
         await db_session.flush()
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
     assert response.status_code == (409 if drift_after_analysis else 200), response.text
     if drift_after_analysis:
         assert response.json()["detail"] == "team hierarchy proposal inputs changed"
@@ -1417,9 +1470,12 @@ async def test_baseline_hierarchy_rerun_uses_fresh_inputs_and_preserves_drift_gu
             item for item in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
             if item.source_process_run_id == fresh.id and item.decision_key == "team_hierarchy:approval"
         )
+        await db_session.commit()  # This request reads committed hierarchy fixture state.
         response = await client.post(
             _answer_url(test_project.id, goal.id, approval.id), json={"selected_option": "approve"},
         )
+        if response.status_code == 200:
+            await _apply_saved_answer(db_session, run.id, response)
         assert response.status_code == 200, response.text
         assert (await service.get_current(db_session, goal.id, "team_hierarchy")).status == "completed"
 
@@ -1445,10 +1501,13 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
         if decision.decision_key == "team_hierarchy:approval"
     )
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, original_approval.id),
         json={"selected_option": "request_changes"},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 200, response.text
     fresh = await service.get_current(db_session, goal.id, "team_hierarchy")
@@ -1462,10 +1521,13 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
     )
     assert fresh_approval.status == "pending"
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, fresh_approval.id),
         json={"selected_option": "approve"},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 200, response.text
     current = await service.get_current(db_session, goal.id, "team_hierarchy")
@@ -1581,10 +1643,13 @@ async def test_hierarchy_edit_rejects_blank_required_definition_without_mutation
         ),
     }
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, decision.id),
         json={"selected_option": "edit", "edited_agent": edited_agent},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 400
     assert "complete non-empty" in response.json()["detail"]
@@ -1665,10 +1730,13 @@ async def test_stale_proposal_answer_leaves_decisions_pending_without_agent_muta
     goal.objective = "Implement a changed API"
     await db_session.flush()
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, decisions[0].id),
         json={"selected_option": "approve"},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 409
     assert {decision.status for decision in decisions} == {"pending"}
@@ -1707,10 +1775,13 @@ async def test_stale_proposal_answer_suggests_rerun_without_superseding_run(
     await db_session.flush()
 
     # Answer the now-stale decision
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal_id, stale_decision.id),
         json={"selected_option": "approve"},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 409
     assert response.json()["detail"] == "team hierarchy proposal inputs changed"
@@ -1748,8 +1819,14 @@ async def test_repeated_proposal_answer_is_conflict_and_creates_agent_once(
     decision = (await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id))[0]
     url = _answer_url(test_project.id, goal.id, decision.id)
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     first = await client.post(url, json={"selected_option": "approve"})
+    if first.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, first)
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     second = await client.post(url, json={"selected_option": "approve"})
+    if second.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, second)
 
     assert first.status_code == 200, first.text
     assert second.status_code == 409
@@ -1784,9 +1861,12 @@ async def test_invalid_resolved_hierarchy_supersedes_old_run_and_keeps_approved_
     old_run.outputs["analysis"]["assignments"][0]["agent_ref"] = "proposal:missing"
     await db_session.flush()
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"}
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 200, response.text
     current = await service.get_current(db_session, goal.id, "team_hierarchy")
@@ -1823,19 +1903,25 @@ async def test_separate_proposal_and_hierarchy_approvals_apply_gaps_and_unused_a
     await TeamHierarchyProcess().advance(db_session, goal, run)
     decisions = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
     for decision in decisions:
+        await db_session.commit()  # This request reads committed hierarchy fixture state.
         response = await client.post(
             _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"}
         )
+        if response.status_code == 200:
+            await _apply_saved_answer(db_session, run.id, response)
         assert response.status_code == 200, response.text
 
     decisions = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
     approval = next(item for item in decisions if item.decision_key == "team_hierarchy:approval")
     assert approval.status == "pending"
     assert all(item.status == "answered" for item in decisions if item is not approval)
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, approval.id),
         json={"selected_option": "approve_with_documented_gaps"},
     )
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
     assert response.status_code == 200, response.text
     current = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
@@ -2293,6 +2379,7 @@ async def test_force_start_team_hierarchy_requires_terminal_agent_review(
         created_by_user_id=None,
     )
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _hierarchy_process_url(test_project.id, goal.id, "start"),
         json={"reason": "review the hierarchy"},
@@ -2310,6 +2397,7 @@ async def test_force_start_team_hierarchy_links_active_run_after_terminal_agent_
 ):
     goal, run = await _advance_trivial_prerequisites(db_session, test_project)
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _hierarchy_process_url(test_project.id, goal.id, "start"),
         json={"reason": "review the hierarchy"},
@@ -2328,6 +2416,7 @@ async def test_force_start_team_hierarchy_links_active_run_after_skipped_agent_r
     goal, run = await _advance_trivial_prerequisites(
         db_session, test_project, advance_agent_review=False
     )
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     review_skip = await client.post(
         (
             f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}"
@@ -2340,6 +2429,7 @@ async def test_force_start_team_hierarchy_links_active_run_after_skipped_agent_r
     assert review_skip.status_code == 200
     assert review_skip.json()["status"] == "skipped"
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _hierarchy_process_url(test_project.id, goal.id, "start"),
         json={"reason": "review the hierarchy"},
@@ -2357,6 +2447,7 @@ async def test_generic_hierarchy_skip_is_human_attributed_and_force_start_supers
     client, auth_headers, db_session, test_project, test_user, safe_goal_analysis
 ):
     goal, run = await _advance_trivial_prerequisites(db_session, test_project)
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     skip = await client.post(
         _hierarchy_process_url(test_project.id, goal.id, "skip"),
         json={"reason": "accept hierarchy risk"},
@@ -2382,6 +2473,7 @@ async def test_generic_hierarchy_skip_is_human_attributed_and_force_start_supers
     )
     assert hierarchy_warning.message == TEAM_HIERARCHY_SKIP_MESSAGE
 
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
     restart = await client.post(
         _hierarchy_process_url(test_project.id, goal.id, "start"),
         json={"reason": "review the hierarchy after all"},
@@ -2418,6 +2510,7 @@ async def test_tick_sequences_team_hierarchy_after_agent_definition_review(
     )
     run.baseline_authorized = True
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await OrchestrationService().tick(db_session, run.id)
 
     assert result["agent_definition_review_process"]["status"] == "completed"
@@ -2492,6 +2585,7 @@ async def test_parked_team_hierarchy_keeps_tick_bookkeeping_and_blocks_progress(
     monkeypatch.setattr(service, "_run_ready_for_final_summary_request", report_ready)
     monkeypatch.setattr(service, "_run_ready_for_completion", report_ready)
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await service.tick(db_session, run.id)
 
     assert result["team_hierarchy_process"]["status"] == "waiting_decision"

@@ -28,6 +28,73 @@ from tests.test_orchestration_runtime_e2e import _agent
 pytestmark = pytest.mark.asyncio
 
 
+from contextlib import asynccontextmanager
+from unittest.mock import patch
+
+
+@asynccontextmanager
+async def _owned_roadmap_setup(db):
+    """Prepare only the exact lexical imported setup helper's native ticks."""
+    original = OrchestrationService.tick
+
+    async def tick(service, candidate, *args, **kwargs):
+        root = candidate.sync_session.get_transaction()
+        if (candidate is db and not candidate.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await candidate.flush()
+            await candidate.commit()
+        return await original(service, candidate, *args, **kwargs)
+
+    with patch.object(OrchestrationService, "tick", tick):
+        yield
+
+
+async def _tick_owned_setup(service, db, run_id):
+    await db.flush()
+    await db.commit()
+    return await service.tick(db, run_id)
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+
 def item(id_, priority=50, depends_on=()):
     return SimpleNamespace(id=id_, priority=priority, depends_on=list(depends_on))
 
@@ -366,7 +433,7 @@ async def test_tick_fills_root_slots_by_rank_queues_the_rest_and_starts_it_when_
     mid = await _task(db_session, test_project, run, agent=agent, priority=50)
     high = await _task(db_session, test_project, run, agent=agent, priority=90)
     service = OrchestrationService()
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     statuses = {name: (await db_session.get(Task, task.id)).status for name, task in (("low", low), ("mid", mid), ("high", high))}
     assert statuses == {"low": "backlog", "mid": "in_progress", "high": "in_progress"}
     await db_session.refresh(run)
@@ -383,7 +450,7 @@ async def test_tick_fills_root_slots_by_rank_queues_the_rest_and_starts_it_when_
     for session in await db_session.scalars(select(Session).where(Session.task_id == high.id)):
         session.status = "completed"
     await db_session.flush()
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert (await db_session.get(Task, low.id)).status == "in_progress"
 
 
@@ -393,7 +460,7 @@ async def test_root_child_and_grandchild_ready_work_starts_at_most_two_in_total(
     child, child_run = await _child(db_session, test_project, root, "roadmap")
     grand, grand_run = await _child(db_session, test_project, child)
     tasks = [await _task(db_session, test_project, run, agent=agent) for run in (root_run, child_run, grand_run)]
-    await OrchestrationService().tick(db_session, root_run.id)
+    await _tick_owned_setup(OrchestrationService(), db_session, root_run.id)
     statuses = [(await db_session.get(Task, t.id)).status for t in tasks]
     assert statuses.count("in_progress") == 2 and statuses.count("backlog") == 1
     assert await available_slots(db_session, root.id) == 0
@@ -406,14 +473,14 @@ async def test_queued_planning_task_is_not_starved_by_later_lower_ranked_work(db
     planner = await _task(db_session, test_project, run, agent=agent, priority=70)
     later = [await _task(db_session, test_project, run, agent=agent, priority=50) for _ in range(2)]
     service = OrchestrationService()
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert (await db_session.get(Task, planner.id)).status == "backlog"  # root full: queued, not dropped
     order = [t.id for t in rank_queued(await queued_tasks(db_session, root.id), {})]
     assert order[0] == planner.id and order == [t.id for t in rank_queued(await queued_tasks(db_session, root.id), {})]
     for audit in audits:  # both audits finish
         audit.status = "done"
     await db_session.flush()
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert (await db_session.get(Task, planner.id)).status == "in_progress"
     started = [(await db_session.get(Task, t.id)).status for t in later]
     assert sorted(started) == ["backlog", "in_progress"]  # planner + one best-ranked later task
@@ -536,8 +603,9 @@ async def _roadmap_children(db, project, keys, child_items):
     from tests.test_orchestration_roadmap_children import accepted_goal_roadmap, goal_item
 
     allocation = {"max_tokens": 400, "max_turns": 2, "max_hours": 2}
-    roadmap, root, root_run, _ = await accepted_goal_roadmap(db, project, [
-        {**goal_item(key, allocation), "goal_type": "roadmap"} for key in keys])
+    async with _owned_roadmap_setup(db):
+        roadmap, root, root_run, _ = await accepted_goal_roadmap(db, project, [
+            {**goal_item(key, allocation), "goal_type": "roadmap"} for key in keys])
     for _ in keys:
         await roadmap.advance(db, root, root_run)
     children = list(await db.scalars(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == root.id)))
@@ -600,7 +668,7 @@ async def test_pending_renewal_child_tick_is_noop(db_session, test_project):
     run.plan_state = {"child_delta_baseline": {"status": "pending_renewal"}}
     task = await _task(db_session, test_project, run, agent=agent)
     await db_session.flush()
-    await OrchestrationService().tick(db_session, run.id)
+    await _tick_owned_setup(OrchestrationService(), db_session, run.id)
     await db_session.refresh(task)
     assert task.status == "backlog"
     assert await db_session.scalar(select(func.count()).select_from(Session).where(Session.task_id == task.id)) == 0

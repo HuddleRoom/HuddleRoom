@@ -44,11 +44,6 @@ async def committed_roadmap_cleanup(test_engine, concurrent_sessions):
     yield
     for db in concurrent_sessions:
         await db.rollback()
-    # Committed children restrict deletion of the versions in the shared cleanup.
-    async with test_engine.begin() as connection:
-        await connection.execute(delete(OrchestrationBudgetReservation))
-        await connection.execute(delete(OrchestrationRoadmapItem))
-        await connection.execute(delete(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id.is_not(None)))
 
 
 def goal_item(key="child", allocation=None, constraints=None):
@@ -58,10 +53,10 @@ def goal_item(key="child", allocation=None, constraints=None):
 
 
 async def accepted_goal_roadmap(db, project, item, cap=1000, authority_model="human_manager", include_planner_in_team=False,
-                                budget_caps=None):
+                                budget_caps=None, owns_setup=False):
     planner = _agent("child-planner", ["planning"])
     db.add(planner); await db.flush()
-    service, parent, run = await _authorized_run(db, project)
+    service, parent, run = await _authorized_run(db, project, owns_setup=owns_setup)
     parent.authority_model = authority_model
     if authority_model == "agent_manager":
         parent.manager_user_id = None
@@ -106,8 +101,8 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, authority_model="hu
     return roadmap, parent, run, version
 
 
-async def release(db, project, item= None, cap=1000):
-    roadmap, parent, run, version = await accepted_goal_roadmap(db, project, item or goal_item(), cap)
+async def release(db, project, item= None, cap=1000, *, owns_setup=False):
+    roadmap, parent, run, version = await accepted_goal_roadmap(db, project, item or goal_item(), cap, owns_setup=owns_setup)
     result = await roadmap.advance(db, parent, run)
     row = await db.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     return roadmap, parent, run, result, row
@@ -131,7 +126,7 @@ async def test_mutable_child_without_agent_or_work_function_requires_exact_autho
         "mutates_shared_state": True,
         "staging_boundary": {"type": "git_worktree", "identifier": "missing", "reversible": True},
     })
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
 
     assert await roadmap.advance(db_session, parent, run) == {
         "step": "waiting", "reason": "waiting_unstaged_approval",
@@ -169,7 +164,7 @@ async def test_child_planning_task_reassignment_and_metadata_tamper_cannot_chang
     item.update({"mutates_shared_state": True, "staging_boundary": None})
     roadmap, parent, run, version = await accepted_goal_roadmap(
         db_session, test_project, item, include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, run)
     approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == parent.id,
@@ -290,8 +285,8 @@ async def assert_child_release(db, parent, run, version, item, *, failed_item_ke
 
 async def test_goal_item_reservation_child_run_and_gate_are_atomic(db_session, test_project):
     item = goal_item()
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
-    result = await roadmap.orchestration.tick(db_session, run.id)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
+    result = await _tick_owned_setup(roadmap.orchestration, db_session, run.id)
     assert result["authorized_execution"] == {"step": "release_item", "item_key": "child", "unit_type": "goal"}
     await assert_child_release(db_session, parent, run, version, item)
     await conserved(db_session, parent)
@@ -299,10 +294,10 @@ async def test_goal_item_reservation_child_run_and_gate_are_atomic(db_session, t
 
 async def test_goal_item_replay_returns_one_child_and_reservation(db_session, test_project):
     item = goal_item()
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
-    await roadmap.orchestration.tick(db_session, run.id)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
+    await _tick_owned_setup(roadmap.orchestration, db_session, run.id)
     identities = await assert_child_release(db_session, parent, run, version, item)
-    await roadmap.orchestration.tick(db_session, run.id)
+    await _tick_owned_setup(roadmap.orchestration, db_session, run.id)
     assert await assert_child_release(db_session, parent, run, version, item) == identities
     parsed = parse_roadmap_items([item], set(parent.budget["caps"]))[0]
     assert await roadmap.release_goal_item(db_session, parent, run, version, parsed) == {
@@ -312,7 +307,7 @@ async def test_goal_item_replay_returns_one_child_and_reservation(db_session, te
 
 
 async def test_goal_item_failure_after_reservation_rolls_back_everything(db_session, test_project, monkeypatch):
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item())
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item(), owns_setup=True)
 
     async def fail_event(*args, **kwargs):
         raise RuntimeError("injected event failure")
@@ -339,7 +334,7 @@ async def test_child_contract_preserves_parent_authority_team_criteria_and_works
     item = goal_item(constraints={"language": "Python"})
     roadmap, parent, run, version = await accepted_goal_roadmap(
         db_session, test_project, item, authority_model=authority_model,
-    )
+     owns_setup=True)
     parent.budget = {**parent.budget, "policy": {"allow_expansion": False}}
     expected = {
         "snapshot_version": 1, "parent_goal_id": str(parent.id),
@@ -383,7 +378,7 @@ async def test_child_contract_preserves_parent_authority_team_criteria_and_works
 
 
 async def test_child_delta_rejects_conflicting_parent_constraint(db_session, test_project, concurrent_sessions):
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item(constraints={"region": "US"}))
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item(constraints={"region": "US"}), owns_setup=True)
     parent_id, run_id = parent.id, run.id
     await db_session.commit()
     writer, reader = concurrent_sessions
@@ -408,7 +403,7 @@ async def test_concurrent_goal_item_release_cannot_overallocate(
 ):
     roadmap, parent, run, version = await accepted_goal_roadmap(
         db_session, test_project, [goal_item("one", {"max_tokens": 700, "max_turns": 1, "max_hours": 1}),
-                                  goal_item("two", {"max_tokens": 700, "max_turns": 1, "max_hours": 1})], 1400)
+                                  goal_item("two", {"max_tokens": 700, "max_turns": 1, "max_hours": 1})], 1400, owns_setup=True)
     parent.budget = {"caps": {"max_tokens": 1000, "max_turns": 10, "max_hours": 10}}
     parent_id, run_id, version_id = parent.id, run.id, version.id
     await db_session.commit()
@@ -483,7 +478,7 @@ async def test_concurrent_goal_item_release_cannot_overallocate(
 
 
 async def test_child_settlement_releases_unused_allocation(db_session, test_project):
-    roadmap, parent, run, _, row = await release(db_session, test_project)
+    roadmap, parent, run, _, row = await release(db_session, test_project, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     agent = _agent("child-spend", ["implementation"])
@@ -507,7 +502,7 @@ async def test_child_settlement_releases_unused_allocation(db_session, test_proj
 
 
 async def test_missing_required_usage_measurement_blocks_settlement(db_session, test_project):
-    roadmap, parent, run, _, row = await release(db_session, test_project)
+    roadmap, parent, run, _, row = await release(db_session, test_project, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     agent = _agent("child-measurement", ["implementation"])
@@ -533,7 +528,7 @@ async def test_missing_required_usage_measurement_blocks_settlement(db_session, 
 async def test_active_child_missing_claim_measurement_waits_and_recovers_through_tick(
     db_session, test_project, monkeypatch,
 ):
-    roadmap, parent, parent_run, _, row = await release(db_session, test_project)
+    roadmap, parent, parent_run, _, row = await release(db_session, test_project, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     parent_run.status = "paused"
@@ -551,7 +546,7 @@ async def test_active_child_missing_claim_measurement_waits_and_recovers_through
         raise AssertionError("missing claim telemetry must wait before dispatch")
 
     monkeypatch.setattr(roadmap.orchestration, "request_llm_decision", must_not_decide)
-    waiting = await roadmap.orchestration.tick(db_session, child_run.id)
+    waiting = await _tick_owned_setup(roadmap.orchestration, db_session, child_run.id)
     assert waiting["authorized_execution"] == {"step": "needs_attention"}
     assert any(blocker["kind"] == "budget_measurement" for blocker in child_run.active_blockers)
 
@@ -562,7 +557,7 @@ async def test_active_child_missing_claim_measurement_waits_and_recovers_through
 
 
 async def test_cancel_with_missing_measurement_conservatively_settles_full_allocation(db_session, test_project):
-    roadmap, parent, run, _, row = await release(db_session, test_project)
+    roadmap, parent, run, _, row = await release(db_session, test_project, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     agent = _agent("child-cancel", ["implementation"])
@@ -583,7 +578,7 @@ async def test_cancel_with_missing_measurement_conservatively_settles_full_alloc
 
 
 async def test_cancelled_child_retains_measured_overage_and_blocks_parent(db_session, test_project):
-    roadmap, parent, run, _, row = await release(db_session, test_project)
+    roadmap, parent, run, _, row = await release(db_session, test_project, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     agent = _agent("child-cancel-overage", ["implementation"])
@@ -604,7 +599,7 @@ async def test_cancelled_child_retains_measured_overage_and_blocks_parent(db_ses
 
 
 async def test_cancelled_child_keeps_known_overage_when_another_session_lacks_telemetry(db_session, test_project):
-    roadmap, parent, run, _, row = await release(db_session, test_project)
+    roadmap, parent, run, _, row = await release(db_session, test_project, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     agent = _agent("child-cancel-mixed-telemetry", ["implementation"])
@@ -639,7 +634,7 @@ async def test_cancelled_child_keeps_known_overage_when_another_session_lacks_te
 async def test_parent_active_session_commitment_blocks_child_budget_admission(db_session, test_project):
     roadmap, parent, run, version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 1, "max_hours": 1}), cap=1000,
-    )
+     owns_setup=True)
     agent = _agent("parent-active-budget", ["implementation"])
     db_session.add(agent); await db_session.flush()
     task = Task(project_id=test_project.id, title="active parent work", status="in_progress",
@@ -659,7 +654,7 @@ async def test_child_session_claim_clamps_adapter_limit_to_remaining_cap(db_sess
     roadmap, parent, parent_run, _version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 1, "max_hours": 1}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -686,7 +681,7 @@ async def test_cli_token_claim_waits_for_exact_human_budget_authority_then_relea
     roadmap, parent, parent_run, version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("cli-budget", {"max_tokens": 400, "max_turns": 1, "max_hours": 1}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -721,7 +716,7 @@ async def test_child_cli_planning_authority_replays_pending_then_resolves_once(
         db_session, test_project,
         goal_item("child-cli", {"max_tokens": 400, "max_turns": 1, "max_hours": 1}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -766,7 +761,7 @@ async def test_accepted_child_plan_expansion_waits_before_creating_lineage(
         db_session, test_project,
         goal_item("accepted-child-cli", {"max_tokens": 400, "max_turns": 2, "max_hours": 1}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -824,7 +819,7 @@ async def test_cli_max_hours_only_claim_needs_no_human_budget_authority(db_sessi
     roadmap, parent, parent_run, _ = await accepted_goal_roadmap(
         db_session, test_project, goal_item("cli-hours", {"max_hours": 1, "max_turns": 1}), cap=1000,
         include_planner_in_team=True, budget_caps={"max_hours": 1, "max_turns": 1},
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -848,7 +843,7 @@ async def test_child_claim_uses_completed_action_lineage_not_editable_task_metad
     roadmap, parent, parent_run, _version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 2, "max_hours": 1}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -878,7 +873,7 @@ async def test_unrelated_completed_action_does_not_grant_budget_ownership(db_ses
     roadmap, parent, run, _version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 2, "max_hours": 1}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     task = Task(project_id=test_project.id, title="unrelated action", status="ready")
     db_session.add(task); await db_session.flush()
     db_session.add(OrchestrationAction(
@@ -894,7 +889,7 @@ async def test_competing_exact_cap_resume_refuses_then_recovers_after_terminal_u
     roadmap, parent, parent_run, _version = await accepted_goal_roadmap(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 5, "max_hours": 5}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
@@ -933,7 +928,7 @@ async def test_competing_exact_cap_resume_refuses_then_recovers_after_terminal_u
 async def test_resume_reserves_prior_usage_plus_only_the_new_grant(db_session, test_project):
     _, _, _, _, row = await release(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 5, "max_hours": 5}),
-    )
+     owns_setup=True)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
     agent = _agent("resumed-cumulative-budget", ["implementation"])
     db_session.add(agent); await db_session.flush()
@@ -962,7 +957,7 @@ async def test_resume_reserves_prior_usage_plus_only_the_new_grant(db_session, t
 async def test_active_cli_resume_charges_prior_overage_and_new_grant(db_session, test_project, monkeypatch):
     _, _, _, _, row = await release(
         db_session, test_project, goal_item("child", {"max_tokens": 800, "max_turns": 5, "max_hours": 5}),
-    )
+     owns_setup=True)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
     agent = _agent("resumed-cli-grants", ["implementation"])
     db_session.add(agent); await db_session.flush()
@@ -1009,7 +1004,7 @@ async def test_active_cli_resume_charges_prior_overage_and_new_grant(db_session,
 async def test_repeated_resume_keeps_cumulative_usage_and_refuses_incomplete_telemetry(db_session, test_project):
     _, _, _, _, row = await release(
         db_session, test_project, goal_item("child", {"max_tokens": 400, "max_turns": 5, "max_hours": 5}),
-    )
+     owns_setup=True)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
     agent = _agent("repeat-resume-budget", ["implementation"])
     db_session.add(agent); await db_session.flush()
@@ -1049,7 +1044,7 @@ async def test_repeated_resume_keeps_cumulative_usage_and_refuses_incomplete_tel
 
 
 async def test_malformed_resume_elapsed_and_active_commitment_create_attention(db_session, test_project):
-    _, _, _, _, row = await release(db_session, test_project)
+    _, _, _, _, row = await release(db_session, test_project, owns_setup=True)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
     agent = _agent("malformed-budget", ["implementation"])
     db_session.add(agent); await db_session.flush()
@@ -1074,7 +1069,7 @@ async def test_fractional_turn_cap_admits_only_one_active_claim(db_session, test
         db_session, test_project,
         goal_item("fractional", {"max_tokens": 800, "max_turns": 1.5, "max_hours": 10}),
         include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
@@ -1098,7 +1093,7 @@ async def test_fractional_turn_cap_admits_only_one_active_claim(db_session, test
 async def test_invalid_active_commitment_is_claim_attention_not_negative_headroom(db_session, test_project):
     roadmap, parent, parent_run, _ = await accepted_goal_roadmap(
         db_session, test_project, goal_item(), include_planner_in_team=True,
-    )
+     owns_setup=True)
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
@@ -1122,7 +1117,7 @@ async def test_invalid_active_commitment_is_claim_attention_not_negative_headroo
 
 
 async def test_outcome_runtime_stops_when_a_capped_dimension_is_exhausted(db_session, test_project):
-    roadmap, _, _, _, row = await release(db_session, test_project)
+    roadmap, _, _, _, row = await release(db_session, test_project, owns_setup=True)
     goal = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == goal.id))
     child_run.budget_state = {"caps": {"max_tokens": 0, "max_turns": 1, "max_hours": 1}}
@@ -1132,7 +1127,7 @@ async def test_outcome_runtime_stops_when_a_capped_dimension_is_exhausted(db_ses
 
 @pytest.mark.parametrize("value", [-1, "NaN", "Infinity"])
 async def test_invalid_token_telemetry_is_rejected(db_session, test_project, value):
-    _, parent, _, _, row = await release(db_session, test_project)
+    _, parent, _, _, row = await release(db_session, test_project, owns_setup=True)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == row.child_goal_id))
     agent = _agent("bad-telemetry", ["implementation"])
     db_session.add(agent); await db_session.flush()
@@ -1171,7 +1166,7 @@ def _shape(goal_type, planning_mode):
 @pytest.mark.parametrize("goal_type,planning_mode", [("outcome", "delivery"), ("roadmap", "roadmap")])
 async def test_explicit_child_goal_type_is_preserved(db_session, test_project, goal_type, planning_mode):
     item = {**goal_item(), "goal_type": goal_type}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     await roadmap.advance(db_session, parent, run)
     child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent.id))
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
@@ -1194,7 +1189,7 @@ async def test_auto_child_is_classified_once_from_its_own_objective(db_session, 
         return _shape("roadmap", "roadmap")
 
     item = {**goal_item(constraints={"language": "Python"}), "goal_type": "auto"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     with patch.object(OrchestrationGoalShapeService, "_classify", classify):
         await roadmap.advance(db_session, parent, run)
         await roadmap.advance(db_session, parent, run)
@@ -1211,7 +1206,7 @@ async def test_auto_child_provider_error_waits_without_persisting_anything(db_se
         raise GoalShapeResolutionError("provider_error", "boom")
 
     item = {**goal_item(), "goal_type": "auto"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     with patch.object(OrchestrationGoalShapeService, "_classify", classify):
         result = await roadmap.release_goal_item(
             db_session, parent, run, version, parse_roadmap_items([item], set(parent.budget["caps"]))[0],
@@ -1229,7 +1224,7 @@ async def test_auto_child_resolving_to_continuous_is_blocked_without_rows(db_ses
         return _shape("continuous", "continuous_policy")
 
     item = {**goal_item(), "goal_type": "auto"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     with patch.object(OrchestrationGoalShapeService, "_classify", classify):
         result = await roadmap.release_goal_item(
             db_session, parent, run, version, parse_roadmap_items([item], set(parent.budget["caps"]))[0],
@@ -1245,7 +1240,7 @@ async def test_auto_child_classifier_runs_after_the_tick_releases_its_writer(
     db_session, test_project, concurrent_sessions, committed_roadmap_cleanup,
 ):
     item = {**goal_item(), "goal_type": "auto"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     parent_id, run_id = parent.id, run.id
     await db_session.commit()
     writer, reader = concurrent_sessions
@@ -1273,10 +1268,10 @@ async def test_rejected_auto_child_is_not_reclassified_until_a_new_version(db_se
         return _shape("continuous", "continuous_policy")
 
     item = {**goal_item(), "goal_type": "auto"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     with patch.object(OrchestrationGoalShapeService, "_classify", classify):
         for _ in range(3):
-            await roadmap.orchestration.tick(db_session, run.id)
+            await _tick_owned_setup(roadmap.orchestration, db_session, run.id)
     assert len(calls) == 1
     blocker, = [b for b in run.active_blockers if b["kind"] == "child_contract"]
     assert blocker["roadmap_version_id"] == str(version.id) and blocker["item_key"] == "child"
@@ -1298,7 +1293,7 @@ async def test_child_inherits_root_limits_and_eligible_evidence_from_accepted_de
     first = goal_item("first", {"max_tokens": 300, "max_turns": 1, "max_hours": 1})
     second = {**goal_item("second", {"max_tokens": 300, "max_turns": 1, "max_hours": 1}),
               "depends_on": ["first"], "goal_type": "outcome", "artifact_ids": [str(artifact_id)]}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [first, second])
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [first, second], owns_setup=True)
     parent.orchestrator_context = {"expansion_policy": {"max_goal_depth": 2, "max_descendant_goals": 5, "depth": 0}}
     await roadmap.advance(db_session, parent, run)
     lineage = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.item_key == "first"))
@@ -1334,7 +1329,7 @@ async def test_expansion_limit_error_messages():
 
 async def test_release_beyond_depth_limit_is_rejected_with_no_rows(db_session, test_project):
     item = {**goal_item(), "mutates_shared_state": True}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     parent.orchestrator_context = _policy(max_goal_depth=0)
     decisions = await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision))  # pylint: disable=not-callable
     result = await roadmap.release_goal_item(
@@ -1350,10 +1345,10 @@ async def test_release_beyond_depth_limit_is_rejected_with_no_rows(db_session, t
 
 async def test_tick_rejects_over_depth_mutable_goal_item_before_any_authority_decision(db_session, test_project):
     item = {**goal_item(), "mutates_shared_state": True}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     parent.orchestrator_context = _policy(max_goal_depth=0)
     decisions = await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision))  # pylint: disable=not-callable
-    await roadmap.orchestration.tick(db_session, run.id)
+    await _tick_owned_setup(roadmap.orchestration, db_session, run.id)
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision)) == decisions  # pylint: disable=not-callable
     assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
     blocker, = [b for b in run.active_blockers if b["kind"] == "expansion_limit"]
@@ -1364,7 +1359,7 @@ async def test_release_beyond_descendant_limit_is_rejected_after_the_first_child
     small = {"max_tokens": 300, "max_turns": 1, "max_hours": 1}
     roadmap, parent, run, version = await accepted_goal_roadmap(
         db_session, test_project, [goal_item("one", small), goal_item("two", small)],
-    )
+     owns_setup=True)
     parent.orchestrator_context = _policy(max_descendant_goals=1)
     await roadmap.advance(db_session, parent, run)
     await roadmap.advance(db_session, parent, run)
@@ -1375,7 +1370,7 @@ async def test_release_beyond_descendant_limit_is_rejected_after_the_first_child
 
 async def test_depth_is_measured_from_the_finite_root_through_released_children(db_session, test_project):
     item = {**goal_item(), "goal_type": "roadmap"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     await roadmap.advance(db_session, parent, run)
     child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == parent.id))
     parent.orchestrator_context = _policy(max_goal_depth=1)
@@ -1386,7 +1381,7 @@ async def test_depth_is_measured_from_the_finite_root_through_released_children(
 
 async def test_literal_three_deep_goal_tree_allows_depth_three_and_rejects_depth_four(db_session, test_project):
     item = {**goal_item(), "goal_type": "roadmap"}
-    roadmap, root, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, root, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     await roadmap.advance(db_session, root, run)  # root -> child (depth 1, real release)
     chain = [root, await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == root.id))]
     for depth, goal_type in ((2, "roadmap"), (3, "outcome")):
@@ -1405,7 +1400,7 @@ async def test_literal_three_deep_goal_tree_allows_depth_three_and_rejects_depth
 
 
 async def test_stale_expansion_limit_blocker_is_cleared_for_a_new_version(db_session, test_project):
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item())
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, goal_item(), owns_setup=True)
     run.active_blockers = [{"kind": "expansion_limit", "item_key": "child", "roadmap_version_id": str(uuid.uuid4()),
                             "reason": "expansion_limit: stale", "required_decision": "request_roadmap_replan"}]
     await roadmap.advance(db_session, parent, run)
@@ -1420,7 +1415,7 @@ NESTED_ITEM = {**goal_item("child", {"max_tokens": 800, "max_turns": 5, "max_hou
 
 async def _nested_child(db, project, *grand):
     """Release Roadmap child C and give it roadmap-item grandchildren: (settled_tokens | None for active, allocation)."""
-    _, parent, run, _, row = await release(db, project, NESTED_ITEM)
+    _, parent, run, _, row = await release(db, project, NESTED_ITEM, owns_setup=True)
     child = await db.get(OrchestrationGoal, row.child_goal_id)
     assert child.goal_type == "roadmap"
     child_run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
@@ -1520,7 +1515,7 @@ async def test_outcome_child_settlement_is_unchanged(db_session, test_project):
 
 async def test_nested_roadmap_cli_cap_authority_keys_by_its_own_version_and_item(db_session, test_project):
     """A nested Roadmap's own capped task item asks on its goal/run/version, as the claim side resolves it."""
-    _, parent, _, _, row = await release(db_session, test_project, NESTED_ITEM)
+    _, parent, _, _, row = await release(db_session, test_project, NESTED_ITEM, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     plan = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft")
@@ -1547,7 +1542,7 @@ async def test_nested_roadmap_cli_cap_authority_keys_by_its_own_version_and_item
 
 
 async def test_nested_roadmap_first_version_freezes_the_parents_workspace_policy(db_session, test_project):
-    _, parent, _, _, row = await release(db_session, test_project, NESTED_ITEM)
+    _, parent, _, _, row = await release(db_session, test_project, NESTED_ITEM, owns_setup=True)
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     assert child.orchestrator_context["workspace_policy"] == {"mode": "isolated"}
@@ -1577,7 +1572,7 @@ async def test_nested_roadmap_first_version_freezes_the_parents_workspace_policy
 async def test_nested_roadmap_planning_task_keeps_the_lineage_it_was_released_under(db_session, test_project):
     """C's own planning claim carries P's version/item (inherited context), so it is authorized on P."""
     _, parent, parent_run, _ = await accepted_goal_roadmap(
-        db_session, test_project, NESTED_ITEM, include_planner_in_team=True)
+        db_session, test_project, NESTED_ITEM, include_planner_in_team=True, owns_setup=True)
     roadmap = OrchestrationRoadmapService(OrchestrationService())
     await roadmap.advance(db_session, parent, parent_run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
@@ -1596,7 +1591,7 @@ async def test_nested_roadmap_planning_task_keeps_the_lineage_it_was_released_un
 
 
 async def _released_nested_roadmap_with_cli_planner(db, project):
-    roadmap, parent, parent_run, _ = await accepted_goal_roadmap(db, project, NESTED_ITEM, include_planner_in_team=True)
+    roadmap, parent, parent_run, _ = await accepted_goal_roadmap(db, project, NESTED_ITEM, include_planner_in_team=True, owns_setup=True)
     await roadmap.advance(db, parent, parent_run)
     row = await db.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     child = await db.get(OrchestrationGoal, row.child_goal_id)
@@ -1704,7 +1699,7 @@ async def test_grandchild_cli_cap_authority_lands_on_the_nested_roadmap(db_sessi
 @pytest.mark.parametrize("change", ["goal", "run", "version", "depth", "descendants", "budget"])
 async def test_auto_child_revalidates_authority_after_classifier(db_session, test_project, change):
     item = {**goal_item(), "goal_type": "auto"}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item)
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item, owns_setup=True)
     async def classify(self, project_id, data):
         if change == "goal":
             parent.status = "paused"
@@ -1733,7 +1728,7 @@ async def test_full_root_capacity_still_creates_one_queued_child(db_session, tes
     from huddleroom.services.orchestration_capacity import available_slots, activate_ready
     item = {**goal_item(), "goal_type": "outcome"}
     roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, item,
-                                                              include_planner_in_team=True)
+                                                              include_planner_in_team=True, owns_setup=True)
     parent.orchestrator_context = {**parent.orchestrator_context, "expansion_policy": {"max_concurrent_tasks": 1}}
     busy = Task(project_id=test_project.id, title="Busy root work", status="in_progress",
                 metadata_={"orchestration": {"run_id": str(run.id)}})
@@ -1760,7 +1755,7 @@ async def test_full_root_capacity_still_creates_one_queued_child(db_session, tes
 async def test_auto_child_revalidates_dependency_gate_after_classifier(db_session, test_project):
     prerequisite = {**goal_item("prerequisite"), "goal_type": "outcome"}
     item = {**goal_item("dependent"), "goal_type": "auto", "depends_on": ["prerequisite"]}
-    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [prerequisite, item])
+    roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [prerequisite, item], owns_setup=True)
     await roadmap.advance(db_session, parent, run)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "prerequisite"))
@@ -1777,3 +1772,49 @@ async def test_auto_child_revalidates_dependency_gate_after_classifier(db_sessio
             parse_roadmap_items([prerequisite, item], set(parent.budget["caps"]))[1])
     assert result == {"step": "waiting", "reason": "waiting_dependencies"}
     assert await _row_counts(db_session, parent, run) == before
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+async def _tick_owned_setup(service, db, run_id, **kwargs):
+    """Publish this test's scenario before its real tick, never a race caller."""
+    await db.flush()
+    await db.commit()
+    return await service.tick(db, run_id, **kwargs)

@@ -3,6 +3,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from huddleroom.config import settings
 from huddleroom.models.base import _utcnow
@@ -13,6 +14,49 @@ from huddleroom.models.task import Task
 from huddleroom.services.orchestration_progress_view import OrchestrationProgressView, ProgressSituation
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_wake_when import ORCHESTRATOR_WAIT_OWNER_TYPE
+
+
+@pytest.fixture(autouse=True)
+def _no_live_native_dispatch(monkeypatch):
+    """Keep committed semantic fixtures from launching real app workers."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Isolate committed native setup, including cyclic roadmap references."""
+    from sqlalchemy import event
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-orchestration.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # Per-test database is discarded whole; no global FK cleanup is changed.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for real service/worker entrypoints."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 pytestmark = pytest.mark.asyncio
@@ -392,7 +436,11 @@ async def _dispatch_adhoc(db, project, **over):
         ))
     db.add_all(decisions)
     await db.flush()
-    actions = [await OrchestrationDecisionDispatcher(service).dispatch(db, run, d) for d in decisions]
+    await db.commit()  # This helper owns immutable dispatch preparation.
+    actions = []
+    for decision in decisions:
+        actions.append(await OrchestrationDecisionDispatcher(service).dispatch(db, run, decision))
+        await db.commit()  # Finish this native effect before the next independent decision.
     tasks = (await db.execute(sa_select(Task).where(Task.project_id == project_id))).scalars().all()
     return actions, tasks
 

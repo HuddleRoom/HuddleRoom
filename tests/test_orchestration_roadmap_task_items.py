@@ -7,6 +7,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -42,7 +43,9 @@ from huddleroom.services.orchestration_service import OrchestrationService
 
 
 @pytest.fixture(autouse=True)
-def _manual_task_start(monkeypatch):
+def _manual_task_start(monkeypatch, request):
+    if request.node.name == "test_owned_roadmap_dispatch_inherits_preflight_ownership":
+        return
     # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
     async def _noop(self, db, goal, run):
         return 0
@@ -88,7 +91,7 @@ async def accepted_roadmap(db_session, test_project):
 
         if assign_agents:
             items = [{**item, "agent_id": str(planner.id)} for item in items]
-        service, goal, run = await _authorized_run(db_session, test_project)
+        service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
         goal.goal_type = "roadmap"
         goal.planning_mode = "roadmap"
         if setup is not None:
@@ -137,7 +140,7 @@ async def test_roadmap_releases_one_dependency_ready_task_and_records_lineage(
         roadmap_task("verify", depends_on=["build"]),
     ])
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
     rows = list((await db_session.scalars(
         select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id)
     )).all())
@@ -164,7 +167,7 @@ async def test_capped_staged_cli_task_waits_for_budget_authority_before_release(
     service, goal, run, _ = await accepted_roadmap([roadmap_task("capped")], setup=setup)
     before = await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem))
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["authorized_execution"] == {"step": "waiting", "reason": "budget_wait"}
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapItem)) == before
@@ -194,7 +197,7 @@ async def test_capped_cli_root_creator_authority_binds_release_and_claim(
     await db_session.flush()
     goal.manager_user_id = None
     goal.created_by_user_id = creator.id
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     version = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
@@ -204,7 +207,7 @@ async def test_capped_cli_root_creator_authority_binds_release_and_claim(
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=creator.id,
     )
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -270,14 +273,14 @@ async def test_derived_cli_task_authority_replays_and_binds_effective_override(
         return [SimpleNamespace(agent_id=derived_agent_id, weak=False)]
 
     monkeypatch.setattr(OrchestrationRosterMapper, "rank_agents", rank_derived)
-    first = await service.tick(db_session, run.id)
+    first = await _tick_owned_setup(service, db_session, run.id)
     assert first["authorized_execution"] == {"step": "waiting", "reason": "budget_wait"}
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_budget_adapter:%:derived-cli:%:cli:max_tokens"),
     ))
     assert decision is not None and decision.status == "pending"
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "budget_wait",
     }
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision).where(
@@ -287,7 +290,7 @@ async def test_derived_cli_task_authority_replays_and_binds_effective_override(
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option=answer, decided_by_user_id=goal.manager_user_id,
     )
-    resolved = await service.tick(db_session, run.id)
+    resolved = await _tick_owned_setup(service, db_session, run.id)
     if answer == "reject":
         assert resolved["authorized_execution"] == {"step": "waiting", "reason": "needs_attention"}
         blockers = [item for item in run.active_blockers if item.get("decision_key") == decision.decision_key]
@@ -321,7 +324,7 @@ async def test_direct_cli_terminal_spend_keeps_known_overage_and_incomplete_audi
         goal.budget = {"caps": {"max_tokens": 400, "max_turns": 2, "max_hours": 1}}
 
     service, goal, run, _ = await accepted_roadmap([roadmap_task("direct-overage")], setup=setup)
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "budget_wait",
     }
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
@@ -331,7 +334,7 @@ async def test_direct_cli_terminal_spend_keeps_known_overage_and_incomplete_audi
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     item = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -349,7 +352,7 @@ async def test_direct_cli_terminal_spend_keeps_known_overage_and_incomplete_audi
     )
     summary = await OrchestrationBudgetService().remaining(db_session, goal)
     assert (known, complete, summary["direct_spend"]["max_tokens"]) == ({"max_tokens": "450"}, False, "450")
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "needs_attention",
     }
     assert any(item["kind"] == "budget_integrity" for item in run.active_blockers)
@@ -370,7 +373,7 @@ async def test_task_run_rejects_staged_adapter_override_before_mutating_task(
 
     item = roadmap_task("override", mutates_shared_state=True)
     service, goal, run, _ = await accepted_roadmap([item], setup=setup)
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     version = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
@@ -379,7 +382,7 @@ async def test_task_run_rejects_staged_adapter_override_before_mutating_task(
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, approval, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -399,7 +402,7 @@ DONE_REPORT = json.dumps({"status": "done", "changes": ["Delivered."], "evidence
 
 async def _complete_producer(db_session, test_project, service, run, task):
     await _complete_task_session(db_session, test_project.id, task, task.assigned_to, DONE_REPORT)
-    return await service.tick(db_session, run.id)
+    return await _tick_owned_setup(service, db_session, run.id)
 
 
 async def _request_and_complete_verification(db_session, test_project, service, run, row, agent_id):
@@ -414,7 +417,7 @@ async def _request_and_complete_verification(db_session, test_project, service, 
         db_session, test_project.id, verifier_task, agent_id,
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["verified"]}),
     )
-    return await service.tick(db_session, run.id)
+    return await _tick_owned_setup(service, db_session, run.id)
 
 
 def _local_decisions(monkeypatch, service, decision_fn):
@@ -435,7 +438,7 @@ async def test_roadmap_task_successor_waits_for_accepted_predecessor_gate(
     service, goal, run, verifier = await accepted_roadmap([
         roadmap_task("build"), roadmap_task("verify", depends_on=["build"]),
     ])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     build = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "build",
     ))
@@ -465,7 +468,7 @@ async def test_roadmap_task_successor_waits_for_accepted_predecessor_gate(
         db_session, test_project.id, verifier_task, verifier.id,
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["verified"]}),
     )
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
     gate = await db_session.get(OrchestrationGate, build.gate_id)
     assert gate.status == "accepted"
     evidence = list((await db_session.scalars(select(OrchestrationEvidence).where(
@@ -474,7 +477,7 @@ async def test_roadmap_task_successor_waits_for_accepted_predecessor_gate(
     assert ("task", task.assigned_to) in [(item.source_type, item.producer_agent_id) for item in evidence]
     assert ("verification", verifier.id) in [(item.source_type, item.producer_agent_id) for item in evidence]
     assert result["authorized_execution"]["item_key"] == "verify"
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id,
         OrchestrationAction.action_type == "request_verification",
@@ -485,7 +488,7 @@ async def test_terminal_roadmap_decision_commits_authority_wait(
     db_session, test_project, accepted_roadmap, monkeypatch,
 ):
     service, goal, run, _ = await accepted_roadmap([roadmap_task("build")])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     item = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -502,7 +505,7 @@ async def test_terminal_roadmap_decision_commits_authority_wait(
         raise HTTPException(status_code=409, detail="waiting_plan_authority")
 
     monkeypatch.setattr(service, "_dispatch_execution_decision", wait_for_authority)
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
     assert result["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_plan_authority",
     }
@@ -510,12 +513,12 @@ async def test_terminal_roadmap_decision_commits_authority_wait(
 
 async def test_roadmap_task_release_replay_duplicates_nothing(db_session, accepted_roadmap):
     service, goal, run, _ = await accepted_roadmap([roadmap_task("build")])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     counts = [
         await db_session.scalar(select(func.count()).select_from(model))
         for model in (Task, OrchestrationAction, OrchestrationGate, OrchestrationRoadmapItem)
     ]
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert [
         await db_session.scalar(select(func.count()).select_from(model))
         for model in (Task, OrchestrationAction, OrchestrationGate, OrchestrationRoadmapItem)
@@ -527,7 +530,7 @@ async def test_concurrent_approved_roadmap_task_claim_creates_one_active_session
 ):
     """Two committed claimers for one approved Roadmap task cannot both hold execution."""
     service, goal, run, _ = await accepted_roadmap([roadmap_task("one-claim")])
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "one-claim"
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "one-claim"
     item = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -567,7 +570,7 @@ async def test_roadmap_task_gate_requires_independent_verification(
     _local_decisions(monkeypatch, service, lambda _ctx: {
         "action_type": "noop", "reason": "Integration verification is pending.",
     })
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id))
     task = await db_session.get(Task, row.task_id)
     await _complete_producer(db_session, test_project, service, run, task)
@@ -584,7 +587,7 @@ async def test_roadmap_mutable_task_items_release_serially(db_session, accepted_
     service, goal, run, _ = await accepted_roadmap([
         roadmap_task("build", mutates_shared_state=True), roadmap_task("verify", mutates_shared_state=True),
     ])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_unstaged_mutation:%:build"),
@@ -592,8 +595,8 @@ async def test_roadmap_mutable_task_items_release_serially(db_session, accepted_
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "build"
-    result = await service.tick(db_session, run.id)
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "build"
+    result = await _tick_owned_setup(service, db_session, run.id)
     assert result["authorized_execution"] == {"step": "waiting", "reason": "waiting_shared_workspace"}
     assert [(row.item_key, row.unit_type) for row in (await db_session.scalars(
         select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id)
@@ -606,19 +609,19 @@ async def test_roadmap_task_release_stops_at_two_active_tasks(db_session, accept
         roadmap_task("two", mutates_shared_state=False),
         roadmap_task("three", mutates_shared_state=False),
     ])
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "one"
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "two"
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "capacity_wait"}
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "one"
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "two"
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "capacity_wait"}
     first = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "one",
     ))
     (await db_session.get(Task, first.task_id)).status = "done"
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "three"
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "three"
 
 
 async def test_roadmap_dependency_uses_predecessor_lineage_version(db_session, accepted_roadmap):
     service, goal, run, _ = await accepted_roadmap([roadmap_task("build")])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     lineage = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "build",
     ))
@@ -635,7 +638,7 @@ async def test_roadmap_unstaged_mutation_waits_for_version_bound_human_authority
     item = roadmap_task("unstaged", mutates_shared_state=True)
     item["staging_boundary"] = None
     service, goal, run, _ = await accepted_roadmap([item])
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "waiting_unstaged_approval"}
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "waiting_unstaged_approval"}
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_unstaged_mutation:%:unstaged"),
@@ -644,14 +647,14 @@ async def test_roadmap_unstaged_mutation_waits_for_version_bound_human_authority
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "unstaged"
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "unstaged"
 
 
 async def test_roadmap_unstaged_mutation_rejection_blocks_dispatch(db_session, accepted_roadmap):
     item = roadmap_task("unstaged", mutates_shared_state=True)
     item["staging_boundary"] = None
     service, goal, run, _ = await accepted_roadmap([item])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_unstaged_mutation:%:unstaged"),
@@ -659,7 +662,7 @@ async def test_roadmap_unstaged_mutation_rejection_blocks_dispatch(db_session, a
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="reject", decided_by_user_id=goal.manager_user_id,
     )
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "needs_attention"}
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {"step": "waiting", "reason": "needs_attention"}
     assert any(item["kind"] == "staging_boundary" for item in run.active_blockers)
     assert await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id
@@ -670,7 +673,7 @@ async def test_roadmap_task_contract_preserves_staging_and_workspace_policy(
     db_session, accepted_roadmap,
 ):
     service, goal, run, _ = await accepted_roadmap([roadmap_task("staged", mutates_shared_state=True)])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_unstaged_mutation:%:staged"),
@@ -678,7 +681,7 @@ async def test_roadmap_task_contract_preserves_staging_and_workspace_policy(
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -701,7 +704,7 @@ async def test_roadmap_mutable_claim_uses_contract_workspace_and_rejects_overrid
     db_session, test_project, accepted_roadmap,
 ):
     service, goal, run, _ = await accepted_roadmap([roadmap_task("claim", mutates_shared_state=True)])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_unstaged_mutation:%:claim"),
@@ -709,7 +712,7 @@ async def test_roadmap_mutable_claim_uses_contract_workspace_and_rejects_overrid
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -736,7 +739,7 @@ async def test_roadmap_claim_uses_version_bound_approval_after_task_metadata_is_
     item = roadmap_task("immutable-approval", mutates_shared_state=True)
     item["staging_boundary"] = None
     service, goal, run, _ = await accepted_roadmap([item])
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.goal_id == goal.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_unstaged_mutation:%:immutable-approval"),
@@ -744,7 +747,7 @@ async def test_roadmap_claim_uses_version_bound_approval_after_task_metadata_is_
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id,
     ))
@@ -830,7 +833,7 @@ async def test_registered_worktree_roadmap_release_and_claim_ignore_mapping_drif
     )
     second = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     assert second.snapshot["workspace_bindings"]["registered"] == first.snapshot["workspace_bindings"]["registered"]
-    assert (await service.tick(db_session, run.id))["authorized_execution"] == {
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"] == {
         "step": "release_item", "item_key": "registered", "unit_type": "task",
     }
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
@@ -920,7 +923,7 @@ async def test_adopted_roadmap_task_item_binds_existing_task_without_new_work(db
     (audit,) = audits
     task_count = await db_session.scalar(select(func.count()).select_from(Task))
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["authorized_execution"] == {"step": "release_item", "item_key": "audit", "unit_type": "task"}
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal.id))
@@ -938,7 +941,7 @@ async def test_adopted_roadmap_task_item_binds_existing_task_without_new_work(db
         db_session, run.id, f"run:{run.id}:kind:create_delegation_task:roadmap_item:audit"
     ) is None
 
-    await service.tick(db_session, run.id)  # replay binds nothing new
+    await _tick_owned_setup(service, db_session, run.id)  # replay binds nothing new
     assert await db_session.scalar(select(func.count()).select_from(Task)) == task_count
     assert len((await db_session.scalars(select(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "adopt_task",
@@ -950,7 +953,7 @@ async def test_roadmap_acceptance_rejects_adoption_by_goal_or_shared_state_item(
     planner = _agent("adoption-planner", ["planning", "implementation"])
     db_session.add(planner)
     await db_session.flush()
-    service, goal, run = await _authorized_run(db_session, test_project)
+    service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
     goal.goal_type, goal.planning_mode = "roadmap", "roadmap"
     audit = await _delegated_audit(service, db_session, run, planner.id)
     goal.budget = {"caps": {"max_tokens": 1000, "max_turns": 10, "max_hours": 10}}
@@ -1011,7 +1014,7 @@ async def _accepted_adopting_roadmap(db_session, accepted_roadmap, *, conflictin
 @pytest.mark.parametrize("legacy_null_adoption", [False, True])
 async def test_replan_refreshes_bound_metadata_and_preserves_frozen_snapshot(db_session, test_project, accepted_roadmap, legacy_null_adoption):
     service, goal, run, audit, adopted = await _accepted_adopting_roadmap(db_session, accepted_roadmap)
-    assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "audit"
+    assert (await _tick_owned_setup(service, db_session, run.id))["authorized_execution"]["item_key"] == "audit"
     from copy import deepcopy
     row_before = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == "audit"))
@@ -1163,3 +1166,111 @@ async def test_legacy_null_adoption_requires_exact_historical_proofs(db_session,
         await roadmap.release_task_item(db_session, goal, run,
             await roadmap.current_version(db_session, goal.id), parse_roadmap_items([adopted], set())[0])
     assert audit.metadata_ == before and row.item_snapshot == frozen
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+async def _tick_owned_setup(service, db, run_id, **kwargs):
+    """Publish this test's scenario before its real tick, never a race caller."""
+    await db.flush()
+    await db.commit()
+    return await service.tick(db, run_id, **kwargs)
+
+
+async def test_owned_roadmap_dispatch_inherits_preflight_ownership(
+    db_session, accepted_roadmap, test_engine, monkeypatch,
+):
+    from huddleroom.services.orchestration_baseline_runtime import (
+        control_operation_owner, current_baseline_operation, owns_control_transaction,
+    )
+    # External execution alone is stopped; real release, task claim and session reservation run.
+    monkeypatch.setattr(SessionService, "_schedule_dispatch_after_commit", lambda *_args, **_kwargs: None)
+    service, goal, run, _ = await accepted_roadmap([roadmap_task("owned-release")])
+    goal_id, run_id = goal.id, run.id
+    await db_session.commit()  # Own this scenario's preparation, before entering the tested owner.
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    observed = []
+    real_advance = OrchestrationRoadmapService.advance
+    real_release = OrchestrationRoadmapService.release_task_item
+
+    async def observe(call, self, db, goal, run, *args, **kwargs):
+        operation = current_baseline_operation()
+        assert operation is not None and operation.db is db
+        assert operation.owner_task is asyncio.current_task() and operation.owns_transaction
+        assert owns_control_transaction(db)
+        observed.append((call.__name__, operation.operation_id, db, asyncio.current_task()))
+        result = await call(self, db, goal, run, *args, **kwargs)
+        assert current_baseline_operation() is operation and owns_control_transaction(db)
+        return result
+
+    async def advance(self, db, goal, run):
+        return await observe(real_advance, self, db, goal, run)
+
+    async def release(self, db, goal, run, *args, **kwargs):
+        return await observe(real_release, self, db, goal, run, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationRoadmapService, "advance", advance)
+    monkeypatch.setattr(OrchestrationRoadmapService, "release_task_item", release)
+    async with factory() as owner:
+        assert not owns_control_transaction(owner)
+        async with asyncio.timeout(10), control_operation_owner(owner):
+            await owner.execute(select(OrchestrationRun.id).where(OrchestrationRun.id == run_id))
+            assert owns_control_transaction(owner)
+            first = await service.tick(owner, run_id)
+            assert first["authorized_execution"]["item_key"] == "owned-release"
+            assert owns_control_transaction(owner)
+            async with factory() as reader:
+                rows = list(await reader.scalars(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == goal_id)))
+                assert len(rows) == 1 and rows[0].task_id is not None
+                task_id = rows[0].task_id
+                sessions = list(await reader.scalars(select(Session).where(Session.task_id == task_id)))
+                assert len(sessions) == 1
+                session_id = sessions[0].id
+                counts = [await reader.scalar(select(func.count()).select_from(model)) for model in (Task, Session, OrchestrationAction, OrchestrationRoadmapItem)]
+            await service.tick(owner, run_id)
+            assert owns_control_transaction(owner)
+        assert not owns_control_transaction(owner) and current_baseline_operation() is None
+    async with factory() as reader:
+        assert [await reader.scalar(select(func.count()).select_from(model)) for model in (Task, Session, OrchestrationAction, OrchestrationRoadmapItem)] == counts
+        assert (await reader.get(Session, session_id)).task_id == task_id
+    assert {name for name, *_ in observed} == {"advance", "release_task_item"}
+    first_advance = next(item for item in observed if item[0] == "advance")
+    first_release = next(item for item in observed if item[0] == "release_task_item")
+    assert first_advance[1:] == first_release[1:]

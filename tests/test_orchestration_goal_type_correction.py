@@ -4,6 +4,7 @@ import uuid
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.orchestration import (
@@ -21,6 +22,42 @@ from huddleroom.services.orchestration_goal_shape import OrchestrationGoalShapeS
 from huddleroom.services.orchestration_roadmap_service import retained_gate_id
 from huddleroom.services.orchestration_service import OrchestrationService
 from tests.test_orchestration_goal_shape import _accepted_gate, _counts, _goal_run, _preview, _run_task
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Keep committed fixture lineage in a database unique to this test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    # Discard the isolated database whole; keep shared foreign-key cleanup unchanged.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine, monkeypatch):
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 async def _request(db, goal, run, actor="human:u1", **kw):
@@ -303,7 +340,17 @@ async def _released_child(db, project):
     from huddleroom.models.orchestration import OrchestrationGoal
     from tests.test_orchestration_roadmap_children import release
 
-    roadmap, parent, parent_run, _, row = await release(db, project)
+    original = OrchestrationService.tick
+    async def owned_setup_tick(self, current_db, *args, **kwargs):
+        root = current_db.sync_session.get_transaction()
+        if (current_db is db and not current_db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await current_db.flush()
+            await current_db.commit()
+        return await original(self, current_db, *args, **kwargs)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(OrchestrationService, "tick", owned_setup_tick)
+        roadmap, parent, parent_run, _, row = await release(db, project)
     child = await db.get(OrchestrationGoal, row.child_goal_id)
     child_run = await OrchestrationService().get_run_for_goal(db, project.id, child.id)
     return roadmap, parent, parent_run, child, child_run
@@ -345,6 +392,7 @@ async def test_parent_auto_child_waits_for_parent_renewal_then_runs_without_star
     assert (old.status, old.terminal_reason) == ("cancelled", "reclassified")
     assert successor.plan_state["child_delta_baseline"]["status"] == "pending_renewal"
     svc = roadmap.orchestration
+    await db_session.commit()  # Publish the corrected child before native renewal ticks.
     idle = await svc.tick(db_session, successor.id)
     assert "authorized_execution" not in idle and successor.phase == "baseline"
 
@@ -368,6 +416,7 @@ async def test_parent_auto_child_waits_for_parent_renewal_then_runs_without_star
         return {"step": "probe", "run_id": str(run.id)}
 
     monkeypatch.setattr(svc, "_advance_authorized_execution", probe)
+    await db_session.commit()
     ran = await svc.tick(db_session, successor.id)  # no human Start
     assert ran["authorized_execution"] == {"step": "probe", "run_id": str(successor.id)}
 

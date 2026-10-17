@@ -1,3 +1,6 @@
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 import uuid
 import hashlib
 import json
@@ -15,6 +18,46 @@ from tests.test_orchestration_runtime_e2e import (
 )
 from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/231: discard committed cyclic Continuous fixtures as a whole database."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-context.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # Per-test database disposal avoids changing global FK-aware cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    """SPR230/231: each scenario explicitly publishes setup before owned native ticks."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+        await session.rollback()
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +79,10 @@ def _fake_db_seams(request, monkeypatch):
     # These routing-only fake-db cases cannot express a durable server generation.
     # Real database cases below exercise the public admission wrapper and its lock.
     monkeypatch.setattr(OrchestrationDecisionDispatcher, "dispatch", OrchestrationDecisionDispatcher._dispatch)
+    # Routing-only fake databases cannot represent the writer admission boundary.
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_baseline_runtime.require_control_admission", AsyncMock(),
+    )
     # the corrective classifier reads durable state; fake-db routing tests keep healthy work ordinary.
     monkeypatch.setattr(OrchestrationService, "classify_corrective_action", ordinary, raising=False)
 
@@ -542,11 +589,12 @@ async def _verifiable_gate(db_session, test_project):
     producer.role, verifier.role = "developer", "validator"
     db_session.add_all([producer, verifier])
     await db_session.flush()
-    service, goal, run = await _authorized_run(db_session, test_project)
+    service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
     await _seed_accepted_plan(db_session, test_project, service, run, producer, plan_items=[{
         "id": "disp-item", "work_function": "implementation", "scope": "Deliver.",
         "deliverable": "Delivered.", "agent_id": str(producer.id),
     }])
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     await service.tick(db_session, run.id)
     work_task = next(t for t in await _tasks_for_run(db_session, run.id)
                      if service._task_work_function(t) == "implementation")
@@ -569,13 +617,16 @@ async def test_failed_verification_is_retryable_and_replays_are_idempotent(
     service, _goal, run, gate = await _verifiable_gate(db_session, test_project)
     dispatcher = OrchestrationDecisionDispatcher(service)
 
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     first = await dispatcher.dispatch(db_session, run, _verify_decision(gate))
     assert first.status == "completed"
     assert ":attempt:" not in first.idempotency_key  # attempt 0 keeps the legacy key
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     assert (await dispatcher.dispatch(db_session, run, _verify_decision(gate))).id == first.id
 
     first.status = "failed"
     await db_session.flush()
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     second = await dispatcher.dispatch(db_session, run, _verify_decision(gate))
     assert second.id != first.id
     assert second.idempotency_key.endswith(":attempt:1")
@@ -583,6 +634,7 @@ async def test_failed_verification_is_retryable_and_replays_are_idempotent(
     assert second.target_id != first.target_id
     assert await db_session.get(Task, second.target_id) is not None
     # replay of the successful retry: same action, no third verifier task
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     assert (await dispatcher.dispatch(db_session, run, _verify_decision(gate))).id == second.id
     verifiers = [a for a in await _run_actions(db_session, run.id)
                  if a.action_type == "create_delegation_task" and ":verify_gate:" in a.idempotency_key]
@@ -606,9 +658,11 @@ async def test_progress_view_follow_up_cleared_only_by_substantive_continuation(
     dispatcher = OrchestrationDecisionDispatcher(service)
     noop = SimpleNamespace(id=None, validator_status="accepted", input_snapshot={}, rejection_reason=None,
                            parsed_decision={"action_type": "noop", "applies_decision_id": str(answered.id)})
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     await dispatcher.dispatch(db_session, run, noop)
     assert await follow_ups() == [str(answered.id)]
 
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     action = await dispatcher.dispatch(
         db_session, run, _verify_decision(gate, applies_decision_id=str(answered.id)),
     )
@@ -650,6 +704,7 @@ async def test_dispatch_invalid_depends_on_records_failed_action_without_raising
     project_id, run_id = test_project.id, run.id
     tasks_before = await _task_count(db_session, project_id)
 
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
 
     assert action is not None and action.status == "failed"
@@ -673,6 +728,7 @@ async def test_dispatcher_classifies_through_its_injected_service_and_keeps_heal
     real = service.classify_corrective_action
     service.classify_corrective_action = AsyncMock(side_effect=real)
 
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, _verify_decision(gate))
 
     request = service.canonical_decision_request(
@@ -736,10 +792,12 @@ async def test_distinct_late_empty_snapshot_plan_decision_cannot_supersede_live_
         return row
     first, late = await decision("first plan"), await decision("distinct late plan")
     dispatcher = OrchestrationDecisionDispatcher(service)
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     first_action = await dispatcher.dispatch(db_session, run, first)
     v1 = copy.deepcopy(run.plan_state)
     cancel = AsyncMock(side_effect=AssertionError("stale decision must not cancel v1"))
     monkeypatch.setattr(service, "_cancel_superseded_planning_task", cancel)
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     with pytest.raises(Exception) as caught:
         await dispatcher.dispatch(db_session, run, late)
     assert type(caught.value).__name__ == "PlanGenerationChanged"
@@ -751,6 +809,7 @@ async def test_distinct_late_empty_snapshot_plan_decision_cannot_supersede_live_
     )))
     assert [row.id for row in actions] == [first_action.id]
     # Exact action replay precedes freshness, despite its original empty snapshot.
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     replay = await dispatcher.dispatch(db_session, run, first)
     assert replay.id == first_action.id
     cancel.assert_not_awaited()
@@ -775,6 +834,7 @@ async def test_distinct_request_plan_rejects_missing_or_malformed_server_generat
                                 })
     db_session.add(row)
     await db_session.flush()
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     with pytest.raises(Exception) as caught:
         await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, row)
     assert type(caught.value).__name__ == "PlanGenerationChanged"
@@ -817,7 +877,11 @@ async def test_stale_plan_generation_is_durably_rejected_and_refreshed_once(
         await _db.flush()
         return fresh
     service.request_llm_decision = AsyncMock(side_effect=refresh)
-    result = await service._dispatch_execution_decision(db_session, run, stale)
+    await db_session.commit()  # SPR230/231: end known stale-decision preparation before native dispatch.
+    from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+    async with service._lock_goal_for_baseline_transition(db_session, goal.id, tick_owns_transaction=True), \
+            baseline_operation(db_session, goal.id, owns_transaction=True, run_id=run.id):
+        result = await service._dispatch_execution_decision(db_session, run, stale)
     service.request_llm_decision.assert_awaited_once()
     service.execute_request_plan_action.assert_not_awaited()
     await db_session.refresh(stale)
@@ -887,11 +951,13 @@ async def test_exact_plan_replay_preserves_server_enrichment_and_successful_retr
             db_session, run_id=run.id, request=canonical, idempotency_key=f"{key}:rejected:1",
         )
     else:
+        await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
         action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
         assert action.request["orchestrator_context"]["product_context"] == {"scope": "synthetic"}
     state = copy.deepcopy(run.plan_state)
     cancel = AsyncMock(side_effect=AssertionError("exact replay cancelled live planner"))
     monkeypatch.setattr(service, "_cancel_superseded_planning_task", cancel)
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     replay = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
     assert replay.id == action.id
     assert run.plan_state == state

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import uuid
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun, OrchestrationWait
@@ -64,7 +65,7 @@ async def test_accepted_noop_with_wake_when_creates_waits_owned_by_decision(db_s
     service, decision = await _noop_with_wake_when(db_session, run, _wake_when())
     assert decision.validator_status == "accepted"
 
-    action = await service._dispatch_execution_decision(db_session, run, decision)
+    action = await _dispatch_owned_setup(service, db_session, run, decision)
 
     assert action.action_type == "noop"
     waits = await _waits(db_session, run)
@@ -77,7 +78,7 @@ async def test_noop_without_wake_when_creates_backstop_wait(db_session, test_pro
     run = await _run(db_session, test_project)
     service, decision = await _decide(db_session, run, {"action_type": "noop", "reason": "Waiting."})
 
-    await service._dispatch_execution_decision(db_session, run, decision)
+    await _dispatch_owned_setup(service, db_session, run, decision)
 
     waits = await _waits(db_session, run)
     assert len(waits) == 1
@@ -89,7 +90,7 @@ async def test_noop_with_invalid_wake_when_shape_creates_backstop(db_session, te
     run = await _run(db_session, test_project)
     service, decision = await _noop_with_wake_when(db_session, run, {"events": "not-a-list"})
 
-    await service._dispatch_execution_decision(db_session, run, decision)
+    await _dispatch_owned_setup(service, db_session, run, decision)
 
     waits = await _waits(db_session, run)
     assert len(waits) == 1
@@ -102,7 +103,7 @@ async def test_rejected_decision_fallback_noop_creates_backstop_wait(db_session,
     service, decision = await _decide(db_session, run, {"action_type": "not_a_real_action", "reason": "x"})
     assert decision.validator_status == "rejected"
 
-    action = await service._dispatch_execution_decision(db_session, run, decision)
+    action = await _dispatch_owned_setup(service, db_session, run, decision)
 
     assert action.action_type == "noop"
     waits = await _waits(db_session, run)
@@ -116,7 +117,7 @@ async def test_invalid_llm_output_creates_backstop_wait(db_session, test_project
     service, decision = await _decide(db_session, run, {}, llm_output="not json")
     assert decision.validator_status == "rejected"
 
-    action = await service._dispatch_execution_decision(db_session, run, decision)
+    action = await _dispatch_owned_setup(service, db_session, run, decision)
 
     assert action.action_type == "noop"
     waits = await _waits(db_session, run)
@@ -132,7 +133,7 @@ async def test_non_noop_dispatch_creates_no_waits(db_session, test_project):
     })
     assert decision.validator_status == "accepted"
 
-    action = await service._dispatch_execution_decision(db_session, run, decision)
+    action = await _dispatch_owned_setup(service, db_session, run, decision)
 
     assert action.action_type == "ask_human"
     assert await _waits(db_session, run) == []
@@ -144,7 +145,7 @@ async def test_stub_decision_wake_when_is_renormalized_and_clamped(db_session, t
         db_session, run, _wake_when(recheck_after_seconds=10 ** 9),
     )
 
-    await service._dispatch_execution_decision(db_session, run, decision)
+    await _dispatch_owned_setup(service, db_session, run, decision)
 
     waits = await _waits(db_session, run)
     assert waits
@@ -158,7 +159,7 @@ async def test_roadmap_accepted_plan_noop_creates_no_waits(db_session, test_proj
     await db_session.flush()
     service, decision = await _noop_with_wake_when(db_session, run, _wake_when())
 
-    await service._dispatch_execution_decision(db_session, run, decision)
+    await _dispatch_owned_setup(service, db_session, run, decision)
 
     assert await _waits(db_session, run) == []
 
@@ -167,9 +168,9 @@ async def test_replayed_dispatch_does_not_duplicate_waits(db_session, test_proje
     run = await _run(db_session, test_project)
     service, decision = await _noop_with_wake_when(db_session, run, _wake_when())
 
-    await service._dispatch_execution_decision(db_session, run, decision)
+    await _dispatch_owned_setup(service, db_session, run, decision)
     first = await _waits(db_session, run)
-    await service._dispatch_execution_decision(db_session, run, decision)
+    await _dispatch_owned_setup(service, db_session, run, decision)
 
     assert len(await _waits(db_session, run)) == len(first) == 1
 
@@ -288,3 +289,54 @@ async def test_act_until_wait_cap_reached_creates_no_post_wait(db_session, test_
     service = OrchestrationService()
     await service._act_until_wait(db_session, goal, run, once, loop_steps=frozenset({"next_action"}))
     assert await _orch_waits(db_session, run) == []
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+
+async def _dispatch_owned_setup(service, db, run, decision):
+    """Commit this test's immutable decision/setup before real native dispatch."""
+    await db.flush()
+    await db.commit()
+    from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+    async with service._lock_goal_for_baseline_transition(
+        db, run.goal_id, tick_owns_transaction=True,
+    ), baseline_operation(db, run.goal_id, run_id=run.id, owns_transaction=True):
+        return await service._dispatch_execution_decision(db, run, decision)

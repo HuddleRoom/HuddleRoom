@@ -25,6 +25,46 @@ async def _make_agent(db_session, *, name, role, capabilities=None, is_active=Tr
     return agent
 
 
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230: isolate committed preparation used by real native ticks."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'summary-owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # The per-test database is discarded; cyclic committed rows need no DELETE cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    # SPR230: committed fixtures must never launch application agents.
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
 @pytest.mark.asyncio
 async def test_management_profile_ranks_manager_roles_strong(db_session, test_project):
     from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
@@ -736,6 +776,7 @@ async def test_force_rerun_replaces_pending_decision_from_prior_process_run(
         return ManagerAssessment("override", "no_manager", "exercise frozen override")
 
     monkeypatch.setattr(ManagerSelectionAnalyzer, "review", override_no_manager)
+    await db_session.commit()  # SPR230: publish authored rerun preparation.
     summary = await OrchestrationDebugService().rerun_last(
         db_session, test_project.id, standard_goal.id, "manager_selection"
     )
@@ -1559,6 +1600,7 @@ async def test_tick_advances_manager_selection_after_goal_definition(
         created_by_user_id=None,
     )
     run.baseline_authorized = True
+    await db_session.commit()  # SPR230: publish authored baseline preparation.
     result = await service.tick(db_session, run.id)
     assert result["baseline_process"]["status"] == "completed"
     assert result["manager_selection_process"]["status"] == "completed"
@@ -1609,6 +1651,7 @@ async def test_tick_does_not_start_manager_selection_before_goal_definition_term
         created_by_user_id=None,
     )
     run.baseline_authorized = True
+    await db_session.commit()  # SPR230: publish authored baseline preparation.
     result = await service.tick(db_session, run.id)
     assert result["baseline_process"]["status"] == "waiting_decision"
     assert result["manager_selection_process"] is None

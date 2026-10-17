@@ -1,6 +1,8 @@
 """Shared asyncio/Celery entry points for orchestration supervision."""
 from __future__ import annotations
 
+from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
+
 from sqlalchemy.orm import SessionTransactionOrigin
 
 import asyncio
@@ -46,25 +48,29 @@ async def _drain_answer_event(db, event_type, payload):
         return
     from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
     from huddleroom.services.orchestration_answer_receipts import drain_answer_applications
-    decision = await db.get(OrchestrationAuthorityDecision, UUID(str(payload["decision_id"])))
-    run_id = decision.run_id if decision else None
-    if decision is not None and decision.continuation_action_id is not None:
-        from huddleroom.models.orchestration import OrchestrationAction
-        action = await db.get(OrchestrationAction, decision.continuation_action_id)
-        if action is not None and action.action_type == "apply_authority_answer":
-            run_id = action.run_id
-    if run_id is None and decision is not None and decision.source_process_run_id is not None:
-        from huddleroom.models.orchestration_process import OrchestrationProcessRun
-        source = await db.get(OrchestrationProcessRun, decision.source_process_run_id)
-        run_id = source.run_id if source else None
-    await db.commit()  # End the worker-owned event lookup before consumer goal locks.
-    if run_id:
-        await drain_answer_applications(db, run_id)
-        await db.commit()
+    from huddleroom.services.orchestration_baseline_runtime import owns_control_transaction
+    if not owns_control_transaction(db):
+        return  # A reusable event helper cannot publish supplied caller work.
+    with db.no_autoflush:
+        decision = await db.get(OrchestrationAuthorityDecision, UUID(str(payload["decision_id"])))
+        run_id = decision.run_id if decision else None
+        if decision is not None and decision.continuation_action_id is not None:
+            from huddleroom.models.orchestration import OrchestrationAction
+            action = await db.get(OrchestrationAction, decision.continuation_action_id)
+            if action is not None and action.action_type == "apply_authority_answer":
+                run_id = action.run_id
+        if run_id is None and decision is not None and decision.source_process_run_id is not None:
+            from huddleroom.models.orchestration_process import OrchestrationProcessRun
+            source = await db.get(OrchestrationProcessRun, decision.source_process_run_id)
+            run_id = source.run_id if source else None
+        await db.commit()  # Ownership was proven at the actual worker session boundary.
+        if run_id:
+            await drain_answer_applications(db, run_id)
+            await db.commit()
 
 
 async def evaluate_supervision_run_async(run_id) -> int:
-    async with AsyncSessionLocal() as db:
+    async with AsyncSessionLocal() as db, control_operation_owner(db):
         try:
             count = await OrchestrationSupervisionScheduler().evaluate_run(db, UUID(str(run_id)))
             await db.commit()
@@ -78,7 +84,7 @@ async def evaluate_supervision_event_async(event_id) -> int:
     from huddleroom.services.orchestration_service import GOAL_RESUMED_EVENT_TYPE, OrchestrationService
 
     await asyncio.sleep(settings.orchestration_event_coalesce_seconds)
-    async with AsyncSessionLocal() as db:
+    async with AsyncSessionLocal() as db, control_operation_owner(db):
         try:
             event = await db.scalar(select(EventLog).where(EventLog.id == UUID(str(event_id))))
             if event is None or event.event_type not in SUPPORTED_EVENTS:
@@ -120,7 +126,7 @@ async def evaluate_supervision_event_async(event_id) -> int:
 
 
 async def supervise_orchestration_async() -> int:
-    async with AsyncSessionLocal() as db:
+    async with AsyncSessionLocal() as db, control_operation_owner(db):
         try:
             from huddleroom.models.orchestration import OrchestrationAction
             from huddleroom.services.orchestration_answer_receipts import drain_answer_applications
@@ -164,7 +170,7 @@ async def run_orchestration_event_supervisor(
             run_ids, resumed = set(pending_run_ids), set(resumed_run_ids)
             pending_run_ids.clear()
             resumed_run_ids.clear()
-            async with AsyncSessionLocal() as db:
+            async with AsyncSessionLocal() as db, control_operation_owner(db):
                 for run_id in resumed:
                     try:
                         transaction = db.sync_session.get_transaction()
@@ -195,7 +201,7 @@ async def run_orchestration_event_supervisor(
                     if delayed is None or delayed.done():
                         delayed = asyncio.create_task(evaluate_after_coalesce())
                 continue
-            async with AsyncSessionLocal() as db:
+            async with AsyncSessionLocal() as db, control_operation_owner(db):
                 try:
                     await _drain_answer_event(db, event.event_type, event.payload)
                     run_ids = await OrchestrationSupervisionScheduler().record_event(

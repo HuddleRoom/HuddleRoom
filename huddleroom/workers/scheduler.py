@@ -1,4 +1,4 @@
-from sqlalchemy.orm import SessionTransactionOrigin
+from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
 import logging
 import asyncio
 from collections import deque
@@ -180,29 +180,28 @@ async def reconcile_orchestration_runs_async(db) -> int:
     from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
     from huddleroom.services.orchestration_service import OrchestrationService
 
-    rows = await db.execute(
-        select(OrchestrationRun.id)
-        .join(OrchestrationGoal, OrchestrationGoal.id == OrchestrationRun.goal_id)
-        .where(
-            OrchestrationRun.status.in_(("running", "blocked")),
-            OrchestrationGoal.status.in_(("active", "blocked")),
-            ~((OrchestrationGoal.goal_type == "continuous") & (OrchestrationRun.phase == "waiting_activation")),
+    with db.no_autoflush:
+        rows = await db.execute(
+            select(OrchestrationRun.id)
+            .join(OrchestrationGoal, OrchestrationGoal.id == OrchestrationRun.goal_id)
+            .where(
+                OrchestrationRun.status.in_(("running", "blocked")),
+                OrchestrationGoal.status.in_(("active", "blocked")),
+                ~((OrchestrationGoal.goal_type == "continuous") & (OrchestrationRun.phase == "waiting_activation")),
+            )
         )
-    )
     run_ids = [row[0] for row in rows.all()]
     service = OrchestrationService()
     reconciled = 0
     for run_id in run_ids:
         try:
-            transaction = db.sync_session.get_transaction()
-            if (not db.in_nested_transaction() and (transaction is None
-                    or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)):
-                await db.commit()  # Publish this worker's preflight before acquiring goal locks.
             await service.tick(db, run_id)
             reconciled += 1
         except Exception as exc:  # one bad run must not stop the sweep
             logger.error("Orchestration reconcile failed for run %s: %s", run_id, exc)
-            await db.rollback()
+            from huddleroom.services.orchestration_baseline_runtime import owns_control_transaction
+            if owns_control_transaction(db):
+                await db.rollback()
     return reconciled
 
 
@@ -232,7 +231,7 @@ async def reconcile_continuous_goals_async(db, now=None) -> int:
 async def reconcile_orchestration_runs_job() -> None:
     from huddleroom.database import AsyncSessionLocal
     try:
-        async with AsyncSessionLocal() as db:
+        async with AsyncSessionLocal() as db, control_operation_owner(db):
             await reconcile_continuous_goals_async(db)
             await reconcile_orchestration_runs_async(db)
     except Exception as e:

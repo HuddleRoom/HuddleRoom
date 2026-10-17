@@ -29,6 +29,46 @@ from huddleroom.services.orchestration_service import OrchestrationService
 from tests.conftest import heal_baseline_drift_for_test
 
 
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230: isolate committed preparation used by real native ticks."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'summary-owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # The per-test database is discarded; cyclic committed rows need no DELETE cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    # SPR230: committed fixtures must never launch application agents.
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
 @pytest.fixture(autouse=True)
 def _manual_task_start(monkeypatch):
     # These tests drive the release-then-manual-run flow; auto-start is covered in test_orchestration_task_autostart.py.
@@ -229,6 +269,8 @@ async def _real_planning_expansion_run(db_session, project_id, planner: Agent, d
         request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
         idempotency_key=f"run:{run.id}:kind:accept_plan",
     )
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     release = await service.tick(db_session, run.id)
     assert release["authorized_execution"] == {"step": "release_work", "released": 1}
     expansion_action = (
@@ -676,6 +718,8 @@ async def _request_summary(db_session, test_project):
     service, goal, run = await _make_run(db_session, test_project.id)
     await _accepted_gate(db_session, run.id, "implemented")
     await _accepted_gate(db_session, run.id, "validated")
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     tick_result = await service.tick(db_session, run.id)
     assert tick_result["final_summary_action_id"] is not None
     action = await db_session.get(OrchestrationAction, tick_result["final_summary_action_id"])
@@ -697,6 +741,8 @@ async def test_tick_requests_summary_after_all_non_summary_gates_pass(db_session
     await _accepted_gate(db_session, run.id, "implemented")
     await _accepted_gate(db_session, run.id, "validated")
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -728,6 +774,8 @@ async def test_tick_weak_summary_fit_suggests_agent_then_retries(db_session, tes
     await _accepted_gate(db_session, run.id, "implemented")
     await _accepted_gate(db_session, run.id, "validated")
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     weak_tick = await service.tick(db_session, run.id)
 
     assert weak_tick["final_summary_action_id"] is None
@@ -745,6 +793,8 @@ async def test_tick_weak_summary_fit_suggests_agent_then_retries(db_session, tes
     db_session.add(writer)
     await db_session.flush()
     await _complete_goal_definition(db_session, _goal, run)
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     retry_tick = await service.tick(db_session, run.id)
 
     assert retry_tick["final_summary_action_id"] is not None
@@ -766,6 +816,8 @@ async def test_summary_task_done_without_session_keeps_gate_and_run_open(db_sess
         dedup_key=f"phase17-task-done:{task.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -801,6 +853,8 @@ async def test_empty_summary_session_fails_final_gate(db_session, test_project):
         dedup_key=f"phase17-session-completed:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     await db_session.refresh(gate)
@@ -831,6 +885,8 @@ async def test_summary_session_requires_valid_json(db_session, test_project):
         dedup_key=f"phase17-invalid-json:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(gate)
@@ -970,6 +1026,8 @@ async def test_summary_session_rejects_invalid_json_shape_and_coverage(
         dedup_key=f"phase17-invalid-json-shape:{case}:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(gate)
@@ -1020,6 +1078,8 @@ async def test_summary_session_requires_completed_assigned_agent(
         dedup_key=f"phase17-session-completed:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     await db_session.refresh(gate)
@@ -1060,6 +1120,8 @@ async def test_summary_session_rejects_unaccepted_evidence_id(db_session, test_p
         dedup_key=f"phase17-unaccepted-evidence:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(gate)
@@ -1104,6 +1166,8 @@ async def test_summary_rejects_reusing_one_criterion_verification_for_another(db
         dedup_key=f"phase17-reused-criterion-evidence:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -1169,6 +1233,8 @@ async def test_summary_allows_one_plan_item_verification_linked_to_both_criteria
         dedup_key=f"phase17-joint-criterion-summary:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -1204,7 +1270,11 @@ async def test_summary_session_completes_run_once_with_evidence_manifest(db_sess
         dedup_key=f"phase17-session-completed:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     replay = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -1333,8 +1403,12 @@ async def test_summary_session_completes_real_planning_expansion_flow(db_session
         dedup_key=f"phase17-real-flow-session-completed:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     first = await service.tick(db_session, run.id)
     assert first["authorized_execution"]["outcome"] == "closeout_ready"
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     second = await service.tick(db_session, run.id)
     assert second["goal_closeout_process"]["status"] == "waiting_decision"
     from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
@@ -1358,6 +1432,8 @@ async def test_summary_session_completes_real_planning_expansion_flow(db_session
             reason="Evidence is sufficient.",
             decided_by_agent_id=decision.authority_agent_id,
         )
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -1404,6 +1480,8 @@ async def test_explicit_exceeded_budget_blocks_completion(db_session, test_proje
         dedup_key=f"phase17-session-completed:{session.id}",
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -1450,6 +1528,8 @@ async def test_tick_resumes_reserved_complete_run_action(db_session, test_projec
         },
     )
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -1476,6 +1556,8 @@ async def _repeat_failure_in_correction(db_session, service, run, task, output):
     await emit_event_once(db_session, correction.project_id, "session.completed",
                           {"session_id": str(session.id), "task_id": str(correction.id)},
                           dedup_key=f"summary-correction-repeat:{session.id}")
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     return session, await service.tick(db_session, run.id)
 
 
@@ -1510,6 +1592,8 @@ async def test_invalid_summary_creates_one_recovery_trigger_not_a_replacement(
     )
     tasks_before = await db_session.scalar(select(func.count(Task.id)))
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     correction_tick = await service.tick(db_session, run.id)
     assert correction_tick["recoveries_created"] == 0 and await _gate_triggers(db_session, run.id) == []
     assert await db_session.scalar(select(func.count(Task.id))) == tasks_before + 1  # the output-only correction
@@ -1535,6 +1619,8 @@ async def test_invalid_summary_creates_one_recovery_trigger_not_a_replacement(
     assert len(await _gate_triggers(db_session, run.id)) == 1
     await _complete_goal_definition(db_session, goal, run)
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     replay = await service.tick(db_session, run.id)
     assert replay["recoveries_created"] == 0
     assert len(await _gate_triggers(db_session, run.id)) == 1
@@ -1556,6 +1642,8 @@ async def test_recovery_trigger_is_stable_per_failed_summary_evidence(db_session
             {"session_id": str(session.id), "task_id": str(task.id)},
             dedup_key=f"phase17-stable-replacement:{session.id}",
         )
+        # SPR230: publish this test-owned preparation before native admission.
+        await db_session.commit()
         await service.tick(db_session, run.id)
 
     await invalid("bad one")
@@ -1563,6 +1651,8 @@ async def test_recovery_trigger_is_stable_per_failed_summary_evidence(db_session
     await _repeat_failure_in_correction(db_session, service, run, task, "bad one")
     first = await _gate_triggers(db_session, run.id)
     await _complete_goal_definition(db_session, _goal, run)
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     await service.tick(db_session, run.id)
     assert [row.id for row in await _gate_triggers(db_session, run.id)] == [row.id for row in first]
 
@@ -1611,6 +1701,8 @@ async def test_terminal_status_after_recovery_blocks_completion(
 
     monkeypatch.setattr(service, "recover_run", terminal_recovery)
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(run)
@@ -1795,6 +1887,8 @@ async def test_failed_complete_run_action_does_not_report_run_completed(db_sessi
     )
     await service.mark_action_failed(db_session, failed_action, "simulated completion failure")
 
+    # SPR230: publish this test-owned preparation before native admission.
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(failed_action)

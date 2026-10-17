@@ -1,3 +1,6 @@
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 import uuid
 from datetime import timedelta
 import json
@@ -24,6 +27,46 @@ from huddleroom.services.orchestration_process_service import OrchestrationProce
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 import pytest
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/231: discard committed cyclic Continuous fixtures as a whole database."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-context.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # Per-test database disposal avoids changing global FK-aware cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    """SPR230/231: each scenario explicitly publishes setup before owned native ticks."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+        await session.rollback()
 
 
 class _EffectivenessAnalyzerStub:
@@ -1054,6 +1097,7 @@ async def test_tick_runs_effectiveness_after_recovery_and_only_waiting_blocks_fi
     )
     monkeypatch.setattr(service, "_run_ready_for_completion", completion_ready)
 
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     result = await service.tick(db_session, run.id)
 
     assert calls == [
@@ -1110,6 +1154,7 @@ async def test_recovery_that_blocks_run_skips_effectiveness_review(
     stub = _EffectivenessAnalyzerStub("revise")
     monkeypatch.setattr(EffectivenessAnalyzer, "review_request", stub.review_request)
 
+    await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     result = await OrchestrationService().tick(db_session, run.id)
 
     assert result["status"] == "blocked"

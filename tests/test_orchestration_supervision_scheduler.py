@@ -472,3 +472,79 @@ async def test_spr213_supervisor_awaits_drain_on_cancel(monkeypatch, active):
     assert len(ticks) == (1 if active else 0)
     assert finalized.is_set() is active
     assert bus._subscribers == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_kind", ["orm", "core"])
+@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
+async def test_supplied_session_preserves_unrelated_writes_on_all_outcomes(
+    test_engine, monkeypatch, tmp_path, write_kind, outcome,
+):
+    # This checks the reusable helper's publication/error boundary, not a real owning job.
+    import asyncio
+    from fastapi import HTTPException
+    from sqlalchemy import delete, event, update
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from huddleroom.models.project import Project
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as setup:
+        project = Project(name="SPR230/SPR231 caller preservation", description="committed", workspace_path=str(tmp_path), config={})
+        setup.add(project)
+        await setup.flush()
+        goal = OrchestrationGoal(project_id=project.id, objective="Caller preservation", status="active")
+        setup.add(goal)
+        await setup.flush()
+        run = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized", budget_state={})
+        setup.add(run)
+        await setup.commit()
+        project_id, goal_id, run_id = project.id, goal.id, run.id
+
+    attempted = []
+
+    async def boundary_tick(self, db, rid, **kwargs):
+        attempted.append(rid)
+        if outcome == "refusal":
+            raise HTTPException(409, detail={"conflict": "orchestration_transaction_shape"})
+        if outcome == "exception":
+            raise RuntimeError("injected downstream failure")
+        return {"run_id": rid, "status": "running"}
+
+    monkeypatch.setattr(OrchestrationService, "tick", boundary_tick)
+    try:
+        async with factory() as caller:
+            project = await caller.get(Project, project_id)
+            if write_kind == "orm":
+                project.description = "caller-only"
+                await caller.flush()
+            else:
+                caller.expunge(project)
+                await caller.execute(update(Project).where(Project.id == project_id).values(
+                    description="caller-only",
+                ).execution_options(synchronize_session=False))
+                assert not caller.new and not caller.dirty and not caller.deleted
+            root = caller.sync_session.get_transaction()
+            calls = []
+            for name in ("before_flush", "before_commit", "after_rollback"):
+                event.listen(caller.sync_session, name, lambda *args, name=name: calls.append(name))
+            try:
+                await asyncio.wait_for(OrchestrationSupervisionScheduler()._tick(caller, run_id), 3)
+            except (HTTPException, RuntimeError):
+                assert outcome != "success"
+            assert attempted == [run_id]
+            assert calls == []
+            assert caller.sync_session.get_transaction() is root and root.is_active
+            with caller.no_autoflush:
+                assert await caller.scalar(select(Project.description).where(Project.id == project_id)) == "caller-only"
+            async with factory() as fresh:
+                assert (await fresh.get(Project, project_id)).description == "committed"
+            await caller.rollback()
+        async with factory() as fresh:
+            assert (await fresh.get(Project, project_id)).description == "committed"
+    finally:
+        async with factory() as cleanup:
+            await cleanup.execute(delete(OrchestrationRun).where(OrchestrationRun.id == run_id))
+            await cleanup.execute(delete(OrchestrationGoal).where(OrchestrationGoal.id == goal_id))
+            await cleanup.execute(delete(Project).where(Project.id == project_id))
+            await cleanup.commit()

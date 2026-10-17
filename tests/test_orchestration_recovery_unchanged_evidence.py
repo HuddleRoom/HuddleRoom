@@ -44,7 +44,8 @@ async def test_public_ticks_bound_unchanged_failed_action_queries_without_manufa
         lambda: real_service(analyzer=RecoveryAnalyzer(completion_fn=completion)),
     )
 
-    async def baseline(_service, _db, _run_id, *, local_only=False):
+    async def baseline(_service, _db, _run_id, *, local_only=False, owns_transaction=False):
+        assert owns_transaction is True  # SPR230: public tick owns its fresh-session operation.
         return {"status": "probe_baseline_stub"}
 
     monkeypatch.setattr(OrchestrationService, "_tick_baseline_impl", baseline)

@@ -52,6 +52,18 @@ class OrchestrationDebugService:
     the run/goal -- tick() stays the only place that does all of that together.
     """
 
+    @staticmethod
+    async def _prepare_caller(db: AsyncSession, goal_id: uuid.UUID, request_owns_transaction: bool) -> bool:
+        """Return True when a supplied caller owns the transaction; refuse before any write if it has
+        pending ORM edits, since this path's flush() would publish them into its transaction."""
+        caller_owns = not await OrchestrationService()._prepare_control_operation(
+            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
+        )
+        if caller_owns and (db.new or db.dirty or db.deleted):
+            raise HTTPException(409, detail={"conflict": "orchestration_transaction_shape",
+                                            "message": "End caller work before acquiring goal transition locks"})
+        return caller_owns
+
     async def step(self, db: AsyncSession, project_id: uuid.UUID, goal_id: uuid.UUID, process_type: str,
                    *, request_owns_transaction: bool = False) -> dict:
         if process_type not in SUPPORTED_PROCESS_TYPES:
@@ -59,12 +71,11 @@ class OrchestrationDebugService:
 
         orchestration_service = OrchestrationService()
 
-        caller_owns_transaction = not await OrchestrationService()._prepare_control_operation(
-            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
-        )
+        caller_owns_transaction = await self._prepare_caller(db, goal_id, request_owns_transaction)
 
-        if await orchestration_service.get_goal(db, project_id, goal_id) is None:
-            raise HTTPException(status_code=404, detail="Orchestration goal not found")
+        with db.no_autoflush:
+            if await orchestration_service.get_goal(db, project_id, goal_id) is None:
+                raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
         try:
             return await self._step_locked(db, project_id, goal_id, process_type, caller_owns_transaction)
@@ -144,9 +155,7 @@ class OrchestrationDebugService:
         if process_type not in SUPPORTED_PROCESS_TYPES:
             raise HTTPException(status_code=400, detail=f"Unsupported process type '{process_type}'")
 
-        caller_owns_transaction = not await OrchestrationService()._prepare_control_operation(
-            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
-        )
+        caller_owns_transaction = await self._prepare_caller(db, goal_id, request_owns_transaction)
         try:
             return await self._retry_locked(db, project_id, goal_id, process_type, caller_owns_transaction)
         except RosterHandoffRequired as handoff:
@@ -259,12 +268,11 @@ class OrchestrationDebugService:
 
         orchestration_service = OrchestrationService()
 
-        caller_owns_transaction = not await OrchestrationService()._prepare_control_operation(
-            db, goal_id=goal_id, request_owns_transaction=request_owns_transaction,
-        )
+        caller_owns_transaction = await self._prepare_caller(db, goal_id, request_owns_transaction)
 
-        if await orchestration_service.get_goal(db, project_id, goal_id) is None:
-            raise HTTPException(status_code=404, detail="Orchestration goal not found")
+        with db.no_autoflush:
+            if await orchestration_service.get_goal(db, project_id, goal_id) is None:
+                raise HTTPException(status_code=404, detail="Orchestration goal not found")
 
         require_baseline_available(goal_id)
         async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id), baseline_operation(

@@ -25,7 +25,7 @@ from huddleroom.services.action_executor import ActionExecutor
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionClaimAttention
 from huddleroom.services.task_service import TaskService
-from tests.test_orchestration_roadmap_integration import child_item, release
+from tests.test_orchestration_roadmap_integration import child_item, release as _release
 from tests.test_orchestration_runtime_e2e import _agent
 from tests.test_session_orchestration_claims import _root_outcome
 
@@ -39,6 +39,32 @@ def _manual_task_start(monkeypatch):
 
 
 pytestmark = pytest.mark.asyncio
+
+
+from contextlib import asynccontextmanager
+from unittest.mock import patch
+
+
+@asynccontextmanager
+async def _owned_roadmap_setup(db):
+    """Prepare only the exact lexical imported setup helper's native ticks."""
+    original = OrchestrationService.tick
+
+    async def tick(service, candidate, *args, **kwargs):
+        root = candidate.sync_session.get_transaction()
+        if (candidate is db and not candidate.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await candidate.flush()
+            await candidate.commit()
+        return await original(service, candidate, *args, **kwargs)
+
+    with patch.object(OrchestrationService, "tick", tick):
+        yield
+
+
+async def release(db, *args, **kwargs):
+    async with _owned_roadmap_setup(db):
+        return await _release(db, *args, **kwargs)
 
 
 @pytest_asyncio.fixture
@@ -414,6 +440,7 @@ async def test_paused_parent_tick_recovers_only_its_claim_after_headroom_returns
     ]
     await db_session.flush()
 
+    await db_session.commit()  # This test owns the staged paused state and claim telemetry.
     await OrchestrationService().tick(db_session, parent_run.id)
 
     await db_session.refresh(parent_run)
@@ -452,6 +479,7 @@ async def test_child_tick_recovers_only_its_claim_when_parent_is_paused_and_keep
     ))
     await db_session.flush()
 
+    await db_session.commit()  # Publish this test's paused child/measurement setup before native tick.
     await OrchestrationService().tick(db_session, child_run.id)
     await db_session.refresh(child_run)
     assert any(item.get("scope") == f"claim:{child.id}" for item in child_run.active_blockers)
@@ -460,6 +488,7 @@ async def test_child_tick_recovers_only_its_claim_when_parent_is_paused_and_keep
     measured = await db_session.scalar(select(Session).where(Session.task_id == child_task.id))
     measured.metadata_ = {"token_count_in": 1, "token_count_out": 1}
     await db_session.flush()
+    await db_session.commit()  # The repaired telemetry is known fixture-owned input to reconciliation.
     await OrchestrationService().tick(db_session, child_run.id)
     await db_session.refresh(child_run)
     assert not any(item.get("scope") == f"claim:{child.id}" for item in child_run.active_blockers)

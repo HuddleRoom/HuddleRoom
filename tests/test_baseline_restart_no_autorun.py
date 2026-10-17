@@ -9,6 +9,7 @@ Exercises the real `reconcile_orchestration_runs_async` scheduler path
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
 
@@ -16,10 +17,54 @@ from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration_process import OrchestrationProcessRun, OrchestrationWarning
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
 from huddleroom.services.orchestration_manager_analyzer import ManagerAssessment, ManagerSelectionAnalyzer
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 from huddleroom.workers.scheduler import reconcile_orchestration_runs_async
+
+
+@pytest.fixture(autouse=True)
+def _no_live_native_dispatch(monkeypatch):
+    """Keep committed semantic fixtures from launching real app workers."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Isolate committed native setup, including cyclic roadmap references."""
+    from sqlalchemy import event
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-orchestration.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # Per-test database is discarded whole; no global FK cleanup is changed.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for real service/worker entrypoints."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 @pytest.fixture(autouse=True)
@@ -118,9 +163,12 @@ async def test_fresh_unauthorized_goal_reconcile_is_a_pure_noop(db_session, test
 
     goal, run = await _create_goal(db_session, test_project)
     assert run.baseline_authorized is False
+    # Publish lexical setup before the real worker owns its preflight.
+    await db_session.commit()
 
     for _ in range(3):
-        reconciled = await reconcile_orchestration_runs_async(db_session)
+        async with control_operation_owner(db_session):
+            reconciled = await reconcile_orchestration_runs_async(db_session)
         assert reconciled == 1
 
     assert await _process_rows(db_session) == []
@@ -166,7 +214,8 @@ async def test_authorized_goal_reconcile_advances_chain_then_stale_input_handlin
     )
     assert run.baseline_authorized is True
 
-    reconciled = await reconcile_orchestration_runs_async(db_session)
+    async with control_operation_owner(db_session):
+        reconciled = await reconcile_orchestration_runs_async(db_session)
     assert reconciled == 1
     await db_session.refresh(run)
 
@@ -199,7 +248,8 @@ async def test_authorized_goal_reconcile_advances_chain_then_stale_input_handlin
     agent.config = {"temperature": 0.9}
     await db_session.flush()
 
-    await reconcile_orchestration_runs_async(db_session)
+    async with control_operation_owner(db_session):
+        await reconcile_orchestration_runs_async(db_session)
 
     assert len(await _process_rows(db_session)) == 4  # no new row
     warnings = (await db_session.execute(select(OrchestrationWarning))).scalars().all()
@@ -216,7 +266,8 @@ async def test_authorized_goal_reconcile_advances_chain_then_stale_input_handlin
     agent.system_prompt = "Implement the requested change differently and verify it."
     await db_session.flush()
 
-    await reconcile_orchestration_runs_async(db_session)
+    async with control_operation_owner(db_session):
+        await reconcile_orchestration_runs_async(db_session)
 
     assert len(await _process_rows(db_session)) == 4  # still no new row
     stale_warnings = [
@@ -234,7 +285,8 @@ async def test_authorized_goal_reconcile_advances_chain_then_stale_input_handlin
     assert {d.id for d in pending_before} <= {d.id for d in pending_after}
 
     # reconcile again with the same drift: still exactly one warning (idempotent)
-    await reconcile_orchestration_runs_async(db_session)
+    async with control_operation_owner(db_session):
+        await reconcile_orchestration_runs_async(db_session)
     stale_warnings_again = [
         w for w in (await db_session.execute(select(OrchestrationWarning))).scalars().all()
         if w.warning_type == "agent_definition_review_stale_inputs"
@@ -251,7 +303,8 @@ async def test_authorized_goal_reconcile_advances_chain_then_stale_input_handlin
     agent.system_prompt = "A third, further-changed persona."
     await db_session.flush()
 
-    await reconcile_orchestration_runs_async(db_session)
+    async with control_operation_owner(db_session):
+        await reconcile_orchestration_runs_async(db_session)
 
     all_stale_warnings = [
         w for w in (await db_session.execute(select(OrchestrationWarning))).scalars().all()

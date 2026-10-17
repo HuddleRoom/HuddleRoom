@@ -5,6 +5,47 @@ import json
 import uuid
 
 import pytest
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
 from sqlalchemy import select
 
 from huddleroom.config import settings
@@ -90,6 +131,8 @@ def _orchestrator(ctx):
 
 async def _tick(service, db, run, stub_decision, decision=_orchestrator):
     stub_decision(decision)
+    await db.flush()
+    await db.commit()  # This driver owns the preceding scenario setup, never an external caller transaction.
     result = await service.tick(db, run.id)
     await db.refresh(run)
     return result
@@ -101,6 +144,7 @@ async def _dispatch(db, service, run, parsed):
                                      validator_status="accepted", parsed_decision=parsed)
     db.add(decision)
     await db.flush()
+    await db.commit()  # This scenario owns its prepared immutable decision before native dispatch.
     return await OrchestrationDecisionDispatcher(service).dispatch(db, run, decision)
 
 
@@ -145,7 +189,7 @@ async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
     researcher.role, verifier.role = "researcher", "validator"
     db_session.add_all([planner, product, researcher, verifier])
     await db_session.flush()
-    service, goal, run = await _authorized_run(db_session, test_project, success_criteria=CRITERIA)
+    service, goal, run = await _authorized_run(db_session, test_project, success_criteria=CRITERIA, owns_setup=True)
 
     # --- Planning: the lead is asked for a plan, which is late.
     await _tick(service, db_session, run, stub_decision, lambda _ctx: {

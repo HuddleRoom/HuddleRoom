@@ -611,3 +611,147 @@ async def test_paused_pending_reservation_redispatches_same_runner_on_resume(ses
         assert len(all_sessions) == 1
         assert all_sessions[0].id == session_id and all_sessions[0].runner_task_id == runner_id
         assert all_sessions[0].status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["single", "duplicate", "changed_runner", "paused_again", "reset", "rollback", "normal_running"])
+async def test_resume_recovers_pending_claim_after_denied_live_worker_finishes(sessions, tmp_path, monkeypatch, recovery):
+    """SPR230/SPR231 one Resume/tick must survive the denied worker's closing window."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select
+    from huddleroom.models.session import Session
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from huddleroom.workers import task_runner
+    from huddleroom.workers.session_tasks import _require_runnable_session
+
+    project, agent = await _publication_seed(sessions, tmp_path)
+    begin_claim, denied, allow_exit, replacement_claimed = [asyncio.Event() for _ in range(4)]
+    executions, claims = [], []
+    deferred_published = asyncio.Event()
+    publish = getattr(task_runner, "_publish_deferred_session_dispatch", None)
+    if publish:
+        def observed_publish(*args, **kwargs):
+            try:
+                return publish(*args, **kwargs)
+            finally:
+                deferred_published.set()
+        monkeypatch.setattr(task_runner, "_publish_deferred_session_dispatch", observed_publish)
+
+    async def execute(session_id, runner_id):
+        executions.append((session_id, runner_id))
+        if len(executions) == 1:
+            await asyncio.wait_for(begin_claim.wait(), 3)
+        async with sessions() as worker:
+            try:
+                allowed = await _require_runnable_session(worker, uuid.UUID(session_id), runner_id)
+            except HTTPException as exc:
+                assert recovery in {"reset", "changed_runner"} and exc.status_code == 409
+                allowed = False
+            claims.append(allowed)
+            await worker.commit()
+        if len(executions) == 1:
+            assert allowed is (recovery == "normal_running")
+            denied.set()
+            # Model actual worker/session cleanup after the terminal claim decision.
+            await asyncio.wait_for(allow_exit.wait(), 3)
+        else:
+            assert allowed is (recovery in {"single", "duplicate"})
+            replacement_claimed.set()
+
+    monkeypatch.setattr(task_runner, "execute_api_session", execute)
+    runner_id, old = None, None
+    try:
+        async with sessions() as setup:
+            goal, run, task, _ = await _root_outcome(setup, project, agent, {})
+            await setup.commit()
+            reserved = await SessionService().create(setup, SessionCreate(
+                agent_id=agent.id, project_id=project.id, task_id=task.id))
+            await setup.commit()
+            session_id, runner_id = reserved.id, reserved.runner_task_id
+        old = task_runner.get_running_tasks()[runner_id]
+        if recovery != "normal_running":
+            async with sessions() as pause:
+                await OrchestrationService().pause_goal(pause, project.id, goal.id)
+        begin_claim.set()
+        await asyncio.wait_for(denied.wait(), 3)
+        assert task_runner.is_task_live(runner_id)
+        if recovery != "normal_running":
+            async with sessions() as resume:
+                await OrchestrationService().resume_goal(resume, project.id, goal.id)
+                await resume.commit()
+        service = OrchestrationService()
+        # Full tick reaches real redispatch before unrelated authorized planning.
+        monkeypatch.setattr(service, "_hard_stop_active", AsyncMock(return_value=True))
+        async with sessions() as tick:
+            if recovery == "rollback":
+                # Real registration helper remains queued until outer success.
+                await SessionService().redispatch_pending_orchestration(tick, run.id)
+                await tick.rollback()
+            else:
+                await service.tick(tick, run.id)
+                await tick.commit()
+        if recovery == "duplicate":
+            # Two independent outer commits must collapse to one deferred retry.
+            async with sessions() as resume:
+                with pytest.raises(HTTPException) as duplicate:
+                    await OrchestrationService().resume_goal(resume, project.id, goal.id)
+                assert duplicate.value.status_code == 409  # already active; no new authority
+                await resume.rollback()
+            async with sessions() as tick:
+                await service.tick(tick, run.id)
+                await tick.commit()
+        assert executions == [(str(session_id), runner_id)]
+        assert task_runner.get_running_tasks()[runner_id] is old
+        if recovery == "changed_runner":
+            from sqlalchemy import update
+            async with sessions() as changed:
+                await changed.execute(update(Session).where(Session.id == session_id).values(runner_task_id="new-attempt"))
+                await changed.commit()
+        elif recovery == "paused_again":
+            async with sessions() as pause:
+                await OrchestrationService().pause_goal(pause, project.id, goal.id)
+        elif recovery == "reset":
+            async with sessions() as reset:
+                await OrchestrationService().reset_goal(reset, project.id, goal.id)
+                await reset.commit()
+        allow_exit.set()
+        await asyncio.wait_for(old, 3)
+        if recovery in {"rollback", "normal_running"}:
+            assert executions == [(str(session_id), runner_id)]
+            assert claims == [recovery == "normal_running"]
+        else:
+            await asyncio.wait_for(replacement_claimed.wait(), 3)
+            assert executions == [(str(session_id), runner_id)] * 2
+            assert claims == [False, recovery in {"single", "duplicate"}]
+            if publish:
+                await asyncio.wait_for(deferred_published.wait(), 3)
+            replacement = task_runner.get_running_tasks().get(runner_id)
+            if replacement is not None:
+                await asyncio.wait_for(replacement, 3)
+            assert executions == [(str(session_id), runner_id)] * 2
+            deferred = getattr(task_runner, "_deferred_session_dispatches", {})
+            assert not any(key[0] == runner_id for key in deferred), "retry must not self-reschedule"
+        assert not any(key[0] == runner_id for key in getattr(task_runner, "_deferred_session_dispatches", {}))
+        async with sessions() as fresh:
+            all_sessions = list((await fresh.scalars(select(Session).where(Session.task_id == task.id))).all())
+            assert len(all_sessions) == 1
+            expected_runner = "new-attempt" if recovery == "changed_runner" else runner_id
+            # Native reset removes the old lineage; the real claim terminalizes
+            # that orphan rather than retaining a recoverable paused reservation.
+            expected_status = ("running" if recovery in {"single", "duplicate", "normal_running"}
+                               else "failed" if recovery == "reset" else "pending")
+            assert (all_sessions[0].id, all_sessions[0].runner_task_id, all_sessions[0].status) == (
+                session_id, expected_runner, expected_status)
+            if recovery == "reset":
+                assert all_sessions[0].error == "orchestration_lineage_invalid"
+    finally:
+        begin_claim.set()
+        allow_exit.set()
+        if runner_id:
+            current = task_runner.get_running_tasks().get(runner_id)
+            if current and not current.done():
+                current.cancel()
+            await asyncio.gather(*(t for t in (old, current) if t is not None), return_exceptions=True)
+            task_runner.get_running_tasks().pop(runner_id, None)
+            task_runner._task_projects.pop(runner_id, None)

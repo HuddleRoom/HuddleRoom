@@ -363,7 +363,126 @@ class OrchestrationSupervisionService:
             return True
         return has_slot and any(c["state"] == "no_work" for c in situation.progress_view)
 
-    async def reconcile_local(self, db, goal, run, now=None, events=(), *, allow_release=True):
+    async def preflight_local_staging(self, db, goal, run):
+        """Read-only check of native-effect branches before caller local staging."""
+        from sqlalchemy import inspect
+        from huddleroom.models.orchestration_steering import OrchestrationSteeringRequest
+        from huddleroom.services.orchestration_steering import OrchestrationSteeringService
+
+        def conflict(branch):
+            raise HTTPException(409, detail={
+                "conflict": "orchestration_transaction_shape",
+                "message": f"Local {branch} requires an owned native operation",
+            })
+
+        # These are fields the local pass replaces. Other pending fields, including
+        # objective/budget and unrelated new/deleted objects, remain composable.
+        if run in db.deleted or goal in db.deleted:
+            conflict("deleted run/goal")
+        for field in ("supervision_state", "active_blockers"):
+            if inspect(run).attrs[field].history.has_changes():
+                conflict(f"pending run.{field}")
+        if (settings.orchestration_conversation_steering_enabled
+                and OrchestrationSteeringService._eligibility(goal, run)[0] != "paused"
+                and await OrchestrationSteeringService()._state(db, goal.id, False) is not None
+                and await db.scalar(select(
+            OrchestrationSteeringRequest.id,
+        ).where(OrchestrationSteeringRequest.goal_id == goal.id,
+                OrchestrationSteeringRequest.status == "pending").limit(1)) is not None):
+            conflict("steering transition")
+        if goal.status != "active" or run.status != "running" or run.phase != "authorized":
+            return
+        if goal.goal_type == "roadmap" and self.orchestration._json_object_or_empty(run.plan_state).get("status") == "accepted":
+            return  # Only stages clearing the obsolete orchestrator waits.
+        tasks = await self.orchestration._orchestrated_tasks_for_run(
+            db, run.id, statuses=["backlog", "ready", "in_progress", "blocked", "done", "failed", "cancelled"],
+        )
+        task_ids = {task.id for task in tasks}
+        provider_task_ids = set(await db.scalars(select(Meeting.source_task_id).where(
+            Meeting.source_task_id.in_(task_ids),
+            Meeting.status.in_(("scheduled", "preparing", "active", "concluding")),
+        )))
+        provider_task_ids.update(await db.scalars(select(GraphRun.linked_task_id).where(
+            GraphRun.linked_task_id.in_(task_ids), GraphRun.status == "active",
+        )))
+        # These concrete sources enter create_wait's native reservation path.
+        if await db.scalar(select(OrchestrationAuthorityDecision.id).where(
+            OrchestrationAuthorityDecision.run_id == run.id,
+            OrchestrationAuthorityDecision.status == "pending",
+        ).limit(1)) is not None:
+            conflict("authority wait reservation")
+        if await db.scalar(select(Session.id).where(
+            Session.task_id.in_(task_ids - provider_task_ids), Session.status.in_(("pending", "running")),
+        ).limit(1)) is not None:
+            conflict("session wait reservation")
+        if await db.scalar(select(OrchestrationRun.id).join(
+            OrchestrationGoal, OrchestrationRun.goal_id == OrchestrationGoal.id,
+        ).where(OrchestrationGoal.parent_goal_id == goal.id,
+                OrchestrationRun.status.in_(("running", "blocked", "paused"))).limit(1)) is not None:
+            conflict("child wait reservation")
+        active = [task for task in tasks if task.status in {"backlog", "ready", "in_progress", "blocked"}]
+        if any(task.status == "in_progress" and task.assigned_to is not None
+               and task.id not in provider_task_ids for task in active):
+            conflict("task wait reservation")
+        # Detect dependency warning before reconcile_local clears old blockers.
+        graph = {task.id: {uuid.UUID(str(item)) for item in task.depends_on or []
+                          if str(item) in {str(t.id) for t in active}} for task in active}
+        seen, visiting = set(), set()
+        def cyclic(key):
+            if key in visiting:
+                return True
+            if key in seen:
+                return False
+            visiting.add(key)
+            cycle = any(cyclic(dep) for dep in graph[key])
+            visiting.remove(key)
+            seen.add(key)
+            return cycle
+        if any(cyclic(key) for key in graph) or any(
+            task.assigned_to is None and task.id not in provider_task_ids for task in active
+        ):
+            conflict("dependency/ownership warning reservation")
+        now = _utcnow()
+        for wait in await db.scalars(select(OrchestrationWait).where(
+            OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open",
+        )):
+            reference = now.replace(tzinfo=None) if wait.due_recheck_at.tzinfo is None else now
+            if wait.due_recheck_at <= reference and (wait.owner or {}).get("type") != "recovery":
+                conflict("due wait fallback reservation")
+        for gate in await db.scalars(select(OrchestrationGate).where(
+            OrchestrationGate.run_id == run.id, OrchestrationGate.status == "open",
+        )):
+            attempts = list((await db.scalars(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run.id,
+                OrchestrationAction.action_type == "request_verification",
+            ).order_by(OrchestrationAction.created_at.desc(), OrchestrationAction.id.desc()))).all())
+            trailing = 0
+            for action in (a for a in attempts if str((a.request or {}).get("gate_id")) == str(gate.id)):
+                if action.status != "failed":
+                    break
+                trailing += 1
+            if trailing and trailing % VERIFICATION_ATTEMPT_LIMIT == 0:
+                conflict("exhausted verification reservation")
+        if (int(((run.supervision_state or {}).get("unchanged") or {}).get("n", 0)) >= UNCHANGED_WAKE_LIMIT
+                and self.orchestration._json_object_or_empty(run.plan_state).get("status") == "accepted"
+                and not plan_in_flight(run.plan_state)):
+            from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
+            from huddleroom.services.orchestration_meeting_commitments import meeting_commitments
+            situation = await OrchestrationProgressView().build_safe(db, goal, run)
+            held = {str(item) for item in provider_task_ids}
+            held.update(str(task.id) for task in active
+                        if task.depends_on and await first_unmet_dependency(db, run, task))
+            has_slot = await self.orchestration._release_headroom(db, await root_goal_id(db, goal.id)) > 0
+            async def situation_getter():
+                return situation
+            proactive = await self._has_proactive_work(situation_getter, held, has_slot)
+            idle_commitments = (not active and any(
+                not item["fulfilled"] for item in await meeting_commitments(db, run)
+            ))
+            if proactive or unreleased_plan_item_ids(run) or idle_commitments:
+                conflict("no-progress owner reservation")
+
+    async def reconcile_local(self, db, goal, run, now=None, events=(), *, allow_release=True, stage_only=False):
         """Deterministic local liveness pass; it never asks a provider or dispatches recovery."""
         now = now or _utcnow()
         _situation: dict = {}
@@ -386,7 +505,8 @@ class OrchestrationSupervisionService:
             )):
                 if (wait.owner or {}).get("type") == _ORCH_OWNER:
                     wait.status, wait.cleared_at = "cleared", now
-            await db.flush()
+            if not stage_only:
+                await db.flush()
             return {"outcome": "continue"}
         # Any subsequent liveness pass supersedes the prior idle snapshot; a
         # fresh idle state below recreates the same fingerprinted blocker.

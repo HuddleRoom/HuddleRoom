@@ -2,6 +2,7 @@ import uuid
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import OrchestrationAction
@@ -12,6 +13,42 @@ from huddleroom.services.orchestration_authority_service import OrchestrationAut
 from huddleroom.services.orchestration_service import OrchestrationService
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Keep committed fixture lineage in a database unique to this test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    # Discard the isolated database whole; keep shared foreign-key cleanup unchanged.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine, monkeypatch):
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 CATEGORIES = [
     "owner_decision", "permission_required", "capability_unavailable", "budget_exhausted",
@@ -158,6 +195,7 @@ async def test_tick_with_escalation_blocker_still_dispatches_unrelated_ready_tas
     db_session.add(task)
     await db_session.flush()
     await service._escalate_owner(db_session, goal, run, "capability_unavailable", "task:other:capability:browser", ["none"], "Q")
+    await db_session.commit()  # Publish the unrelated escalation and ready task before the native tick.
     await service.tick(db_session, run.id)
     assert (await db_session.get(Task, task.id)).status == "in_progress"
     assert any(b["kind"] == "owner_escalation" for b in run.active_blockers)

@@ -11,6 +11,20 @@ from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.models.event_log import EventLog
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+# committed-run operations cannot run under conftest's explicit begin() root (SPR230 caller contract)
+@pytest.fixture
+async def db_session(test_engine):
+    """SPR230: module-local session without conftest's explicit begin() root.
+
+    Ticks are committed-run operations; the conftest root cannot be committed
+    mid-test.  Committed rows are removed by the autouse clean_test_database.
+    """
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 async def _make_run(db, project_id):
@@ -55,6 +69,8 @@ async def test_tick_advances_cursor_and_emits(db_session, test_project):
     )
     assert created is True
 
+    run.baseline_authorized = True  # SPR230: unauthorized baseline ticks only consume existing evidence (no emit)
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
 
     assert result["processed_events"] == 1
@@ -76,6 +92,8 @@ async def test_tick_processes_multiple_events_and_lands_on_last(db_session, test
         assert created is True
         seeded.append(ev)
 
+    run.baseline_authorized = True  # SPR230: unauthorized baseline ticks only consume existing evidence (no emit)
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
 
     assert result["processed_events"] == 3
@@ -94,6 +112,8 @@ async def test_tick_processes_multiple_events_and_lands_on_last(db_session, test
 async def test_repeated_tick_without_new_events_is_noop(db_session, test_project):
     service, goal, run = await _make_run(db_session, test_project.id)
 
+    run.baseline_authorized = True  # SPR230: unauthorized baseline ticks only consume existing evidence (no emit)
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     first = await service.tick(db_session, run.id)
     assert first["tick_emitted"] is True
     cursor_after_first = run.event_cursor
@@ -134,6 +154,7 @@ async def test_tick_ignores_orchestration_events(db_session, test_project):
         db_session, test_project.id, "orchestration.something", {}, dedup_key="orch-1"
     )
 
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
     assert result["processed_events"] == 0
 
@@ -144,6 +165,7 @@ async def test_tick_skips_inactive_run(db_session, test_project):
     run.status = "paused"
     await db_session.flush()
 
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
     assert result["tick_emitted"] is False
     assert result["processed_events"] == 0
@@ -160,6 +182,7 @@ async def test_tick_skips_terminal_run(db_session, test_project, terminal_status
     run.status = terminal_status
     await db_session.flush()
 
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
     assert result["tick_emitted"] is False
     assert result["processed_events"] == 0
@@ -180,6 +203,8 @@ async def test_tick_processes_blocked_run(db_session, test_project):
     seeded, _ = await emit_event_once(
         db_session, test_project.id, "task.created", {"n": 1}, dedup_key="blocked-1"
     )
+    run.baseline_authorized = True  # SPR230: unauthorized baseline ticks only consume existing evidence (no emit)
+    await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
     assert result["status"] == "blocked"
     assert result["tick_emitted"] is True
@@ -228,7 +253,7 @@ def _goal_payload():
 
 
 @pytest.mark.asyncio
-async def test_force_tick_endpoint_first_tick_emits_then_noop(client, test_project):
+async def test_force_tick_endpoint_first_tick_emits_then_noop(client, db_session, test_project):
     created = await client.post(
         f"/api/v1/projects/{test_project.id}/orchestration/goals",
         json=_goal_payload(),
@@ -236,6 +261,9 @@ async def test_force_tick_endpoint_first_tick_emits_then_noop(client, test_proje
     assert created.status_code == 201, created.text
     run_id = created.json()["run"]["id"]
 
+    from huddleroom.models.orchestration import OrchestrationRun
+    (await db_session.get(OrchestrationRun, uuid.UUID(run_id))).baseline_authorized = True  # SPR230: see above
+    await db_session.commit()  # publish created goal before the tick endpoint (SPR230)
     first = await client.post(f"/api/v1/projects/{test_project.id}/orchestration/runs/{run_id}/tick")
     assert first.status_code == 200, first.text
     first_body = first.json()

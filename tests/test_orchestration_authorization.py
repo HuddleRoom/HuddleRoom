@@ -3,6 +3,7 @@ import uuid
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from huddleroom.models.orchestration import (
     GOAL_TYPE_VALUES,
@@ -16,6 +17,65 @@ from huddleroom.models.orchestration import (
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+
+@pytest.fixture(autouse=True)
+def _no_live_native_dispatch(monkeypatch):
+    """Keep committed semantic fixtures from launching real app workers."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Isolate committed native setup, including cyclic roadmap references."""
+    from sqlalchemy import event
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-orchestration.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # Per-test database is discarded whole; no global FK cleanup is changed.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for real service/worker entrypoints."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _owned_tick_setup(db_session, monkeypatch):
+    """End only this module's known-owned preparation before the real tick."""
+    original = OrchestrationService.tick
+
+    async def tick(self, db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if (db is db_session and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await db.flush()
+            await db.commit()
+        return await original(self, db, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
 
 
 @pytest.mark.asyncio

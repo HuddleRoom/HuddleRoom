@@ -303,10 +303,20 @@ async def test_sqlite_autobegin_precommit_keeps_first_iteration_when_second_rais
                 await service._advance_authorized_execution(tick_db, goal_row, run_row)
             await tick_db.rollback()
         async with factory() as check:
-            keys = set((await check.scalars(
-                select(OrchestrationAction.idempotency_key).where(OrchestrationAction.run_id == ids[2])
-            )).all())
-        assert keys == {"iter1"}  # exactly one action; iter2 row rolled back
+            actions = list(await check.scalars(
+                select(OrchestrationAction).where(OrchestrationAction.run_id == ids[2])
+            ))
+        logical = [action for action in actions if action.action_type == "request_verification"]
+        assert {action.idempotency_key for action in logical} == {"iter1"}
+        admissions = [action for action in actions if action.action_type == "admit_control_call"]
+        assert len(admissions) == 1 and len(actions) == 2  # iter2 logical row rolled back
+        admission = admissions[0]
+        assert admission.status == "completed" and admission.target_type == "orchestration_run"
+        assert admission.target_id == ids[2]
+        assert admission.request["call_id"] == str(admission.id)
+        assert uuid.UUID(admission.request["operation_id"])
+        assert admission.request["source_process_id"] is None
+        assert admission.request["source_action_id"] is None
     finally:
         async with factory() as cleanup:
             await cleanup.execute(delete(OrchestrationAction).where(OrchestrationAction.run_id == ids[2]))

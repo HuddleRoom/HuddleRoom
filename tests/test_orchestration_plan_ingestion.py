@@ -3,6 +3,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
@@ -23,7 +24,8 @@ GOAL = SimpleNamespace(success_criteria=[{"key": "c1"}], budget={"caps": {"max_t
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("budget", [{}, {"caps": {}}])
-async def test_roadmap_missing_budget_requires_attention(db_session, test_project, test_user, monkeypatch, budget):
+async def test_roadmap_missing_budget_requires_attention(budget_session, test_project, test_user, monkeypatch, budget):
+    db_session = budget_session
     from copy import deepcopy
     from huddleroom.models.orchestration import (
         OrchestrationAction, OrchestrationGate, OrchestrationGoal, OrchestrationBudgetReservation,
@@ -73,6 +75,8 @@ async def test_roadmap_missing_budget_requires_attention(db_session, test_projec
 
     async def assert_blocked_replay():
         await service._ingest_session_evidence(db_session, run, _completed(session.id))
+        await db_session.flush()
+        await db_session.commit()
         await service.tick(db_session, run.id, local_only=True)
         with pytest.raises(HTTPException) as exc:
             await service.execute_request_plan_revision_action(
@@ -527,3 +531,14 @@ async def test_ingest_accepts_plan_item_artifact_in_project(db_session, test_pro
     await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
 
     assert await _plan_artifacts(db_session, task.id) == 1
+
+
+@pytest_asyncio.fixture
+async def budget_session(db_session, test_project, test_user, test_engine):
+    """Publish only budget-case fixture actors, then use a real independent session."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+    await db_session.flush()
+    await db_session.commit()
+    async with AsyncSession(test_engine, expire_on_commit=False) as independent:
+        yield independent
+        await independent.rollback()

@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
@@ -182,7 +183,7 @@ async def test_tick_keeps_gate_open_when_required_review_evidence_is_missing(db_
         dedup_key=f"phase14-task-done:{task.id}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["evidence_created"] == 1
     assert result["gates_validated"] == 0
@@ -645,7 +646,7 @@ async def test_tick_ingests_task_evidence_and_accepts_single_source_gate(db_sess
         dedup_key=f"phase14-single-source-task:{task.id}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
     rows = await _evidence_rows(db_session, gate.id)
 
     assert result["evidence_created"] == 1
@@ -979,7 +980,7 @@ async def test_adhoc_gate_accepts_only_completed_task_with_valid_evidence_report
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task)
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["gates_validated"] == 1 and gate.status == "accepted"
     assert [e.verdict for e in await _evidence_rows(db_session, gate.id)] == ["accepted"]
@@ -999,8 +1000,8 @@ async def test_adhoc_gate_fails_for_final_invalid_or_evidence_free_report(db_ses
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task, report)
 
-    await service.tick(db_session, run.id)
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     if reason == "Task report is invalid":
         assert gate.status == "open"
@@ -1015,7 +1016,7 @@ async def test_adhoc_gate_fails_when_task_fails(db_session, test_project):
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task, status="failed")
 
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert gate.status == "failed"
 
@@ -1139,7 +1140,7 @@ async def test_session_completed_reopens_failed_attempt_gate(db_session, test_pr
     await db_session.flush()
     await emit_event_once(db_session, test_project.id, "session.failed",
                           {"session_id": str(failed.id), "task_id": str(task.id)}, dedup_key=f"failed:{failed.id}")
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from session"
 
     task.status = "in_progress"  # recovery retry reuses the task
@@ -1150,7 +1151,7 @@ async def test_session_completed_reopens_failed_attempt_gate(db_session, test_pr
     await _finish(db_session, test_project.id, task)
     await emit_event_once(db_session, test_project.id, "session.completed",
                           {"session_id": str(retry.id), "task_id": str(task.id)}, dedup_key=f"completed:{retry.id}")
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert (gate.status, gate.failure_reason) == ("accepted", None)
 
@@ -1184,16 +1185,16 @@ async def test_adhoc_gate_reopens_and_accepts_after_successful_retry(db_session,
     task = await _delegate_adhoc(db_session, service, run, agent, "r1")
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task, status="failed")
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert gate.status == "failed" and gate.failure_reason == "Rejected evidence from task"
 
     task.status = "in_progress"  # recovery retry reuses the task
     await _finish(db_session, test_project.id, task)
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert gate.status == "accepted" and gate.failure_reason is None and gate.failed_at is None
     count, accepted_at = len(await _evidence_rows(db_session, gate.id)), gate.accepted_at
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     assert len(await _evidence_rows(db_session, gate.id)) == count
     assert gate.status == "accepted" and gate.accepted_at == accepted_at
 
@@ -1204,10 +1205,10 @@ async def test_adhoc_gate_failed_without_retry_stays_failed(db_session, test_pro
     task = await _delegate_adhoc(db_session, service, run, agent, "r2")
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task, status="failed")
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     failed_at = gate.failed_at
 
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert gate.status == "failed" and gate.failed_at == failed_at
 
@@ -1218,11 +1219,11 @@ async def test_adhoc_gate_not_reopened_when_task_cancelled(db_session, test_proj
     task = await _delegate_adhoc(db_session, service, run, agent, "r3")
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task, status="failed")
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     task.status = "in_progress"
     await _finish(db_session, test_project.id, task, status="cancelled")
 
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert gate.status == "failed"
 
@@ -1236,7 +1237,7 @@ async def test_gate_failed_for_review_rejection_not_reopened_by_task_done(db_ses
     await db_session.flush()
     await _finish(db_session, test_project.id, task)
 
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert gate.status == "failed"
     assert gate.failure_reason == "Rejected evidence from verification"
@@ -1278,13 +1279,13 @@ async def test_adhoc_dependent_starts_once_only_after_predecessor_gate_accepted(
         return list(await db_session.scalars(select(Session).where(Session.task_id == second.id)))
 
     for _ in range(2):  # done but gate open: dependent stays in backlog
-        await service.tick(db_session, run.id)
+        await _tick_owned_setup(service, db_session, run.id)
         await db_session.refresh(second)
         assert second.status == "backlog" and await sessions() == []
 
     await _finish(db_session, test_project.id, first)
-    await service.tick(db_session, run.id)
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
 
     assert gate.status == "accepted"
     await db_session.refresh(second)
@@ -1297,7 +1298,7 @@ async def test_adhoc_gate_accepts_report_repaired_on_the_clarification_task_mark
     task = await _delegate_adhoc(db_session, service, run, agent, "r1")
     gate = await _adhoc_gate(db_session, task)
     await _finish(db_session, test_project.id, task, "not a report")
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     repair = await service._existing_action_for_key(
         db_session, run.id, f"run:{run.id}:kind:report_clarification:task:{task.id}",
     )
@@ -1325,8 +1326,8 @@ async def test_accepted_readiness_gate_unblocks_dependent_but_never_feeds_criter
     second = await _delegate_adhoc(db_session, service, run, agent, "m2", depends_on=[str(first.id)])
     gate = await _adhoc_gate(db_session, first)
     await _finish(db_session, test_project.id, first)
-    await service.tick(db_session, run.id)
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     await db_session.refresh(second)
     assert gate.status == "accepted" and second.status == "in_progress"
 
@@ -1390,7 +1391,7 @@ async def test_dispatched_failed_clarification_is_final(db_session, test_project
         repair = await db_session.get(Task, corrections[-1])
         repair.status = repair_status
         await db_session.flush()
-        await service.tick(db_session, run.id)
+        await _tick_owned_setup(service, db_session, run.id)
         marker = await service._existing_action_for_key(
             db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}",
         )
@@ -1429,3 +1430,50 @@ async def test_cached_predispatch_recovery_only_reopens_exact_legacy_gate(db_ses
     for _ in range(2):
         await service.consume_canonical_report(db_session, run, task, None)
     assert gate.status == ("open" if shape == "known" else "accepted" if shape == "accepted" else "failed")
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+
+async def _tick_owned_setup(service, db, run_id, **kwargs):
+    """Publish only this test's prepared scenario before the real native tick."""
+    await db.flush()
+    await db.commit()
+    return await service.tick(db, run_id, **kwargs)

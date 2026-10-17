@@ -71,10 +71,13 @@ class OrchestrationDecisionDispatcher:
         recovery_context: RecoveryDispatchContext | None = None,
     ) -> OrchestrationAction | None:
         owns = await self._service._prepare_control_operation(db, goal_id=run.goal_id)
-        async with self._service._lock_goal_for_baseline_transition(db, run.goal_id):
-            return await self._dispatch_prepared(
-                db, run, decision, recovery_context=recovery_context, owns_transaction=owns,
-            )
+        from contextlib import nullcontext
+        from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
+        async with control_operation_owner(db) if owns else nullcontext():
+            async with self._service._lock_goal_for_baseline_transition(db, run.goal_id):
+                return await self._dispatch_prepared(
+                    db, run, decision, recovery_context=recovery_context, owns_transaction=owns,
+                )
 
     async def _dispatch_prepared(
         self, db: AsyncSession, run: OrchestrationRun, decision: OrchestrationDecision, *,

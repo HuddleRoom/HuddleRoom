@@ -768,6 +768,8 @@ async def test_api_adapter_invocation_uses_task_source_before_extra_context(monk
         await original(*args)
 
     monkeypatch.setattr(adapter, "_run_with_retry", run_with_retry)
+    # This invocation unit uses non-ORM doubles for a manual task, without orchestration ownership.
+    monkeypatch.setattr("huddleroom.workers.session_tasks.orchestration_lineage_state", AsyncMock(return_value=None))
     monkeypatch.setattr("huddleroom.adapters.api_adapter.emit_event", AsyncMock())
     monkeypatch.setattr("huddleroom.services.session_sync.sync_task_from_session", AsyncMock())
     await adapter.run(session.id, db)

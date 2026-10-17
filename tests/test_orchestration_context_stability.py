@@ -1,9 +1,52 @@
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 import asyncio
 from datetime import timedelta
 
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/231: discard committed cyclic Continuous fixtures as a whole database."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-context.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # Per-test database disposal avoids changing global FK-aware cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    """SPR230/231: each scenario explicitly publishes setup before owned native ticks."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+        await session.rollback()
 
 
 async def _run(db, project):
@@ -39,10 +82,12 @@ def _diff_paths(a, b, prefix=""):
 async def test_decision_context_is_identical_across_two_idle_local_ticks(db_session, test_project):
     goal, run = await _run(db_session, test_project)
     service = OrchestrationService()
+    await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
     await service.tick(db_session, run.id, local_only=True)
     await db_session.refresh(run)
     ctx1 = await service._decision_context(db_session, goal, run)
     await asyncio.sleep(0.01)
+    await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
     await service.tick(db_session, run.id, local_only=True)
     await db_session.refresh(run)
     ctx2 = await service._decision_context(db_session, goal, run)

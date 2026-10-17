@@ -1,6 +1,7 @@
 """tick() starts never-started backlog tasks the orchestrator delegated."""
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -10,6 +11,15 @@ from huddleroom.services.orchestration_service import OrchestrationService
 from tests.test_orchestration_runtime_e2e import _agent
 
 pytestmark = pytest.mark.asyncio
+
+
+# committed-run operations cannot run under conftest's explicit begin() root (SPR230 caller contract)
+@pytest.fixture
+async def db_session(test_engine):
+    """SPR230: module-local session without conftest's explicit begin() root, so setup can be committed."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 async def _setup(db, project, phase, **task_kwargs):
@@ -48,6 +58,7 @@ async def test_tick_starts_delegated_backlog_task_once(db_session, test_project,
 
         monkeypatch.setattr(GoalClarificationAnalyzer, "analyze_request", analyze)
     service, run, task = await _setup(db_session, test_project, phase)
+    await db_session.commit()  # SPR230: publish committed setup before the tick
     await service.tick(db_session, run.id)
     await db_session.refresh(task)
     assert task.status == "in_progress"
@@ -59,6 +70,7 @@ async def test_tick_starts_delegated_backlog_task_once(db_session, test_project,
 
 async def test_tick_leaves_task_in_backlog_when_not_released(db_session, test_project):
     service, run, task = await _setup(db_session, test_project, "ready")
+    await db_session.commit()  # SPR230: publish committed setup before the tick
     await service.tick(db_session, run.id)
     await db_session.refresh(task)
     assert task.status == "backlog" and await _sessions(db_session, task) == []
@@ -71,6 +83,7 @@ async def test_tick_leaves_task_with_open_dependency_in_backlog(db_session, test
     await db_session.flush()
     task.depends_on = [str(dep.id)]
     await db_session.flush()
+    await db_session.commit()  # SPR230: publish committed setup before the tick
     await service.tick(db_session, run.id)
     await db_session.refresh(task)
     assert task.status == "backlog" and await _sessions(db_session, task) == []
@@ -90,6 +103,7 @@ async def test_adhoc_task_starts_once_only_after_predecessor_gate_accepted(db_se
     task.depends_on = [str(dep.id)]
     await db_session.flush()
 
+    await db_session.commit()  # SPR230: publish committed setup before the tick
     for _ in range(2):  # done + open gate does not release the dependent
         await service.tick(db_session, run.id)
         await db_session.refresh(task)
@@ -97,6 +111,7 @@ async def test_adhoc_task_starts_once_only_after_predecessor_gate_accepted(db_se
 
     gate.status = "accepted"
     await db_session.flush()
+    await db_session.commit()  # SPR230: publish committed setup before the tick
     await service.tick(db_session, run.id)
     await db_session.refresh(task)
     assert task.status == "in_progress" and len(await _sessions(db_session, task)) == 1

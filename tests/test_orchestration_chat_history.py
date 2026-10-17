@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from huddleroom.models import Project, User
@@ -37,7 +38,7 @@ def _snapshot(path):
                 for name in names if name != "alembic_version" and not name.startswith("project_chat")}
 
 
-async def _seed_sources(db, *, commit=True):
+async def _seed_sources(db, *, commit=True, historical_schema=False):
     now = datetime(2026, 10, 13, 12, tzinfo=timezone.utc)
     actors = [User(email=f"chat-history-{i}@test.dev", hashed_password="unused") for i in range(2)]
     projects = [Project(name=f"history-{i}") for i in range(2)]
@@ -47,8 +48,15 @@ async def _seed_sources(db, *, commit=True):
                                created_by_user_id=actors[0].id) for i in range(3)]
     db.add_all(goals)
     await db.flush()
-    runs = [OrchestrationRun(goal_id=goal.id) for goal in goals]
-    db.add_all(runs)
+    runs = [OrchestrationRun(id=uuid.uuid4(), goal_id=goal.id) for goal in goals]
+    if historical_schema:
+        # Revision 049 predates the current ORM's Pause-control columns.
+        await db.execute(text("""
+            INSERT INTO orchestration_runs (id, goal_id, started_at, created_at, updated_at)
+            VALUES (:id, :goal_id, :now, :now, :now)
+        """), [{"id": run.id.hex, "goal_id": run.goal_id.hex, "now": now.isoformat()} for run in runs])
+    else:
+        db.add_all(runs)
     await db.flush()
     advisors = [ProjectAdvisorTurn(project_id=projects[project].id, actor_id=actors[actor].id,
                                    question=question, answer="legacy answer" if status == "completed" else None,
@@ -178,7 +186,7 @@ async def test_upgrade_preserves_sources_and_visibility(tmp_path, monkeypatch):
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with sessions() as db:
-            seeded = await _seed_sources(db)
+            seeded = await _seed_sources(db, historical_schema=True)
         before = _snapshot(path)
         _alembic(path, "upgrade", "050")
         from huddleroom.models.orchestration_chat import ProjectChatTurn
@@ -194,6 +202,8 @@ async def test_upgrade_preserves_sources_and_visibility(tmp_path, monkeypatch):
             indexes = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")}
             assert {index.name for index in ProjectChatTurn.__table__.indexes} <= indexes
         assert {table: rows for table, rows in _snapshot(path).items() if table in before} == before
+        # Current service models require the current schema; keep the 050 assertions above exact.
+        _alembic(path, "upgrade", "head")
         async with sessions() as db:
             first = await history(db, seeded["project"], seeded["actors"][0])
             second = await history(db, seeded["project"], seeded["actors"][0])
@@ -236,6 +246,7 @@ async def test_upgrade_preserves_sources_and_visibility(tmp_path, monkeypatch):
         assert other_content["shared 1"].goal_turn.feedback.feedback_id == seeded["feedback"][1]
         assert other_content["shared 1"].goal_turn.feedback_eligible is False
         assert other_content["shared 2"].goal_turn.feedback_eligible is True
+        _alembic(path, "downgrade", "050")
         assert {table: rows for table, rows in _snapshot(path).items() if table in before} == before
         _alembic(path, "downgrade", "049")
         assert _snapshot(path) == before

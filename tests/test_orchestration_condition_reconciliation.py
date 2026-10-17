@@ -85,6 +85,7 @@ import json  # noqa: E402
 from datetime import timedelta  # noqa: E402
 
 from sqlalchemy import select  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 
 from huddleroom.models.base import _utcnow  # noqa: E402
 from huddleroom.models.event_log import EventLog  # noqa: E402
@@ -97,8 +98,36 @@ from huddleroom.services.session_sync import sync_task_from_session  # noqa: E40
 from tests.test_orchestration_final_summary_request import runnable_workspace  # noqa: E402,F401  (autouse)
 from tests.test_orchestration_plan_ingestion import _db_output, _planning_run  # noqa: E402
 from tests.test_orchestration_result_correction import (  # noqa: E402
-    MISSING_FIELDS, VALID, _complete, _corrections, _setup,
+    MISSING_FIELDS, VALID, _complete, _corrections, _setup as _result_setup,
 )
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+async def _owned_setup_call(db, setup, *args, **kwargs):
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    original = OrchestrationService.tick
+    async def owned_setup_tick(self, current_db, *args, **tick_kwargs):
+        root = current_db.sync_session.get_transaction()
+        if (current_db is db and not current_db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await current_db.flush()
+            await current_db.commit()
+        return await original(self, current_db, *args, **tick_kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(OrchestrationService, "tick", owned_setup_tick)
+        return await setup(db, *args, **kwargs)
+
+
+async def _setup(db, project, **kwargs):
+    return await _owned_setup_call(db, _result_setup, project, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -205,6 +234,7 @@ async def test_rejected_output_keeps_result_missing_until_the_corrected_result_i
     await service._ingest_evidence_from_event(
         db_session, run, await db_session.scalar(select(EventLog).where(EventLog.dedup_key == key)),
     )
+    await db_session.commit()  # Publish this test's completed-session/event setup before the owned tick.
     await service.tick(db_session, run.id)
     await db_session.refresh(session_warning)
     await db_session.refresh(result_warning)
@@ -213,6 +243,7 @@ async def test_rejected_output_keeps_result_missing_until_the_corrected_result_i
 
     [correction] = await _corrections(db_session, task)
     await _complete(db_session, service, run, correction, json.dumps(VALID))
+    await db_session.commit()
     await service.tick(db_session, run.id)
     await db_session.refresh(result_warning)
     assert not result_warning.active and result_warning.resolved_by == "system"
@@ -261,6 +292,7 @@ async def test_one_malformed_item_is_skipped_and_the_rest_still_reconcile(db_ses
     db_session.add(marker)
     await db_session.flush()
 
+    await db_session.commit()  # Publish the intentionally corrupt ledger and warning fixtures.
     await service.tick(db_session, run.id)
 
     await db_session.refresh(broken)
@@ -446,8 +478,8 @@ async def test_spr208_roadmap_accepted_generation_survives_replanning(
         _accept_replan_after_selected_authority,
     )
 
-    service, goal, run, _manual, approval, _fingerprint = await _roadmap_acceptance(
-        db_session, test_project, test_user,
+    service, goal, run, _manual, approval, _fingerprint = await _owned_setup_call(
+        db_session, _roadmap_acceptance, test_project, test_user,
     )
     task = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
     # This helper requests the task before switching its goal to roadmap.
@@ -502,6 +534,7 @@ async def test_spr208_tick_keeps_warning_when_accepted_snapshot_is_missing(db_se
     run.plan_state = {k: v for k, v in run.plan_state.items() if k != "accepted_plan_snapshot"}
     run.phase = "authorized"
     await db_session.flush()
+    await db_session.commit()  # The missing accepted snapshot is committed fixture state.
 
     await service.tick(db_session, run.id)
 

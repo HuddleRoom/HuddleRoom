@@ -9,8 +9,23 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    """SPR230/231: native owned operations start after explicitly committed test preparation.
+
+    No fixture/wrapper commits caller work. The shared clean_test_database fixture
+    removes committed rows after each test; explicit-caller cases open their own root.
+    """
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+        await session.rollback()
+
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.memory_item import MemoryItem
@@ -729,12 +744,14 @@ async def _three_pending_proposals(db_session, review_goal, review_run):
 
 @pytest.mark.asyncio
 async def test_agent_definition_review_batch_applies_mixed_answers_once_without_rerun(
-    client, db_session, test_project, review_goal, review_run
+    client, db_session, test_engine, test_project, review_goal, review_run
 ):
     agents, analyzer, process, current, decisions = await _three_pending_proposals(
         db_session, review_goal, review_run
     )
 
+    review_run.baseline_authorized = True
+    await db_session.commit()  # SPR231: publish seeded review before the request-owned acceptance.
     response = await client.post(_batch_answer_url(test_project.id, review_goal.id), json={"answers": [
         {"decision_id": str(decisions[0].id), "selected_option": "approve"},
         {"decision_id": str(decisions[1].id), "selected_option": "edit",
@@ -743,8 +760,24 @@ async def test_agent_definition_review_batch_applies_mixed_answers_once_without_
     ]})
 
     assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["process"] is None
+    assert saved["answer_receipt"]["application_state"] == "pending"
+    action_id = uuid.UUID(saved["answer_receipt"]["action_id"])
     assert analyzer.calls == 3
+    await db_session.commit()
+    from huddleroom.services.orchestration_decision_application import drain_answer_applications
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as consumer:
+        applied = await drain_answer_applications(consumer, review_run.id)
+        assert applied.applied == [action_id]
+        await consumer.commit()
+    async with factory() as repeated:
+        assert (await drain_answer_applications(repeated, review_run.id)).applied == []
     await db_session.refresh(current)
+    for agent in agents:
+        await db_session.refresh(agent)
+    assert analyzer.calls == 3
     assert current.status == "completed" and current.superseded_by_id is None
     assert current.outputs["fingerprint"] == await process.current_fingerprint(
         db_session, review_goal, review_run
@@ -809,11 +842,14 @@ async def test_agent_definition_review_batch_rejects_stale_pending_set(
         decided_by_user_id=test_user.id,
     )
 
+    await db_session.commit()  # SPR231: publish the prior answer before a separate stale submission.
     response = await client.post(_batch_answer_url(test_project.id, review_goal.id), json={"answers": [
         {"decision_id": str(decision.id), "selected_option": "approve"} for decision in decisions
     ]})
 
     assert response.status_code == 409
+    for row in [*decisions, *agents, current]:
+        await db_session.refresh(row)
     assert [decision.status for decision in decisions] == ["answered", "pending", "pending"]
     assert [agent.description for agent in agents] == ["Original description."] * 3
     assert current.status == "waiting_decision"
@@ -914,6 +950,7 @@ async def test_retry_failed_agent_review_reuses_completed_frozen_requests(
         "huddleroom.services.orchestration_agent_definition_review.settings.orchestration_model",
         "changed-after-failure",
     )
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     second_failure = await process.retry_failed(db_session, review_goal, review_run, current)
 
     assert second_failure["retry_failed"] is True
@@ -926,6 +963,7 @@ async def test_retry_failed_agent_review_reuses_completed_frozen_requests(
         "warning_id": str(unrelated.id),
         "reason": "unrelated analyzer warning",
     })
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await process.retry_failed(db_session, review_goal, review_run, current)
 
     assert analyzer.calls == [agent_a.id, agent_b.id, agent_b.id, agent_b.id, agent_c.id]
@@ -1379,6 +1417,7 @@ async def test_analyzer_failure_recovery_resolves_warning_and_unblocks(
     )
     process = AgentDefinitionReviewProcess()
     monkeypatch.setattr(orchestration_debug_service, "AgentDefinitionReviewProcess", lambda: process)
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     await OrchestrationDebugService().rerun_last(
         db_session, test_project.id, review_goal.id, "agent_definition_review"
     )
@@ -1392,10 +1431,12 @@ async def test_analyzer_failure_recovery_resolves_warning_and_unblocks(
     )
     monkeypatch.setattr(orchestration_debug_service, "AgentDefinitionReviewProcess", lambda: process)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException, match="baseline/retry"):
         await OrchestrationDebugService().step(
             db_session, test_project.id, review_goal.id, "agent_definition_review"
         )
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().retry_failed(
         db_session, test_project.id, review_goal.id, "agent_definition_review"
     )
@@ -1441,6 +1482,7 @@ async def test_tick_short_circuits_when_agent_definition_review_blocked(
     monkeypatch.setattr(orchestration_service, "AgentDefinitionReviewProcess", NoAutoAdvance)
 
     # Must not raise -- tick short-circuits before touching AgentDefinitionReviewProcess.
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     await OrchestrationService().tick(db_session, review_run.id)
 
 
@@ -1995,6 +2037,7 @@ async def test_tick_suggests_rerun_when_assignment_identity_changes_but_coverage
     await db_session.delete(task)
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     await OrchestrationService().tick(db_session, review_run.id)
     second = await _current_process(db_session, review_goal)
 
@@ -2250,6 +2293,7 @@ async def test_tick_runs_agent_review_after_goal_definition_and_manager_selectio
     )
     run.baseline_authorized = True
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await service.tick(db_session, run.id)
 
     assert result["baseline_process"]["status"] == "completed"
@@ -2290,6 +2334,7 @@ async def test_tick_does_not_start_agent_review_before_manager_selection_termina
         run_id=review_run.id,
     )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationService().tick(db_session, review_run.id)
 
     assert result["manager_selection_process"]["status"] == "waiting_decision"
@@ -2946,13 +2991,19 @@ async def test_definition_batch_answer_reserves_under_goal_lock_then_applies_ros
     seeded = await seed_definition_proposal(sessions, tmp_path)
     lock_tracer.start()
 
-    response = await act_definition_batch(sessions, seeded)
+    response = await act_definition_batch(sessions, seeded, apply=False)
+    assert response.process is None and response.answer_receipt.application_state == "pending"
+    from huddleroom.services.orchestration_decision_application import drain_answer_applications
+    async with sessions() as consumer:
+        application = await drain_answer_applications(consumer, seeded.run_id)
+        assert application.applied == [response.answer_receipt.action_id]
+        await consumer.commit()
 
     assert_entry_handoff(lock_tracer, seeded.goal_id)
     single_agent_write(lock_tracer, agent_id=seeded.agent_id)
     assert (await fresh_agent(sessions, seeded.agent_id)).description == PROPOSED_DESCRIPTION
     assert (await current_process(sessions, seeded.goal_id, "agent_definition_review")).status == "completed"
-    assert response.process["status"] == "completed"
+    assert response.answer_receipt.application_state == "pending"  # Immutable Saved response predates application.
 
 
 @pytest.mark.asyncio

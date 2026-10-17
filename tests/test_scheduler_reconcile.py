@@ -1,16 +1,73 @@
 from decimal import Decimal
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
+from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
 from huddleroom.workers.scheduler import (
     reconcile_continuous_goals_async,
     reconcile_orchestration_runs_async,
     reconcile_orchestration_runs_job,
 )
 from tests.test_orchestration_continuous_service import started_continuous
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230: per-test engine so the committed roadmap setup used by real native ticks is discarded with the file."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'reconcile-owned-setup.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # The per-test database is discarded; cyclic committed roadmap rows need no DELETE cleanup.
+    yield
+
+
+# committed-run operations cannot run under conftest's explicit begin() root (SPR230 caller contract)
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    # SPR230: no conftest begin() root, so setup can be committed; committed fixtures never launch agents.
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+def _commit_before_setup_ticks(monkeypatch):
+    """Roadmap setup helpers tick a flushed session; publish their preparation first (setup only)."""
+    from huddleroom.services.orchestration_service import OrchestrationService
+    original_tick = OrchestrationService.tick
+
+    async def setup_tick(service, db, *args, **kwargs):
+        await db.flush()
+        await db.commit()
+        return await original_tick(service, db, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationService, "tick", setup_tick)
+    return lambda: monkeypatch.setattr(OrchestrationService, "tick", original_tick)
 
 
 async def make_run(db_session, project, *, goal_status, run_status):
@@ -124,7 +181,10 @@ async def test_reconcile_ticks_authorized_roadmap_parent_and_child_once(db_sessi
     from huddleroom.models.orchestration import OrchestrationAction, OrchestrationBudgetReservation, OrchestrationRoadmapItem
     from huddleroom.services.orchestration_service import OrchestrationService
     from tests.test_orchestration_roadmap_integration import release
+    restore_tick = _commit_before_setup_ticks(monkeypatch)
     roadmap, goal, parent, _, row = await release(db_session, test_project)
+    restore_tick()
+    await db_session.commit()  # SPR230: publish committed roadmap setup before reconcile
     child_goal = await db_session.get(OrchestrationGoal, row.child_goal_id)
     child = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child_goal.id))
     # Scheduler owns selection only.  Keep the real tick/release path while
@@ -231,7 +291,10 @@ async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_pro
         return 0
 
     monkeypatch.setattr(OrchestrationService, "_start_released_tasks", noop_start)
+    restore_tick = _commit_before_setup_ticks(monkeypatch)
     n = await nested_roadmap(db_session, test_project, monkeypatch)
+    restore_tick()
+    await db_session.commit()  # SPR230: publish committed roadmap setup before reconcile
 
     async def no_external_decision(self, db, run_id, adapter=None):
         run = await db.get(OrchestrationRun, run_id)
@@ -275,7 +338,9 @@ async def test_reconcile_nested_roadmap_one_lineage_per_key(db_session, test_pro
             OrchestrationGoal, OrchestrationGoal.id == OrchestrationRun.goal_id).where(
             OrchestrationRun.status.in_(("running", "blocked")), OrchestrationGoal.status.in_(("active", "blocked"))))
         assert runnable >= 2
-        assert await reconcile_orchestration_runs_async(db_session) == runnable
+        # SPR230: the real reconcile job owns the session (reconcile_orchestration_runs_job); a bare supplied session is caller-composed.
+        async with control_operation_owner(db_session):
+            assert await reconcile_orchestration_runs_async(db_session) == runnable
         assert "reconcile failed" not in caplog.text and not [r for r in caplog.records if r.levelname == "ERROR"]
 
     assert await _children_of(db_session, n.child) == []
@@ -441,3 +506,76 @@ async def test_continuous_rollover_reconciles_cycle_one_artifacts_in_cycle_two(
     assert remaining["direct_spend"]["max_tokens"] == "0"
     assert Decimal(remaining["settled_child_spend"]["max_tokens"]) >= 7
     assert [run.id for run in await run_lineage(db_session, cycle2)] == [cycle2.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_kind", ["orm", "core"])
+@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
+async def test_supplied_session_preserves_unrelated_writes_on_all_outcomes(
+    test_engine, monkeypatch, tmp_path, write_kind, outcome,
+):
+    # This checks the reusable helper's publication/error boundary, not a real owning job.
+    import asyncio
+    from fastapi import HTTPException
+    from sqlalchemy import delete, event, update
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from huddleroom.models.project import Project
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as setup:
+        project = Project(name="SPR230/SPR231 caller preservation", description="committed", workspace_path=str(tmp_path), config={})
+        setup.add(project)
+        await setup.flush()
+        goal = OrchestrationGoal(project_id=project.id, objective="Caller preservation", status="active")
+        setup.add(goal)
+        await setup.flush()
+        run = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized", budget_state={})
+        setup.add(run)
+        await setup.commit()
+        project_id, goal_id, run_id = project.id, goal.id, run.id
+
+    attempted = []
+
+    async def boundary_tick(self, db, rid, **kwargs):
+        attempted.append(rid)
+        if outcome == "refusal":
+            raise HTTPException(409, detail={"conflict": "orchestration_transaction_shape"})
+        if outcome == "exception":
+            raise RuntimeError("injected downstream failure")
+        return {"run_id": rid, "status": "running"}
+
+    monkeypatch.setattr(OrchestrationService, "tick", boundary_tick)
+    try:
+        async with factory() as caller:
+            project = await caller.get(Project, project_id)
+            if write_kind == "orm":
+                project.description = "caller-only"
+                await caller.flush()
+            else:
+                caller.expunge(project)
+                await caller.execute(update(Project).where(Project.id == project_id).values(
+                    description="caller-only",
+                ).execution_options(synchronize_session=False))
+                assert not caller.new and not caller.dirty and not caller.deleted
+            root = caller.sync_session.get_transaction()
+            calls = []
+            for name in ("before_flush", "before_commit", "after_rollback"):
+                event.listen(caller.sync_session, name, lambda *args, name=name: calls.append(name))
+            await asyncio.wait_for(reconcile_orchestration_runs_async(caller), 3)
+            assert attempted == [run_id]
+            assert calls == []
+            assert caller.sync_session.get_transaction() is root and root.is_active
+            with caller.no_autoflush:
+                assert await caller.scalar(select(Project.description).where(Project.id == project_id)) == "caller-only"
+            async with factory() as fresh:
+                assert (await fresh.get(Project, project_id)).description == "committed"
+            await caller.rollback()
+        async with factory() as fresh:
+            assert (await fresh.get(Project, project_id)).description == "committed"
+    finally:
+        async with factory() as cleanup:
+            await cleanup.execute(delete(OrchestrationRun).where(OrchestrationRun.id == run_id))
+            await cleanup.execute(delete(OrchestrationGoal).where(OrchestrationGoal.id == goal_id))
+            await cleanup.execute(delete(Project).where(Project.id == project_id))
+            await cleanup.commit()

@@ -40,7 +40,72 @@ def _manual_task_start(monkeypatch):
     monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
 
 
+@pytest.fixture
+async def test_engine(tmp_path):
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-scenario.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _owned_module_setup(db_session, monkeypatch):
+    # Patch only this module's setup aliases; imported helpers remain unchanged for other modules.
+    original_authorized = _authorized_run
+    async def authorized(db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if db is db_session and not db.in_nested_transaction() and (root is None or root.origin.name == "AUTOBEGIN"):
+            kwargs["owns_setup"] = True
+        return await original_authorized(db, *args, **kwargs)
+    monkeypatch.setitem(globals(), "_authorized_run", authorized)
+
+    for name in ("release", "_complete_roadmap_task", "_complete_child", "_dispatched_roadmap_verifier"):
+        helper = globals()[name]
+        def wrap(original):
+            async def owned(db, *args, **kwargs):
+                original_tick = OrchestrationService.tick
+                async def tick(self, current_db, *tick_args, **tick_kwargs):
+                    root = current_db.sync_session.get_transaction()
+                    if (current_db is db_session and not current_db.in_nested_transaction()
+                            and (root is None or root.origin.name == "AUTOBEGIN")):
+                        await current_db.flush()
+                        await current_db.commit()
+                    return await original_tick(self, current_db, *tick_args, **tick_kwargs)
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(OrchestrationService, "tick", tick)
+                    return await original(db, *args, **kwargs)
+            return owned
+        monkeypatch.setitem(globals(), name, wrap(helper))
+
 
 
 async def accepted_goal_roadmap(db, project, item, cap=1000, team_agent_ids=(), budget_caps=None):
@@ -183,6 +248,7 @@ async def test_integration_decision_commits_authority_wait(db_session, test_proj
 
     monkeypatch.setattr(service, "request_llm_decision", decision)
     monkeypatch.setattr(service, "_dispatch_execution_decision", wait_for_authority)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await service.tick(db_session, run.id)
     assert result["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_human_scope_budget_authority",
@@ -291,6 +357,7 @@ async def test_mixed_task_goal_task_graph_releases_in_gate_order(
     )
     service = roadmap.orchestration
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "build"
     build_row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "build",
@@ -303,7 +370,9 @@ async def test_mixed_task_goal_task_graph_releases_in_gate_order(
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "rollout",
     ))
     await _complete_child(db_session, test_project, roadmap, rollout_row, planner, producer, verifier, summarizer)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"] == {"step": "settle_children", "count": 1}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"] == {
         "step": "release_item", "item_key": "docs", "unit_type": "task",
     }
@@ -320,8 +389,11 @@ async def test_mixed_cap_releases_eligible_goal_after_two_active_tasks(db_sessio
     ])
     service = roadmap.orchestration
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "one"
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "two"
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"] == {
         "step": "release_item", "item_key": "child", "unit_type": "goal",
     }
@@ -355,6 +427,7 @@ async def test_mixed_cap_releases_eligible_goal_after_two_active_tasks(db_sessio
 
     assert await counts() == (3, 2, 1, 1, 3)
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_active_work",
     }
@@ -370,6 +443,7 @@ async def test_completed_child_projects_one_parent_item_evidence_record(
         db_session, test_project, roadmap, row, *actors,
     )
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"] == {
         "step": "settle_children", "count": 1,
     }
@@ -403,6 +477,7 @@ async def test_terminal_child_without_completed_outcome_does_not_unlock_parent(d
         [{"id": "work", "work_function": "implementation", "scope": "Do child work.",
           "deliverable": "Child work.", "agent_id": str(producer.id), "success_criterion_keys": ["local"]}],
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, child_run.id)
     task = next(task for task in await _tasks_for_run(db_session, child_run.id)
                 if roadmap.orchestration._task_work_function(task) == "implementation")
@@ -412,6 +487,7 @@ async def test_terminal_child_without_completed_outcome_does_not_unlock_parent(d
     )
     child = await db_session.get(OrchestrationGoal, row.child_goal_id)
     assert child.status == "active"
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_active_work",
     }
@@ -455,6 +531,7 @@ async def test_wrong_child_version_or_item_cannot_roll_up(
 
     with db_session.no_autoflush:
         with pytest.raises(HTTPException, match="lineage is invalid") as exc:
+            await db_session.commit()  # Publish known scenario state before the native tick.
             await roadmap.orchestration.tick(db_session, run.id)
     assert exc.value.status_code == 409
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationEvidence).where(
@@ -470,12 +547,14 @@ async def test_replay_settles_and_projects_child_once(
     child, _child_run, _child_gate, _child_evidence, _ = await _complete_child(
         db_session, test_project, roadmap, row, *actors,
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"] == {
         "step": "settle_children", "count": 1,
     }
     _local_decisions(monkeypatch, roadmap.orchestration, lambda _ctx: {
         "action_type": "noop", "reason": "Awaiting integration verification.",
     })
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"]["step"] == "integration_decision"
     reservations = list((await db_session.scalars(select(OrchestrationBudgetReservation).where(
         OrchestrationBudgetReservation.roadmap_item_id == row.id,
@@ -511,6 +590,7 @@ async def test_terminal_child_settles_before_parent_measurement_attention_and_re
     child, _child_run, _child_gate, _child_evidence, _ = await _complete_child(
         db_session, test_project, roadmap, row, *actors,
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await roadmap.orchestration.tick(db_session, run.id)
     reservation = await db_session.scalar(select(OrchestrationBudgetReservation).where(
         OrchestrationBudgetReservation.roadmap_item_id == row.id,
@@ -531,6 +611,7 @@ async def test_terminal_child_settles_before_parent_measurement_attention_and_re
     _local_decisions(monkeypatch, roadmap.orchestration, lambda _ctx: {
         "action_type": "noop", "reason": "Awaiting integration verification.",
     })
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await roadmap.orchestration.tick(db_session, run.id)
     assert result["authorized_execution"]["step"] == "integration_decision"
     assert not any(item.get("scope") == f"parent:{parent.id}" for item in run.active_blockers)
@@ -548,7 +629,9 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
         {**roadmap_task("build", mutates_shared_state=False), "agent_id": str(builder.id)},
         {**roadmap_task("after", depends_on=["build"], mutates_shared_state=False), "agent_id": str(builder.id)},
     ])
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await dependency.orchestration.tick(db_session, run.id))["authorized_execution"]["item_key"] == "build"
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await dependency.orchestration.tick(db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_dependencies",
     }
@@ -556,6 +639,7 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
         {**roadmap_task("one", mutates_shared_state=True), "agent_id": str(builder.id)},
         {**roadmap_task("two", mutates_shared_state=True), "agent_id": str(builder.id)},
     ])
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await shared.orchestration.tick(db_session, shared_run.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == shared_run.id,
@@ -564,15 +648,20 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision, selected_option="approve", decided_by_user_id=_parent.manager_user_id,
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await shared.orchestration.tick(db_session, shared_run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await shared.orchestration.tick(db_session, shared_run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_shared_workspace",
     }
     capped, _parent, capped_run, _ = await accepted_goal_roadmap(db_session, test_project, [
         {**roadmap_task(key, mutates_shared_state=False), "agent_id": str(builder.id)} for key in ("one", "two", "three")
     ])
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await capped.orchestration.tick(db_session, capped_run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await capped.orchestration.tick(db_session, capped_run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await capped.orchestration.tick(db_session, capped_run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "capacity_wait",
     }
@@ -581,6 +670,7 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
     unstaged, unstaged_parent, unstaged_run, _ = await accepted_goal_roadmap(
         db_session, test_project, [{**unstaged_item, "agent_id": str(builder.id)}],
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await unstaged.orchestration.tick(db_session, unstaged_run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_unstaged_approval",
     }
@@ -590,6 +680,7 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, decision[0], selected_option="reject", decided_by_user_id=unstaged_parent.manager_user_id,
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await unstaged.orchestration.tick(db_session, unstaged_run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "needs_attention",
     }
@@ -611,6 +702,7 @@ async def test_no_eligible_item_returns_explicit_wait_reason(db_session, test_pr
                            ended_at=over_budget_run.started_at + timedelta(minutes=1),
                            metadata_={"token_count_in": 400, "token_count_out": 0}))
     await db_session.flush()
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await over_budget.orchestration.tick(db_session, over_budget_run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "budget_wait",
     }
@@ -623,7 +715,9 @@ async def test_missing_telemetry_does_not_stall_later_child_cancellation(
     roadmap, parent, run, _ = await accepted_goal_roadmap(
         db_session, test_project, [child_item("first"), child_item("second")],
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, run.id)
     rows = {row.item_key: row for row in (await db_session.scalars(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id,
@@ -655,6 +749,7 @@ async def test_missing_telemetry_does_not_stall_later_child_cancellation(
     await roadmap.orchestration.cancel_goal(
         db_session, test_project.id, rows["second"].child_goal_id, cancelled_by="human:test",
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "needs_attention",
     }
@@ -677,6 +772,7 @@ async def test_measured_overage_creates_one_durable_blocker_on_replay(
     sessions[0].metadata_ = {"token_count_in": 401, "token_count_out": 1}
     await db_session.flush()
     for _ in range(2):
+        await db_session.commit()  # Publish known scenario state before the native tick.
         assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"] == {
             "step": "waiting", "reason": "needs_attention",
         }
@@ -742,6 +838,7 @@ async def test_integration_gate_waits_for_every_current_item_gate(db_session, te
     service = roadmap.orchestration
     decision = {"action_type": "noop", "reason": "Awaiting item verification."}
     _local_decisions(monkeypatch, service, lambda _ctx: decision)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"]["item_key"] == "one"
     one = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "one",
@@ -752,6 +849,7 @@ async def test_integration_gate_waits_for_every_current_item_gate(db_session, te
     ))
     task = await db_session.get(Task, two.task_id)
     await _record_measured_completion(db_session, test_project.id, run, task, builder.id, DONE_REPORT)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     assert await _integration_gate(db_session, roadmap, parent, run, version) is None
 
@@ -779,10 +877,12 @@ async def test_integration_gate_is_created_once_across_replay(
         "action_type": "noop", "reason": "Awaiting integration verification.",
     }
     _local_decisions(monkeypatch, service, lambda _ctx: decision)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     await _complete_roadmap_task(db_session, test_project.id, roadmap.orchestration, run, row, verifier.id)
     first = await _integration_gate(db_session, roadmap, parent, run, version)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, run.id)
     second = await _integration_gate(db_session, roadmap, parent, run, version)
     assert first.id == second.id == uuid.uuid5(
@@ -794,6 +894,7 @@ async def test_integration_gate_is_created_once_across_replay(
 
     if accept_v1:
         decision = {"action_type": "request_verification", "gate_id": str(first.id), "work_function": "validation"}
+        await db_session.commit()  # Publish known scenario state before the native tick.
         await service.tick(db_session, run.id)
         await _finish_integration_verification(db_session, test_project.id, service, run, first, verifier.id)
         decision = {"action_type": "noop", "reason": "Replan before summarizing V1."}
@@ -809,6 +910,7 @@ async def test_integration_gate_is_created_once_across_replay(
     )
     db_session.add(v2)
     await db_session.flush()
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"]["item_key"] == "next"
     next_row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
         OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == "next",
@@ -824,9 +926,11 @@ async def test_integration_gate_is_created_once_across_replay(
                 if action.action_type in {"request_final_summary", "complete_run"}]
 
     decision = {"action_type": "request_verification", "gate_id": str(current.id), "work_function": "validation"}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     await _finish_integration_verification(db_session, test_project.id, service, run, current, verifier.id)
     decision = {"action_type": "noop", "reason": "Current integration verified."}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     gates, evidence = await service._accepted_non_summary_manifest(db_session, run.id)
     assert first.id not in {gate.id for gate in gates}
@@ -873,7 +977,9 @@ async def test_integration_gate_is_created_once_across_replay(
         await _record_measured_completion(
             db_session, test_project.id, run, summary_task, summarizer.id, json.dumps(payload),
         )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     assert (parent.status, run.status, run.phase) == ("completed", "completed", "completed")
     closeout = await service._closeout_preconditions_manifest(db_session, parent, run)
@@ -911,6 +1017,7 @@ async def test_integration_verifier_must_differ_from_every_item_producer(
     decision = {"action_type": "noop", "reason": "No integration verifier yet."}
     _local_decisions(monkeypatch, service, lambda _ctx: decision)
     for key, expected in (("one", builders[0]), ("two", builders[1])):
+        await db_session.commit()  # Publish known scenario state before the native tick.
         await service.tick(db_session, run.id)
         row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
             OrchestrationRoadmapItem.goal_id == parent.id, OrchestrationRoadmapItem.item_key == key,
@@ -924,7 +1031,9 @@ async def test_integration_verifier_must_differ_from_every_item_producer(
         actor.capabilities = capabilities
     await db_session.flush()
     await _complete_child(db_session, test_project, roadmap, child_row, *actors)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     gate = await _integration_gate(db_session, roadmap, parent, run, version)
     assert gate is not None
@@ -947,9 +1056,11 @@ async def test_integration_verifier_must_differ_from_every_item_producer(
     verifier.is_active = True
     await db_session.flush()
     decision = {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     await _finish_integration_verification(db_session, test_project.id, service, run, gate, verifier.id)
     decision = {"action_type": "noop", "reason": "Verification landed."}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     assert gate.status == "accepted"
 
@@ -967,14 +1078,17 @@ async def test_accepted_integration_evidence_covers_every_parent_criterion(
     service = roadmap.orchestration
     decision = {"action_type": "noop", "reason": "Awaiting integration verification."}
     _local_decisions(monkeypatch, service, lambda _ctx: decision)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     await _complete_roadmap_task(db_session, test_project.id, service, run, row, verifier.id)
     gate = await _integration_gate(db_session, roadmap, parent, run, version)
     decision = {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     await _finish_integration_verification(db_session, test_project.id, service, run, gate, verifier.id)
     decision = {"action_type": "noop", "reason": "Integration accepted."}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     item_gate = await db_session.get(OrchestrationGate, row.gate_id)
     item_evidence = await db_session.scalar(select(OrchestrationEvidence).where(
@@ -1017,6 +1131,7 @@ async def test_child_and_task_evidence_cannot_satisfy_parent_criterion(db_sessio
     _local_decisions(monkeypatch, roadmap.orchestration, lambda _ctx: {
         "action_type": "noop", "reason": "Item verification only.",
     })
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     await _complete_roadmap_task(db_session, test_project.id, roadmap.orchestration, run, row, verifier.id)
@@ -1041,12 +1156,14 @@ async def test_roadmap_cannot_close_without_accepted_integration_gate(db_session
     _local_decisions(monkeypatch, roadmap.orchestration, lambda _ctx: {
         "action_type": "noop", "reason": "Keep integration open.",
     })
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await roadmap.orchestration.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     await _complete_roadmap_task(db_session, test_project.id, roadmap.orchestration, run, row, verifier.id)
     gate = await _integration_gate(db_session, roadmap, parent, run, version)
     assert gate is not None and gate.status == "open"
     for _ in range(2):
+        await db_session.commit()  # Publish known scenario state before the native tick.
         await roadmap.orchestration.tick(db_session, run.id)
     actions = await _run_actions(db_session, run.id)
     assert not [action for action in actions if action.action_type in {"request_final_summary", "complete_run"}]
@@ -1068,11 +1185,13 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
     service = roadmap.orchestration
     decision = {"action_type": "noop", "reason": "Awaiting integration verification.", "wake_when": NOOP_WAKE_WHEN}
     _local_decisions(monkeypatch, service, lambda _ctx: decision)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     await _complete_roadmap_task(db_session, test_project.id, service, run, row, verifier.id)
     gate = await _integration_gate(db_session, roadmap, parent, run, version)
     decision = {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     first = await service.tick(db_session, run.id)
     assert first["authorized_execution"]["step"] == "integration_decision"
     assert await db_session.scalar(select(OrchestrationGate.id).where(
@@ -1084,6 +1203,7 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
         await db_session.scalar(select(func.count()).select_from(model).where(model.run_id == run.id))
         for model in (OrchestrationAction, OrchestrationGate, OrchestrationEvidence)
     ]
+    await db_session.commit()  # Publish known scenario state before the native tick.
     waiting = await service.tick(db_session, run.id)
     assert waiting["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
     assert [
@@ -1094,6 +1214,7 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
         db_session, test_project.id, service, run, gate, verifier.id,
     )
     decision = {"action_type": "noop", "reason": "Integration report consumed.", "wake_when": NOOP_WAKE_WHEN}
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     evidence = await db_session.scalar(select(OrchestrationEvidence).where(
         OrchestrationEvidence.gate_id == gate.id,
@@ -1112,7 +1233,9 @@ async def test_accepted_integration_reuses_existing_summary_and_closeout(
             "unresolved_gaps": [],
         }),
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     await db_session.refresh(parent)
     await db_session.refresh(run)
@@ -1137,6 +1260,7 @@ async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
     ])
     service = roadmap.orchestration
     _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     task = await db_session.get(Task, row.task_id)
@@ -1156,6 +1280,7 @@ async def test_verdict_correction_in_flight_counts_as_an_active_verifier(
     await ingest()
     [correction] = (await db_session.scalars(select(Task).where(Task.parent_id == verifier_task.id))).all()
     assert await roadmap.has_active_bound_verifier(db_session, run) is True
+    await db_session.commit()  # Publish known scenario state before the native tick.
     tick = await service.tick(db_session, run.id)
     assert tick["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
     assert len([a for a in await _run_actions(db_session, run.id) if a.action_type == "request_verification"]) == 1
@@ -1182,6 +1307,7 @@ async def test_blocked_verifier_awaiting_the_owner_holds_the_verifier_slot(
     ])
     service = roadmap.orchestration
     _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Waiting."})
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     row = await db_session.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     task = await db_session.get(Task, row.task_id)
@@ -1200,6 +1326,7 @@ async def test_blocked_verifier_awaiting_the_owner_holds_the_verifier_slot(
     await service._ingest_evidence_from_events(db_session, run, events)
 
     assert await roadmap.has_active_bound_verifier(db_session, run) is True
+    await db_session.commit()  # Publish known scenario state before the native tick.
     tick = await service.tick(db_session, run.id)
     assert tick["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
     assert len([a for a in await _run_actions(db_session, run.id) if a.action_type == "request_verification"]) == 1

@@ -49,7 +49,54 @@ def _manual_task_start(monkeypatch):
     monkeypatch.setattr(OrchestrationService, "_start_released_tasks", _noop)
 
 
+@pytest.fixture
+async def test_engine(tmp_path):
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-scenario.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _owned_module_setup(db_session, monkeypatch):
+    # Patch only this module's setup aliases; imported helpers remain unchanged for other modules.
+    original_authorized = _authorized_run
+    async def authorized(db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if db is db_session and not db.in_nested_transaction() and (root is None or root.origin.name == "AUTOBEGIN"):
+            kwargs["owns_setup"] = True
+        return await original_authorized(db, *args, **kwargs)
+    monkeypatch.setitem(globals(), "_authorized_run", authorized)
+
 
 
 async def test_ordinary_request_serializers_omit_empty_orchestrator_context():
@@ -701,6 +748,7 @@ async def test_tick_reconciles_terminal_roadmap_task_by_dispatching_one_verifier
         "work_function": "validation", "reason": "Verify terminal item.",
     })
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await service.tick(db_session, run.id)
     assert result["authorized_execution"]["step"] == "terminal_item_decision"
     verification = await db_session.get(
@@ -713,6 +761,7 @@ async def test_tick_reconciles_terminal_roadmap_task_by_dispatching_one_verifier
         await db_session.scalar(select(func.count()).select_from(model).where(model.run_id == run.id))
         for model in (OrchestrationAction, OrchestrationDecision, OrchestrationGate, OrchestrationEvidence)
     ]
+    await db_session.commit()  # Publish known scenario state before the native tick.
     waiting = await service.tick(db_session, run.id)
     assert waiting["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
     assert [
@@ -726,6 +775,7 @@ async def test_tick_releases_only_the_first_ready_roadmap_item(db_session, test_
         db_session, test_project, test_user, items=[_roadmap_task("first"), _roadmap_task("second")],
     )
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     result = await service.tick(db_session, run.id)
 
     assert result["authorized_execution"] == {"step": "release_item", "item_key": "first", "unit_type": "task"}
@@ -761,6 +811,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
     )
     artifact.metadata_["plan_items"][0]["agent_id"] = str(artifact.created_by_agent)
     _accept_decision(stub_decision, artifact)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     first_wait = await service.tick(db_session, run.id)
     first_verification = await db_session.get(
         OrchestrationAction, uuid.UUID(first_wait["authorized_execution"]["action_id"]),
@@ -770,10 +821,12 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         db_session, test_project.id, first_task, verifier.id,
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["V1 reviewed"]}),
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     await service.tick(db_session, run.id)
     v1 = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     assert v1 is not None and v1.version == 1
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     released = await service.tick(db_session, run.id)
     assert released["authorized_execution"]["step"] == "release_item"
     v1_row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
@@ -788,6 +841,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         "action_type": "request_verification", "gate_id": str(v1_row.gate_id),
         "work_function": "validation", "reason": "Verify V1 item.",
     })
+    await db_session.commit()  # Publish known scenario state before the native tick.
     terminal = await service.tick(db_session, run.id)
     v1_item_verification = await db_session.get(
         OrchestrationAction, uuid.UUID(terminal["authorized_execution"]["action_id"]),
@@ -801,6 +855,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         "action_type": "request_roadmap_replan", "agent_id": str(artifact.created_by_agent),
         "scope": "Revise remaining work.", "reason": "New information.",
     })
+    await db_session.commit()  # Publish known scenario state before the native tick.
     integration_tick = await service.tick(db_session, run.id)
     assert integration_tick["authorized_execution"]["step"] == "integration_decision"
     integration_verification = await db_session.get(
@@ -817,6 +872,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         json.dumps({"schema_version": 1, "plan_kind": "roadmap", "summary": "Add v2.",
                     "plan_items": [{**item, "why_runnable": "Unstarted work."} for item in v2_items]}),
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     replan_tick = await service.tick(db_session, run.id)
     assert replan_tick["authorized_execution"]["step"] == "replan_decision"
     replan = await db_session.scalar(select(OrchestrationAction).where(
@@ -834,6 +890,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
     db_session.add(candidate)
     await db_session.flush()
     _accept_decision(stub_decision, candidate)
+    await db_session.commit()  # Publish known scenario state before the native tick.
     waiting = await service.tick(db_session, run.id)
     assert waiting["authorized_execution"]["step"] == "waiting_plan_authority"
     second_verification = await db_session.get(
@@ -849,6 +906,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         "gate_id": str(approval_gate.id),
     }
     counts = await cardinalities()
+    await db_session.commit()  # Publish known scenario state before the native tick.
     replay_wait = await service.tick(db_session, run.id)
     assert replay_wait["authorized_execution"] == {"step": "waiting", "reason": "waiting_active_verification"}
     assert await cardinalities() == counts
@@ -856,6 +914,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         db_session, test_project.id, first_task, verifier.id,
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["Stale V1 reviewed"]}),
     )
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_active_verification",
     }
@@ -867,6 +926,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["Wrong V2 reviewed"]}),
     )
     second_task.status = second_task_status
+    await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db_session, run.id))["authorized_execution"] == {
         "step": "waiting", "reason": "waiting_active_verification",
     }
@@ -876,6 +936,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["V2 reviewed"]}),
     )
 
+    await db_session.commit()  # Publish known scenario state before the native tick.
     accepted = await service.tick(db_session, run.id)
     assert accepted["authorized_execution"]["step"] == "replan_decision"
     current = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)

@@ -6,12 +6,56 @@ from contextlib import asynccontextmanager
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+
+@pytest.fixture(autouse=True)
+def _no_live_native_dispatch(monkeypatch):
+    """Keep committed semantic fixtures from launching real app workers."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Isolate committed native setup, including cyclic roadmap references."""
+    from sqlalchemy import event
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-orchestration.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # Per-test database is discarded whole; no global FK cleanup is changed.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for real service/worker entrypoints."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 @pytest.fixture
@@ -235,6 +279,9 @@ async def test_standard_tick_parks_closeout_before_complete_run(
     service, _goal, run = completion_ready_goal
     await stub_tick_baseline(monkeypatch)
 
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     assert result["goal_closeout_process"]["status"] == "waiting_decision"
@@ -249,6 +296,9 @@ async def test_approved_closeout_completes_run_in_same_tick(
 ):
     service, _goal, run = completion_ready_goal
     await stub_tick_baseline(monkeypatch)
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     first = await service.tick(db_session, run.id)
     decision = await db_session.get(
         OrchestrationAuthorityDecision,
@@ -262,6 +312,9 @@ async def test_approved_closeout_completes_run_in_same_tick(
         decided_by_user_id=test_user.id,
     )
 
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     assert result["goal_closeout_process"]["status"] == "completed"
@@ -277,6 +330,9 @@ async def test_trivial_closeout_and_completion_finish_in_one_tick(
     service, _goal, run = trivial_completion_ready_goal
     await stub_tick_baseline(monkeypatch)
 
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     assert result["goal_closeout_process"]["full_closeout"] is False
@@ -564,6 +620,9 @@ async def test_terminal_tick_returns_skipped_closeout_summary(db_session, test_p
     run.status = "completed"
     await db_session.flush()
 
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     result = await OrchestrationService().tick(db_session, run.id)
 
     assert result["goal_closeout_process"] == {
@@ -891,6 +950,9 @@ async def test_cancel_waiting_completion_closeout_completes_as_cancellation(
     assert closeout.status == "completed"
     assert closeout.outputs["mode"] == "cancellation"
     assert closeout.outputs["completion_authorized"] is False
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     tick = await OrchestrationService().tick(db_session, run.id)
     assert tick["goal_closeout_process"]["mode"] == "cancellation"
 
@@ -1137,6 +1199,9 @@ async def test_tick_swallows_commitment_409_and_progress_view_lists_it(db_sessio
     db_session.add(item)
     await db_session.flush()
 
+    # End this test-owned setup before the real orchestration operation.
+    await db_session.flush()
+    await db_session.commit()
     await service.tick(db_session, run.id)
 
     assert run.status != "completed"

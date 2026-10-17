@@ -1,3 +1,6 @@
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 from datetime import datetime, timedelta
 
 import pytest
@@ -20,6 +23,46 @@ from tests.test_orchestration_continuous_service import dispatched_discovery_sou
 pytestmark = pytest.mark.asyncio
 
 
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/231: discard committed cyclic Continuous fixtures as a whole database."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-context.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # Per-test database disposal avoids changing global FK-aware cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    """SPR230/231: each scenario explicitly publishes setup before owned native ticks."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+        await session.rollback()
+
+
 async def test_discovery_fan_out_replay_creates_one_durable_lifecycle(db_session, test_project, test_agent, monkeypatch):
     goal, cycle, task, session, continuous = await dispatched_discovery_source(
         db_session, test_project, test_agent, monkeypatch,
@@ -34,6 +77,7 @@ async def test_discovery_fan_out_replay_creates_one_durable_lifecycle(db_session
     assert (cycle.status, cycle.phase) == ("running", "authorized")
     assert cycle.plan_state["discovery"]["active_session_id"] == str(session.id)
     for _ in range(4):
+        await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
         await continuous.orchestration.tick(db_session, cycle.id)
 
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
@@ -108,6 +152,7 @@ async def test_scheduler_claims_creates_one_child_and_leaves_successor_without_w
     assert cycle.phase == "authorized"
 
     # Tick only this claimed parent: a global sweep would also execute the new Outcome child.
+    await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
     await OrchestrationService().tick(db_session, cycle.id)
     child = await db_session.scalar(select(OrchestrationGoal).where(
         OrchestrationGoal.parent_goal_id == goal.id,
@@ -135,6 +180,7 @@ async def test_restart_replay_duplicates_no_cycle_child_reservation_or_successor
     due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
 
     await reconcile_continuous_goals_async(db_session, due)
+    await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
     await OrchestrationService().tick(db_session, cycle.id)
     for _ in range(3):
         # The periodic Continuous reconciler may safely replay durable state;
@@ -156,6 +202,7 @@ async def test_missed_child_completion_event_is_settled_on_periodic_reconcile(db
     goal, cycle = await started_continuous(db_session, test_project)
     due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
     await reconcile_continuous_goals_async(db_session, due)
+    await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
     await OrchestrationService().tick(db_session, cycle.id)
     child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == goal.id))
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
@@ -178,6 +225,7 @@ async def test_cancelled_continuous_parent_cannot_be_revived_by_late_child_compl
     goal, cycle = await started_continuous(db_session, test_project)
     due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
     await reconcile_continuous_goals_async(db_session, due)
+    await db_session.commit()  # SPR230/231: end this scenario’s preparation/read root before owned tick.
     await OrchestrationService().tick(db_session, cycle.id)
     child = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == goal.id))
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))

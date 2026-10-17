@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
@@ -576,7 +577,7 @@ async def test_concluded_meeting_decision_satisfies_configured_gate(db_session, 
         dedup_key=f"phase16-meeting-concluded:{meeting.id}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     await db_session.refresh(gate)
     evidence = list(
@@ -623,7 +624,7 @@ async def test_graph_run_step_records_exact_edge_evidence(db_session, test_proje
     )
     run_instance = await db_session.get(GraphRun, action.target_id)
 
-    before = await service.tick(db_session, run.id)
+    before = await _tick_owned_setup(service, db_session, run.id)
     assert before["evidence_created"] == 0
     await GraphEngineService().advance_manually(
         db_session,
@@ -642,7 +643,7 @@ async def test_graph_run_step_records_exact_edge_evidence(db_session, test_proje
         )
     ).scalar_one()
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     await db_session.refresh(gate)
     evidence = list(
@@ -689,7 +690,7 @@ async def _start_graph_for_evidence(db_session, project_id, required_source_type
         idempotency_key=f"run:{run.id}:kind:start_graph:graph:{graph.id}:task:{task.id}",
     )
     run_instance = await db_session.get(GraphRun, action.target_id)
-    await service.tick(db_session, run.id)
+    await _tick_owned_setup(service, db_session, run.id)
     return service, run, gate, task, graph, run_instance
 
 
@@ -721,7 +722,7 @@ async def test_graph_run_step_rejects_missing_or_malformed_step_id(
         dedup_key=f"phase16-invalid-step:{run_instance.id}:{step_id}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["evidence_created"] == 0
     assert await db_session.scalar(
@@ -766,7 +767,7 @@ async def test_graph_run_step_rejects_step_owned_by_another_run(db_session, test
         dedup_key=f"phase16-foreign-step:{run_instance.id}:{foreign_step.id}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["evidence_created"] == 0
     assert await db_session.scalar(
@@ -806,7 +807,7 @@ async def test_terminal_graph_evidence_keeps_run_source(
         dedup_key=f"phase16-terminal-source:{run_instance.id}:{include_step_id}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     evidence = list(
         (
@@ -876,9 +877,56 @@ async def test_terminal_graph_evidence_rejects_invalid_step_identity(
         dedup_key=f"phase16-invalid-terminal-step:{run_instance.id}:{event_type}:{step_identity}",
     )
 
-    result = await service.tick(db_session, run.id)
+    result = await _tick_owned_setup(service, db_session, run.id)
 
     assert result["evidence_created"] == 0
     assert await db_session.scalar(
         select(func.count(OrchestrationEvidence.id)).where(OrchestrationEvidence.gate_id == gate.id)
     ) == 0
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230/SPR231 commit-capable fixtures stay isolated per test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    # The database file and engine are unique to this test; disposal replaces global row deletion.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+
+async def _tick_owned_setup(service, db, run_id, **kwargs):
+    """Publish only this test's prepared scenario before the real native tick."""
+    await db.flush()
+    await db.commit()
+    return await service.tick(db, run_id, **kwargs)

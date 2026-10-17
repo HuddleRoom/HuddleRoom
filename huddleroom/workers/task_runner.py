@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import uuid
+from contextvars import Context
 
 from fastapi import HTTPException
 
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _running_tasks: dict[str, asyncio.Task] = {}
 _task_projects: dict[str, str] = {}
+_deferred_session_dispatches: dict[tuple[str, asyncio.Task], tuple[str, str, str, str]] = {}
 PROJECT_CANCELLATION_TIMEOUT_SECONDS = 5
 
 
@@ -24,6 +26,39 @@ def get_running_tasks() -> dict[str, asyncio.Task]:
 def is_task_live(task_id: str | None) -> bool:
     """Only an exact, live registry entry proves a local worker is alive."""
     return bool(task_id and (task := _running_tasks.get(task_id)) is not None and not task.done())
+
+
+def publish_session_dispatch(
+    session_id: str, adapter_type: str, project_id: str | uuid.UUID, task_id: str,
+) -> None:
+    """Publish one committed dispatch, retaining it until an exact closing worker exits."""
+    from huddleroom.services.backend_restart import draining
+    if draining:
+        return
+    worker = _running_tasks.get(task_id)
+    if worker is None or worker.done():
+        register_session(session_id, adapter_type, project_id, task_id=task_id)
+        return
+    key = (task_id, worker)
+    if key in _deferred_session_dispatches:
+        return
+    _deferred_session_dispatches[key] = (session_id, adapter_type, str(project_id), task_id)
+    worker.add_done_callback(
+        lambda _done: _publish_deferred_session_dispatch(key), context=Context(),
+    )
+
+
+def _publish_deferred_session_dispatch(key: tuple[str, asyncio.Task]) -> None:
+    """Consume the frozen intent once, after the old worker's finally cleanup."""
+    intent = _deferred_session_dispatches.pop(key, None)
+    from huddleroom.services.backend_restart import draining
+    if intent is None or draining or key[1].cancelled():
+        return
+    current = _running_tasks.get(key[0])
+    if current is not None and not current.done():
+        return
+    session_id, adapter_type, project_id, task_id = intent
+    register_session(session_id, adapter_type, project_id, task_id=task_id)
 
 
 def register_session(
@@ -54,8 +89,9 @@ def register_session(
             if draining:
                 raise
         finally:
-            _running_tasks.pop(task_id, None)
-            _task_projects.pop(task_id, None)
+            if _running_tasks.get(task_id) is asyncio.current_task():
+                _running_tasks.pop(task_id, None)
+                _task_projects.pop(task_id, None)
 
     task = asyncio.create_task(_wrapped())
     _running_tasks[task_id] = task
@@ -106,9 +142,10 @@ async def cancel_project_sessions(project_id: str | uuid.UUID) -> int:
         )
         if pending:
             raise TimeoutError(f"{len(pending)} project session task(s) did not stop before reset timeout")
-    for task_id, _ in selected:
-        _running_tasks.pop(task_id, None)
-        _task_projects.pop(task_id, None)
+    for task_id, selected_task in selected:
+        if _running_tasks.get(task_id) is selected_task:
+            _running_tasks.pop(task_id, None)
+            _task_projects.pop(task_id, None)
     return len(selected)
 
 
@@ -147,8 +184,9 @@ async def retry_api_session(
             if draining:
                 raise
         finally:
-            _running_tasks.pop(task_id, None)
-            _task_projects.pop(task_id, None)
+            if _running_tasks.get(task_id) is asyncio.current_task():
+                _running_tasks.pop(task_id, None)
+                _task_projects.pop(task_id, None)
 
     task = asyncio.create_task(_wrapped())
     _running_tasks[task_id] = task
@@ -170,7 +208,8 @@ async def cancel_all_sessions() -> int:
         for task in done:
             if not task.cancelled() and task.exception() is not None:
                 raise RuntimeError("Session shutdown failed") from task.exception()
-    for task_id, _ in selected:
-        _running_tasks.pop(task_id, None)
-        _task_projects.pop(task_id, None)
+    for task_id, selected_task in selected:
+        if _running_tasks.get(task_id) is selected_task:
+            _running_tasks.pop(task_id, None)
+            _task_projects.pop(task_id, None)
     return len(selected)

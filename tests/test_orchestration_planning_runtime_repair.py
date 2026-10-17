@@ -72,6 +72,7 @@ async def test_out_of_order_real_controller_completions_fence_late_request_with_
         first = await asyncio.wait_for(pending[0], 5)
         async with factory() as caller:
             run = await caller.get(OrchestrationRun, run_id)
+            await caller.commit()  # End this request's native-row read before independent dispatch admission.
             action = await OrchestrationDecisionDispatcher(service).dispatch(caller, run, first)
             row = await caller.get(Session, sid)
             row.task_id, row.runner_task_id = action.target_id, runner
@@ -93,7 +94,11 @@ async def test_out_of_order_real_controller_completions_fence_late_request_with_
         service.request_llm_decision = AsyncMock(return_value=current)
         async with factory() as caller:
             run = await caller.get(OrchestrationRun, run_id)
-            result = await service._dispatch_execution_decision(caller, run, late)
+            await caller.commit()
+            from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+            async with service._lock_goal_for_baseline_transition(caller, run.goal_id, tick_owns_transaction=True):
+                async with baseline_operation(caller, run.goal_id, owns_transaction=True, tick=True, run_id=run_id):
+                    result = await service._dispatch_execution_decision(caller, run, late)
             assert result.action_type == "noop"
             await caller.commit()
         async with factory() as check:
@@ -219,13 +224,17 @@ async def test_live_planner_stale_fence_then_acknowledged_independent_replacemen
                 await caller.commit()
                 await caller.refresh(run)
                 successor_id = uuid.UUID(run.plan_state["planning_task_id"])
+                await caller.commit()  # Replay is a separate request after readback.
                 replay = await method(caller, run_id=run_id, request=request, idempotency_key=key)
                 assert replay.id == action.id
                 await caller.commit()
             expected = service._plan_generation_seal(run_id, state)
-            assert [entry[0] for entry in seals[:3]] == [expected] * 3
-            assert [entry[1] for entry in seals[:3]] == ["running", "cancelled", "cancelled"]
-            assert seals[2][2] == "cancelled", "old task commit must precede final generation admission"
+            assert [entry[0] for entry in seals] == [expected] * 4
+            assert [(entry[1], entry[2]) for entry in seals] == [
+                ("running", "backlog"), ("running", "backlog"),
+                ("cancelled", "backlog"), ("cancelled", "cancelled"),
+            ]
+            assert seals[3][2] == "cancelled", "old task commit must precede final generation admission"
             async with factory() as check:
                 old_session = await check.get(Session, sid)
                 old_task = await check.get(Task, old_task_id)

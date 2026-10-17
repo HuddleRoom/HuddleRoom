@@ -1028,13 +1028,23 @@ async def test_scenario_8_expired_analyzer_claim_is_reclaimed_and_leaves_a_bound
             OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"))).all()
         actions = (await observer.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == run.id))).all()
     assert len(waits) >= 1 and all(w.fallback["action_type"] in {"continue", "attention"} for w in waits)
-    assert len(actions) == 1
+    # SPR230: one logical disposition plus its separately durable provider admission.
+    [disposition] = [action for action in actions if action.action_type != "admit_control_call"]
+    [admission] = [action for action in actions if action.action_type == "admit_control_call"]
+    assert disposition.action_type == "noop" and disposition.status == "completed"
+    assert admission.status == "completed" and admission.run_id == run.id
+    assert admission.target_type == "orchestration_run" and admission.target_id == run.id
+    claim_token = admission.request["judgment_claim_token"]
+    assert claim_token and admission.idempotency_key == f"run:{run.id}:judgment_call:{claim_token}"
+    assert admission.request["fingerprint"] == state["context_fingerprint"]
+    action_ids = {action.id for action in actions}
+    assert len(action_ids) == 2
     # Replay: the finished judgment is not due again, so nothing is re-judged or duplicated.
     async with sessions() as worker:
         await scheduler.evaluate_run(worker, run.id, now=_NOW)
     async with sessions() as observer:
-        assert len((await observer.scalars(select(OrchestrationAction).where(
-            OrchestrationAction.run_id == run.id))).all()) == 1
+        assert {action.id for action in (await observer.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id))).all()} == action_ids
         assert len((await observer.scalars(select(OrchestrationWait).where(
             OrchestrationWait.run_id == run.id, OrchestrationWait.status == "open"))).all()) == len(waits)
     assert calls == [1]

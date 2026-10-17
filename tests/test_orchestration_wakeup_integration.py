@@ -8,7 +8,7 @@ import uuid
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
@@ -18,6 +18,15 @@ from huddleroom.services.orchestration_service import GOAL_RESUMED_EVENT_TYPE, O
 from huddleroom.workers import orchestration_tasks, scheduler
 from tests.test_orchestration_continuous_service import started_continuous
 from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _seed_accepted_plan
+
+
+# committed-run operations cannot run under conftest's explicit begin() root (SPR230 caller contract)
+@pytest.fixture
+async def db_session(test_engine):
+    """SPR230: module-local session without conftest's explicit begin() root, so committed setup is possible."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 def _sessions(test_engine):
@@ -41,6 +50,9 @@ def _bus_and_sessions(monkeypatch, test_engine):
     monkeypatch.setattr(orchestration_tasks, "get_event_bus", lambda: bus)
     monkeypatch.setattr(orchestration_tasks, "AsyncSessionLocal", _sessions(test_engine))
     monkeypatch.setattr(database, "AsyncSessionLocal", _sessions(test_engine))
+    # SPR230: committed decision sessions must come from the same engine as the worker (plan row 5: foreign factory).
+    from huddleroom.services import orchestration_service
+    monkeypatch.setattr(orchestration_service, "AsyncSessionLocal", _sessions(test_engine))
     monkeypatch.setattr(orchestration_tasks.settings, "orchestration_event_coalesce_seconds", 0)
     return bus
 
@@ -116,7 +128,7 @@ async def test_spr213_resume_is_commit_bound(
     stub_decision(lambda _context: {"action_type": "noop", "reason": "resume integration"})
     goals = []
     for _ in range(2):
-        service, goal, run = await _authorized_run(db_session, test_project)
+        service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
         await service.pause_goal(db_session, test_project.id, goal.id)
         goals.append((goal.id, run.id))
     await db_session.commit()
@@ -204,7 +216,7 @@ async def test_spr213_startup_resume_periodic_effects_are_serialized(
     auditor = _agent("spr213-auditor", ["investigation"])
     db_session.add_all([planner, auditor])
     await db_session.flush()
-    service, goal, run = await _authorized_run(db_session, test_project)
+    service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
     audit_action = await service.execute_create_delegation_task_action(
         db_session, run.id,
         {"action_type": "create_delegation_task", "agent_id": str(auditor.id),
@@ -361,7 +373,7 @@ async def test_spr213_stale_wakeup_does_not_dispatch(
 ):
     from huddleroom.services.session_service import SessionService
 
-    service, goal, run = await _authorized_run(db_session, test_project)
+    service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
     await db_session.commit()
     bus = _bus_and_sessions(monkeypatch, test_engine)
     subscribed, execution_ready, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -452,7 +464,7 @@ async def test_spr213_wakeup_keeps_authorization_and_budget_fences(
     db_session.add(worker)
     await db_session.flush()
     if permission == "exhausted":
-        service, goal, run = await _authorized_run(db_session, test_project)
+        service, goal, run = await _authorized_run(db_session, test_project, owns_setup=True)
         await _seed_accepted_plan(db_session, test_project, service, run, worker)
         run.budget_state = {"status": "exceeded", "overridden": False}
     else:
@@ -465,6 +477,7 @@ async def test_spr213_wakeup_keeps_authorization_and_budget_fences(
         )
         run.baseline_authorized = True
         await complete_baseline_processes(db_session, goal, run)
+        await db_session.commit()  # SPR230: publish setup before the committed-run tick
         await service.tick(db_session, run.id)
         assert run.phase == "ready"
     await db_session.commit()
@@ -523,3 +536,234 @@ async def test_spr213_wakeup_keeps_authorization_and_budget_fences(
     finally:
         listener.cancel()
         await asyncio.gather(listener, return_exceptions=True)
+
+
+async def _owned_boundary_scenario(test_engine, tmp_path, monkeypatch):
+    """Committed baseline permission with one valid clarification; no ingestion scenario."""
+    import json
+    from types import SimpleNamespace
+    from huddleroom import database
+    from huddleroom.models.project import Project
+    from huddleroom.schemas.orchestration import OrchestrationGoalCreate
+    from huddleroom.services import orchestration_completion, orchestration_service
+    from huddleroom.services.orchestration_baseline_runtime import owns_control_transaction
+
+    factory = _sessions(test_engine)
+    sessions, observations, providers = [], [], []
+
+    @asynccontextmanager
+    async def tracked_factory():
+        async with factory() as db:
+            sessions.append(db)
+            try:
+                yield db
+            finally:
+                assert not owns_control_transaction(db), "lexical owner leaked beyond its real boundary"
+
+    async def completion(**kwargs):
+        providers.append(kwargs)
+        content = {"assumptions": [], "questions": [{
+            "question": "Which concrete scope should be delivered?", "rationale": "Scope is material.",
+            "destination": "objective",
+        }], "unsafe_unresolved": True}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(content)))])
+
+    real_prepare = OrchestrationService._prepare_control_operation
+
+    async def observe_prepare(self, db, **kwargs):
+        task = asyncio.current_task()
+        before = owns_control_transaction(db)
+        had_preflight = db.sync_session.get_transaction() is not None
+        result = await real_prepare(self, db, **kwargs)
+        observations.append((db, task, before, had_preflight, result, owns_control_transaction(db)))
+        return result
+
+    monkeypatch.setattr(database, "AsyncSessionLocal", tracked_factory)
+    monkeypatch.setattr(orchestration_service, "AsyncSessionLocal", tracked_factory)
+    monkeypatch.setattr(orchestration_tasks, "AsyncSessionLocal", tracked_factory)
+    monkeypatch.setattr(orchestration_completion, "orchestration_completion", completion)
+    monkeypatch.setattr(OrchestrationService, "_prepare_control_operation", observe_prepare)
+    monkeypatch.setattr(orchestration_tasks.settings, "orchestration_event_coalesce_seconds", 0)
+    async with factory() as setup:
+        project = Project(name="SPR230 SPR231 real ownership", description="test", workspace_path=str(tmp_path), config={})
+        setup.add(project)
+        await setup.flush()
+        service = OrchestrationService()
+        goal, run = await service.create_goal(setup, project_id=project.id, data=OrchestrationGoalCreate(
+            objective="Define the requested change", success_criteria=[{"key": "done", "description": "Scope agreed"}],
+        ), created_by_user_id=None)
+        run.baseline_authorized = True
+        await setup.commit()
+        return factory, project.id, goal.id, run.id, observations, providers
+
+
+async def _assert_owned_boundary_result(factory, run_id, goal_id):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    async with factory() as fresh:
+        process = await fresh.scalar(select(OrchestrationProcessRun).where(
+            OrchestrationProcessRun.run_id == run_id,
+            OrchestrationProcessRun.process_type == "goal_definition",
+            OrchestrationProcessRun.superseded_by_id.is_(None),
+        ))
+        assert process is not None and process.status == "waiting_decision"
+        admissions = list(await fresh.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "admit_control_call",
+        )))
+        assert len(admissions) == 1
+        assert admissions[0].dispatch_contract["provider_completed"] is True
+        assert not (process.outputs or {}).get("_lm_retry")
+        assert process.goal_id == goal_id
+        return process.id, admissions[0].id
+
+
+@pytest.mark.asyncio
+async def test_owned_tick_endpoint_after_preflight_reaches_real_admission(test_engine, tmp_path, monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from huddleroom.main import create_app
+    scenario = await _owned_boundary_scenario(test_engine, tmp_path, monkeypatch)
+    factory, project_id, goal_id, run_id, observations, providers = scenario
+    app = create_app()  # No get_db override: actual request owner opens the real file-backed factory.
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async with asyncio.timeout(10):
+            response = await client.post(f"/api/v1/projects/{project_id}/orchestration/runs/{run_id}/tick")
+            assert response.status_code == 200, response.text
+            identity = await _assert_owned_boundary_result(factory, run_id, goal_id)
+            replay = await client.post(f"/api/v1/projects/{project_id}/orchestration/runs/{run_id}/tick")
+            assert replay.status_code == 200, replay.text
+    assert len(providers) == 1
+    assert identity == await _assert_owned_boundary_result(factory, run_id, goal_id)
+    assert observations and any(preflight for _, _, _, preflight, _, _ in observations)
+    assert all(before and result and after for _, _, before, _, result, after in observations)
+
+
+@pytest.mark.asyncio
+async def test_owned_retry_endpoint_after_preflight_retains_ownership(test_engine, tmp_path, monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from huddleroom.main import create_app
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+    factory, project_id, goal_id, run_id, observations, providers = await _owned_boundary_scenario(test_engine, tmp_path, monkeypatch)
+    async with factory() as setup:
+        current = await OrchestrationProcessService().start_process(
+            setup, goal_id, process_type="goal_definition", trigger_reason="retry boundary", run_id=run_id,
+        )
+        current.outputs = {"_lm_retry": {
+            "version": 1, "kind": "goal_analysis",
+            "request": {"model": "test", "messages": [], "response_format": {"type": "json_object"}, "temperature": 0},
+            "continuation": {"clarification_round": 0, "context": {}, "working_goal": {"objective": "Define change", "success_criteria": []}},
+        }}
+        await setup.commit()
+    async with AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://test") as client:
+        async with asyncio.timeout(10):
+            url = f"/api/v1/projects/{project_id}/orchestration/goals/{goal_id}/baseline/retry"
+            response = await client.post(url, json={"process_type": "goal_definition"})
+            assert response.status_code == 200, response.text
+            identity = await _assert_owned_boundary_result(factory, run_id, goal_id)
+            replay = await client.post(url, json={"process_type": "goal_definition"})
+            assert replay.status_code == 409
+    assert len(providers) == 1
+    assert identity == await _assert_owned_boundary_result(factory, run_id, goal_id)
+    assert observations and any(preflight for _, _, _, preflight, _, _ in observations)
+    assert all(before and result and after for _, _, before, _, result, after in observations)
+
+
+@pytest.mark.asyncio
+async def test_owned_reconcile_job_after_preflight_reaches_real_tick(test_engine, tmp_path, monkeypatch):
+    factory, project_id, goal_id, run_id, observations, providers = await _owned_boundary_scenario(test_engine, tmp_path, monkeypatch)
+    async with factory() as setup:
+        paused_goal = OrchestrationGoal(project_id=project_id, objective="Paused control", status="paused")
+        setup.add(paused_goal)
+        await setup.flush()
+        paused_run = OrchestrationRun(goal_id=paused_goal.id, status="paused", phase="baseline", baseline_authorized=True)
+        setup.add(paused_run)
+        await setup.commit()
+        paused_id = paused_run.id
+    async with asyncio.timeout(10):
+        await scheduler.reconcile_orchestration_runs_job()
+        identity = await _assert_owned_boundary_result(factory, run_id, goal_id)
+        await scheduler.reconcile_orchestration_runs_job()
+    assert identity == await _assert_owned_boundary_result(factory, run_id, goal_id)
+    assert len(providers) == 1
+    assert observations and any(preflight for _, _, _, preflight, _, _ in observations)
+    assert all(before and result and after for _, _, before, _, result, after in observations)
+    async with factory() as fresh:
+        assert (await fresh.get(OrchestrationRun, paused_id)).status == "paused"
+        assert not list(await fresh.scalars(select(OrchestrationAction).where(OrchestrationAction.run_id == paused_id)))
+
+
+@pytest.mark.asyncio
+async def test_owned_sweep_one_after_preflight_reaches_real_local_tick(test_engine, tmp_path, monkeypatch):
+    from huddleroom.services.orchestration_supervision_scheduler import OrchestrationSupervisionScheduler
+    factory, _, goal_id, run_id, observations, providers = await _owned_boundary_scenario(test_engine, tmp_path, monkeypatch)
+    async with asyncio.timeout(10):
+        await OrchestrationSupervisionScheduler()._sweep_one(goal_id, 5, datetime.now(timezone.utc))
+    assert providers == []  # A real local tick must stay provider-free.
+    assert len(observations) == 1
+    db, task, before, preflight, result, after = observations[0]
+    assert task is asyncio.current_task() and before and preflight and result and after
+    from huddleroom.services.orchestration_baseline_runtime import owns_control_transaction
+    assert not owns_control_transaction(db)
+    async with factory() as fresh:
+        run = await fresh.get(OrchestrationRun, run_id)
+        assert run.supervision_state["evaluated_at"]
+        assert run.supervision_state["context_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_owned_committed_resume_worker_reaches_real_tick(test_engine, tmp_path, monkeypatch):
+    factory, project_id, goal_id, run_id, observations, providers = await _owned_boundary_scenario(test_engine, tmp_path, monkeypatch)
+    async with factory() as setup:
+        event, _ = await emit_event_once(setup, project_id, GOAL_RESUMED_EVENT_TYPE,
+            {"run_id": str(run_id), "goal_id": str(goal_id)}, dedup_key=f"owned-resume:{run_id}")
+        event_id = event.id
+        await setup.commit()
+    async with asyncio.timeout(10):
+        assert await orchestration_tasks.evaluate_supervision_event_async(event_id) == 1
+        identity = await _assert_owned_boundary_result(factory, run_id, goal_id)
+        assert await orchestration_tasks.evaluate_supervision_event_async(event_id) == 1
+    assert identity == await _assert_owned_boundary_result(factory, run_id, goal_id)
+    assert len(providers) == 1
+    # Direct event worker explicitly publishes its owned event SELECT before tick.
+    assert observations and all(before and result and after for _, _, before, _, result, after in observations)
+
+
+@pytest.mark.asyncio
+async def test_owned_supervisor_committed_resume_reaches_real_tick(test_engine, tmp_path, monkeypatch):
+    from huddleroom.services import event_bus
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    factory, project_id, goal_id, run_id, observations, providers = await _owned_boundary_scenario(test_engine, tmp_path, monkeypatch)
+    bus = EventBusService()
+    monkeypatch.setattr(event_bus, "_event_bus", bus)
+    monkeypatch.setattr(orchestration_tasks, "get_event_bus", lambda: bus)
+    ready, execution_ready = asyncio.Event(), asyncio.Event()
+    listener = asyncio.create_task(orchestration_tasks.run_orchestration_event_supervisor(ready=ready, execution_ready=execution_ready))
+    try:
+        async with asyncio.timeout(10):
+            await ready.wait()
+            async with factory() as writer:
+                await emit_event_once(writer, project_id, GOAL_RESUMED_EVENT_TYPE,
+                    {"run_id": str(run_id)}, dedup_key=f"rollback-boundary:{run_id}")
+                await writer.rollback()
+            assert bus._subscribers[0][0].empty()
+            assert observations == providers == []
+            async with factory() as writer:
+                await emit_event_once(writer, project_id, GOAL_RESUMED_EVENT_TYPE,
+                    {"run_id": str(run_id)}, dedup_key=f"commit-boundary:{run_id}")
+                assert observations == providers == []
+                await writer.commit()
+            execution_ready.set()
+            while True:
+                async with factory() as fresh:
+                    status = await fresh.scalar(select(OrchestrationProcessRun.status).where(
+                        OrchestrationProcessRun.run_id == run_id,
+                        OrchestrationProcessRun.process_type == "goal_definition",
+                    ))
+                if status == "waiting_decision":
+                    break
+                await asyncio.sleep(0.01)
+            await _assert_owned_boundary_result(factory, run_id, goal_id)
+        assert len(providers) == 1
+        assert observations and all(before and result and after for _, _, before, _, result, after in observations)
+    finally:
+        listener.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await listener

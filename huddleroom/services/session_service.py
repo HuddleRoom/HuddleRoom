@@ -48,9 +48,8 @@ def _session_dispatch_after_commit(session) -> None:
             continue
         seen.add(entry["dispatch"])
         if settings.is_sqlite:
-            from huddleroom.workers.task_runner import register_session, is_task_live
-            if not is_task_live(task_id):
-                register_session(str(session_id), adapter_type, project_id, task_id=task_id)
+            from huddleroom.workers.task_runner import publish_session_dispatch
+            publish_session_dispatch(str(session_id), adapter_type, project_id, task_id)
         else:
             from huddleroom.workers.session_tasks import run_api_session, run_cli_session
             task = run_api_session if adapter_type == "api" else run_cli_session

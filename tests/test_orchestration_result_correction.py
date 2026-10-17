@@ -4,6 +4,7 @@ import json
 import uuid
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 from huddleroom.models.agent import Agent
@@ -34,6 +35,67 @@ VALID = {
 MISSING_FIELDS = json.dumps({"status": "completed", "changes": ["Audited the API."]})
 
 
+@pytest_asyncio.fixture
+async def test_engine(tmp_path, monkeypatch):
+    """SPR230: isolate committed preparation used by real native ticks."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from huddleroom.models.base import Base
+    from huddleroom.services import orchestration_service
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'summary-owned-setup.db'}")
+    # production uses one engine; route the service's isolated sessions to the test engine
+    monkeypatch.setattr(orchestration_service, "AsyncSessionLocal", async_sessionmaker(engine, expire_on_commit=False))
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # The per-test database is discarded; cyclic committed rows need no DELETE cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    # SPR230: committed fixtures must never launch application agents.
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+async def _owned_authorized_run(db, project, **kwargs):
+    """SPR230: publish only the imported fixture's lexical setup before its real ticks."""
+    from unittest.mock import patch
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_runtime_e2e import _authorized_run
+
+    original_tick = OrchestrationService.tick
+
+    async def setup_tick(service, session, *args, **tick_kwargs):
+        root = session.sync_session.get_transaction()
+        if session is db and not session.in_nested_transaction() and (root is None or root.origin.name == "AUTOBEGIN"):
+            await session.commit()
+        return await original_tick(service, session, *args, **tick_kwargs)
+
+    with patch.object(OrchestrationService, "tick", setup_tick):
+        return await _authorized_run(db, project, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def no_live_decisions(stub_decision):
     stub_decision(lambda _context: {"action_type": "noop"})
@@ -44,7 +106,7 @@ async def _setup(db, project, *, caps=None):
                   adapter_type="api", capabilities=["investigation"], config={}, is_active=True)
     db.add(agent)
     await db.flush()
-    service, goal, run = await _authorized_run(db, project)
+    service, goal, run = await _owned_authorized_run(db, project)
     if caps:
         goal.budget = {"caps": caps}
     request = {
@@ -171,6 +233,7 @@ async def test_funded_correction_cancels_its_pending_budget_ask(db_session, test
 
     goal.budget = {"caps": {"max_tokens": 100}}
     run.budget_state = {}
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     assert len(await _corrections(db_session, task)) == 1
@@ -196,6 +259,7 @@ async def test_identical_failure_stops_with_both_attempts_and_ticks_do_not_rearm
 
     before = len(list(await asks()))
     for _ in range(2):
+        await db_session.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db_session, run.id)
         await service.consume_canonical_report(db_session, run, task)
     assert len(await _corrections(db_session, task)) == 1
@@ -292,6 +356,7 @@ async def test_correction_finished_while_paused_is_consumed_after_resume(db_sess
     assert (await _ledger(service, db_session, run, task))["stale"] == "run_paused"
 
     run.status = "running"
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
@@ -317,6 +382,7 @@ async def test_owner_contract_change_starts_a_fresh_cycle_and_drops_the_old_corr
         db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{old.id}",
     ) is None
     for _ in range(2):  # ticks do not start yet another cycle
+        await db_session.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db_session, run.id)
     assert len(await _corrections(db_session, task)) == 2
 
@@ -339,6 +405,7 @@ async def test_owner_retry_answer_starts_new_cycle_with_cycle_subject(db_session
     await _complete(db_session, service, run, first, MISSING_FIELDS)
     await _answer(db_session, run, await _ledger(service, db_session, run, task), "retry", test_user)
 
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
@@ -365,6 +432,7 @@ async def test_retry_answer_cancels_the_old_cycles_other_asks_and_drops_their_bl
     )
     await _answer(db_session, run, exhausted, "retry", test_user)
 
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
@@ -383,6 +451,7 @@ async def test_owner_dismiss_answer_closes_the_ledger(db_session, test_project, 
     await _answer(db_session, run, await _ledger(service, db_session, run, task), "dismiss", test_user)
 
     for _ in range(2):
+        await db_session.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db_session, run.id)
 
     assert (await _ledger(service, db_session, run, task))["status"] == "owner_declined"
@@ -394,6 +463,7 @@ async def test_unavailable_retry_uses_cycle_subject(db_session, test_project, te
     await _complete(db_session, service, run, task, "")
     await _answer(db_session, run, await _ledger(service, db_session, run, task), "retry", test_user)
 
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     [blocker] = _escalations(run, "capability_unavailable")
@@ -417,11 +487,13 @@ async def test_failed_correction_task_counts_as_an_attempt_and_gate_follows_the_
     [first] = await _corrections(db_session, task)
     await _fail(db_session, first)
 
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     [second] = [item for item in await _corrections(db_session, task) if item.id != first.id]
     assert (await service._adhoc_report_failure(db_session, gate))[1] is False
     await _fail(db_session, second)
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
@@ -510,6 +582,7 @@ async def test_contract_change_while_exhausted_cancels_the_stale_ask(db_session,
     assert ask.status == "pending"
 
     goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     await db_session.refresh(ask)
@@ -527,6 +600,7 @@ async def test_contract_change_while_waiting_on_budget_cancels_the_stale_budget_
     ask = await _decision(db_session, blocker["decision_id"])
 
     goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     await db_session.refresh(ask)
@@ -763,6 +837,7 @@ async def test_plan_correction_by_another_author_is_rejected_and_not_corrected_a
     assert "plan_artifact_id" not in run.plan_state and await _plan_artifact_count(db_session, test_project) == 0
     ledger = await _ledger(service, db_session, run, task)
     assert ledger["status"] == "rejected" and "author" in ledger["reason"]
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     assert len(await _corrections(db_session, task)) == 1
 
@@ -801,6 +876,7 @@ async def test_plan_revision_supersedes_an_in_flight_plan_correction(db_session,
     )
 
     await _complete(db_session, service, run, correction, _plan())
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     assert "plan_artifact_id" not in run.plan_state and await _plan_artifact_count(db_session, test_project) == 0
@@ -820,6 +896,7 @@ async def test_exhausted_plan_correction_falls_back_to_plan_revision(db_session,
     assert ledger["status"] == "exhausted"
     assert run.plan_state["status"] == "revision_required"
     assert "protocol_fallback" in run.plan_state["revision_reason"]
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     assert len(await _corrections(db_session, task)) == 1
 
@@ -837,6 +914,7 @@ async def test_dismissed_pending_replan_correction_allows_the_replan_revision(db
 
     await _complete(db_session, service, run, correction, failed)
     await _answer(db_session, run, await _ledger(service, db_session, run, task), "dismiss", test_user)
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     assert (await _ledger(service, db_session, run, task))["status"] == "owner_declined"
@@ -882,6 +960,7 @@ async def test_plan_correction_rejected_with_a_manual_plan_present_stops_and_kee
     ledger = await _ledger(service, db_session, run, task)
     assert ledger["status"] == "rejected" and "other_key" in ledger["reason"]
     assert {key: marker.request.get(key) for key in original} == original
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     assert len(await _corrections(db_session, task)) == 1
 
@@ -951,11 +1030,12 @@ async def _verifier_setup(db, project, *, dispatcher_key=False):
     producer.role, verifier.role = "developer", "validator"
     db.add_all([producer, verifier])
     await db.flush()
-    service, _goal, run = await _authorized_run(db, project)
+    service, _goal, run = await _owned_authorized_run(db, project)
     await _seed_accepted_plan(db, project, service, run, producer, plan_items=[{
         "id": "verdict-item", "work_function": "implementation",
         "scope": "Deliver work.", "deliverable": "Delivered work.", "agent_id": str(producer.id),
     }])
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     work_task = next(task for task in await _tasks_for_run(db, run.id)
                      if service._task_work_function(task) == "implementation")
@@ -1005,7 +1085,9 @@ async def test_well_formed_blocked_or_failed_verifier_report_escalates_once_and_
 ):
     service, run, gate, verifier_task = await _verifier_setup(db_session, test_project)
     await _complete(db_session, service, run, verifier_task, json.dumps({"status": status, "notes": "No access."}))
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     assert await _corrections(db_session, verifier_task) == []
@@ -1078,6 +1160,7 @@ async def test_prose_verdict_is_corrected_and_the_corrected_verdict_is_recorded(
     assert '"verdict": "accepted|rejected"' in correction.description
     ledger = await _ledger(service, db_session, run, verifier_task)
     assert ledger["kind"] == "verification_verdict" and ledger["status"] == "correcting"
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     await db_session.refresh(gate)
     assert gate.status != "accepted"
@@ -1088,6 +1171,7 @@ async def test_prose_verdict_is_corrected_and_the_corrected_verdict_is_recorded(
     assert evidence.source_id == fixed.id and evidence.verdict == "candidate"
     assert evidence.evidence_metadata["result_correction_parent_task_id"] == str(verifier_task.id)
     assert (await _ledger(service, db_session, run, verifier_task))["status"] == "corrected"
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     await db_session.refresh(gate)
     assert gate.status == "accepted"
@@ -1101,6 +1185,7 @@ async def test_repeated_identical_verdict_failure_stops_without_counting(db_sess
     [correction] = await _corrections(db_session, verifier_task)
 
     await _complete(db_session, service, run, correction, missing_verdict)
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, verifier_task)
@@ -1153,6 +1238,7 @@ async def test_invalid_final_summary_is_corrected_and_the_corrected_summary_comp
 
     service, goal, run, task, gate = await _summary_setup(db_session, test_project)
     await _complete(db_session, service, run, task, "Everything shipped; see the gates.")
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     [correction] = await _corrections(db_session, task)
@@ -1162,6 +1248,7 @@ async def test_invalid_final_summary_is_corrected_and_the_corrected_summary_comp
     assert await _summary_triggers(db_session, run) == []
 
     await _complete(db_session, service, run, correction, await _valid_summary_output(db_session, goal, run))
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(gate)
@@ -1174,12 +1261,15 @@ async def test_invalid_final_summary_is_corrected_and_the_corrected_summary_comp
 async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exhausted(db_session, test_project):
     service, _goal, run, task, gate = await _summary_setup(db_session, test_project)
     await _complete(db_session, service, run, task, "not json")
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     [correction] = await _corrections(db_session, task)
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     assert await _summary_triggers(db_session, run) == []
 
     await _complete(db_session, service, run, correction, "not json")
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
@@ -1188,6 +1278,7 @@ async def test_final_summary_recovery_trigger_fires_only_after_correction_is_exh
     assert _escalations(run, "result_correction_exhausted") == []
     assert len(await _summary_triggers(db_session, run)) == 1
     assert await _non_recovery_asks(db_session, run) == []
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     assert len(await _summary_triggers(db_session, run)) == 1
     assert len(await _corrections(db_session, task)) == 1
@@ -1209,9 +1300,11 @@ async def test_contract_change_after_a_summary_correction_stopped_keeps_it_with_
 ):
     service, goal, run, task, gate = await _summary_setup(db_session, test_project)
     await _complete(db_session, service, run, task, "not json")
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     [correction] = await _corrections(db_session, task)
     await _complete(db_session, service, run, correction, "not json")
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     settled = await _ledger(service, db_session, run, task)
     assert settled["status"] == "exhausted" and len(await _summary_triggers(db_session, run)) == 1
@@ -1219,6 +1312,7 @@ async def test_contract_change_after_a_summary_correction_stopped_keeps_it_with_
     goal.constraints = {**(goal.constraints or {}), "no_network": True}
     await db_session.flush()
     for _ in range(2):
+        await db_session.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db_session, run.id)
 
     # the stopped summary correction already went to the replacement-summary recovery: no fresh cycle
@@ -1237,6 +1331,7 @@ async def test_summary_correction_that_cannot_be_dispatched_hands_over_to_recove
     writer.is_active = False
     await db_session.flush()
 
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     ledger = await _ledger(service, db_session, run, task)
@@ -1267,20 +1362,24 @@ async def test_superseded_summary_correction_cannot_satisfy_the_gate(db_session,
 
     service, goal, run, task, gate = await _summary_setup(db_session, test_project)
     await _complete(db_session, service, run, task, "not json")
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     [old] = await _corrections(db_session, task)
     goal.constraints = {**(goal.constraints or {}), "no_network": True}
     await db_session.flush()
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)  # a new owner contract starts a fresh correction cycle
     [new] = [item for item in await _corrections(db_session, task) if item.id != old.id]
 
     await _complete(db_session, service, run, old, await _valid_summary_output(db_session, goal, run))
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     await db_session.refresh(gate)
     assert gate.status != "accepted"
     assert await _summary_triggers(db_session, run) == []
 
     await _complete(db_session, service, run, new, await _valid_summary_output(db_session, goal, run))
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
     await db_session.refresh(gate)
     assert gate.status == "accepted"

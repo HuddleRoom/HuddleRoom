@@ -4,8 +4,9 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import inspect, select, update
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm.util import identity_key
 from fastapi import HTTPException
 from huddleroom.database import AsyncSessionLocal
 from huddleroom.models.session import Session as SessionModel
@@ -23,7 +24,78 @@ _TASK_DISPATCH_ACTIONS = frozenset((
 _RECOVERY_DISPATCH_ACTIONS = frozenset(("retry_task", "reassign_task"))
 
 
+_LINEAGE_FIELDS = {
+    SessionModel: ("id", "task_id", "project_id", "agent_id", "metadata_"),
+    Task: ("id", "project_id", "assigned_to", "metadata_"),
+    OrchestrationAction: (
+        "id", "run_id", "status", "action_type", "request", "dispatch_contract", "target_type", "target_id",
+    ),
+    OrchestrationRun: ("id", "goal_id"),
+    OrchestrationGoal: ("id", "project_id"),
+}
+
+
+class _PendingLineage(Exception):
+    """Unpublished caller ownership cannot authorize a durable worker."""
+
+
+def _check_lineage_history(db, row) -> None:
+    if row is None:
+        return
+    state = inspect(row)
+    fields = _LINEAGE_FIELDS[type(row)]
+    if row in db.deleted or state.pending or any(state.attrs[field].history.has_changes() for field in fields):
+        raise _PendingLineage
+
+
+def _check_cached_lineage_history(db, session: SessionModel) -> None:
+    """Inspect the loaded graph before refreshing any member; never trigger SQL."""
+    def cached(model, row_id):
+        if row_id is None:
+            return None
+        row = db.sync_session.identity_map.get(identity_key(model, row_id))
+        if row is None:
+            row = next((item for item in db.new if isinstance(item, model)
+                        and inspect(item).dict.get("id") == row_id), None)
+        _check_lineage_history(db, row)
+        return row
+
+    _check_lineage_history(db, session)
+    task = cached(Task, inspect(session).dict.get("task_id"))
+    metadata = inspect(task).dict.get("metadata_") if task is not None else None
+    ownership = metadata.get("orchestration") if isinstance(metadata, dict) else None
+    if not isinstance(ownership, dict):
+        return
+    try:
+        action_id = uuid.UUID(str(ownership["action_id"]))
+        run_id = uuid.UUID(str(ownership["run_id"]))
+    except (KeyError, TypeError, ValueError):
+        return
+    cached(OrchestrationAction, action_id)
+    run = cached(OrchestrationRun, run_id)
+    cached(OrchestrationGoal, inspect(run).dict.get("goal_id") if run is not None else None)
+
+
+async def _fresh_lineage_row(db, model, row_id):
+    row = await db.get(model, row_id)
+    _check_lineage_history(db, row)
+    if row is not None:
+        # Refresh only authority inputs, preserving unrelated caller descriptions/output.
+        await db.refresh(row, attribute_names=[field for field in _LINEAGE_FIELDS[model] if field != "id"])
+    return row
+
+
 async def orchestration_lineage_state(db, session: SessionModel) -> bool | None:
+    """Read durable ownership without publishing or replacing pending caller state."""
+    try:
+        with db.no_autoflush:
+            _check_cached_lineage_history(db, session)
+            return await _orchestration_lineage_state(db, session)
+    except _PendingLineage:
+        return False
+
+
+async def _orchestration_lineage_state(db, session: SessionModel) -> bool | None:
     """Return True for durable orchestration work, None for manual work, False for invalid lineage."""
     session_metadata = session.metadata_ if isinstance(session.metadata_, dict) else {}
     session_orchestration = session_metadata.get("orchestration")
@@ -31,7 +103,7 @@ async def orchestration_lineage_state(db, session: SessionModel) -> bool | None:
         session_orchestration = None
     if session.task_id is None:
         return False if session_orchestration is not None else None
-    task = await db.get(Task, session.task_id, populate_existing=True)
+    task = await _fresh_lineage_row(db, Task, session.task_id)
     task_metadata = task.metadata_ if task is not None and isinstance(task.metadata_, dict) else {}
     task_orchestration = task_metadata.get("orchestration")
     if not isinstance(task_orchestration, dict):
@@ -43,9 +115,9 @@ async def orchestration_lineage_state(db, session: SessionModel) -> bool | None:
         return False
     if session_orchestration is not None and str(session_orchestration.get("action_id")) != str(action_id):
         return False
-    action = await db.get(OrchestrationAction, action_id, populate_existing=True)
-    run = await db.get(OrchestrationRun, run_id, populate_existing=True)
-    goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True) if run is not None else None
+    action = await _fresh_lineage_row(db, OrchestrationAction, action_id)
+    run = await _fresh_lineage_row(db, OrchestrationRun, run_id)
+    goal = await _fresh_lineage_row(db, OrchestrationGoal, run.goal_id) if run is not None else None
     if (task is None or action is None or run is None or goal is None or action.run_id != run.id
             or goal.project_id != session.project_id
             or task.project_id != session.project_id or task.assigned_to != session.agent_id

@@ -53,6 +53,7 @@ async def require_control_admission(db, run_id, *, require_baseline_authorizatio
 @dataclass
 class Operation:
     db: Any
+    owner_task: Any = field(default_factory=asyncio.current_task, init=False)
     owns_transaction: bool
     run_id: Any = None
     tick: bool = False
@@ -64,6 +65,25 @@ class Operation:
     finished: asyncio.Event = field(default_factory=asyncio.Event)
 
 _current = ContextVar("baseline_operation", default=None)
+_owner = ContextVar("orchestration_session_owner", default=None)
+
+
+@asynccontextmanager
+async def control_operation_owner(db):
+    """Carry session-boundary ownership through this task's internal reads."""
+    token = _owner.set((db, asyncio.current_task()))
+    try:
+        yield
+    finally:
+        _owner.reset(token)
+
+
+def owns_control_transaction(db):
+    operation = _current.get()
+    if operation is not None and operation.db is db:
+        return operation.owns_transaction and operation.owner_task is asyncio.current_task()
+    return _owner.get() == (db, asyncio.current_task())
+
 _active = {}
 _detached = set()
 _resetting = {}
@@ -88,13 +108,14 @@ async def baseline_operation(db, goal_id, *, owns_transaction, tick=False, regis
         _active[goal_id] = operation
     try:
         if operation.run_id is None:
-            operation.run_id = await db.scalar(
-                select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id)
-                .order_by(OrchestrationRun.created_at.desc()).limit(1)
-            )
+            with db.no_autoflush:
+                operation.run_id = await db.scalar(
+                    select(OrchestrationRun.id).where(OrchestrationRun.goal_id == goal_id)
+                    .order_by(OrchestrationRun.created_at.desc()).limit(1)
+                )
         yield
         from huddleroom.services.orchestration_control import apply_pause_status
-        if operation.run_id is not None and not operation.interrupted.is_set():
+        if owns_transaction and operation.run_id is not None and not operation.interrupted.is_set():
             snapshot = await apply_pause_status(db, operation.run_id)
             if snapshot.pause_requested:
                 await db.flush()
@@ -109,14 +130,15 @@ async def baseline_operation(db, goal_id, *, owns_transaction, tick=False, regis
         }) from None
     except BaselinePaused:
         from huddleroom.services.orchestration_control import apply_pause_status
-        if operation.run_id is not None:
+        if owns_transaction and operation.run_id is not None:
             await apply_pause_status(db, operation.run_id)
             await db.flush()
         if owns_transaction:
             await db.commit()
         raise HTTPException(status_code=409, detail="Orchestration admission paused") from None
     except BaselineInterrupted:
-        await db.rollback()
+        if owns_transaction:
+            await db.rollback()
         raise HTTPException(status_code=409, detail="Baseline operation discarded by reset") from None
     finally:
         _current.reset(token)
@@ -125,6 +147,8 @@ async def baseline_operation(db, goal_id, *, owns_transaction, tick=False, regis
         operation.finished.set()
 
 async def publish_baseline_transaction(db):
+    if not owns_control_transaction(db):
+        raise BaselineTransactionConflict()
     operation = _current.get()
     if operation is not None and operation.run_id is not None:
         from huddleroom.services.orchestration_control import apply_pause_status
@@ -158,6 +182,8 @@ async def await_baseline_completion(completion_fn, request, *, observer=None):
     from huddleroom.services.agent_response_stream import supports_observer, mark_observation_truncated, _prefix, DisplayTextBuffer
     observable = observer is not None and supports_observer(completion_fn)
     operation = _current.get()
+    if operation is not None and operation.owner_task is not asyncio.current_task():
+        raise BaselineTransactionConflict()
     if operation is None:
         if observable:
             return await completion_fn(**request, observer=observer)

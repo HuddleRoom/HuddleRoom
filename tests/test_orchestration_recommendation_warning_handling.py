@@ -1,8 +1,52 @@
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_native_dispatch(monkeypatch):
+    """Keep committed semantic fixtures from launching real app workers."""
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *args, **kwargs: None)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Isolate committed native setup, including cyclic roadmap references."""
+    from sqlalchemy import event
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-orchestration.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def foreign_keys(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # Per-test database is discarded whole; no global FK cleanup is changed.
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine):
+    """This module owns committed setup for real service/worker entrypoints."""
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 @pytest_asyncio.fixture
@@ -108,6 +152,9 @@ async def test_tick_noops_when_hard_stop_warning_is_active(db_session, test_proj
         run_id=run.id,
     )
 
+    # End known-owned warning/event setup before the real tick.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
 
     await db_session.refresh(goal)
@@ -123,8 +170,17 @@ async def test_tick_noops_when_hard_stop_warning_is_active(db_session, test_proj
     await OrchestrationWarningService().resolve_warning(
         db_session, warning, resolved_by="human:tester", reason="False alarm, action was retried."
     )
+    # End known-owned warning/event setup before the real tick.
+    await db_session.flush()
+    await db_session.commit()
     result_after = await service.tick(db_session, run.id)
-    assert result_after["baseline_process"] is not None
+    assert result_after["baseline_process"] is None
+    await db_session.refresh(run)
+    assert run.baseline_authorized is False  # Resolving a warning grants no Continue authority.
+    await service.authorize_baseline(db_session, test_project.id, goal.id, actor="human:tester")
+    await db_session.commit()
+    continued = await service.tick(db_session, run.id)
+    assert continued["baseline_process"] is not None
 
 
 @pytest.mark.asyncio
@@ -203,6 +259,9 @@ async def test_completion_manifest_allows_completion_once_blocker_resolved(
     await db_session.refresh(run)
     assert f"warning:{warning.id}" in [item["kind"] for item in run.active_blockers]
 
+    # End known-owned warning/event setup before the real tick.
+    await db_session.flush()
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
     assert result["run_completed"] is False
 

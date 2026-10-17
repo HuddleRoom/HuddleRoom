@@ -1,6 +1,7 @@
 import uuid
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -17,6 +18,48 @@ from huddleroom.schemas.orchestration import OrchestrationDelegationContract, Or
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.task_service import TaskService
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230: isolate committed preparation used by real native ticks."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'summary-owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # The per-test database is discarded; cyclic committed rows need no DELETE cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    # SPR230: committed fixtures must never launch application agents.
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+
 
 
 async def _complete_goal_definition(db_session, goal, run):
@@ -1010,6 +1053,7 @@ async def test_dispatch_unknown_artifact_is_failed_action_with_zero_tasks(db_ses
     project_id = test_project.id
     before = await _task_count(db_session, project_id)
 
+    await db_session.commit()  # SPR230: publish authored dispatcher preparation.
     action = await OrchestrationDecisionDispatcher(service).dispatch(db_session, run, decision)
 
     assert action.status == "failed" and "artifact_invalid" in (action.error or "")
@@ -1095,6 +1139,7 @@ async def test_forged_admission_context_without_approved_recovery_is_rejected(db
             process_type="team_hierarchy", gate_id=failed.id, gate_fingerprint="a" * 64),
     )
 
+    await db_session.commit()  # SPR230: exercise the actual forged-admission check.
     action = await OrchestrationDecisionDispatcher(OrchestrationService()).dispatch(
         db_session, rows.run, decision, recovery_context=context)
 
@@ -1119,7 +1164,15 @@ async def test_approved_baseline_repair_reuses_adhoc_executor_without_broad_skip
     monkeypatch.setattr(OrchestrationService, "execute_create_delegation_task_action", spy)
     approved = await approve(db_session, rows, await propose(db_session, rows, HIERARCHY_RETRY))
 
-    receipt = await execute(db_session, approved)
+    await db_session.commit()  # SPR230: approved recovery is durable before execution.
+    from huddleroom.services.orchestration_baseline_runtime import baseline_operation
+
+    # This registry method is internal to the native recovery operation, which owns
+    # the actual goal/root locks and its transaction before dispatching an effect.
+    service = OrchestrationService()
+    async with service._lock_goal_for_baseline_transition(db_session, rows.goal.id, tick_owns_transaction=True):
+        async with baseline_operation(db_session, rows.goal.id, owns_transaction=True, run_id=rows.run.id):
+            receipt = await execute(db_session, approved)
 
     assert receipt.status == "waiting"
     assert len(calls) == 1

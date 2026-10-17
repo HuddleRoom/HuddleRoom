@@ -1,7 +1,8 @@
 """Event-first, provider-free scheduling for authorized orchestration runs."""
 from __future__ import annotations
 
-from sqlalchemy.orm import SessionTransactionOrigin
+from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
+
 
 import asyncio
 import logging
@@ -60,10 +61,6 @@ class OrchestrationSupervisionScheduler:
         if self._tick_impl is not None:
             return await self._tick_impl(db, run_id, local_only=local_only)
         from huddleroom.services.orchestration_service import OrchestrationService
-        transaction = db.sync_session.get_transaction()
-        if (not db.in_nested_transaction() and (transaction is None
-                or transaction.origin == SessionTransactionOrigin.AUTOBEGIN)):
-            await db.commit()  # This worker owns its preflight transaction before a new goal mutex.
         return await OrchestrationService().tick(db, run_id, local_only=local_only)
 
     @staticmethod
@@ -108,7 +105,7 @@ class OrchestrationSupervisionScheduler:
         from huddleroom.services.orchestration_service import OrchestrationService
         from huddleroom.services.orchestration_supervision_context import OrchestrationSupervisionContextBuilder
 
-        async with AsyncSessionLocal() as db:
+        async with AsyncSessionLocal() as db, control_operation_owner(db):
             service, context = OrchestrationService(), OrchestrationSupervisionContextBuilder()
             await service.tick(db, run_id, local_only=True)
             run = await db.get(OrchestrationRun, run_id, populate_existing=True)
@@ -348,7 +345,7 @@ class OrchestrationSupervisionScheduler:
                         )
                 return int(await self._finish_judgment(claim, assessment))
             except (Exception, asyncio.CancelledError) as exc:  # pylint: disable=broad-exception-caught
-                if isinstance(exc, HTTPException) and exc.detail == "Orchestration admission paused":
+                if isinstance(exc, HTTPException) and getattr(exc, "detail", None) == "Orchestration admission paused":
                     await self._update_judgment_failure(run_id, failure=False, token=claim["token"])
                     return 0
                 # Each retry obtains a new local snapshot in a new transaction.
@@ -584,16 +581,16 @@ class OrchestrationSupervisionScheduler:
 
     async def _sweep_one(self, goal_id, timeout_seconds, now):
         from huddleroom.database import AsyncSessionLocal
-        async with AsyncSessionLocal() as db:
+        async with AsyncSessionLocal() as db, control_operation_owner(db):
             run_id = await db.scalar(select(OrchestrationRun.id).where(
                 OrchestrationRun.goal_id == goal_id,
                 OrchestrationRun.status.in_(("running", "blocked")),
             ).order_by(OrchestrationRun.created_at.desc()).limit(1))
             if run_id is not None:
-                await asyncio.wait_for(
-                    self._tick(db, run_id, local_only=True),
-                    timeout=max(0.01, timeout_seconds),
-                )
+                # Keep the owned session on this task; wait_for would inherit
+                # its ContextVar in a child without transferring ownership.
+                async with asyncio.timeout(max(0.01, timeout_seconds)):
+                    await self._tick(db, run_id, local_only=True)
                 run = await db.get(OrchestrationRun, run_id, populate_existing=True)
                 await db.commit()
                 state = dict(run.supervision_state or {}) if run is not None else {}

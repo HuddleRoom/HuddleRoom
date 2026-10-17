@@ -28,6 +28,7 @@ async def test_planner_terminal_tick_releases_sqlite_writer_before_controller(te
     """
     if test_engine.dialect.name != "sqlite":
         pytest.skip("SQLite single-writer regression")
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
     import huddleroom.services.orchestration_service as service_module
 
     assert test_engine.url.database != ":memory:"
@@ -51,7 +52,7 @@ async def test_planner_terminal_tick_releases_sqlite_writer_before_controller(te
             planner = _agent("lock-planner", ["planning"])
             setup.add(planner)
             await setup.flush()
-            service, _, run = await _authorized_run(setup, project)
+            service, _, run = await _authorized_run(setup, project, owns_setup=True)
             action = await service.execute_request_plan_action(setup, run.id, {
                 "action_type": "request_plan", "agent_id": str(planner.id),
                 "work_function": "planning", "scope": "Plan the fixture audit.",
@@ -79,8 +80,10 @@ async def test_planner_terminal_tick_releases_sqlite_writer_before_controller(te
                 "action_type": "noop", "reason": "Await independent plan review.", "wake_when": NOOP_WAKE_WHEN,
             }})}}]}
 
-        adapter = OrchestrationDecisionAdapter(completion_fn=fake_completion)
-        monkeypatch.setattr(service_module, "OrchestrationDecisionAdapter", lambda: adapter)
+        class FixtureDecisionAdapter(OrchestrationDecisionAdapter):
+            def __init__(self):
+                super().__init__(completion_fn=fake_completion)
+        monkeypatch.setattr(service_module, "OrchestrationDecisionAdapter", FixtureDecisionAdapter)
 
         async def no_start(*_args):
             return 0

@@ -51,6 +51,7 @@ async def _owned(db, project, agent, *, session_status="running", task_status="i
     db.add(session); await db.flush()
     action.request = {"task_id": str(task.id)}
     action.target_type, action.target_id = "session", session.id
+    await db.flush()  # Publish this helper's complete native ownership setup.
     return goal, run, action, task, session
 
 
@@ -142,6 +143,7 @@ async def test_delegation_lineage_contract_keys(db_session, test_project, test_a
     action.target_type, action.target_id = "task", task.id
     action.dispatch_contract = contract
 
+    await db_session.flush()  # End only known-owned positive fixture preparation.
     assert await orchestration_lineage_state(db_session, session) is expected
 
 
@@ -154,6 +156,7 @@ async def test_roadmap_replan_task_lineage_is_valid(db_session, test_project, te
     action.target_type, action.target_id = "task", task.id
     action.dispatch_contract = {}
 
+    await db_session.flush()  # End only known-owned positive fixture preparation.
     assert await orchestration_lineage_state(db_session, session) is True
 
 
@@ -1148,6 +1151,7 @@ async def test_direct_task_dispatch_allows_absent_session_metadata_but_rejects_a
         "create_delegation_task", "task", task.id, {},
     )
     session.metadata_ = {"attempt": {}}
+    await db_session.flush()  # End only known-owned positive fixture preparation.
     recovery = OrchestrationRecoveryService()
     assert await recovery.resolve_owned_session(db_session, session.id)
     action.action_type = "run_command"
@@ -1166,9 +1170,16 @@ async def test_direct_ownership_rejects_session_metadata_mismatch_and_goal_proje
     recovery = OrchestrationRecoveryService()
     assert await recovery.resolve_owned_session(db_session, session.id) is None
     session.metadata_ = {"attempt": {}}
-    goal.project_id = uuid.uuid4()
+    from sqlalchemy import inspect
+    changed_project = uuid.uuid4()
+    goal.project_id = changed_project
+    before = inspect(goal).attrs.project_id.history
+    outer = db_session.get_transaction()
     with db_session.no_autoflush:
         assert await recovery.resolve_owned_session(db_session, session.id) is None
+    assert goal.project_id == changed_project
+    assert inspect(goal).attrs.project_id.history == before
+    assert goal in db_session.dirty and db_session.get_transaction() is outer
 
 
 @pytest.mark.asyncio
@@ -1402,3 +1413,111 @@ async def test_owned_live_attempt_is_adopted_without_a_recovery_trigger(db_sessi
 
     assert result.classification == "live" and result.wait_id
     assert await _run_actions(db_session, run, "recovery_trigger") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,field", [
+    ("goal", "project_id"), ("run", "goal_id"), ("task", "assigned_to"),
+    ("action", "target_id"),
+])
+async def test_ownership_resolver_preserves_dirty_lineage_without_flush(db_session, test_project, test_agent, kind, field):
+    """SPR230/SPR231 caller-owned lineage edits cannot be erased or authorize work."""
+    from sqlalchemy import inspect
+    goal, run, action, task, session = await _owned(db_session, test_project, test_agent)
+    action.action_type, action.target_type, action.target_id, action.dispatch_contract = (
+        "create_delegation_task", "task", task.id, {},
+    )
+    await db_session.flush()
+    target = {"goal": goal, "run": run, "task": task, "action": action}[kind]
+    original, changed = getattr(target, field), uuid.uuid4()
+    setattr(target, field, changed)
+    history = inspect(target).attrs[field].history
+    outer = db_session.get_transaction()
+    with db_session.no_autoflush:
+        assert await OrchestrationRecoveryService().resolve_owned_session(db_session, session.id) is None
+        assert await db_session.scalar(select(getattr(type(target), field)).where(type(target).id == target.id)) == original
+    assert getattr(target, field) == changed
+    assert inspect(target).attrs[field].history == history
+    assert target in db_session.dirty and db_session.get_transaction() is outer
+
+
+@pytest.mark.asyncio
+async def test_ownership_resolver_allows_unrelated_dirty_goal_and_output(db_session, test_project, test_agent):
+    from sqlalchemy import inspect
+    goal, _, action, task, session = await _owned(db_session, test_project, test_agent)
+    action.action_type, action.target_type, action.target_id, action.dispatch_contract = (
+        "create_delegation_task", "task", task.id, {},
+    )
+    await db_session.flush()
+    goal.objective = "Caller descriptive edit"
+    session.output = "Caller retained output"
+    goal_history = inspect(goal).attrs.objective.history
+    output_history = inspect(session).attrs.output.history
+    outer = db_session.get_transaction()
+    with db_session.no_autoflush:
+        assert await OrchestrationRecoveryService().resolve_owned_session(db_session, session.id)
+    assert inspect(goal).attrs.objective.history == goal_history
+    assert inspect(session).attrs.output.history == output_history
+    assert db_session.get_transaction() is outer
+
+
+@pytest.mark.asyncio
+async def test_ownership_resolver_clean_cached_goal_observes_external_project_mismatch(concurrent_sessions, tmp_path):
+    from sqlalchemy import update
+    from tests.test_orchestration_roster_mutation import seed_project_user, make_agent
+    reader, writer = concurrent_sessions
+    project, _ = await seed_project_user(writer, tmp_path)
+    other, _ = await seed_project_user(writer, tmp_path)
+    agent = make_agent(name=f"ownership-{uuid.uuid4()}", capabilities=["implementation"])
+    writer.add(agent)
+    await writer.flush()
+    goal, _, action, task, session = await _owned(writer, project, agent)
+    action.action_type, action.target_type, action.target_id, action.dispatch_contract = (
+        "create_delegation_task", "task", task.id, {},
+    )
+    await writer.commit()
+    cached = await reader.get(OrchestrationGoal, goal.id)
+    assert cached.project_id == project.id
+    await reader.commit()  # End preflight, keep the clean identity-map object cached.
+    await writer.execute(update(OrchestrationGoal).where(OrchestrationGoal.id == goal.id).values(project_id=other.id))
+    await writer.commit()
+    assert await OrchestrationRecoveryService().resolve_owned_session(reader, session.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ownership_resolver_new_pending_linkage_does_not_authorize_or_flush(db_session, test_project, test_agent):
+    from sqlalchemy import inspect
+    _, run, action, task, session = await _owned(db_session, test_project, test_agent)
+    action.action_type, action.target_type, action.target_id, action.dispatch_contract = (
+        "create_delegation_task", "task", task.id, {},
+    )
+    await db_session.flush()
+    pending = OrchestrationAction(id=uuid.uuid4(), run_id=run.id, idempotency_key=f"pending-{uuid.uuid4()}",
+        action_type="create_delegation_task", status="completed", target_type="task", target_id=task.id)
+    db_session.add(pending)
+    task.metadata_ = {"orchestration": {"action_id": str(pending.id), "run_id": str(run.id)}}
+    history = inspect(task).attrs.metadata_.history
+    outer = db_session.get_transaction()
+    with db_session.no_autoflush:
+        assert await OrchestrationRecoveryService().resolve_owned_session(db_session, session.id) is None
+        assert await db_session.scalar(select(OrchestrationAction.id).where(OrchestrationAction.id == pending.id)) is None
+    assert pending in db_session.new
+    assert inspect(task).attrs.metadata_.history == history
+    assert task in db_session.dirty and db_session.get_transaction() is outer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "task"])
+async def test_ownership_resolver_pending_delete_cannot_authorize(db_session, test_project, test_agent, kind):
+    goal, _, action, task, session = await _owned(db_session, test_project, test_agent)
+    action.action_type, action.target_type, action.target_id, action.dispatch_contract = (
+        "create_delegation_task", "task", task.id, {},
+    )
+    await db_session.flush()
+    target = goal if kind == "goal" else task
+    await db_session.delete(target)
+    outer = db_session.get_transaction()
+    with db_session.no_autoflush:
+        assert await OrchestrationRecoveryService().resolve_owned_session(db_session, session.id) is None
+        assert await db_session.scalar(select(type(target).id).where(type(target).id == target.id)) == target.id
+    assert target in db_session.deleted and db_session.get_transaction() is outer

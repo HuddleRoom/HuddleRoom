@@ -29,6 +29,7 @@ import httpx
 import litellm
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.config import settings
 from huddleroom.models.agent import Agent
@@ -59,15 +60,81 @@ from huddleroom.workers import task_runner
 from tests.conftest import bind_plan_author_team, complete_baseline_processes, heal_baseline_drift_for_test
 from tests.test_orchestration_roadmap_children import goal_item
 from tests.test_orchestration_roadmap_e2e import (
-    _assert_budget_conserved, _children_of, _close_roadmap, _item, _run_of, _snapshot, _tick_until,
+    _assert_budget_conserved, _children_of, _close_roadmap as _scenario_close_roadmap, _item, _run_of, _snapshot, _tick_until as _scenario_tick_until,
 )
 from tests.test_orchestration_roadmap_integration import (
-    _child_actors, _complete_child, _complete_roadmap_task, _integration_gate, _record_measured_completion,
+    _child_actors, _complete_child as _scenario_complete_child,
+    _complete_roadmap_task as _scenario_complete_roadmap_task,
+    _integration_gate, _record_measured_completion,
 )
 from tests.test_orchestration_roadmap_task_items import roadmap_task
 from tests.test_orchestration_runtime_e2e import (
     _agent, _authorized_run, _run_actions, _seed_accepted_plan, _tasks_for_run,
 )
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-hierarchy.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    yield
+
+
+@pytest.fixture
+async def db_session(test_engine, monkeypatch):
+    monkeypatch.setattr(task_runner, "register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+async def _owned_scenario_helper(helper, db, *args, **helper_kwargs):
+    original = OrchestrationService.tick
+    async def tick(self, current_db, *tick_args, **kwargs):
+        root = current_db.sync_session.get_transaction()
+        if (current_db is db and not current_db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            await current_db.flush()
+            await current_db.commit()
+        return await original(self, current_db, *tick_args, **kwargs)
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(OrchestrationService, "tick", tick)
+        return await helper(db, *args, **helper_kwargs)
+
+
+async def _tick_until(db, *args):
+    return await _owned_scenario_helper(_scenario_tick_until, db, *args)
+
+
+async def _close_roadmap(db, *args):
+    return await _owned_scenario_helper(_scenario_close_roadmap, db, *args)
+
+
+async def _complete_roadmap_task(db, *args, **kwargs):
+    return await _owned_scenario_helper(_scenario_complete_roadmap_task, db, *args, **kwargs)
+
+
+async def _complete_child(db, *args, **kwargs):
+    return await _owned_scenario_helper(_scenario_complete_child, db, *args, **kwargs)
+
 
 ROOT_OBJECTIVE = "Launch v2: core platform area, then rollout."
 
@@ -170,11 +237,13 @@ async def _plan_roadmap_by_tick(db, project, service, scripts, goal, run, planne
         return None
 
     scripts[run.id] = plan
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)
     task = await db.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
     assert task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"] == "roadmap"
     await _record_measured_completion(db, project.id, run, task, task.assigned_to,
                                       json.dumps(_roadmap_envelope(items, summary)))
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)  # ingests the envelope and opens the human plan approval
     decision = await db.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending",
@@ -222,6 +291,7 @@ async def _verify(db, project, service, run, gate, verifier):
         f"run:{run.id}:kind:request_verification:{gate.success_criterion_key}")
     task = await db.get(Task, action.target_id)
     assert task.assigned_to == verifier.id
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)
     await db.refresh(task)
     output = json.dumps({"status": "done", "verdict": "accepted", "evidence": [f"independent check {gate.id}"]})
@@ -229,6 +299,7 @@ async def _verify(db, project, service, run, gate, verifier):
         await _finish(db, project, run, task, output)
     else:
         await _record_measured_completion(db, project.id, run, task, verifier.id, output)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)
     await db.refresh(gate)
     assert gate.status == "accepted", gate.failure_reason
@@ -246,6 +317,7 @@ async def _tick_until_task(db, service, run, work_function):
                      if service._task_work_function(task) == work_function and task.status == "in_progress"), None)
         if task is not None:
             return task
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, run.id)
     raise AssertionError(f"no live {work_function} task")
 
@@ -253,6 +325,7 @@ async def _tick_until_task(db, service, run, work_function):
 async def _assert_replay_adds_nothing(db, service, models, runs):
     before = await _snapshot(db, models)
     for run in runs:
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, run.id)
     after = await _snapshot(db, models)
     assert {m: [r["id"] for r in rows] for m, rows in after.items()} == {
@@ -325,6 +398,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     assert classified == [ROOT_OBJECTIVE]
     root_run.baseline_authorized = True
     await complete_baseline_processes(db, root, root_run)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, root_run.id)
     assert (root_run.phase, root_run.status) == ("ready", "running")
     await service.start_run(db, project.id, root.id, actor="human:e2e")
@@ -366,7 +440,9 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     for task in root_audits:
         await _record_measured_completion(db, project.id, root_run, task, auditor.id,
                                           _report("Preliminary roadmap risk evidence."))
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, root_run.id)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, root_run.id)
     assert await _item(db, root, "build") is None
     for index, task in enumerate(root_audits):
@@ -377,9 +453,11 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
         if index == 0:
             assert await _item(db, root, "build") is None
     # 2. build accepted -> P releases only the nested Roadmap C (parent_explicit: no classifier call).
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, root_run.id)
     build_row = await _item(db, root, "build")
     await _complete_roadmap_task(db, project.id, service, root_run, build_row, verifier.id)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, root_run.id)
     (area_goal,) = await _children_of(db, root)
     area_run = await _run_of(db, area_goal)
@@ -396,6 +474,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     await _plan_roadmap_by_tick(db, project, service, scripts, area_goal, area_run, planner, [g1, probe, g2],
                                 "Leaf g1, a probe task, then g2.")
     v1 = await OrchestrationRoadmapService(service).current_version(db, area_goal.id)
+    await db.commit()  # Publish known scenario state before the native tick.
     assert (await service.tick(db, area_run.id))["authorized_execution"]["item_key"] == "g1"
     (leaf,) = await _children_of(db, area_goal)
     leaf_run = await _run_of(db, leaf)
@@ -428,6 +507,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     scripts[leaf_run.id] = leaf_script
     auto_start["on"] = True
     for _ in range(3):
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, leaf_run.id)
     planning = await db.get(Task, uuid.UUID(leaf_run.plan_state["planning_task_id"]))
     audit0, audit1 = await _audits(db, service, leaf_run)
@@ -437,6 +517,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
 
     # 4. audit-0 reports evidence; its slot goes to audit-1, whose first attempt fails (the failed predecessor).
     await _finish(db, project, leaf_run, audit0, _report("Area 0 call sites listed."))
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, leaf_run.id)
     readiness = await db.get(OrchestrationGate, uuid.UUID(audit0.metadata_["orchestration"]["gate_id"]))
     assert readiness.status == "accepted" and evidence_semantics(
@@ -445,11 +526,13 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     await db.refresh(audit1)
     assert audit1.status == "in_progress" and await _live_count(db) == 2
     await _finish(db, project, leaf_run, audit1, None, failed=True)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, leaf_run.id)
     retry = await _approved_retry(db, service, leaf_run, audit1)
     await db.refresh(audit1)
     assert retry.status == "completed" and audit1.status == "in_progress"
     await _finish(db, project, leaf_run, audit1, _report("Area 1 review notes."))
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, leaf_run.id)
 
     # 5. The planner adopts both audits and joins them in a synthesis item.
@@ -466,6 +549,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     await _finish(db, project, leaf_run, planning, json.dumps(envelope))
     await _elapse_backstops(db, leaf_run)
     await _tick_until(db, service, leaf_run, lambda: leaf_run.plan_state.get("status") == "accepted")
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, leaf_run.id)  # adopts both audits: no new task, no new slot
     audit_gates = [await _item_gate(db, leaf_run, f"audit-{n}") for n in range(2)]
     assert [task.metadata_["orchestration"]["plan_item_gate_id"] for task in (audit0, audit1)] == [
@@ -484,6 +568,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
 
     # 7. Synthesis delivers, is verified, and the leaf closes through its final summary.
     await _finish(db, project, leaf_run, synthesis, _report("g1 delivered."))
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, leaf_run.id)
     synthesis_gate = await _item_gate(db, leaf_run, "synthesis")
     await _verify(db, project, service, leaf_run, synthesis_gate, verifier)
@@ -507,6 +592,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     g1_evidence = list(await db.scalars(select(OrchestrationEvidence).where(OrchestrationEvidence.gate_id == g1_gate.id)))
     assert g1_gate.status == "accepted" and [(e.source_type, e.verdict) for e in g1_evidence] == [("child_goal", "accepted")]
     for _ in range(3):
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, area_run.id)
         probe_row = await _item(db, area_goal, "probe")
         if probe_row is not None:
@@ -531,6 +617,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
         (run.plan_state or {}).get("pending_replan")) else None
     decision = None
     for _ in range(4):
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, area_run.id)
         decision = await db.scalar(select(OrchestrationAuthorityDecision).where(
             OrchestrationAuthorityDecision.run_id == area_run.id, OrchestrationAuthorityDecision.status == "pending",
@@ -542,6 +629,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
         db, decision, selected_option="approve", decided_by_user_id=area_goal.manager_user_id)
     roadmap = OrchestrationRoadmapService(service)
     for _ in range(4):
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, area_run.id)
         v2 = await roadmap.current_version(db, area_goal.id)
         if v2.id != v1.id:
@@ -559,6 +647,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     await _verify(db, project, service, area_run, await db.get(OrchestrationGate, probe_row.gate_id), verifier)
     auto_start["on"] = False  # remaining sessions are played through the shared Roadmap helpers
     for _ in range(3):
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, area_run.id)
         g2_row = await _item(db, area_goal, "g2")
         if g2_row is not None:
@@ -583,6 +672,7 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     models = (OrchestrationAction, Task, OrchestrationGate, OrchestrationEvidence, OrchestrationRoadmapItem,
               OrchestrationRoadmapVersion, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun, Session)
     for _ in range(4):  # C's integration gate opens; then nothing else is due anywhere
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, area_run.id)
         if await _integration_gate(db, roadmap, area_goal, area_run, v2) is not None:
             break
@@ -645,6 +735,7 @@ async def test_explicit_type_is_preserved_and_corrected_auto_root_needs_fresh_st
     assert classified == ["Pick one thing."]
     old.baseline_authorized = True
     await complete_baseline_processes(db, goal, old)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, old.id)
     await service.start_run(db, project.id, goal.id, actor="human:e2e")
     await bind_plan_author_team(db, goal, planner)
@@ -652,6 +743,7 @@ async def test_explicit_type_is_preserved_and_corrected_auto_root_needs_fresh_st
     scripts[old.id] = lambda run: None if (run.plan_state or {}).get("planning_task_id") else {
         "action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
         "scope": "Plan it."}
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, old.id)
     old_plan = await db.get(Task, uuid.UUID(old.plan_state["planning_task_id"]))
     assert old_plan.status == "backlog"  # never activated (auto start off)
@@ -674,6 +766,7 @@ async def test_explicit_type_is_preserved_and_corrected_auto_root_needs_fresh_st
         "action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
         "scope": "Plan the Roadmap."}
     await complete_baseline_processes(db, goal, successor)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, successor.id)
     assert successor.phase == "ready" and not (successor.plan_state or {}).get("planning_task_id")
     denied = await effective_authorization(db, goal, successor)
@@ -687,6 +780,7 @@ async def test_explicit_type_is_preserved_and_corrected_auto_root_needs_fresh_st
     assert (allowed.allowed, allowed.authority_source, allowed.run_id) == (True, "root_start", successor.id)
     await bind_plan_author_team(db, goal, planner)
     await heal_baseline_drift_for_test(db, goal, successor)
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, successor.id)
     plan = await db.get(Task, uuid.UUID(successor.plan_state["planning_task_id"]))
     assert plan.metadata_["orchestration"]["run_id"] == str(successor.id)
@@ -717,12 +811,13 @@ async def test_failed_predecessor_attempt_retries_then_its_accepted_gate_release
     worker.role = "developer"
     db.add_all([worker, verifier])
     await db.flush()
-    service, goal, run = await _authorized_run(db, project)
+    service, goal, run = await _authorized_run(db, project, owns_setup=True)
     goal.weight = "trivial"
     _script(monkeypatch, service, {})
     item = {"work_function": "implementation", "scope": "s", "deliverable": "d", "agent_id": str(worker.id)}
     await _seed_accepted_plan(db, project, service, run, worker, plan_items=[
         {**item, "id": "first"}, {**item, "id": "second", "depends_on": ["first"]}])
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)
 
     def released(item_id):
@@ -732,15 +827,18 @@ async def test_failed_predecessor_attempt_retries_then_its_accepted_gate_release
     (first,) = released("first")
     assert first.status == "in_progress" and released("second") == []
     await _finish(db, project, run, first, None, failed=True)  # the failed predecessor attempt
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)
     retry = await _approved_retry(db, service, run, first)
     assert retry.status == "completed" and first.status == "in_progress", retry.error
     tasks = await _tasks_for_run(db, run.id)
     assert released("second") == []  # a failed predecessor is a wait, never a release
     await _finish(db, project, run, first, _report("first delivered on retry"))
+    await db.commit()  # Publish known scenario state before the native tick.
     await service.tick(db, run.id)
     await _verify(db, project, service, run, await _item_gate(db, run, "first"), verifier)
     for _ in range(3):
+        await db.commit()  # Publish known scenario state before the native tick.
         await service.tick(db, run.id)
     tasks = await _tasks_for_run(db, run.id)
     assert (await _item_gate(db, run, "first")).status == "accepted"

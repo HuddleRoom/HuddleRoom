@@ -173,6 +173,64 @@ PRODUCER_REPORT = {
 }
 
 
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """SPR230: isolate committed preparation used by real native ticks."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'summary-owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database(test_engine):
+    # The per-test database is discarded; cyclic committed rows need no DELETE cleanup.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    # SPR230: committed fixtures must never launch application agents.
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
+
+
+async def _owned_authorized_run(db, project, **kwargs):
+    """SPR230: publish only the imported fixture's lexical setup before its real ticks."""
+    from unittest.mock import patch
+    from huddleroom.services.orchestration_service import OrchestrationService
+    from tests.test_orchestration_runtime_e2e import _authorized_run
+
+    original_tick = OrchestrationService.tick
+
+    async def setup_tick(service, session, *args, **tick_kwargs):
+        root = session.sync_session.get_transaction()
+        if session is db and not session.in_nested_transaction() and (root is None or root.origin.name == "AUTOBEGIN"):
+            await session.commit()
+        return await original_tick(service, session, *args, **tick_kwargs)
+
+    with patch.object(OrchestrationService, "tick", setup_tick):
+        return await _authorized_run(db, project, **kwargs)
+
+
 @pytest.fixture
 def no_live_decisions(stub_decision):
     stub_decision(lambda _context: {"action_type": "noop"})
@@ -201,7 +259,7 @@ async def _verifier_for_db_only_report(
         verifier.adapter_type, verifier.provider, verifier.config = "cli", "anthropic", {"cli_runtime": "claude_code"}
     db.add_all([producer, verifier])
     await db.flush()
-    service, _goal, run = await _authorized_run(db, project, success_criteria=[
+    service, _goal, run = await _owned_authorized_run(db, project, success_criteria=[
         {"key": "login", "description": "Users can sign in with email and password."},
     ])
     await _seed_accepted_plan(db, project, service, run, producer, plan_items=[{
@@ -209,6 +267,7 @@ async def _verifier_for_db_only_report(
         "deliverable": "Login form with validation.", "success_evidence": ["Login form test output."],
         "success_criterion_keys": ["login"], "agent_id": str(producer.id),
     }])
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     work_task = next(task for task in await _tasks_for_run(db, run.id)
                      if service._task_work_function(task) == "implementation")
@@ -310,6 +369,7 @@ async def test_changes_requested_review_keeps_bounded_findings(db_session, test_
         "review_outcome": GraphEngineService()._parse_review_outcome(output),
     }, dedup_key=f"changes-requested:{session.id}")
 
+    await db_session.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db_session, run.id)
 
     [evidence] = [row for row in await db_session.scalars(select(OrchestrationEvidence).where(
@@ -390,6 +450,7 @@ async def _finish(db, service, run, task, output):
     from tests.test_orchestration_result_correction import _complete
 
     await _complete(db, service, run, task, output)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
 
@@ -478,6 +539,7 @@ async def test_third_rejection_escalates_revision_exhausted_and_re_verifications
     history = " ".join(ask["history"])
     assert all(text in history for text in ("First finding.", "Second finding.", "Third finding."))
 
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # ticks and replays never re-arm
     assert len(await _revision_tasks(db, work_task)) == 2 and len(_owner_asks(run, "revision_exhausted")) == 1
 
@@ -493,6 +555,7 @@ async def test_replayed_rejection_adds_no_revision(db_session, test_project):
     from huddleroom.models.event_log import EventLog
     events = list(await db.scalars(select(EventLog).where(EventLog.payload["task_id"].as_string() == str(verifier_task.id))))
     await service._ingest_evidence_from_events(db, run, events)  # the rejection event replayed
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     await service.recover_run(db, run.id, baseline_ready=True)
 
@@ -569,6 +632,7 @@ async def test_rejection_from_a_verdict_correction_revises_once_for_the_original
     await _complete(db, service, run, verifier_task, "The password check is missing.")  # no verdict: corrected
     [correction] = await _corrections(db, verifier_task)
     await _finish(db, service, run, correction, _rejection("Empty password returns 500."))
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
     assert len(await _revision_tasks(db, work_task)) == 1
@@ -584,7 +648,7 @@ async def _reviewed_work(db, project, required=("task",), caps=None, gate_type="
     developer, reviewer = _agent("developer", "developer", ["implementation"]), _agent("reviewer", "reviewer", ["review"])
     db.add_all([developer, reviewer])
     await db.flush()
-    service, goal, run = await _authorized_run(db, project)
+    service, goal, run = await _owned_authorized_run(db, project)
     if caps:
         goal.budget = {"caps": caps}
     gate = OrchestrationGate(run_id=run.id, success_criterion_key="plan_item:implement-api", gate_type=gate_type,
@@ -608,6 +672,7 @@ async def _review_rejects(db, service, run, task, reviewer, finding):
         "session_id": str(session.id), "task_id": str(task.id),
         "review_outcome": GraphEngineService()._parse_review_outcome(output),
     }, dedup_key=f"changes-requested:{session.id}")
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
 
@@ -765,6 +830,7 @@ async def _review_approves(db, service, run, task, reviewer):
         "session_id": str(session.id), "task_id": str(task.id),
         "review_outcome": GraphEngineService()._parse_review_outcome(output),
     }, dedup_key=f"approved:{session.id}")
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
 
@@ -815,6 +881,7 @@ async def test_a_failed_re_verification_dispatch_is_retried_on_a_later_tick(db_s
     assert failed.status == "failed" and await _reverifier(db, service, run, revision) is None
     assert _owner_asks(run, "capability_unavailable") == []  # one failure is not yet persistent
 
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     attempts = await service._reverification_actions(db, run.id, revision.id)
     assert [a.status for a in attempts] == ["failed", "completed"] and attempts[1].idempotency_key.endswith(":attempt:1")
@@ -862,8 +929,11 @@ async def test_owner_answer_re_arms_re_verification_after_repeated_failures(db_s
 
     monkeypatch.setattr(service, "_best_recovery_agent", fit)
     await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # three failures spent: no fourth attempt until the owner answers
 
     attempts = await service._reverification_actions(db, run.id, revision.id)
@@ -875,6 +945,7 @@ async def test_owner_answer_re_arms_re_verification_after_repeated_failures(db_s
         decided_by_user_id=goal.manager_user_id or uuid.uuid4(),
     )
 
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     reviewer_task = await _reverifier(db, service, run, revision)
     assert reviewer_task is not None and reviewer_task.assigned_to == reviewer.id
@@ -902,7 +973,9 @@ async def test_spend_authority_wait_inside_dispatch_spends_no_attempt(db_session
 
     monkeypatch.setattr(service, "roadmap_pre_release_authority", authority)
     await _finish(db, service, run, revision, json.dumps(VALID_REPORT))
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
     # a persistent wait records one failed action, not one per tick
@@ -913,6 +986,7 @@ async def test_spend_authority_wait_inside_dispatch_spends_no_attempt(db_session
     for _ in range(2):  # retried once the wait backoff passes; waits never spend attempts
         for action in await service._reverification_actions(db, run.id, revision.id):
             action.created_at = action.created_at - timedelta(hours=1)
+        await db.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db, run.id)
     reviewer_task = await _reverifier(db, service, run, revision)
     assert [a.error for a in await service._reverification_actions(db, run.id, revision.id)][:2] == ["budget_wait"] * 2
@@ -966,6 +1040,7 @@ async def test_direct_workspace_edit_after_dispatch_drops_the_approval_and_verif
     reverifier = await db.get(Task, second.target_id)
     assert reverifier.id != verifier_task.id and f"sha256 {new_digest}" in reverifier.description
 
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # repeated ticks request nothing more
     assert len(await _verification_actions(db, run, gate)) == 2
 
@@ -983,6 +1058,7 @@ async def test_edit_after_approval_before_acceptance_is_not_accepted(db_session,
     await _complete(db, service, run, verifier_task, ACCEPTED)  # approval recorded, gate not validated yet
     (Path(test_project.workspace_path) / "login.py").write_text("tampered\n")
 
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
     await db.refresh(gate)
@@ -997,6 +1073,7 @@ async def test_file_vanishing_after_dispatch_goes_back_to_the_producer_once(db_s
     (Path(test_project.workspace_path) / "login.py").unlink()
 
     await _finish(db, service, run, verifier_task, ACCEPTED)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     await service.recover_run(db, run.id, baseline_ready=True)
 
@@ -1006,6 +1083,7 @@ async def test_file_vanishing_after_dispatch_goes_back_to_the_producer_once(db_s
     [entry] = await _revisions(service, db, run, gate)
     assert entry["cause"] == "deliverable_missing" and entry["revision_task_id"] == str(revision.id)
     assert len(await _verification_actions(db, run, gate)) == 1  # no verifier for missing content
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # repeated ticks: still one revision
     assert len(await _revision_tasks(db, work_task)) == 1 and len(await _revisions(service, db, run, gate)) == 1
 
@@ -1047,6 +1125,7 @@ async def test_unpinned_url_never_reaches_a_verifier_and_never_revises(db_sessio
     )
     assert verifier_task is None  # nothing pinned to judge: no verifier run
 
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     await service.recover_run(db, run.id, baseline_ready=True)
 
@@ -1069,6 +1148,7 @@ async def test_later_edits_never_reopen_an_accepted_gate(db_session, test_projec
     assert gate.status == "accepted"
 
     (Path(test_project.workspace_path) / "login.py").write_text("later work on the same file\n")
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     await service.recover_run(db, run.id, baseline_ready=True)
 
@@ -1105,6 +1185,7 @@ async def test_cited_file_absent_from_the_workspace_goes_back_to_the_producer_wi
     assert str(artifact.id) in revision.description and "<<<FINDINGS" in revision.description
 
     for _ in range(2):  # repeated ticks and verification requests: still exactly one revision, no verifier
+        await db.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db, run.id)
         await service.recover_run(db, run.id, baseline_ready=True)
         await service.execute_request_verification_action(
@@ -1163,6 +1244,7 @@ async def test_unreadable_path_blocks_the_gate_and_asks_for_permission(db_sessio
         service, run, gate, work_task, artifact, _verifier, verifier_task = await _verifier_for_db_only_report(
             db, test_project, artifact_fields={"path": "secret/login.py"},
         )
+        await db.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db, run.id)
         await service.recover_run(db, run.id, baseline_ready=True)
     finally:
@@ -1245,6 +1327,7 @@ async def test_rejection_while_the_deliverable_is_unreadable_asks_instead_of_rev
         db, decision, selected_option=(decision.options or [{"key": "done"}])[0]["key"],
         decided_by_user_id=(await db.get(OrchestrationGoal, run.goal_id)).manager_user_id or uuid.uuid4(),
     )
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # the owner answered: the rejection is revised
     await service.recover_run(db, run.id, baseline_ready=True)
     [revision] = await _revision_tasks(db, work_task)
@@ -1293,6 +1376,7 @@ async def test_wrong_artifact_id_for_present_content_is_corrected_then_verified(
 
     progress = await OrchestrationProgressView().build(db, await db.get(OrchestrationGoal, run.goal_id), run)
     assert not [f for f in progress.untracked_follow_ups if f["id"] == str(gate.id)]  # the correction is the work
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # nothing to verify while the correction runs
     assert len(await _verification_actions(db, run, gate)) == 1
 
@@ -1302,7 +1386,9 @@ async def test_wrong_artifact_id_for_present_content_is_corrected_then_verified(
     assert marker.request["result_correction"]["status"] == "corrected"
     assert len(list(await db.scalars(select(Session).where(
         Session.task_id == work_task.id, Session.status == "completed")))) == 1  # no work redone
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # the held verification is requested again by itself, with no new request
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     held, action = await _verification_actions(db, run, gate)
     verifier = await db.get(Task, action.target_id)
@@ -1396,6 +1482,7 @@ async def test_dismissed_report_correction_asks_once_on_the_gate_instead_of_hold
     [correction] = [row for row in await db.scalars(select(Task).where(Task.parent_id == work_task.id))
                     if (row.metadata_ or {}).get("result_correction_parent_task_id") == str(work_task.id)]
     await _complete(db, service, run, correction, json.dumps(_cites(wrong)(None)))  # stops: exhausted
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     assert _owner_asks(run, "capability_unavailable") == []  # the correction's own ask is the owner's decision
 
@@ -1408,6 +1495,7 @@ async def test_dismissed_report_correction_asks_once_on_the_gate_instead_of_hold
     for _ in range(3):
         for action in await _verification_actions(db, run, gate):
             action.created_at = action.created_at - timedelta(hours=1)
+        await db.commit()  # SPR230: publish authored native-tick preparation.
         await service.tick(db, run.id)
 
     [ask] = _owner_asks(run, "capability_unavailable")
@@ -1446,6 +1534,7 @@ async def test_pending_input_ask_adds_no_classification_or_routed_rows(db_sessio
         for _ in range(3):
             for action in await _verification_actions(db, run, gate):
                 action.created_at = action.created_at - timedelta(hours=1)
+            await db.commit()  # SPR230: publish authored native-tick preparation.
             await service.tick(db, run.id)
             await service.recover_run(db, run.id, baseline_ready=True)
     finally:
@@ -1462,11 +1551,12 @@ async def test_sessionless_work_with_a_consumed_marker_still_gets_a_verifier(db_
     producer.role, verifier.role = "developer", "validator"
     db.add_all([producer, verifier])
     await db.flush()
-    service, _goal, run = await _authorized_run(db, test_project)
+    service, _goal, run = await _owned_authorized_run(db, test_project)
     await _seed_accepted_plan(db, test_project, service, run, producer, plan_items=[{
         "id": "hand-item", "work_function": "implementation", "scope": "Finish by hand.",
         "deliverable": "Delivered work.", "agent_id": str(producer.id),
     }])
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     work_task = next(task for task in await _tasks_for_run(db, run.id)
                      if service._task_work_function(task) == "implementation")
@@ -1530,6 +1620,7 @@ async def test_funding_wait_for_changed_content_asks_the_owner_and_clears_once_d
     monkeypatch.setattr(service, "roadmap_pre_release_authority", authority)
     (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): return True\n")
     await _finish(db, service, run, verifier_task, ACCEPTED)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)  # within the wait backoff: no second waiting action
 
     first, waiting = await _verification_actions(db, run, gate)
@@ -1538,6 +1629,7 @@ async def test_funding_wait_for_changed_content_asks_the_owner_and_clears_once_d
     assert ask["scope"].startswith(f"gate:{gate.id}:reverify:")
 
     waiting.created_at = waiting.created_at - timedelta(hours=1)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
     actions = await _verification_actions(db, run, gate)
     assert actions[-1].target_type == "task" and _owner_asks(run, "budget_exhausted") == []
@@ -1557,6 +1649,7 @@ async def test_answered_ask_after_failed_changed_content_verifications_re_arms_a
     await _complete(db, service, run, verifier_task, ACCEPTED)
     with patch.object(service, "_best_recovery_agent", AsyncMock(return_value=None)):  # no verifier fits
         for _ in range(4):
+            await db.commit()  # SPR230: publish authored native-tick preparation.
             await service.tick(db, run.id)
     assert [a.status for a in (await _verification_actions(db, run, gate))[1:]] == ["failed"] * 3
     [ask] = _owner_asks(run, "capability_unavailable")
@@ -1567,6 +1660,7 @@ async def test_answered_ask_after_failed_changed_content_verifications_re_arms_a
     await OrchestrationAuthorityDecisionService().answer_decision(
         db, decision, selected_option=option, reason=None, decided_by_user_id=test_user.id,
     )
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
     actions = await _verification_actions(db, run, gate)
@@ -1650,7 +1744,9 @@ async def test_work_finished_after_its_review_gets_a_fresh_verifier_told_the_evi
     await emit_event_once(db, task.project_id, "session.completed", {
         "session_id": str(producer.id), "task_id": str(task.id),
     }, dedup_key=f"late-work:{producer.id}")
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
+    await db.commit()  # SPR230: publish authored native-tick preparation.
     await service.tick(db, run.id)
 
     await db.refresh(gate)

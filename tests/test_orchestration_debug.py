@@ -9,8 +9,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.base import _utcnow
@@ -34,6 +36,20 @@ pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.usefixtures("safe_goal_analysis", "safe_effectiveness_review"),
 ]
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    """SPR230/231: native owned operations start after explicitly committed test preparation.
+
+    No fixture/wrapper commits caller work. The shared clean_test_database fixture
+    removes committed rows after each test; explicit-caller cases open their own root.
+    """
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+        await session.rollback()
+
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +242,7 @@ async def test_six_type_happy_path(db_session, test_project, process_type, expec
         await _seed_full_baseline(db_session, goal, run)
         await _seed_closeout_preconditions(db_session, test_project, goal, run)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().step(db_session, test_project.id, goal.id, process_type)
 
     assert result["process_type"] == process_type
@@ -247,6 +264,7 @@ async def test_unsupported_process_type_returns_400(db_session, test_project):
     goal = await _make_goal(db_session, test_project)
     await _make_run(db_session, goal)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "not_a_real_process")
 
@@ -255,6 +273,7 @@ async def test_unsupported_process_type_returns_400(db_session, test_project):
 
 
 async def test_missing_goal_returns_404(db_session, test_project):
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(
             db_session, test_project.id, uuid.uuid4(), "goal_definition"
@@ -267,6 +286,7 @@ async def test_non_advanceable_goal_status_returns_409(db_session, test_project,
     goal = await _make_goal(db_session, test_project, status=goal_status)
     await _make_run(db_session, goal)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_definition")
 
@@ -277,6 +297,7 @@ async def test_non_advanceable_goal_status_returns_409(db_session, test_project,
 async def test_no_active_run_returns_409(db_session, test_project):
     goal = await _make_goal(db_session, test_project)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_definition")
 
@@ -295,6 +316,7 @@ async def test_retry_rejects_checkpoint_from_a_previous_run(db_session, test_pro
     active_run = await _make_run(db_session, goal)
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().retry_failed(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -328,6 +350,7 @@ async def test_retry_dispatches_valid_manager_request(db_session, test_project, 
         return {"process_type": "manager_selection", "status": "running"}
 
     monkeypatch.setattr(ManagerSelectionProcess, "retry_failed", retry_failed)
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().retry_failed(
         db_session, test_project.id, goal.id, "manager_selection"
     )
@@ -383,6 +406,7 @@ async def test_retry_dispatches_frozen_team_hierarchy_request_and_creates_propos
 
     monkeypatch.setattr(TeamHierarchyAnalyzer, "review_request", review_request)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().retry_failed(
         db_session, test_project.id, goal.id, "team_hierarchy"
     )
@@ -407,6 +431,7 @@ async def test_retry_rejects_non_running_checkpoint_process(db_session, test_pro
     current.outputs = {"_lm_retry": {"version": 1, "kind": "goal_analysis", "request": {}}}
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().retry_failed(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -429,6 +454,7 @@ async def test_retry_rejects_checkpoint_awaiting_authority_interview(db_session,
     )
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().retry_failed(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -442,6 +468,7 @@ async def test_retry_rejects_authority_interview_process_type(db_session, test_p
     goal = await _make_goal(db_session, test_project)
     await _make_run(db_session, goal)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().retry_failed(
             db_session, test_project.id, goal.id, "authority_interview"
@@ -459,6 +486,7 @@ async def test_retry_rejects_when_no_active_run_exists(db_session, test_project)
     current.outputs = {"_lm_retry": {"version": 1, "kind": "goal_analysis", "request": {}}}
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().retry_failed(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -484,6 +512,7 @@ async def test_retry_uses_current_identity_not_a_superseded_checkpoint(db_sessio
     await db_session.flush()
     assert old.superseded_by_id == current.id
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().retry_failed(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -557,6 +586,7 @@ async def test_step_reruns_waiting_process_and_cancels_its_pending_decisions(
         source_process_run_id=other_process.id,
     )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().step(
         db_session, test_project.id, goal.id, "goal_definition"
     )
@@ -616,6 +646,7 @@ async def test_step_waiting_reset_rolls_back_when_successor_advance_fails(
 
     monkeypatch.setattr(OrchestrationDebugService, "_advance", fail_successor_advance)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(RuntimeError, match="successor advance failed"):
         await OrchestrationDebugService().step(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -645,6 +676,7 @@ async def test_paused_run_returns_409_not_tickable(db_session, test_project):
     goal = await _make_goal(db_session, test_project)
     await _make_run(db_session, goal, status="paused")
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_definition")
 
@@ -667,6 +699,7 @@ async def test_predecessor_not_terminal_returns_409(db_session, test_project, pr
     goal = await _make_goal(db_session, test_project)
     run = await _make_run(db_session, goal)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(db_session, test_project.id, goal.id, process_type)
 
@@ -690,6 +723,7 @@ async def test_goal_closeout_requires_full_baseline_terminal(db_session, test_pr
     await _seed_terminal(db_session, goal.id, "goal_definition", run.id)
     await _seed_terminal(db_session, goal.id, "manager_selection", run.id)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_closeout")
 
@@ -712,6 +746,7 @@ async def test_goal_closeout_no_executable_work_completes(db_session, test_proje
     await _seed_full_baseline(db_session, goal, run)
     # No gates/evidence/final-summary artifacts at all.
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().step(
         db_session, test_project.id, goal.id, "goal_closeout"
     )
@@ -737,6 +772,7 @@ async def test_step_never_chains_into_next_process(db_session, test_project):
     run = await _make_run(db_session, goal)
     await _seed_terminal(db_session, goal.id, "goal_definition", run.id)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().step(
         db_session, test_project.id, goal.id, "manager_selection"
     )
@@ -775,6 +811,7 @@ async def test_goal_closeout_step_does_not_complete_goal_or_run_and_leaves_no_ot
     gates_before_snapshot = [(gate.id, gate.status) for gate in gates_before]
     event_cursor_before = run.event_cursor
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_closeout")
     assert result["process"]["status"] == "completed"
     assert result["process"]["completion_authorized"] is True
@@ -852,21 +889,39 @@ async def test_concurrent_step_serializes_and_does_not_duplicate_process_row(
 # ---------------------------------------------------------------------------
 
 
-async def test_step_preserves_caller_explicit_transaction(db_session, test_project):
-    """db_session already holds an explicit (non-AUTOBEGIN) transaction; step()
-    must not commit it out from under the caller, and the session must stay
-    usable afterward."""
+async def test_step_preserves_caller_explicit_transaction(db_session, test_project, monkeypatch):
+    """SPR230/231: a written caller root fails closed before locks/providers and stays caller-owned."""
+    from huddleroom.services.orchestration_goal_analyzer import GoalClarificationAnalyzer
+
     goal = await _make_goal(db_session, test_project)
     run = await _make_run(db_session, goal)
+    await db_session.commit()
+    original_name = test_project.name
+    project_id = test_project.id
+    provider_calls = []
 
-    result = await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_definition")
-    assert result["process"]["status"] == "completed"
+    async def forbidden_provider(*_args, **_kwargs):
+        provider_calls.append(True)
+        raise AssertionError("provider must not run inside caller work")
 
-    # Session must remain usable -- no InvalidRequestError from a transaction
-    # step() should not have touched.
-    assert db_session.in_transaction()
-    again = (await db_session.execute(select(OrchestrationGoal).where(OrchestrationGoal.id == goal.id))).scalar_one()
-    assert again.id == goal.id
+    monkeypatch.setattr(GoalClarificationAnalyzer, "analyze_request", forbidden_provider)
+    async with db_session.begin():
+        caller_root = db_session.get_transaction()
+        test_project.name = "SPR230 unrelated caller write"
+        await db_session.flush()
+        with pytest.raises(HTTPException) as error:
+            await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "goal_definition")
+        assert error.value.status_code == 409
+        assert error.value.detail["conflict"] == "orchestration_transaction_shape"
+        assert provider_calls == []
+        assert db_session.in_transaction() and db_session.get_transaction() is caller_root
+        assert test_project.name == "SPR230 unrelated caller write"
+        again = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.id == goal.id))
+        assert again.id == goal.id
+        current = await OrchestrationProcessService().get_current(db_session, goal.id, "goal_definition")
+        assert current is None
+        await db_session.rollback()  # The caller alone chooses its outer transaction outcome.
+    assert (await db_session.get(Project, project_id, populate_existing=True)).name == original_name
 
 
 async def test_step_commits_when_it_owns_the_transaction(concurrent_sessions, tmp_path):
@@ -979,6 +1034,7 @@ async def test_rerun_last_reuses_snapshot_and_version(db_session, test_project):
         db_session, original, outputs={"triggers": original_triggers}
     )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "effectiveness_review"
 
@@ -1001,6 +1057,7 @@ async def test_rerun_last_team_hierarchy_no_drift_keeps_single_supersession(db_s
     await _seed_terminal(db_session, goal.id, "manager_selection", run.id)
     await _seed_terminal(db_session, goal.id, "agent_definition_review", run.id)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     step_result = await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "team_hierarchy")
     assert step_result["process"]["status"] == "completed"
     original = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
@@ -1008,6 +1065,7 @@ async def test_rerun_last_team_hierarchy_no_drift_keeps_single_supersession(db_s
     original_version = original.process_version
 
     # No drift: fingerprint inputs (goal fields) are unchanged from the original run.
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "team_hierarchy"
 
@@ -1036,6 +1094,7 @@ async def test_rerun_last_team_hierarchy_drift_recomputes_and_supersedes_again(d
     await _seed_terminal(db_session, goal.id, "manager_selection", run.id)
     await _seed_terminal(db_session, goal.id, "agent_definition_review", run.id)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     step_result = await OrchestrationDebugService().step(db_session, test_project.id, goal.id, "team_hierarchy")
     assert step_result["process"]["status"] == "completed"
     original = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
@@ -1051,6 +1110,7 @@ async def test_rerun_last_team_hierarchy_drift_recomputes_and_supersedes_again(d
     goal.authority_model = "no_manager"
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "team_hierarchy"
 
@@ -1099,6 +1159,7 @@ async def test_rerun_last_preserves_superseded_row(db_session, test_project):
     original_outputs = dict(original.outputs)
     original_completed_at = original.completed_at
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "goal_definition"
 
@@ -1121,6 +1182,7 @@ async def test_rerun_last_selects_skipped_process(db_session, test_project):
     run = await _make_run(db_session, goal)
     original = await _seed_terminal(db_session, goal.id, "goal_definition", run.id, terminal="skipped")
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "goal_definition"
 
@@ -1145,6 +1207,7 @@ async def test_rerun_last_resolves_every_active_warning_linked_to_skipped_proces
         message="Other risk", run_id=run.id,
     )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
 
     assert result["process"]["status"] == "completed"
@@ -1165,6 +1228,7 @@ async def test_rerun_selected_terminal_process_not_last(db_session, test_project
     selected = await _seed_terminal(db_session, goal.id, "goal_definition", run.id)
     await _seed_terminal(db_session, goal.id, "effectiveness_review", run.id)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(
         db_session, test_project.id, goal.id, process_type="goal_definition"
     )
@@ -1192,6 +1256,7 @@ async def test_rerun_selected_terminal_cancels_only_its_pending_decisions(
         question="Keep this?", authority="human", run_id=run.id, source_process_run_id=other.id,
     )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     await OrchestrationDebugService().rerun_last(
         db_session, test_project.id, goal.id, process_type="effectiveness_review"
     )
@@ -1211,6 +1276,7 @@ async def test_rerun_selected_non_rerunnable_process_returns_409(db_session, tes
             db_session, goal.id, process_type="effectiveness_review", trigger_reason="test seed", run_id=run.id
         )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(
             db_session, test_project.id, goal.id, process_type="effectiveness_review"
@@ -1272,6 +1338,7 @@ async def test_rerun_last_recovers_retryable_stuck_process(db_session, test_proj
 
     monkeypatch.setattr(OrchestrationDebugService, "_advance", advance)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     await OrchestrationDebugService().rerun_last(
         db_session, test_project.id, goal.id, "goal_definition"
     )
@@ -1312,6 +1379,7 @@ async def test_rerun_last_stuck_retry_rollback_restores_source(db_session, test_
         raise RuntimeError("advance failed")
 
     monkeypatch.setattr(OrchestrationDebugService, "_advance", fail_advance)
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(RuntimeError, match="advance failed"):
         await OrchestrationDebugService().rerun_last(
             db_session, test_project.id, goal.id, "goal_definition"
@@ -1386,6 +1454,7 @@ async def test_rerun_last_reruns_waiting_process_and_cancels_its_pending_decisio
         source_process_run_id=terminal_process.id,
     )
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "effectiveness_review"
 
@@ -1416,6 +1485,7 @@ async def test_rerun_last_non_advanceable_goal_status_returns_409(db_session, te
     goal = await _make_goal(db_session, test_project, status=goal_status)
     await _make_run(db_session, goal)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
 
@@ -1424,6 +1494,7 @@ async def test_rerun_last_non_advanceable_goal_status_returns_409(db_session, te
 
 
 async def test_rerun_last_missing_goal_returns_404(db_session, test_project):
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, uuid.uuid4())
     assert exc_info.value.status_code == 404
@@ -1432,6 +1503,7 @@ async def test_rerun_last_missing_goal_returns_404(db_session, test_project):
 async def test_rerun_last_no_active_run_returns_409(db_session, test_project):
     goal = await _make_goal(db_session, test_project)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
 
@@ -1443,6 +1515,7 @@ async def test_rerun_last_paused_run_returns_409_not_tickable(db_session, test_p
     goal = await _make_goal(db_session, test_project)
     await _make_run(db_session, goal, status="paused")
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
 
@@ -1458,6 +1531,7 @@ async def test_rerun_last_no_terminal_process_returns_409(db_session, test_proje
     goal = await _make_goal(db_session, test_project)
     await _make_run(db_session, goal)
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
 
@@ -1482,6 +1556,7 @@ async def test_rerun_last_advance_failure_keeps_skipped_warnings_active(
         raise RuntimeError("advance failed")
 
     monkeypatch.setattr(OrchestrationDebugService, "_advance", fail_advance)
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(RuntimeError, match="advance failed"):
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert (await OrchestrationProcessService().get_current(
@@ -1506,6 +1581,7 @@ async def test_rerun_last_rolls_back_on_predecessor_failure(db_session, test_pro
     adr_current.status = "running"
     await db_session.flush()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     with pytest.raises(HTTPException) as exc_info:
         await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
 
@@ -1587,6 +1663,7 @@ async def test_rerun_last_only_changes_selected_type_rows(db_session, test_proje
         await db_session.execute(select(OrchestrationAction).where(OrchestrationAction.run_id == run.id))
     ).scalars().all()
 
+    await db_session.commit()  # SPR230/231: end known test preparation before native ownership.
     result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
     assert result["process_type"] == "goal_definition"
 
@@ -1620,19 +1697,40 @@ async def test_rerun_last_only_changes_selected_type_rows(db_session, test_proje
 # 11. Transaction ownership
 
 
-async def test_rerun_last_preserves_caller_explicit_transaction(db_session, test_project):
+async def test_rerun_last_preserves_caller_explicit_transaction(db_session, test_project, monkeypatch):
+    """SPR230/231: a written caller root fails closed before locks/providers and stays caller-owned."""
+    from huddleroom.services.orchestration_goal_analyzer import GoalClarificationAnalyzer
+
     goal = await _make_goal(db_session, test_project)
     run = await _make_run(db_session, goal)
-    await _seed_terminal(db_session, goal.id, "goal_definition", run.id)
+    original = await _seed_terminal(db_session, goal.id, "goal_definition", run.id)
+    await db_session.commit()
+    original_name = test_project.name
+    project_id = test_project.id
+    provider_calls = []
 
-    result = await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
-    assert result["process_type"] == "goal_definition"
+    async def forbidden_provider(*_args, **_kwargs):
+        provider_calls.append(True)
+        raise AssertionError("provider must not run inside caller work")
 
-    # Session must remain usable -- no InvalidRequestError from a transaction
-    # rerun_last() should not have touched.
-    assert db_session.in_transaction()
-    again = (await db_session.execute(select(OrchestrationGoal).where(OrchestrationGoal.id == goal.id))).scalar_one()
-    assert again.id == goal.id
+    monkeypatch.setattr(GoalClarificationAnalyzer, "analyze_request", forbidden_provider)
+    async with db_session.begin():
+        caller_root = db_session.get_transaction()
+        test_project.name = "SPR230 unrelated caller write"
+        await db_session.flush()
+        with pytest.raises(HTTPException) as error:
+            await OrchestrationDebugService().rerun_last(db_session, test_project.id, goal.id)
+        assert error.value.status_code == 409
+        assert error.value.detail["conflict"] == "orchestration_transaction_shape"
+        assert provider_calls == []
+        assert db_session.in_transaction() and db_session.get_transaction() is caller_root
+        assert test_project.name == "SPR230 unrelated caller write"
+        again = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.id == goal.id))
+        assert again.id == goal.id
+        current = await OrchestrationProcessService().get_current(db_session, goal.id, "goal_definition")
+        assert current.id == original.id and current.status == "completed"
+        await db_session.rollback()  # The caller alone chooses its outer transaction outcome.
+    assert (await db_session.get(Project, project_id, populate_existing=True)).name == original_name
 
 
 async def test_rerun_last_commits_when_it_owns_the_transaction(concurrent_sessions, tmp_path):

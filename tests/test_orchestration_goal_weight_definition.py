@@ -7,10 +7,47 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.dependencies import _ANON_USER
 
 FIXED_TS = datetime(2026, 7, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+async def test_engine(tmp_path):
+    """Keep committed fixture lineage in a database unique to this test."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-setup.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    # Discard the isolated database whole; keep shared foreign-key cleanup unchanged.
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(test_engine, monkeypatch):
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+        yield db
+        await db.rollback()
 
 
 def test_parse_goal_analysis_accepts_generated_question_and_rejects_bad_destination():
@@ -922,6 +959,7 @@ async def test_analyzer_failure_blocks_until_goal_definition_debug_step_succeeds
             raise AssertionError("normal tick retried the blocked analyzer")
 
     monkeypatch.setattr(orchestration_service, "GoalDefinitionProcess", NoAutoAdvance)
+    await db_session.commit()  # Native tick observes the committed analyzer failure/blocker fixture.
     assert (await OrchestrationService().tick(db_session, orch_run.id))["baseline_process"] is None
 
     monkeypatch.setattr(orchestration_debug_service, "GoalDefinitionProcess", lambda: process)
@@ -1012,10 +1050,12 @@ async def test_goal_definition_analyzer_error_warning_requires_baseline_retry(
     await process.advance(db_session, orch_goal, orch_run)
     monkeypatch.setattr(orchestration_debug_service, "GoalDefinitionProcess", lambda: process)
 
+    await db_session.commit()  # Publish the failed analysis before testing explicit recovery controls.
     with pytest.raises(HTTPException, match="baseline/retry"):
         await OrchestrationDebugService().step(
             db_session, test_project.id, orch_goal.id, "goal_definition"
         )
+    await db_session.commit()  # End the rejected step's read transaction before the independent retry request.
     await OrchestrationDebugService().retry_failed(
         db_session, test_project.id, orch_goal.id, "goal_definition"
     )
@@ -1307,6 +1347,7 @@ async def test_parked_goal_definition_blocks_forward_progress(
 
     service._run_ready_for_final_summary_request = ready
     service._run_ready_for_completion = ready
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
     assert result["baseline_process"]["status"] == "waiting_decision"
     assert result["final_summary_action_id"] is None
@@ -1322,6 +1363,7 @@ async def test_parked_goal_definition_blocks_actions(db_session, test_project, p
 
     _goal, run = await _goal_and_run(db_session, test_project, objective="Deliver the module")
     service = OrchestrationService()
+    await db_session.commit()
     await service.tick(db_session, run.id)
     with pytest.raises(HTTPException, match="Goal definition") as exc:
         await service.execute_create_delegation_task_action(

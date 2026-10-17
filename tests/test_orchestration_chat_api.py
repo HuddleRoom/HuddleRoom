@@ -544,7 +544,10 @@ async def test_crash_recovery_has_one_source_and_effect(sessions, tmp_path, monk
 
 @pytest.mark.parametrize("kind", ["agent_batch", "hierarchy"])
 async def test_crash_recovery_has_one_source_and_effect_handoffs(sessions, tmp_path, monkeypatch, approve_semantic_reviews, kind):
-    import huddleroom.services.orchestration_decision_application as application
+    from huddleroom.services import agent_service, orchestration_decision_application as application
+    from huddleroom.models.agent import Agent
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
     from tests.test_orchestration_chat_actions import _loaded_goal_user
     from tests.test_orchestration_roster_mutation import seed_definition_proposal, seed_hierarchy_proposal
 
@@ -562,19 +565,68 @@ async def test_crash_recovery_has_one_source_and_effect_handoffs(sessions, tmp_p
         dispatches.append(True)
         raise RuntimeError("crash after reservation before roster handoff")
 
-    monkeypatch.setattr(application, "complete_roster_handoff", crash)
+    original_handoff = agent_service.complete_roster_handoff
+    monkeypatch.setattr(agent_service, "complete_roster_handoff", crash)
     facade = service(sessions, interpretation=interpreter)
     data = request(f"Answer {seeded.decision_id} approve", goal.id)
-    try:
-        await facade.submit(goal.project_id, user.id, data)
-    except RuntimeError:
-        pass
+    await facade.submit(goal.project_id, user.id, data)
+    async with sessions() as consumer:
+        failed = await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
     replay = await facade.submit(goal.project_id, user.id, data)
     assert len(dispatches) == 1 and len(interpreter.calls) == 1
     assert replay.receipts and replay.receipts[0].status in {"recorded", "interrupted_unknown"}
     async with sessions() as db:
         turns = (await db.scalars(select(ProjectChatTurn).where(ProjectChatTurn.project_id == goal.project_id))).all()
         assert len(turns) == 1 and turns[0].frozen_context["action_reservation"]
+        applications = list(await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == seeded.run_id, OrchestrationAction.action_type == "apply_authority_answer")))
+        assert len(applications) == 1
+        saved_application = applications[0]
+        action_id = saved_application.id
+        assert failed.failed == [action_id] and saved_application.status == "failed"
+        effects = saved_application.dispatch_contract["effects"]
+        assert len([key for key in effects if key.startswith("roster_reservation:")]) == 1
+        assert not any(key.startswith("roster_agent:") for key in effects)
+        decision = await db.get(OrchestrationAuthorityDecision, seeded.decision_id)
+        assert decision.status == "answered" and decision.continuation_action_id == action_id
+        source_id = decision.source_process_run_id
+    # Failed continuations require explicit retry; neither chat replay nor a sweep reaccepts the answer.
+    async with sessions() as consumer:
+        skipped = await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+    assert not skipped.applied and not skipped.failed and len(dispatches) == 1
+    completed_handoffs = []
+    async def complete_once(*args, **kwargs):
+        result = await original_handoff(*args, **kwargs)
+        completed_handoffs.append(True)
+        return result
+    monkeypatch.setattr(agent_service, "complete_roster_handoff", complete_once)
+    async with sessions() as retry:
+        await application.retry_answer_application(retry, action_id)
+        await retry.commit()
+    async with sessions() as consumer:
+        applied = await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+    assert applied.applied == [action_id] and completed_handoffs == [True]
+    async with sessions() as db:
+        saved_application = await db.get(OrchestrationAction, action_id)
+        assert saved_application.status == "completed"
+        if kind == "agent_batch":
+            assert (await db.get(OrchestrationProcessRun, source_id)).status == "completed"
+        effects = dict(saved_application.dispatch_contract["effects"])
+        roster_effects = [effect for key, effect in effects.items() if key.startswith("roster_agent:")]
+        assert len(roster_effects) == 1
+        assert await db.get(Agent, uuid.UUID(roster_effects[0]["target_id"])) is not None
+        agent_count = await db.scalar(select(func.count()).select_from(Agent))
+    await facade.submit(goal.project_id, user.id, data)
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+        assert await consumer.scalar(select(func.count()).select_from(Agent)) == agent_count
+        assert (await consumer.get(OrchestrationAction, action_id)).dispatch_contract["effects"] == effects
+        assert await consumer.scalar(select(func.count()).select_from(ProjectChatTurn)) == 1
+    assert completed_handoffs == [True] and len(interpreter.calls) == 1
 
 
 async def test_frozen_submission_run_replacement_cannot_prepare_for_new_run(sessions, tmp_path):
@@ -611,8 +663,9 @@ async def test_crash_recovery_has_one_source_and_effect_recovery_reservation(ses
         agent = make_agent(name=f"planner-{uuid.uuid4()}", capabilities=["planning"])
         db.add(agent)
         await db.flush()
+        await db.commit()
         _, _, proposal, decision = await diagnosed(db, await db.get(OrchestrationGoal, goal.id),
-            await db.get(OrchestrationRun, run.id), agent)
+            await db.get(OrchestrationRun, run.id), agent, owns_setup=True)
         await db.commit()
     interpreter = Interpreter(sessions, ChatInterpretation(intent="instruction", operation="approve_recovery",
         goal_id=goal.id, payload={"target_id": str(decision.id), "selected_option": "approve_fix"}))

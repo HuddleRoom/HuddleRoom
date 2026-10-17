@@ -8,10 +8,10 @@ import uuid
 from fastapi import HTTPException
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, text
+from sqlalchemy import delete, event, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from huddleroom.models.orchestration import OrchestrationDecision, OrchestrationGoal, OrchestrationRun
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.project import Project
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
@@ -419,8 +419,8 @@ async def committed_run_details_fixture(test_engine, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_request_llm_decision_records_accepted_adapter_decision(db_session, test_project):
-    service, run = await _make_run(db_session, test_project)
+async def test_request_llm_decision_records_accepted_adapter_decision(committed_run):
+    service, session_factory, run_id = committed_run
     adapter = RecordingAdapter(
         {
             "action_type": "ask_human",
@@ -429,20 +429,21 @@ async def test_request_llm_decision_records_accepted_adapter_decision(db_session
         }
     )
 
-    decision = await service.request_llm_decision(db_session, run.id, adapter=adapter)
+    async with session_factory() as db:
+        decision = await service.request_llm_decision(db, run_id, adapter=adapter)
 
-    assert decision.run_id == run.id
+    assert decision.run_id == run_id
     assert decision.decision_type == "ask_human"
     assert decision.validator_status == "accepted"
     assert decision.rejection_reason is None
     assert decision.reason == "No safe automatic fit exists."
     assert adapter.contexts[0]["goal"]["objective"] == "Choose the next coordination move"
-    assert adapter.contexts[0]["run"]["id"] == str(run.id)
+    assert adapter.contexts[0]["run"]["id"] == str(run_id)
 
 
 @pytest.mark.asyncio
-async def test_request_llm_decision_records_malformed_adapter_output_as_rejected(db_session, test_project):
-    service, run = await _make_run(db_session, test_project)
+async def test_request_llm_decision_records_malformed_adapter_output_as_rejected(committed_run):
+    service, session_factory, run_id = committed_run
     adapter = RecordingAdapter(
         {
             "action_type": "invalid_llm_output",
@@ -450,7 +451,8 @@ async def test_request_llm_decision_records_malformed_adapter_output_as_rejected
         }
     )
 
-    decision = await service.request_llm_decision(db_session, run.id, adapter=adapter)
+    async with session_factory() as db:
+        decision = await service.request_llm_decision(db, run_id, adapter=adapter)
 
     assert decision.decision_type == "invalid_llm_output"
     assert decision.validator_status == "rejected"
@@ -462,37 +464,33 @@ async def test_request_llm_decision_records_malformed_adapter_output_as_rejected
 
 
 @pytest.mark.asyncio
-async def test_decision_context_excludes_orchestration_events_to_keep_cache_stable(db_session, test_project):
-    service, run = await _make_run(db_session, test_project)
-    await emit_event_once(
-        db_session,
-        test_project.id,
-        "orchestration.tick",
-        {"run_id": str(run.id)},
-        dedup_key=f"phase7-tick-{uuid.uuid4()}",
-    )
-    await emit_event_once(
-        db_session,
-        test_project.id,
-        "task.created",
-        {"title": "Existing work"},
-        dedup_key=f"phase7-task-{uuid.uuid4()}",
-    )
+async def test_decision_context_excludes_orchestration_events_to_keep_cache_stable(committed_run_details):
+    service, session_factory, project_id, _goal_id, run_id = committed_run_details
+    async with session_factory() as setup:
+        await emit_event_once(setup, project_id, "orchestration.tick", {"run_id": str(run_id)},
+                              dedup_key=f"phase7-tick-{uuid.uuid4()}")
+        await emit_event_once(setup, project_id, "task.created", {"title": "Existing work"},
+                              dedup_key=f"phase7-task-{uuid.uuid4()}")
+        await setup.commit()
     adapter = RecordingAdapter({"action_type": "noop", "reason": "Only inspecting context.", "wake_when": NOOP_WAKE_WHEN})
 
-    await service.request_llm_decision(db_session, run.id, adapter=adapter)
+    async with session_factory() as db:
+        await service.request_llm_decision(db, run_id, adapter=adapter)
 
     assert "recent_events" not in adapter.contexts[0]
 
 
 @pytest.mark.asyncio
-async def test_request_llm_decision_allows_blocked_run(db_session, test_project):
-    service, run = await _make_run(db_session, test_project)
-    run.status = "blocked"
-    await db_session.flush()
+async def test_request_llm_decision_allows_blocked_run(committed_run):
+    service, session_factory, run_id = committed_run
+    async with session_factory() as setup:
+        run = await setup.get(OrchestrationRun, run_id)
+        run.status = "blocked"
+        await setup.commit()
     adapter = RecordingAdapter({"action_type": "noop", "reason": "Blocked runs can still coordinate recovery.", "wake_when": NOOP_WAKE_WHEN})
 
-    decision = await service.request_llm_decision(db_session, run.id, adapter=adapter)
+    async with session_factory() as db:
+        decision = await service.request_llm_decision(db, run_id, adapter=adapter)
 
     assert decision.validator_status == "accepted"
     assert adapter.contexts[0]["run"]["status"] == "blocked"
@@ -562,6 +560,82 @@ async def test_request_llm_decision_uses_committed_sessions_for_committed_run(co
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dirty", [False, True, "status"])
+async def test_request_llm_decision_prior_select_retains_caller_and_durable_result(committed_run, dirty):
+    service, session_factory, run_id = committed_run
+    async with session_factory() as caller_db:
+        await caller_db.execute(select(OrchestrationRun.id).where(OrchestrationRun.id == run_id))
+        run = await caller_db.get(OrchestrationRun, run_id)
+        goal = await caller_db.get(OrchestrationGoal, run.goal_id)
+        goal_id = goal.id
+        if dirty is True:
+            goal.objective = "Caller-only objective"
+        elif dirty == "status":
+            run.status = "paused"
+        root = caller_db.sync_session.get_transaction()
+        calls = []
+        for name in ("before_flush", "before_commit", "after_rollback"):
+            event.listen(caller_db.sync_session, name, lambda *args, name=name: calls.append(name))
+        adapter = RecordingAdapter({
+            "action_type": "noop", "reason": "Committed context should win.", "wake_when": NOOP_WAKE_WHEN,
+        })
+        decision = await asyncio.wait_for(service.request_llm_decision(caller_db, run_id, adapter=adapter), 3)
+        assert calls == []
+        assert caller_db.sync_session.get_transaction() is root and root.is_active
+        assert caller_db.is_modified(goal) is (dirty is True)
+        assert caller_db.is_modified(run) is (dirty == "status")
+        assert run.status == ("paused" if dirty == "status" else "running")
+        assert adapter.contexts[0]["run"]["status"] == "running"
+        assert goal.objective == ("Caller-only objective" if dirty is True else "Choose the next coordination move")
+        assert decision.run_id == run_id
+        assert decision.input_snapshot["goal"]["id"] == str(goal_id)
+        assert decision.validator_status == "accepted"
+        assert adapter.contexts[0]["goal"]["objective"] == "Choose the next coordination move"
+        decision_id = decision.id
+        await caller_db.rollback()
+        async with session_factory() as fresh:
+            assert (await fresh.get(OrchestrationGoal, goal_id)).objective == "Choose the next coordination move"
+            assert (await fresh.get(OrchestrationRun, run_id)).status == "running"
+            persisted = await fresh.get(OrchestrationDecision, decision_id)
+            assert persisted is not None and persisted.validator_status == "accepted"
+            admissions = list(await fresh.scalars(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run_id,
+                OrchestrationAction.action_type == "admit_control_call",
+            )))
+            assert len(admissions) == 1
+            assert admissions[0].dispatch_contract["provider_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_request_llm_decision_rejects_preflushed_committed_run_caller(committed_run, monkeypatch):
+    import huddleroom.services.orchestration_service as orchestration_service_module
+
+    service, session_factory, run_id = committed_run
+    monkeypatch.setattr(orchestration_service_module, "AsyncSessionLocal", session_factory)
+
+    async with session_factory() as caller_db:
+        run = await caller_db.get(orchestration_service_module.OrchestrationRun, run_id)
+        goal = await caller_db.get(orchestration_service_module.OrchestrationGoal, run.goal_id)
+        goal.objective = "Caller-only objective"
+        await caller_db.flush()
+        root = caller_db.sync_session.get_transaction()
+        adapter = RecordingAdapter({"action_type": "noop", "reason": "Committed context should win.", "wake_when": NOOP_WAKE_WHEN})
+
+        with pytest.raises(HTTPException) as refused:
+            await service.request_llm_decision(caller_db, run_id, adapter=adapter)
+        assert refused.value.status_code == 409
+        assert refused.value.detail["conflict"] == "orchestration_transaction_shape"
+        assert caller_db.sync_session.get_transaction() is root and root.is_active
+        assert goal.objective == "Caller-only objective"
+
+        async with session_factory() as verify_db:
+            persisted_goal = await verify_db.get(orchestration_service_module.OrchestrationGoal, goal.id)
+            assert persisted_goal.objective == "Choose the next coordination move"
+
+    assert adapter.contexts == []
+
+
+@pytest.mark.asyncio
 async def test_request_llm_decision_uses_caller_when_factory_has_another_engine(db_session, test_project, monkeypatch):
     import huddleroom.services.orchestration_service as orchestration_service_module
 
@@ -581,11 +655,15 @@ async def test_request_llm_decision_uses_caller_when_factory_has_another_engine(
             return None
 
     monkeypatch.setattr(orchestration_service_module, "AsyncSessionLocal", ForeignSession)
-    decision = await service.request_llm_decision(
-        db_session, run.id, adapter=RecordingAdapter({"action_type": "noop", "reason": "Caller owns run.", "wake_when": NOOP_WAKE_WHEN}),
-    )
-
-    assert decision.run_id == run.id
+    root = db_session.sync_session.get_transaction()
+    adapter = RecordingAdapter({"action_type": "noop", "reason": "Caller owns run.", "wake_when": NOOP_WAKE_WHEN})
+    with pytest.raises(HTTPException) as refused:
+        await service.request_llm_decision(db_session, run.id, adapter=adapter)
+    assert refused.value.status_code == 409
+    assert refused.value.detail["conflict"] == "orchestration_transaction_shape"
+    assert db_session.sync_session.get_transaction() is root and root.is_active
+    assert await db_session.get(OrchestrationRun, run.id) is run
+    assert adapter.contexts == []
 
 
 @pytest.mark.asyncio
@@ -722,7 +800,7 @@ async def test_request_llm_decision_releases_sqlite_autobegin_workspace_lock_bef
 
     async def commit_while_provider_waits():
         nonlocal writer_error
-        await started.wait()
+        await asyncio.wait_for(started.wait(), 3)
         try:
             await commit_other_writer()
         except Exception as exc:  # Re-raise inside the provider so the pre-fix path exits cleanly.
@@ -739,7 +817,11 @@ async def test_request_llm_decision_releases_sqlite_autobegin_workspace_lock_bef
             try:
                 decision = await service.request_llm_decision(caller_db, run_id, adapter=BlockingAdapter())
             finally:
-                await writer_task
+                if not started.is_set():
+                    writer_task.cancel()
+                    await asyncio.gather(writer_task, return_exceptions=True)
+                else:
+                    await asyncio.wait_for(writer_task, 3)
 
         assert "orchestration_tick_owns_transaction" not in caller_db.info
 
@@ -758,25 +840,53 @@ async def test_request_llm_decision_releases_sqlite_autobegin_workspace_lock_bef
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["explicit", "nested", "autobegin_written", "core_written", "explicit_pending"])
 async def test_request_llm_decision_preserves_explicit_nested_caller_transaction(
     committed_run_details,
     monkeypatch,
+    shape,
 ):
     import huddleroom.services.orchestration_service as orchestration_service_module
 
-    service, session_factory, _project_id, _goal_id, run_id = committed_run_details
+    service, session_factory, project_id, _goal_id, run_id = committed_run_details
     monkeypatch.setattr(orchestration_service_module, "AsyncSessionLocal", session_factory)
     adapter = RecordingAdapter({"action_type": "noop", "reason": "Caller owns this transaction.", "wake_when": NOOP_WAKE_WHEN})
 
     async with session_factory() as caller_db:
-        async with caller_db.begin():
-            async with caller_db.begin_nested():
-                decision = await service.request_llm_decision(caller_db, run_id, adapter=adapter)
-                assert caller_db.in_transaction()
-                assert caller_db.in_nested_transaction()
-
-    assert decision.run_id == run_id
-    assert decision.validator_status == "accepted"
+        if shape in {"explicit", "nested", "explicit_pending"}:
+            await caller_db.begin()
+        project = await caller_db.get(Project, project_id)
+        project.description = "unrelated caller work must stay uncommitted"
+        if shape == "core_written":
+            caller_db.expunge(project)
+            await caller_db.execute(update(Project).where(Project.id == project_id).values(
+                description="unrelated caller work must stay uncommitted",
+            ).execution_options(synchronize_session=False))
+            assert not caller_db.new and not caller_db.dirty and not caller_db.deleted
+        elif shape != "explicit_pending":
+            await caller_db.flush()
+        nested = await caller_db.begin_nested() if shape == "nested" else None
+        root = caller_db.sync_session.get_transaction()
+        calls = []
+        for name in ("before_flush", "before_commit", "after_rollback"):
+            event.listen(caller_db.sync_session, name, lambda *args, name=name: calls.append(name))
+        with pytest.raises(HTTPException) as refused:
+            await asyncio.wait_for(service.request_llm_decision(caller_db, run_id, adapter=adapter), 3)
+        assert calls == []
+        assert refused.value.status_code == 409
+        assert refused.value.detail["conflict"] == "orchestration_transaction_shape"
+        assert caller_db.sync_session.get_transaction() is root and root.is_active
+        assert caller_db.in_nested_transaction() is (shape == "nested")
+        if nested is not None:
+            assert nested.is_active
+        assert adapter.contexts == []
+        assert project.description == "unrelated caller work must stay uncommitted"
+        async with session_factory() as fresh:
+            assert (await fresh.get(Project, project_id)).description != project.description
+            assert not list(await fresh.scalars(
+                orchestration_service_module.select(OrchestrationDecision).where(OrchestrationDecision.run_id == run_id)
+            ))
+        await caller_db.rollback()
 
 
 @pytest.mark.asyncio
@@ -901,6 +1011,7 @@ async def test_request_llm_decision_committed_path_retries_after_rejected_duplic
 
     async with session_factory() as caller_db:
         first = await service.request_llm_decision(caller_db, run_id, adapter=adapter)
+        await caller_db.commit()  # End only this test-owned request's completed read/preparation scope.
         second = await service.request_llm_decision(caller_db, run_id, adapter=adapter)
 
     assert adapter.calls == 2
