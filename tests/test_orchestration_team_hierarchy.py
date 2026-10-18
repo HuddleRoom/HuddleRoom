@@ -3,6 +3,7 @@ import json
 import uuid
 
 import pytest
+from sqlalchemy.orm.attributes import flag_modified
 from fastapi import HTTPException
 from sqlalchemy import select
 
@@ -1336,7 +1337,19 @@ async def _apply_saved_answer(db_session, run_id, response):
     async with async_sessionmaker(db_session.bind, expire_on_commit=False)() as consumer:
         await drain_answer_applications(consumer, run_id)
         await consumer.commit()
-    db_session.expire_all()
+    await _refresh_all(db_session)
+
+
+async def _refresh_all(db_session):
+    """Reload every tracked object; attributes expire after commits and service rollbacks."""
+    for obj in list(db_session.identity_map.values()):
+        await db_session.refresh(obj)
+
+
+async def _settle_answer(db_session, run, response):
+    await _refresh_all(db_session)  # a service rollback expires tracked objects
+    if response.status_code == 200:
+        await _apply_saved_answer(db_session, run.id, response)
 
 
 @pytest.mark.asyncio
@@ -1369,8 +1382,7 @@ async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposin
 
     await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(_answer_url(test_project.id, goal.id, decision.id), json=body)
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 200, response.text
     await db_session.refresh(decision)
@@ -1458,8 +1470,7 @@ async def test_baseline_hierarchy_rerun_uses_fresh_inputs_and_preserves_drift_gu
     response = await client.post(
         _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
     assert response.status_code == (409 if drift_after_analysis else 200), response.text
     if drift_after_analysis:
         assert response.json()["detail"] == "team hierarchy proposal inputs changed"
@@ -1474,8 +1485,7 @@ async def test_baseline_hierarchy_rerun_uses_fresh_inputs_and_preserves_drift_gu
         response = await client.post(
             _answer_url(test_project.id, goal.id, approval.id), json={"selected_option": "approve"},
         )
-        if response.status_code == 200:
-            await _apply_saved_answer(db_session, run.id, response)
+        await _settle_answer(db_session, run, response)
         assert response.status_code == 200, response.text
         assert (await service.get_current(db_session, goal.id, "team_hierarchy")).status == "completed"
 
@@ -1506,8 +1516,7 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
         _answer_url(test_project.id, goal.id, original_approval.id),
         json={"selected_option": "request_changes"},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 200, response.text
     fresh = await service.get_current(db_session, goal.id, "team_hierarchy")
@@ -1526,8 +1535,7 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
         _answer_url(test_project.id, goal.id, fresh_approval.id),
         json={"selected_option": "approve"},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 200, response.text
     current = await service.get_current(db_session, goal.id, "team_hierarchy")
@@ -1648,8 +1656,7 @@ async def test_hierarchy_edit_rejects_blank_required_definition_without_mutation
         _answer_url(test_project.id, goal.id, decision.id),
         json={"selected_option": "edit", "edited_agent": edited_agent},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 400
     assert "complete non-empty" in response.json()["detail"]
@@ -1735,8 +1742,7 @@ async def test_stale_proposal_answer_leaves_decisions_pending_without_agent_muta
         _answer_url(test_project.id, goal.id, decisions[0].id),
         json={"selected_option": "approve"},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 409
     assert {decision.status for decision in decisions} == {"pending"}
@@ -1780,8 +1786,7 @@ async def test_stale_proposal_answer_suggests_rerun_without_superseding_run(
         _answer_url(test_project.id, goal_id, stale_decision.id),
         json={"selected_option": "approve"},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 409
     assert response.json()["detail"] == "team hierarchy proposal inputs changed"
@@ -1790,8 +1795,8 @@ async def test_stale_proposal_answer_suggests_rerun_without_superseding_run(
     assert old_run.superseded_by_id is None, "No new run is created -- suggestion only"
     assert old_run.id == old_run_id
 
-    # The endpoint commits internally on this 409 path, ending the test
-    # fixture's outer transaction -- query with an independent session.
+    # The endpoint commits internally on this 409 path, so read the committed
+    # state through an independent session.
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     session_factory = async_sessionmaker(test_engine, class_=type(db_session), expire_on_commit=False)
@@ -1803,9 +1808,10 @@ async def test_stale_proposal_answer_suggests_rerun_without_superseding_run(
 
 
 @pytest.mark.asyncio
-async def test_repeated_proposal_answer_is_conflict_and_creates_agent_once(
+async def test_repeated_proposal_answer_replays_receipt_and_conflicting_answer_is_rejected(
     client, db_session, test_project, test_user, monkeypatch
 ):
+    """A matching accepted replay returns its saved receipt; only a conflicting answer is rejected."""
     goal, run, _agents, _review = await _lifecycle_goal(
         db_session, test_project, test_user, weight="substantial"
     )
@@ -1821,15 +1827,21 @@ async def test_repeated_proposal_answer_is_conflict_and_creates_agent_once(
 
     await db_session.commit()  # This request reads committed hierarchy fixture state.
     first = await client.post(url, json={"selected_option": "approve"})
-    if first.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, first)
+    await _settle_answer(db_session, run, first)
     await db_session.commit()  # This request reads committed hierarchy fixture state.
     second = await client.post(url, json={"selected_option": "approve"})
-    if second.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, second)
+    await _settle_answer(db_session, run, second)
+    await db_session.commit()  # This request reads committed hierarchy fixture state.
+    conflicting = await client.post(url, json={"selected_option": "reject"})
+    await _settle_answer(db_session, run, conflicting)
 
     assert first.status_code == 200, first.text
-    assert second.status_code == 409
+    assert second.status_code == 200, second.text
+    assert (
+        second.json()["answer_receipt"]["action_id"] == first.json()["answer_receipt"]["action_id"]
+    )
+    assert conflicting.status_code == 409
+    assert "conflicts with saved answer" in conflicting.text
     assert len(list((await db_session.execute(
         select(Agent.id).where(Agent.name == proposal["definition"]["name"])
     )).scalars())) == 1
@@ -1859,14 +1871,14 @@ async def test_invalid_resolved_hierarchy_supersedes_old_run_and_keeps_approved_
     old_run = await service.get_current(db_session, goal.id, "team_hierarchy")
     decision = (await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id))[0]
     old_run.outputs["analysis"]["assignments"][0]["agent_ref"] = "proposal:missing"
+    flag_modified(old_run, "outputs")
     await db_session.flush()
 
     await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"}
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 200, response.text
     current = await service.get_current(db_session, goal.id, "team_hierarchy")
@@ -1907,8 +1919,7 @@ async def test_separate_proposal_and_hierarchy_approvals_apply_gaps_and_unused_a
         response = await client.post(
             _answer_url(test_project.id, goal.id, decision.id), json={"selected_option": "approve"}
         )
-        if response.status_code == 200:
-            await _apply_saved_answer(db_session, run.id, response)
+        await _settle_answer(db_session, run, response)
         assert response.status_code == 200, response.text
 
     decisions = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
@@ -1920,8 +1931,7 @@ async def test_separate_proposal_and_hierarchy_approvals_apply_gaps_and_unused_a
         _answer_url(test_project.id, goal.id, approval.id),
         json={"selected_option": "approve_with_documented_gaps"},
     )
-    if response.status_code == 200:
-        await _apply_saved_answer(db_session, run.id, response)
+    await _settle_answer(db_session, run, response)
 
     assert response.status_code == 200, response.text
     current = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")

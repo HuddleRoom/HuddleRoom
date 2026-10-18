@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
+import pytest_asyncio
 from pydantic import TypeAdapter, ValidationError
 
 from huddleroom.schemas.orchestration_recovery import (
@@ -908,10 +909,20 @@ def recovery_call_events(monkeypatch):
     return events
 
 
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
 @pytest.mark.asyncio
 async def test_recovery_default_api_observations_arrive_before_baseline_completion(
-    db_session, monkeypatch, recovery_call_events,
+    db_session, owned_session_factory, conversation_goal_run, monkeypatch, recovery_call_events,
 ):
+    goal, run = conversation_goal_run
+    run.status = "running"
+    await db_session.commit()
     from huddleroom.config import settings
     from huddleroom.services import orchestration_baseline_runtime as runtime
     from huddleroom.services import orchestration_completion as completion
@@ -940,7 +951,9 @@ async def test_recovery_default_api_observations_arrive_before_baseline_completi
     monkeypatch.setattr(completion.litellm, "stream_chunk_builder", lambda *_args, **_kwargs: final)
 
     async def analyze():
-        async with runtime.baseline_operation(db_session, uuid4(), owns_transaction=False):
+        async with owned_session_factory() as own, runtime.baseline_operation(
+            own, goal.id, owns_transaction=True, run_id=run.id,
+        ):
             return await RecoveryAnalyzer(completion_fn=completion.orchestration_completion).analyze(
                 {}, project_id=UUID_A, evidence_query=AsyncMock())
 
@@ -966,8 +979,11 @@ async def test_recovery_default_api_observations_arrive_before_baseline_completi
 @pytest.mark.asyncio
 @pytest.mark.parametrize("baseline", [False, True])
 async def test_recovery_nonadvertising_injection_preserves_request_contract(
-    db_session, recovery_call_events, baseline,
+    db_session, owned_session_factory, conversation_goal_run, recovery_call_events, baseline,
 ):
+    goal, run = conversation_goal_run
+    run.status = "running"
+    await db_session.commit()
     from huddleroom.services import orchestration_baseline_runtime as runtime
     requests = []
 
@@ -977,7 +993,9 @@ async def test_recovery_nonadvertising_injection_preserves_request_contract(
 
     analyzer = RecoveryAnalyzer(completion_fn=injected)
     if baseline:
-        async with runtime.baseline_operation(db_session, uuid4(), owns_transaction=False):
+        async with owned_session_factory() as own, runtime.baseline_operation(
+            own, goal.id, owns_transaction=True, run_id=run.id,
+        ):
             result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
     else:
         result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
@@ -992,8 +1010,11 @@ async def test_recovery_nonadvertising_injection_preserves_request_contract(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("baseline", [False, True])
 async def test_recovery_default_api_prechunk_unsupported_uses_one_linked_fallback(
-    db_session, monkeypatch, recovery_call_events, baseline,
+    db_session, owned_session_factory, conversation_goal_run, monkeypatch, recovery_call_events, baseline,
 ):
+    goal, run = conversation_goal_run
+    run.status = "running"
+    await db_session.commit()
     from huddleroom.config import settings
     from huddleroom.services import orchestration_completion as completion
     from huddleroom.services import orchestration_baseline_runtime as runtime
@@ -1009,7 +1030,9 @@ async def test_recovery_default_api_prechunk_unsupported_uses_one_linked_fallbac
     monkeypatch.setattr(completion.litellm, "acompletion", api)
     analyzer = RecoveryAnalyzer(completion_fn=completion.orchestration_completion)
     if baseline:
-        async with runtime.baseline_operation(db_session, uuid4(), owns_transaction=False):
+        async with owned_session_factory() as own, runtime.baseline_operation(
+            own, goal.id, owns_transaction=True, run_id=run.id,
+        ):
             result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())
     else:
         result = await analyzer.analyze({}, project_id=UUID_A, evidence_query=AsyncMock())

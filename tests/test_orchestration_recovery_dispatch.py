@@ -5,7 +5,10 @@ import json
 import uuid
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
+
+from tests.conftest import adopt_session
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
@@ -16,6 +19,14 @@ from huddleroom.schemas.orchestration_recovery import (
 from huddleroom.services import orchestration_decision_dispatcher as dispatcher_module
 from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 def _hash(value):
@@ -88,6 +99,7 @@ async def _effect_rows(db, run_id):
 
 async def _recovery_fixture(db, conversation_goal_run, *, purpose="apply", authority_status="answered",
                             selected_option="approve_fix", proposal_id=None, call_id="call-1", retry_ordinal=1):
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
     goal, run = conversation_goal_run
     service = OrchestrationService()
     proposal_id = proposal_id or uuid.uuid4()

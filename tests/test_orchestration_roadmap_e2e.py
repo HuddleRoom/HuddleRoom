@@ -32,7 +32,7 @@ from huddleroom.services.orchestration_authority_service import OrchestrationAut
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService, parse_roadmap_items
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
-from tests.conftest import complete_baseline_processes, heal_baseline_drift_for_test
+from tests.conftest import adopt_session, owned_session, complete_baseline_processes, heal_baseline_drift_for_test
 from tests.test_orchestration_roadmap_children import goal_item
 from tests.test_orchestration_roadmap_integration import (
     _child_actors, _complete_child, _complete_roadmap_task,
@@ -54,7 +54,40 @@ def _manual_task_start(monkeypatch):
 pytestmark = pytest.mark.asyncio
 
 
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from tests.conftest import Base, _seed_anon_actors
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-scenario.db'}")
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+async def clean_test_database():
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
 async def _ready_roadmap(db, project):
+    adopt_session(db)
     service = OrchestrationService()
     # Roster changes after baseline make the real baseline-review reconciler
     # correctly re-open; seed the planner before taking its baseline snapshot.
@@ -454,6 +487,9 @@ async def test_roadmap_fault_boundaries_rollback_then_replay_one_lineage(
     run_id, parent_id = run.id, parent.id
     models = (OrchestrationGoal, OrchestrationRun, OrchestrationAction, OrchestrationRoadmapVersion,
               OrchestrationRoadmapItem, OrchestrationBudgetReservation, OrchestrationGate, OrchestrationEvidence)
+    # A tick publishes its reconciliation cursor before the failing step, so settle it first.
+    # The cursor is deliberately committed before the snapshot and is not part of the rollback assertion.
+    await service._reconcile_conditions(db_session, await db_session.get(OrchestrationRun, run_id))
     before = await _snapshot(db_session, models)
     await db_session.commit()
     factory = async_sessionmaker(test_engine, expire_on_commit=False)
@@ -475,17 +511,31 @@ async def test_roadmap_fault_boundaries_rollback_then_replay_one_lineage(
 
     event.listen(model, hook, fail_at_operation)
     try:
-        async with factory() as failed:
+        async with owned_session(factory) as failed:
             with pytest.raises(RuntimeError, match=f"{boundary}: injected"):
-                async with failed.begin():
-                    result = await service.tick(failed, run_id)
-                    assert hits, result
+                result = await service.tick(failed, run_id)
+                assert hits, result
             await failed.rollback()
     finally:
         event.remove(model, hook, fail_at_operation)
     assert len(hits) == 1
-    async with factory() as restarted:
-        assert await _snapshot(restarted, models) == before
+    async with owned_session(factory) as restarted:
+        after_fault = await _snapshot(restarted, models)
+        if boundary in {"child_insert", "reservation_check"}:
+            # Release failures are durably recorded as exactly one failed action; nothing else changes.
+            old_ids = {row["id"] for row in before["OrchestrationAction"]}
+            added = [row for row in after_fault["OrchestrationAction"] if row["id"] not in old_ids]
+            assert len(added) == 1, added
+            assert added[0]["action_type"] == "release_roadmap_item"
+            assert added[0]["idempotency_key"].endswith(":child"), added[0]["idempotency_key"]
+            assert added[0]["status"] == "failed"
+            assert added[0]["error"] == f"{boundary}: injected"
+            assert [row for row in after_fault["OrchestrationAction"] if row["id"] in old_ids] == \
+                before["OrchestrationAction"]
+            assert {k: v for k, v in after_fault.items() if k != "OrchestrationAction"} == \
+                {k: v for k, v in before.items() if k != "OrchestrationAction"}
+        else:
+            assert after_fault == before
         recovered = await service.tick(restarted, run_id)
         assert recovered["authorized_execution"]["step"] == {
             "version_insert": "plan_decision", "reservation_check": "release_item", "child_insert": "release_item",
@@ -493,7 +543,7 @@ async def test_roadmap_fault_boundaries_rollback_then_replay_one_lineage(
             "integration_gate_creation": "integration_decision",
         }[boundary]
         await restarted.commit()
-    async with factory() as replay:
+    async with owned_session(factory) as replay:
         parent = await replay.get(OrchestrationGoal, parent_id)
         if boundary == "version_insert":
             _local_decisions(monkeypatch, service, lambda _ctx: {"action_type": "noop", "reason": "Replay"})

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
@@ -42,11 +43,20 @@ from huddleroom.services.orchestration_blocker_recovery import (
 from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.conftest import adopt_session, owned_session
 from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture re-exported
 
 pytestmark = pytest.mark.usefixtures(
     "safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue", "no_live_decisions",
 )
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 @pytest.fixture
@@ -104,6 +114,7 @@ async def _decision(db, run, parsed, *, decision_type="coordination", snapshot=N
 
 
 async def _authorized_goal(db, project):
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
     goal = OrchestrationGoal(project_id=project.id, objective="Recovery activation", status="active")
     db.add(goal)
     await db.flush()
@@ -224,6 +235,7 @@ async def _make_planner_ineligible(db, goal, run, planner):
 async def test_plan_author_unavailable_creates_one_recovery_lineage(
     db_session, test_project, stub_decision, analyzer_calls,
 ):
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from huddleroom.services.orchestration_team_hierarchy import select_plan_author
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
@@ -262,6 +274,7 @@ async def test_plan_author_unavailable_creates_one_recovery_lineage(
 async def test_timer_only_noop_without_live_producer_creates_one_eventless_lineage(
     db_session, test_project, stub_decision, analyzer_calls,
 ):
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     stub_decision(lambda _ctx: {"action_type": "noop", "reason": "Waiting for things to improve.",
@@ -285,6 +298,7 @@ async def test_noop_waiting_on_a_relevant_pending_human_decision_stays_a_wait(
 ):
     """Guard against over-triggering: a real pending owner decision is a live producer, so the noop
     (decided from the server-built context) stays a wait and starts no recovery lineage."""
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
@@ -311,6 +325,7 @@ async def test_noop_waiting_on_a_relevant_pending_human_decision_stays_a_wait(
 async def test_dispatched_timer_only_noop_without_relevant_producer_creates_one_trigger(
     db_session, test_project, analyzer_calls,
 ):
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     service, goal, run = await _authorized_run(db_session, test_project)
@@ -420,6 +435,7 @@ async def test_healthy_follow_up_on_a_recovery_created_plan_task_stays_ordinary(
 
 @pytest.mark.asyncio
 async def test_tick_with_failed_task_creates_one_trigger_and_never_retries(db_session, test_project, analyzer_calls):
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_basic_recovery import (
         _actions as basic_actions, _add_failed_session, _agent, _make_gate, _make_orchestrated_task, _make_run,
     )
@@ -444,7 +460,7 @@ async def test_tick_with_failed_task_creates_one_trigger_and_never_retries(db_se
 async def _committed_authorized_run(sessions, tmp_path):  # noqa: F811 -- fixture name reused as parameter
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
-    async with sessions() as s:
+    async with owned_session(sessions) as s:  # the authorized run ticks, so this session must be owned
         workspace = tmp_path / f"ws-{uuid.uuid4().hex[:6]}"
         workspace.mkdir()
         project = Project(name="Activation", workspace_path=str(workspace.resolve()), config={})
@@ -457,7 +473,7 @@ async def _committed_authorized_run(sessions, tmp_path):  # noqa: F811 -- fixtur
 
 @pytest.mark.asyncio
 async def test_tick_diagnoses_a_reserved_trigger_after_committing_it(
-    sessions, tmp_path, monkeypatch, stub_decision,  # noqa: F811
+    sessions, tmp_path, monkeypatch, stub_decision, owned_session_factory,  # noqa: F811
 ):
     """Carry-in 1(a): the trigger is committed before the analyzer runs and no SQLite write lock is held
     across the analyzer call (an independent writer can commit while the analyzer is "thinking")."""
@@ -484,7 +500,7 @@ async def test_tick_diagnoses_a_reserved_trigger_after_committing_it(
 
     monkeypatch.setattr(RecoveryAnalyzer, "analyze", analyze)
 
-    async with sessions() as s:
+    async with owned_session(sessions) as s:  # the tick needs an owned autobegin session
         await OrchestrationService().tick(s, seeded.run_id)
 
     assert observed == {"trigger_visible": True, "committed": True}
@@ -501,6 +517,7 @@ async def test_tick_drives_resume_for_approved_proposals_and_recovery_waits(
 ):
     """Carry-in 1(b)/(c) + 2: an approved non-terminal proposal is resumed every tick, including while a
     recovery-owned (delegated remediation) wait is open and while it is due."""
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_recovery_adapters import approved_call
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
@@ -685,6 +702,7 @@ class _Scripted:
 
 async def _approved_task_lineage(db, project, user, monkeypatch):
     """failed task -> recover_run trigger -> proposal -> approve_fix -> resume (apply + verify + retry wrapper)."""
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_basic_recovery import (
         _add_failed_session, _agent, _fake_task_run, _make_gate, _make_orchestrated_task, _make_run,
     )
@@ -892,6 +910,7 @@ async def test_invalid_final_summary_lineage_approves_gate_linked_replacement_an
 @pytest.mark.asyncio
 async def test_repeated_eventless_noops_and_reports_keep_one_open_lineage_each(db_session, test_project, analyzer_calls):
     """I2: a stuck loop's new noop / recover_blocker decisions join the open lineage instead of stacking new ones."""
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     service, goal, run = await _authorized_run(db_session, test_project)
@@ -919,6 +938,7 @@ async def test_repeated_eventless_noops_and_reports_keep_one_open_lineage_each(d
 @pytest.mark.asyncio
 async def test_tick_diagnoses_at_most_one_trigger_per_run(db_session, test_project, analyzer_calls, stub_decision):
     """M2: diagnosis is bounded to one analyzer exchange per run per tick."""
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     stub_decision(lambda _ctx: {"action_type": "ask_human", "question": "Proceed?", "reason": "Unsure."})
@@ -1039,11 +1059,13 @@ async def test_a_trigger_whose_diagnosis_keeps_raising_does_not_starve_the_next(
     db_session, test_project, analyzer_calls, stub_decision, monkeypatch,
 ):
     """F: the per-tick diagnosis goes to the least recently attempted trigger, so a broken one rotates out."""
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from huddleroom.services.orchestration_recovery_evidence import RecoveryContextBuilder
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     stub_decision(lambda _ctx: {"action_type": "ask_human", "question": "Proceed?", "reason": "Unsure."})
     service, goal, run = await _authorized_run(db_session, test_project)
+    run_id = run.id  # captured before the ticks: a failed step's rollback expires ORM attributes
     svc = OrchestrationBlockerRecoveryService()
     broken = await svc.create_trigger(db_session, _trigger(goal.id, run.id, blocker_code="broken_blocker").model_copy(
         update={"source_fingerprint": "b" * 64}))
@@ -1058,8 +1080,8 @@ async def test_a_trigger_whose_diagnosis_keeps_raising_does_not_starve_the_next(
 
     monkeypatch.setattr(RecoveryContextBuilder, "build", build)
 
-    await service.tick(db_session, run.id)  # the older, broken trigger is attempted first and fails
-    await service.tick(db_session, run.id)  # it rotates out: the healthy one is diagnosed
+    await service.tick(db_session, run_id)  # the older, broken trigger is attempted first and fails
+    await service.tick(db_session, run_id)  # it rotates out: the healthy one is diagnosed
 
     await db_session.refresh(broken)
     await db_session.refresh(healthy)
@@ -1072,6 +1094,7 @@ async def test_analyzer_outage_backs_off_instead_of_calling_the_provider_every_t
     db_session, test_project, stub_decision, monkeypatch,
 ):
     """F3: an analyzer exception stamps the trigger; the next tick inside the backoff window makes no call."""
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
     calls = []

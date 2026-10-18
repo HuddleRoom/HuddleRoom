@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import inspect, select, update
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import InvalidRequestError, MissingGreenlet, OperationalError, PendingRollbackError
 from sqlalchemy.orm.util import identity_key
 from fastapi import HTTPException
 from huddleroom.database import AsyncSessionLocal
@@ -44,8 +44,24 @@ def _check_lineage_history(db, row) -> None:
         return
     state = inspect(row)
     fields = _LINEAGE_FIELDS[type(row)]
-    if row in db.deleted or state.pending or any(state.attrs[field].history.has_changes() for field in fields):
+    if row in db.deleted or state.pending or any(_lineage_field_changed(state, field) for field in fields):
         raise _PendingLineage
+
+
+def _lineage_field_changed(state, field) -> bool:
+    history = state.attrs[field].history
+    if not history.has_changes():
+        return False
+    if field != "metadata_":
+        return True
+    # metadata_ is a plain JSON column (no in-place mutation tracking): only a reassignment shows up here.
+    # Only the "orchestration" sub-dict is lineage; fail closed when the old value is unknown.
+    if not history.deleted:
+        return True
+    def sub(v):
+        return v.get("orchestration") if isinstance(v, dict) else None
+
+    return [sub(v) for v in history.deleted] != [sub(v) for v in history.added]
 
 
 def _check_cached_lineage_history(db, session: SessionModel) -> None:
@@ -81,7 +97,12 @@ async def _fresh_lineage_row(db, model, row_id):
     _check_lineage_history(db, row)
     if row is not None:
         # Refresh only authority inputs, preserving unrelated caller descriptions/output.
-        await db.refresh(row, attribute_names=[field for field in _LINEAGE_FIELDS[model] if field != "id"])
+        try:
+            await db.refresh(row, attribute_names=[field for field in _LINEAGE_FIELDS[model] if field != "id"])
+        except (PendingRollbackError, MissingGreenlet):
+            raise
+        except InvalidRequestError:  # row deleted underneath a stale identity-map entry
+            return None
     return row
 
 

@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import MissingGreenlet, OperationalError, PendingRollbackError
 
 from huddleroom.adapters.api_adapter import ApiAdapter
 from huddleroom.adapters.cli_adapter import CliAdapter
@@ -1521,3 +1521,162 @@ async def test_ownership_resolver_pending_delete_cannot_authorize(db_session, te
         assert await OrchestrationRecoveryService().resolve_owned_session(db_session, session.id) is None
         assert await db_session.scalar(select(type(target).id).where(type(target).id == target.id)) == target.id
     assert target in db_session.deleted and db_session.get_transaction() is outer
+
+
+# --- lineage-state purity: caller-pending changes must be rejected without side effects (SPR230/231) ---
+
+async def _lineage_agent(db):
+    from tests.test_orchestration_roster_mutation import make_agent
+    agent = make_agent(); db.add(agent); await db.flush()
+    return agent.id
+
+
+async def _lineage_project(db, tmp_path):
+    workspace = tmp_path / "w2"; workspace.mkdir()
+    other = Project(name="o", workspace_path=str(workspace.resolve()), config={}); db.add(other); await db.flush()
+    return other.id
+
+
+async def _lineage_setup(db, project, agent):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    goal, run, action, task, session = await _owned(db, project, agent)
+    action.action_type, action.target_type, action.target_id, action.dispatch_contract = (
+        "create_delegation_task", "task", task.id, {})
+    await db.flush()
+    assert await orchestration_lineage_state(db, session) is True
+    return goal, run, action, task, session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["edit", "delete"])
+async def test_lineage_state_rejects_unflushed_caller_change_without_autoflush(db_session, test_project, test_agent, kind):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, _, _, task, session = await _lineage_setup(db_session, test_project, test_agent)
+    if kind == "edit":
+        task.assigned_to = await _lineage_agent(db_session)
+    else:
+        await db_session.delete(task)
+    assert await orchestration_lineage_state(db_session, session) is False
+    assert (task in db_session.dirty) if kind == "edit" else (task in db_session.deleted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["edit", "delete"])
+async def test_lineage_state_rejects_preflushed_caller_change(db_session, test_project, test_agent, kind, tmp_path):
+    from sqlalchemy import inspect as sa_inspect
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    goal, _, _, task, session = await _lineage_setup(db_session, test_project, test_agent)
+    if kind == "edit":
+        goal.project_id = await _lineage_project(db_session, tmp_path)
+    else:
+        await db_session.delete(task)
+    await db_session.flush()
+    assert not sa_inspect(goal).attrs.project_id.history.has_changes()
+    assert await orchestration_lineage_state(db_session, session) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["update", "delete"])
+async def test_lineage_state_rejects_core_sync_false_change(db_session, test_project, test_agent, kind):
+    from sqlalchemy import delete, inspect as sa_inspect, update
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, _, _, task, session = await _lineage_setup(db_session, test_project, test_agent)
+    if kind == "update":
+        stmt = update(Task).where(Task.id == task.id).values(assigned_to=await _lineage_agent(db_session))
+    else:
+        stmt = delete(Task).where(Task.id == task.id)
+    await db_session.execute(stmt.execution_options(synchronize_session=False))
+    assert not sa_inspect(task).attrs.assigned_to.history.has_changes()  # identity map is stale
+    assert await orchestration_lineage_state(db_session, session) is False
+
+
+@pytest.mark.asyncio
+async def test_lineage_state_performs_no_caller_flush_or_transaction_ops(db_session, test_project, test_agent, monkeypatch):
+    import inspect as pyinspect
+    from sqlalchemy import event, inspect as sa_inspect
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    goal, _, _, _, session = await _lineage_setup(db_session, test_project, test_agent)
+    goal.objective = "unrelated caller edit"; session.output = "caller output"
+    flushes, ops = [], []
+    event.listen(db_session.sync_session, "before_flush", lambda *a: flushes.append(1))
+
+    def spy(name, orig):
+        if pyinspect.iscoroutinefunction(orig):
+            async def wrapper(*a, **k):
+                ops.append(name); return await orig(*a, **k)
+        else:
+            def wrapper(*a, **k):
+                ops.append(name); return orig(*a, **k)
+        return wrapper
+
+    for name in ("commit", "rollback", "expire", "expire_all", "expunge"):
+        monkeypatch.setattr(db_session, name, spy(name, getattr(db_session, name)))
+    hist = sa_inspect(goal).attrs.objective.history
+    txn = db_session.get_transaction()
+    assert await orchestration_lineage_state(db_session, session) is True
+    assert flushes == [] and ops == []
+    assert goal in db_session.dirty and session in db_session.dirty
+    assert sa_inspect(goal).attrs.objective.history == hist
+    assert goal.objective == "unrelated caller edit" and session.output == "caller output"
+    assert db_session.get_transaction() is txn
+    assert "objective" not in sa_inspect(goal).unloaded
+
+
+@pytest.mark.asyncio
+async def test_lineage_state_ignores_unrelated_metadata_reassignment_on_manual_work(db_session, test_project, test_agent):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    task = Task(project_id=test_project.id, title="manual", description="manual", status="in_progress",
+                assigned_to=test_agent.id, metadata_={})
+    db_session.add(task); await db_session.flush()
+    session = Session(project_id=test_project.id, agent_id=test_agent.id, task_id=task.id, adapter_type="cli",
+                      status="running", metadata_={})
+    db_session.add(session); await db_session.flush()
+    assert await orchestration_lineage_state(db_session, session) is None
+    task.metadata_ = {**(task.metadata_ or {}), "note": "x"}
+    session.metadata_ = {**(session.metadata_ or {}), "note": "y"}
+    assert await orchestration_lineage_state(db_session, session) is None
+
+
+@pytest.mark.asyncio
+async def test_lineage_state_rejects_orchestration_subdict_metadata_reassignment(db_session, test_project, test_agent):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, run, action, task, session = await _lineage_setup(db_session, test_project, test_agent)
+    # unrelated key on an orchestration task is still fine
+    task.metadata_ = {**task.metadata_, "note": "x"}
+    assert await orchestration_lineage_state(db_session, session) is True
+    # changing the orchestration sub-dict is a lineage change
+    task.metadata_ = {"orchestration": {"run_id": str(run.id), "action_id": str(uuid.uuid4())}}
+    assert await orchestration_lineage_state(db_session, session) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [PendingRollbackError("rolled back"), MissingGreenlet("no greenlet")])
+async def test_lineage_state_propagates_session_state_errors_from_refresh(db_session, test_project, test_agent, monkeypatch, exc):
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, _, _, task, session = await _lineage_setup(db_session, test_project, test_agent)
+    orig = db_session.refresh
+
+    async def refresh(row, *a, **k):
+        if row is task:
+            raise exc
+        return await orig(row, *a, **k)
+
+    monkeypatch.setattr(db_session, "refresh", refresh)
+    with pytest.raises(type(exc)):
+        await orchestration_lineage_state(db_session, session)
+
+
+@pytest.mark.asyncio
+async def test_lineage_state_plain_invalid_request_error_is_invalid_lineage(db_session, test_project, test_agent, monkeypatch):
+    from sqlalchemy.exc import InvalidRequestError
+    from huddleroom.workers.session_tasks import orchestration_lineage_state
+    _, _, _, task, session = await _lineage_setup(db_session, test_project, test_agent)
+    orig = db_session.refresh
+
+    async def refresh(row, *a, **k):
+        if row is task:
+            raise InvalidRequestError("instance is not persistent")
+        return await orig(row, *a, **k)
+
+    monkeypatch.setattr(db_session, "refresh", refresh)
+    assert await orchestration_lineage_state(db_session, session) is False

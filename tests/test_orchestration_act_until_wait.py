@@ -235,6 +235,7 @@ async def test_sqlite_autobegin_precommit_keeps_first_iteration_when_second_rais
     from huddleroom.models.project import Project
     from huddleroom.schemas.orchestration import OrchestrationGoalCreate
     from huddleroom.services.orchestration_llm_decision_adapter import OrchestrationDecisionAdapterResult
+    from huddleroom.services.orchestration_baseline_runtime import baseline_operation
     from tests.conftest import complete_baseline_processes
 
     if test_engine.dialect.name != "sqlite":
@@ -296,11 +297,13 @@ async def test_sqlite_autobegin_precommit_keeps_first_iteration_when_second_rais
     monkeypatch.setattr(service, "_advance_authorized_execution_once", once)
     try:
         async with factory() as tick_db:
-            tick_db.info["orchestration_tick_owns_transaction"] = True
             goal_row = await tick_db.get(OrchestrationGoal, ids[1])
             run_row = await tick_db.get(OrchestrationRun, ids[2])
-            with pytest.raises(HTTPException):
-                await service._advance_authorized_execution(tick_db, goal_row, run_row)
+            with pytest.raises(HTTPException) as exc:
+                async with baseline_operation(tick_db, ids[1], owns_transaction=True, tick=True):
+                    await service._advance_authorized_execution(tick_db, goal_row, run_row)
+            assert exc.value.status_code == 409
+            assert exc.value.detail == "boom"
             await tick_db.rollback()
         async with factory() as check:
             actions = list(await check.scalars(

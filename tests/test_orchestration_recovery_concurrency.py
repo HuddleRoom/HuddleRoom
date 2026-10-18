@@ -6,6 +6,7 @@ from collections import Counter
 from time import monotonic
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,6 +20,14 @@ from tests.test_orchestration_recovery_execution import (
 )
 from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
 from huddleroom.services.orchestration_service import OrchestrationService
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 async def _diagnosis_ticks(db_session, test_engine, conversation_goal_run, monkeypatch, completion):

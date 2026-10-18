@@ -34,6 +34,7 @@ def publish_session_dispatch(
     """Publish one committed dispatch, retaining it until an exact closing worker exits."""
     from huddleroom.services.backend_restart import draining
     if draining:
+        # Deliberate: after-commit listener, no 503; session stays pending, recovers next tick.
         return
     worker = _running_tasks.get(task_id)
     if worker is None or worker.done():

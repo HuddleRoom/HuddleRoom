@@ -17,6 +17,7 @@ from huddleroom.models.task import Task
 from huddleroom.services.event_bus import BusEvent, emit_event_once
 from huddleroom.services.graph_engine import GraphEngineService
 from huddleroom.services.graph_service import GraphService
+from tests.conftest import adopt_session
 from tests.test_orchestration_evidence_ingestion import (
     _agent,
     _make_gate,
@@ -25,6 +26,14 @@ from tests.test_orchestration_evidence_ingestion import (
 )
 
 pytestmark = pytest.mark.usefixtures("safe_goal_analysis")
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -152,6 +161,7 @@ async def test_final_line_request_changes_awaits_revision(db_session, test_proje
 
 @pytest.mark.asyncio
 async def test_commented_outcome_records_no_review_evidence(db_session, test_project):
+    adopt_session(db_session)
     service, _goal, run = await _make_run(db_session, test_project.id)
     gate = await _make_gate(db_session, run.id, gate_type="review_accepted")
     reviewer = _agent("reviewer", "reviewer", ["review"])
@@ -463,6 +473,7 @@ async def test_redelivered_refused_approval_does_not_duplicate_reviews_or_merger
 async def _review_gate(db, project):
     from huddleroom.models.orchestration import OrchestrationGate
 
+    adopt_session(db)  # the test task drives the orchestration ticks through this session
     service, _goal, orchestration_run = await _make_run(db, project.id)
     gate = OrchestrationGate(run_id=orchestration_run.id, success_criterion_key="plan_item:review-pr",
                              gate_type="review_accepted",

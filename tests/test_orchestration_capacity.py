@@ -23,6 +23,7 @@ from huddleroom.services.orchestration_capacity import (
 from huddleroom.services.orchestration_roadmap_service import descendant_count, expansion_scope
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.task_service import TaskService
+from tests.conftest import owned_session
 from tests.test_orchestration_runtime_e2e import _agent
 
 pytestmark = pytest.mark.asyncio
@@ -545,7 +546,7 @@ async def test_goal_lock_takes_the_finite_root_lock_first(
 
 
 async def test_racing_sibling_ticks_cannot_overfill_root_slots(
-    db_session, test_project, test_engine, committed_tree_cleanup,
+    db_session, test_project, test_engine, committed_tree_cleanup, owned_session_factory,
 ):
     agent = await _agent_row(db_session)
     root, root_run = await _root(db_session, test_project)
@@ -561,7 +562,7 @@ async def test_racing_sibling_ticks_cannot_overfill_root_slots(
     factory = async_sessionmaker(test_engine, expire_on_commit=False)
 
     async def tick(run_id):
-        async with factory() as db:
+        async with owned_session(factory) as db:
             return await OrchestrationService().tick(db, run_id)
 
     await asyncio.wait_for(asyncio.gather(*(tick(run_id) for run_id in run_ids)), timeout=30)
@@ -619,7 +620,7 @@ async def _race_ticks(test_engine, run_ids):
     factory = async_sessionmaker(test_engine, expire_on_commit=False)
 
     async def tick(run_id):
-        async with factory() as db:
+        async with owned_session(factory) as db:
             return await OrchestrationService().tick(db, run_id)
 
     results = await asyncio.wait_for(asyncio.gather(*(tick(run_id) for run_id in run_ids)), timeout=30)

@@ -11,10 +11,12 @@ import pytest_asyncio
 from sqlalchemy import delete, event, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import huddleroom.services.orchestration_service as osm
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.project import Project
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
+from huddleroom.services.orchestration_baseline_runtime import baseline_operation
 from huddleroom.services.orchestration_llm_decision_adapter import (
     OrchestrationDecisionAdapter,
     OrchestrationDecisionAdapterResult,
@@ -636,7 +638,7 @@ async def test_request_llm_decision_rejects_preflushed_committed_run_caller(comm
 
 
 @pytest.mark.asyncio
-async def test_request_llm_decision_uses_caller_when_factory_has_another_engine(db_session, test_project, monkeypatch):
+async def test_request_llm_decision_refuses_caller_when_factory_has_another_engine(db_session, test_project, monkeypatch):
     import huddleroom.services.orchestration_service as orchestration_service_module
 
     service, run = await _make_run(db_session, test_project)
@@ -1426,3 +1428,165 @@ async def test_adapter_decide_accepts_a_recover_blocker_decision_unchanged():
     )
 
     assert result.parsed_decision == decision
+
+
+# --- transaction-ownership / publication regressions ---
+_OWNED_DECISION = {"action_type": "noop", "reason": "probe", "wake_when": NOOP_WAKE_WHEN}
+
+
+class _WaitAdapter:
+    def __init__(self, started=None, release=None, raises=None, usage=None):
+        self.started, self.release, self.raises, self.usage = started, release, raises, usage
+
+    async def decide(self, context, project=None, goal=None):
+        if self.started: self.started.set()
+        if self.release: await asyncio.wait_for(self.release.wait(), 5)
+        if self.raises: raise self.raises
+        r = OrchestrationDecisionAdapterResult(
+            input_snapshot=context, llm_output={"raw_content": json.dumps({"decision": _OWNED_DECISION})}, parsed_decision=_OWNED_DECISION)
+        if self.usage:
+            # OrchestrationDecisionAdapterResult has no usage field; set it ad hoc (plumbing-only check)
+            object.__setattr__(r, "usage", self.usage)
+        return r
+
+
+async def _writer_free(factory, project_id):
+    async with factory() as w:
+        await w.execute(text("PRAGMA busy_timeout = 100"))
+        p = await w.get(Project, project_id)
+        p.description = "other writer ok"
+        await w.commit()
+
+
+def _spy_calls(db):
+    calls = []
+    for n in ("before_flush", "before_commit", "after_rollback"):
+        event.listen(db.sync_session, n, lambda *a, n=n: calls.append(n))
+    return calls
+
+
+async def _admissions(factory, run_id):
+    async with factory() as f:
+        return list(await f.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "admit_control_call")))
+
+
+@pytest.mark.asyncio
+async def test_owned_result_write_fails_usage_durable_writer_free(committed_run_details, monkeypatch):
+    service, factory, project_id, goal_id, run_id = committed_run_details
+    monkeypatch.setattr(osm, "AsyncSessionLocal", factory)
+    started, release = asyncio.Event(), asyncio.Event()
+    async def boom(*a, **k): raise RuntimeError("result write boom")
+    monkeypatch.setattr(service, "record_validated_decision", boom)
+    usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    async def other():
+        await asyncio.wait_for(started.wait(), 5)
+        try: await _writer_free(factory, project_id)  # writer released DURING provider wait
+        finally: release.set()
+    t = asyncio.create_task(other())
+    async with factory() as db:
+        async with baseline_operation(db, goal_id, owns_transaction=True, run_id=run_id):
+            with pytest.raises(RuntimeError, match="result write boom"):
+                await service.request_llm_decision(db, run_id, adapter=_WaitAdapter(started, release, usage=usage))
+            await asyncio.wait_for(t, 3)
+            # writer must not be left held after the exception, before owner cleanup
+            await _writer_free(factory, project_id)
+            adm = await _admissions(factory, run_id)
+            assert len(adm) == 1 and adm[0].dispatch_contract["provider_completed"] is True
+            assert adm[0].dispatch_contract["usage"] == usage
+            async with factory() as f:
+                assert not list(await f.scalars(select(OrchestrationDecision).where(OrchestrationDecision.run_id == run_id)))
+            assert not db.in_transaction()  # published
+
+
+@pytest.mark.asyncio
+async def test_owned_provider_raises_writer_not_held(committed_run_details, monkeypatch):
+    service, factory, project_id, goal_id, run_id = committed_run_details
+    monkeypatch.setattr(osm, "AsyncSessionLocal", factory)
+    async with factory() as db:
+        async with baseline_operation(db, goal_id, owns_transaction=True, run_id=run_id):
+            with pytest.raises(RuntimeError, match="prov"):
+                await service.request_llm_decision(db, run_id, adapter=_WaitAdapter(raises=RuntimeError("prov")))
+            await _writer_free(factory, project_id)
+
+
+@pytest.mark.asyncio
+async def test_owned_pause_during_wait_still_accepted(committed_run_details, monkeypatch):
+    service, factory, project_id, goal_id, run_id = committed_run_details
+    monkeypatch.setattr(osm, "AsyncSessionLocal", factory)
+    started, release = asyncio.Event(), asyncio.Event()
+    async def pause():
+        await asyncio.wait_for(started.wait(), 5)
+        async with factory() as p:
+            await p.execute(text("PRAGMA busy_timeout = 100"))
+            r = await p.get(OrchestrationRun, run_id); r.pause_requested = True; r.status = "paused"
+            await p.commit()
+        release.set()
+    t = asyncio.create_task(pause())
+    async with factory() as db:
+        async with baseline_operation(db, goal_id, owns_transaction=True, run_id=run_id):
+            dec = await asyncio.wait_for(service.request_llm_decision(db, run_id, adapter=_WaitAdapter(started, release)), 5)
+    await t
+    async with factory() as f:
+        assert (await f.get(OrchestrationDecision, dec.id)).validator_status == "accepted"
+        assert (await f.get(OrchestrationRun, run_id)).status == "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", ["provider", "result_write"])
+@pytest.mark.parametrize("shape", ["safe_autobegin_dirty", "explicit", "nested"])
+async def test_caller_exception_paths_no_publication(committed_run_details, monkeypatch, fail, shape):
+    service, factory, project_id, goal_id, run_id = committed_run_details
+    monkeypatch.setattr(osm, "AsyncSessionLocal", factory)
+    if fail == "result_write":
+        async def boom(*a, **k): raise RuntimeError("result write boom")
+        monkeypatch.setattr(service, "record_validated_decision", boom)
+    async with factory() as db:
+        if shape != "safe_autobegin_dirty": await db.begin()
+        goal = await db.get(OrchestrationGoal, goal_id)
+        if shape == "safe_autobegin_dirty":
+            await db.execute(select(OrchestrationRun.id))
+            goal.objective = "caller only"
+        else:
+            goal.objective = "caller only"; await db.flush()
+        if shape == "nested": await db.begin_nested()
+        root = db.sync_session.get_transaction(); calls = _spy_calls(db)
+        ad = _WaitAdapter(raises=RuntimeError("prov")) if fail == "provider" else _WaitAdapter()
+        if shape == "safe_autobegin_dirty":
+            exc, msg = RuntimeError, {"provider": "prov", "result_write": "result write boom"}[fail]
+        else:  # caller-owned explicit/nested txn is rejected before the provider call
+            exc, msg = HTTPException, "orchestration_transaction_shape"
+        with pytest.raises(exc, match=msg):
+            await service.request_llm_decision(db, run_id, adapter=ad)
+        assert calls == []
+        assert db.sync_session.get_transaction() is root and root.is_active
+        assert goal.objective == "caller only"
+        if shape == "safe_autobegin_dirty":
+            await _writer_free(factory, project_id)  # explicit/nested caller legitimately holds the writer itself
+        async with factory() as f:
+            assert (await f.get(OrchestrationGoal, goal_id)).objective != "caller only"
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_safe_caller_pause_during_wait_accepted_and_dirty_kept(committed_run_details, monkeypatch):
+    service, factory, project_id, goal_id, run_id = committed_run_details
+    monkeypatch.setattr(osm, "AsyncSessionLocal", factory)
+    started, release = asyncio.Event(), asyncio.Event()
+    async def pause():
+        await asyncio.wait_for(started.wait(), 5)
+        async with factory() as p:
+            r = await p.get(OrchestrationRun, run_id); r.pause_requested = True; r.status = "paused"
+            await p.commit()
+        release.set()
+    t = asyncio.create_task(pause())
+    async with factory() as db:
+        await db.execute(select(OrchestrationRun.id))
+        goal = await db.get(OrchestrationGoal, goal_id); goal.objective = "caller only"
+        calls = _spy_calls(db)
+        dec = await asyncio.wait_for(service.request_llm_decision(db, run_id, adapter=_WaitAdapter(started, release)), 5)
+        assert calls == [] and goal.objective == "caller only"
+        await db.rollback()
+    await t
+    async with factory() as f:
+        assert (await f.get(OrchestrationDecision, dec.id)).validator_status == "accepted"

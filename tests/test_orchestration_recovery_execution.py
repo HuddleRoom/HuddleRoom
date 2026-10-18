@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
 
@@ -55,10 +56,19 @@ from huddleroom.services.orchestration_blocker_recovery import (
 from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_supervision import OrchestrationSupervisionService
+from tests.conftest import adopt_session
 from tests.test_orchestration_recovery_adapters import seed_rows
 from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture re-exported
 
 DOMAIN_ERRORS = (ValueError, HTTPException, RecoveryProposalStale)
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 # --------------------------------------------------------------------------- scripted analyzer
@@ -88,6 +98,7 @@ class ScriptedAnalyzer:
 
 async def seed(db, project, *, task_status="ready"):
     """seed_rows (goal/run/planner/organizer/gate/graph/task) plus a durably failed source action."""
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
     rows = await seed_rows(db, project, task_status=task_status)
     request = OrchestrationService().canonical_decision_request(
         "request_verification", {"gate_id": str(rows.gate.id), "work_function": "validation"}, run_id=rows.run.id)

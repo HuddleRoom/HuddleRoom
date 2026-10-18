@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 from huddleroom.models.event_log import EventLog
@@ -11,7 +12,7 @@ from huddleroom.models.task import Task
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_work_report import validate_work_report
-from tests.conftest import heal_baseline_drift_for_test
+from tests.conftest import adopt_session, heal_baseline_drift_for_test
 from tests.test_orchestration_delegation_contracts import _agent, _delegation_request, _make_run
 from tests.test_orchestration_final_summary_request import (  # noqa: F401  (autouse fixtures are reused)
     _manual_task_start, _real_planning_expansion_run, _request_summary, _valid_summary_output,
@@ -20,6 +21,14 @@ from tests.test_orchestration_final_summary_request import (  # noqa: F401  (aut
 from tests.test_orchestration_plan_ingestion import (
     _completed, _db_output, _finish, _plan_artifacts, _planning_run,
 )
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
 
 REPORT = {
     "status": "done", "changes": ["x"], "evidence": [], "criterion_progress": {}, "decisions": [],
@@ -137,6 +146,7 @@ async def test_fenced_plan_envelope_registers_plan(db_session, test_project):
 
 
 async def _summary_run(db_session, test_project, wrap):
+    adopt_session(db_session)
     service, goal, run, writer, task, gate = await _request_summary(db_session, test_project)
     goal.weight = "trivial"
     await heal_baseline_drift_for_test(db_session, goal, run)
@@ -148,6 +158,7 @@ async def _summary_run(db_session, test_project, wrap):
     await emit_event_once(db_session, test_project.id, "session.completed",
                           {"session_id": str(session.id), "task_id": str(task.id)},
                           dedup_key=f"norm-summary:{session.id}")
+    await db_session.commit()
     result = await service.tick(db_session, run.id)
     evidence = (await db_session.execute(select(OrchestrationEvidence).where(
         OrchestrationEvidence.gate_id == gate.id, OrchestrationEvidence.source_type == "session",
@@ -179,6 +190,7 @@ async def test_ambiguous_final_summary_rejected(db_session, test_project):
 
 @pytest.mark.asyncio
 async def test_framed_outcome_verification_evidence_records_normalization(db_session, test_project):
+    adopt_session(db_session)
     planner = _agent("planner", role="planner", capabilities=["planning", "validation"])
     developer = _agent("developer", role="developer", capabilities=["implementation"])
     db_session.add_all([planner, developer])

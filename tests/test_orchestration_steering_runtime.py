@@ -2,8 +2,11 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from tests.conftest import adopt_session
 
 from huddleroom.config import settings
 from huddleroom.models.event_log import EventLog
@@ -20,6 +23,14 @@ from huddleroom.services.orchestration_supervision_context import OrchestrationS
 
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 async def test_sqlite_stale_rejection_is_durable_after_autobegin_caller_rollback(test_engine):
@@ -43,6 +54,7 @@ async def test_sqlite_stale_rejection_is_durable_after_autobegin_caller_rollback
 
     service = OrchestrationService()
     async with sessions() as caller:
+        adopt_session(caller)
         await caller.get(OrchestrationDecision, decision_id)  # starts AUTOBEGIN
         await service._reject_stale_steering_decision(caller, decision_id)
         await caller.rollback()
@@ -112,6 +124,7 @@ async def _applied_item(db, conversation_goal_run, test_project, test_user, monk
 async def test_supervision_context_projects_steering_and_omits_drifted_item(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, task, request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -130,6 +143,7 @@ async def test_supervision_context_projects_steering_and_omits_drifted_item(
 async def test_steered_decision_uses_final_versioned_action_key_and_links_result(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -155,6 +169,7 @@ async def test_steered_decision_uses_final_versioned_action_key_and_links_result
 async def test_steered_decision_cannot_pause_a_run(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -181,6 +196,7 @@ async def test_steered_decision_cannot_pause_a_run(
 async def test_stale_steering_versions_do_not_reserve_an_action(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -205,6 +221,7 @@ async def test_stale_steering_versions_do_not_reserve_an_action(
 async def test_stale_steering_replays_a_completed_action_by_its_persisted_key(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -243,6 +260,7 @@ async def test_stale_steering_replays_a_completed_action_by_its_persisted_key(
 async def test_stale_steering_fails_a_reserved_action_replay(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -276,6 +294,7 @@ async def test_item_lifetime_drift_stales_a_frozen_steering_decision(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     drift,
 ):
+    adopt_session(db_session)
     goal, run, task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -305,6 +324,7 @@ async def test_item_lifetime_drift_stales_a_frozen_steering_decision(
 async def test_stale_decision_is_rejected_then_reevaluated_once(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -353,6 +373,7 @@ async def test_late_item_lifetime_drift_fails_reservation_and_reevaluates_once(
     )
     await db_session.commit()
     session_a, session_b = concurrent_sessions
+    adopt_session(session_a)
     goal = await session_a.get(OrchestrationGoal, goal.id)
     run = await session_a.get(OrchestrationRun, run.id)
     task = await session_a.get(Task, task.id)
@@ -403,7 +424,7 @@ async def test_late_item_lifetime_drift_fails_reservation_and_reevaluates_once(
     monkeypatch.setattr(service, "_existing_action_for_key", drift_after_early_fence)
     monkeypatch.setattr(service, "request_llm_decision", fresh_decision)
     # The simulated concurrent writer commits session_a mid-executor, which a real savepoint cannot survive;
-    # the failed-row-kept behaviour under a real savepoint is covered in test_orchestration_failed_action_outcome.
+    # the failed-row-kept behaviour under a real savepoint is covered in test_steering_versions_changed_keeps_failed_row (test_orchestration_failed_action_outcome).
     from contextlib import nullcontext
     from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
     monkeypatch.setattr(OrchestrationDecisionDispatcher, "_savepoint", staticmethod(lambda _db: nullcontext()))
@@ -432,6 +453,7 @@ async def test_late_item_lifetime_drift_fails_reservation_and_reevaluates_once(
 async def test_second_stale_decision_waits_without_an_action(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, _request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )
@@ -476,6 +498,7 @@ async def test_second_stale_decision_waits_without_an_action(
 async def test_distinct_accepted_noop_replay_preserves_original_steering_lineage(
     db_session, conversation_goal_run, test_project, test_user, monkeypatch,
 ):
+    adopt_session(db_session)
     goal, run, _task, request = await _applied_item(
         db_session, conversation_goal_run, test_project, test_user, monkeypatch,
     )

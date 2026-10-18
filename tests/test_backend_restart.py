@@ -466,3 +466,131 @@ def test_genuine_supervised_child_installs_controller(monkeypatch):
     assert result.exit_code == 0, result.output
     assert len(applications) == 1
     assert applications[0].state.backend_restart.parent_pid == os.getppid()
+
+
+@pytest.fixture
+def isolated_runner(monkeypatch):
+    """Snapshot/restore task_runner module registries around a test."""
+    from huddleroom.workers import meeting_tasks, task_runner
+    for name in ("_running_tasks", "_task_projects", "_deferred_session_dispatches"):
+        monkeypatch.setattr(task_runner, name, {})
+    monkeypatch.setattr(meeting_tasks, "_running_meeting_tasks", {})
+    return task_runner
+
+
+async def test_stale_cleanup_keeps_replacement_real(isolated_runner, monkeypatch):
+    tr = isolated_runner
+    gates = [asyncio.Event(), asyncio.Event()]
+    started = iter(gates)
+
+    async def blocker(session_id, task_id):
+        await next(started).wait()
+
+    monkeypatch.setattr(tr, "execute_api_session", blocker)
+    tr.register_session("s", "api", "p", task_id="T")
+    old = tr._running_tasks["T"]
+    await asyncio.sleep(0)
+    tr.register_session("s", "api", "p", task_id="T")  # replacement while old is live
+    new = tr._running_tasks["T"]
+    assert new is not old
+    await asyncio.sleep(0)
+    gates[0].set()
+    await old
+    # Old worker's cleanup must not evict the replacement.
+    assert tr._running_tasks.get("T") is new and tr._task_projects.get("T") == "p"
+    gates[1].set()
+    await new
+    assert "T" not in tr._running_tasks
+
+
+async def test_cancel_all_identity_keeps_replacement(isolated_runner):
+    tr = isolated_runner
+    replacement = asyncio.ensure_future(asyncio.sleep(10))
+
+    async def stubborn():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            tr._running_tasks["T"] = replacement  # replaced during cancellation cleanup
+
+    old = asyncio.ensure_future(stubborn())
+    tr._running_tasks["T"] = old
+    tr._task_projects["T"] = "p"
+    await asyncio.sleep(0)
+    try:
+        assert await tr.cancel_all_sessions() == 1
+        assert tr._running_tasks.get("T") is replacement
+    finally:
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+
+
+async def test_cancel_project_identity_keeps_replacement(isolated_runner):
+    tr = isolated_runner
+    replacement = asyncio.ensure_future(asyncio.sleep(10))
+
+    async def stubborn():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            tr._running_tasks["T"] = replacement
+
+    old = asyncio.ensure_future(stubborn())
+    tr._running_tasks["T"] = old
+    tr._task_projects["T"] = "p"
+    await asyncio.sleep(0)
+    try:
+        assert await tr.cancel_project_sessions("p") == 1
+        assert tr._running_tasks.get("T") is replacement
+    finally:
+        replacement.cancel()
+        await asyncio.gather(replacement, return_exceptions=True)
+
+
+@pytest.fixture
+def registered(isolated_runner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(isolated_runner, "register_session", lambda *a, **k: calls.append((a, k)))
+    return calls
+
+
+async def test_publish_draining_drops(isolated_runner, registered, monkeypatch):
+    from huddleroom.services import backend_restart
+    tr = isolated_runner
+    monkeypatch.setattr(backend_restart, "draining", True)  # restored by monkeypatch
+    tr.publish_session_dispatch("s", "api", "p", "T")  # no worker
+    worker = asyncio.ensure_future(asyncio.sleep(0.01))
+    tr._running_tasks["T"] = worker
+    tr.publish_session_dispatch("s", "api", "p", "T")  # live worker
+    assert registered == [] and not tr._deferred_session_dispatches
+    await worker
+    await asyncio.sleep(0)
+    assert registered == []
+
+
+async def test_deferred_drain_after_publish_drops(isolated_runner, registered, monkeypatch):
+    from huddleroom.services import backend_restart
+    tr = isolated_runner
+    worker = asyncio.ensure_future(asyncio.sleep(0.02))
+    tr._running_tasks["T"] = worker
+    tr.publish_session_dispatch("s", "api", "p", "T")
+    assert len(tr._deferred_session_dispatches) == 1
+    monkeypatch.setattr(backend_restart, "draining", True)
+    await worker
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert registered == [] and not tr._deferred_session_dispatches
+
+
+async def test_deferred_cancelled_worker_drops(isolated_runner, registered):
+    tr = isolated_runner
+    worker = asyncio.ensure_future(asyncio.sleep(10))
+    tr._running_tasks["T"] = worker
+    await asyncio.sleep(0)
+    tr.publish_session_dispatch("s", "api", "p", "T")
+    assert len(tr._deferred_session_dispatches) == 1
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert registered == [] and not tr._deferred_session_dispatches

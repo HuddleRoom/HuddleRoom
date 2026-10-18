@@ -6,6 +6,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 from huddleroom.config import settings
@@ -26,7 +27,7 @@ from huddleroom.services.orchestration_wake_when import (
     clamp_recheck_seconds,
 )
 
-from tests.conftest import heal_baseline_drift_for_test
+from tests.conftest import adopt_session, heal_baseline_drift_for_test
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 from tests.test_orchestration_roadmap_e2e import _ready_roadmap
 from tests.test_orchestration_roadmap_task_items import roadmap_task
@@ -66,6 +67,30 @@ from tests.test_orchestration_runtime_e2e import (
     _seed_accepted_plan,
     _tasks_for_run,
 )
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Plain autobegin session so the test task can own it, like get_db."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture(autouse=True)
+def _owned_tick_setup(db_session, monkeypatch):
+    original = OrchestrationService.tick
+
+    async def tick(self, db, *args, **kwargs):
+        root = db.sync_session.get_transaction()
+        if (db is db_session and not db.in_nested_transaction()
+                and (root is None or root.origin.name == "AUTOBEGIN")):
+            # Test-owned setup boundary only; production tick still enforces ownership.
+            await db.flush()
+            await db.commit()
+        return await original(self, db, *args, **kwargs)
+
+    monkeypatch.setattr(OrchestrationService, "tick", tick)
 
 
 @pytest.fixture(autouse=True)
@@ -439,6 +464,7 @@ async def test_nested_roadmap_outcome_loop_real(db_session, test_project, stub_d
     from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
     from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
 
+    adopt_session(db_session)
     cap = 3
     monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", cap)
     service, goal, run, planner = await _ready_roadmap(db_session, test_project)
@@ -530,7 +556,8 @@ async def test_nested_roadmap_outcome_loop_real(db_session, test_project, stub_d
 # services, stubs only LLM decisions / the semantic judge, asserts the global
 # liveness invariant after each tick and replays the effects to prove idempotence.
 # ---------------------------------------------------------------------------
-_NON_SUBSTANTIVE_ACTIONS = {"noop", "record_warning", "ask_human", "decision_continuation"}
+_NON_SUBSTANTIVE_ACTIONS = {"noop", "record_warning", "ask_human", "decision_continuation",
+                            "admit_control_call"}
 
 
 async def _snapshot(db, run):
@@ -650,6 +677,7 @@ async def test_scenario_3a_blocked_task_with_missing_agent_starts_recovery_not_r
     from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
     from tests.test_orchestration_recovery_activation import _gap
 
+    adopt_session(db_session)
     monkeypatch.setattr("huddleroom.services.orchestration_service.TaskService.run", _fake_task_run([]))
     original = _recovery_agent("original", "developer", ["implementation"], is_active=False)
     alternate = _recovery_agent("alternate", "developer", ["implementation"])
@@ -666,6 +694,7 @@ async def test_scenario_3a_blocked_task_with_missing_agent_starts_recovery_not_r
     assert await service.recover_run(db_session, run.id, baseline_ready=True) == 1
     triggers = await _recovery_actions(db_session, run.id, "recovery_trigger")
     assert len(triggers) == 1
+    await db_session.commit()
     await OrchestrationBlockerRecoveryService().diagnose(db_session, triggers[0].id)
 
     from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision

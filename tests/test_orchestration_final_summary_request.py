@@ -58,13 +58,11 @@ async def clean_test_database(test_engine):
 
 
 @pytest_asyncio.fixture
-async def db_session(test_engine, monkeypatch):
-    from sqlalchemy.ext.asyncio import AsyncSession
-
+async def db_session(owned_session_factory, monkeypatch):
     # SPR230: committed fixtures must never launch application agents.
     monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
 
-    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+    async with owned_session_factory() as db:
         yield db
         await db.rollback()
 
@@ -104,8 +102,9 @@ def _agent(name: str, role: str, capabilities: list[str]) -> Agent:
 
 
 async def _complete_goal_definition(db_session, goal, run):
-    from tests.conftest import complete_baseline_processes, heal_baseline_drift_for_test
+    from tests.conftest import adopt_session, complete_baseline_processes, heal_baseline_drift_for_test
 
+    adopt_session(db_session)  # the test task owns this autobegin session, as get_db does
     run.baseline_authorized = True
     await complete_baseline_processes(db_session, goal, run)
     # This whole file exercises completion machinery downstream of

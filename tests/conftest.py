@@ -2,6 +2,7 @@ import asyncio
 import os
 import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -271,6 +272,9 @@ async def test_engine():
                 pass
 
 
+# Non-owned tests deliberately keep using db_session (session.begin(), never an
+# owned control session). Tests that reach the transaction-ownership guards use
+# owned_session_factory + owned_session / adopt_session below instead.
 @pytest_asyncio.fixture
 async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
     """Per-test transaction that rolls back after each test."""
@@ -279,6 +283,45 @@ async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
         async with session.begin():
             yield session
             await session.rollback()
+
+
+@pytest.fixture
+def owned_session_factory(test_engine, monkeypatch):
+    """Factory bound to the test engine; also replaces the service's AsyncSessionLocal."""
+    from huddleroom.services import orchestration_service
+
+    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(orchestration_service, "AsyncSessionLocal", factory)
+    return factory
+
+
+@asynccontextmanager
+async def owned_session(factory):
+    """Autobegin session owned by the current task, like get_db. Enter inside the test body."""
+    from huddleroom.services.orchestration_baseline_runtime import control_operation_owner
+
+    async with factory() as session, control_operation_owner(session):
+        yield session
+
+
+def adopt_session(session):
+    """Mark an existing autobegin session as owned by the calling test task (no reindent).
+
+    Exactly one session per test; for a second session use `async with owned_session(...)`.
+    Call from the test body or a helper it calls, never from a fixture (ownership is keyed to current_task).
+    """
+    from sqlalchemy.orm import SessionTransactionOrigin
+
+    from huddleroom.services.orchestration_baseline_runtime import _owner
+
+    transaction = session.sync_session.get_transaction()
+    if transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN:
+        raise AssertionError(
+            "adopt_session requires a plain autobegin session, not session.begin(); "
+            "open the session without an explicit begin."
+        )
+    _owner.set((session, asyncio.current_task()))
+    return session
 
 
 @pytest_asyncio.fixture(autouse=True)

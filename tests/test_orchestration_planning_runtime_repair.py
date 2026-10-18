@@ -229,6 +229,7 @@ async def test_live_planner_stale_fence_then_acknowledged_independent_replacemen
                 assert replay.id == action.id
                 await caller.commit()
             expected = service._plan_generation_seal(run_id, state)
+            # Exact count is intentional: one seal per generation-admission checkpoint below; update when seals change.
             assert [entry[0] for entry in seals] == [expected] * 4
             assert [(entry[1], entry[2]) for entry in seals] == [
                 ("running", "backlog"), ("running", "backlog"),

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
@@ -44,6 +45,7 @@ from huddleroom.services.orchestration_decision_dispatcher import OrchestrationD
 from huddleroom.services.orchestration_recovery_configuration import RecoveryConfigurationService
 from huddleroom.services.orchestration_recovery_registry import RecoveryToolRegistry
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.conftest import adopt_session
 from tests.test_orchestration_recovery_configuration import (  # noqa: F401 -- fixtures re-exported
     approved_flow,
     load_flow,
@@ -68,6 +70,14 @@ ADAPTER_TOOLS = (
 ACTION_TYPES = {tool: tool.split(".", 1)[1] for tool in ADAPTER_TOOLS}
 
 
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
 def sha(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
@@ -76,6 +86,7 @@ def sha(value) -> str:
 
 
 async def seed_rows(db, project, *, task_status="ready", gate_status="open"):
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
     planner = Agent(**_agent(PLANNER_ID, "Planner", "planning").__dict__)
     organizer = Agent(**_agent(REVIEWER_ID, "Organizer", "review").__dict__)
     db.add_all([planner, organizer])
@@ -350,6 +361,7 @@ async def test_adapter_uses_real_verification_executor_and_target(
     """No stubs: the effect is the real verification executor's action and its real verifier task target."""
     from tests.test_orchestration_decision_dispatcher import _verifiable_gate
 
+    adopt_session(db_session)
     service, goal, run, gate = await _verifiable_gate(db_session, test_project)
     planner = Agent(**_agent(PLANNER_ID, "Planner", "planning").__dict__)
     db_session.add(planner)
@@ -891,12 +903,13 @@ async def test_direction_removed_after_approval_blocks_apply(db_session, test_pr
 async def test_diagnose_writes_the_steering_seal_on_the_proposal(db_session, conversation_goal_run, test_agent):
     from tests.test_orchestration_recovery_persistence import proposal_payload, service_for, trigger_for
 
+    adopt_session(db_session)
     goal, run = conversation_goal_run
     run.status = "running"
     svc = service_for(proposal_payload(test_agent))
     trigger = await svc.create_trigger(db_session, trigger_for(goal, run))
 
-    proposal = await svc.diagnose(db_session, trigger.id)
+    proposal = await svc.diagnose(db_session, trigger.id, tick_owns_transaction=True)
 
     seal = proposal.dispatch_contract["steering"]
     assert seal == await _steering_seal(db_session, goal, run)

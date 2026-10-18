@@ -6,13 +6,14 @@ from contextlib import asynccontextmanager
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.orchestration_memory import OrchestrationMemorySection
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from tests.conftest import adopt_session
 
 
 @pytest.fixture(autouse=True)
@@ -51,9 +52,9 @@ async def clean_test_database(test_engine):
 
 
 @pytest.fixture
-async def db_session(test_engine):
-    """This module owns committed setup for real service/worker entrypoints."""
-    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
         yield db
         await db.rollback()
 
@@ -276,6 +277,7 @@ async def test_complete_run_action_is_blocked_until_closeout_authorizes(
 async def test_standard_tick_parks_closeout_before_complete_run(
     db_session, completion_ready_goal, monkeypatch
 ):
+    adopt_session(db_session)
     service, _goal, run = completion_ready_goal
     await stub_tick_baseline(monkeypatch)
 
@@ -294,6 +296,7 @@ async def test_standard_tick_parks_closeout_before_complete_run(
 async def test_approved_closeout_completes_run_in_same_tick(
     db_session, completion_ready_goal, test_user, monkeypatch
 ):
+    adopt_session(db_session)
     service, _goal, run = completion_ready_goal
     await stub_tick_baseline(monkeypatch)
     # End this test-owned setup before the real orchestration operation.
@@ -327,6 +330,7 @@ async def test_approved_closeout_completes_run_in_same_tick(
 async def test_trivial_closeout_and_completion_finish_in_one_tick(
     db_session, trivial_completion_ready_goal, monkeypatch
 ):
+    adopt_session(db_session)
     service, _goal, run = trivial_completion_ready_goal
     await stub_tick_baseline(monkeypatch)
 

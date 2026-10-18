@@ -24,6 +24,7 @@ from huddleroom.schemas.project import ProjectCreate, ProjectUpdate
 from huddleroom.schemas.session import SessionCreate, SessionResponse
 from huddleroom.schemas.task import TaskCreate, TaskUpdate
 from huddleroom.security import hash_password
+from tests.conftest import owned_session
 from huddleroom.services.agent_service import AgentService
 from huddleroom.services.auth_service import AuthService
 from huddleroom.services.channel_service import ChannelService
@@ -2041,8 +2042,24 @@ async def test_task_create_depends_on_rejects_invalid(db_session: AsyncSession, 
         assert exc_info.value.status_code == 422
 
 
+async def _run_in_owned_project(owned_session_factory, tmp_path, body, *args):
+    """Seed a project in an owned autobegin session, then run ``body`` in that session."""
+    async with owned_session(owned_session_factory) as db_session:
+        workspace = tmp_path / "project-workspace"
+        workspace.mkdir()
+        project = Project(name="Test Project", description="A test project",
+                          workspace_path=str(workspace.resolve()), config={})
+        db_session.add(project)
+        await db_session.flush()
+        await body(db_session, project, *args)
+
+
 @pytest.mark.asyncio
-async def test_resume_refused_when_orchestration_start_is_stale(db_session: AsyncSession, test_project):
+async def test_resume_refused_when_orchestration_start_is_stale(owned_session_factory, tmp_path):
+    await _run_in_owned_project(owned_session_factory, tmp_path, _resume_refused_when_start_is_stale)
+
+
+async def _resume_refused_when_start_is_stale(db_session: AsyncSession, test_project):
     from huddleroom.services.session_service import SessionClaimAttention, SessionService
     from tests.test_orchestration_authorization import _started_with_backlog_task
 
@@ -2063,7 +2080,11 @@ async def test_resume_refused_when_orchestration_start_is_stale(db_session: Asyn
 
 
 @pytest.mark.asyncio
-async def test_allowed_claim_clears_authorization_blocker(db_session: AsyncSession, test_project):
+async def test_allowed_claim_clears_authorization_blocker(owned_session_factory, tmp_path):
+    await _run_in_owned_project(owned_session_factory, tmp_path, _allowed_claim_clears_blocker)
+
+
+async def _allowed_claim_clears_blocker(db_session: AsyncSession, test_project):
     from huddleroom.services.session_service import SessionClaimAttention, SessionService
     from tests.test_orchestration_authorization import _started_with_backlog_task
 

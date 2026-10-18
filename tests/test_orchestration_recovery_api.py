@@ -1,7 +1,8 @@
 """typed recovery projection on decision routes and the recovery approval answer branch.
 
-Fake completions only; the HTTP client shares ``db_session`` (no rollback on error), so tests that
-prove durability commit their setup and read the outcome from a fresh session.
+Fake completions only; each HTTP request gets its own owned session (commit on success, rollback on
+error, like get_db), so tests that prove durability commit their setup and read the outcome from a
+fresh session.
 """
 
 import json
@@ -21,9 +22,11 @@ from huddleroom.services.orchestration_blocker_recovery import OrchestrationBloc
 from huddleroom.services.orchestration_service import OrchestrationService
 
 # Reuse the recovery (fixtures are imported by name so pytest registers them in this module).
+from tests.conftest import adopt_session, owned_session
 from tests.test_orchestration_recovery_authority import (  # noqa: F401  pylint: disable=unused-import
-    actions_of, diagnosed, fail_on_effect, goal_run, proposal_payload, service_for,
+    actions_of, fail_on_effect, goal_run, proposal_payload, service_for,
 )
+from tests.test_orchestration_recovery_authority import diagnosed as _diagnosed
 from tests.test_orchestration_recovery_persistence import gap_payload
 from tests.test_orchestration_recovery_persistence import service_for as gap_service_for
 
@@ -38,6 +41,52 @@ RESPONSE_KEYS = {
 
 def base(goal):
     return f"/api/v1/projects/{goal.project_id}/orchestration/goals/{goal.id}/decisions"
+
+
+@pytest.fixture
+async def db_session(owned_session_factory):
+    """Plain autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
+async def diagnosed(db, goal, run, agent):
+    adopt_session(db)  # the test task owns this session, as get_db does
+    await db.commit()  # recovery continuation requires caller work to be committed first
+    return await _diagnosed(db, goal, run, agent, owns_setup=True)
+
+
+def _owned_client_app(db_session, owned_session_factory, test_user):
+    from huddleroom.dependencies import get_current_user
+    from huddleroom.database import get_db
+    from huddleroom.main import create_app
+
+    app = create_app()
+
+    async def override_get_db():
+        await db_session.commit()  # publish the test's seeded data to the per-request session
+        async with owned_session(owned_session_factory) as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+        await db_session.commit()  # end the test session's snapshot so it sees the request's writes
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: test_user
+    return app
+
+
+@pytest.fixture
+async def client(db_session, owned_session_factory, test_user):
+    from httpx import ASGITransport, AsyncClient
+
+    app = _owned_client_app(db_session, owned_session_factory, test_user)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
 
 
 async def committed(db):
@@ -362,29 +411,9 @@ async def test_generic_cancel_still_refuses_recovery_decisions(client, db_sessio
 
 
 @pytest.fixture
-async def real_db_client(test_engine, test_user):
-    """Client whose sessions behave like production get_db: commit on success, roll back on any exception."""
-    from httpx import ASGITransport, AsyncClient
-    from huddleroom.dependencies import get_current_user
-    from huddleroom.database import get_db
-    from huddleroom.main import create_app
-
-    app = create_app()
-    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-
-    async def override_get_db():
-        async with factory() as session:
-            try:
-                yield session
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
-
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = lambda: test_user
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
+async def real_db_client(client):
+    """Owned client: per-request sessions commit on success, roll back on any exception (like get_db)."""
+    return client
 
 
 async def _tamper_run_inactive(db, proposal, run):
@@ -427,9 +456,13 @@ async def test_stale_approval_returns_409_and_commits_stale_writes(
 # ---- unsupported / capability gap ----------------------------------------------------------------
 
 async def _gap(db, goal, run, agent):
+    adopt_session(db)  # the test task owns this session, as get_db does
+    await db.commit()  # recovery continuation requires caller work to be committed first
     svc = gap_service_for(gap_payload(agent))
     from tests.test_orchestration_recovery_authority import trigger_for
     trigger = await svc.create_trigger(db, trigger_for(goal, run))
+    await db.flush()
+    await db.commit()
     action = await svc.diagnose(db, trigger.id)
     decision = (await db.scalars(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.related_action_id == action.id,

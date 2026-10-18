@@ -11,6 +11,7 @@ from huddleroom.models.orchestration import OrchestrationAction, OrchestrationDe
 from huddleroom.models.session import Session
 from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
 from huddleroom.services.orchestration_decision_validator import validate_orchestration_decision
+from tests.conftest import adopt_session
 from tests.test_orchestration_basic_recovery import _actions, _agent, _blocked_setup, _make_gate, _make_orchestrated_task
 from tests.test_orchestration_act_until_wait import _setup
 from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
@@ -325,9 +326,10 @@ async def test_partial_work_before_4xx_is_discarded(db_session, test_project, mo
     assert (await db_session.scalars(select(model).where(model.project_id == test_project.id))).all() == []
 
 
-async def test_record_warning_high_real_validator_tick_chain(db_session, test_project, stub_decision):
+async def test_record_warning_high_real_validator_tick_chain(db_session, test_project, stub_decision, owned_session_factory):
     from huddleroom.models.orchestration_process import OrchestrationWarning
     from tests.test_orchestration_runtime_e2e import _authorized_run
+    adopt_session(db_session)
     stub_decision(lambda _ctx: {
         "action_type": "record_warning", "warning_type": "x", "severity": "high", "message": "m"})
     service, _goal, run = await _authorized_run(db_session, test_project)

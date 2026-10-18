@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from tests.conftest import adopt_session
 from huddleroom.models.orchestration import (
     GOAL_TYPE_VALUES,
     LEGACY_PLANNING_MODE_BY_GOAL_TYPE,
@@ -859,7 +860,8 @@ async def test_restart_records_one_action_per_fingerprint_and_authorizes(db_sess
 
 
 @pytest.mark.asyncio
-async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_session, test_project):
+async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_session, test_project, owned_session_factory):
+    adopt_session(db_session)
     svc = OrchestrationService()
     goal, run = await _seed_baseline_terminal_run(db_session, test_project)
     await svc.tick(db_session, run.id)

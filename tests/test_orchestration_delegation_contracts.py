@@ -18,6 +18,7 @@ from huddleroom.schemas.orchestration import OrchestrationDelegationContract, Or
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.task_service import TaskService
+from tests.conftest import adopt_session
 
 @pytest_asyncio.fixture
 async def test_engine(tmp_path):
@@ -517,6 +518,7 @@ async def test_execute_create_delegation_task_action_replay_of_reserved_action_w
             error_message = "Parent task not found"
 
         async with session_factory() as replay_db:
+            adopt_session(replay_db)
             service = OrchestrationService()
             with pytest.raises(HTTPException) as exc_info:
                 await service.execute_create_delegation_task_action(

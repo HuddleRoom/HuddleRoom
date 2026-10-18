@@ -11,6 +11,7 @@ from sqlalchemy import select
 from huddleroom.models.orchestration import OrchestrationEvidence
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+from tests.conftest import adopt_session
 from tests.test_orchestration_escalation import _answer, _asks, _make_run
 from tests.test_orchestration_review_context import (  # noqa: F401  (fixtures)
     PRODUCER_REPORT, _finish, _owner_asks, _rejection, _revision_tasks, _reverifier, _verifier_for_db_only_report,
@@ -153,13 +154,13 @@ async def test_budget_ask_cancel_race_still_drops_the_blocker(db_session, test_p
 
 
 @pytest.mark.usefixtures("workspace", "no_live_decisions", "safe_effectiveness_review_continue")
-async def test_cancelled_reverification_capability_ask_re_arms(db_session, test_project):
+async def test_cancelled_reverification_capability_ask_re_arms(db_session, test_project, owned_session_factory):
     from pathlib import Path
 
     from tests.test_orchestration_result_correction import _complete
     from tests.test_orchestration_review_context import ACCEPTED, _verification_actions
 
-    db = db_session
+    db = adopt_session(db_session)
     with _owned_review_preparation(db):
         service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
     (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): return True\n")

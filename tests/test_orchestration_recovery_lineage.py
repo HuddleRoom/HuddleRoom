@@ -19,6 +19,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import func, select
 
 from huddleroom.models.orchestration import OrchestrationAction
@@ -26,6 +27,7 @@ from huddleroom.models.orchestration_process import OrchestrationAuthorityDecisi
 from huddleroom.schemas.orchestration_recovery import EvidenceV1
 from huddleroom.services.orchestration_blocker_recovery import RecoveryDiagnosisFailed
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from tests.conftest import adopt_session
 from tests.test_orchestration_recovery_execution import (
     Executors,
     ScriptedAnalyzer,
@@ -41,12 +43,25 @@ from tests.test_orchestration_recovery_execution import (
     propose,
     reassign_call,
     retry_task_call,
-    seed,
+    seed as _execution_seed,
     status,
     trigger,
     verified,
     verify_call,
 )
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
+async def seed(db, project, **kwargs):
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
+    return await _execution_seed(db, project, **kwargs)
 
 
 def evidence(label: str, source_id, kind="action", **value) -> EvidenceV1:
@@ -280,6 +295,7 @@ async def delegation_rows(db, run_id):
 
 @pytest.mark.asyncio
 async def test_failed_delegation_to_the_same_agent_and_scope_cannot_recur(db_session, test_project, test_user, monkeypatch):
+    adopt_session(db_session)
     from tests.test_orchestration_recovery_delegation import draft as delegation_draft
 
     flow, task = await failed_delegation(db_session, test_project, test_user, monkeypatch)
@@ -297,6 +313,7 @@ async def test_failed_delegation_to_the_same_agent_and_scope_cannot_recur(db_ses
 
 @pytest.mark.asyncio
 async def test_failed_delegation_is_evidence_for_a_different_qualified_agent(db_session, test_project, test_user, monkeypatch):
+    adopt_session(db_session)
     from tests.test_orchestration_recovery_delegation import draft as delegation_draft
 
     flow, task = await failed_delegation(db_session, test_project, test_user, monkeypatch)
@@ -506,6 +523,7 @@ async def test_one_lineage_warning_does_not_stale_another_lineage_proposal(db_se
 
 @pytest.mark.asyncio
 async def test_reworded_objective_cannot_repeat_a_failed_delegation(db_session, test_project, test_user, monkeypatch):
+    adopt_session(db_session)
     from tests.test_orchestration_recovery_delegation import draft as delegation_draft
 
     flow, task = await failed_delegation(db_session, test_project, test_user, monkeypatch)
@@ -554,6 +572,7 @@ async def test_capability_answer_is_fenced_by_a_reset_reservation(db_session, te
 async def test_reported_blockers_with_different_evidence_get_separate_lineages_and_repeats_join(
     db_session, test_project,
 ):
+    adopt_session(db_session)
     from huddleroom.models.task import Task
     from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
     from huddleroom.services.orchestration_service import OrchestrationService
@@ -584,6 +603,7 @@ async def test_reported_blockers_with_different_evidence_get_separate_lineages_a
 
 @pytest.mark.asyncio
 async def test_reported_blocker_evidence_variants_join_the_same_lineage(db_session, test_project):
+    adopt_session(db_session)
     from huddleroom.models.task import Task
     from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
     from huddleroom.services.orchestration_service import OrchestrationService
@@ -612,6 +632,7 @@ async def test_reported_blocker_evidence_variants_join_the_same_lineage(db_sessi
 
 @pytest.mark.asyncio
 async def test_malformed_reported_blocker_evidence_refs_are_ignored_not_fatal(db_session, test_project):
+    adopt_session(db_session)
     from huddleroom.models.task import Task
     from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
     from huddleroom.services.orchestration_service import OrchestrationService

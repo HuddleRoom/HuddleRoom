@@ -7,10 +7,12 @@ from sqlalchemy import select
 from huddleroom.models.agent import Agent
 from huddleroom.models.event_log import EventLog
 from huddleroom.models.orchestration import OrchestrationGate
+from huddleroom.models.project import Project
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
+from tests.conftest import owned_session
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_work_report import (
@@ -176,7 +178,23 @@ async def _make_orchestrated_task(db_session, project_id, run_id, gate_id, agent
     return task
 
 
-async def test_session_completed_event_replay_curates_memory_once(db_session, test_project):
+async def _run_in_owned_project(owned_session_factory, tmp_path, body, *args):
+    """Seed a project in an owned autobegin session, then run ``body`` in that session."""
+    async with owned_session(owned_session_factory) as db_session:
+        workspace = tmp_path / "project-workspace"
+        workspace.mkdir()
+        project = Project(name="Test Project", description="A test project",
+                          workspace_path=str(workspace.resolve()), config={})
+        db_session.add(project)
+        await db_session.flush()
+        await body(db_session, project, *args)
+
+
+async def test_session_completed_event_replay_curates_memory_once(owned_session_factory, tmp_path):
+    await _run_in_owned_project(owned_session_factory, tmp_path, _session_completed_event_replay_body)
+
+
+async def _session_completed_event_replay_body(db_session, test_project):
     """Replaying the same session.completed event does not curate memory twice.
 
     This exercises the pre-existing evidence-level replay guard: on replay,

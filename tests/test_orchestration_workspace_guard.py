@@ -2,6 +2,7 @@ import asyncio
 import uuid
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import event, func, select
 
@@ -22,6 +23,15 @@ from huddleroom.schemas.project import ProjectUpdate
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.project_service import ProjectService
+from tests.conftest import adopt_session
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 def _assert_not_runnable(exc_info: pytest.ExceptionInfo[HTTPException]) -> None:
@@ -76,6 +86,7 @@ async def test_goal_create_rejects_unrunnable_project_before_goal_or_run_mutatio
 
 @pytest.mark.asyncio
 async def test_resume_and_tick_reject_unrunnable_project_without_mutating_goal_or_run(db_session, legacy_project):
+    adopt_session(db_session)
     goal = OrchestrationGoal(project_id=legacy_project.id, objective="guarded goal", status="paused")
     db_session.add(goal)
     await db_session.flush()
@@ -89,7 +100,7 @@ async def test_resume_and_tick_reject_unrunnable_project_without_mutating_goal_o
     _assert_not_runnable(resume_error)
 
     run.status = "running"
-    await db_session.flush()
+    await db_session.commit()
     with pytest.raises(HTTPException) as tick_error:
         await service.tick(db_session, run.id)
     _assert_not_runnable(tick_error)

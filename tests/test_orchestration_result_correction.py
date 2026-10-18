@@ -10,7 +10,9 @@ from sqlalchemy import select
 from huddleroom.models.agent import Agent
 from huddleroom.models.base import _utcnow
 from huddleroom.models.event_log import EventLog
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationRun
+from huddleroom.models.orchestration import (
+    OrchestrationAction, OrchestrationGate, OrchestrationGoal, OrchestrationRun,
+)
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
 from huddleroom.services.event_bus import emit_event_once
@@ -121,7 +123,7 @@ async def _setup(db, project, *, caps=None):
     return service, goal, run, agent, await db.get(Task, action.target_id)
 
 
-async def _complete(db, service, run, task, output, *, tokens=0, agent_id=None):
+async def _complete(db, service, run, task, output, *, tokens=0, agent_id=None, ingest=True):
     """Finish one attempt the way an adapter does, then ingest its completion event."""
     task.status = "in_progress"
     session = Session(
@@ -138,7 +140,8 @@ async def _complete(db, service, run, task, output, *, tokens=0, agent_id=None):
         "session_id": str(session.id), "task_id": str(task.id),
     }, dedup_key=key)
     event = await db.scalar(select(EventLog).where(EventLog.dedup_key == key))
-    await service._ingest_evidence_from_event(db, run, event)
+    if ingest:  # ingest=False leaves the event for a real (possibly unauthorized-landing) tick
+        await service._ingest_evidence_from_event(db, run, event)
     return session
 
 
@@ -1383,3 +1386,568 @@ async def test_superseded_summary_correction_cannot_satisfy_the_gate(db_session,
     await service.tick(db_session, run.id)
     await db_session.refresh(gate)
     assert gate.status == "accepted"
+
+
+# ---- continuations pended while landing under an unauthorized baseline ----
+
+async def _revoke(db, run):
+    """Return the run to an unauthorized baseline (as a re-Start/reset would) and publish it."""
+    run.phase, run.baseline_authorized = "baseline", False
+    await db.commit()
+
+
+async def _authorize(db, service, goal):
+    await db.commit()
+    await service.authorize_baseline(db, goal.project_id, goal.id, actor="human:step4")
+    await db.commit()
+
+
+async def _ticks(db, service, run, times=1):
+    for _ in range(times):
+        await db.commit()
+        await service.tick(db, run.id)
+    await db.commit()
+    await db.refresh(run)
+
+
+async def _pended(db, run_id, key="pending_result_continuation", kind=None):
+    rows = await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run_id).execution_options(populate_existing=True))
+    return [(a, a.request[key]) for a in rows
+            if isinstance(a.request, dict) and key in a.request and (kind is None or a.request[key]["kind"] == kind)]
+
+
+async def _ask_count(db, run_id, key_part=""):
+    return len([a for a in await db.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run_id, OrchestrationAction.action_type == "ask_human"))
+        if key_part in a.idempotency_key])
+
+
+def _pend_body(kind, task, session=None, *, reason="contract_changed", input_version=None, task_id=None):
+    return {"kind": kind, "event_id": "synthetic-event",
+            "task_id": task_id if task_id is not None else (str(task.id) if task is not None else None),
+            "session_id": str(session.id) if session is not None else None,
+            "input_version": input_version or {}, "reason": reason, "diagnostics_or_findings": {}}
+
+
+async def _synthetic_pend(db, run, pending, *, age=0):
+    """A report_consumed marker carrying a hand-built pend; `age` seconds older orders it earlier in a tick."""
+    from datetime import timedelta
+
+    action = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"synthetic:{uuid.uuid4()}", action_type="report_consumed", status="completed",
+        request={"pending_result_continuation": pending}, created_at=_utcnow() - timedelta(seconds=age),
+    )
+    db.add(action)
+    await db.commit()
+    return action
+
+
+def _record_resume(service, monkeypatch, *, raises=False):
+    calls = []
+
+    async def resume(db, run, action):
+        calls.append(action.id)
+        if raises:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(service, "_resume_result_correction", resume)
+    return calls
+
+
+async def _unauth_verifier_pend(db, project):
+    """A real verifier_owner_ask pend landed under a revoked baseline (ingest path)."""
+    service, run, _gate, verifier = await _verifier_setup(db, project)
+    goal = await db.get(OrchestrationGoal, run.goal_id)
+    await _revoke(db, run)
+    session = await _complete(db, service, run, verifier, json.dumps({"status": "blocked", "notes": "No access."}),
+                              ingest=False)
+    await _ticks(db, service, run)
+    [(action, pending)] = await _pended(db, run.id, kind="verifier_owner_ask")
+    return service, goal, run, verifier, session, action, pending
+
+
+async def _settled(db, run_id, action):
+    rows = dict((a.id, p) for a, p in await _pended(db, run_id, key="pending_result_continuation_settled"))
+    return rows.get(action.id)
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+@pytest.mark.parametrize("superseded", [False, True])
+@pytest.mark.parametrize("status", ["blocked", "failed"])
+@pytest.mark.parametrize("path", ["ingest", "correction_landing"])
+async def test_unauthorized_verifier_report_pends_owner_ask_then_asks_once_or_settles_stale(
+    db_session, test_project, path, status, superseded,
+):
+    """Both verifier pend paths: ingest (task = verifier, own session) and correction landing
+    (task = parent verifier, session = the correction task's session)."""
+    db = db_session
+    service, run, _gate, verifier = await _verifier_setup(db, test_project)
+    goal = await db.get(OrchestrationGoal, run.goal_id)
+    report = json.dumps({"status": status, "notes": "No access."})
+    if path == "ingest":
+        await _revoke(db, run)
+        session = await _complete(db, service, run, verifier, report, ingest=False)
+        session_task, corrections_before = verifier, 0
+    else:
+        await _complete(db, service, run, verifier, "Looks fine.")  # prose while authorized -> correction
+        [correction] = await _corrections(db, verifier)
+        await _revoke(db, run)
+        session = await _complete(db, service, run, correction, report, ingest=False)
+        session_task, corrections_before = correction, 1
+    asks_before = await _ask_count(db, run.id)
+
+    await _ticks(db, service, run)
+
+    # Landed under the unauthorized baseline: no ask, no extra correction, one pending on the bound verification.
+    [(action, pending)] = await _pended(db, run.id, kind="verifier_owner_ask")
+    assert action.action_type == "request_verification"
+    assert str(action.id) == verifier.metadata_["orchestration"]["verification_action_id"]
+    assert pending["task_id"] == str(verifier.id) and pending["session_id"] == str(session.id)
+    # the event the landing happened on: one of the session task's own terminal events (completion or status change)
+    landed_on = await db.scalar(select(EventLog).where(EventLog.id == uuid.UUID(pending["event_id"])))
+    assert landed_on.payload.get("task_id") == str(session_task.id) or landed_on.payload.get("session_id") == str(session.id)
+    assert pending["reason"] == f"verifier_{status}"
+    assert pending["diagnostics_or_findings"]["status"] == status
+    assert "No access." in pending["diagnostics_or_findings"]["notes"]
+    assert await _ask_count(db, run.id) == asks_before and _escalations(run, "capability_unavailable") == []
+    assert len(await _corrections(db, verifier)) == corrections_before
+    assert run.baseline_authorized is False
+    await _ticks(db, service, run, 2)  # still unauthorized: replay adds nothing and keeps the pend
+    assert [p for _a, p in await _pended(db, run.id, kind="verifier_owner_ask")] == [pending]
+    assert await _ask_count(db, run.id) == asks_before
+
+    if superseded:  # a genuinely newer completed session of the session's own task supersedes the pend
+        db.add(Session(project_id=test_project.id, task_id=session_task.id, agent_id=session_task.assigned_to,
+                       adapter_type="api", status="completed", input_context={}, output="newer attempt",
+                       origin="orchestrator", ended_at=_utcnow()))
+        await db.commit()
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)
+    assert await _pended(db, run.id, kind="verifier_owner_ask") == []
+    [(_a, settled)] = await _pended(db, run.id, key="pending_result_continuation_settled", kind="verifier_owner_ask")
+    assert settled["kind"] == "verifier_owner_ask" and settled["event_id"] == pending["event_id"]
+    assert await _ask_count(db, run.id) == (asks_before if superseded else asks_before + 1)
+    if superseded:
+        assert settled["outcome"] == "stale" and settled["reason"] == "session_changed"
+        assert _escalations(run, "capability_unavailable") == []
+    else:
+        # Regression: the correction-landing pend is NOT stale merely because the parent verifier task has no
+        # newer completed session than the pend's (correction) session.
+        assert settled["outcome"] == "applied" and settled["reason"] == f"verifier_{status}"
+        [escalation] = _escalations(run, "capability_unavailable")
+        assert escalation["scope"] == f"task:{verifier.id}:verifier_{status}"
+        assert any("No access." in line for line in escalation["history"])
+    assert len(await _corrections(db, verifier)) == corrections_before
+    assert await _pended(db, run.id) == []  # no pend remains on any action
+    if path == "correction_landing":
+        # the corrected verdict is final: the re-ingested original (result_correction) pend must not reopen a cycle
+        assert (await _ledger(service, db, run, verifier))["status"] in {
+            "corrected", "owner_declined", "superseded", "rejected", "exhausted", "unavailable"}
+        await _ticks(db, service, run, 2)
+        assert len(await _corrections(db, verifier)) == corrections_before and await _pended(db, run.id) == []
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_later_different_pend_replaces_an_unconsumed_earlier_pend_on_the_same_action(db_session, test_project):
+    """Single pending slot per action (documented): a different identity replaces, it does not queue."""
+    db = db_session
+    service, run, _gate, verifier = await _verifier_setup(db, test_project)
+    await _revoke(db, run)
+    first = await _complete(db, service, run, verifier, json.dumps({"status": "blocked", "notes": "No access."}),
+                            ingest=False)
+    await _ticks(db, service, run)
+    [(action, earlier)] = await _pended(db, run.id, kind="verifier_owner_ask")
+    assert earlier["session_id"] == str(first.id)
+
+    later_session = uuid.uuid4()
+    db.info["landing_event_id"] = "later-event"
+    try:
+        service._pend_result_continuation(
+            db, action, "verifier_owner_ask", verifier, later_session, {"session_id": str(later_session)},
+            "verifier_failed", {"status": "failed", "notes": "Later.", "evidence": []},
+        )
+    finally:
+        db.info.pop("landing_event_id", None)
+    [(_a, current)] = await _pended(db, run.id, kind="verifier_owner_ask")
+    assert current != earlier and current["session_id"] == str(later_session)
+    assert current["event_id"] == "later-event" and current["reason"] == "verifier_failed"
+
+
+async def test_owner_contract_change_while_unauthorized_pends_the_fresh_cycle_until_authorized(db_session, test_project):
+    """T-D: landing under a revoked authorization keeps the old cycle, its ask and blocker; the fresh cycle is
+    one pending continuation consumed exactly once after authorization."""
+    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+
+    db = db_session
+    service, goal, run, _agent, task = await _setup(db, test_project)
+    original = await _complete(db, service, run, task, MISSING_FIELDS)
+    [old] = await _corrections(db, task)
+    # a pending owner ask on this cycle's subject must survive until the fresh cycle is really started
+    funding = await service._escalate_owner(
+        db, goal, run, "budget_exhausted", f"task:{task.id}:result_correction", ["capped"], "Raise?",
+    )
+    goal.constraints = {**(goal.constraints or {}), "no_network": True}
+    await db.flush()
+    await _revoke(db, run)
+    old_session = await _complete(db, service, run, old, json.dumps(VALID), ingest=False)
+    asks_before = await _ask_count(db, run.id)
+
+    await _ticks(db, service, run)
+
+    ledger = await _ledger(service, db, run, task)
+    assert ledger.get("cycle", 1) == 1 and ledger["status"] == "correcting"
+    assert [a["session_id"] for a in ledger["attempts"]] == [str(original.id)]  # attempts preserved
+    assert ledger["correction_task_id"] == str(old.id) and await _corrections(db, task) == [old]
+    assert (await db.get(OrchestrationAuthorityDecision, funding.target_id)).status == "pending"
+    assert _escalations(run, "budget_exhausted") and await _ask_count(db, run.id) == asks_before
+    marker = await service._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+    pending = marker.request["pending_result_continuation"]
+    assert pending["kind"] == "result_correction" and pending["reason"] == "contract_changed"
+    assert pending["task_id"] == str(old.id) and pending["session_id"] == str(old_session.id)
+    await _ticks(db, service, run, 2)  # still unauthorized: replay neither advances nor duplicates
+    assert (await _ledger(service, db, run, task)).get("cycle", 1) == 1 and await _corrections(db, task) == [old]
+
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)
+
+    ledger = await _ledger(service, db, run, task)
+    assert ledger["cycle"] == 2 and ledger["status"] == "correcting"
+    assert [a["session_id"] for a in ledger["attempts"]] == [str(original.id)]
+    new = next(item for item in await _corrections(db, task) if item.id != old.id)
+    assert ledger["correction_task_id"] == str(new.id) and len(await _corrections(db, task)) == 2
+    assert await service._existing_action_for_key(
+        db, run.id, f"run:{run.id}:kind:report_consumed:task:{old.id}",
+    ) is None
+    assert (await db.get(OrchestrationAuthorityDecision, funding.target_id)).status == "cancelled"
+    assert await _pended(db, run.id, kind="result_correction") == []
+    [(_a, settled)] = await _pended(db, run.id, key="pending_result_continuation_settled", kind="result_correction")
+    assert settled["outcome"] == "applied" and settled["reason"] == "contract_changed"
+    await _ticks(db, service, run, 2)
+    assert len(await _corrections(db, task)) == 2 and (await _ledger(service, db, run, task))["cycle"] == 2
+
+
+@pytest.mark.parametrize("denial", ["paused", "http_409"])
+async def test_final_admission_denial_after_landing_keeps_the_pending_and_retries_exactly_once(
+    db_session, test_project, monkeypatch, denial,
+):
+    """T-E: the native effect runs, then final admission is denied: only that effect rolls back."""
+    from fastapi import HTTPException
+    from huddleroom.services.orchestration_baseline_runtime import BaselinePaused
+
+    db = db_session
+    service, goal, run, _agent, task = await _setup(db, test_project)
+    await _revoke(db, run)
+    original = await _complete(db, service, run, task, MISSING_FIELDS, ingest=False)
+    await _ticks(db, service, run)
+    marker = await service._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+    pending = marker.request["pending_result_continuation"]
+    assert pending["kind"] == "result_correction" and pending["session_id"] == str(original.id)
+    assert await _corrections(db, task) == []
+    ledger_before = await _ledger(service, db, run, task)
+    assert ledger_before["status"] == "pending" and ledger_before["attempts"] == []
+    counts = lambda: _counts(db)  # noqa: E731
+    before = await counts()
+
+    await _authorize(db, service, goal)
+    real, attempts = service._advance_result_correction, []
+
+    async def admission_denied_after_effect(*args, **kwargs):
+        attempts.append(1)
+        await real(*args, **kwargs)  # the dispatch really happens inside the continuation savepoint ...
+        raise BaselinePaused() if denial == "paused" else HTTPException(409, detail="Orchestration admission paused")
+
+    monkeypatch.setattr(service, "_advance_result_correction", admission_denied_after_effect)
+    await _ticks(db, service, run)
+
+    assert attempts  # the continuation was attempted and denied ...
+    assert await _pended(db, run.id, key="pending_result_continuation_settled", kind="result_correction") == []
+    [(_a, still_pending)] = await _pended(db, run.id, kind="result_correction")
+    assert still_pending == pending  # ... so the pending identity is intact
+    assert await _corrections(db, task) == []
+    assert await _ledger(service, db, run, task) == ledger_before  # no cycle advance, no attempt recorded
+    assert await counts() == before  # no Task/Session/ask created by the rolled back effect
+
+    monkeypatch.delattr(service, "_advance_result_correction")  # admission is open again
+    await _ticks(db, service, run, 2)
+
+    [correction] = await _corrections(db, task)
+    ledger = await _ledger(service, db, run, task)
+    assert ledger["cycle"] == 1 and ledger["status"] == "correcting" and ledger["correction_task_id"] == str(correction.id)
+    assert [a["session_id"] for a in ledger["attempts"]] == [str(original.id)]
+    assert await _pended(db, run.id, kind="result_correction") == []
+    [(_a, settled)] = await _pended(db, run.id, key="pending_result_continuation_settled", kind="result_correction")
+    assert settled["outcome"] == "applied" and settled["event_id"] == pending["event_id"]
+    await _ticks(db, service, run, 2)
+    assert len(await _corrections(db, task)) == 1
+
+
+async def _counts(db):
+    from sqlalchemy import func
+
+    return tuple([await db.scalar(select(func.count()).select_from(model)) for model in (Task, Session)] + [
+        await _ask_count(db, (await db.scalar(select(OrchestrationRun.id)))),
+    ])
+
+
+async def test_unauthorized_budget_required_plan_pends_one_followup_ask_until_authorized(
+    db_session, test_project, monkeypatch,
+):
+    from huddleroom.services.orchestration_service import BUDGET_REQUIRED_CODE
+    from tests.conftest import complete_baseline_processes
+    from tests.test_orchestration_plan_ingestion import _env, _finish, _planning_run
+
+    db = db_session
+    service, goal, run, task, session = await _planning_run(db, test_project.id, roadmap_budget={})
+    await complete_baseline_processes(db, goal, run)
+    child = {"item_key": "child", "unit_type": "goal", "title": "Child", "objective": "Deliver child",
+             "success_criteria": [{"key": "done"}], "allocation": {}, "why_runnable": "ready"}
+    await _finish(db, task, session, json.dumps(_env("roadmap", [child])))
+    await emit_event_once(db, test_project.id, "session.completed", {
+        "session_id": str(session.id), "task_id": str(task.id),
+    }, dedup_key=f"budget-required-test:{session.id}")
+    await _revoke(db, run)  # the fixture authorizes baseline; landing must happen without it
+    run_id = run.id
+    key = f"run:{run_id}:kind:ask_human:{BUDGET_REQUIRED_CODE}"
+
+    await _ticks(db, service, run, 3)  # landing + replays under the unauthorized baseline
+
+    assert await _ask_count(db, run_id) == 0
+    assert run.plan_state["status"] == "budget_required" and run.status == "blocked"  # state/blocker still land
+    [(marker, pending)] = await _pended(db, run_id, kind="plan_rejection_followup")
+    assert marker.action_type == "report_consumed" and marker.target_id == task.id
+    assert pending["reason"] == "budget_required" and pending["task_id"] == str(task.id)
+    assert pending["session_id"] == str(session.id)
+    # a result_correction pend sharing the budget-blocked run must wait for the blocker (kind filter)
+    resumed = _record_resume(service, monkeypatch)
+    rc_action = await _synthetic_pend(db, run, _pend_body("result_correction", task, session))
+
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)
+
+    assert await _ask_count(db, run_id, key) == 1 and await _ask_count(db, run_id) == 1
+    assert resumed == [] and await _settled(db, run_id, rc_action) is None  # not applied while the blocker is active
+    assert [a.id for a, _p in await _pended(db, run_id, kind="result_correction")] == [rc_action.id]
+    assert await _pended(db, run_id, kind="plan_rejection_followup") == []
+    [(_a, settled)] = await _pended(db, run_id, key="pending_result_continuation_settled")
+    assert settled["kind"] == "plan_rejection_followup" and settled["outcome"] == "applied"
+    assert settled["reason"] == "budget_required" and settled["event_id"] == pending["event_id"]
+    await _ticks(db, service, run, 2)
+    assert await _ask_count(db, run_id) == 1
+
+    # clear the blocker directly (no existing helper answers the budget ask here) -> the pend is applied once
+    run.active_blockers = [b for b in run.active_blockers if b.get("kind") != BUDGET_REQUIRED_CODE]
+    run.status = "running"
+    await db.commit()
+    await _ticks(db, service, run, 2)
+    assert len(resumed) == 1 and (await _settled(db, run_id, rc_action))["outcome"] == "applied"
+    assert await _pended(db, run_id, kind="result_correction") == []
+
+
+# ---- W5-fix: consumer (`_settle_pending_result_continuations` / `_apply_pending_continuation`) guards ----
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_ready_phase_run_applies_pending_only_once_baseline_authorized(db_session, test_project):
+    """H1: a root run left in phase="ready" is unauthorized until baseline_authorized flips."""
+    db = db_session
+    service, _goal, run, _verifier, _session, action, pending = await _unauth_verifier_pend(db, test_project)
+    asks_before = await _ask_count(db, run.id)
+    run.phase, run.baseline_authorized = "ready", False
+    await db.commit()
+
+    await _ticks(db, service, run, 2)
+
+    assert [p for _a, p in await _pended(db, run.id, kind="verifier_owner_ask")] == [pending]
+    assert await _ask_count(db, run.id) == asks_before and await _settled(db, run.id, action) is None
+
+    run.baseline_authorized = True
+    await db.commit()
+    await _ticks(db, service, run, 2)
+
+    assert await _pended(db, run.id, kind="verifier_owner_ask") == []
+    assert (await _settled(db, run.id, action))["outcome"] == "applied"
+    assert await _ask_count(db, run.id) == asks_before + 1
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_poisoned_pendings_do_not_block_other_pendings_in_the_same_tick(db_session, test_project, monkeypatch):
+    """M1: a malformed task_id settles stale; an effect raising a generic Exception stays pending; a valid
+    pend after both still applies and the tick completes."""
+    db = db_session
+    service, goal, run, verifier, session, real, _pending = await _unauth_verifier_pend(db, test_project)
+    asks_before = await _ask_count(db, run.id)
+    raising_pend = _pend_body("result_correction", verifier, session)
+    raising = await _synthetic_pend(db, run, raising_pend, age=20)
+    malformed = await _synthetic_pend(
+        db, run, _pend_body("result_correction", None, task_id="not-a-uuid"), age=10)
+    calls = _record_resume(service, monkeypatch, raises=True)
+
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)  # must not raise
+
+    assert calls  # the raising effect was attempted
+    assert [p for a, p in await _pended(db, run.id, kind="result_correction") if a.id == raising.id] == [raising_pend]
+    assert await _settled(db, run.id, raising) is None
+    settled = await _settled(db, run.id, malformed)
+    assert settled["outcome"] == "stale" and settled["reason"] == "task_missing"
+    assert (await _settled(db, run.id, real))["outcome"] == "applied"
+    assert await _ask_count(db, run.id) == asks_before + 1
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+@pytest.mark.parametrize("how", ["pause_requested", "admission_paused"])
+async def test_paused_run_applies_no_pending_and_raises_nothing(db_session, test_project, monkeypatch, how):
+    """M2"""
+    from huddleroom.services import orchestration_baseline_runtime as runtime
+
+    db = db_session
+    service, goal, run, _verifier, _session, action, pending = await _unauth_verifier_pend(db, test_project)
+    asks_before = await _ask_count(db, run.id)
+    await _authorize(db, service, goal)
+    if how == "pause_requested":
+        run.pause_requested = True
+        await db.commit()
+    else:
+        async def paused(*_args, **_kwargs):
+            raise runtime.BaselinePaused()
+
+        monkeypatch.setattr(runtime, "require_control_admission", paused)
+
+    await _ticks(db, service, run, 2)
+
+    assert [p for _a, p in await _pended(db, run.id, kind="verifier_owner_ask")] == [pending]
+    assert await _settled(db, run.id, action) is None and await _ask_count(db, run.id) == asks_before
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+@pytest.mark.parametrize("case", ["version_mismatch", "no_budget_required"])
+async def test_stale_plan_rejection_followup_settles_run_superseded_without_a_budget_ask(
+    db_session, test_project, case,
+):
+    """M3"""
+    from huddleroom.services.orchestration_service import BUDGET_REQUIRED_CODE
+
+    db = db_session
+    service, run, _gate, verifier = await _verifier_setup(db, test_project)
+    details = {"code": BUDGET_REQUIRED_CODE, "title": "Budget required", "message": "Need budget."}
+    run.plan_state = {"planning_version": 2, "budget_required": details} if case == "version_mismatch" \
+        else {"planning_version": 1}
+    action = await _synthetic_pend(db, run, _pend_body(
+        "plan_rejection_followup", verifier, reason="budget_required", input_version={"planning_version": 1}))
+    asks_before = await _ask_count(db, run.id)
+
+    await _ticks(db, service, run, 2)
+
+    settled = await _settled(db, run.id, action)
+    assert settled["outcome"] == "stale" and settled["reason"] == "run_superseded"
+    assert await _pended(db, run.id, kind="plan_rejection_followup") == []
+    assert await _ask_count(db, run.id, BUDGET_REQUIRED_CODE) == 0 and await _ask_count(db, run.id) == asks_before
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_newer_failed_session_on_the_pends_task_settles_stale(db_session, test_project):
+    """L3"""
+    db = db_session
+    service, goal, run, verifier, _session, action, _pending = await _unauth_verifier_pend(db, test_project)
+    asks_before = await _ask_count(db, run.id)
+    db.add(Session(project_id=test_project.id, task_id=verifier.id, agent_id=verifier.assigned_to,
+                   adapter_type="api", status="failed", input_context={}, output="crashed", origin="orchestrator",
+                   ended_at=_utcnow()))
+    await db.commit()
+
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)
+
+    settled = await _settled(db, run.id, action)
+    assert settled["outcome"] == "stale" and settled["reason"] == "session_changed"
+    assert await _ask_count(db, run.id) == asks_before and _escalations(run, "capability_unavailable") == []
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_result_correction_pend_with_an_unrelated_tasks_session_settles_stale(
+    db_session, test_project, monkeypatch,
+):
+    """L1: the pend's session belongs to neither the owner task nor the ledger's correction task."""
+    db = db_session
+    service, run, _gate, verifier = await _verifier_setup(db, test_project)
+    unrelated = await db.scalar(select(Session).where(
+        Session.project_id == test_project.id, Session.task_id != verifier.id, Session.status == "completed"))
+    assert unrelated is not None
+    calls = _record_resume(service, monkeypatch)
+    action = await _synthetic_pend(db, run, _pend_body("result_correction", verifier, unrelated))
+
+    await _ticks(db, service, run, 2)
+
+    settled = await _settled(db, run.id, action)
+    assert settled["outcome"] == "stale" and settled["reason"] == "session_changed"
+    assert calls == []
+
+
+async def _ledger_terminal_pend(db, test_project, ledger_version):
+    """An exhausted ledger plus an unauthorized_baseline result_correction pend, run revoked to baseline."""
+    service, run, _gate, verifier = await _verifier_setup(db, test_project)
+    goal = await db.get(OrchestrationGoal, run.goal_id)
+    await _revoke(db, run)
+    version = ledger_version(service._result_correction_version(goal, run))
+    action = await _synthetic_pend(db, run, _pend_body("result_correction", verifier, reason="unauthorized_baseline"))
+    action.request = {**action.request, "result_correction": {
+        "kind": "work_report", "cycle": 1, "version": version, "attempts": [], "status": "exhausted"}}
+    await db.commit()
+    return service, goal, run, action
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_exhausted_ledger_at_an_old_version_starts_a_new_cycle_after_authorization(
+    db_session, test_project, monkeypatch,
+):
+    """L-a"""
+    db = db_session
+    service, goal, run, action = await _ledger_terminal_pend(
+        db, test_project, lambda v: {**v, "owner_contract": "older-contract"})
+    requested = []
+
+    async def request(db_, run_, subject, session_id, kind, errors):
+        requested.append(kind)
+
+    monkeypatch.setattr(service, "_request_result_correction", request)
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)
+
+    settled = await _settled(db, run.id, action)
+    assert settled["outcome"] == "applied" and requested == ["work_report"]
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_exhausted_ledger_at_the_same_version_settles_ledger_terminal(db_session, test_project, monkeypatch):
+    """L-b"""
+    db = db_session
+    service, goal, run, action = await _ledger_terminal_pend(db, test_project, lambda v: v)
+    requested = []
+
+    async def request(*args):
+        requested.append(args)
+
+    monkeypatch.setattr(service, "_request_result_correction", request)
+    await _authorize(db, service, goal)
+    await _ticks(db, service, run, 2)
+
+    settled = await _settled(db, run.id, action)
+    assert settled["outcome"] == "stale" and settled["reason"] == "ledger_terminal" and requested == []
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_start_authorizes_baseline_then_execution_sets_phase_authorized(db_session, test_project):
+    """Locks the gate assumption: Start flips baseline_authorized while phase stays baseline; execution -> authorized."""
+    db = db_session
+    service, run, _gate, _verifier = await _verifier_setup(db, test_project)
+    goal = await db.get(OrchestrationGoal, run.goal_id)
+    await _revoke(db, run)
+    await service.authorize_baseline(db, goal.project_id, goal.id, actor="human:step4")
+    await db.commit()
+    await db.refresh(run)
+    assert run.baseline_authorized is True and run.phase == "baseline"
+    run.phase = "ready"
+    await db.commit()
+    await service.start_run(db, goal.project_id, goal.id, actor="human:step4")
+    await db.refresh(run)
+    assert run.phase == "authorized"

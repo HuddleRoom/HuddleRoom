@@ -21,6 +21,15 @@ from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.conftest import adopt_session, owned_session
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -72,7 +81,9 @@ async def test_concurrent_ticks_no_duplicate_events(db_session, test_project):
     This verifies the dedup_key in emit_event_once prevents duplicate emission
     when tick's event_cursor/baseline_process writes are inside the lock (fix #9).
     """
+    adopt_session(db_session)
     service, goal, run = await _make_run(db_session, test_project.id)
+    run.baseline_authorized = True
 
     # Seed one event
     seeded, _ = await emit_event_once(
@@ -109,6 +120,7 @@ async def test_tick_cursor_advances_correctly_inside_lock(db_session, test_proje
     Verifies that cursor assignment happens inside the lock block, preventing
     another tick from interleaving and seeing partial state.
     """
+    adopt_session(db_session)
     service, goal, run = await _make_run(db_session, test_project.id)
 
     # Seed three events
@@ -146,6 +158,7 @@ async def test_tick_reloads_goal_status_inside_lock(db_session, test_project):
     Verifies that goal status is re-read with populate_existing inside the lock,
     preventing stale checks from before the lock was acquired.
     """
+    adopt_session(db_session)
     service, goal, run = await _make_run(db_session, test_project.id)
 
     # First tick succeeds
@@ -169,7 +182,7 @@ async def test_tick_reloads_goal_status_inside_lock(db_session, test_project):
 
 @pytest.mark.asyncio
 async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
-    db_session, test_project, stub_decision, concurrent_sessions, monkeypatch
+    db_session, test_project, stub_decision, owned_session_factory, monkeypatch
 ):
     """Two independent audits start while the planner runs; the accepted plan adopts both and
     concurrent ticks bind each exactly once -- no duplicate task, session, gate or marker."""
@@ -187,6 +200,7 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
 
     from huddleroom.services.session_service import SessionService
 
+    adopt_session(db_session)
     monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     monkeypatch.setattr(SessionService, "_schedule_dispatch_after_commit", lambda *_args: None)
     planner = _agent("adopting-planner", ["planning"])
@@ -273,15 +287,15 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
     run_id = run.id
     await db_session.commit()
 
-    async def tick(db):
+    async def tick():
+        # Each concurrent task owns its own session; the test task's session is never shared across tasks.
         try:
-            return await OrchestrationService().tick(db, run_id)
+            async with owned_session(owned_session_factory) as db:
+                return await OrchestrationService().tick(db, run_id)
         except HTTPException as exc:
-            await db.rollback()
             return exc
 
-    first, second = concurrent_sessions
-    results = await asyncio.wait_for(asyncio.gather(tick(first), tick(second)), timeout=30)
+    results = await asyncio.wait_for(asyncio.gather(tick(), tick()), timeout=30)
     assert all(isinstance(result, dict) for result in results), results
     # One tick binds both adopted audits (no slot spent); the other finds them bound and waits on them.
     assert sorted(r["authorized_execution"]["step"] for r in results) == ["local_liveness", "release_work"]

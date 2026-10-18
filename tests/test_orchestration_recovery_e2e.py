@@ -28,12 +28,12 @@ from huddleroom.services.orchestration_process_service import OrchestrationProce
 from huddleroom.services.orchestration_recovery_analyzer import RecoveryAnalyzer
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_team_hierarchy import select_plan_author
-from tests.conftest import complete_baseline_processes
+from tests.conftest import adopt_session, complete_baseline_processes, owned_session
 from tests.test_orchestration_recovery_configuration import (
     PLANNER_DESCRIPTION, arm_semantic_guard, configuration_arguments, proposal_draft, seed_spr180,
     snapshot_configuration_state,
 )
-from tests.test_orchestration_roster_mutation import assign, seed_goal_run, sessions  # noqa: F401
+from tests.test_orchestration_roster_mutation import assign, seed_goal_run  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures(
     "safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue",
@@ -49,8 +49,48 @@ def decisions_url(project_id, goal_id) -> str:
     return f"/api/v1/projects/{project_id}/orchestration/goals/{goal_id}/decisions"
 
 
+@pytest.fixture
+def sessions(owned_session_factory):
+    """Factory of per-use owned sessions (autobegin, like get_db); enter inside the test body."""
+    return lambda: owned_session(owned_session_factory)
+
+
+@pytest.fixture
+async def db_session(owned_session_factory):
+    """Plain autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
+@pytest.fixture
+async def client(db_session, owned_session_factory, test_user):
+    """Owned HTTP client: each request gets its own owned session; the test session is committed around it."""
+    from huddleroom.database import get_db
+    from huddleroom.dependencies import get_current_user
+    from huddleroom.main import create_app
+
+    app = create_app()
+
+    async def override_get_db():
+        await db_session.commit()  # publish the test's seeded data to the per-request session
+        async with owned_session(owned_session_factory) as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+        await db_session.commit()  # end the test session's snapshot so it sees the request's writes
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: test_user
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        yield ac
+
+
 def committed_client(test_engine, user_id):
-    """HTTP client whose sessions behave like production get_db (commit on success, rollback on error)."""
+    """HTTP client whose per-request sessions are owned like production get_db (commit on success, rollback on error)."""
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from huddleroom.database import get_db
@@ -61,7 +101,7 @@ def committed_client(test_engine, user_id):
     factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
     async def override_get_db():
-        async with factory() as session:
+        async with owned_session(factory) as session:
             try:
                 yield session
                 await session.commit()
@@ -398,6 +438,7 @@ async def test_eventless_noop_enters_recovery_without_warning_loop(
 ):
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
+    adopt_session(db_session)  # the test task owns this session, as get_db does
     analyzer_calls = script_analyzer(monkeypatch, lambda: gap_assessment(uuid.uuid4()))
     stub_decision(lambda _ctx: {"action_type": "noop", "reason": "Waiting for the environment to recover.",
                                 "wake_when": {"recheck_after_seconds": 60,
@@ -439,6 +480,7 @@ async def test_capability_gap_waits_for_the_named_human_input_then_rediagnoses_o
     from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
     from tests.test_orchestration_runtime_e2e import _authorized_run
 
+    adopt_session(db_session)  # the test task owns this session, as get_db does
     stub_decision(lambda _ctx: {"action_type": "ask_human", "question": "Proceed?", "reason": "Unsure."})
     service, goal, run = await _authorized_run(db_session, test_project)
     analyzer_calls = script_analyzer(monkeypatch, gap_assessment(run.id))
@@ -733,9 +775,12 @@ async def test_reset_during_an_async_delegation_wait_discards_the_remediation(
 ):
     from tests.test_orchestration_recovery_execution import deliver, delegation_flow
 
+    adopt_session(db_session)  # the test task owns this session, as get_db does
     no_session_dispatch(monkeypatch)
     flow = await delegation_flow(db_session, test_project, test_user, monkeypatch)
+    await db_session.commit()  # seeded data must be committed before continuation / failing paths roll back
     receipt = await flow.svc.execute_next_call(db_session, flow.proposal)
+    await db_session.commit()
     assert receipt.status == "waiting"
     task = await db_session.get(Task, uuid.UUID(next(ref["id"] for ref in receipt.target_refs if ref["kind"] == "task")))
     old_run_id = flow.rows.run.id
@@ -744,6 +789,7 @@ async def test_reset_during_an_async_delegation_wait_discards_the_remediation(
         task.status = "done"
         await db_session.flush()
         await deliver(db_session, flow.rows.run, "task.status_changed", task.id)
+        await db_session.commit()
         outcome = await attempt(flow.svc.resume(db_session, flow.proposal.id))
     assert isinstance(outcome, HTTPException) and outcome.status_code == 409, outcome
     assert await actions(db_session, old_run_id, "recovery_verify") == []

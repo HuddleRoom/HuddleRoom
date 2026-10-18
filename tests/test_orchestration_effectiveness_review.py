@@ -1,5 +1,4 @@
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 import uuid
 from datetime import timedelta
@@ -26,6 +25,7 @@ from huddleroom.services.orchestration_memory_service import OrchestrationMemory
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+from tests.conftest import adopt_session
 import pytest
 
 
@@ -60,11 +60,10 @@ async def clean_test_database():
 
 
 @pytest_asyncio.fixture
-async def db_session(test_engine, monkeypatch):
-    """SPR230/231: each scenario explicitly publishes setup before owned native ticks."""
+async def db_session(owned_session_factory, monkeypatch):
+    """Autobegin session (no session.begin()) so the test task can own it; setup is published before ticks."""
     monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
-    factory = async_sessionmaker(test_engine, expire_on_commit=False)
-    async with factory() as session:
+    async with owned_session_factory() as session:
         yield session
         await session.rollback()
 
@@ -1097,6 +1096,7 @@ async def test_tick_runs_effectiveness_after_recovery_and_only_waiting_blocks_fi
     )
     monkeypatch.setattr(service, "_run_ready_for_completion", completion_ready)
 
+    adopt_session(db_session)  # the test task drives the tick through this session, as get_db does
     await db_session.commit()  # SPR230/231: publish known scenario setup before native admission.
     result = await service.tick(db_session, run.id)
 

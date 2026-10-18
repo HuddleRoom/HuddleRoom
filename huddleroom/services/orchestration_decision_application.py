@@ -242,7 +242,10 @@ async def validate_ordinary_submission(db, goal, decisions, submission, answers)
         hierarchy = TeamHierarchyProcess()
         fingerprint = hierarchy._semantic_fingerprint(hierarchy._strip_volatile(await hierarchy._analysis_input(db, goal)))
         if current.input_snapshot.get("fingerprint") != fingerprint:
-            raise HTTPException(409, "team hierarchy proposal inputs changed")
+            stale = HTTPException(409, "team hierarchy proposal inputs changed")
+            # The accepting owner persists the rerun suggestion after rolling this rejection back.
+            stale.stale_inputs = {"goal_id": goal.id, "process_run_id": current.id, "run_id": current.run_id}
+            raise stale
         if answer["selected_option"] == "edit":
             from huddleroom.schemas.agent import AgentCreate
             edited_agent = canonical_agent_create(AgentCreate.model_validate(answer["edited_agent"]))

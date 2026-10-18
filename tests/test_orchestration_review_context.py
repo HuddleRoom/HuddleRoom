@@ -164,6 +164,7 @@ from huddleroom.models.artifact import Artifact  # noqa: E402
 from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate  # noqa: E402
 from huddleroom.models.session import Session  # noqa: E402
 from huddleroom.models.task import Task  # noqa: E402
+from tests.conftest import adopt_session  # noqa: E402
 
 PRODUCER_REPORT = {
     "status": "completed", "changes": ["Built the login form."],
@@ -202,13 +203,12 @@ async def clean_test_database(test_engine):
 
 
 @pytest_asyncio.fixture
-async def db_session(test_engine, monkeypatch):
-    from sqlalchemy.ext.asyncio import AsyncSession
-
+async def db_session(owned_session_factory, monkeypatch):
+    """Autobegin session (no session.begin()) so the test task can own it."""
     # SPR230: committed fixtures must never launch application agents.
     monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
 
-    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+    async with owned_session_factory() as db:
         yield db
         await db.rollback()
 
@@ -1475,6 +1475,7 @@ async def test_dismissed_report_correction_asks_once_on_the_gate_instead_of_hold
     from tests.test_orchestration_result_correction import _complete
 
     db = db_session
+    adopt_session(db)
     wrong = uuid.uuid4()
     service, run, gate, work_task, _artifact, _verifier, _task = await _verifier_for_db_only_report(
         db, test_project, report_for=_cites(wrong),
@@ -1644,6 +1645,7 @@ async def test_answered_ask_after_failed_changed_content_verifications_re_arms_a
     from tests.test_orchestration_result_correction import _complete
 
     db = db_session
+    adopt_session(db)
     service, run, gate, _work_task, _artifact, _verifier, verifier_task = await _verifier_for_db_only_report(db, test_project)
     (Path(test_project.workspace_path) / "login.py").write_text("def login(email, password): return True\n")
     await _complete(db, service, run, verifier_task, ACCEPTED)
@@ -1719,6 +1721,7 @@ async def test_work_finished_after_its_review_gets_a_fresh_verifier_told_the_evi
     from huddleroom.services.session_sync import sync_task_from_session
 
     db = db_session
+    adopt_session(db)
     from tests.test_orchestration_evidence_ingestion import _agent
 
     service, _goal, run, gate, task, reviewer = await _reviewed_work(db, test_project, required=("task", "review"))

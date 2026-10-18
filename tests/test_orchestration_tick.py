@@ -157,6 +157,8 @@ async def test_tick_ignores_orchestration_events(db_session, test_project):
     await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
     result = await service.tick(db_session, run.id)
     assert result["processed_events"] == 0
+    assert result["tick_emitted"] is False
+    assert await _count_tick_events(db_session, test_project.id) == 0
 
 
 @pytest.mark.asyncio
@@ -166,7 +168,10 @@ async def test_tick_skips_inactive_run(db_session, test_project):
     await db_session.flush()
 
     await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
+    cursor_before = run.event_cursor
     result = await service.tick(db_session, run.id)
+    assert result["event_cursor"] == cursor_before
+    assert run.event_cursor == cursor_before
     assert result["tick_emitted"] is False
     assert result["processed_events"] == 0
     assert result["status"] == "paused"
@@ -183,12 +188,83 @@ async def test_tick_skips_terminal_run(db_session, test_project, terminal_status
     await db_session.flush()
 
     await db_session.commit()  # setup committed: tick is a committed-run operation (SPR230)
+    cursor_before = run.event_cursor
     result = await service.tick(db_session, run.id)
+    assert result["event_cursor"] == cursor_before
+    assert run.event_cursor == cursor_before
     assert result["tick_emitted"] is False
     assert result["processed_events"] == 0
     assert result["status"] == terminal_status
     assert result["team_hierarchy_process"] is None
     assert await _count_tick_events(db_session, test_project.id) == 0
+
+
+async def _snapshot(test_engine, project_id, run_id, goal_id):
+    from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+    async with AsyncSession(test_engine) as fresh:
+        r = await fresh.get(OrchestrationRun, run_id)
+        g = await fresh.get(OrchestrationGoal, goal_id)
+        events = (await fresh.execute(
+            select(func.count(EventLog.id)).where(EventLog.project_id == project_id)
+        )).scalar()
+        return (r.updated_at, r.event_cursor, r.status, r.retry_state, g.updated_at, g.status, events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "cancelled", "paused"])
+async def test_unauthorized_owned_guard_tick_is_byte_pure(db_session, test_engine, test_project, terminal_status):
+    service, goal, run = await _make_run(db_session, test_project.id)
+    run.status = terminal_status
+    await emit_event_once(db_session, test_project.id, "task.created", {"n": 1}, dedup_key="pure-1")
+    await db_session.commit()
+    before = await _snapshot(test_engine, test_project.id, run.id, goal.id)
+    result = await service.tick(db_session, run.id)
+    assert result["processed_events"] == 0 and result["tick_emitted"] is False
+    assert await _snapshot(test_engine, test_project.id, run.id, goal.id) == before
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_owned_tick_sees_goal_paused_by_other_session(db_session, test_engine, test_project):
+    from huddleroom.models.orchestration import OrchestrationGoal
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await emit_event_once(db_session, test_project.id, "task.created", {"n": 1}, dedup_key="stale-goal-1")
+    await db_session.commit()
+    assert goal.status == "active"  # identity map holds the active goal
+    async with AsyncSession(test_engine) as other:
+        (await other.get(OrchestrationGoal, goal.id)).status = "paused"
+        await other.commit()
+    before = await _snapshot(test_engine, test_project.id, run.id, goal.id)
+    result = await service.tick(db_session, run.id)
+    assert result["processed_events"] == 0 and result["evidence_created"] == 0
+    assert result["event_cursor"] == before[1]
+    assert await _snapshot(test_engine, test_project.id, run.id, goal.id) == before
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_tick_keeps_non_owned_callers_pending_run_field(db_session, test_engine, test_project):
+    from fastapi import HTTPException
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await db_session.commit()
+    assert run.status == "running" and run.baseline_authorized is False
+    assert run.phase == "baseline"
+    # Caller-composed unit of work: transaction already begun by caller, with a pending dirty run field.
+    await db_session.get(type(run), run.id)
+    await db_session.execute(select(1))  # read before dirtying the field, so autoflush cannot persist it
+    run.retry_state = {"caller_pending": "keep-me"}
+    before_cursor = run.event_cursor
+    assert db_session.in_transaction()
+    rejected = None
+    try:
+        await service.tick(db_session, run.id)
+    except HTTPException as exc:
+        rejected = exc
+    # Observed outcome: tick succeeds (no rejection) and keeps the caller's pending value on the in-memory object.
+    assert rejected is None
+    assert run.retry_state == {"caller_pending": "keep-me"}
+    assert run.event_cursor == before_cursor
+    # Never leaked to a fresh reader (caller still owns the commit decision).
+    async with AsyncSession(test_engine) as fresh:
+        assert (await fresh.get(type(run), run.id)).retry_state != {"caller_pending": "keep-me"}
 
 
 @pytest.mark.asyncio

@@ -416,6 +416,66 @@ async def test_spr231_ordinary_answer_returns_saved_before_continuation(sessions
             EventLog.dedup_key == f"authority.decision_resolved:{decision.id}")) == 1
 
 
+async def test_spr231_locked_database_during_drain_stays_pending_then_applies_once(sessions, tmp_path, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+    original, attempts = OrchestrationDebugService.advance_process, []
+    async def locked_once(service, db, goal, run, process_type, *args, **kwargs):
+        attempts.append(process_type)
+        if len(attempts) == 1:
+            raise OperationalError("database is locked", None, None)
+        return await original(service, db, goal, run, process_type, *args, **kwargs)
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", locked_once)
+    async with sessions() as submitting:
+        result = await application.answer_decision(submitting, project.id, goal.id, decision.id,
+            OrchestrationDecisionAnswerRequest(selected_option="approve", reason="Retry after lock"), user)
+        action_id = result.answer_receipt.action_id
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    async with sessions() as fresh:
+        obligation = await fresh.get(OrchestrationAction, action_id, populate_existing=True)
+        assert obligation.status == "reserved"
+        assert obligation.dispatch_contract["application_state"] == "pending"
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert len(attempts) == 2
+    async with sessions() as fresh:
+        obligation = await fresh.get(OrchestrationAction, action_id, populate_existing=True)
+        assert obligation.status == "completed"
+        assert obligation.dispatch_contract["application_state"] == "applied"
+        assert await fresh.scalar(select(func.count()).select_from(EventLog).where(
+            EventLog.dedup_key == f"authority.decision_resolved:{decision.id}")) == 1
+
+
+async def test_spr231_non_lock_operational_error_during_drain_fails_without_retry(sessions, tmp_path, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+    attempts = []
+    async def missing_table(service, db, goal, run, process_type, *args, **kwargs):
+        attempts.append(process_type)
+        raise OperationalError("no such table: x", None, None)
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", missing_table)
+    async with sessions() as submitting:
+        result = await application.answer_decision(submitting, project.id, goal.id, decision.id,
+            OrchestrationDecisionAnswerRequest(selected_option="approve", reason="Non-lock failure"), user)
+        action_id = result.answer_receipt.action_id
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    async with sessions() as fresh:
+        obligation = await fresh.get(OrchestrationAction, action_id, populate_existing=True)
+        assert obligation.status == "failed"
+        assert obligation.dispatch_contract["application_state"] == "failed"
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert len(attempts) == 1
+
+
 @pytest.mark.parametrize("selected_option", ["approve", "request_changes"])
 async def test_spr231_request_loss_fresh_consumer_applies_original_answer_once(sessions, tmp_path, monkeypatch, selected_option):
     from huddleroom.services.orchestration_debug_service import OrchestrationDebugService

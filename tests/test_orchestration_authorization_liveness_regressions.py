@@ -8,6 +8,7 @@ from huddleroom.models.task import Task
 from huddleroom.services.orchestration_progress_view import OrchestrationProgressView
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionService
+from tests.conftest import owned_session
 from tests.test_orchestration_progress_view import _run_with_criteria, _task
 from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
@@ -182,11 +183,11 @@ async def test_paused_claim_recovery_fails_action_without_raising(db_session, te
     assert "run_not_active" in str(action.error)
 
 
-async def test_tick_sweeps_cancelled_task_authorization_blocker(sessions, tmp_path):
+async def test_tick_sweeps_cancelled_task_authorization_blocker(sessions, tmp_path, owned_session_factory):
     from tests.test_orchestration_authorization import _started_with_backlog_task
     from tests.test_orchestration_roster_mutation import seed_project_user
 
-    async with sessions() as db:
+    async with owned_session(sessions) as db:
         project, _ = await seed_project_user(db, tmp_path)
         service, goal, run, task = await _started_with_backlog_task(db, project, owns_setup=True)
         task.status = "cancelled"

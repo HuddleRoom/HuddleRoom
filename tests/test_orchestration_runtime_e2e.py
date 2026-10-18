@@ -8,6 +8,7 @@ import json
 import uuid
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from fastapi import HTTPException
@@ -41,15 +42,15 @@ from huddleroom.services.orchestration_memory_service import OrchestrationMemory
 from huddleroom.services.task_service import TaskService
 from huddleroom.services.orchestration_work_report import parse_work_report
 
-from tests.conftest import complete_baseline_processes, heal_baseline_drift_for_test
+from tests.conftest import adopt_session, complete_baseline_processes, heal_baseline_drift_for_test
 from tests.orchestration_wake_helpers import NOOP_WAKE_WHEN
 from tests.test_orchestration_roster_mutation import sessions  # noqa: F401 -- fixture
 
 
-@pytest.fixture
-async def db_session(test_engine):
-    """This module owns committed setup for native end-to-end invocations."""
-    async with AsyncSession(test_engine, expire_on_commit=False) as db:
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Plain autobegin session so the test task can own it, like get_db."""
+    async with owned_session_factory() as db:
         yield db
         await db.rollback()
 
@@ -104,6 +105,7 @@ async def _authorized_run(db_session, test_project, success_criteria=None, *, ow
     created after baseline is terminal) would trigger spec-8.1's "roster
     gained candidates" auto-rerun on every subsequent tick -- which calls
     the real (unstubbed) manager analyzer and stalls baseline_ready."""
+    adopt_session(db_session)
     service = OrchestrationService()
     goal, run = await service.create_goal(
         db_session,

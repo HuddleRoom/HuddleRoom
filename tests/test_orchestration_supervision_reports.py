@@ -2,6 +2,7 @@ import json
 import uuid
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 from huddleroom.models.base import _utcnow
@@ -12,11 +13,50 @@ from huddleroom.models.task import Task
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_work_report import validate_work_report
+from tests.conftest import adopt_session
 from tests.test_orchestration_roadmap_integration import child_item, release
 from tests.test_orchestration_runtime_e2e import _authorized_run
 
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest_asyncio.fixture
+async def test_engine(tmp_path):
+    """Private engine per test: committed orchestration rows are discarded with the file."""
+    from sqlalchemy import event
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from huddleroom.models.base import Base
+    from tests.conftest import _seed_anon_actors
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'owned-reports.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def pragmas(connection, _record):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await _seed_anon_actors(connection)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_test_database():
+    yield
+
+
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
 
 
 def canonical_report() -> str:
@@ -81,6 +121,7 @@ async def _terminal_task(db_session, test_project, test_agent, output, *, sessio
 async def test_winning_attempt_is_consumed_once_and_claim_only_requests_verification(
     db_session, test_project, test_agent,
 ):
+    adopt_session(db_session)
     service, run, task, session = await _terminal_task(
         db_session, test_project, test_agent, canonical_report()
     )
@@ -100,6 +141,7 @@ async def test_winning_attempt_is_consumed_once_and_claim_only_requests_verifica
 async def test_completed_marker_replays_its_persisted_report_not_mutated_output(
     db_session, test_project, test_agent,
 ):
+    adopt_session(db_session)
     service, run, task, session = await _terminal_task(
         db_session, test_project, test_agent, canonical_report()
     )
@@ -111,6 +153,7 @@ async def test_completed_marker_replays_its_persisted_report_not_mutated_output(
 
 
 async def test_reserved_marker_is_completed_with_persisted_result(db_session, test_project, test_agent):
+    adopt_session(db_session)
     service, run, task, session = await _terminal_task(
         db_session, test_project, test_agent, canonical_report()
     )
@@ -126,6 +169,7 @@ async def test_reserved_marker_is_completed_with_persisted_result(db_session, te
 
 
 async def test_sessionless_invalid_report_records_validation_errors(db_session, test_project, test_agent):
+    adopt_session(db_session)
     service, run, task, _session = await _terminal_task(
         db_session, test_project, test_agent, "{}", sessionless=True
     )
@@ -140,6 +184,7 @@ async def test_sessionless_invalid_report_records_validation_errors(db_session, 
 
 
 async def test_malformed_report_gets_one_funded_same_owner_clarification(db_session, test_project, test_agent):
+    adopt_session(db_session)
     # A legacy contract without a stored result kind is a work report and gets the same bounded correction.
     service, run, task, session = await _terminal_task(db_session, test_project, test_agent, "not json")
     goal = await db_session.get(OrchestrationGoal, run.goal_id)
@@ -166,6 +211,7 @@ async def test_malformed_report_gets_one_funded_same_owner_clarification(db_sess
 async def test_malformed_report_in_exhausted_outcome_records_attention_without_follow_up(
     db_session, test_project, test_agent,
 ):
+    adopt_session(db_session)
     _roadmap, _parent, _parent_run, _result, row = await release(
         db_session, test_project,
         child_item(allocation={"max_tokens": 2, "max_turns": 1, "max_hours": 1}),
@@ -228,6 +274,7 @@ async def test_malformed_report_in_exhausted_outcome_records_attention_without_f
 
 
 async def test_second_malformed_report_requests_human_attention(db_session, test_project, test_agent):
+    adopt_session(db_session)
     service, run, task, session = await _terminal_task(
         db_session, test_project, test_agent, "not json",
         contract={"expected_result": "canonical_work_report"},
@@ -256,6 +303,7 @@ async def test_second_malformed_report_requests_human_attention(db_session, test
 
 
 async def test_done_task_event_consumes_sessionless_metadata_report(db_session, test_project, test_agent):
+    adopt_session(db_session)
     service, run, task, _session = await _terminal_task(
         db_session, test_project, test_agent, canonical_report(), sessionless=True
     )
@@ -297,6 +345,7 @@ def test_strict_validator_names_each_invalid_scalar_field():
 async def test_competing_late_session_cannot_replace_consumed_lineage(
     db_session, test_project, test_agent,
 ):
+    adopt_session(db_session)
     service, run, task, winner = await _terminal_task(
         db_session, test_project, test_agent, canonical_report()
     )
@@ -313,6 +362,7 @@ async def test_competing_late_session_cannot_replace_consumed_lineage(
 
 
 async def test_cached_invalid_report_retries_after_funding_returns(db_session, test_project, test_agent, stub_decision):
+    adopt_session(db_session)
     stub_decision(lambda _context: {"action_type": "noop"})
     service, run, task, session = await _terminal_task(
         db_session, test_project, test_agent, "not json", contract={"expected_result": "canonical_work_report"},

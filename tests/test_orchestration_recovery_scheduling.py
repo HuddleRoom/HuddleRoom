@@ -320,6 +320,11 @@ async def test_spr213_supported_events_wait_for_recovery_and_runtime_readiness(
             await super().wait()
 
     class Db:
+        sync_session = SimpleNamespace(get_transaction=lambda: None)
+
+        def in_nested_transaction(self):
+            return False
+
         async def commit(self):
             pass
 

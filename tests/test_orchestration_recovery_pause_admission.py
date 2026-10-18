@@ -110,6 +110,8 @@ async def test_public_recovery_pause_stops_next_admission_without_reclassifying_
     # Supported resume reuses the same trigger and proves admission ownership cleared.
     async with factory() as resuming:
         await OrchestrationService().resume_goal(resuming, project_id, goal_id)
+        # Resume keeps the baseline paused; explicit re-authorization admits the next provider call.
+        await OrchestrationService().authorize_baseline(resuming, project_id, goal_id, actor="test")
         await resuming.commit()
     response_kind = "terminal"
     await tick()
@@ -442,6 +444,8 @@ async def test_spr230_repeated_pause_does_not_spend_recovery_refusal_budget(
             await asyncio.gather(pending, return_exceptions=True)
         async with factory() as resume:
             await OrchestrationService().resume_goal(resume, goal.project_id, goal.id)
+            # Resume keeps the baseline paused; explicit re-authorization admits the next provider call.
+            await OrchestrationService().authorize_baseline(resume, goal.project_id, goal.id, actor="test")
             await resume.commit()
     await tick()
     assert len(calls) == MAX_RECOVERY_ATTEMPTS_WITHOUT_PROGRESS + 1

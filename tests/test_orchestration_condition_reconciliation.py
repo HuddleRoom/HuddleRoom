@@ -2,6 +2,7 @@ import uuid
 
 import pytest
 
+from tests.conftest import adopt_session
 from huddleroom.services.orchestration_condition import (
     CONDITIONS,
     ConditionError,
@@ -198,7 +199,10 @@ async def test_late_plan_clears_its_warning_and_question_but_never_owner_or_unde
     assert undeclared.active
 
 
-async def test_rejected_output_keeps_result_missing_until_the_corrected_result_is_accepted(db_session, test_project):
+async def test_rejected_output_keeps_result_missing_until_the_corrected_result_is_accepted(
+    db_session, test_project, owned_session_factory,
+):
+    adopt_session(db_session)
     service, goal, run, agent, task = await _setup(db_session, test_project)
     task.status = "in_progress"
     running = Session(
@@ -271,7 +275,10 @@ async def test_gate_condition_clears_only_on_acceptance_and_shared_undeclared_it
     assert not cleared.active and shared.active
 
 
-async def test_one_malformed_item_is_skipped_and_the_rest_still_reconcile(db_session, test_project):
+async def test_one_malformed_item_is_skipped_and_the_rest_still_reconcile(
+    db_session, test_project, owned_session_factory,
+):
+    adopt_session(db_session)
     service, goal, run, _agent, task = await _setup(db_session, test_project)
     gate = OrchestrationGate(run_id=run.id, success_criterion_key="done", gate_type="work_completed", status="accepted")
     db_session.add(gate)

@@ -4,12 +4,14 @@ import uuid
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
+from huddleroom.services import orchestration_service
 from huddleroom.services.event_bus import emit_event
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionService
@@ -23,11 +25,13 @@ from tests.test_orchestration_runtime_e2e import _accept_ingested, _agent, _auth
 
 @pytest.mark.asyncio
 async def test_planner_finishes_while_paused_survives_reload_and_consumes_once(
-    sessions, tmp_path, monkeypatch, stub_decision, safe_effectiveness_review_continue,
+    sessions, test_engine, tmp_path, monkeypatch, stub_decision, safe_effectiveness_review_continue,
 ):
     """The original, actually claimed planner finishes before Resume; no replacement is needed."""
     monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     monkeypatch.setattr("huddleroom.workers.task_runner.register_session", lambda *_args, **_kwargs: None)
+    # SPR230: committed decision sessions must come from the same engine as the test sessions.
+    monkeypatch.setattr(orchestration_service, "AsyncSessionLocal", async_sessionmaker(test_engine, expire_on_commit=False))
     async with sessions() as setup:
         project, _ = await seed_project_user(setup, tmp_path)
         planner = _agent("paused-planner", ["planning"])

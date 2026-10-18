@@ -1,5 +1,6 @@
 """Durable ordinary human-answer acceptance and source-process application."""
 
+import logging
 import uuid
 from contextvars import ContextVar
 from contextlib import contextmanager
@@ -7,12 +8,15 @@ from copy import deepcopy
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationRun, OrchestrationGoal
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
 from huddleroom.schemas.orchestration import AnswerSubmission, AnswerReceipt, AnswerApplicationPass
 from huddleroom.services.orchestration_control import acquire_control_writer
+
+logger = logging.getLogger(__name__)
 
 _application = ContextVar("authority_answer_application", default=None)
 
@@ -153,9 +157,22 @@ async def accept_answer(db, project_id, goal_id, submission, user, *, validation
         return await _accept_answer(db, decisions, answers, user, owns=owns, submission_input=submission,
             validate=validate, validation_callback=validation_callback, reservation_callback=reservation_callback,
             completion_callback=completion_callback, make_response=response)
-    except BaseException:
+    except BaseException as exc:
         if owns:
             await db.rollback()
+            stale = getattr(exc, "stale_inputs", None)
+            if stale:  # rejected stale proposal: keep only the one-time rerun suggestion
+                # Callers that own the transaction themselves (e.g. chat actions) get no warning
+                # here; the tick/advance path re-suggests it.
+                try:
+                    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+                    await OrchestrationWarningService().suggest_stale_inputs(
+                        db, stale["goal_id"], process_type="team_hierarchy",
+                        process_run_id=stale["process_run_id"], step_label="team hierarchy", run_id=stale["run_id"])
+                    await db.commit()
+                except Exception:
+                    logger.warning("stale-inputs suggestion failed", exc_info=True)
+                    await db.rollback()
         raise
 
 
@@ -415,7 +432,7 @@ async def drain_answer_applications(db, run_id):
                         return
                     submission = action.request["submission"]
                     source_id = submission.get("source_process_run_id")
-                    source = await db.get(OrchestrationProcessRun, uuid.UUID(source_id)) if source_id else None
+                    source = await db.get(OrchestrationProcessRun, uuid.UUID(source_id), populate_existing=True) if source_id else None
                     goal = await db.get(OrchestrationGoal, goal_id, populate_existing=True)
                     run = await db.get(OrchestrationRun, run_id, populate_existing=True)
                     if source_id and source is None:
@@ -452,7 +469,7 @@ async def drain_answer_applications(db, run_id):
                     action.status = "completed"
                     from datetime import datetime, timezone
                     for decision_id in submission["decision_ids"]:
-                        decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(decision_id))
+                        decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(decision_id), populate_existing=True)
                         decision.continuation_applied_at = datetime.now(timezone.utc)
                     await db.flush()
         try:
@@ -479,7 +496,7 @@ async def drain_answer_applications(db, run_id):
                 )
             else:
                 reason = _safe_completion_error(exc)
-                retryable = False
+                retryable = isinstance(exc, OperationalError) and any(s in str(exc).lower() for s in ("locked", "busy"))  # e.g. "database is locked": retry on next drain
             await acquire_control_writer(db, run_id)
             action = await db.get(OrchestrationAction, action_id, populate_existing=True)
             if action.status != "completed":

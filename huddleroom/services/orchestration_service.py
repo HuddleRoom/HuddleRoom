@@ -20,6 +20,7 @@ from typing import Any, Mapping, Sequence
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, func, or_, select, text, update
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import SessionTransactionOrigin, object_session
@@ -337,8 +338,8 @@ REMEDIATION_REQUEST_KEYS = (
 
 
 
-class _UnauthorizedResultDeferred(Exception):
-    """Keep an existing terminal result pending until continuation is authorized."""
+class _PendingContinuationUnrecorded(Exception):
+    """A landing-mode continuation had no action row to record its pending state on."""
 
 
 class OrchestrationService:
@@ -1037,7 +1038,7 @@ class OrchestrationService:
                                                 "message": "Commit caller work before model continuation"})
             if operation is not None and owns_provider_transaction:
                 adapter_result = await self._admitted_decision_adapter(
-                    db, committed_goal_id, decision_adapter, context, project_ctx, goal_ctx,
+                    db, committed_goal_id, decision_adapter, context, project_ctx, goal_ctx,  # pylint: disable=possibly-used-before-assignment  # context is only set after committed_goal_id
                     owns=True, run_id=run_id,
                 )
             else:
@@ -8181,7 +8182,6 @@ class OrchestrationService:
         try:
             artifact = await ingest(db, goal, run, task, session_id, version, plan_text)
         except PlanIngestionError as exc:
-            self._defer_unauthorized_result_continuation(db, run)
             # ponytail: legacy self-registering planners keep working; drop this check once they are gone.
             manual_plan = await db.scalar(select(Artifact.id).where(
                 Artifact.linked_task_id == task.id,
@@ -8209,16 +8209,15 @@ class OrchestrationService:
                     "kind": BUDGET_REQUIRED_CODE, "reason": f"Budget required: {BUDGET_REQUIRED_MESSAGE}",
                     "details": details,
                 })
-                ask = await self.execute_ask_human_action(
-                    db, run.id, {
-                        "action_type": "ask_human", "question": BUDGET_REQUIRED_MESSAGE,
-                        "subject": BUDGET_REQUIRED_CODE, "contract_version": "explicit_parent_caps:v1",
-                        "reason": json.dumps(details, ensure_ascii=False),
-                        "options": [{"key": "acknowledge", "label": "Acknowledge"}],
-                    }, f"run:{run.id}:kind:ask_human:{BUDGET_REQUIRED_CODE}",
-                )
-                question = await db.get(OrchestrationAuthorityDecision, ask.target_id)
-                question.title = "Budget required"
+                if self._landing_only(db, run):  # the owner ask is an effect: pend it for the authorized tick
+                    self._pend_result_continuation(
+                        db, marker, "plan_rejection_followup", task, session_id,
+                        {"planning_version": version},
+                        "budget_required",
+                        {"errors": [f"{details['code']}: {details['message']}", *map(str, details["diagnostics"] or [])]},
+                    )
+                else:
+                    await self._ask_budget_required(db, run, details)
                 await self._mark_action_completed(db, marker, "task", task.id)
                 return
             if correct:
@@ -8403,7 +8402,6 @@ class OrchestrationService:
         """Bounded, output-only correction of a result that failed validation, tracked on the original's ledger.
 
         ``task`` is the original task or its current correction task; ``kind`` names the validator that failed."""
-        self._defer_unauthorized_result_continuation(db, run)
         metadata = self._json_object_or_empty(task.metadata_)
         contract = self._json_object_or_empty(metadata.get("orchestration_contract"))
         context = self._json_object_or_empty(contract.get("orchestrator_context"))
@@ -8435,6 +8433,13 @@ class OrchestrationService:
             "kind": kind, "cycle": 1, "version": version, "attempts": [],
             "correction_task_id": None, "correction_task_ids": [], "status": "pending",
         }
+        if self._landing_only(db, run):
+            marker.request = {**self._json_object_or_empty(marker.request), "result_correction": ledger}
+            self._pend_result_continuation(
+                db, marker, "result_correction", task, session_id, version,
+                "unauthorized_baseline", {"errors": errors},
+            )
+            return
         try:
             await self._advance_result_correction(db, goal, run, parent, marker, ledger, task, session_id, errors, version)
             self._plan_correction_fallback(run, ledger)
@@ -9866,6 +9871,12 @@ class OrchestrationService:
         )):
             return
         if ledger.get("version") != self._result_correction_version(goal, run):
+            if self._landing_only(db, run):  # a fresh cycle is an effect: pend it for the authorized tick
+                self._pend_result_continuation(
+                    db, marker, "result_correction", task, session_id,
+                    self._result_correction_version(goal, run), "contract_changed", None,
+                )
+                return
             await self._resume_result_correction(db, run, marker)  # new contract version: fresh cycle, not this result
             return
         stale = await self._result_correction_stale(db, run)
@@ -9931,6 +9942,27 @@ class OrchestrationService:
             f"The verifier for task {task.id} reported it could not verify ({status}): {findings['notes']}",
         )
 
+    async def _ask_budget_required(self, db: AsyncSession, run: OrchestrationRun, details: Mapping[str, Any]) -> None:
+        ask = await self.execute_ask_human_action(
+            db, run.id, {
+                "action_type": "ask_human", "question": BUDGET_REQUIRED_MESSAGE,
+                "subject": BUDGET_REQUIRED_CODE, "contract_version": "explicit_parent_caps:v1",
+                "reason": json.dumps(details, ensure_ascii=False),
+                "options": [{"key": "acknowledge", "label": "Acknowledge"}],
+            }, f"run:{run.id}:kind:ask_human:{BUDGET_REQUIRED_CODE}",
+        )
+        question = await db.get(OrchestrationAuthorityDecision, ask.target_id)
+        question.title = "Budget required"
+
+    def _pend_verifier_owner_ask(self, db, action, task, session, findings: Mapping[str, Any]) -> None:
+        """Landing-only: record the verifier-could-not-verify owner ask on the bound request_verification action."""
+        status = findings["status"]
+        self._pend_result_continuation(
+            db, action, "verifier_owner_ask", task, session.id, {"session_id": str(session.id)},
+            f"verifier_{status}"[:64],
+            {"status": status, "notes": findings.get("notes"), "evidence": findings.get("evidence")},
+        )
+
     async def _land_verification_correction(
         self,
         db: AsyncSession,
@@ -9953,7 +9985,10 @@ class OrchestrationService:
             return
         verdict, errors, findings = self._verification_report(session.output)
         if verdict is None and not errors:  # the verifier now reports it cannot verify; stop correcting
-            self._set_result_correction_status(marker, "rejected", reason=f"the verifier reported {findings['status']}")
+            self._set_result_correction_status(marker, "rejected", reason=f"the verifier reported {findings['status']}")  # pylint: disable=unsubscriptable-object  # verdict None with no errors implies a findings dict
+            if self._landing_only(db, run):
+                self._pend_verifier_owner_ask(db, binding[0], parent, session, findings)
+                return
             await self._escalate_verifier_could_not_verify(db, run, parent, session, findings)
             return
         if verdict is None:
@@ -10335,6 +10370,8 @@ class OrchestrationService:
             # A blocked/failed verifier report is no output error and is never corrected: the owner is asked.
             if errors:
                 await self._request_result_correction(db, run, task, session.id, VERIFICATION_VERDICT, errors)
+            elif self._landing_only(db, run):
+                self._pend_verifier_owner_ask(db, action, task, session, findings)
             else:
                 await self._escalate_verifier_could_not_verify(db, run, task, session, findings)
             return 0
@@ -10381,7 +10418,7 @@ class OrchestrationService:
                 "source_task_id": str(source_task.id),
                 "graph_run_id": str(session.graph_run_id) if session.graph_run_id else None,
                 **({"normalized": findings["normalized"]} if findings.get("normalized") else {}),
-                **({"artifact_identity": identity}
+                **({"artifact_identity": identity}  # pylint: disable=used-before-assignment  # walrus in the condition runs first
                    if (identity := self._json_object_or_empty(action.request).get("artifact_identity")) else {}),
                 **({"findings": bound_findings(findings.get("evidence") or [], findings.get("notes"), "Verification")}
                    if verdict == "rejected" else {}),
@@ -13803,17 +13840,233 @@ class OrchestrationService:
         ]
 
     @staticmethod
-    def _defer_unauthorized_result_continuation(db, run) -> None:
+    def _landing_only(db, run) -> bool:
         from huddleroom.services.orchestration_baseline_runtime import current_baseline_operation
         operation = current_baseline_operation()
-        if (operation is not None and operation.db is db and operation.tick
-                and run.phase == "baseline" and not run.baseline_authorized):
-            raise _UnauthorizedResultDeferred
+        return bool(operation is not None and operation.db is db and operation.tick
+                    and run.phase == "baseline" and not run.baseline_authorized)
+
+    def _pend_result_continuation(
+        self, db, action, kind: str, task, session_id, input_version: Mapping[str, Any],
+        reason: str, payload: Mapping[str, Any] | None,
+    ) -> None:
+        if action is None:
+            raise _PendingContinuationUnrecorded(kind)
+
+        def text(value, limit):
+            return defang_fence_marks(one_line(value, limit))
+
+        payload = payload if isinstance(payload, Mapping) else {}
+        iv = json.loads(json.dumps(input_version or {}, default=str))
+
+        def items(value):
+            return list(value) if isinstance(value, (list, tuple)) else ([str(value)] if value else [])
+
+        findings: dict[str, Any] = {}
+        if "errors" in payload:
+            findings["errors"] = [text(e, 500) for e in items(payload["errors"])[:8]]
+        if "status" in payload:
+            findings["status"] = text(payload["status"], 64)
+        if "notes" in payload:
+            findings["notes"] = text(payload["notes"], 500)
+        if "evidence" in payload:
+            findings["evidence"] = [text(e, 200) for e in items(payload["evidence"])[:5]]
+        event_id = db.info.get("landing_event_id")
+        pending = {
+            "kind": kind,
+            "event_id": str(event_id) if event_id is not None else None,
+            "task_id": str(task.id) if task is not None else None,
+            "session_id": str(session_id) if session_id is not None else None,
+            "input_version": iv,
+            "reason": text(reason, 64),
+            "diagnostics_or_findings": findings,
+        }
+
+        def size() -> int:
+            return len(json.dumps(pending, default=str).encode())
+
+        # Truncate, never raise: shed list tails, then notes, then everything.
+        while size() > 4096 and (findings.get("errors") or findings.get("evidence")):
+            findings["errors" if findings.get("errors") else "evidence"].pop()
+        if size() > 4096:
+            findings.pop("notes", None)
+        if size() > 4096:
+            pending["diagnostics_or_findings"] = {}
+        if size() > 4096:  # oversized input_version: keep only a stable digest
+            pending["input_version"] = {"hash": self._stable_hash(iv)}
+        request = self._json_object_or_empty(action.request)
+        identity = lambda p: (  # noqa: E731
+            p.get("kind"), p.get("event_id"), p.get("task_id"), p.get("session_id"),
+            self._stable_hash(p.get("input_version") or {}),
+        )
+        current = request.get("pending_result_continuation")
+        if isinstance(current, Mapping) and identity(current) == identity(pending):
+            return
+        # ponytail: single pending slot per action; a later different identity replaces an unconsumed earlier pend
+        action.request = {**request, "pending_result_continuation": pending}
+
+    def _settle_pending(self, action, outcome: str, reason: str) -> None:
+        request = self._json_object_or_empty(action.request)
+        pending = request.pop("pending_result_continuation", None)
+        if not isinstance(pending, Mapping):
+            return
+        action.request = {**request, "pending_result_continuation_settled": {
+            "kind": pending.get("kind"), "event_id": pending.get("event_id"),
+            "outcome": outcome, "reason": reason,
+        }}
+
+    async def _verifier_pend_subject(self, db, session: Session) -> tuple[Task | None, Task | None]:
+        """(task the session actually ran, its result-correction parent or None)."""
+        session_task = await db.get(Task, session.task_id) if session.task_id else None
+        parent_id = self._event_uuid(
+            self._json_object_or_empty(session_task.metadata_).get("result_correction_parent_task_id")
+        ) if session_task is not None else None
+        return session_task, (await db.get(Task, parent_id) if parent_id else None)
+
+    async def _apply_pending_continuation(self, db, run, action, pending: Mapping[str, Any]) -> None:
+        """Revalidate one pending continuation against live state, then apply or settle it stale."""
+        kind = pending.get("kind")
+        stale = await self._result_correction_stale(db, run)
+        if stale is not None:
+            return self._settle_pending(action, "stale", "run_superseded")
+        session = None
+        if pending.get("session_id"):
+            try:
+                session = await db.get(Session, uuid.UUID(pending["session_id"]))
+            except (ValueError, TypeError):
+                session = None
+            if session is None or session.status != "completed":
+                return self._settle_pending(action, "stale", "session_changed")
+        subject = parent = None
+        if kind == "verifier_owner_ask":
+            if session is None:
+                return self._settle_pending(action, "stale", "session_changed")
+            subject, parent = await self._verifier_pend_subject(db, session)
+            if subject is None:
+                return self._settle_pending(action, "stale", "task_missing")
+            if parent is None and self._json_object_or_empty(subject.metadata_).get("result_correction_parent_task_id"):
+                return self._settle_pending(action, "stale", "task_missing")
+        else:
+            try:
+                subject = await db.get(Task, uuid.UUID(pending["task_id"])) if pending.get("task_id") else None
+            except (ValueError, TypeError):
+                subject = None
+            if subject is None:
+                return self._settle_pending(action, "stale", "task_missing")
+        if session is not None:
+            latest = await db.scalar(
+                select(Session.id).where(Session.task_id == session.task_id,
+                                         Session.status.in_(("completed", "failed")))
+                .order_by(desc(Session.created_at), desc(Session.id)).limit(1)
+            )
+            if latest != session.id:
+                return self._settle_pending(action, "stale", "session_changed")
+        owner = parent or subject
+        if pending.get("task_id") != str(owner.id) or (session is not None and pending["session_id"] != str(session.id)):
+            return self._settle_pending(action, "stale", "session_changed")
+        reason = str(pending.get("reason") or "")
+        findings = self._json_object_or_empty(pending.get("diagnostics_or_findings"))
+        if kind == "result_correction" and session is not None:
+            # the pend sites store the producing task's session: the owner's, or the ledger's current correction task's
+            ledger_task = self._json_object_or_empty(self._json_object_or_empty(
+                self._json_object_or_empty(action.request).get("result_correction"))).get("correction_task_id")
+            if session.task_id != owner.id and str(session.task_id) != str(ledger_task):
+                return self._settle_pending(action, "stale", "session_changed")
+        if kind == "plan_rejection_followup":
+            current = self._json_object_or_empty(run.plan_state).get("planning_version")
+            pended = self._json_object_or_empty(pending.get("input_version")).get("planning_version")
+            # ponytail: no recorded plan_state version => cannot compare, trust budget_required presence
+            if (current is not None and str(current) != str(pended)) or not self._json_object_or_empty(
+                    self._json_object_or_empty(run.plan_state).get("budget_required")):
+                return self._settle_pending(action, "stale", "run_superseded")
+        if kind == "verifier_owner_ask":
+            await self._escalate_verifier_could_not_verify(db, run, owner, session, {
+                "status": findings.get("status"), "notes": findings.get("notes") or "",
+                "evidence": findings.get("evidence") or [],
+            })
+        elif kind == "plan_rejection_followup":
+            details = self._json_object_or_empty(self._json_object_or_empty(run.plan_state).get("budget_required"))
+            await self._ask_budget_required(db, run, details or {
+                "code": BUDGET_REQUIRED_CODE, "title": "Budget required", "message": BUDGET_REQUIRED_MESSAGE,
+                "diagnostics": findings.get("errors") or [],
+            })
+        elif kind == "result_correction" and reason == "contract_changed":
+            await self._resume_result_correction(db, run, action)
+        elif kind == "result_correction" and reason == "unauthorized_baseline":
+            ledger = self._json_object_or_empty(self._json_object_or_empty(action.request).get("result_correction"))
+            status = ledger.get("status")
+            # exhausted/unavailable are terminal only for the version they stopped at; a newer one starts a new cycle
+            if status in {"corrected", "owner_declined", "superseded", "rejected"} or (
+                status in {"exhausted", "unavailable"} and ledger.get("version") == self._result_correction_version(
+                    await db.get(OrchestrationGoal, run.goal_id), run)
+            ):
+                return self._settle_pending(action, "stale", "ledger_terminal")
+            await self._request_result_correction(
+                db, run, subject, session.id if session is not None else None,
+                str(ledger.get("kind") or ""), findings.get("errors") or [],
+            )
+        else:
+            return self._settle_pending(action, "stale", "session_changed")
+        self._settle_pending(action, "applied", reason)
+
+    async def _settle_pending_result_continuations(self, db, goal, run, *, kinds=None) -> None:
+        """Full tick: apply continuations pended while landing under an unauthorized baseline."""
+        from huddleroom.services.orchestration_baseline_runtime import (
+            BaselinePaused, owns_control_transaction, require_control_admission,
+        )
+
+        # child runs are born phase="authorized"; a root run stays baseline/ready after Start (baseline_authorized flips),
+        # so "unauthorized" is keyed on the flag, not phase alone
+        if ((not run.baseline_authorized and run.phase in ("baseline", "ready")) or run.status not in LLM_DECISION_RUN_STATUSES
+                or not owns_control_transaction(db)):
+            return  # a non-owning caller leaves the pending for the owner's tick
+        # ponytail: oldest 50 pending per tick; page by cursor if a run ever holds more
+        pend = OrchestrationAction.request["pending_result_continuation"]["kind"].as_string()
+        ids = list(await db.scalars(select(OrchestrationAction.id).where(
+            OrchestrationAction.run_id == run.id, pend.in_(kinds) if kinds else pend.is_not(None),
+        ).order_by(OrchestrationAction.created_at, OrchestrationAction.id).limit(50)))
+        if not ids:
+            return
+
+        async def reload() -> None:
+            await db.refresh(run)
+            await db.refresh(goal)
+
+        try:
+            await require_control_admission(db, run.id)
+        except BaselinePaused:
+            await reload()
+            return
+        except HTTPException as exc:
+            if exc.status_code != 409 or exc.detail != "Orchestration admission paused":
+                raise
+            await reload()
+            return
+        for action_id in ids:
+            action = await db.get(OrchestrationAction, action_id, populate_existing=True)
+            pending = self._json_object_or_empty(action.request).get("pending_result_continuation") if action else None
+            if not isinstance(pending, Mapping):
+                continue
+            try:
+                async with db.begin_nested():
+                    await self._apply_pending_continuation(db, run, action, pending)
+            except BaselinePaused:
+                await reload()
+                break
+            except HTTPException as exc:
+                if exc.status_code == 409 and exc.detail == "Orchestration admission paused":
+                    await reload()
+                    break
+                logger.exception("pending continuation %s failed; left pending", action_id)
+                await reload()
+            except Exception:  # CancelledError is a BaseException and still propagates
+                logger.exception("pending continuation %s failed; left pending", action_id)
+                await reload()
 
     async def _tick_unauthorized_evidence(self, db, run_id, *, owns_transaction):
         """Land already-produced evidence without admitting any continuation work."""
         from huddleroom.services.orchestration_baseline_runtime import (
-            baseline_operation, publish_baseline_transaction, require_control_admission,
+            baseline_operation, publish_baseline_transaction,
         )
         with db.no_autoflush:
             run = await db.get(OrchestrationRun, run_id)
@@ -13823,41 +14076,43 @@ class OrchestrationService:
         async with self._lock_goal_for_baseline_transition(
             db, goal_id, tick_owns_transaction=owns_transaction,
         ), baseline_operation(db, goal_id, owns_transaction=owns_transaction, tick=True, run_id=run_id):
-            await require_control_admission(db, run_id, require_baseline_authorization=False)
-            await db.refresh(run)
+            if owns_transaction:
+                await db.refresh(run)
             if run.phase != "baseline" or run.baseline_authorized:
-                if owns_transaction:
-                    await publish_baseline_transaction(db)
                 return None
             goal = await db.get(OrchestrationGoal, goal_id)
+            if owns_transaction:
+                await db.refresh(goal)  # identity map may hold a stale status
+            if run.status not in LLM_DECISION_RUN_STATUSES or goal.status not in {"active", "blocked"}:
+                return self._tick_noop_result(run)
             await ProjectService().require_runnable_project(db, goal.project_id)
             events = await self._new_events(db, goal.project_id, run.event_cursor)
             processed = evidence_created = gates_validated = 0
             cursor = run.event_cursor
+            unresolved = False
             for event in events:
                 scope = await db.begin_nested()
+                db.info["landing_event_id"] = str(event.id)
                 try:
                     count = await self._ingest_evidence_from_event(db, run, event)
-                except _UnauthorizedResultDeferred:
+                except _PendingContinuationUnrecorded:
                     await scope.rollback()
-                    await db.refresh(run)
-                    break
+                    for obj in (run, goal):  # rollback expires state; a non-owned caller's pending fields stay intact
+                        if owns_transaction or sa_inspect(obj).expired_attributes:
+                            await db.refresh(obj)
+                    unresolved = True  # cursor stays at the last contiguous resolved seq; later events still land
                 else:
                     await scope.commit()
                     evidence_created += count
                     processed += 1
-                    cursor = event.seq
+                    if not unresolved:
+                        cursor = event.seq
+                finally:
+                    db.info.pop("landing_event_id", None)
             if processed:
-                scope = await db.begin_nested()
-                try:
-                    await self._reconcile_outcome_gate_acceptance(db, goal, run)
-                    gates_validated = await self.validate_open_gates(db, run.id)
-                    await self._reconcile_conditions(db, run)
-                except _UnauthorizedResultDeferred:
-                    await scope.rollback()
-                    await db.refresh(run)
-                else:
-                    await scope.commit()
+                await self._reconcile_outcome_gate_acceptance(db, goal, run)
+                gates_validated = await self.validate_open_gates(db, run.id)
+                await self._reconcile_conditions(db, run)
                 run.event_cursor = cursor
                 await db.flush()
             if owns_transaction:
@@ -14140,6 +14395,11 @@ class OrchestrationService:
                 await self.supervision.preflight_local_staging(db, goal, run)
             await self._clear_obsolete_authorization_blockers(db, run)
             if self._has_active_blocker(run, BUDGET_REQUIRED_CODE):
+                # ponytail: blocked-on-budget tick settles only the owner ask; the rest waits for the blocker
+                await self._settle_pending_result_continuations(db, goal, run, kinds=("plan_rejection_followup",))
+                await db.flush()
+                if not caller_owns_transaction:
+                    await publish_baseline_transaction(db)
                 return {**self._tick_noop_result(run), "authorized_execution": {
                     "step": "needs_attention", "reason": BUDGET_REQUIRED_CODE,
                 }}
@@ -14408,6 +14668,7 @@ class OrchestrationService:
             new_cursor = new_events[-1].seq if new_events else run.event_cursor
             cursor_token = str(new_cursor) if new_cursor is not None else "genesis"
             evidence_created = await self._ingest_evidence_from_events(db, run, new_events)
+            await self._settle_pending_result_continuations(db, goal, run)
             await self._sweep_result_corrections(db, run)
             await self._reconcile_outcome_gate_acceptance(db, goal, run)
             gates_validated = await self.validate_open_gates(db, run.id)

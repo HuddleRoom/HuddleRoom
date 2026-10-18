@@ -11,12 +11,14 @@ from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationEvidence, OrchestrationGoal, OrchestrationGate, OrchestrationRoadmapVersion, OrchestrationRun, OrchestrationWait
 from huddleroom.models.session import Session
 from huddleroom.models.meeting import Meeting
+from huddleroom.models.project import Project
 from huddleroom.models.task import Task
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
 from huddleroom.services.orchestration_authority_service import runtime_decision_identity
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_supervision import SupervisionAssessment
 from huddleroom.routers.orchestration_goals import _detail
+from tests.conftest import owned_session
 
 
 pytestmark = pytest.mark.asyncio
@@ -878,7 +880,25 @@ async def test_only_non_adhoc_open_gates_block_closeout_readiness(db_session, te
     assert result["outcome"] == outcome
 
 
-async def test_reconcile_local_capacity_wait_is_typed_wait_without_provider_call(db_session, test_project, monkeypatch):
+async def _run_in_owned_project(owned_session_factory, tmp_path, body, *args):
+    """Seed a project in an owned autobegin session, then run ``body`` in that session."""
+    async with owned_session(owned_session_factory) as db_session:
+        workspace = tmp_path / "project-workspace"
+        workspace.mkdir()
+        project = Project(name="Test Project", description="A test project",
+                          workspace_path=str(workspace.resolve()), config={})
+        db_session.add(project)
+        await db_session.flush()
+        await body(db_session, project, *args)
+
+
+async def test_reconcile_local_capacity_wait_is_typed_wait_without_provider_call(owned_session_factory, tmp_path, monkeypatch):
+    await _run_in_owned_project(
+        owned_session_factory, tmp_path, _reconcile_local_capacity_wait_body, monkeypatch,
+    )
+
+
+async def _reconcile_local_capacity_wait_body(db_session, test_project, monkeypatch):
     from tests.test_orchestration_runtime_e2e import _agent
     from huddleroom.models.orchestration import OrchestrationDecision
     goal, run = await _run(db_session, test_project)

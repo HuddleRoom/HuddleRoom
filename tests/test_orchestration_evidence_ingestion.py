@@ -862,7 +862,18 @@ async def test_unauthorized_tick_only_consumes_existing_terminal_evidence_once(d
     await db_session.commit()  # This fixture owns its read-only preflight.
     result = await service.tick(db_session, run.id)
     await db_session.commit()
-    assert await counts() == before_counts
+    after = await counts()
+    if not with_terminal_event:
+        assert after == before_counts
+    else:
+        # SPR230/231: landing consumes the report (marker) and pends the native correction; no work/dispatch.
+        assert after == (before_counts[0] + 1,) + before_counts[1:]  # Task/Session/ProcessRun unchanged
+        markers = list(await db_session.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.idempotency_key == f"run:{run.id}:kind:report_consumed:task:{task.id}")))
+        assert len(markers) == 1 and markers[0].action_type == "report_consumed" and markers[0].target_id == task.id
+        pending = markers[0].request["pending_result_continuation"]
+        assert pending["kind"] == "result_correction" and pending["task_id"] == str(task.id)
+        assert pending["event_id"] == str(event.id) and pending["reason"] == "unauthorized_baseline"
     assert all(spy.await_count == 0 for spy in spies)
     await db_session.refresh(run)
     assert run.baseline_authorized is False and run.phase == "baseline"
@@ -875,6 +886,9 @@ async def test_unauthorized_tick_only_consumes_existing_terminal_evidence_once(d
         assert again["evidence_created"] == 0
         assert len(await _evidence_rows(db_session, run.id)) == 1
         assert all(spy.await_count == 0 for spy in spies)
+        assert await counts() == after
+        await db_session.refresh(markers[0])
+        assert markers[0].request["pending_result_continuation"] == pending
     else:
         assert result["processed_events"] == 0
         after_rows = tuple(await db_session.execute(select(*OrchestrationRun.__table__.c).where(OrchestrationRun.id == run.id)))
@@ -885,11 +899,11 @@ async def test_unauthorized_tick_only_consumes_existing_terminal_evidence_once(d
 @pytest.mark.asyncio
 @pytest.mark.parametrize("valid", [True, False])
 async def test_unauthorized_retained_report_defers_correction_before_consumption(db_session, test_project, monkeypatch, valid):
-    """SPR230/SPR231 invalid retained output waits for Continue without losing its event."""
+    """SPR230/SPR231 invalid retained output lands deterministically, pends its correction, and waits for Continue."""
     import json
     from unittest.mock import AsyncMock
     from sqlalchemy import func
-    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationRun
     from huddleroom.services.orchestration_goal_definition import GoalDefinitionProcess
 
     service, goal, run = await _make_run(db_session, test_project.id)
@@ -910,19 +924,24 @@ async def test_unauthorized_retained_report_defers_correction_before_consumption
     db_session.add(owner)
     await db_session.flush()
     task.metadata_ = {**task.metadata_, "orchestration": {**task.metadata_["orchestration"], "action_id": str(owner.id)}}
-    prefix_event = None
-    if not valid:
-        # A valid earlier terminal event must survive the deferred suffix.
-        prior_gate = await _make_gate(db_session, run.id)
-        prior_task = await _make_orchestrated_task(db_session, test_project.id, run.id, prior_gate.id, agent.id)
-        prior_task.status, prior_task.completed_at = "done", datetime.now(timezone.utc)
-        prefix_event, _ = await emit_event_once(db_session, test_project.id, "task.status_changed", {
-            "task_id": str(prior_task.id), "status": "done", "previous_status": "in_progress", "project_id": str(test_project.id),
-        }, dedup_key=f"retained-valid-prefix:{prior_task.id}")
+    # Invalid/missing output event FIRST.
     event, _ = await emit_event_once(db_session, test_project.id, "task.status_changed", {
         "task_id": str(task.id), "status": "done", "previous_status": "in_progress", "project_id": str(test_project.id),
     }, dedup_key=f"retained-report-event:{task.id}")
+    second_event = None
+    if not valid:
+        # An independent valid terminal event SECOND must still land.
+        second_gate = await _make_gate(db_session, run.id)
+        second_task = await _make_orchestrated_task(db_session, test_project.id, run.id, second_gate.id, agent.id)
+        second_task.status, second_task.completed_at = "done", datetime.now(timezone.utc)
+        second_task.metadata_ = {**second_task.metadata_, "orchestration": {**second_task.metadata_["orchestration"],
+            "terminal_output": json.dumps(report)}, "orchestration_contract": {"expected_result": "work_report"}}
+        second_event, _ = await emit_event_once(db_session, test_project.id, "task.status_changed", {
+            "task_id": str(second_task.id), "status": "done", "previous_status": "in_progress", "project_id": str(test_project.id),
+        }, dedup_key=f"retained-valid-second:{second_task.id}")
     await db_session.commit()
+    run_id, goal_id, project_id, task_id, owner_id = run.id, goal.id, test_project.id, task.id, owner.id
+    event_id, second_id = event.id, second_event.id if second_event else None
     baseline = (await db_session.scalar(select(func.count()).select_from(Task)),
                 await db_session.scalar(select(func.count()).select_from(Session)))
     await db_session.commit()
@@ -932,42 +951,220 @@ async def test_unauthorized_retained_report_defers_correction_before_consumption
     monkeypatch.setattr(service, "_drive_recovery", recovery)
     monkeypatch.setattr(service, "_dispatch_result_correction", correction)
     monkeypatch.setattr(service, "request_llm_decision", provider)
-    await service.tick(db_session, run.id)
+    await service.tick(db_session, run_id)
     await db_session.commit()
-    marker_key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
+    db_session.expire_all()  # fresh reads
+    marker_key = f"run:{run_id}:kind:report_consumed:task:{task_id}"
     markers = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.idempotency_key == marker_key)))
-    native_actions = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.id != owner.id)))
+    native_actions = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.id != owner_id)))
     assert correction.await_count == recovery.await_count == provider.await_count == 0
     assert baseline == (await db_session.scalar(select(func.count()).select_from(Task)),
                         await db_session.scalar(select(func.count()).select_from(Session)))
-    await db_session.refresh(run)
+    run = await db_session.get(OrchestrationRun, run_id)
     assert run.baseline_authorized is False
     if valid:
         assert len(markers) == len(native_actions) == 1
-        assert markers[0].action_type == "report_consumed" and markers[0].target_id == task.id
-        assert run.event_cursor == (await _event_log(db_session, event.id)).seq
+        assert markers[0].action_type == "report_consumed" and markers[0].target_id == task_id
+        assert "pending_result_continuation" not in markers[0].request
+        assert run.event_cursor == (await _event_log(db_session, event_id)).seq
         await db_session.commit()
-        await service.tick(db_session, run.id)
+        await service.tick(db_session, run_id)
         assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
             OrchestrationAction.idempotency_key == marker_key)) == 1
         assert correction.await_count == recovery.await_count == provider.await_count == 0
     else:
-        assert markers == native_actions == []
-        assert prefix_event is not None
-        assert run.event_cursor == (await _event_log(db_session, prefix_event.id)).seq
-        assert len(await _evidence_rows(db_session, run.id)) == 1
-        # Explicit Continue unlocks the normal native invalid-report path.
-        await service.authorize_baseline(db_session, test_project.id, goal.id, actor="human:retained-report")
+        assert second_event is not None
+        # Both events' deterministic evidence/diagnostics are visible before authorization.
+        assert len(await _evidence_rows(db_session, run_id)) == 1  # the independent second event's evidence
+        # Only the invalid report pends; the independent valid second task's own consumption marker carries no pending.
+        assert len(markers) == 1 and markers[0] in native_actions and len(native_actions) == 2
+        (other,) = [a for a in native_actions if a.id != markers[0].id]
+        assert other.action_type == "report_consumed" and "pending_result_continuation" not in (other.request or {})
+        assert markers[0].request.get("report_validation_errors")
+        pending = markers[0].request["pending_result_continuation"]
+        assert pending["kind"] == "result_correction" and pending["task_id"] == str(task_id)
+        assert pending["event_id"] == str(event_id) and pending["reason"] == "unauthorized_baseline"
+        # Pending identity persisted in the same txn as the cursor advance past the second event.
+        assert run.event_cursor >= (await _event_log(db_session, second_id)).seq
+        # Reload, then Continue: exactly one native continuation, settled as applied.
+        await db_session.commit()
+        db_session.expire_all()
+        await service.authorize_baseline(db_session, project_id, goal_id, actor="human:retained-report")
         await db_session.commit()
         monkeypatch.setattr(GoalDefinitionProcess, "advance", AsyncMock(return_value={"status": "waiting_decision"}))
-        await service.tick(db_session, run.id)
+        await service.tick(db_session, run_id)
         await db_session.commit()
+        await service.tick(db_session, run_id)
+        await db_session.commit()
+        db_session.expire_all()
         assert correction.await_count == 1
         markers = list(await db_session.scalars(select(OrchestrationAction).where(OrchestrationAction.idempotency_key == marker_key)))
         assert len(markers) == 1
-        assert run.event_cursor >= (await _event_log(db_session, event.id)).seq
-        await db_session.commit()
+        assert "pending_result_continuation" not in markers[0].request
+        assert markers[0].request["pending_result_continuation_settled"]["outcome"] == "applied"
+        run = await db_session.get(OrchestrationRun, run_id)
+        assert run.event_cursor >= (await _event_log(db_session, second_id)).seq
         # Replay observes the consumed report; it does not acknowledge a second marker.
-        await service.tick(db_session, run.id)
+        await service.tick(db_session, run_id)
+        await db_session.commit()
         assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
             OrchestrationAction.idempotency_key == marker_key)) == 1
+        assert correction.await_count == 1
+
+
+# ---- SPR230/231: an event whose continuation cannot be recorded must not strand later landings ----
+
+async def _unrecordable_scenario(db_session, test_project, monkeypatch, *, filler_events=0):
+    """noise (resolved) -> invalid retained report (pend forced to fail) -> [fillers] -> independent valid terminal task."""
+    import json
+    from sqlalchemy import func
+    from huddleroom.models.orchestration import OrchestrationAction, OrchestrationRun
+    from huddleroom.services.orchestration_service import _PendingContinuationUnrecorded
+
+    service, goal, run = await _make_run(db_session, test_project.id)
+    agent = _agent("unrecordable", "developer", ["planning"])
+    db_session.add(agent)
+    await db_session.flush()
+    report = {"status": "completed", "changes": ["Audited existing state."], "evidence": ["Recorded audit observations."],
+              "criterion_progress": {"work": "candidate"}, "decisions": [], "risks": [], "open_questions": [],
+              "next_step": "Request verification.", "collaboration_need": None}
+    stuck = Task(project_id=test_project.id, title="Unrecordable report", status="done", assigned_to=agent.id,
+                 metadata_={"orchestration": {"run_id": str(run.id), "work_function": "planning",
+                                              "terminal_output": "invalid retained report"},
+                            "orchestration_contract": {"expected_result": "work_report"}})
+    db_session.add(stuck)
+    await db_session.flush()
+    owner = OrchestrationAction(run_id=run.id, idempotency_key=f"admitted-report:{stuck.id}",
+                                action_type="request_plan", status="completed", target_type="task", target_id=stuck.id)
+    db_session.add(owner)
+    await db_session.flush()
+    stuck.metadata_ = {**stuck.metadata_, "orchestration": {**stuck.metadata_["orchestration"], "action_id": str(owner.id)}}
+    gate = await _make_gate(db_session, run.id)
+    independent = await _make_orchestrated_task(db_session, test_project.id, run.id, gate.id, agent.id)
+    independent.status, independent.completed_at = "done", datetime.now(timezone.utc)
+    independent.metadata_ = {**independent.metadata_, "orchestration": {**independent.metadata_["orchestration"],
+                             "terminal_output": json.dumps(report)}, "orchestration_contract": {"expected_result": "work_report"}}
+
+    async def emit(event_type, payload, key):
+        event, _ = await emit_event_once(db_session, test_project.id, event_type, payload, dedup_key=key)
+        return event
+
+    events = {"before": await emit("noise.event", {}, f"noise-before:{stuck.id}")}
+    events["stuck"] = await emit("task.status_changed", {
+        "task_id": str(stuck.id), "status": "done", "previous_status": "in_progress", "project_id": str(test_project.id),
+    }, f"unrecordable:{stuck.id}")
+    for index in range(filler_events):
+        await emit("noise.event", {}, f"noise-{index}:{stuck.id}")
+    events["independent"] = await emit("task.status_changed", {
+        "task_id": str(independent.id), "status": "done", "previous_status": "in_progress",
+        "project_id": str(test_project.id),
+    }, f"independent-valid:{independent.id}")
+    await db_session.commit()
+    ids = {name: event.id for name, event in events.items()}
+    run_id, stuck_id, independent_id = run.id, stuck.id, independent.id
+
+    real = service._pend_result_continuation
+
+    def flaky(db, action, kind, task, *args, **kwargs):
+        if task is not None and task.id == stuck_id:
+            raise _PendingContinuationUnrecorded(kind)
+        return real(db, action, kind, task, *args, **kwargs)
+
+    monkeypatch.setattr(service, "_pend_result_continuation", flaky)
+    marker_count = lambda task_id: db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(  # noqa: E731
+        OrchestrationAction.idempotency_key == f"run:{run_id}:kind:report_consumed:task:{task_id}"))
+
+    async def cursor():
+        db_session.expire_all()
+        return (await db_session.get(OrchestrationRun, run_id)).event_cursor
+
+    async def seq(name):
+        return (await _event_log(db_session, ids[name])).seq
+
+    async def unpatch():
+        monkeypatch.setattr(service, "_pend_result_continuation", real)
+
+    return service, run_id, stuck_id, independent_id, marker_count, cursor, seq, unpatch, real
+
+
+@pytest.mark.asyncio
+async def test_unrecordable_continuation_freezes_the_cursor_but_later_independent_events_still_land(
+    db_session, test_project, monkeypatch,
+):
+    from unittest.mock import AsyncMock
+    from sqlalchemy import func
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.models.orchestration import OrchestrationRun
+
+    service, run_id, stuck_id, independent_id, marker_count, cursor, seq, unpatch, _real = (
+        await _unrecordable_scenario(db_session, test_project, monkeypatch))
+    spies = {name: AsyncMock() for name in ("_drive_recovery", "_dispatch_result_correction", "request_llm_decision")}
+    for name, spy in spies.items():
+        monkeypatch.setattr(service, name, spy)
+    tasks_before = await db_session.scalar(select(func.count()).select_from(Task))
+
+    result = await service.tick(db_session, run_id)  # no MissingGreenlet on the iteration after the rollback / post-loop
+    await db_session.commit()
+
+    assert result["processed_events"] == 2  # the noise event and the later independent terminal event
+    assert result["evidence_created"] == 1 and result["event_cursor"] == await seq("before")
+    # cursor frozen at the last contiguous resolved seq: it did not jump over the unresolved event
+    assert await cursor() == await seq("before") < await seq("stuck") < await seq("independent")
+    rows = await _evidence_rows(db_session, run_id)
+    assert [row.source_id for row in rows] == [independent_id]  # the later independent event landed
+    assert await marker_count(stuck_id) == 0  # the unrecordable event's partial work rolled back whole
+    assert await db_session.scalar(select(func.count()).select_from(Task)) == tasks_before
+    assert all(spy.await_count == 0 for spy in spies.values())
+    assert (await db_session.get(OrchestrationRun, run_id)).baseline_authorized is False
+
+    for _ in range(2):  # re-tick: the stuck event is retried, the landed one is not duplicated
+        again = await service.tick(db_session, run_id)
+        await db_session.commit()
+        assert again["evidence_created"] == 0
+        assert await cursor() == await seq("before")
+        assert [row.source_id for row in await _evidence_rows(db_session, run_id)] == [independent_id]
+        assert await marker_count(independent_id) == 1 and await marker_count(stuck_id) == 0
+
+    await unpatch()  # once the pend can be recorded the same event lands and the cursor moves past it
+    await service.tick(db_session, run_id)
+    await db_session.commit()
+    assert await cursor() == await seq("independent")
+    assert [row.source_id for row in await _evidence_rows(db_session, run_id)] == [independent_id]  # no duplicate
+    assert await marker_count(stuck_id) == 1 and await marker_count(independent_id) == 1
+    stuck_marker = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.idempotency_key == f"run:{run_id}:kind:report_consumed:task:{stuck_id}"))
+    assert stuck_marker.request["pending_result_continuation"]["event_id"] == str((await _event_log_by_seq(db_session, await seq("stuck"))).id)
+
+
+async def _event_log_by_seq(db_session, seq):
+    return (await db_session.execute(select(EventLog).where(EventLog.seq == seq))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_stuck_unrecordable_event_hides_events_beyond_the_batch_limit_known_tradeoff(
+    db_session, test_project, monkeypatch,
+):
+    """F4, KNOWN TRADE-OFF (asserts current behaviour, not a desired one): the frozen cursor makes every tick re-read
+    the same TICK_EVENT_BATCH_LIMIT events starting at the stuck one, so events past the batch are not reached
+    until the stuck event becomes recordable."""
+    from huddleroom.services.orchestration_service import TICK_EVENT_BATCH_LIMIT
+
+    # stuck + (LIMIT) fillers + independent: the independent event sits beyond the first batch of LIMIT events
+    service, run_id, stuck_id, independent_id, marker_count, cursor, seq, unpatch, _real = (
+        await _unrecordable_scenario(db_session, test_project, monkeypatch, filler_events=TICK_EVENT_BATCH_LIMIT))
+
+    for _ in range(2):
+        await service.tick(db_session, run_id)
+        await db_session.commit()
+        assert await cursor() == await seq("before")  # frozen behind the stuck event on every tick
+        assert await _evidence_rows(db_session, run_id) == []  # the independent event is beyond the batch: not reached
+        assert await marker_count(independent_id) == 0 and await marker_count(stuck_id) == 0
+
+    await unpatch()
+    await service.tick(db_session, run_id)  # stuck event now recordable; its batch resolves and the cursor moves on
+    await db_session.commit()
+    assert await cursor() > await seq("stuck")
+    await service.tick(db_session, run_id)  # next batch finally reaches the independent event
+    await db_session.commit()
+    assert await cursor() == await seq("independent")
+    assert {row.source_id for row in await _evidence_rows(db_session, run_id)} >= {independent_id}

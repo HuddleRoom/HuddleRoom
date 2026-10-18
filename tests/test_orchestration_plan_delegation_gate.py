@@ -30,6 +30,7 @@ from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.task_service import TaskService
 
 
+from tests.conftest import adopt_session
 from tests.conftest import bind_plan_author_team as _bind_team
 
 
@@ -736,6 +737,7 @@ async def test_execute_request_plan_action_replay_missing_inactive_stored_agent_
             action_id = action.id
 
         async with session_factory() as replay_db:
+            adopt_session(replay_db)
             service = OrchestrationService()
             with pytest.raises(HTTPException) as exc_info:
                 await service.execute_request_plan_action(
@@ -1996,6 +1998,7 @@ async def test_execute_request_plan_revision_action_replay_failure_persists_afte
             action_id = revision_action.id
 
         async with session_factory() as replay_db:
+            adopt_session(replay_db)
             service = OrchestrationService()
             with pytest.raises(HTTPException) as exc_info:
                 await service.execute_request_plan_revision_action(
@@ -2084,6 +2087,7 @@ async def test_execute_accept_plan_action_replay_failure_persists_after_rollback
             action_id = accept_action.id
 
         async with session_factory() as replay_db:
+            adopt_session(replay_db)
             service = OrchestrationService()
             with pytest.raises(HTTPException) as exc_info:
                 await service.execute_accept_plan_action(
@@ -2297,6 +2301,7 @@ async def test_execute_request_plan_action_replay_failure_persists_after_rollbac
             action_id = action.id
 
         async with session_factory() as replay_db:
+            adopt_session(replay_db)
             with pytest.raises(HTTPException) as exc_info:
                 await service.execute_request_plan_action(
                     replay_db,

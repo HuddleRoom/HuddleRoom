@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
@@ -46,6 +47,7 @@ from huddleroom.services.orchestration_decision_dispatcher import OrchestrationD
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_recovery_registry import RecoveryToolRegistry
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.conftest import adopt_session
 from tests.test_orchestration_delegation_contracts import _make_run
 from tests.test_orchestration_recovery_adapters import sha, spy_dispatch
 
@@ -91,8 +93,17 @@ def cli_agent(name: str, runtime: str | None = "claude_code", *, adapter_type: s
                  is_active=active)
 
 
+@pytest_asyncio.fixture
+async def db_session(owned_session_factory):
+    """Autobegin session (no session.begin()) so the test task can own it."""
+    async with owned_session_factory() as db:
+        yield db
+        await db.rollback()
+
+
 async def seed(db, project, *, agent: Agent | None = None, eligible: bool = True):
     """An authorized (Started) run with a completed baseline; the agent is accepted for implementation work."""
+    adopt_session(db)  # the test task owns this autobegin session, as get_db does
     agent = agent or cli_agent("fixer")
     db.add(agent)
     await db.flush()

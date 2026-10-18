@@ -38,6 +38,7 @@ from huddleroom.services.orchestration_roadmap_service import (
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.schemas.orchestration import OrchestrationDelegationContract
 
+from tests.conftest import adopt_session
 from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _complete_task_session, _run_actions
 
 
@@ -61,6 +62,7 @@ async def test_engine(tmp_path):
         cursor = connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -90,12 +92,25 @@ pytestmark = pytest.mark.asyncio
 def _owned_module_setup(db_session, monkeypatch):
     # Patch only this module's setup aliases; imported helpers remain unchanged for other modules.
     original_authorized = _authorized_run
+    marker = "orchestration_tick_owns_transaction"
+    previous = db_session.info.get(marker)
     async def authorized(db, *args, **kwargs):
         root = db.sync_session.get_transaction()
         if db is db_session and not db.in_nested_transaction() and (root is None or root.origin.name == "AUTOBEGIN"):
             kwargs["owns_setup"] = True
+            adopt_session(db)
+            # Direct step calls stand in for a tick-owned transaction that releases the writer before model calls.
+            # Direct step calls after setup need the flag too, so it cannot be scoped to this call; the goal id
+            # does not exist until setup runs, so _lock_goal_for_baseline_transition (the production setter)
+            # cannot wrap it. Set it here and restore it at test teardown instead.
+            db.info[marker] = True
         return await original_authorized(db, *args, **kwargs)
     monkeypatch.setitem(globals(), "_authorized_run", authorized)
+    yield
+    if previous is None:
+        db_session.info.pop(marker, None)
+    else:
+        db_session.info[marker] = previous
 
 
 
@@ -568,6 +583,7 @@ async def test_managed_advance_waits_then_accepts_and_replays_once(
     _accept_decision(stub_decision, artifact)
     approval_id = None
     for _ in range(3):
+        await db_session.commit()
         assert await service._advance_authorized_execution(db_session, goal, run) == {
             "step": "waiting_plan_authority",
         }
@@ -582,6 +598,7 @@ async def test_managed_advance_waits_then_accepts_and_replays_once(
     )) == 1
 
     await _approve(db_session, goal, approval)
+    await db_session.commit()
     result = await service._advance_authorized_execution(db_session, goal, run)
     assert result["step"] == "plan_decision"
     action = await db_session.get(OrchestrationAction, uuid.UUID(result["action_id"]))
@@ -608,6 +625,7 @@ async def test_advance_rejects_approval_from_wrong_selected_authority_before_res
         db_session, test_project, test_user, authority_model=authority_model, seed_approval=False,
     )
     _accept_decision(stub_decision, artifact)
+    await db_session.commit()
     assert (await service._advance_authorized_execution(db_session, goal, run))["step"] == "waiting_plan_authority"
     approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id,
@@ -626,6 +644,7 @@ async def test_advance_rejects_approval_from_wrong_selected_authority_before_res
         await db_session.flush()
         goal.manager_agent_id = replacement.id
 
+    await db_session.commit()
     assert await service._advance_authorized_execution(db_session, goal, run) == {"step": "plan_revision_required"}
     assert run.plan_state["status"] == "revision_required"
     assert "not from the selected authority" in run.plan_state["revision_reason"]
@@ -640,11 +659,13 @@ async def test_advance_rejected_approval_requests_revision_without_accept_action
         db_session, test_project, test_user, seed_approval=False,
     )
     _accept_decision(stub_decision, artifact)
+    await db_session.commit()
     await service._advance_authorized_execution(db_session, goal, run)
     approval = await _pending_approval(db_session, run)
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, approval, selected_option="reject", decided_by_user_id=goal.manager_user_id,
     )
+    await db_session.commit()
     assert await service._advance_authorized_execution(db_session, goal, run) == {"step": "plan_revision_required"}
     assert run.plan_state["status"] == "revision_required"
     assert run.plan_state["revision_reason"] == "Roadmap plan approval was rejected"
@@ -652,6 +673,7 @@ async def test_advance_rejected_approval_requests_revision_without_accept_action
         "action_type": "request_plan_revision", "plan_task_id": str(artifact.linked_task_id),
         "revision_request": "Address the authority rejection.", "reason": "Authority rejected this plan.",
     })
+    await db_session.commit()
     result = await service._advance_authorized_execution(db_session, goal, run)
     revision = await db_session.get(OrchestrationAction, uuid.UUID(result["action_id"]))
     assert revision.action_type == "request_plan_revision" and revision.status == "completed"
@@ -675,6 +697,7 @@ async def test_no_manager_advance_ingests_independent_verification_and_accepts_o
     _accept_decision(stub_decision, artifact)
     verification_id = None
     for _ in range(3):
+        await db_session.commit()
         result = await service._advance_authorized_execution(db_session, goal, run)
         assert result["step"] == "waiting_plan_authority"
         verification_id = verification_id or result["action_id"]
@@ -705,6 +728,7 @@ async def test_no_manager_advance_ingests_independent_verification_and_accepts_o
     assert evidence[0].evidence_metadata["verification_action_id"] == verification_id
     assert await service._ingest_evidence_from_events(db_session, run, events) == 0
 
+    await db_session.commit()
     result = await service._advance_authorized_execution(db_session, goal, run)
     assert result["step"] == "plan_decision"
     acceptance = await db_session.get(OrchestrationAction, uuid.UUID(result["action_id"]))
@@ -890,6 +914,13 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
     db_session.add(candidate)
     await db_session.flush()
     _accept_decision(stub_decision, candidate)
+    # The candidate artifact does not alter decision context, so mark the earlier replan decision as
+    # computed from a different context; otherwise the committed read replays it instead of deciding anew.
+    # Restricted to the latest decision, the one the committed read would replay instead of deciding anew.
+    latest_decision_id = await db_session.scalar(select(OrchestrationDecision.id).where(
+        OrchestrationDecision.run_id == run.id).order_by(OrchestrationDecision.created_at.desc()).limit(1))
+    await db_session.execute(update(OrchestrationDecision).where(
+        OrchestrationDecision.id == latest_decision_id).values(input_snapshot={"superseded": True}))
     await db_session.commit()  # Publish known scenario state before the native tick.
     waiting = await service.tick(db_session, run.id)
     assert waiting["authorized_execution"]["step"] == "waiting_plan_authority"
@@ -1749,6 +1780,7 @@ async def test_advance_turns_expansion_limit_into_plan_revision(db_session, test
     )
     goal.orchestrator_context = {**goal.orchestrator_context, "expansion_policy": {"max_goal_depth": 0, "depth": 0}}
     _accept_decision(stub_decision, artifact)
+    await db_session.commit()
     result = await service._advance_authorized_execution(db_session, goal, run)
     assert result["step"] == "plan_revision_required" and "max_goal_depth 0" in result["reason"]
     assert run.plan_state["status"] == "revision_required" and "expansion_limit" in run.plan_state["revision_reason"]

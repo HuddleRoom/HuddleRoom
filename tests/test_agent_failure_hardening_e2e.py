@@ -48,6 +48,7 @@ async def db_session(test_engine, monkeypatch):
 
 from sqlalchemy import select
 
+from tests.conftest import adopt_session
 from huddleroom.config import settings
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.orchestration import (
@@ -174,8 +175,9 @@ async def _criteria(db, goal, run):
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
 async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
-    db_session, test_project, stub_decision, monkeypatch,
+    db_session, test_project, stub_decision, monkeypatch, owned_session_factory,
 ):
+    adopt_session(db_session)
     monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     analyzed = []
 
