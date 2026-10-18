@@ -450,6 +450,127 @@ async def test_spr231_locked_database_during_drain_stays_pending_then_applies_on
             EventLog.dedup_key == f"authority.decision_resolved:{decision.id}")) == 1
 
 
+async def test_spr248_stalled_source_blocks_saved_answer_without_continuation_timestamp(
+    sessions, tmp_path, monkeypatch,
+):
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+
+    async def stalled(*_args, **_kwargs):
+        return {"status": "waiting_decision"}
+
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", stalled)
+    async with sessions() as submitting:
+        accepted = await application.answer_decision(
+            submitting, project.id, goal.id, decision.id,
+            OrchestrationDecisionAnswerRequest(selected_option="approve", reason="Await actual source progress"), user,
+        )
+    async with sessions() as consumer:
+        result = await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert accepted.answer_receipt.action_id in result.failed
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, accepted.answer_receipt.action_id)
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+        assert action.status == "failed"
+        assert action.dispatch_contract["application_state"] == "blocked"
+        assert action.dispatch_contract["reason"] == "source_process_did_not_advance"
+        assert saved.continuation_applied_at is None
+        assert (await fresh.get(OrchestrationProcessRun, source.id)).status == "waiting_decision"
+
+
+async def test_spr248_linked_successor_applies_request_changes_answer(sessions, tmp_path, monkeypatch):
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+
+    async def supersede(_service, db, current_goal, current_run, process_type):
+        return await OrchestrationProcessService().start_process(
+            db, current_goal.id, process_type=process_type, trigger_reason="requested revision",
+            run_id=current_run.id, supersede_waiting=True,
+        )
+
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", supersede)
+    async with sessions() as submitting:
+        accepted = await application.answer_decision(
+            submitting, project.id, goal.id, decision.id,
+            OrchestrationDecisionAnswerRequest(selected_option="request_changes", reason="Revise the objective"), user,
+        )
+    async with sessions() as consumer:
+        result = await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert accepted.answer_receipt.action_id in result.applied
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, accepted.answer_receipt.action_id)
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+        current = await OrchestrationProcessService().get_current(fresh, goal.id, source.process_type)
+        assert action.status == "completed" and action.dispatch_contract["application_state"] == "applied"
+        assert saved.continuation_applied_at is not None
+        assert current is not None and current.id != source.id and current.run_id == run.id
+
+
+@pytest.mark.parametrize("forgery", ["missing", "wrong_type", "wrong_key", "foreign_goal", "stale_source"])
+async def test_spr248_forged_hierarchy_continuation_effect_cannot_settle_answer(
+    sessions, tmp_path, monkeypatch, forgery,
+):
+    seeded = await seed_hierarchy_proposal(sessions, tmp_path, monkeypatch)
+    async with sessions() as submitting:
+        goal = await submitting.get(OrchestrationGoal, seeded.goal_id)
+        user = await submitting.get(User, seeded.user_id)
+        accepted = await application.answer_decision(
+            submitting, seeded.project_id, seeded.goal_id, seeded.decision_id,
+            OrchestrationDecisionAnswerRequest(selected_option="approve"), user,
+        )
+        action = await submitting.get(OrchestrationAction, accepted.answer_receipt.action_id)
+        decision = await submitting.get(OrchestrationAuthorityDecision, seeded.decision_id)
+        target_id = uuid.uuid4()
+        target_type = "decision"
+        if forgery == "wrong_type":
+            target_type = "process"
+        elif forgery == "wrong_key":
+            target_id = decision.id
+        elif forgery == "foreign_goal":
+            from huddleroom.models.orchestration import OrchestrationRun
+            foreign_goal = OrchestrationGoal(project_id=goal.project_id, objective="Foreign hierarchy target")
+            submitting.add(foreign_goal)
+            await submitting.flush()
+            foreign_run = OrchestrationRun(goal_id=foreign_goal.id, status="running", phase="baseline")
+            submitting.add(foreign_run)
+            await submitting.flush()
+            foreign = OrchestrationAuthorityDecision(
+                goal_id=foreign_goal.id, run_id=foreign_run.id, decision_key="team_hierarchy:approval",
+                title="Foreign hierarchy approval", authority="human", question="Approve?", options=[{"key": "approve"}],
+            )
+            submitting.add(foreign)
+            await submitting.flush()
+            target_id = foreign.id
+        elif forgery == "stale_source":
+            from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+            await OrchestrationProcessService().start_process(
+                submitting, goal.id, process_type="team_hierarchy", trigger_reason="stale replacement",
+                run_id=seeded.run_id, supersede_waiting=True,
+            )
+        effects = dict(action.dispatch_contract["effects"])
+        effects[f"continuation_decision:{decision.source_process_run_id}"] = {
+            "target_type": target_type,
+            "target_id": str(target_id),
+        }
+        action.dispatch_contract = {**action.dispatch_contract, "effects": effects}
+        await submitting.commit()
+    async with sessions() as consumer:
+        result = await application.drain_answer_applications(consumer, seeded.run_id)
+        await consumer.commit()
+    assert accepted.answer_receipt.action_id not in result.applied
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, accepted.answer_receipt.action_id)
+        decision = await fresh.get(OrchestrationAuthorityDecision, seeded.decision_id)
+        assert action.status == "failed"
+        assert decision.continuation_applied_at is None
+
+
 async def test_spr231_non_lock_operational_error_during_drain_fails_without_retry(sessions, tmp_path, monkeypatch):
     from sqlalchemy.exc import OperationalError
     from huddleroom.services.orchestration_debug_service import OrchestrationDebugService

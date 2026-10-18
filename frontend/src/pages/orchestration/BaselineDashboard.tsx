@@ -46,6 +46,7 @@ import { ProcessFocus } from './ProcessFocus'
 import { NeedsYouQueue, type RecoveryAnswerOption } from './NeedsYouQueue'
 import { useGoalAnnouncer } from './goalAnnouncer'
 import { hierarchyAgentResolver } from './hierarchyAgentNames'
+import { HierarchyEvidence } from './HierarchyEvidence'
 import {
   safeNeedsYouText,
   validateNeedsYouEdit,
@@ -589,7 +590,8 @@ function TeamHierarchyProposalForm({ decision, disabled, reviewLocked = false, s
   </div>
 }
 
-function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: readonly OrchestrationAuthorityDecisionRecord[]; processId: string | null; reviews: readonly OrchestrationAgentReviewRecord[] }) {
+function TeamHierarchyStatus({ decisions, process, reviews }: { decisions: readonly OrchestrationAuthorityDecisionRecord[]; process: OrchestrationProcessRunRecord | undefined; reviews: readonly OrchestrationAgentReviewRecord[] }) {
+  const processId = process?.id ?? null
   const current = processId ? decisions.filter((item) => item.source_process_run_id === processId) : []
   const pending = current.filter((item) => item.status === 'pending' && item.decision_key.startsWith('team_hierarchy:agent:'))
   const approval = current.find((item) => item.status === 'pending' && item.decision_key === 'team_hierarchy:approval')
@@ -601,17 +603,19 @@ function TeamHierarchyStatus({ decisions, processId, reviews }: { decisions: rea
   const option = approval?.options.find((candidate) => typeof candidate === 'object' && candidate !== null && 'proposal' in candidate) as { proposal?: Record<string, unknown> } | undefined
   const proposal = option?.proposal
   if (!proposal) return null
-  const list = (key: string) => Array.isArray(proposal[key]) ? proposal[key] as unknown[] : []
+  const approvalOption = (option as Record<string, unknown> | undefined)?.key === 'approve_with_documented_gaps'
+    ? 'Approve with documented gaps'
+    : null
+  const outputs = process && typeof process.outputs === 'object' && process.outputs !== null && !Array.isArray(process.outputs) ? process.outputs as Record<string, unknown> : {}
+  const revisionContext = typeof outputs.revision_context === 'object' && outputs.revision_context !== null && !Array.isArray(outputs.revision_context) ? outputs.revision_context as Record<string, unknown> : null
+  const approvedUnused = Array.isArray(proposal.approved_but_unused_agent_ids) ? proposal.approved_but_unused_agent_ids : []
   const resolveAgent = hierarchyAgentResolver(reviews)
-  const agentName = (value: unknown) => resolveAgent(value) ?? 'Unknown agent'
-  const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-  const assignments = list('assignments').filter(isRecord)
-  const reporting = list('reporting_lines').filter(isRecord)
   return <section className="rounded border border-huddleroom-border p-3"><h3 className="text-sm font-medium text-huddleroom-text-primary">Proposed hierarchy</h3>
-    <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Assignments</p><ul className="text-sm text-huddleroom-text-secondary">{assignments.map((assignment, index) => <li key={index}>{typeof assignment.work_function === 'string' ? assignment.work_function : 'Work function'}: {agentName(assignment.agent_ref)}</li>)}</ul>
-    <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Reporting</p><ul className="text-sm text-huddleroom-text-secondary">{reporting.map((line, index) => <li key={index}>{agentName(line.agent_ref)} reports to {agentName(line.reports_to)}</li>)}</ul>
+    <HierarchyEvidence proposal={proposal} reviews={reviews} revisionContext={revisionContext} />
+    {approvalOption && <p className="mt-2 text-xs"><span className="font-medium text-huddleroom-text-muted">Approval:</span> {approvalOption}</p>}
     <p className="mt-2 text-xs"><span className="font-medium text-huddleroom-text-muted">Rationale:</span> {String(proposal.rationale ?? 'None')}</p><p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Self-review:</span> {String(proposal.self_review ?? 'None')}</p>
-    <p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Documented gaps:</span> {list('documented_gaps').length ? list('documented_gaps').join(', ') : 'None'}</p><p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Approved but unused:</span> {list('approved_but_unused_agent_ids').length ? list('approved_but_unused_agent_ids').map(agentName).join(', ') : 'None'}</p>
+    <p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Documented gaps:</span> {Array.isArray(proposal.documented_gaps) && proposal.documented_gaps.length ? proposal.documented_gaps.join(', ') : 'None'}</p>
+    <p className="mt-1 text-xs"><span className="font-medium text-huddleroom-text-muted">Approved but unused:</span> {approvedUnused.length ? approvedUnused.map((agent) => resolveAgent(agent) ?? 'Unknown agent').join(', ') : 'None'}</p>
   </section>
 }
 
@@ -1380,7 +1384,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   }
 
   return <div data-testid="baseline-dashboard" className="flex min-w-0 flex-col gap-4">
-    <TeamHierarchyStatus decisions={decisions} reviews={dashboard.agentReviews.data ?? []} processId={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)?.id ?? null} />
+    <TeamHierarchyStatus decisions={decisions} reviews={dashboard.agentReviews.data ?? []} process={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)} />
     <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
     {processState === 'ready' && <>
       {savedAnswers.length > 0 && <section aria-label="Saved answers" className="mb-3 space-y-2">{savedAnswers.map((receipt) => <p key={receipt.action_id ?? receipt.decision_ids.join(':')} className="break-words rounded border border-huddleroom-border p-3 text-sm">

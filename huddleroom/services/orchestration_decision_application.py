@@ -234,6 +234,12 @@ async def validate_ordinary_submission(db, goal, decisions, submission, answers)
         if set(submission.decision_ids) != {d.id for d in pending}:
             raise HTTPException(409, "pending proposal set changed")
     for decision, answer in zip(decisions, answers):
+        if (
+            decision.decision_key == "team_hierarchy:approval"
+            and answer["selected_option"] == "request_changes"
+            and not str(answer.get("reason") or "").strip()
+        ):
+            raise HTTPException(400, "team hierarchy request_changes requires feedback")
         if not decision.decision_key.startswith("team_hierarchy:agent:"):
             continue
         current = await OrchestrationProcessService().get_current(db, goal.id, "team_hierarchy")
@@ -246,12 +252,38 @@ async def validate_ordinary_submission(db, goal, decisions, submission, answers)
             # The accepting owner persists the rerun suggestion after rolling this rejection back.
             stale.stale_inputs = {"goal_id": goal.id, "process_run_id": current.id, "run_id": current.run_id}
             raise stale
-        if answer["selected_option"] == "edit":
+        if answer["selected_option"] in {"approve", "edit"}:
             from huddleroom.schemas.agent import AgentCreate
-            edited_agent = canonical_agent_create(AgentCreate.model_validate(answer["edited_agent"]))
-            AgentService.validate_create(edited_agent)
-            answer["answer_reason"] = json.dumps({"reason": answer.get("reason"), "created_agent_id": str(uuid.uuid4()),
-                "edited_agent": edited_agent.model_dump(mode="json")}, sort_keys=True)
+            metadata = {"reason": answer.get("reason"), "created_agent_id": str(uuid.uuid4())}
+            if answer["selected_option"] == "edit":
+                edited_agent = canonical_agent_create(AgentCreate.model_validate(answer["edited_agent"]))
+                AgentService.validate_create(edited_agent)
+                metadata["edited_agent"] = edited_agent.model_dump(mode="json")
+            else:
+                analysis = (current.outputs or {}).get("analysis")
+                proposal = next((item for item in (analysis or {}).get("proposed_agents", [])
+                                 if decision.decision_key == f"team_hierarchy:agent:{item.get('proposal_id')}"), None)
+                if not isinstance(proposal, dict) or not isinstance(proposal.get("definition"), dict):
+                    raise HTTPException(409, "team hierarchy proposal definition is unavailable")
+                AgentService.validate_create(canonical_agent_create(AgentCreate.model_validate(proposal["definition"])))
+                proposal_ref = f"proposal:{proposal.get('proposal_id')}"
+                needs_rejudge = (
+                    isinstance((current.outputs or {}).get("revision_context"), dict)
+                    or any(
+                        isinstance(item, dict)
+                        and item.get("agent_ref") == proposal_ref
+                        and item.get("status") == "proposed"
+                        for item in (analysis or {}).get("responsibility_coverage", [])
+                    )
+                )
+                if needs_rejudge:
+                    # The answer application will roster-create this reserved
+                    # agent. A revision/provisional coverage needs one successor
+                    # to rejudge its actual accepted definition.
+                    from huddleroom.services.orchestration_team_hierarchy import PROPOSAL_RESOLUTION_RERUN_SENTINEL
+                    current.outputs = {**(current.outputs or {}), "resolved_validation_repair_attempted": True}
+                    current.input_snapshot = {"fingerprint": PROPOSAL_RESOLUTION_RERUN_SENTINEL}
+            answer["answer_reason"] = json.dumps(metadata, sort_keys=True)
 
 
 from huddleroom.services.orchestration_answer_receipts import (  # noqa: E402

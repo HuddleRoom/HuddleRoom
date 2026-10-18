@@ -1618,6 +1618,51 @@ describe('Baseline dashboard D3 composition', () => {
     } finally { view.cleanup() }
   })
 
+  it('renders readonly hierarchy feedback, outcomes, and capability coverage from the pending exact proposal', () => {
+    const hierarchy = process({
+      id: 'hierarchy-evidence', process_type: 'team_hierarchy', status: 'waiting_decision',
+      outputs: { revision_context: { feedback_text: 'Keep the market and product feedback durable.' } },
+    })
+    const proposal = {
+      assignments: [{ work_function: 'implementation', agent_ref: 'worker-id' }],
+      reporting_lines: [], documented_gaps: [], rationale: 'The final proposal is evidence-backed.', self_review: 'Checked.',
+      feedback_results: [
+        { item_id: 'feedback:market', source_excerpt: 'Assign Market ownership.', disposition: 'applied', reason: 'Market accepted the commercial work.', change_refs: ['responsibility:commercial'] },
+        { item_id: 'feedback:product', source_excerpt: 'Assign Product ownership.', disposition: 'applied', reason: 'Product accepted sequencing.', change_refs: ['responsibility:product'] },
+        { item_id: 'feedback:ux', source_excerpt: 'Record the UX gap.', disposition: 'impossible', reason: 'No eligible UX capability.', change_refs: [] },
+        { item_id: 'feedback:developer', source_excerpt: 'Do not assign the excluded coder.', disposition: 'declined', reason: 'Commercial work is excluded.', change_refs: [] },
+      ],
+      responsibility_coverage: [
+        { responsibility_id: 'commercial', responsibility: 'Commercial evidence', work_function: 'implementation', agent_ref: 'market-id', status: 'covered', reason: 'Accepted Market evidence.', evidence_ref: 'agent_review:market', source_ref: 'feedback:market' },
+        { responsibility_id: 'product', responsibility: 'Acceptance sequencing', work_function: 'implementation', agent_ref: 'product-id', status: 'covered', reason: 'Accepted Product evidence.', evidence_ref: 'agent_review:product', source_ref: 'feedback:product' },
+        { responsibility_id: 'ux-zero-eligible', responsibility: 'UX consent', work_function: 'implementation', agent_ref: null, status: 'gap', reason: 'No eligible UX capability.', evidence_ref: 'gap:ux', source_ref: 'feedback:ux' },
+      ],
+    }
+    const approval = decision({
+      decision_key: 'team_hierarchy:approval', source_process_run_id: hierarchy.id,
+      options: [{ key: 'approve_with_documented_gaps', proposal }],
+    })
+    api.dashboard = dashboardData({
+      processes: query([hierarchy]), decisions: query([approval]),
+      checkpoint: query({ goal_id: goal().id, items: [approval], deferred_count: 0, max_questions: 5 }),
+      agentReviews: query([
+        review({ agent_id: 'worker-id', definition_snapshot: { name: 'Worker' } }),
+        review({ agent_id: 'market-id', definition_snapshot: { name: 'Market Owner' } }),
+        review({ agent_id: 'product-id', definition_snapshot: { name: 'Product Owner' } }),
+      ]),
+    })
+
+    const markup = renderDashboard()
+
+    for (const text of [
+      'Feedback requested', 'Keep the market and product feedback durable.', 'Outcomes', 'Assign Market ownership.', 'Assign Product ownership.',
+      'Record the UX gap.', 'Do not assign the excluded coder.', 'Responsibility coverage',
+      'Market Owner', 'Product Owner', 'UX consent', 'No eligible UX capability.',
+      'Domain owner — lacks execution role',
+    ]) expect(markup).toContain(text)
+    expect(markup).toContain('Approve with documented gaps')
+  })
+
   it('shows agent names in proposed hierarchy assignments, reporting and unused agents without raw JSON', () => {
     const implementerId = '11111111-1111-4111-8111-111111111111'
     const managerId = '22222222-2222-4222-8222-222222222222'

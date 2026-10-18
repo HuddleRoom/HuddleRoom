@@ -4,6 +4,7 @@ from dataclasses import replace
 from copy import deepcopy
 import hashlib
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
@@ -2056,7 +2057,16 @@ async def test_resource_capture_contains_full_redacted_roster_and_all_preview_in
     )
     hierarchy = OrchestrationProcessRun(
         goal_id=goal.id, run_id=run.id, process_type="team_hierarchy", status="completed",
-        trigger_reason="accepted", input_snapshot={"fingerprint": SHA256}, outputs={"analysis": {"manager": str(planner.id)}},
+        trigger_reason="accepted", input_snapshot={"fingerprint": SHA256}, outputs={
+            "analysis": {"manager": str(planner.id)},
+            "responsibility_coverage": [{
+                "responsibility_id": "ux-zero-eligible",
+                "status": "gap",
+                "reason": "Sensitive note token=sk-coverage-secret must be redacted.",
+                "evidence_ref": "gap:zero-eligible-ux",
+            }],
+            "accepted_responsibility_gap_ids": ["ux-zero-eligible"],
+        },
     )
     db_session.add_all([task, definition, hierarchy])
     await db_session.flush()
@@ -2084,9 +2094,15 @@ async def test_resource_capture_contains_full_redacted_roster_and_all_preview_in
     assert f"task:{task.id}" in before.values
     assert f"process:agent_definition_review:{definition.id}" in before.values
     assert f"process:team_hierarchy:{hierarchy.id}" in before.values
+    captured_hierarchy = before.values[f"process:team_hierarchy:{hierarchy.id}"]
+    assert captured_hierarchy["accepted_responsibility_coverage"][0]["responsibility_id"] == "ux-zero-eligible"
+    assert captured_hierarchy["accepted_accepted_responsibility_gap_ids"] == ["ux-zero-eligible"]
+    captured_hierarchy["accepted_responsibility_coverage"][0]["reason"] = "mutated snapshot"
+    assert hierarchy.outputs["responsibility_coverage"][0]["reason"] != "mutated snapshot"
     serialized = json.dumps(before.values, sort_keys=True)
     assert "api_key" not in serialized
     assert "must-not-appear" not in serialized
+    assert "sk-coverage-secret" not in serialized
 
     db_planner.description = "Changed full roster field."
     collateral_goal.constraints = {"deadline": "tomorrow"}
@@ -2096,6 +2112,124 @@ async def test_resource_capture_contains_full_redacted_roster_and_all_preview_in
     after = await registry.capture_resources(db_session, goal, run, proposal)
 
     assert after.fingerprint != before.fingerprint
+
+
+def test_configuration_gates_require_exact_substantive_gap_acknowledgement_but_keep_legacy_behavior():
+    definition = SimpleNamespace(
+        status="completed",
+        outputs={"gates": {"agent_definitions_reviewed": True}},
+    )
+    gap = {
+        "responsibility_id": "ux-zero-eligible",
+        "status": "gap",
+        "reason": "No accepted UX capability.",
+    }
+    hierarchy = SimpleNamespace(
+        status="completed",
+        outputs={
+            "approval": "approve_with_documented_gaps",
+            "approval_decision_id": "bound-human-decision",
+            "responsibility_coverage": [gap],
+            "accepted_responsibility_gap_ids": [gap["responsibility_id"]],
+            "documented_gaps": [],
+            "gates": {
+                "team_structure_reviewed": True,
+                "agent_definitions_reviewed": True,
+                "required_work_functions_mapped": False,
+                "missing_capabilities_handled": True,
+                "independent_verification_possible_or_overridden": True,
+            },
+        },
+    )
+
+    assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is True
+    for invalid in (
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": []},
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": ["wrong-gap"]},
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": [gap["responsibility_id"], gap["responsibility_id"]]},
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": [gap["responsibility_id"], 1]},
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": [""]},
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": ["   "]},
+        {**hierarchy.outputs, "approval": "approve"},
+        {**hierarchy.outputs, "approval_decision_id": None},
+        {**hierarchy.outputs, "responsibility_coverage": []},
+        {**hierarchy.outputs, "responsibility_coverage": [{}]},
+        {**hierarchy.outputs, "responsibility_coverage": [{**gap, "status": "proposed"}]},
+        {**hierarchy.outputs, "responsibility_coverage": [{**gap, "status": "partial"}]},
+        {**hierarchy.outputs, "responsibility_coverage": [{key: value for key, value in gap.items() if key != "responsibility_id"}]},
+        {**hierarchy.outputs, "responsibility_coverage": [{**gap, "responsibility_id": ""}]},
+        {**hierarchy.outputs, "responsibility_coverage": [{**gap, "responsibility_id": "   "}]},
+        {**hierarchy.outputs, "responsibility_coverage": [{**gap, "responsibility_id": 1}]},
+        {**hierarchy.outputs, "responsibility_coverage": [gap, deepcopy(gap)]},
+    ):
+        hierarchy.outputs = invalid
+        assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is False
+
+    generic_gaps = ["legacy-generic-gap"]
+    hierarchy.outputs = {
+        "approval": "approve_with_documented_gaps",
+        "approval_decision_id": "bound-human-decision",
+        "responsibility_coverage": [],
+        "accepted_responsibility_gap_ids": [],
+        "documented_gaps": generic_gaps,
+        "gates": {
+            "team_structure_reviewed": True,
+            "agent_definitions_reviewed": True,
+            "required_work_functions_mapped": False,
+            "missing_capabilities_handled": True,
+            "independent_verification_possible_or_overridden": True,
+        },
+    }
+    assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is True
+    for invalid in (
+        {**hierarchy.outputs, "approval": "approve"},
+        {**hierarchy.outputs, "approval_decision_id": ""},
+        {**hierarchy.outputs, "accepted_responsibility_gap_ids": ["stale-gap"]},
+    ):
+        hierarchy.outputs = invalid
+        assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is False
+
+    hierarchy.outputs = {
+        **{
+            key: value for key, value in hierarchy.outputs.items()
+            if key not in {"approval", "approval_decision_id", "responsibility_coverage", "accepted_responsibility_gap_ids"}
+        },
+        "approval": "approve_with_documented_gaps",
+        "approval_decision_id": "bound-human-decision",
+        "responsibility_coverage": [gap],
+        "accepted_responsibility_gap_ids": [gap["responsibility_id"]],
+    }
+    assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is True
+
+    hierarchy.outputs = {
+        "approval": "approve",
+        "approval_decision_id": "clean-bound-decision",
+        "responsibility_coverage": [],
+        "accepted_responsibility_gap_ids": [],
+        "documented_gaps": [],
+        "gates": {
+            "team_structure_reviewed": True,
+            "agent_definitions_reviewed": True,
+            "required_work_functions_mapped": True,
+            "missing_capabilities_handled": True,
+            "independent_verification_possible_or_overridden": True,
+        },
+    }
+    assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is True
+    hierarchy.outputs = {**hierarchy.outputs, "accepted_responsibility_gap_ids": ["stale-gap"]}
+    assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is False
+
+    hierarchy.outputs = {
+        "documented_gaps": ["legacy-generic-gap"],
+        "gates": {
+            "team_structure_reviewed": True,
+            "agent_definitions_reviewed": True,
+            "required_work_functions_mapped": False,
+            "missing_capabilities_handled": True,
+            "independent_verification_possible_or_overridden": True,
+        },
+    }
+    assert RecoveryToolRegistry._configuration_gates(definition, hierarchy) is True
 
 
 @pytest.mark.asyncio

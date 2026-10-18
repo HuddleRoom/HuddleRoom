@@ -441,6 +441,8 @@ async def drain_answer_applications(db, run_id):
                         action.status = "failed"
                         return
                     if source is not None and source.process_type in SUPPORTED_PROCESS_TYPES:
+                        source_id_value = source.id
+                        linked_successor = False
                         current = await OrchestrationProcessService().get_current(db, goal_id, source.process_type)
                         effects = (action.dispatch_contract or {}).get("effects", {})
                         if current is None or current.id != source.id:
@@ -449,12 +451,17 @@ async def drain_answer_applications(db, run_id):
                                     and successor["target_id"] == str(current.id) and current.run_id == run_id):
                                 # Resume only the successor already linked by this application's native write.
                                 source = current
+                                linked_successor = True
                             elif f"complete_process:{source.id}" not in effects:
                                 action.dispatch_contract = {**(action.dispatch_contract or {}),
                                     "application_state": "blocked", "reason": "source_process_superseded"}
                                 action.status = "failed"
                                 return
-                        if f"complete_process:{source.id}" not in effects and source.superseded_by_id is None:
+                        if (
+                            not linked_successor
+                            and f"complete_process:{source.id}" not in effects
+                            and source.superseded_by_id is None
+                        ):
                             with application_context(action_id):
                                 if source.process_type == "team_hierarchy":
                                     from huddleroom.services.orchestration_team_hierarchy import (
@@ -465,6 +472,57 @@ async def drain_answer_applications(db, run_id):
                                         await TeamHierarchyProcess()._cancel_pending_for_run(db, goal_id, source.id)
                                         source.input_snapshot = {"fingerprint": PROPOSAL_RESOLUTION_RERUN_SENTINEL}
                                 await OrchestrationDebugService().advance_process(db, goal, run, source.process_type)
+                                await db.refresh(action)
+                                effects = dict((action.dispatch_contract or {}).get("effects", {}))
+                        original = await db.get(OrchestrationProcessRun, source_id_value, populate_existing=True)
+                        successor = ((action.dispatch_contract or {}).get("effects", {})
+                                     .get(f"source_successor:{source.process_type}"))
+                        current = await OrchestrationProcessService().get_current(db, goal_id, source.process_type)
+                        linked_successor = linked_successor or (
+                            original is not None
+                            and isinstance(successor, dict)
+                            and successor.get("target_id") == str(current.id if current is not None else "")
+                            and current is not None
+                            and current.run_id == run_id
+                            and original.superseded_by_id == current.id
+                        )
+                        completed = f"complete_process:{source_id_value}" in (
+                            (action.dispatch_contract or {}).get("effects", {})
+                        ) or (original is not None and original.status in {"completed", "skipped"})
+                        continuation = effects.get(f"continuation_decision:{source_id_value}")
+                        hierarchy_continuation = False
+                        if (
+                            source.process_type == "team_hierarchy"
+                            and isinstance(continuation, dict)
+                            and continuation.get("target_type") == "decision"
+                            and isinstance(continuation.get("target_id"), str)
+                            and current is not None
+                            and current.id == source_id_value
+                            and current.run_id == run_id
+                        ):
+                            try:
+                                target_id = uuid.UUID(continuation["target_id"])
+                            except (TypeError, ValueError):
+                                target_id = None
+                            target = await db.get(OrchestrationAuthorityDecision, target_id) if target_id else None
+                            accepted = await db.get(
+                                OrchestrationAuthorityDecision, uuid.UUID(submission["decision_ids"][0])
+                            )
+                            hierarchy_continuation = bool(
+                                target is not None
+                                and accepted is not None
+                                and accepted.decision_key.startswith("team_hierarchy:agent:")
+                                and target.decision_key == "team_hierarchy:approval"
+                                and target.goal_id == goal_id
+                                and target.run_id == run_id
+                                and target.source_process_run_id == source_id_value
+                                and target.status in {"pending", "answered"}
+                            )
+                        if not completed and not linked_successor and not hierarchy_continuation:
+                            action.dispatch_contract = {**(action.dispatch_contract or {}),
+                                "application_state": "blocked", "reason": "source_process_did_not_advance"}
+                            action.status = "failed"
+                            return
                     action.dispatch_contract = {**(action.dispatch_contract or {}), "application_state": "applied"}
                     action.status = "completed"
                     from datetime import datetime, timezone

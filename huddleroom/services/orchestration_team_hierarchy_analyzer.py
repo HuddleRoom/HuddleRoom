@@ -37,6 +37,8 @@ class TeamHierarchyAnalysis:
     documented_gaps: tuple[str, ...]
     rationale: str
     self_review: str
+    feedback_results: tuple[dict[str, Any], ...] = ()
+    responsibility_coverage: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return redact_semantic_payload({
@@ -46,6 +48,8 @@ class TeamHierarchyAnalysis:
             "documented_gaps": self.documented_gaps,
             "rationale": self.rationale,
             "self_review": self.self_review,
+            "feedback_results": self.feedback_results,
+            "responsibility_coverage": self.responsibility_coverage,
         })
 
 
@@ -101,6 +105,9 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
     required_keys = {
         "proposed_agents", "assignments", "reporting_lines", "documented_gaps", "rationale", "self_review",
     }
+    has_context = isinstance(request_payload.get("hierarchy_context"), Mapping)
+    if has_context:
+        required_keys |= {"feedback_results", "responsibility_coverage"}
     if set(payload) != required_keys:
         raise ValueError("team hierarchy analysis must contain exactly the required fields")
 
@@ -205,9 +212,198 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
     missing_work = required_work - assigned_functions
     if len(gaps) != len(set(gaps)) or set(gaps) != missing_work:
         raise ValueError("documented gaps must exactly match unassigned required work")
+    feedback_results: list[dict[str, Any]] = []
+    responsibility_coverage: list[dict[str, Any]] = []
+    if has_context:
+        context = request_payload["hierarchy_context"]
+        review_agent_by_id = {
+            str(item.get("review_id")): str(item.get("agent_id"))
+            for item in context.get("agent_reviews", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("review_id"), str)
+            and isinstance(item.get("agent_id"), str)
+        }
+        review_agent_by_decision_id = {
+            str(item.get("accepted_decision_id")): (
+                str(item.get("agent_id")),
+                isinstance(item.get("accepted_definition"), Mapping),
+            )
+            for item in context.get("agent_reviews", [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("accepted_decision_id"), str)
+            and isinstance(item.get("agent_id"), str)
+        }
+        eligible_by_agent = {
+            str(item.get("agent_id")): set(item.get("approved_work_functions", []))
+            for item in context.get("agent_reviews", [])
+            if isinstance(item, Mapping) and isinstance(item.get("agent_id"), str)
+        }
+        feedback_ids: set[str] = set()
+        for item in _object_list(payload, "feedback_results"):
+            if set(item) != {"item_id", "source_excerpt", "disposition", "reason", "change_refs"}:
+                raise ValueError("each feedback result must contain item_id, source_excerpt, disposition, reason, and change_refs")
+            item_id = _required_text(item, "item_id")
+            if item_id in feedback_ids:
+                raise ValueError("feedback results require unique item ids")
+            disposition = _required_text(item, "disposition")
+            if disposition not in {"applied", "declined", "impossible"}:
+                raise ValueError("feedback result disposition must be applied, declined, or impossible")
+            refs = item.get("change_refs")
+            if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+                raise ValueError("feedback result change_refs must contain text")
+            feedback_ids.add(item_id)
+            feedback_results.append({
+                "item_id": item_id,
+                "source_excerpt": _required_text(item, "source_excerpt"),
+                "disposition": disposition,
+                "reason": _required_text(item, "reason"),
+                "change_refs": list(refs),
+            })
+        if context.get("revision") is None and feedback_results:
+            raise ValueError("feedback results require a revision context")
+        revision = context.get("revision")
+        if isinstance(revision, Mapping):
+            if str(revision.get("feedback_text") or "").strip() and not feedback_results:
+                raise ValueError("feedback results must account for request_changes feedback")
+            frozen_items = revision.get("feedback_items")
+            if not isinstance(frozen_items, list):
+                raise ValueError("revision feedback items are invalid")
+            frozen_by_id = {
+                item.get("item_id"): item.get("source_excerpt")
+                for item in frozen_items
+                if isinstance(item, Mapping)
+                and isinstance(item.get("item_id"), str)
+                and isinstance(item.get("source_excerpt"), str)
+            }
+            if frozen_items:
+                if len(frozen_by_id) != len(frozen_items) or {item["item_id"] for item in feedback_results} != set(frozen_by_id):
+                    raise ValueError("feedback results must exactly account for frozen feedback items")
+                if any(item["source_excerpt"] != frozen_by_id[item["item_id"]] for item in feedback_results):
+                    raise ValueError("feedback source excerpts must match frozen feedback items")
+            previous = revision.get("previous_proposal")
+            if not isinstance(previous, Mapping):
+                raise ValueError("revision previous proposal is invalid")
+            previous_assignments = {
+                item.get("work_function"): item.get("agent_ref")
+                for item in previous.get("assignments", []) if isinstance(item, Mapping)
+            }
+            changed_refs = {
+                f"assignment:{work_function}"
+                for work_function in set(previous_assignments) | {item["work_function"] for item in assignments}
+                if previous_assignments.get(work_function) != next(
+                    (item["agent_ref"] for item in assignments if item["work_function"] == work_function), None
+                )
+            }
+            previous_reporting = {
+                item.get("agent_ref"): item.get("reports_to")
+                for item in previous.get("reporting_lines", []) if isinstance(item, Mapping)
+            }
+            current_reporting = {item["agent_ref"]: item["reports_to"] for item in reporting}
+            changed_refs.update(
+                f"reporting:{agent_ref}"
+                for agent_ref in set(previous_reporting) | set(current_reporting)
+                if previous_reporting.get(agent_ref) != current_reporting.get(agent_ref)
+            )
+            coverage_fact = lambda item: {
+                key: value for key, value in item.items() if key not in {"reason"}
+            }
+            previous_coverage = {
+                item.get("responsibility_id"): coverage_fact(item)
+                for item in previous.get("responsibility_coverage", []) if isinstance(item, Mapping)
+            }
+            current_coverage = {
+                item.get("responsibility_id"): coverage_fact(item)
+                for item in _object_list(payload, "responsibility_coverage")
+            }
+            changed_refs.update(
+                f"responsibility:{responsibility_id}"
+                for responsibility_id in set(previous_coverage) | set(current_coverage)
+                if previous_coverage.get(responsibility_id) != current_coverage.get(responsibility_id)
+            )
+            previous_gaps = set(previous.get("documented_gaps", []))
+            changed_refs.update(
+                f"generic_gap:{work_function}"
+                for work_function in previous_gaps | set(gaps)
+                if (work_function in previous_gaps) != (work_function in gaps)
+            )
+            for item in feedback_results:
+                if item["disposition"] == "applied" and (
+                    not item["change_refs"] or not set(item["change_refs"]) <= changed_refs
+                ):
+                    if not item["change_refs"]:
+                        raise ValueError("applied feedback requires a changed reference")
+                    raise ValueError("applied feedback references must reference actual changed hierarchy facts")
+
+        responsibility_ids: set[str] = set()
+        for item in _object_list(payload, "responsibility_coverage"):
+            expected = {
+                "responsibility_id", "responsibility", "source_ref", "work_function", "agent_ref",
+                "status", "reason", "evidence_ref",
+            }
+            if set(item) != expected:
+                raise ValueError("each responsibility coverage entry must contain the required fields")
+            responsibility_id = _required_text(item, "responsibility_id")
+            if responsibility_id in responsibility_ids:
+                raise ValueError("responsibility coverage requires unique ids")
+            work_function = _required_text(item, "work_function")
+            if work_function not in required_work:
+                raise ValueError("responsibility coverage work_function must be required")
+            source_ref = _required_text(item, "source_ref")
+            criteria = request_payload.get("goal", {}).get("success_criteria", [])
+            criterion_refs = {f"criterion:{index}" for index, _ in enumerate(criteria, start=1)} if isinstance(criteria, list) else set()
+            frozen_feedback_refs = {
+                str(frozen.get("item_id")) for frozen in (revision.get("feedback_items", []) if isinstance(revision, Mapping) else [])
+                if isinstance(frozen, Mapping) and isinstance(frozen.get("item_id"), str)
+            }
+            feedback_refs = frozen_feedback_refs or {item["item_id"] for item in feedback_results}
+            if source_ref != "objective" and source_ref not in criterion_refs and source_ref not in feedback_refs:
+                raise ValueError("responsibility coverage source_ref must identify the objective, criterion, or feedback")
+            status = _required_text(item, "status")
+            agent_ref = item.get("agent_ref")
+            evidence_ref = _required_text(item, "evidence_ref")
+            if status == "proposed":
+                if not isinstance(agent_ref, str) or agent_ref not in valid_refs or not agent_ref.startswith("proposal:") or evidence_ref != agent_ref:
+                    raise ValueError("proposed responsibility coverage requires its proposal evidence")
+            elif status == "covered":
+                if not isinstance(agent_ref, str) or agent_ref not in active_ids:
+                    raise ValueError("covered responsibility coverage requires an active agent")
+                if evidence_ref.startswith("agent_review:"):
+                    review_id = evidence_ref.removeprefix("agent_review:")
+                    evidence_agent = review_agent_by_id.get(review_id)
+                elif evidence_ref.startswith("agent_decision:"):
+                    decision_id = evidence_ref.removeprefix("agent_decision:")
+                    decision_evidence = review_agent_by_decision_id.get(decision_id)
+                    evidence_agent = decision_evidence[0] if decision_evidence else None
+                    if not decision_evidence or not decision_evidence[1]:
+                        raise ValueError("covered responsibility coverage requires the accepted definition")
+                else:
+                    raise ValueError("covered responsibility coverage requires accepted review evidence")
+                if (
+                    evidence_agent != agent_ref
+                    or work_function not in eligible_by_agent.get(agent_ref, set())
+                ):
+                    raise ValueError("covered responsibility coverage evidence is not accepted for this work_function")
+            elif status == "gap":
+                if agent_ref is not None:
+                    raise ValueError("gap responsibility coverage must have no owner")
+            else:
+                raise ValueError("responsibility coverage status must be covered, proposed, or gap")
+            responsibility_ids.add(responsibility_id)
+            responsibility_coverage.append({
+                "responsibility_id": responsibility_id,
+                "responsibility": _required_text(item, "responsibility"),
+                "source_ref": source_ref,
+                "work_function": work_function,
+                "agent_ref": agent_ref,
+                "status": status,
+                "reason": _required_text(item, "reason"),
+                "evidence_ref": evidence_ref,
+            })
+
     return TeamHierarchyAnalysis(
         tuple(proposed), tuple(assignments), tuple(reporting), gaps,
         _required_text(payload, "rationale"), _required_text(payload, "self_review"),
+        tuple(feedback_results), tuple(responsibility_coverage),
     )
 
 
@@ -243,7 +439,14 @@ class TeamHierarchyAnalyzer:
                 "[{work_function, agent_ref}], reporting_lines [{agent_ref, reports_to}], documented_gaps "
                 "[string], rationale "
                 "(string), self_review (string). Never repeat a definition fingerprint listed in "
-                "resolved_proposal_exclusions; propose only a materially different definition when still needed."
+                "resolved_proposal_exclusions; propose only a materially different definition when still needed. "
+                "When hierarchy_context is present, also return feedback_results "
+                "[{item_id, source_excerpt, disposition, reason, change_refs}] and responsibility_coverage "
+                "[{responsibility_id, responsibility, source_ref, work_function, agent_ref, status, reason, evidence_ref}]. "
+                "Use only accepted agent_review evidence for covered existing agents, accepted agent_decision evidence for "
+                "covered newly approved agents, proposal:<id> evidence for proposed agents, "
+                "and a gap with no owner when evidence is missing. Treat each independent requested change as a "
+                "separate feedback item and return exactly one outcome for each item."
             )},
             {"role": "user", "content": json.dumps(safe_payload, sort_keys=True, default=str)},
         ]

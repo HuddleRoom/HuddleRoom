@@ -145,13 +145,15 @@ def hierarchy_analysis_input_from_projection(
     })
 
 
-def resolved_proposal_exclusions_from_decisions(decisions: list[OrchestrationAuthorityDecision]) -> list[dict]:
+def resolved_proposal_exclusions_from_decisions(
+    decisions: list[OrchestrationAuthorityDecision], *, include_approved: bool = False,
+) -> list[dict]:
     exclusions = []
     for decision in decisions:
         if not (
             decision.status == "answered"
             and decision.decision_key.startswith("team_hierarchy:agent:")
-            and decision.selected_option in {"edit", "reject"}
+            and decision.selected_option in ({"approve", "edit", "reject"} if include_approved else {"edit", "reject"})
         ):
             continue
         option = next((item for item in decision.options if item.get("key") == decision.selected_option), None)
@@ -651,6 +653,13 @@ class TeamHierarchyProcess:
         input_fingerprint = self._semantic_fingerprint(self._strip_volatile(payload))
         if current is not None and current.status in {"running", "waiting_decision"}:
             reserved = await self._apply_reserved_agents(db, goal, run, current)
+            if reserved:
+                # Reservation can roster-create an approved hierarchy agent in
+                # this same continuation. Rebuild before any rerun prompt so
+                # it judges the actual accepted definition, never the stale
+                # pre-handoff roster projection.
+                payload = await self._analysis_input(db, goal)
+                input_fingerprint = self._semantic_fingerprint(self._strip_volatile(payload))
             snapshot = current.input_snapshot or {}
             unstamped = reserved - set(snapshot.get("stamped_agent_ids") or ())
             if unstamped and snapshot.get("fingerprint") != input_fingerprint and snapshot.get(
@@ -762,6 +771,8 @@ class TeamHierarchyProcess:
             or current.input_snapshot.get("fingerprint") in INTERNAL_RERUN_SENTINELS
         ):
             await self._cancel_pending_for_run(db, goal.id, current.id)
+            revision_context = (current.outputs or {}).get("revision_context")
+            resolved_validation_repair_attempted = (current.outputs or {}).get("resolved_validation_repair_attempted")
             current = await self.process_service.start_process(
                 db, goal.id, process_type=PROCESS_TYPE,
                 trigger_reason="auto-rerun: hierarchy inputs changed",
@@ -770,6 +781,11 @@ class TeamHierarchyProcess:
                 supersede_waiting=True,
                 supersede_running=True,
             )
+            if isinstance(revision_context, dict) or resolved_validation_repair_attempted:
+                current.outputs = {
+                    **({"revision_context": revision_context} if isinstance(revision_context, dict) else {}),
+                    **({"resolved_validation_repair_attempted": True} if resolved_validation_repair_attempted else {}),
+                }
         if current.status not in {"running", "waiting_decision"}:
             return self._summary(current.status)
 
@@ -778,14 +794,23 @@ class TeamHierarchyProcess:
             from huddleroom.models.project import Project
             _proj = await db.get(Project, goal.project_id)
             project_dict = {"name": _proj.name, "description": _proj.description} if _proj else None
+            revision_context = (current.outputs or {}).get("revision_context")
+            prompt_payload = await self._hierarchy_prompt_payload(
+                db, goal, payload, revision_context if isinstance(revision_context, dict) else None
+            )
             try:
                 result = await self.analyzer.review(
-                    payload, project=project_dict, project_id=goal.project_id,
+                    prompt_payload, project=project_dict, project_id=goal.project_id,
                 )
             except Exception as exc:  # analyzer normalizes provider and semantic failures
                 safe_error = _safe_completion_error(exc)
-                request = getattr(exc, "request", None) or TeamHierarchyAnalyzer.build_request(payload, project=project_dict)
+                request = getattr(exc, "request", None) or TeamHierarchyAnalyzer.build_request(
+                    prompt_payload, project=project_dict
+                )
                 current.outputs = {
+                    **({"revision_context": revision_context} if isinstance(revision_context, dict) else {}),
+                    **({"resolved_validation_repair_attempted": True}
+                       if (current.outputs or {}).get("resolved_validation_repair_attempted") else {}),
                     "_lm_retry": {"kind": PROCESS_TYPE, "version": 1, "request": redact_semantic_payload(request)},
                     "retryable": True,
                     "error": safe_error,
@@ -793,11 +818,39 @@ class TeamHierarchyProcess:
                 await db.flush()
                 return {**self._summary(current.status), "retryable": True, "error": safe_error}
             analysis = result.to_dict()
+            if isinstance(revision_context, dict) and not revision_context.get("feedback_items"):
+                revision_context = {
+                    **revision_context,
+                    "feedback_items": [
+                        {"item_id": item["item_id"], "source_excerpt": item["source_excerpt"]}
+                        for item in analysis.get("feedback_results", [])
+                    ],
+                }
             current.outputs = {
+                **({"revision_context": revision_context} if isinstance(revision_context, dict) else {}),
+                **({"resolved_validation_repair_attempted": True}
+                   if (current.outputs or {}).get("resolved_validation_repair_attempted") else {}),
                 "analysis": analysis,
                 "fingerprint": self._semantic_fingerprint({"input": self._strip_volatile(payload), "analysis": analysis}),
             }
             await db.flush()
+
+        if (
+            (current.outputs or {}).get("resolved_validation_repair_attempted")
+            and (
+                isinstance((current.outputs or {}).get("revision_context"), dict)
+                or (current.outputs or {}).get("resolved_validation_retry_repair")
+            )
+            and analysis.get("proposed_agents")
+        ):
+            current.outputs = {
+                **current.outputs,
+                "retryable": False,
+                "semantic_error": "resolved hierarchy repair must return final covered or gap evidence",
+            }
+            await self.process_service.park_process(db, current)
+            await db.flush()
+            return self._summary("waiting_decision")
 
         proposal_decisions = [
             decision for decision in await self.decision_service.list_decisions(db, goal.id)
@@ -838,9 +891,13 @@ class TeamHierarchyProcess:
             decision.status == "answered" and decision.selected_option == "approve"
             for decision in proposal_decisions
         ):
+            revision_context = (current.outputs or {}).get("revision_context")
             frozen = self._resolve_analysis(analysis, created_by_ref)
             refreshed_payload = await self._analysis_input(db, goal)
             try:
+                refreshed_prompt = await self._hierarchy_prompt_payload(
+                    db, goal, refreshed_payload, revision_context if isinstance(revision_context, dict) else None
+                )
                 parse_team_hierarchy_analysis({
                     "proposed_agents": [],
                     "assignments": frozen["assignments"],
@@ -848,9 +905,17 @@ class TeamHierarchyProcess:
                     "documented_gaps": frozen["documented_gaps"],
                     "rationale": frozen["rationale"],
                     "self_review": frozen["self_review"],
-                }, refreshed_payload)
+                    "feedback_results": frozen["feedback_results"],
+                    "responsibility_coverage": frozen["responsibility_coverage"],
+                }, refreshed_prompt)
             except ValueError as exc:
+                if (current.outputs or {}).get("resolved_validation_repair_attempted"):
+                    current.outputs = {**current.outputs, "retryable": False, "semantic_error": str(exc)}
+                    await self.process_service.park_process(db, current)
+                    await db.flush()
+                    return self._summary("waiting_decision")
                 current.outputs = {**current.outputs, "retryable": False, "semantic_error": str(exc)}
+                current.outputs["resolved_validation_repair_attempted"] = True
                 await self._cancel_pending_for_run(db, goal.id, current.id)
                 current.input_snapshot = {"fingerprint": RESOLVED_VALIDATION_FAILED_RERUN_SENTINEL}
                 await db.flush()
@@ -871,16 +936,28 @@ class TeamHierarchyProcess:
                 "approve", "approve_with_documented_gaps"
             }:
                 selected = next(option for option in approval.options if option["key"] == approval.selected_option)
+                selected_proposal = selected["proposal"]
+                substantive_gap_ids = sorted(
+                    item["responsibility_id"] for item in selected_proposal.get("responsibility_coverage", [])
+                    if item.get("status") == "gap"
+                )
+                has_gaps = bool(substantive_gap_ids or selected_proposal["documented_gaps"])
+                if has_gaps and approval.selected_option != "approve_with_documented_gaps":
+                    await self.process_service.park_process(db, current)
+                    return self._summary("waiting_decision")
                 outputs = {
-                    **selected["proposal"],
+                    **selected_proposal,
+                    "proposal": selected_proposal,
                     "fingerprint": current.input_snapshot["fingerprint"],
                     "approval": approval.selected_option,
                     "approval_decision_id": str(approval.id),
+                    "accepted_responsibility_gap_ids": substantive_gap_ids,
+                    **({"revision_context": revision_context} if isinstance(revision_context, dict) else {}),
                     "gates": {
                         "team_structure_reviewed": True,
-                        "required_work_functions_mapped": not selected["proposal"]["documented_gaps"],
+                        "required_work_functions_mapped": not has_gaps,
                         "agent_definitions_reviewed": True,
-                        "missing_capabilities_handled": not selected["proposal"]["documented_gaps"],
+                        "missing_capabilities_handled": has_gaps or not selected_proposal["documented_gaps"],
                         "independent_verification_possible_or_overridden": True,
                     },
                 }
@@ -891,25 +968,55 @@ class TeamHierarchyProcess:
                 await self.process_service.complete_process(db, current, outputs=outputs)
                 return self._summary("completed")
             if approval is not None and approval.status == "answered":
+                replacement_revision = self._revision_context(current, approval)
+                prior_revision = (current.outputs or {}).get("revision_context")
+                replacement_outputs = {
+                    **(current.outputs or {}),
+                    "revision_context": replacement_revision,
+                }
+                if not (
+                    isinstance(prior_revision, dict)
+                    and prior_revision.get("source_decision_id") == replacement_revision["source_decision_id"]
+                ):
+                    replacement_outputs.pop("resolved_validation_repair_attempted", None)
+                    replacement_outputs.pop("resolved_validation_retry_repair", None)
+                current.outputs = replacement_outputs
                 await self._cancel_pending_for_run(db, goal.id, current.id)
                 current.input_snapshot = {"fingerprint": HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL}
                 await db.flush()
                 return await self._advance_orchestrated(db, goal, run, current)
             if approval is None:
                 gaps = list(frozen["documented_gaps"])
-                approve_key = "approve_with_documented_gaps" if gaps else "approve"
-                await self.decision_service.create_pending(
+                substantive_gaps = [
+                    item["responsibility_id"] for item in frozen.get("responsibility_coverage", [])
+                    if item.get("status") == "gap"
+                ]
+                approve_key = "approve_with_documented_gaps" if gaps or substantive_gaps else "approve"
+                current.outputs = {
+                    **(current.outputs or {}),
+                    "proposal": frozen,
+                    "gates": {
+                        "required_work_functions_mapped": not frozen["documented_gaps"] and not substantive_gaps,
+                        "missing_capabilities_handled": not frozen["documented_gaps"] and not substantive_gaps,
+                    },
+                }
+                approval_decision = await self.decision_service.create_pending(
                     db, goal.id, decision_key=APPROVAL_DECISION_KEY,
                     title="Approve team hierarchy",
                     question="Approve the proposed team hierarchy and role assignments?",
                     authority="human", authority_agent_id=None,
                     options=[{"key": approve_key, "proposal": frozen}, {"key": "request_changes"}],
-                    context=json.dumps({"documented_gaps": frozen["documented_gaps"]}, sort_keys=True),
+                    context=json.dumps({"documented_gaps": frozen["documented_gaps"], "responsibility_gap_ids": substantive_gaps}, sort_keys=True),
                     recommendation=approve_key, run_id=run.id, source_process_run_id=current.id,
                 )
                 questions_created = 1
             else:
                 questions_created = 0
+                approval_decision = approval
+            from huddleroom.services.orchestration_answer_receipts import record_current_answer_effect
+            await record_current_answer_effect(
+                db, f"continuation_decision:{current.id}", "decision", approval_decision.id,
+            )
             await self.process_service.park_process(db, current)
             return self._summary("waiting_decision", questions_created)
 
@@ -1062,7 +1169,39 @@ class TeamHierarchyProcess:
             "documented_gaps": list(analysis["documented_gaps"]),
             "rationale": analysis["rationale"],
             "self_review": analysis["self_review"],
+            "feedback_results": list(analysis.get("feedback_results", [])),
+            "responsibility_coverage": list(analysis.get("responsibility_coverage", [])),
             "approved_but_unused_agent_ids": sorted(approved - used),
+        }
+
+    def _revision_context(
+        self, current: OrchestrationProcessRun, decision: OrchestrationAuthorityDecision,
+    ) -> dict:
+        """Freeze a request-change answer once, before its successor is drafted."""
+        existing = (current.outputs or {}).get("revision_context")
+        if isinstance(existing, dict) and existing.get("source_decision_id") == str(decision.id):
+            return existing
+        if isinstance(current.outputs, dict):
+            current.outputs = {
+                key: value for key, value in current.outputs.items()
+                if key not in {"resolved_validation_repair_attempted", "resolved_validation_retry_repair"}
+            }
+        saved_reason = self._decision_metadata(decision.reason).get("reason", decision.reason) or ""
+        feedback_text = str(saved_reason)
+        if not feedback_text.strip():
+            raise ValueError("team hierarchy request_changes requires feedback")
+        previous = next(
+            (option.get("proposal") for option in decision.options
+             if isinstance(option, dict) and option.get("key") == "request_changes" and option.get("proposal")),
+            (current.outputs or {}).get("proposal"),
+        )
+        return {
+            "source_process_id": str(current.id),
+            "source_decision_id": str(decision.id),
+            "saved_reason": saved_reason,
+            "feedback_text": feedback_text,
+            "previous_proposal": previous,
+            "feedback_items": [],
         }
 
     async def _analysis_input(self, db: AsyncSession, goal: OrchestrationGoal) -> dict:
@@ -1071,11 +1210,125 @@ class TeamHierarchyProcess:
         )).scalars())
         loads = await self.roster_mapper.loads_by_agent(db, goal.project_id)
         exclusions = resolved_proposal_exclusions_from_decisions(
-            await self.decision_service.list_decisions(db, goal.id)
+            await self.decision_service.list_decisions(db, goal.id),
         )
         return hierarchy_analysis_input_from_projection(
             goal, agents, loads=loads, exclusions=exclusions,
         )
+
+    async def _hierarchy_prompt_payload(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        base_payload: dict,
+        revision_context: dict | None,
+    ) -> dict:
+        """Add accepted review evidence for the analyzer without changing input identity."""
+        payload = json.loads(json.dumps(base_payload, default=str))
+        review_process = await self.process_service.get_current(db, goal.id, "agent_definition_review")
+        reviews = []
+        decisions = await self.decision_service.list_decisions(db, goal.id)
+        if review_process is not None and review_process.status == "completed":
+            eligibility = (review_process.outputs or {}).get("eligibility")
+            assessments = (review_process.outputs or {}).get("semantic_assessments")
+            agents = {agent["id"]: agent for agent in payload.get("agents", [])}
+            if isinstance(eligibility, dict):
+                accepted_decisions = {}
+                for decision in decisions:
+                    if (
+                        decision.source_process_run_id != review_process.id
+                        or decision.status != "answered"
+                        or decision.selected_option not in {"approve", "edit"}
+                    ):
+                        continue
+                    try:
+                        decision_context = json.loads(decision.context or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    agent_id = decision_context.get("agent_id") if isinstance(decision_context, dict) else None
+                    if isinstance(agent_id, str):
+                        accepted_decisions[agent_id] = decision
+                for review in await self.review_service.list_reviews(db, goal.id):
+                    agent_id = str(review.agent_id) if review.agent_id is not None else None
+                    if review.source_process_run_id != review_process.id or agent_id not in eligibility:
+                        continue
+                    agent = agents.get(agent_id)
+                    if agent is None:
+                        continue
+                    assessment = assessments.get(agent_id, {}) if isinstance(assessments, dict) else {}
+                    decision = accepted_decisions.get(agent_id)
+                    reviews.append({
+                        "review_id": str(review.id),
+                        "source_process_id": str(review_process.id),
+                        "agent_id": agent_id,
+                        "agent_name": agent["name"],
+                        "approved_work_functions": list(eligibility[agent_id]),
+                        "definition_snapshot": review.definition_snapshot,
+                        "accepted_definition": {
+                            key: agent[key]
+                            for key in ("name", "role", "description", "system_prompt", "capabilities")
+                        },
+                        "assessment": {
+                            "reason": assessment.get("reason"),
+                            "problems": assessment.get("problems", []),
+                            "boundaries": list(review.risks or []),
+                        },
+                        "accepted_decision_id": str(decision.id) if decision is not None else None,
+                        "accepted_decision": decision.selected_option if decision is not None else None,
+                    })
+        agents = {agent["id"]: agent for agent in payload.get("agents", [])}
+        for decision in decisions:
+            if not (
+                decision.decision_key.startswith("team_hierarchy:agent:")
+                and decision.status == "answered"
+                and decision.selected_option in {"approve", "edit"}
+            ):
+                continue
+            created_id = self._decision_metadata(decision.reason).get("created_agent_id")
+            agent = agents.get(created_id) if isinstance(created_id, str) else None
+            if agent is None:
+                continue
+            try:
+                accepted_definition = AgentCreate.model_validate({
+                    key: agent[key]
+                    for key in (
+                        "name", "role", "description", "provider", "model", "system_prompt",
+                        "adapter_type", "cli_runtime", "capabilities", "config",
+                    )
+                }).model_dump(mode="json")
+            except (KeyError, ValueError):
+                continue
+            reviews.append({
+                "review_id": f"hierarchy-decision:{decision.id}",
+                "source_process_id": str(decision.source_process_run_id),
+                "agent_id": created_id,
+                "agent_name": agent["name"],
+                # The analyzer must rejudge this actual accepted definition; membership
+                # here merely keeps its result within the existing generic taxonomy.
+                "approved_work_functions": list(payload.get("required_work_functions", [])),
+                "definition_snapshot": accepted_definition,
+                "accepted_definition": accepted_definition,
+                "assessment": {
+                    "reason": "Rejudge this approved hierarchy definition for the proposed responsibility.",
+                    "problems": [], "boundaries": [],
+                },
+                "accepted_decision_id": str(decision.id),
+                "accepted_decision": decision.selected_option,
+            })
+        payload["hierarchy_context"] = {
+            "agent_reviews": reviews,
+            "revision": revision_context,
+        }
+        if isinstance(revision_context, dict):
+            approved = [
+                item for item in resolved_proposal_exclusions_from_decisions(decisions, include_approved=True)
+                if item["action"] == "approve"
+            ]
+            if approved:
+                payload["resolved_proposal_exclusions"] = [
+                    *payload.get("resolved_proposal_exclusions", []), *approved,
+                ]
+        return payload
 
     @staticmethod
     def _semantic_fingerprint(payload: dict) -> str:
@@ -1105,6 +1358,11 @@ class TeamHierarchyProcess:
         (workload-only) formula.
         """
         stripped = json.loads(json.dumps(payload, default=str))
+        stripped.pop("hierarchy_context", None)
+        stripped["resolved_proposal_exclusions"] = [
+            item for item in stripped.get("resolved_proposal_exclusions", [])
+            if not isinstance(item, dict) or item.get("action") != "approve"
+        ]
         for agent in stripped.get("agents", []):
             agent.pop("workload", None)
             for field in extra_fields:
@@ -1139,19 +1397,40 @@ class TeamHierarchyProcess:
         if not isinstance(request, dict):
             raise ValueError("team hierarchy retry request is invalid")
         try:
+            payload = json.loads(request["messages"][1]["content"])
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("team hierarchy retry request is invalid") from exc
+        hierarchy_context = payload.get("hierarchy_context") if isinstance(payload, dict) else None
+        revision_context = hierarchy_context.get("revision") if isinstance(hierarchy_context, dict) else None
+        try:
             result = await self.analyzer.review_request(request, project_id=goal.project_id)
         except Exception as exc:  # mirror advance(): re-park instead of surfacing a 500
             safe_error = _safe_completion_error(exc)
             current.outputs = {
+                **({"revision_context": revision_context} if isinstance(revision_context, dict) else {}),
+                **({"resolved_validation_repair_attempted": True}
+                   if (current.outputs or {}).get("resolved_validation_repair_attempted") else {}),
                 "_lm_retry": {"kind": PROCESS_TYPE, "version": 1, "request": redact_semantic_payload(request)},
                 "retryable": True,
                 "error": safe_error,
             }
             await db.flush()
             return {**self._summary(current.status), "retryable": True, "error": safe_error}
-        payload = json.loads(request["messages"][1]["content"])
         analysis = result.to_dict()
+        if isinstance(revision_context, dict) and not revision_context.get("feedback_items"):
+            revision_context = {
+                **revision_context,
+                "feedback_items": [
+                    {"item_id": item["item_id"], "source_excerpt": item["source_excerpt"]}
+                    for item in analysis.get("feedback_results", [])
+                ],
+            }
         current.outputs = {
+            **({"revision_context": revision_context} if isinstance(revision_context, dict) else {}),
+            **({"resolved_validation_repair_attempted": True}
+               if (current.outputs or {}).get("resolved_validation_repair_attempted") else {}),
+            **({"resolved_validation_retry_repair": True}
+               if (current.outputs or {}).get("resolved_validation_repair_attempted") else {}),
             "analysis": analysis,
             "fingerprint": self._semantic_fingerprint({"input": self._strip_volatile(payload), "analysis": analysis}),
         }

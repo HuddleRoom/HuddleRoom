@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import React, { act, createRef } from 'react'
-import { mountWithTestDom, textOf } from '../../../tests/support/dom'
+import { descendants, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import type {
   OrchestrationAgentReviewRecord,
   OrchestrationAuthorityDecisionRecord,
@@ -135,6 +135,68 @@ describe('ProcessFocus', () => {
     })
     try {
       expect(textOf(view.container)).not.toContain('UPGRADE HINT TEXT')
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('distinguishes recorded empty hierarchy coverage from legacy evidence that was not recorded', async () => {
+    const recordedEmpty = process({
+      status: 'completed',
+      outputs: { feedback_results: [], responsibility_coverage: [] },
+    })
+    const emptyView = await mount({ process: recordedEmpty })
+    try {
+      expect(textOf(emptyView.container)).toContain('Feedback requested')
+      expect(textOf(emptyView.container)).toContain('No requested feedback recorded.')
+      expect(textOf(emptyView.container)).toContain('Responsibility coverage')
+      expect(textOf(emptyView.container)).toContain('No uncovered responsibilities.')
+    } finally {
+      emptyView.cleanup()
+    }
+
+    const legacyView = await mount({ process: process({ status: 'completed', outputs: {} }) })
+    try {
+      expect(textOf(legacyView.container)).toContain('Feedback requested: Not recorded')
+      expect(textOf(legacyView.container)).toContain('Responsibility coverage: Not recorded')
+    } finally {
+      legacyView.cleanup()
+    }
+  })
+
+  it('renders retained hierarchy source feedback and outcomes from the saved proposal', async () => {
+    const retained = process({
+      status: 'completed',
+      outputs: {
+        revision_context: { feedback_text: 'Preserve the accepted product responsibility.' },
+        proposal: {
+          assignments: [], reporting_lines: [],
+          feedback_results: [{ item_id: 'feedback:product', source_excerpt: 'Retain Product evidence.', disposition: 'applied', reason: 'The accepted definition covers sequencing.' }],
+          responsibility_coverage: [
+            { responsibility_id: 'product', responsibility: 'Product sequencing', status: 'covered', agent_ref: 'product-id', reason: 'Accepted Product evidence.' },
+            { responsibility_id: 'ux', responsibility: 'UX consent', status: 'gap', agent_ref: null, reason: 'No eligible UX capability.' },
+          ],
+        },
+      },
+    })
+    const view = await mount({
+      process: retained,
+      reviews: [{ id: 'review-product', goal_id: 'goal-1', agent_id: 'product-id', definition_snapshot: { name: 'Product Owner' }, disposition: 'accepted', reasons: [], created_at: ISO.started, updated_at: ISO.started }],
+    })
+    try {
+      const rendered = textOf(view.container)
+      for (const text of [
+        'Feedback requested', 'Preserve the accepted product responsibility.', 'Outcomes',
+        'Retain Product evidence.', 'applied', 'The accepted definition covers sequencing.',
+        'Responsibility coverage', 'Product sequencing', 'Product Owner', 'Domain owner — lacks execution role',
+        'Blocking gaps', 'UX consent', 'No eligible UX capability.',
+      ]) expect(rendered).toContain(text)
+      expect(descendants(view.container).filter((node) => node.tagName === 'H4').map(textOf)).toEqual(expect.arrayContaining([
+        'Feedback requested', 'Outcomes', 'Responsibility coverage', 'Blocking gaps',
+      ]))
+      await view.rerender()
+      expect(textOf(view.container)).toContain('Preserve the accepted product responsibility.')
+      expect(textOf(view.container)).toContain('No eligible UX capability.')
     } finally {
       view.cleanup()
     }

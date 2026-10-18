@@ -476,7 +476,8 @@ class RecoveryToolRegistry:
             value["fingerprint"] = (process.input_snapshot or {}).get("fingerprint")
             for key in ("fingerprint", "coverage_fingerprint", "hierarchy_fingerprint", "target_ids", "review_ids",
                         "source_agent_review_process_id", "eligibility", "assignments", "role_to_agent", "hierarchy",
-                        "documented_gaps", "approval", "approval_decision_id"):
+                        "documented_gaps", "approval", "approval_decision_id", "responsibility_coverage",
+                        "accepted_responsibility_gap_ids"):
                 if key in outputs:
                     value["accepted_" + key] = copy.deepcopy(outputs[key])
             provenance = outputs.get("recovery_provenance")
@@ -1111,9 +1112,51 @@ class RecoveryToolRegistry:
         gates = outputs.get("gates", {})
         required = ("team_structure_reviewed", "agent_definitions_reviewed", "missing_capabilities_handled",
                     "independent_verification_possible_or_overridden")
-        return ((definition.outputs or {}).get("gates", {}).get("agent_definitions_reviewed") is True
-                and all(gates.get(key) is True for key in required)
-                and (gates.get("required_work_functions_mapped") is True or bool(outputs.get("documented_gaps"))))
+        if not ((definition.outputs or {}).get("gates", {}).get("agent_definitions_reviewed") is True
+                and all(gates.get(key) is True for key in required)):
+            return False
+        coverage = outputs.get("responsibility_coverage")
+        has_new_coverage = "responsibility_coverage" in outputs or "accepted_responsibility_gap_ids" in outputs
+        if has_new_coverage:
+            if not isinstance(coverage, list) or not isinstance(outputs.get("accepted_responsibility_gap_ids"), list):
+                return False
+            gap_ids = []
+            responsibility_ids = set()
+            for item in coverage:
+                if not isinstance(item, dict) or item.get("status") not in {"covered", "gap"}:
+                    return False
+                gap_id = item.get("responsibility_id")
+                if not isinstance(gap_id, str) or not gap_id.strip() or gap_id in responsibility_ids:
+                    return False
+                responsibility_ids.add(gap_id)
+                if item.get("status") == "gap":
+                    gap_ids.append(gap_id)
+            accepted_gap_ids = outputs["accepted_responsibility_gap_ids"]
+            if (
+                any(not isinstance(gap_id, str) or not gap_id.strip() for gap_id in accepted_gap_ids)
+                or len(accepted_gap_ids) != len(set(accepted_gap_ids))
+                or sorted(accepted_gap_ids) != sorted(gap_ids)
+            ):
+                return False
+            if gap_ids or outputs.get("documented_gaps"):
+                return (
+                    gates.get("required_work_functions_mapped") is False
+                    and gates.get("missing_capabilities_handled") is True
+                    and outputs.get("approval") == "approve_with_documented_gaps"
+                    and isinstance(outputs.get("approval_decision_id"), str)
+                    and bool(outputs.get("approval_decision_id"))
+                )
+            return gates.get("required_work_functions_mapped") is True
+        substantive_gaps = []
+        if substantive_gaps:
+            return (
+                gates.get("required_work_functions_mapped") is False
+                and gates.get("missing_capabilities_handled") is True
+                and outputs.get("approval") == "approve_with_documented_gaps"
+                and isinstance(outputs.get("approval_decision_id"), str)
+                and sorted(outputs.get("accepted_responsibility_gap_ids", [])) == substantive_gaps
+            )
+        return gates.get("required_work_functions_mapped") is True or bool(outputs.get("documented_gaps"))
 
     async def _team_configuration_accepted(self, db: AsyncSession, proposal: RecoveryProposalV1, call: RecoveryCallV1,
                                            goal: OrchestrationGoal, run: OrchestrationRun, rows: list) -> bool:

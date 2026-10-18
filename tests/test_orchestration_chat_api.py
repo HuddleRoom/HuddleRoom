@@ -618,6 +618,22 @@ async def test_crash_recovery_has_one_source_and_effect_handoffs(sessions, tmp_p
         roster_effects = [effect for key, effect in effects.items() if key.startswith("roster_agent:")]
         assert len(roster_effects) == 1
         assert await db.get(Agent, uuid.UUID(roster_effects[0]["target_id"])) is not None
+        if kind == "hierarchy":
+            continuation = effects[f"continuation_decision:{source_id}"]
+            assert continuation["target_type"] == "decision"
+            final_approval = await db.get(
+                OrchestrationAuthorityDecision, uuid.UUID(continuation["target_id"])
+            )
+            assert final_approval is not None
+            assert (
+                final_approval.decision_key,
+                final_approval.goal_id,
+                final_approval.run_id,
+                final_approval.source_process_run_id,
+                final_approval.status,
+            ) == (
+                "team_hierarchy:approval", goal.id, seeded.run_id, source_id, "pending"
+            )
         agent_count = await db.scalar(select(func.count()).select_from(Agent))
     await facade.submit(goal.project_id, user.id, data)
     async with sessions() as consumer:

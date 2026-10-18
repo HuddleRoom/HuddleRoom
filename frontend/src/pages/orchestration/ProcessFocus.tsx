@@ -15,6 +15,7 @@ import { ZONE_TITLE_CLASS } from './zoneTitle'
 import type { BaselineFocusAction } from './BaselineDashboard'
 import { useGoalAnnouncer } from './goalAnnouncer'
 import { hierarchyAgentResolver } from './hierarchyAgentNames'
+import { HierarchyEvidence } from './HierarchyEvidence'
 
 // Shared retry button + pending/error UI. Reused by the queue in Phase C.
 export function RetryControl({
@@ -146,11 +147,17 @@ function parseHierarchy(process: OrchestrationProcessRunRecord, reviews: readonl
 
 function HierarchyCard({ process, reviews }: { process: OrchestrationProcessRunRecord; reviews: readonly OrchestrationAgentReviewRecord[] }) {
   const { manager, roles, missing, weakFits, verification } = parseHierarchy(process, reviews)
+  const outputs = isRecord(process.outputs) ? process.outputs : {}
+  const proposal = isRecord(outputs.proposal) ? outputs.proposal : outputs
+  const revisionContext = isRecord(outputs.revision_context) ? outputs.revision_context : null
   return <article className="mt-4 border-t border-huddleroom-border pt-3 text-sm text-huddleroom-text-secondary">
     <h3 className="font-semibold text-huddleroom-text-primary">How the orchestrator structured the team</h3>
     <p className="mt-1 text-xs text-huddleroom-text-muted">Independent verification means a different agent than the one who did the work checks it before it's accepted.</p>
-    <p className="mt-1">Manager: {manager}</p>
-    {roles.map(({ role, agent }) => <p key={role} className="mt-1">{role}: {agent}</p>)}
+    <HierarchyEvidence proposal={proposal} reviews={reviews} revisionContext={revisionContext} />
+    {!(Array.isArray(proposal.assignments) || Array.isArray(proposal.feedback_results) || Array.isArray(proposal.responsibility_coverage)) && <>
+      <p className="mt-1">Manager: {manager}</p>
+      {roles.map(({ role, agent }) => <p key={role} className="mt-1">{role}: {agent}</p>)}
+    </>}
     {missing.length > 0 && <p className="mt-1">Missing work functions: {missing.join(', ')}</p>}
     {weakFits.length > 0 && <p className="mt-1">Weak fits: {weakFits.join(', ')}</p>}
     <p className="mt-1">{verification}</p>

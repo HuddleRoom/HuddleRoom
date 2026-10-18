@@ -314,16 +314,26 @@ def valid_lm_retry_checkpoint(checkpoint: Any, process_type: str | None = None) 
             payload = json.loads(messages[1]["content"])
         except (TypeError, ValueError):
             return False
+        base_keys = {
+            "schema_version", "goal", "selected_manager", "required_work_functions", "agents",
+        }
+        legacy_keys = (base_keys, base_keys | {"resolved_proposal_exclusions"})
+        payload_keys = set(payload) if isinstance(payload, dict) else set()
+        has_context = "hierarchy_context" in payload_keys
+        context = payload.get("hierarchy_context") if isinstance(payload, dict) else None
         return (
             set(checkpoint) == {"kind", "version", "request"}
             and isinstance(payload, dict)
-            and set(payload) in ({
-                "schema_version", "goal", "selected_manager",
-                "required_work_functions", "agents",
-            }, {
-                "schema_version", "goal", "selected_manager",
-                "required_work_functions", "agents", "resolved_proposal_exclusions",
-            })
+            and (payload_keys - {"hierarchy_context"} in legacy_keys if has_context else payload_keys in legacy_keys)
+            and (
+                not has_context
+                or (
+                    isinstance(context, dict)
+                    and set(context) == {"agent_reviews", "revision"}
+                    and isinstance(context["agent_reviews"], list)
+                    and (context["revision"] is None or isinstance(context["revision"], dict))
+                )
+            )
             and payload.get("schema_version") == 1
             and isinstance(payload.get("goal"), dict)
             and isinstance(payload.get("selected_manager"), dict)

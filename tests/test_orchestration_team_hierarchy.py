@@ -1,11 +1,13 @@
 import asyncio
+import copy
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.orm.attributes import flag_modified
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from huddleroom.models.agent import Agent
 from huddleroom.models.event_log import EventLog
@@ -121,6 +123,492 @@ def test_hierarchy_parser_rejects_disconnected_graph_and_inexact_gaps():
             "reporting_lines": [{"agent_ref": "worker", "reports_to": "manager"}],
             "documented_gaps": ["review", "review"],
         }, request)
+
+
+def _task1_analysis_payload(*, feedback_results=None, responsibility_coverage=None):
+    return {
+        "proposed_agents": [],
+        "assignments": [{"work_function": "implementation", "agent_ref": "worker"}],
+        "reporting_lines": [{"agent_ref": "worker", "reports_to": "manager"}],
+        "documented_gaps": [],
+        "rationale": "Worker owns the implementation work.",
+        "self_review": "Checked references and coverage.",
+        "feedback_results": feedback_results if feedback_results is not None else [],
+        "responsibility_coverage": responsibility_coverage if responsibility_coverage is not None else [{
+            "responsibility_id": "implementation-owner",
+            "responsibility": "Implement the accepted scope.",
+            "source_ref": "objective",
+            "work_function": "implementation",
+            "agent_ref": "worker",
+            "status": "covered",
+            "reason": "The accepted review approves this exact work function.",
+            "evidence_ref": "agent_review:review-worker",
+        }],
+    }
+
+
+def _task1_analysis_request():
+    return {
+        "agents": [{"id": "worker"}],
+        "required_work_functions": ["implementation"],
+        "hierarchy_context": {
+            "agent_reviews": [{
+                "review_id": "review-worker",
+                "agent_id": "worker",
+                "approved_work_functions": ["implementation"],
+            }],
+            "revision": None,
+        },
+    }
+
+
+def _task2_revision_request():
+    request = _task1_analysis_request()
+    request["agents"] = [{"id": "worker"}, {"id": "replacement"}]
+    request["hierarchy_context"]["revision"] = {
+        "source_process_id": "source-process",
+        "source_decision_id": "source-decision",
+        "saved_reason": "Move implementation ownership.\nDocument the remaining constraint.",
+        "feedback_text": "Move implementation ownership.\nDocument the remaining constraint.",
+        "previous_proposal": {
+            "assignments": [{"work_function": "implementation", "agent_ref": "worker"}],
+            "reporting_lines": [{"agent_ref": "worker", "reports_to": "manager"}],
+            "documented_gaps": [],
+        },
+        "feedback_items": [
+            {"item_id": "feedback:1", "source_excerpt": "Move implementation ownership."},
+            {"item_id": "feedback:2", "source_excerpt": "Document the remaining constraint."},
+        ],
+    }
+    return request
+
+
+def _task2_revision_payload(*, feedback_results):
+    payload = _task1_analysis_payload(feedback_results=feedback_results)
+    payload["assignments"] = [{"work_function": "implementation", "agent_ref": "replacement"}]
+    payload["reporting_lines"] = [{"agent_ref": "replacement", "reports_to": "manager"}]
+    return payload
+
+
+def test_hierarchy_parser_binds_frozen_feedback_items_and_real_applied_references():
+    request = _task2_revision_request()
+    valid = _task2_revision_payload(feedback_results=[
+        {
+            "item_id": "feedback:1",
+            "source_excerpt": "Move implementation ownership.",
+            "disposition": "applied",
+            "reason": "Implementation ownership now uses the replacement.",
+            "change_refs": ["assignment:implementation"],
+        },
+        {
+            "item_id": "feedback:2",
+            "source_excerpt": "Document the remaining constraint.",
+            "disposition": "impossible",
+            "reason": "No eligible owner exists for the requested constraint.",
+            "change_refs": [],
+        },
+    ])
+
+    assert parse_team_hierarchy_analysis(valid, request).feedback_results[0]["change_refs"] == [
+        "assignment:implementation"
+    ]
+    for reference in (
+        "assignment:implementation",
+        "reporting:worker",
+        "reporting:replacement",
+        "responsibility:implementation-owner",
+    ):
+        changed = copy.deepcopy(valid)
+        changed["feedback_results"][0]["change_refs"] = [reference]
+        assert parse_team_hierarchy_analysis(changed, request).feedback_results[0]["change_refs"] == [reference]
+
+    gap_request = _task2_revision_request()
+    gap_request["required_work_functions"].append("review")
+    gap_payload = copy.deepcopy(valid)
+    gap_payload["documented_gaps"] = ["review"]
+    gap_payload["feedback_results"][0]["change_refs"] = ["generic_gap:review"]
+    assert parse_team_hierarchy_analysis(gap_payload, gap_request).feedback_results[0]["change_refs"] == [
+        "generic_gap:review"
+    ]
+
+    invalid_cases = [
+        (
+            _task2_revision_payload(feedback_results=valid["feedback_results"][:1]),
+            "exactly account for frozen feedback items",
+        ),
+        (
+            _task2_revision_payload(feedback_results=[
+                {**valid["feedback_results"][0], "item_id": "feedback:unknown"},
+                valid["feedback_results"][1],
+            ]),
+            "exactly account for frozen feedback items",
+        ),
+        (
+            _task2_revision_payload(feedback_results=[
+                {**valid["feedback_results"][0], "source_excerpt": "Different text."},
+                valid["feedback_results"][1],
+            ]),
+            "source excerpts must match frozen feedback items",
+        ),
+        (
+            _task2_revision_payload(feedback_results=[
+                {**valid["feedback_results"][0], "change_refs": []},
+                valid["feedback_results"][1],
+            ]),
+            "applied feedback requires a changed reference",
+        ),
+        (
+            _task2_revision_payload(feedback_results=[
+                {**valid["feedback_results"][0], "change_refs": ["assignment:unknown"]},
+                valid["feedback_results"][1],
+            ]),
+            "reference actual changed hierarchy facts",
+        ),
+        (
+            _task1_analysis_payload(feedback_results=valid["feedback_results"]),
+            "reference actual changed hierarchy facts",
+        ),
+    ]
+    for payload, match in invalid_cases:
+        with pytest.raises(ValueError, match=match):
+            parse_team_hierarchy_analysis(payload, request)
+
+
+def test_hierarchy_parser_accepts_only_current_accepted_hierarchy_decision_coverage_for_new_agents():
+    request = _task2_revision_request()
+    request["hierarchy_context"]["agent_reviews"].append({
+        "review_id": "review-replacement",
+        "agent_id": "replacement",
+        "approved_work_functions": ["implementation"],
+        "accepted_decision_id": "hierarchy-approval",
+        "accepted_definition": {"name": "replacement"},
+    })
+    payload = _task2_revision_payload(feedback_results=[
+        {
+            "item_id": "feedback:1",
+            "source_excerpt": "Move implementation ownership.",
+            "disposition": "applied",
+            "reason": "Implementation ownership now uses the accepted edited agent.",
+            "change_refs": ["assignment:implementation"],
+        },
+        {
+            "item_id": "feedback:2",
+            "source_excerpt": "Document the remaining constraint.",
+            "disposition": "declined",
+            "reason": "No further supported change exists.",
+            "change_refs": [],
+        },
+    ])
+    payload["responsibility_coverage"] = [{
+        "responsibility_id": "implementation-owner",
+        "responsibility": "Implement the accepted scope.",
+        "source_ref": "feedback:1",
+        "work_function": "implementation",
+        "agent_ref": "replacement",
+        "status": "covered",
+        "reason": "The accepted hierarchy decision approves the edited definition for implementation.",
+        "evidence_ref": "agent_decision:hierarchy-approval",
+    }]
+
+    assert parse_team_hierarchy_analysis(payload, request).responsibility_coverage[0]["agent_ref"] == "replacement"
+
+    unaccepted = copy.deepcopy(request)
+    unaccepted["hierarchy_context"]["agent_reviews"][-1].pop("accepted_decision_id")
+    with pytest.raises(ValueError, match="accepted"):
+        parse_team_hierarchy_analysis(payload, unaccepted)
+
+    provisional = copy.deepcopy(payload)
+    provisional["responsibility_coverage"][0].update({
+        "agent_ref": "proposal:replacement",
+        "status": "proposed",
+        "evidence_ref": "proposal:replacement",
+    })
+    with pytest.raises(ValueError, match="proposal"):
+        parse_team_hierarchy_analysis(provisional, request)
+
+
+@pytest.mark.parametrize("source_ref", ["criterion:unknown", "feedback:unknown", "feedback:1"])
+def test_hierarchy_parser_rejects_coverage_refs_not_present_in_current_input(source_ref):
+    payload = _task1_analysis_payload()
+    payload["responsibility_coverage"][0]["source_ref"] = source_ref
+
+    with pytest.raises(ValueError, match="source_ref"):
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+
+def test_hierarchy_parser_accepts_first_response_feedback_provenance_before_freeze():
+    request = _task2_revision_request()
+    request["hierarchy_context"]["revision"]["feedback_items"] = []
+    payload = _task2_revision_payload(feedback_results=[{
+        "item_id": "feedback:1",
+        "source_excerpt": "Move implementation ownership.",
+        "disposition": "applied",
+        "reason": "Implementation ownership now uses the replacement.",
+        "change_refs": ["assignment:implementation"],
+    }])
+    payload["responsibility_coverage"][0]["source_ref"] = "feedback:1"
+
+    parsed = parse_team_hierarchy_analysis(payload, request)
+
+    assert parsed.responsibility_coverage[0]["source_ref"] == "feedback:1"
+    assert parsed.feedback_results[0]["item_id"] == "feedback:1"
+
+
+def test_hierarchy_parser_does_not_treat_reason_only_coverage_change_as_applied():
+    request = _task2_revision_request()
+    payload = _task2_revision_payload(feedback_results=[
+        {
+            "item_id": "feedback:1",
+            "source_excerpt": "Move implementation ownership.",
+            "disposition": "applied",
+            "reason": "Only the explanation changed.",
+            "change_refs": ["responsibility:implementation-owner"],
+        },
+        {
+            "item_id": "feedback:2",
+            "source_excerpt": "Document the remaining constraint.",
+            "disposition": "declined",
+            "reason": "No supported change exists.",
+            "change_refs": [],
+        },
+    ])
+    payload["assignments"] = [{"work_function": "implementation", "agent_ref": "worker"}]
+    payload["reporting_lines"] = [{"agent_ref": "worker", "reports_to": "manager"}]
+    request["hierarchy_context"]["revision"]["previous_proposal"]["responsibility_coverage"] = [
+        {**payload["responsibility_coverage"][0], "reason": "Earlier wording only."}
+    ]
+
+    with pytest.raises(ValueError, match="actual changed hierarchy facts"):
+        parse_team_hierarchy_analysis(payload, request)
+
+
+def test_revision_context_starts_new_frozen_items_for_a_new_request_change_decision():
+    process = TeamHierarchyProcess()
+    prior = {
+        "source_process_id": "prior-process",
+        "source_decision_id": "prior-decision",
+        "saved_reason": "Old request.",
+        "feedback_text": "Old request.",
+        "previous_proposal": {"marker": "old"},
+        "feedback_items": [{"item_id": "feedback:old", "source_excerpt": "Old request."}],
+    }
+    current = SimpleNamespace(
+        id=uuid.uuid4(),
+        outputs={"revision_context": prior, "proposal": {"marker": "new"}},
+    )
+    decision = SimpleNamespace(id=uuid.uuid4(), reason="New compound request.", options=[])
+
+    revision = process._revision_context(current, decision)
+
+    assert revision["source_process_id"] == str(current.id)
+    assert revision["source_decision_id"] == str(decision.id)
+    assert revision["saved_reason"] == "New compound request."
+    assert revision["previous_proposal"] == {"marker": "new"}
+    assert revision["feedback_items"] == []
+
+
+def test_revision_context_reuses_repair_markers_only_for_the_same_human_decision():
+    process = TeamHierarchyProcess()
+    decision_id = uuid.uuid4()
+    prior = {
+        "source_process_id": "prior-process",
+        "source_decision_id": str(decision_id),
+        "saved_reason": "Preserve this request.",
+        "feedback_text": "Preserve this request.",
+        "previous_proposal": {"marker": "prior"},
+        "feedback_items": [{"item_id": "feedback:prior", "source_excerpt": "Preserve this request."}],
+    }
+    current = SimpleNamespace(
+        id=uuid.uuid4(),
+        outputs={
+            "revision_context": prior,
+            "resolved_validation_repair_attempted": True,
+            "resolved_validation_retry_repair": True,
+            "proposal": {"marker": "new"},
+        },
+    )
+    retry = SimpleNamespace(id=decision_id, reason="Preserve this request.", options=[])
+
+    assert process._revision_context(current, retry) == prior
+    assert current.outputs["resolved_validation_repair_attempted"] is True
+    assert current.outputs["resolved_validation_retry_repair"] is True
+
+    new_request = SimpleNamespace(id=uuid.uuid4(), reason="A distinct human request.", options=[])
+    new_context = process._revision_context(current, new_request)
+
+    assert new_context["source_decision_id"] == str(new_request.id)
+    assert new_context["feedback_items"] == []
+    assert "resolved_validation_repair_attempted" not in current.outputs
+    assert "resolved_validation_retry_repair" not in current.outputs
+
+
+def test_hierarchy_parser_rejects_empty_first_feedback_for_nonblank_change_request():
+    request = _task2_revision_request()
+    request["hierarchy_context"]["revision"]["feedback_items"] = []
+    payload = _task2_revision_payload(feedback_results=[])
+
+    with pytest.raises(ValueError, match="feedback results must account for request_changes feedback"):
+        parse_team_hierarchy_analysis(payload, request)
+
+
+def test_revision_context_rejects_blank_human_change_request_reason():
+    process = TeamHierarchyProcess()
+    current = SimpleNamespace(id=uuid.uuid4(), outputs={"proposal": {"marker": "new"}})
+    blank_request = SimpleNamespace(id=uuid.uuid4(), reason="  ", options=[])
+
+    with pytest.raises(ValueError, match="team hierarchy request_changes requires feedback"):
+        process._revision_context(current, blank_request)
+
+
+def test_hierarchy_identity_ignores_prompt_only_approved_exclusions():
+    process = TeamHierarchyProcess()
+    base = {
+        "goal": {"id": "goal"},
+        "agents": [],
+        "resolved_proposal_exclusions": [{"fingerprint": "rejected", "action": "reject"}],
+    }
+    enriched = copy.deepcopy(base)
+    enriched["hierarchy_context"] = {"agent_reviews": [], "revision": {"source_process_id": "source"}}
+    enriched["resolved_proposal_exclusions"].append({"fingerprint": "approved", "action": "approve"})
+
+    assert process._semantic_fingerprint(process._strip_volatile(enriched)) == (
+        process._semantic_fingerprint(process._strip_volatile(base))
+    )
+
+
+def test_hierarchy_parser_preserves_empty_feedback_and_validates_accepted_coverage_evidence():
+    result = parse_team_hierarchy_analysis(_task1_analysis_payload(), _task1_analysis_request())
+
+    assert result.feedback_results == ()
+    assert result.responsibility_coverage == ({
+        "responsibility_id": "implementation-owner",
+        "responsibility": "Implement the accepted scope.",
+        "source_ref": "objective",
+        "work_function": "implementation",
+        "agent_ref": "worker",
+        "status": "covered",
+        "reason": "The accepted review approves this exact work function.",
+        "evidence_ref": "agent_review:review-worker",
+    },)
+
+
+def test_domain_owners_need_accepted_capability_evidence_without_gaining_execution_authority():
+    request = _task1_analysis_request()
+    request["agents"].extend([
+        {"id": "market"}, {"id": "product"}, {"id": "code-writer"}, {"id": "ux"},
+    ])
+    request["hierarchy_context"]["agent_reviews"].extend([
+        {"review_id": "review-market", "agent_id": "market", "approved_work_functions": ["implementation"]},
+        {"review_id": "review-product", "agent_id": "product", "approved_work_functions": ["implementation"]},
+        {"review_id": "review-code-writer", "agent_id": "code-writer", "approved_work_functions": []},
+        {"review_id": "review-ux", "agent_id": "ux", "approved_work_functions": []},
+    ])
+    before_request = copy.deepcopy(request)
+    payload = _task1_analysis_payload(responsibility_coverage=[
+        {
+            "responsibility_id": "commercial-evidence",
+            "responsibility": "Market owns commercial evidence.",
+            "source_ref": "objective",
+            "work_function": "implementation",
+            "agent_ref": "market",
+            "status": "covered",
+            "reason": "The accepted Market review supports this domain ownership.",
+            "evidence_ref": "agent_review:review-market",
+        },
+        {
+            "responsibility_id": "product-acceptance",
+            "responsibility": "Product owns acceptance sequencing.",
+            "source_ref": "objective",
+            "work_function": "implementation",
+            "agent_ref": "product",
+            "status": "covered",
+            "reason": "The accepted Product review supports this domain ownership.",
+            "evidence_ref": "agent_review:review-product",
+        },
+        {
+            "responsibility_id": "ux-zero-eligible",
+            "responsibility": "UX consent work needs an eligible owner.",
+            "source_ref": "objective",
+            "work_function": "implementation",
+            "agent_ref": None,
+            "status": "gap",
+            "reason": "No accepted UX capability is eligible.",
+            "evidence_ref": "gap:zero-eligible-ux",
+        },
+    ])
+
+    parsed = parse_team_hierarchy_analysis(payload, request)
+
+    assert [row["agent_ref"] for row in parsed.responsibility_coverage] == ["market", "product", None]
+    assert parsed.assignments == ({"work_function": "implementation", "agent_ref": "worker"},)
+    assert request == before_request
+    coder_claim = copy.deepcopy(payload)
+    coder_claim["responsibility_coverage"][0].update({
+        "agent_ref": "code-writer", "evidence_ref": "agent_review:review-code-writer",
+    })
+    with pytest.raises(ValueError, match="not accepted"):
+        parse_team_hierarchy_analysis(coder_claim, request)
+
+
+def test_hierarchy_parser_requires_new_fields_for_context_but_normalizes_legacy_payloads():
+    legacy_request = {"agents": [{"id": "worker"}], "required_work_functions": ["implementation"]}
+    legacy_payload = _task1_analysis_payload()
+    legacy_payload.pop("feedback_results")
+    legacy_payload.pop("responsibility_coverage")
+
+    legacy = parse_team_hierarchy_analysis(legacy_payload, legacy_request)
+
+    assert legacy.feedback_results == ()
+    assert legacy.responsibility_coverage == ()
+    with pytest.raises(ValueError, match="required fields"):
+        parse_team_hierarchy_analysis(legacy_payload, _task1_analysis_request())
+
+
+@pytest.mark.parametrize("mutate, match", [
+    (lambda payload: payload["feedback_results"].append({
+        "item_id": "one", "source_excerpt": "Add product ownership.", "disposition": "applied",
+        "reason": "Added it.", "change_refs": ["assignment:implementation"],
+    }) or payload["feedback_results"].append({
+        "item_id": "one", "source_excerpt": "Also add product ownership.", "disposition": "declined",
+        "reason": "Duplicate.", "change_refs": [],
+    }), "unique"),
+    (lambda payload: payload["feedback_results"].append({
+        "item_id": "one", "source_excerpt": "Add product ownership.", "disposition": "partial",
+        "reason": "Partly done.", "change_refs": [],
+    }), "disposition"),
+    (lambda payload: payload["feedback_results"].append({
+        "item_id": "one", "source_excerpt": "Add product ownership.", "disposition": "declined",
+        "reason": " ", "change_refs": [],
+    }), "reason"),
+    (lambda payload: payload["responsibility_coverage"].__setitem__(0, {
+        **payload["responsibility_coverage"][0], "work_function": "invented",
+    }), "work_function"),
+    (lambda payload: payload["responsibility_coverage"].__setitem__(0, {
+        **payload["responsibility_coverage"][0], "evidence_ref": "agent_review:unknown",
+    }), "evidence"),
+    (lambda payload: payload["responsibility_coverage"].__setitem__(0, {
+        **payload["responsibility_coverage"][0], "source_ref": "unrelated",
+    }), "source_ref"),
+    (lambda payload: payload["responsibility_coverage"].__setitem__(0, {
+        **payload["responsibility_coverage"][0], "status": "proposed", "evidence_ref": "worker",
+    }), "proposed"),
+])
+def test_hierarchy_parser_rejects_invalid_feedback_and_coverage_contract(mutate, match):
+    payload = _task1_analysis_payload()
+    mutate(payload)
+
+    with pytest.raises(ValueError, match=match):
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+
+def test_hierarchy_parser_rejects_feedback_without_a_revision_context():
+    payload = _task1_analysis_payload(feedback_results=[{
+        "item_id": "one", "source_excerpt": "Add product ownership.", "disposition": "declined",
+        "reason": "No product scope was approved.", "change_refs": [],
+    }])
+
+    with pytest.raises(ValueError, match="revision context"):
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
 
 
 def test_hierarchy_parser_normalizes_proposal_id_that_echoes_the_prefix():
@@ -438,6 +926,27 @@ def test_team_hierarchy_retry_checkpoint_owns_frozen_request():
     assert valid_lm_retry_checkpoint(checkpoint, "team_hierarchy") is False
 
 
+def test_team_hierarchy_retry_checkpoint_accepts_only_well_formed_prompt_context():
+    from huddleroom.schemas.orchestration import valid_lm_retry_checkpoint
+
+    payload = {
+        "schema_version": 1,
+        "goal": {},
+        "selected_manager": {"kind": "none", "id": None},
+        "required_work_functions": [],
+        "agents": [],
+        "hierarchy_context": {"agent_reviews": [], "revision": None},
+    }
+    request = TeamHierarchyAnalyzer.build_request(payload)
+    checkpoint = {"kind": "team_hierarchy", "version": 1, "request": request}
+
+    assert valid_lm_retry_checkpoint(checkpoint, "team_hierarchy") is True
+    malformed = copy.deepcopy(checkpoint)
+    payload["hierarchy_context"] = {"agent_reviews": "not-a-list", "revision": []}
+    malformed["request"]["messages"][1]["content"] = json.dumps(payload)
+    assert valid_lm_retry_checkpoint(malformed, "team_hierarchy") is False
+
+
 @pytest.mark.asyncio
 async def test_llm_hierarchy_receives_full_roster_without_deterministic_draft(
     db_session, test_project, test_user
@@ -491,10 +1000,11 @@ async def test_llm_hierarchy_receives_full_roster_without_deterministic_draft(
     assert summary == {"process_type": "team_hierarchy", "status": "waiting_decision", "questions_created": 1}
     assert set(captured) == {
         "schema_version", "goal", "selected_manager", "required_work_functions", "agents",
-        "resolved_proposal_exclusions",
+        "resolved_proposal_exclusions", "hierarchy_context",
     }
     assert {row["id"] for row in captured["agents"]} >= {str(agent.id) for agent in [*agents.values(), extra]}
     assert all("workload" in row for row in captured["agents"])
+    assert captured["hierarchy_context"] == {"agent_reviews": [], "revision": None}
     assert not ({"proposal", "hierarchy", "role_to_agent", "candidate_agents"} & set(captured))
     decisions = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
     assert [(item.decision_key, item.authority, [option["key"] for option in item.options]) for item in decisions] == [
@@ -594,7 +1104,11 @@ async def test_failed_hierarchy_retries_frozen_request_into_proposal_decision(
             "documented_gaps": [],
             "rationale": "The active roster covers all required work.",
             "self_review": "Checked definitions, references, coverage, reporting, and independence.",
+            "feedback_results": [],
+            "responsibility_coverage": [],
         })
+
+
         return {"choices": [{"message": {"content": json.dumps(returned_payload)}}]}
 
     process = TeamHierarchyProcess(analyzer=TeamHierarchyAnalyzer(completion))
@@ -623,6 +1137,164 @@ async def test_failed_hierarchy_retries_frozen_request_into_proposal_decision(
     decisions = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
     assert [decision.decision_key for decision in decisions] == [
         "team_hierarchy:agent:optional-specialist"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repaired_frozen_retry_with_proposal_parks_without_new_handoff(
+    db_session, test_project, test_user
+):
+    """A post-repair retry may not reopen the proposal loop."""
+    from huddleroom.services.orchestration_team_hierarchy import HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL
+
+    goal, run, _agents, _review = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    requests = []
+    before_agents = list((await db_session.execute(select(Agent.id))).scalars())
+
+    async def completion(**request):
+        requests.append(copy.deepcopy(request))
+        payload = json.loads(request["messages"][1]["content"])
+        revision = payload["hierarchy_context"]["revision"]
+        if revision is not None and len([
+            sent for sent in requests
+            if json.loads(sent["messages"][1]["content"])["hierarchy_context"]["revision"] is not None
+        ]) == 1:
+            raise RuntimeError("provider unavailable")
+        analysis = _analysis_for(
+            payload,
+            proposals=(_proposed_agent(),) if revision is not None else (),
+        ).to_dict()
+        if revision is not None:
+            analysis["feedback_results"] = [{
+                "item_id": item["item_id"],
+                "source_excerpt": item["source_excerpt"],
+                "disposition": "declined",
+                "reason": "The accepted roster cannot satisfy this requested change.",
+                "change_refs": [],
+            } for item in revision["feedback_items"]]
+        return {"choices": [{"message": {"content": json.dumps(analysis)}}]}
+
+    process = TeamHierarchyProcess(analyzer=TeamHierarchyAnalyzer(completion))
+    service = OrchestrationProcessService()
+    assert (await process.advance(db_session, goal, run))["status"] == "waiting_decision"
+    source = await service.get_current(db_session, goal.id, "team_hierarchy")
+    revision_context = {
+        "source_process_id": str(source.id),
+        "source_decision_id": "request-changes-decision",
+        "saved_reason": "Keep this frozen constraint.",
+        "feedback_text": "Keep this frozen constraint.",
+        "previous_proposal": copy.deepcopy(source.outputs["proposal"]),
+        "feedback_items": [{
+            "item_id": "feedback:1",
+            "source_excerpt": "Keep this frozen constraint.",
+        }],
+    }
+    source.outputs = {**source.outputs, "revision_context": revision_context}
+    source.input_snapshot = {"fingerprint": HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL}
+    await db_session.flush()
+
+    failed = await process.advance(db_session, goal, run)
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    repair_process_id = current.id
+    decisions_before_retry = await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
+    current.outputs = {
+        **current.outputs,
+        "resolved_validation_repair_attempted": True,
+    }
+    flag_modified(current, "outputs")
+    await db_session.flush()
+
+    retried = await process.retry_failed(db_session, goal, run, current)
+
+    assert failed["retryable"] is True
+    assert retried["status"] == "waiting_decision"
+    assert len(requests) == 3
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    assert current.id == repair_process_id
+    assert current.status == "waiting_decision"
+    assert current.outputs["revision_context"] == revision_context
+    assert current.outputs["retryable"] is False
+    assert "resolved hierarchy repair" in current.outputs["semantic_error"]
+    assert "_lm_retry" not in current.outputs
+    assert await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id) == decisions_before_retry
+    assert list((await db_session.execute(select(Agent.id))).scalars()) == before_agents
+
+
+@pytest.mark.asyncio
+async def test_revision_feedback_retry_preserves_frozen_context_and_repairs_same_items(
+    db_session, test_project, test_user
+):
+    from huddleroom.services.orchestration_team_hierarchy import HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL
+
+    goal, run, _agents, _review = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    requests = []
+
+    async def completion(**request):
+        prompt = json.loads(request["messages"][1]["content"])
+        revision = prompt["hierarchy_context"]["revision"]
+        requests.append(copy.deepcopy(request))
+        if revision is None:
+            return {"choices": [{"message": {"content": json.dumps(_analysis_for(prompt).to_dict())}}]}
+        if len([item for item in requests if json.loads(item["messages"][1]["content"])["hierarchy_context"]["revision"]]) <= 2:
+            raise RuntimeError("provider unavailable")
+        analysis = _analysis_for(prompt).to_dict()
+        analysis["feedback_results"] = [
+            {
+                "item_id": item["item_id"],
+                "source_excerpt": item["source_excerpt"],
+                "disposition": "declined",
+                "reason": "The accepted roster cannot satisfy this request.",
+                "change_refs": [],
+            }
+            for item in revision["feedback_items"]
+        ]
+        return {"choices": [{"message": {"content": json.dumps(analysis)}}]}
+
+    process = TeamHierarchyProcess(analyzer=TeamHierarchyAnalyzer(completion))
+    service = OrchestrationProcessService()
+    assert (await process.advance(db_session, goal, run))["status"] == "waiting_decision"
+    source = await service.get_current(db_session, goal.id, "team_hierarchy")
+    revision_context = {
+        "source_process_id": str(source.id),
+        "source_decision_id": "source-decision",
+        "saved_reason": "Preserve this first request.\nPreserve this second request.",
+        "feedback_text": "Preserve this first request.\nPreserve this second request.",
+        "previous_proposal": copy.deepcopy(source.outputs["proposal"]),
+        "feedback_items": [
+            {"item_id": "feedback:1", "source_excerpt": "Preserve this first request."},
+            {"item_id": "feedback:2", "source_excerpt": "Preserve this second request."},
+        ],
+    }
+    source.outputs = {**source.outputs, "revision_context": revision_context}
+    source.input_snapshot = {"fingerprint": HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL}
+    await db_session.flush()
+
+    failed = await process.advance(db_session, goal, run)
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    frozen_prompt = json.loads(current.outputs["_lm_retry"]["request"]["messages"][1]["content"])
+
+    assert failed["retryable"] is True
+    assert current.outputs["revision_context"] == revision_context
+    assert frozen_prompt["hierarchy_context"]["revision"] == revision_context
+
+    retry_failed = await process.retry_failed(db_session, goal, run, current)
+
+    assert retry_failed["retryable"] is True
+    assert current.outputs["revision_context"] == revision_context
+    retry_frozen_prompt = json.loads(current.outputs["_lm_retry"]["request"]["messages"][1]["content"])
+    assert retry_frozen_prompt["hierarchy_context"]["revision"] == revision_context
+
+    retried = await process.retry_failed(db_session, goal, run, current)
+
+    assert retried["status"] == "waiting_decision"
+    assert "_lm_retry" not in current.outputs
+    assert current.outputs["revision_context"] == revision_context
+    assert [item["item_id"] for item in current.outputs["analysis"]["feedback_results"]] == [
+        "feedback:1", "feedback:2"
     ]
 
 
@@ -1250,6 +1922,65 @@ async def _lifecycle_goal(
     return goal, run, agents, review_process
 
 
+@pytest.mark.asyncio
+async def test_hierarchy_prompt_context_uses_accepted_reviews_without_changing_input_identity(
+    db_session, test_project, test_user
+):
+    goal, run, agents, review_process = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    process = TeamHierarchyProcess()
+    reviews = await process.review_service.list_reviews(db_session, goal.id)
+    for review in reviews:
+        review.source_process_run_id = review_process.id
+    review_process.outputs = {
+        "review_ids": [str(review.id) for review in reviews],
+        "eligibility": {
+            str(review.agent_id): review.approved_for_work_functions
+            for review in reviews
+        },
+        "semantic_assessments": {
+            str(review.agent_id): {"reason": "Accepted after review.", "problems": []}
+            for review in reviews
+        },
+    }
+    flag_modified(review_process, "outputs")
+    await db_session.flush()
+    base = await process._analysis_input(db_session, goal)
+    original = copy.deepcopy(base)
+
+    enriched = await process._hierarchy_prompt_payload(db_session, goal, base, None)
+
+    assert base == original
+    assert enriched["hierarchy_context"]["revision"] is None
+    context = json.dumps(enriched["hierarchy_context"], sort_keys=True)
+    assert str(review_process.id) in context
+    for agent in agents.values():
+        assert str(agent.id) in context
+        assert agent.name in context
+    assert process._semantic_fingerprint(process._strip_volatile(enriched)) == (
+        process._semantic_fingerprint(process._strip_volatile(base))
+    )
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_prompt_context_excludes_unaccepted_review_process_evidence(
+    db_session, test_project, test_user
+):
+    goal, _run, _agents, review_process = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    review_process.status = "waiting_decision"
+    await db_session.flush()
+    process = TeamHierarchyProcess()
+
+    enriched = await process._hierarchy_prompt_payload(
+        db_session, goal, await process._analysis_input(db_session, goal), None
+    )
+
+    assert enriched["hierarchy_context"] == {"agent_reviews": [], "revision": None}
+
+
 class FrozenHierarchyAnalyzer:
     def __init__(self):
         self.calls = 0
@@ -1353,9 +2084,12 @@ async def _settle_answer(db_session, run, response):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("answer", "created"), [("edit", True), ("reject", False)])
+@pytest.mark.parametrize(
+    ("answer", "created", "repeat_proposed"),
+    [("approve", True, False), ("edit", True, False), ("reject", False, False), ("approve", True, True)],
+)
 async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposing_original(
-    client, db_session, test_project, test_user, monkeypatch, answer, created
+    client, db_session, test_project, test_user, monkeypatch, answer, created, repeat_proposed
 ):
     goal, run, _agents, _review = await _lifecycle_goal(
         db_session, test_project, test_user, weight="substantial"
@@ -1366,15 +2100,84 @@ async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposin
     async def review(_self, payload, project=None, *, project_id=None):
         if not rerun_payloads:
             rerun_payloads.append(payload)
-            return _analysis_for(payload, proposals=(original,))
+            analysis = _analysis_for(payload, proposals=(original,))
+            return TeamHierarchyAnalysis(
+                analysis.proposed_agents,
+                analysis.assignments,
+                analysis.reporting_lines,
+                analysis.documented_gaps,
+                analysis.rationale,
+                analysis.self_review,
+                (),
+                ({
+                    "responsibility_id": "implementation-owner",
+                    "responsibility": "Implement the accepted scope.",
+                    "source_ref": "objective",
+                    "work_function": "implementation",
+                    "agent_ref": "proposal:optional-specialist",
+                    "status": "proposed",
+                    "reason": "This remains provisional until the human answers the proposal.",
+                    "evidence_ref": "proposal:optional-specialist",
+                },),
+            )
         rerun_payloads.append(payload)
-        return parse_team_hierarchy_analysis(
-            _analysis_for(payload, proposals=(original,)).to_dict(), payload
-        )
+        rerun = _analysis_for(payload).to_dict()
+        revision = payload["hierarchy_context"]["revision"]
+        if revision is not None:
+            rerun["feedback_results"] = [
+                {
+                    "item_id": item["item_id"],
+                    "source_excerpt": item["source_excerpt"],
+                    "disposition": "declined",
+                    "reason": "The proposal outcome does not satisfy this frozen request.",
+                    "change_refs": [],
+                }
+                for item in revision["feedback_items"]
+            ]
+        accepted = next((
+            item for item in payload["hierarchy_context"]["agent_reviews"]
+            if str(item.get("review_id", "")).startswith("hierarchy-decision:")
+        ), None)
+        rerun["responsibility_coverage"] = [{
+            "responsibility_id": "implementation-owner",
+            "responsibility": "Implement the accepted scope.",
+            "source_ref": "feedback:1",
+            "work_function": "implementation",
+            "agent_ref": accepted["agent_id"] if accepted else None,
+            "status": "covered" if accepted else "gap",
+            "reason": (
+                "The accepted hierarchy decision provides the reviewed implementation owner."
+                if accepted else "The rejected proposal cannot own implementation."
+            ),
+            "evidence_ref": (
+                f"agent_decision:{accepted['accepted_decision_id']}" if accepted else "gap:rejected-proposal"
+            ),
+        }]
+        if repeat_proposed:
+            rerun["responsibility_coverage"][0].update({
+                "agent_ref": "proposal:optional-specialist",
+                "status": "proposed",
+                "evidence_ref": "proposal:optional-specialist",
+            })
+        return parse_team_hierarchy_analysis(rerun, payload)
 
     monkeypatch.setattr(TeamHierarchyAnalyzer, "review", review)
     await TeamHierarchyProcess().advance(db_session, goal, run)
     decision = (await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id))[0]
+    source = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    revision_context = {
+        "source_process_id": str(source.id),
+        "source_decision_id": "source-decision",
+        "saved_reason": "Keep this constraint through proposal resolution.",
+        "feedback_text": "Keep this constraint through proposal resolution.",
+        "previous_proposal": {"assignments": [], "reporting_lines": [], "documented_gaps": []},
+        "feedback_items": [{
+            "item_id": "feedback:1",
+            "source_excerpt": "Keep this constraint through proposal resolution.",
+        }],
+    }
+    source.outputs = {**source.outputs, "revision_context": revision_context}
+    await db_session.flush()
     body = {"selected_option": answer}
     edited_name = f"edited-{uuid.uuid4()}"
     if answer == "edit":
@@ -1388,17 +2191,55 @@ async def test_proposal_resolution_reruns_via_answer_endpoint_without_reproposin
     await db_session.refresh(decision)
     metadata = json.loads(decision.reason) if decision.reason else {}
     assert ("created_agent_id" in metadata) is created
+    resolved_name = edited_name if answer == "edit" else original["definition"]["name"]
     created_agents = list((await db_session.execute(
-        select(Agent).where(Agent.name == edited_name)
+        select(Agent).where(Agent.name == resolved_name)
     )).scalars())
     assert len(created_agents) == int(created)
-    assert all(agent["name"] != original["definition"]["name"] for agent in rerun_payloads[-1]["agents"])
+    if answer in {"edit", "reject"}:
+        assert all(agent["name"] != original["definition"]["name"] for agent in rerun_payloads[-1]["agents"])
     if created:
         assert any(agent["id"] == metadata["created_agent_id"] for agent in rerun_payloads[-1]["agents"])
     assert rerun_payloads[-1]["resolved_proposal_exclusions"][0]["action"] == answer
-    assert not [item for item in await OrchestrationAuthorityDecisionService().list_decisions(
+    assert rerun_payloads[-1]["hierarchy_context"]["revision"] == revision_context
+    decision_evidence = [
+        item for item in rerun_payloads[-1]["hierarchy_context"]["agent_reviews"]
+        if item["agent_id"] == metadata.get("created_agent_id")
+    ]
+    if created:
+        assert len(decision_evidence) == 1
+        evidence = decision_evidence[0]
+        assert evidence["accepted_decision_id"] == str(decision.id)
+        assert evidence["accepted_definition"]["name"] == resolved_name
+        assert "implementation" in evidence["approved_work_functions"]
+    else:
+        assert decision_evidence == []
+    current = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    await db_session.refresh(source)
+    assert source.superseded_by_id == current.id
+    assert len(rerun_payloads) == 2
+    if repeat_proposed:
+        assert current.outputs["retryable"] is True
+        assert "_lm_retry" in current.outputs
+        assert not await OrchestrationAuthorityDecisionService().list_decisions(
+            db_session, goal.id, status="pending"
+        )
+        assert len(created_agents) == 1
+        return
+    assert current.outputs["revision_context"] == revision_context
+    assert current.outputs.get("analysis", {}).get("feedback_results") == [
+        {
+            "item_id": "feedback:1",
+            "source_excerpt": "Keep this constraint through proposal resolution.",
+            "disposition": "declined",
+            "reason": "The proposal outcome does not satisfy this frozen request.",
+            "change_refs": [],
+        }
+    ], current.outputs
+    pending = await OrchestrationAuthorityDecisionService().list_decisions(
         db_session, goal.id, status="pending"
-    )]
+    )
+    assert [item.decision_key for item in pending] == ["team_hierarchy:approval"]
 
 
 @pytest.mark.asyncio
@@ -1497,9 +2338,42 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
     goal, run, _agents, _review = await _lifecycle_goal(
         db_session, test_project, test_user, weight="substantial"
     )
+    feedback_text = (
+        "Assign an eligible Market owner.\n"
+        "Assign an eligible Product owner.\n"
+        "Record the missing UX ownership as a gap.\n"
+        "Do not give commercial work to an excluded developer."
+    )
+    review_payloads = []
+    semantic_items = [
+        {"item_id": "feedback:market", "source_excerpt": "Assign an eligible Market owner."},
+        {"item_id": "feedback:product", "source_excerpt": "Assign an eligible Product owner."},
+        {"item_id": "feedback:ux", "source_excerpt": "Record the missing UX ownership as a gap."},
+        {"item_id": "feedback:developer", "source_excerpt": "Do not give commercial work to an excluded developer."},
+    ]
 
     async def review(_self, payload, project=None, *, project_id=None):
-        return _analysis_for(payload)
+        review_payloads.append(copy.deepcopy(payload))
+        analysis = _analysis_for(payload)
+        revision = payload["hierarchy_context"]["revision"]
+        if revision is None:
+            return analysis
+        return TeamHierarchyAnalysis(
+            analysis.proposed_agents,
+            analysis.assignments,
+            analysis.reporting_lines,
+            analysis.documented_gaps,
+            analysis.rationale,
+            analysis.self_review,
+            tuple({
+                "item_id": item["item_id"],
+                "source_excerpt": item["source_excerpt"],
+                "disposition": "declined",
+                "reason": "The current accepted roster cannot support this request.",
+                "change_refs": [],
+            } for item in (revision["feedback_items"] or semantic_items)),
+            analysis.responsibility_coverage,
+        )
 
     monkeypatch.setattr(TeamHierarchyAnalyzer, "review", review)
     service = OrchestrationProcessService()
@@ -1514,7 +2388,7 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
     await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, original_approval.id),
-        json={"selected_option": "request_changes"},
+        json={"selected_option": "request_changes", "reason": feedback_text},
     )
     await _settle_answer(db_session, run, response)
 
@@ -1522,6 +2396,15 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
     fresh = await service.get_current(db_session, goal.id, "team_hierarchy")
     assert fresh.id != original.id
     assert original.superseded_by_id == fresh.id
+    revision = fresh.outputs["revision_context"]
+    assert revision["source_process_id"] == str(original.id)
+    assert revision["source_decision_id"] == str(original_approval.id)
+    assert revision["saved_reason"] == feedback_text
+    assert revision["feedback_text"] == feedback_text
+    assert revision["previous_proposal"] == original.outputs["proposal"]
+    assert revision["feedback_items"] == semantic_items
+    assert review_payloads[-1]["hierarchy_context"]["revision"]["feedback_items"] == []
+    waiting_proposal = copy.deepcopy(fresh.outputs["proposal"])
     fresh_approval = next(
         decision
         for decision in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
@@ -1542,8 +2425,63 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
     assert current.id == fresh.id
     assert current.status == "completed"
     assert current.superseded_by_id is None
+    assert current.outputs["revision_context"] == revision
+    assert current.outputs["proposal"] == waiting_proposal
+    assert current.outputs["proposal"]["feedback_results"] == [
+        {
+            "item_id": item["item_id"],
+            "source_excerpt": item["source_excerpt"],
+            "disposition": "declined",
+            "reason": "The current accepted roster cannot support this request.",
+            "change_refs": [],
+        }
+        for item in revision["feedback_items"]
+    ]
     warnings = await OrchestrationWarningService().list_warnings(db_session, goal.id, active_only=True)
     assert not [warning for warning in warnings if warning.warning_type == "team_hierarchy_stale_inputs"]
+
+
+@pytest.mark.asyncio
+async def test_blank_hierarchy_change_request_is_rejected_before_answer_acceptance(
+    client, db_session, test_project, test_user, monkeypatch
+):
+    goal, run, _agents, _review = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+
+    async def review(_self, payload, project=None, *, project_id=None):
+        return _analysis_for(payload)
+
+    monkeypatch.setattr(TeamHierarchyAnalyzer, "review", review)
+    service = OrchestrationProcessService()
+    assert (await TeamHierarchyProcess().advance(db_session, goal, run))["status"] == "waiting_decision"
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    decision = next(
+        item for item in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
+        if item.decision_key == "team_hierarchy:approval"
+    )
+    original_outputs = copy.deepcopy(current.outputs)
+    original_snapshot = copy.deepcopy(current.input_snapshot)
+    await db_session.commit()
+
+    response = await client.post(
+        _answer_url(test_project.id, goal.id, decision.id),
+        json={"selected_option": "request_changes", "reason": "  "},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "requires feedback" in response.json()["detail"]
+    await _refresh_all(db_session)
+    assert (decision.status, decision.selected_option, decision.reason, decision.continuation_action_id) == (
+        "pending", None, None, None
+    )
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    assert current.status == "waiting_decision"
+    assert current.outputs == original_outputs
+    assert current.input_snapshot == original_snapshot
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+        OrchestrationAction.idempotency_key == f"run:{run.id}:kind:decision_continuation:decision:{decision.id}"
+    )) == 0
 
 
 @pytest.mark.asyncio
@@ -1942,6 +2880,79 @@ async def test_separate_proposal_and_hierarchy_approvals_apply_gaps_and_unused_a
     assert current.status == "completed"
     assert current.outputs["documented_gaps"] == ["validation"]
     assert current.outputs["approved_but_unused_agent_ids"] == created_ids
+
+
+@pytest.mark.asyncio
+async def test_substantive_gap_requires_exact_human_acknowledgement_before_completion(
+    client, db_session, test_project, test_user, monkeypatch
+):
+    goal, run, _agents, _review = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    gap_id = "ux-zero-eligible"
+
+    async def review(_self, payload, project=None, *, project_id=None):
+        analysis = _analysis_for(payload)
+        return TeamHierarchyAnalysis(
+            analysis.proposed_agents,
+            analysis.assignments,
+            analysis.reporting_lines,
+            analysis.documented_gaps,
+            analysis.rationale,
+            analysis.self_review,
+            analysis.feedback_results,
+            ({
+                "responsibility_id": gap_id,
+                "responsibility": "UX consent work requires an accepted eligible owner.",
+                "source_ref": "objective",
+                "work_function": "implementation",
+                "agent_ref": None,
+                "status": "gap",
+                "reason": "No reviewed UX capability is eligible for this substantive responsibility.",
+                "evidence_ref": "gap:zero-eligible-ux",
+            },),
+        )
+
+    monkeypatch.setattr(TeamHierarchyAnalyzer, "review", review)
+    process = TeamHierarchyProcess()
+    service = OrchestrationProcessService()
+    assert (await process.advance(db_session, goal, run))["status"] == "waiting_decision"
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    approval = next(
+        item for item in await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id)
+        if item.decision_key == "team_hierarchy:approval"
+    )
+
+    assert [item["key"] for item in approval.options] == [
+        "approve_with_documented_gaps", "request_changes",
+    ]
+    assert current.outputs["gates"]["required_work_functions_mapped"] is False
+    assert current.outputs["gates"]["missing_capabilities_handled"] is False
+
+    # The acknowledgement is bound to the exact pending option. A later
+    # recomputation must not silently replace its recorded substantive gaps.
+    current.outputs = {
+        **current.outputs,
+        "analysis": {**current.outputs["analysis"], "responsibility_coverage": []},
+    }
+    flag_modified(current, "outputs")
+    await db_session.flush()
+
+    await db_session.commit()
+    response = await client.post(
+        _answer_url(test_project.id, goal.id, approval.id),
+        json={"selected_option": "approve_with_documented_gaps"},
+    )
+    await _settle_answer(db_session, run, response)
+
+    assert response.status_code == 200, response.text
+    current = await service.get_current(db_session, goal.id, "team_hierarchy")
+    assert current.status == "completed"
+    assert current.outputs["approval"] == "approve_with_documented_gaps"
+    assert current.outputs["approval_decision_id"] == str(approval.id)
+    assert current.outputs["accepted_responsibility_gap_ids"] == [gap_id]
+    assert current.outputs["gates"]["required_work_functions_mapped"] is False
+    assert current.outputs["gates"]["missing_capabilities_handled"] is True
 
 
 @pytest.mark.asyncio
