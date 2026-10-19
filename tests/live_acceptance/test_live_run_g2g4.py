@@ -36,6 +36,7 @@ from tests.live_acceptance.spend_ledger import Ledger
 from tests.live_acceptance.test_live_run import FRONTEND, L1, TH_MARKER, real_home
 
 CAP = 400_000
+WARNING_MARGIN = 150_000
 CAMPAIGN_CAP, CAMPAIGN_PRIOR = 800_000, {"g1": 131_000}
 ROOT = os.environ.get("LIVE_ACCEPTANCE_EVIDENCE_ROOT")
 SNAP = os.environ.get("LIVE_ACCEPTANCE_SNAPSHOT_S")
@@ -172,9 +173,9 @@ class G2G4ResumeScenario(G2G4Scenario):
         self.original_root = Path(original_root).resolve()
         self.prior_spend = prior_spend
         self.continue_through_warning = True
-        self.warning_cap = 800_000
         self.warning_recorded: set[str] = set()
         super().__init__(*args, **kwargs)
+        self.warning_cap = self.budget - WARNING_MARGIN
 
     def _historical_codex(self, root: Path) -> tuple[ShimHandle, int]:
         historical = ShimHandle(root / "shim", "codex", root / "shim" / "codex")
@@ -305,7 +306,7 @@ class G2G4(L1):
         self.workspace_head = self._git("rev-parse", "HEAD").strip()
         self.p2 = self.planner_task = self.planner_inv = None
         self.feedback: dict = {}
-        self.notes.update({"cap": sc.budget, "warn": sc.budget * 0.8, "campaign_cap": sc.campaign_cap,
+        self.notes.update({"cap": sc.budget, "warn": max(sc.budget - WARNING_MARGIN, 0), "campaign_cap": sc.campaign_cap,
                            "campaign_prior": CAMPAIGN_PRIOR,
                            "retry_policy": {"automatic_retries": 0, "maximum": 1,
                                             "status": "not_exercised"}})
@@ -350,7 +351,7 @@ class G2G4(L1):
         used = totals["global"]["non_cached"]
         self.notes["spend"] = {"used": used, "totals": totals}
         cap = self.sc.budget
-        warn = getattr(self.sc, "warning_cap", cap * 0.8)
+        warn = getattr(self.sc, "warning_cap", max(cap - WARNING_MARGIN, 0))
         if used >= cap:
             raise AssertionError("budget cap reached; no further call may be released")
         if used >= warn:
@@ -364,7 +365,7 @@ class G2G4(L1):
         campaign_used = campaign["global"]["non_cached"]
         if campaign_used >= self.sc.campaign_cap:
             raise AssertionError("campaign budget cap reached; no further call may be released")
-        campaign_warn = getattr(self.sc, "warning_cap", self.sc.campaign_cap * 0.8)
+        campaign_warn = getattr(self.sc, "warning_cap", max(self.sc.campaign_cap - WARNING_MARGIN, 0))
         if campaign_used >= campaign_warn:
             self.notes["operator_confirmation_required"] = {
                 "used": campaign_used, "warn": campaign_warn, "cap": self.sc.campaign_cap,
@@ -1198,7 +1199,7 @@ def test_live_run_g2g4_resume_s_1m():
         campaign_ledger_path=artifact / "campaign-spend.jsonl", campaign_cap=1_000_000,
     ) as sc:
         sc.findings["historical_campaign_audit"] = {
-            "saved_run_spend": old_fresh, "prior_total": prior, "cap": 1_000_000, "warn": 800_000,
+            "saved_run_spend": old_fresh, "prior_total": prior, "cap": 1_000_000, "warn": 1_000_000 - WARNING_MARGIN,
         }
         _run_resume_s(sc, frozen, retry_request)
 
@@ -1248,7 +1249,7 @@ def test_live_run_g2g4_resume_s_1m_2():
         campaign_ledger_path=artifact / "campaign-spend.jsonl", campaign_cap=1_000_000,
     ) as sc:
         sc.findings["historical_campaign_audit"] = {
-            "first_resume_total": prior, "cap": 1_000_000, "warn": 800_000,
+            "first_resume_total": prior, "cap": 1_000_000, "warn": 1_000_000 - WARNING_MARGIN,
         }
         _run_resume_s(sc, frozen, retry_request)
 
@@ -1317,7 +1318,7 @@ def test_live_run_g2g4_resume_s_1m_3():
         campaign_ledger_path=artifact / "campaign-spend.jsonl", campaign_cap=1_000_000,
     ) as sc:
         sc.findings["historical_campaign_audit"] = {
-            "second_resume_total": prior, "cap": 1_000_000, "warn": 800_000,
+            "second_resume_total": prior, "cap": 1_000_000, "warn": 1_000_000 - WARNING_MARGIN,
         }
         sc.findings["system_message_refresh"] = {
             "old_request_sha256": old_sha, "new_request_sha256": new_sha,
