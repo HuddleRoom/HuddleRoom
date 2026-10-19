@@ -710,46 +710,56 @@ class G2G4(L1):
             bad.append("PLAN.md exists")
         return bad
 
+    @staticmethod
+    def _work_function(task: dict):
+        return ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function")
+
+    def _verifier_only(self) -> bool:
+        tasks = self.sc.oracle.tasks(self.goal_id)
+        if any(self._work_function(task) == "implementation" for task in tasks):
+            return False
+        active = [task for task in tasks if task.get("status") in ("ready", "in_progress")]
+        return bool(active) and all(self._work_function(task) in ("planning", "review", "validation", "verification") for task in active)
+
+    def _pending_plan_decisions(self):
+        found = [d for d in self.sc.oracle.decisions(self.goal_id)
+                 if d["status"] == "pending" and str(d["decision_key"]).startswith("roadmap_plan:")]
+        return found or None
+
+    def _release_plan_work(self, why: str, stop_if_plan_decision: bool = False) -> None:
+        """Release one held non-match codex control call, or a claude plan verifier."""
+        if self._executing():
+            return
+        if any(self._work_function(task) == "implementation" for task in self.sc.oracle.tasks(self.goal_id)):
+            return
+        if stop_if_plan_decision and self._pending_plan_decisions():
+            return
+        control = [item for item in self._held(self.codex) if not any(".match." in gate for gate in item.gates)]
+        if control:
+            self.release_one(self.codex, f"{why} work", ordinal=control[0].ordinal)
+        elif self._held(self.claude) and self._verifier_only():
+            held = self._held(self.claude)[0]
+            inv = self.release_one(self.claude, f"{why} verifier", ordinal=held.ordinal)
+            if inv is not None:
+                active = [task for task in self.sc.oracle.tasks(self.goal_id)
+                          if task.get("status") in ("ready", "in_progress")]
+                self.notes.setdefault("claude_releases", []).append({
+                    "ordinal": inv.ordinal,
+                    "active_tasks": [{"id": task["id"], "work_function": self._work_function(task)} for task in active],
+                })
+
     def inspect_plan(self) -> None:
         violations = self.workspace_violations()
         if violations:
             raise AssertionError(f"planner changed the workspace: {violations}")
-        def plan_decisions():
-            found = [d for d in self.sc.oracle.decisions(self.goal_id)
-                     if d["status"] == "pending" and str(d["decision_key"]).startswith("roadmap_plan:")]
-            return found or None
-
-        def work_function(task: dict):
-            return ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function")
-
-        def verifier_only() -> bool:
-            tasks = self.sc.oracle.tasks(self.goal_id)
-            if any(work_function(task) == "implementation" for task in tasks):
-                return False
-            active = [task for task in tasks if task.get("status") in ("ready", "in_progress")]
-            return bool(active) and all(work_function(task) in ("planning", "review", "validation") for task in active)
-
         decisions = None
         end = time.monotonic() + 600
         while time.monotonic() < end:
             self.guard()
-            decisions = plan_decisions()
+            decisions = self._pending_plan_decisions()
             if decisions:
                 break
-            if not self._executing():
-                control = [item for item in self._held(self.codex) if not any(".match." in gate for gate in item.gates)]
-                if control:
-                    self.release_one(self.codex, "plan review work", ordinal=control[0].ordinal)
-                elif self._held(self.claude) and verifier_only():
-                    held = self._held(self.claude)[0]
-                    inv = self.release_one(self.claude, "plan review verifier", ordinal=held.ordinal)
-                    if inv is not None:
-                        active = [task for task in self.sc.oracle.tasks(self.goal_id)
-                                  if task.get("status") in ("ready", "in_progress")]
-                        self.notes.setdefault("claude_releases", []).append({
-                            "ordinal": inv.ordinal,
-                            "active_tasks": [{"id": task["id"], "work_function": work_function(task)} for task in active],
-                        })
+            self._release_plan_work("plan review", stop_if_plan_decision=True)
             time.sleep(1)
         decisions = decisions or []
         violations = self.workspace_violations()
@@ -784,7 +794,13 @@ class G2G4(L1):
             raise AssertionError("artifact metadata does not match the reviewed plan identity")
         self.plan_identity, self.plan_hash = identity, digest
         self.plan_items = metadata.get("plan_items") or []
-        ui = self.pw_ok("inspect-plan", LIVE_ACCEPTANCE_PLAN_DECISION_TITLE=str(self.plan_decision.get("title") or ""))
+        authority = str(self.plan_decision.get("authority") or "")
+        self.notes["plan_approval_authority"] = {"authority": authority,
+                                                 "authority_agent_id": self.plan_decision.get("authority_agent_id")}
+        if authority == "manager" and not _same_uuid(self.plan_decision.get("authority_agent_id"), self.ids["manager_id"]):
+            raise AssertionError("plan approval authority agent is not the live manager")
+        ui = self.pw_ok("inspect-plan", LIVE_ACCEPTANCE_PLAN_DECISION_TITLE=str(self.plan_decision.get("title") or ""),
+                        LIVE_ACCEPTANCE_PLAN_AUTHORITY=authority)
         self.verify("read_only_planner", {"head_unchanged": self._git("rev-parse", "HEAD").strip() == self.workspace_head,
                                           "workspace_clean": not self.workspace_violations(),
                                           "plan_canary_absent": not (self.sc.run_dir.workspace / "PLAN.md").exists(),
@@ -837,9 +853,33 @@ class G2G4(L1):
                     accepted_assignments=assignments)
 
     def approve_plan(self) -> None:
-        before_tasks = {task["id"] for task in self.sc.oracle.tasks(self.goal_id)}
-        before_sessions = {session["id"] for session in self.sc.oracle.sessions()}
-        ui = self.pw_ok("approve-plan", LIVE_ACCEPTANCE_PLAN_DECISION_TITLE=str(self.plan_decision.get("title") or ""))
+        manager = (self.notes.get("plan_approval_authority") or {}).get("authority") == "manager"
+        if manager:
+            ui = {}
+            self.notes["human_ui_plan_approval"] = ("not_exercised: plan approval authority is the agent manager "
+                "(G3 spec: roadmap approval uses selected human, manager or verifier)")
+            end = time.monotonic() + 600
+            while time.monotonic() < end:
+                current = next((d for d in self.sc.oracle.decisions(self.goal_id) if d["id"] == self.plan_decision["id"]), None)
+                if current and current["status"] == "answered":
+                    if current.get("selected_option") != "approve":
+                        raise AssertionError(f"manager answered plan decision with {current.get('selected_option')!r}")
+                    break
+                self.guard()
+                self._release_plan_work("manager plan decision")
+                time.sleep(1)
+            else:
+                raise AssertionError("manager did not answer the plan decision within 600s")
+            if not _same_uuid(current.get("decided_by_agent_id"), self.ids["manager_id"]):
+                raise AssertionError("plan decision was not answered by the live manager")
+            self.notes["plan_decided_by_agent_id"] = current.get("decided_by_agent_id")
+            before_tasks = {task["id"] for task in self.sc.oracle.tasks(self.goal_id)}
+            before_sessions = {session["id"] for session in self.sc.oracle.sessions()}
+            self.passive(60, lambda: (self.sc.oracle.run_state(self.run_id).get("plan_state") or {}).get("status") == "accepted" or None)
+        else:
+            before_tasks = {task["id"] for task in self.sc.oracle.tasks(self.goal_id)}
+            before_sessions = {session["id"] for session in self.sc.oracle.sessions()}
+            ui = self.pw_ok("approve-plan", LIVE_ACCEPTANCE_PLAN_DECISION_TITLE=str(self.plan_decision.get("title") or ""))
         decision_key = str(self.plan_decision["decision_key"])
         prefix = "roadmap_plan:"
         review_marker = ":review:"
@@ -866,6 +906,7 @@ class G2G4(L1):
                 or stable_decision.get("selected_option") != "approve"
                 or (stable_run.get("plan_state") or {}).get("status") != "accepted"):
             raise AssertionError("plan acceptance was not stable after the bounded guard")
+        self.passive(45, lambda: None)
         run = self.sc.oracle.run_state(self.run_id)
         state = run.get("plan_state") or {}
         answered = stable_decision
@@ -876,8 +917,8 @@ class G2G4(L1):
         new_tasks = {task["id"] for task in self.sc.oracle.tasks(self.goal_id)} - before_tasks
         new_sessions = {session["id"] for session in self.sc.oracle.sessions()} - before_sessions
         self.guard()
-        self.verify("no_implementation", {"approved": ui.get("approved") is True,
-                                            "answer_posted": bool(ui.get("answer_posts")),
+        self.verify("no_implementation", {"approved": manager or ui.get("approved") is True,
+                                            "answer_posted": manager or bool(ui.get("answer_posts")),
                                             "answered_approve": answered.get("selected_option") == "approve",
                                             "answer_bound_to_hash": context.get("plan_review_identity_hash") == self.plan_hash,
                                             "accepted_state": state.get("status") == "accepted",
@@ -887,7 +928,10 @@ class G2G4(L1):
                                             "complete_ownership_bound": accepted.get("items") == self.expected_plan_ownership,
                                             "no_implementation_task": not impl,
                                             "no_new_task_or_session": not new_tasks and not new_sessions,
-                                            "no_claude_invocation": not self.claude.invocations()}, answered=answered, bindings=bindings)
+                                            "codex_invocations_released": {inv.ordinal for inv in self.codex.invocations()} <= self.sc.released_ordinals["codex"],
+                                            "no_claude_invocation": (not self.claude.invocations() if not manager else
+                                                                     {inv.ordinal for inv in self.claude.invocations()}
+                                                                     <= set(self.claude_released))}, answered=answered, bindings=bindings)
         self.sc.oracle_dump("plan-approved")
 
     def write_results(self) -> None:
@@ -912,7 +956,7 @@ class G2G4(L1):
         )
         lines.extend(["", "## Design rows", ""])
         lines.extend(f"- {number}: {self.steps.get(step, 'not_run')}" for number, step in design_steps)
-        lines.extend(["", "## Evidence", "", "- oracle dumps: planning-started, planner-held-paused, planner-done-paused-pre-restart, planner-done-paused-post-restart, plan-review-pending, plan-approved", "- retry: 0 (not exercised)", f"- codex resume: {self.notes.get('codex_resume', 'not_exercised')}", f"- human plan rows: {self.notes.get('human_plan_rows', 'not_exercised')}", "- P1 UI history: not exercised (accepted risk)"])
+        lines.extend(["", "## Evidence", "", "- oracle dumps: planning-started, planner-held-paused, planner-done-paused-pre-restart, planner-done-paused-post-restart, plan-review-pending, plan-approved", "- retry: 0 (not exercised)", f"- codex resume: {self.notes.get('codex_resume', 'not_exercised')}", f"- human plan rows: {self.notes.get('human_plan_rows', 'not_exercised')}", f"- plan approval authority: {self.notes.get('plan_approval_authority', 'not_run')}", f"- human UI plan approval: {self.notes.get('human_ui_plan_approval', 'exercised' if self.steps.get('approve-plan') == 'pass' else 'not_run')}","- P1 UI history: not exercised (accepted risk)"])
         (self.sc.run_dir.root / "results.md").write_text("\n".join(lines) + "\n")
 
 

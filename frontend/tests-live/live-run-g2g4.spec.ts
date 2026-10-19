@@ -11,6 +11,7 @@ const goalId = process.env.LIVE_ACCEPTANCE_GOAL_ID ?? ''
 const out = process.env.LIVE_ACCEPTANCE_OUTPUT || 'test-results-live'
 const TH_TITLE = /Approve team hierarchy/i
 const planDecisionTitle = process.env.LIVE_ACCEPTANCE_PLAN_DECISION_TITLE ?? ''
+const planAuthority = process.env.LIVE_ACCEPTANCE_PLAN_AUTHORITY ?? ''
 
 async function openGoal(page: Page) {
   expect(projectId && goalId, 'LIVE_ACCEPTANCE_PROJECT_ID and LIVE_ACCEPTANCE_GOAL_ID are required').toBeTruthy()
@@ -126,8 +127,33 @@ test('start-planning', async ({ page }) => {
   writeJson('start-planning', { planning_only: true })
 })
 
+// Manager authority: the decision is not in the human "Needs you" queue.  The Details > Plan tab
+// must expose the completed candidate with the pending authority state, before and after reload.
+// ponytail: PlanTab has no manager-specific text; it renders the generic "Awaiting review" badge and
+// "Authority: pending".  The Approve button's visibility is recorded, not asserted.
+async function inspectManagerPlan(page: Page) {
+  await openGoal(page)
+  const view = async () => {
+    await page.getByRole('tab', { name: 'Plan', exact: true }).click()
+    const candidate = page.getByRole('region', { name: /Plan candidate v\d+/ })
+    await expect(candidate).toBeVisible({ timeout: 120_000 })
+    const content = await candidate.locator('pre').innerText()
+    expect(content.trim()).toBeTruthy()
+    expect(content).not.toMatch(/Reference unavailable|Being drafted/i)
+    await expect(candidate.getByText('Awaiting review', { exact: true })).toBeVisible()
+    await expect(candidate.getByText(/^pending$/i).first()).toBeVisible()
+    return candidate.getByRole('button', { name: /Approve plan v\d+/ }).count()
+  }
+  const approveButtons = await view()
+  await page.reload()
+  const approveButtonsAfterReload = await view()
+  await shot(page, 'plan-after-reload')
+  writeJson('inspect-plan', { decision_readable: true, authority: 'manager', approve_button_count: approveButtons, approve_button_count_after_reload: approveButtonsAfterReload })
+}
+
 test('inspect-plan', async ({ page }) => {
   test.setTimeout(120_000)
+  if (planAuthority === 'manager') return inspectManagerPlan(page)
   expect(planDecisionTitle, 'Python must provide the exact plan decision title').toBeTruthy()
   await openGoal(page)
   const row = decisionRow(page, planDecisionTitle).first()
