@@ -3944,6 +3944,13 @@ class OrchestrationService:
 
             report = await self._agent_decision_report(db, decision)
             if report is None:
+                action = await db.get(OrchestrationAction, decision.related_action_id)
+                task = await db.get(Task, action.target_id) if action is not None and action.target_type == "task" else None
+                if task is not None and task.status in {"failed", "cancelled"}:
+                    await self._escalate_authority_decision(
+                        db, goal, run, decision, reason="designated agent decision task failed",
+                    )
+                    escalated += 1
                 continue
             try:
                 idempotency_key = f"record_authority_decision:{decision.id}"
@@ -13824,6 +13831,23 @@ class OrchestrationService:
             return {"step": "waiting", "reason": exc.detail}
         return None
 
+    async def _followed_waited_decision(
+        self, db: AsyncSession, run: OrchestrationRun, approval_id: uuid.UUID,
+    ) -> OrchestrationAuthorityDecision | None:
+        """The waited approval, or -- if escalation cancelled it -- the newest pending/answered
+        replacement for the same run and decision_key (so the wait survives agent->human escalation)."""
+        waited = await db.get(OrchestrationAuthorityDecision, approval_id)
+        if waited is None or waited.status not in {"cancelled", "expired"}:
+            return waited
+        newer = await db.execute(
+            select(OrchestrationAuthorityDecision).where(
+                OrchestrationAuthorityDecision.run_id == waited.run_id,
+                OrchestrationAuthorityDecision.decision_key == waited.decision_key,
+                OrchestrationAuthorityDecision.status.in_(("pending", "answered")),
+            ).order_by(OrchestrationAuthorityDecision.created_at.desc(), OrchestrationAuthorityDecision.id.desc())
+        )
+        return newer.scalars().first() or waited
+
     async def _apply_answered_roadmap_approval(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, plan_state: dict,
     ) -> dict | None:
@@ -13840,7 +13864,7 @@ class OrchestrationService:
             artifact_id = uuid.UUID(str(wait.get("artifact_id")))
         except ValueError:
             return None
-        waited = await db.get(OrchestrationAuthorityDecision, approval_id)
+        waited = await self._followed_waited_decision(db, run, approval_id)
         if waited is None or waited.run_id != run.id or waited.status != "answered":
             return None
         roadmap = OrchestrationRoadmapService(self)
@@ -13895,6 +13919,35 @@ class OrchestrationService:
         if action.status != "completed":
             return None  # e.g. a prior failed attempt: let the LLM path's retry logic run
         return {"step": "plan_decision", "action_id": str(action.id)}
+
+    async def _roadmap_plan_authority_pending(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, plan_state: dict,
+    ) -> bool:
+        """True while the stored roadmap approval wait is still unanswered for the current plan."""
+        from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+
+        wait = self._json_object_or_empty(plan_state.get("roadmap_authority_wait"))
+        if wait.get("approval_kind") != "authority_decision":
+            return False  # ponytail: verifier gates keep the LLM path, which re-issues request_verification
+        try:
+            approval_id = uuid.UUID(str(wait.get("approval_id")))
+            artifact_id = uuid.UUID(str(wait.get("artifact_id")))
+        except ValueError:
+            return False
+        waited = await self._followed_waited_decision(db, run, approval_id)
+        if waited is None or waited.run_id != run.id or waited.status != "pending":
+            return False
+        roadmap = OrchestrationRoadmapService(self)
+        try:
+            artifact = await self._plan_artifact_for_run(db, run, artifact_id)
+            fingerprint = await roadmap.plan_fingerprint(db, run, [
+                item.model_dump(mode="json") for item in roadmap.parse_items(artifact, goal)
+            ])
+        except HTTPException as exc:
+            if exc.status_code not in {404, 409, 422}:
+                raise
+            return False
+        return fingerprint == wait.get("fingerprint")
 
     async def _recover_failed_accept_plan(
         self, db: AsyncSession, run: OrchestrationRun, parsed: dict, decision_id: uuid.UUID | None,
@@ -13952,6 +14005,10 @@ class OrchestrationService:
                 applied = await self._apply_answered_roadmap_approval(db, goal, run, plan_state)
                 if applied is not None:
                     return applied
+                # ponytail: pending plan authority freezes orchestrator-initiated plan changes;
+                # owner/supervision cancellation of the decision unfreezes.
+                if await self._roadmap_plan_authority_pending(db, goal, run, plan_state):
+                    return {"step": "waiting_plan_authority"}
             decision = await self.request_llm_decision(db, run.id)
             decision_action_type = self._json_object_or_empty(decision.parsed_decision).get("action_type")
             if goal.goal_type == "roadmap" and decision_action_type == "accept_plan":

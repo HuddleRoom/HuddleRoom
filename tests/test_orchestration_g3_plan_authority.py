@@ -579,3 +579,112 @@ async def test_revision_required_clears_roadmap_authority_wait(
     _no_llm(service, monkeypatch)
     await service._advance_authorized_execution_once(db_session, goal, run)
     assert "roadmap_authority_wait" not in run.plan_state
+
+
+async def _pending_manager_wait(db_session, test_project, test_user):
+    service, goal, run, artifact, decision, _ = await _roadmap_acceptance(
+        db_session, test_project, test_user, authority_model="agent_manager",
+    )
+    roadmap = OrchestrationRoadmapService(service)
+    run.plan_state = {**run.plan_state, "roadmap_authority_wait": {
+        "artifact_id": str(artifact.id),
+        "fingerprint": await roadmap.plan_fingerprint(
+            db_session, run, [i.model_dump(mode="json") for i in roadmap.parse_items(artifact, goal)],
+        ),
+        "approval_id": str(decision.id), "approval_kind": "authority_decision",
+    }}
+    await db_session.flush()
+    return service, goal, run, decision
+
+
+async def test_pending_plan_authority_freezes_orchestrator_without_llm(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _pending_manager_wait(db_session, test_project, test_user)
+    before = dict(run.plan_state)
+    calls = _no_llm(service, monkeypatch)
+
+    result = await service._advance_authorized_execution_once(db_session, goal, run)
+    assert result == {"step": "waiting_plan_authority"} and calls == []
+    assert run.plan_state == before
+
+
+async def test_cancelled_plan_authority_unfreezes_llm_path(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, decision = await _pending_manager_wait(db_session, test_project, test_user)
+    decision.status = "cancelled"
+    await db_session.flush()
+    calls = _no_llm(service, monkeypatch)
+
+    with pytest.raises(TimeoutError):
+        await service._advance_authorized_execution_once(db_session, goal, run)
+    assert calls == [1]
+
+
+async def test_stale_pending_plan_authority_wait_falls_through_to_llm(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _pending_manager_wait(db_session, test_project, test_user)
+    wait = run.plan_state["roadmap_authority_wait"]
+    run.plan_state = {**run.plan_state, "roadmap_authority_wait": {**wait, "fingerprint": "stale"}}
+    await db_session.flush()
+    calls = _no_llm(service, monkeypatch)
+
+    with pytest.raises(TimeoutError):
+        await service._advance_authorized_execution_once(db_session, goal, run)
+    assert calls == [1]
+
+
+async def _human_decision_after_escalation(db_session, service, goal, run, decision):
+    await service._escalate_authority_decision(db_session, goal, run, decision, reason="test escalation")
+    await db_session.flush()
+    return (await db_session.execute(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id,
+        OrchestrationAuthorityDecision.decision_key == decision.decision_key,
+        OrchestrationAuthorityDecision.status == "pending",
+    ))).scalar_one()
+
+
+async def test_escalated_plan_authority_keeps_freeze_and_routes_human_answer_without_llm(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, decision = await _pending_manager_wait(db_session, test_project, test_user)
+    human = await _human_decision_after_escalation(db_session, service, goal, run, decision)
+    assert decision.status == "cancelled" and human.authority == "human"
+    calls = _no_llm(service, monkeypatch)
+
+    assert await service._advance_authorized_execution_once(db_session, goal, run) == {"step": "waiting_plan_authority"}
+    assert calls == []
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, human, selected_option="approve", decided_by_user_id=test_user.id,
+    )
+    result = await service._advance_authorized_execution_once(db_session, goal, run)
+    await db_session.refresh(run)
+    # Applied deterministically (no LLM). Under agent_manager a human approval is, by existing
+    # _require_plan_approval design, not "from the selected authority", so it requires revision.
+    assert result["step"] == "plan_revision_required" and calls == []
+    assert "not from the selected authority" in run.plan_state["revision_reason"]
+
+
+async def test_failed_delegation_task_without_report_escalates_and_freeze_follows(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, decision = await _pending_manager_wait(db_session, test_project, test_user)
+    await service._sync_agent_authority_decisions(db_session, goal, run)
+    await db_session.refresh(decision)
+    assert decision.related_action_id is not None and decision.status == "pending"
+    action = await db_session.get(OrchestrationAction, decision.related_action_id)
+    (await db_session.get(Task, action.target_id)).status = "failed"
+    await db_session.flush()
+
+    summary = await service._sync_agent_authority_decisions(db_session, goal, run)
+    await db_session.refresh(decision)
+    assert summary["escalated"] == 1 and decision.status == "cancelled"
+    assert (await db_session.execute(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.decision_key == decision.decision_key,
+        OrchestrationAuthorityDecision.status == "pending", OrchestrationAuthorityDecision.authority == "human",
+    ))).scalar_one()
+    calls = _no_llm(service, monkeypatch)
+    assert await service._advance_authorized_execution_once(db_session, goal, run) == {"step": "waiting_plan_authority"}
+    assert calls == []
