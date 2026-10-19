@@ -658,3 +658,50 @@ async def test_ingest_without_accepted_team_skips_membership_check(db_session, t
     artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
 
     assert artifact.metadata_["plan_items"][0]["work_function"] == "documentation"
+
+
+async def _two_responsibilities(db_session, goal):
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    team = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    outputs = dict(team.outputs)
+    base = next(r for r in outputs["responsibility_coverage"] if r["work_function"] == "implementation")
+    outputs["responsibility_coverage"] = [
+        {**base, "responsibility_id": "write-pricing"}, {**base, "responsibility_id": "persist-plan"},
+    ]
+    team.outputs = outputs
+    await db_session.flush()
+
+
+@pytest.mark.asyncio
+async def test_ingest_requires_responsibility_id_when_function_has_several(db_session, test_project):
+    from huddleroom.schemas.orchestration import OrchestrationPlanItem
+    from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    await _two_responsibilities(db_session, goal)
+    version = run.plan_state["planning_version"]
+
+    for evidence in ({}, {"responsibility_id": "bogus"}):
+        output = json.dumps(_env(items=[_item(success_criterion_keys=["plan"], required_evidence=evidence)]))
+        with pytest.raises(PlanIngestionError) as exc:
+            await ingest(db_session, goal, run, task, session.id, version, output)
+        assert exc.value.correctable
+        [diagnostic] = exc.value.diagnostics
+        assert "[write-pricing, persist-plan]" in diagnostic and "required_evidence.responsibility_id" in diagnostic
+
+    output = json.dumps(_env(items=[_item(success_criterion_keys=["plan"], required_evidence={"responsibility_id": "persist-plan"})]))
+    assert await ingest(db_session, goal, run, task, session.id, version, output) is not None
+    item = OrchestrationPlanItem(id="a", work_function="implementation", scope="s", deliverable="d",
+                                 required_evidence={"responsibility_id": "persist-plan"})
+    [result] = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
+    assert result["status"] == "eligible"
+
+
+@pytest.mark.asyncio
+async def test_ingest_single_responsibility_needs_no_id(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    output = json.dumps(_env(items=[_item(success_criterion_keys=["plan"])]))
+    assert await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output) is not None

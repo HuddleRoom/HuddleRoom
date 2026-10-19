@@ -90,6 +90,27 @@ class PlanOwnershipService:
         lines = ["Accepted team (use only these agents):"]
         lines += [f"- {function}: {names.get(agent_id, agent_id)} ({agent_id})" for function, agent_id in sorted(functions.items())]
         lines.append(f"Allowed work_function values: {', '.join(sorted(functions))}")
+        owned = {
+            function: [row for row in inventory["coverage"] if row.get("status") == "covered" and row.get("work_function") == function]
+            for function in sorted(functions)
+        }
+        if any(owned.values()):
+            if goal.goal_type == "roadmap":  # roadmap item schema forbids required_evidence
+                lines.append(
+                    "Responsibilities (Roadmap items have no responsibility field; "
+                    "reference the responsibility in the item scope text.):"
+                )
+            else:
+                lines.append(
+                    'Responsibilities (set "required_evidence": {"responsibility_id": "<id>"} on each task item; '
+                    "required when a function has more than one):"
+                )
+            for function, rows in owned.items():
+                if rows:
+                    lines.append(f"- {function}: " + ", ".join(
+                        f"{row.get('responsibility_id')} ({row.get('responsibility')})" if row.get("responsibility")
+                        else str(row.get("responsibility_id")) for row in rows
+                    ))
         gap_ids = [str(row.get("responsibility_id")) for row in inventory["coverage"] if row.get("status") == "gap"]
         if gap_ids:
             lines.append(
@@ -156,7 +177,11 @@ class PlanOwnershipService:
             if not matching_coverage:
                 results.append({"item_id": item_id, "status": "conflict", "reason": "accepted responsibility coverage is missing"})
                 continue
-            if responsibility_id is None and evidence_ref is None and len(matching_coverage) != 1:
+            # ponytail: roadmap items carry no responsibility reference; ownership is resolved by function -> accepted agent.
+            unambiguous_owner = not hasattr(item, "required_evidence") and all(
+                row.get("status") == "covered" and str(row.get("agent_ref")) == eligible_id for row in matching_coverage
+            )
+            if responsibility_id is None and evidence_ref is None and len(matching_coverage) != 1 and not unambiguous_owner:
                 results.append({"item_id": item_id, "status": "conflict", "reason": "accepted responsibility coverage is ambiguous"})
                 continue
             if any(row.get("status") == "gap" for row in matching_coverage):

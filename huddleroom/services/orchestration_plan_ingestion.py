@@ -202,6 +202,14 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
                               f"[{', '.join(sorted(functions))}]")
             elif item.agent_id is not None and str(item.agent_id) != functions[item.work_function]:
                 errors.append(f"item '{item_key}': agent_id is outside the accepted team for '{item.work_function}'")
+            elif hasattr(item, "required_evidence"):  # roadmap items carry no evidence field
+                ids = [str(r.get("responsibility_id")) for r in inventory["coverage"]
+                       if r.get("status") == "covered" and r.get("work_function") == item.work_function]
+                evidence = item.required_evidence if isinstance(item.required_evidence, dict) else {}
+                rid = evidence.get("responsibility_id")
+                if len(ids) > 1 and (rid is None and evidence.get("evidence_ref") is None or rid is not None and str(rid) not in ids):
+                    errors.append(f"item '{item_key}': work_function '{item.work_function}' has several accepted "
+                                  f"responsibilities [{', '.join(ids)}]; set required_evidence.responsibility_id to one of them")
         if errors:
             raise PlanIngestionError("; ".join(errors[:3]), diagnostics=errors)
     required = [uuid.UUID(str(i)) for i in plan_meta.get("pre_plan_task_ids") or []]

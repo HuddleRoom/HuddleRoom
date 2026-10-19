@@ -246,3 +246,56 @@ async def test_g3_goal_item_rejects_incomplete_g2_inventory(db_session, test_pro
     )
     result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
     assert result == [{"item_id": "child", "status": "conflict", "reason": "current accepted agent review is missing"}]
+
+
+async def _two_row_goal(db_session, test_project, *, second_status="covered"):
+    agent = _agent("worker")
+    db_session.add(agent)
+    await db_session.flush()
+    goal = OrchestrationGoal(project_id=test_project.id, objective="o", original_request="o")
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    await _accepted_review(db_session, goal, agent.id)
+    gap = second_status == "gap"
+    db_session.add(OrchestrationProcessRun(
+        goal_id=goal.id, process_type="team_hierarchy", status="completed", trigger_reason="test",
+        outputs=_accepted_outputs(agent.id, coverage=[
+            {"responsibility_id": "a", "work_function": "implementation", "agent_ref": str(agent.id),
+             "status": "covered", "evidence_ref": "agent_review:a"},
+            {"responsibility_id": "b", "work_function": "implementation", "agent_ref": None if gap else str(agent.id),
+             "status": second_status, "evidence_ref": "gap:b" if gap else "agent_review:b"},
+        ]) | ({"approval": "approve_with_documented_gaps", "accepted_responsibility_gap_ids": ["b"]} if gap else {}),
+    ))
+    await db_session.flush()
+    return agent, goal, run
+
+
+@pytest.mark.asyncio
+async def test_roadmap_item_with_multi_row_function_is_eligible(db_session, test_project):
+    agent, goal, run = await _two_row_goal(db_session, test_project)
+    item = OrchestrationRoadmapPlanItem(item_key="r", unit_type="task", title="t", work_function="implementation",
+                                        scope="s", deliverable="d")
+    result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
+    assert result[0]["status"] == "eligible"
+    assert result[0]["agent_id"] == str(agent.id)
+
+
+@pytest.mark.asyncio
+async def test_outcome_item_with_empty_evidence_and_multi_row_stays_ambiguous(db_session, test_project):
+    _, goal, run = await _two_row_goal(db_session, test_project)
+    item = OrchestrationPlanItem(id="o", work_function="implementation", scope="s", deliverable="d", required_evidence={})
+    result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
+    assert result[0]["status"] == "conflict"
+    assert "ambiguous" in result[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_roadmap_item_with_gap_row_still_conflicts(db_session, test_project):
+    _, goal, run = await _two_row_goal(db_session, test_project, second_status="gap")
+    item = OrchestrationRoadmapPlanItem(item_key="r", unit_type="task", title="t", work_function="implementation",
+                                        scope="s", deliverable="d")
+    result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
+    assert result[0]["status"] == "conflict"
+    assert "gap" in result[0]["reason"] or "ambiguous" in result[0]["reason"]
