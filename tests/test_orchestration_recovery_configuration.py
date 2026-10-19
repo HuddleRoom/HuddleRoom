@@ -141,7 +141,7 @@ async def seed_spr180(sessions, tmp_path, *, mode="create", independent=False, e
             await assign(s, project.id, run.id, planner, "planning")
         await complete_baseline_processes(s, goal, run)
         definition = await OrchestrationProcessService().get_current(s, goal.id, "agent_definition_review")
-        if planner is not None:  # legacy stale eligibility (SPR 180 / Mimlo): hierarchy predates the guard
+        if planner is not None:  # legacy stale eligibility (SPR 180): hierarchy predates the guard
             planner.description = planner.system_prompt = ""
             definition.outputs = {**definition.outputs,
                                   "eligibility": {**definition.outputs["eligibility"], str(planner.id): []}}

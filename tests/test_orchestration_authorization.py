@@ -312,7 +312,7 @@ async def test_start_with_do_not_start_text_creates_recommendation_warning(
 ):
     goal = await _start_ready_goal(
         db_session, client, auth_headers, test_project,
-        description="Mimlo site. Prepare only; do not start the goal.",
+        description="Marketing site. Prepare only; do not start the goal.",
     )
     found = await _conflict_warnings(db_session, goal)
     assert len(found) == 1

@@ -789,22 +789,6 @@ def test_api_request_timeout_defaults_and_accepts_override(monkeypatch):
     assert [kwargs["timeout"] for _, kwargs in seen] == [60, 300]
 
 
-def test_second_resume_keeps_the_authorized_budget_and_ordinal_contract():
-    source = Path(__file__).with_name("test_live_run_g2g4.py").read_text()
-    tree = ast.parse(source)
-    second = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "G2G4SecondResumeScenario")
-    text = ast.unparse(second)
-    assert "artifact_name = 'resume-S-1m-2'" in text
-    assert "return (historical, 17)" in text
-    assert "[15, 16, 17]" in text
-    assert 'write_text(str(self.historical_codex_last))' in source
-    assert "prior != 562663" in source.replace("_", "")
-    assert 'api.retry_async("team_hierarchy", timeout=300)' in source
-    assert "driver.drive_codex(360" in source
-    assert "EXPECTED_RESUME_LEAF" in source and "/Users/yaron/" not in source
-    assert "RESUME_ROOT_RAW" in source and "Path(RESUME_ROOT_RAW).is_absolute()" in source
-
-
 def test_existing_snap_a_is_not_overwritten_and_counts_dirty(tmp_path, fakes, monkeypatch):
     rd = _paused_run(tmp_path / "ev")
     old = rd.snapshots / "snap-A-paused-before-call4"

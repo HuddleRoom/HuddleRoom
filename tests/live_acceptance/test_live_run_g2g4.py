@@ -13,7 +13,6 @@ import os
 import re
 import signal
 import shlex
-import sqlite3
 import subprocess
 import time
 import uuid
@@ -22,16 +21,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from huddleroom.services.orchestration_team_hierarchy_analyzer import TeamHierarchyAnalyzer
-from tests.live_acceptance import auth_dir_watch, oracle
-from tests.live_acceptance.cli_shim import ShimHandle, TOOLS, make_shim, resolve_real, seed_campaign
-from tests.live_acceptance.dry_run import Api, _auth_roots
+from tests.live_acceptance.cli_shim import seed_campaign
+from tests.live_acceptance.dry_run import Api
 from tests.live_acceptance.fixtures import G2G4_GOAL_CONSTRAINTS, G2G4_GOAL_TEXT
-from tests.live_acceptance.live_env import server_env_for_cli
-from tests.live_acceptance.run_dir import RunDir, assert_isolated
 from tests.live_acceptance.scenario import LiveScenario, _latest_ids
 from tests.live_acceptance.seed import create_goal
-from tests.live_acceptance.server_supervisor import Supervisor, free_port
 from tests.live_acceptance.spend_ledger import Ledger
 from tests.live_acceptance.test_live_run import FRONTEND, L1, TH_MARKER, real_home
 
@@ -40,8 +34,6 @@ WARNING_MARGIN = 150_000
 CAMPAIGN_CAP, CAMPAIGN_PRIOR = 800_000, {"g1": 131_000}
 ROOT = os.environ.get("LIVE_ACCEPTANCE_EVIDENCE_ROOT")
 SNAP = os.environ.get("LIVE_ACCEPTANCE_SNAPSHOT_S")
-RESUME_S = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_S") == "1"
-RESUME_S_2 = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_S") == "2"
 
 
 def _argv(args: str) -> list[str]:
@@ -50,10 +42,6 @@ def _argv(args: str) -> list[str]:
         return shlex.split(args)
     except ValueError:
         return args.split()
-RESUME_S_3 = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_S") == "3"
-RESUME_ROOT_RAW = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_ROOT", "")
-RESUME_ROOT = Path(RESUME_ROOT_RAW) if RESUME_ROOT_RAW else None
-EXPECTED_RESUME_LEAF = "run-20261019T140732Z-g2g4-S-405489"
 LIVE_ENABLED = (os.environ.get("HUDDLEROOM_LIVE_ACCEPTANCE") == "1"
                 and os.environ.get("HUDDLEROOM_LIVE_EVAL") == "1")
 PLAN_MARKER = r"# Task: Planning:"
@@ -74,15 +62,6 @@ def _s_cap() -> int:
     if cap <= 0:
         pytest.fail("LIVE_ACCEPTANCE_G2G4_S_CAP must be a positive integer")
     return cap
-
-
-def _expected_resume_root() -> Path:
-    if not ROOT:
-        raise AssertionError("LIVE_ACCEPTANCE_EVIDENCE_ROOT is required for the authorized resume")
-    evidence_root = Path(ROOT)
-    if not evidence_root.is_absolute():
-        raise AssertionError("LIVE_ACCEPTANCE_EVIDENCE_ROOT must be absolute for the authorized resume")
-    return evidence_root.resolve() / EXPECTED_RESUME_LEAF
 
 
 def _ledger_totals_readonly(path: Path) -> dict[str, dict[str, int]]:
@@ -170,126 +149,6 @@ class G2G4Scenario(LiveScenario):
             verdict_path.write_text(json.dumps(verdict, indent=2, default=str))
         except OSError as exc:
             self.errors.append(f"fatal verdict write: {exc}")
-
-
-class G2G4ResumeScenario(G2G4Scenario):
-    """Reopen one paused S run without recreating its baseline or artifacts."""
-
-    artifact_name = "resume-S-1m"
-
-    def __init__(self, original_root: Path, prior_spend: int, *args, **kwargs):
-        self.original_root = Path(original_root).resolve()
-        self.prior_spend = prior_spend
-        self.continue_through_warning = True
-        self.warning_recorded: set[str] = set()
-        super().__init__(*args, **kwargs)
-        self.warning_cap = self.budget - WARNING_MARGIN
-
-    def _historical_codex(self, root: Path) -> tuple[ShimHandle, int]:
-        historical = ShimHandle(root / "shim", "codex", root / "shim" / "codex")
-        old_invocations, old_settled = historical.invocations(), historical.settled_ordinals()
-        if max((item.ordinal for item in old_invocations), default=0) != 14:
-            raise AssertionError("expected historical codex ordinal 14")
-        ordinal_14 = [item for item in old_invocations if item.ordinal == 14]
-        if (len(ordinal_14) != 1 or ordinal_14[0].exec_at is not None or ordinal_14[0].refused
-                or ordinal_14[0].timed_out or 14 in old_settled):
-            raise AssertionError("historical codex ordinal 14 must be held and never executed")
-        unsettled = [item.ordinal for item in old_invocations if item.exec_at is not None and item.ordinal not in old_settled]
-        if unsettled:
-            raise AssertionError(f"historical executed codex calls are unsettled: {unsettled}")
-        return historical, 14
-
-    def _start(self) -> None:
-        root = self.original_root
-        artifact_root = root / self.artifact_name
-        if not (root / "app.db").is_file() or not (root / "workspace").is_dir():
-            raise AssertionError(f"resume root is incomplete: {root}")
-        if artifact_root.exists():
-            raise AssertionError(f"resume artifacts already exist: {artifact_root}")
-        artifact_root.mkdir()
-        for name in ("snapshots", "shim"):
-            (artifact_root / name).mkdir()
-        seed_campaign(artifact_root / "campaign-spend.jsonl", self.campaign_cap,
-                      {"g2g4-S-prior": self.prior_spend})
-        _, self.historical_codex_last = self._historical_codex(root)
-        (artifact_root / "shim" / "counters").mkdir()
-        (artifact_root / "shim" / "counters" / "codex").write_text(str(self.historical_codex_last))
-        self.run_dir = RunDir(
-            root=root, db=root / "app.db", workspace=root / "workspace",
-            snapshots=artifact_root / "snapshots", shim=artifact_root / "shim",
-            proxy_log=artifact_root / "proxy.jsonl", spend=artifact_root / "spend.jsonl",
-            config=artifact_root / "config.json",
-        )
-        assert_isolated(self.run_dir, self.run_dir.db, self.run_dir.workspace)
-        self._artifact_root = artifact_root
-        self._set_artifact_root()
-        self.ids = _latest_ids(self.run_dir.db)
-        self.mark(f"scenario {self.name} resume start; root={root}")
-        self.auth_before = auth_dir_watch.listing(_auth_roots())
-        auth_dir_watch.write_listing(self.artifact_root / "auth-before.json", self.auth_before)
-        self.ledger = Ledger(self.run_dir.spend, self.budget, {self.name: self.budget})
-        self.ledger.record(self.name, "prior_S_attempts", self.prior_spend, 0)
-        extra = {"campaign_ledger": {"path": str(self.campaign_ledger_path.absolute()),
-                                      "cap": self.campaign_cap, "scenario": self.name}}
-        self.findings["campaign_ledger"] = {"active": True, **extra["campaign_ledger"]}
-        for tool in TOOLS:
-            real = self.real_paths.get(tool) or resolve_real(tool, self.run_dir.shim)
-            handle = self.shims[tool] = make_shim(
-                self.run_dir.shim, tool, Path(real), ledger_path=self.run_dir.spend, scenario=self.name,
-                global_cap=self.budget, scenario_cap=self.budget, output_ceiling=self.output_ceiling,
-                hold_each=bool(self.hold_spec.get(f"{tool}_each")), **extra)
-            for rx in self.hold_spec.get(f"{tool}_match", ()):
-                handle.hold_matching(rx)
-        self.sup = Supervisor(self.run_dir, self.port or free_port(), env_overrides=server_env_for_cli(),
-                              shim_dir=self.run_dir.shim,
-                              extra_pid_dirs=sorted({h.shim_dir / "pids" for h in self.shims.values()}))
-        prior_logs = [int(path.stem.split("-")[1]) for path in root.glob("server-*.log")
-                      if path.stem.split("-")[1].isdigit()]
-        self.sup.incarnation = max(prior_logs, default=0)
-        self.sup.start()
-        self.mark(f"server up at {self.sup.base_url}")
-        self.oracle = oracle.Oracle(self.run_dir.db)
-        oracle.snapshot(self.run_dir.db, self.run_dir.snapshots / "00-before.db")
-
-
-class G2G4SecondResumeScenario(G2G4ResumeScenario):
-    """Continue only the saved 1M resume; do not recreate either earlier run."""
-
-    artifact_name = "resume-S-1m-2"
-
-    def _historical_codex(self, root: Path) -> tuple[ShimHandle, int]:
-        super()._historical_codex(root)
-        prior = root / "resume-S-1m" / "shim"
-        historical = ShimHandle(prior, "codex", prior / "codex")
-        invocations, settled = historical.invocations(), historical.settled_ordinals()
-        ordinals = [item.ordinal for item in invocations]
-        if ordinals != [15, 16, 17]:
-            raise AssertionError(f"expected first-resume codex ordinals 15--17, got {ordinals}")
-        if any(item.exec_at is None or item.refused or item.timed_out for item in invocations):
-            raise AssertionError("first-resume codex calls 15--17 must all execute")
-        if settled != {15, 16, 17}:
-            raise AssertionError(f"first-resume codex calls must settle: {sorted(settled)}")
-        return historical, 17
-
-
-class G2G4ThirdResumeScenario(G2G4SecondResumeScenario):
-    """Continue only the saved 1M retry checkpoint after ordinals 18--20."""
-
-    artifact_name = "resume-S-1m-3"
-
-    def _historical_codex(self, root: Path) -> tuple[ShimHandle, int]:
-        super()._historical_codex(root)
-        prior = root / "resume-S-1m-2" / "shim"
-        historical = ShimHandle(prior, "codex", prior / "codex")
-        invocations, settled = historical.invocations(), historical.settled_ordinals()
-        ordinals = [item.ordinal for item in invocations]
-        if ordinals != [18, 19, 20]:
-            raise AssertionError(f"expected second-resume codex ordinals 18--20, got {ordinals}")
-        if any(item.exec_at is None or item.refused or item.timed_out for item in invocations):
-            raise AssertionError("second-resume codex calls 18--20 must all execute")
-        if settled != {18, 19, 20}:
-            raise AssertionError(f"second-resume codex calls must settle: {sorted(settled)}")
-        return historical, 20
 
 
 class G2G4(L1):
@@ -395,9 +254,6 @@ class G2G4(L1):
         inv = held[0] if ordinal is None else next((item for item in held if item.ordinal == ordinal), None)
         if inv is None:
             raise AssertionError(f"requested held {handle.tool} ordinal={ordinal} is unavailable")
-        if handle.tool == "codex" and not self.sc.released_ordinals["codex"] and hasattr(self.sc, "historical_codex_last"):
-            if inv.ordinal != self.sc.historical_codex_last + 1:
-                raise AssertionError(f"resumed first codex ordinal is {inv.ordinal}, not {self.sc.historical_codex_last + 1}")
         self.sc.released_ordinals[handle.tool].add(inv.ordinal)
         (self.released if handle is self.codex else self.claude_released).append(inv.ordinal)
         self.notes.setdefault("release_timeline", []).append(
@@ -1067,123 +923,6 @@ def _run_s(sc: G2G4Scenario) -> None:
     _complete_s(sc, driver, p1)
 
 
-def _refresh_retry_system_message(db: Path, process_id: str) -> tuple[str, str]:
-    """Replace only the saved retry request's architect instructions with HEAD wording.
-
-    The preamble and user payload stay byte-identical; input_snapshot is never touched.
-    """
-    pid = uuid.UUID(str(process_id)).hex
-    marker = "Act as the team architect."
-    conn = sqlite3.connect(str(db))
-    try:
-        row = conn.execute("SELECT outputs FROM orchestration_process_runs WHERE id = ?", (pid,)).fetchone()
-        if row is None:
-            raise AssertionError(f"no orchestration process run {process_id} in {db}")
-        outputs = json.loads(row[0])
-        request = outputs["_lm_retry"]["request"]
-        old_system = request["messages"][0]["content"]
-        user_payload = json.loads(request["messages"][1]["content"])
-        new_tail = TeamHierarchyAnalyzer.build_request(user_payload, project=None)["messages"][0]["content"]
-        if old_system.count(marker) != 1 or new_tail.count(marker) != 1:
-            raise AssertionError("architect marker must occur exactly once in saved and HEAD system messages")
-        new_system = old_system[:old_system.index(marker)] + new_tail[new_tail.index(marker):]
-        if "criterion:<1-based success-criteria index>" not in new_system:
-            raise AssertionError("refreshed system message must carry the HEAD criterion rule")
-        old_sha = hashlib.sha256(_json_bytes(request)).hexdigest()
-        if new_system == old_system:
-            # ponytail: idempotent re-run; already refreshed, nothing to write.
-            return old_sha, old_sha
-        request["messages"][0]["content"] = new_system
-        new_sha = hashlib.sha256(_json_bytes(request)).hexdigest()
-        cursor = conn.execute("UPDATE orchestration_process_runs SET outputs = ? WHERE id = ?",
-                              (json.dumps(outputs), pid))
-        if cursor.rowcount != 1:
-            raise AssertionError(f"expected one orchestration process row, updated {cursor.rowcount}")
-        conn.commit()
-    finally:
-        conn.close()
-    return old_sha, new_sha
-
-
-def _resume_preflight(root: Path, require_first_resume: bool = False, previous: str | None = None,
-                      artifact: str | None = None) -> tuple[dict[str, str], dict]:
-    """Refuse to alter any state unless this is the exact paused retry checkpoint."""
-    if (previous is None) != (artifact is None):
-        raise ValueError("previous and artifact must be given together")
-    rd = RunDir(root, root / "app.db", root / "workspace", root / "snapshots", root / "shim",
-                root / "proxy.jsonl", root / "spend.jsonl", root / "config.json")
-    assert_isolated(rd, rd.db, rd.workspace)
-    with oracle.Oracle(rd.db) as before:
-        ids = _latest_ids(rd.db)
-        run = before.run_state(ids.get("run_id"))
-        processes = before.process_runs(run_id=ids.get("run_id"))
-        current = [row for row in processes if row["process_type"] == "team_hierarchy" and not row.get("superseded_by_id")]
-        pending = [row["decision_key"] for row in before.decisions(ids.get("goal_id")) if row["status"] == "pending"]
-        retry = before.process_outputs(current[-1]["id"]) if len(current) == 1 else None
-    checkpoint = retry.get("_lm_retry") if isinstance(retry, dict) else None
-    request = checkpoint.get("request") if isinstance(checkpoint, dict) else None
-    lsof = subprocess.run(["lsof", "-t", str(rd.db)], capture_output=True, text=True, check=False)
-    if lsof.returncode not in (0, 1):
-        raise AssertionError(f"lsof failed for saved app.db: rc={lsof.returncode} {lsof.stderr.strip()[:200]}")
-    clean = subprocess.run(["git", "status", "--porcelain"], cwd=rd.workspace,
-                           capture_output=True, text=True, check=True).stdout
-    resident = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True, check=True).stdout
-    owned_processes = [line for line in resident.splitlines() if str(root) in line and
-                       ("-m huddleroom.cli serve" in line or "cli_shim_runner.py" in line)]
-    conditions = {
-        "ids": all(ids.get(key) for key in ("project_id", "goal_id", "run_id")),
-        "paused": bool(run and run["status"] == "paused" and run["pause_requested"] == 1),
-        "baseline": bool(run and run["phase"] == "baseline"),
-        "one_current_running_hierarchy": len(current) == 1 and current[0]["status"] == "running",
-        "lm_retry": isinstance(checkpoint, dict) and checkpoint.get("kind") == "team_hierarchy",
-        "retry_request": isinstance(request, dict),
-        "no_pending_decisions": not pending,
-        "clean_workspace": not clean.strip() and not (rd.workspace / "PLAN.md").exists(),
-        "no_run_processes": not owned_processes and lsof.returncode == 1,
-        "resume_artifacts": (((root / previous).is_dir() and not (root / artifact).exists())
-                             if previous and artifact else
-                             (root / "resume-S-1m").is_dir() and not (root / "resume-S-1m-2").exists()
-                             if require_first_resume else not (root / "resume-S-1m").exists()),
-    }
-    if not all(conditions.values()):
-        raise AssertionError(f"resume preflight failed: {conditions}; pending={pending}")
-    return ids, request
-
-
-def _run_resume_s(sc: G2G4ResumeScenario, frozen_input: dict, retry_request: dict) -> None:
-    driver = G2G4.__new__(G2G4)
-    driver.sc, driver.codex, driver.claude, driver.released, driver.claude_released = (
-        sc, sc.shims["codex"], sc.shims["claude"], [], [])
-    driver.ids = sc.ids = {**sc.ids, **_latest_ids(sc.run_dir.db), **_live_agent_ids(sc)}
-    driver.run_id, driver.goal_id, driver.project_id = (driver.ids[key] for key in ("run_id", "goal_id", "project_id"))
-    driver.notes, driver.checks, driver.steps = {"release_timeline": []}, {key: {"status": "not_run", "evidence": []} for key in CHECKS}, {}
-    driver.p2 = driver.planner_task = driver.planner_inv = None
-    driver.feedback = {}
-    api = Api(sc.base_url, driver.project_id, driver.goal_id)
-    if api.resume() != 200:
-        raise AssertionError(f"resume endpoint failed: {api.calls[-1]}")
-    retry = api.retry_async("team_hierarchy", timeout=300)
-    p1 = driver.drive_codex(360, lambda: next((row for row in sc.oracle.process_runs(goal_id=driver.goal_id)
-        if row["process_type"] == "team_hierarchy" and row["status"] == "waiting_decision"), None), "team hierarchy retry")
-    retry["thread"].join(10)
-    if not retry["done"] or retry["status"] != 200:
-        raise AssertionError(f"baseline/retry did not complete successfully: {retry}")
-    if p1 is None:
-        raise AssertionError("resumed P1 did not reach waiting_decision")
-    reused = sc.oracle.process_input_snapshot(p1["id"])
-    if _json_bytes(reused) != _json_bytes(frozen_input):
-        raise AssertionError("resumed hierarchy did not reuse the frozen request")
-    new_ordinals = [item.ordinal for item in driver.codex.invocations()]
-    first = min(new_ordinals, default=0)
-    if first != sc.historical_codex_last + 1:
-        raise AssertionError(f"resumed codex first ordinal {first} does not follow {sc.historical_codex_last}")
-    sc.findings.update({"resume_calls": api.calls, "frozen_request_reused": True,
-                        "retry_request_sha256": hashlib.sha256(_json_bytes(retry_request)).hexdigest(),
-                        "retry_request_reuse": "TeamHierarchyProcess.retry_failed -> analyzer.review_request(request)",
-                        "historical_ordinals": {"codex_last": sc.historical_codex_last, "new_first": first}})
-    _complete_s(sc, driver, p1)
-
-
 @pytest.mark.live
 @pytest.mark.skipif(not LIVE_ENABLED, reason="requires HUDDLEROOM_LIVE_ACCEPTANCE=1 and HUDDLEROOM_LIVE_EVAL=1")
 def test_live_run_g2g4_s():
@@ -1213,170 +952,6 @@ def test_live_run_g2g4_s():
             # Carry prior failed S usage into this run's local budget, not as new spend.
             sc.ledger.record(sc.name, "prior_S_attempts", prior_s, 0)
         _run_s(sc)
-
-
-@pytest.mark.live
-@pytest.mark.skipif(not (LIVE_ENABLED and RESUME_S),
-                    reason="requires both live flags and LIVE_ACCEPTANCE_G2G4_RESUME_S=1")
-def test_live_run_g2g4_resume_s_1m():
-    """One user-authorized continuation; never seeds or restarts baseline work."""
-    if not RESUME_ROOT_RAW:
-        pytest.skip("needs LIVE_ACCEPTANCE_G2G4_RESUME_ROOT")
-    if not Path(RESUME_ROOT_RAW).is_absolute():
-        raise AssertionError("LIVE_ACCEPTANCE_G2G4_RESUME_ROOT must be absolute")
-    assert RESUME_ROOT is not None
-    root = RESUME_ROOT.resolve()
-    expected_root = _expected_resume_root()
-    if root != expected_root:
-        raise AssertionError(f"resume is authorized only for {expected_root}")
-    ids, retry_request = _resume_preflight(root)
-    historical = _ledger_totals_readonly(root / "spend.jsonl")
-    old_fresh = historical["global"]["non_cached"]
-    if old_fresh != 213_983:
-        raise AssertionError(f"unexpected saved-run spend: {old_fresh}")
-    campaign = _ledger_totals_readonly(root.parent / "campaign-spend-g2g4-S-fresh.jsonl")
-    prior = campaign["global"]["non_cached"]
-    if prior != 487_444:
-        raise AssertionError(f"unexpected fresh campaign spend: {prior}")
-    with oracle.Oracle(root / "app.db") as before:
-        current = [row for row in before.process_runs(run_id=ids["run_id"])
-                   if row["process_type"] == "team_hierarchy" and not row.get("superseded_by_id")]
-        frozen = before.process_input_snapshot(current[0]["id"])
-    if not isinstance(frozen, dict):
-        raise AssertionError("current hierarchy has no frozen input snapshot")
-    artifact = root / "resume-S-1m"
-    with G2G4ResumeScenario(
-        root, prior, "g2g4-S-resume", None, root.parent, 1_000_000,
-        hold_spec={"codex_each": True, "claude_each": True, "codex_match": [TH_MARKER]}, roster="g2g4",
-        campaign_ledger_path=artifact / "campaign-spend.jsonl", campaign_cap=1_000_000,
-    ) as sc:
-        sc.findings["historical_campaign_audit"] = {
-            "saved_run_spend": old_fresh, "prior_total": prior, "cap": 1_000_000, "warn": 1_000_000 - WARNING_MARGIN,
-        }
-        _run_resume_s(sc, frozen, retry_request)
-
-
-@pytest.mark.live
-@pytest.mark.skipif(not (LIVE_ENABLED and RESUME_S_2),
-                    reason="requires both live flags and LIVE_ACCEPTANCE_G2G4_RESUME_S=2")
-def test_live_run_g2g4_resume_s_1m_2():
-    """Continue only the paused 1M retry checkpoint after ordinals 15--17."""
-    if not RESUME_ROOT_RAW:
-        pytest.skip("needs LIVE_ACCEPTANCE_G2G4_RESUME_ROOT")
-    if not Path(RESUME_ROOT_RAW).is_absolute():
-        raise AssertionError("LIVE_ACCEPTANCE_G2G4_RESUME_ROOT must be absolute")
-    assert RESUME_ROOT is not None
-    root = RESUME_ROOT.resolve()
-    expected_root = _expected_resume_root()
-    if root != expected_root:
-        raise AssertionError(f"resume is authorized only for {expected_root}")
-    ids, retry_request = _resume_preflight(root, require_first_resume=True)
-    first = root / "resume-S-1m"
-    campaign = _ledger_totals_readonly(first / "campaign-spend.jsonl")
-    prior = campaign["global"]["non_cached"]
-    if prior != 562_663:
-        raise AssertionError(f"unexpected first-resume campaign spend: {prior}")
-    with oracle.Oracle(root / "app.db") as current:
-        runs = [row for row in current.process_runs(run_id=ids["run_id"])
-                if row["process_type"] == "team_hierarchy" and not row.get("superseded_by_id")]
-        frozen = current.process_input_snapshot(runs[0]["id"])
-    with oracle.Oracle(first / "snapshots" / "00-before.db") as saved:
-        saved_ids = _latest_ids(first / "snapshots" / "00-before.db")
-        saved_runs = [row for row in saved.process_runs(run_id=saved_ids["run_id"])
-                      if row["process_type"] == "team_hierarchy" and not row.get("superseded_by_id")]
-        saved_outputs = saved.process_outputs(saved_runs[0]["id"]) or {}
-        saved_checkpoint = saved_outputs.get("_lm_retry") or {}
-        saved_request = saved_checkpoint.get("request")
-        saved_frozen = saved.process_input_snapshot(saved_runs[0]["id"])
-    if not isinstance(frozen, dict) or not isinstance(saved_frozen, dict):
-        raise AssertionError("current and saved hierarchy inputs must be frozen")
-    if _json_bytes(frozen) != _json_bytes(saved_frozen):
-        raise AssertionError("second resume would alter the frozen hierarchy input")
-    if not isinstance(saved_request, dict) or _json_bytes(retry_request) != _json_bytes(saved_request):
-        raise AssertionError("second resume would alter the saved retry request")
-    artifact = root / "resume-S-1m-2"
-    with G2G4SecondResumeScenario(
-        root, prior, "g2g4-S-resume-2", None, root.parent, 1_000_000,
-        hold_spec={"codex_each": True, "claude_each": True, "codex_match": [TH_MARKER]}, roster="g2g4",
-        campaign_ledger_path=artifact / "campaign-spend.jsonl", campaign_cap=1_000_000,
-    ) as sc:
-        sc.findings["historical_campaign_audit"] = {
-            "first_resume_total": prior, "cap": 1_000_000, "warn": 1_000_000 - WARNING_MARGIN,
-        }
-        _run_resume_s(sc, frozen, retry_request)
-
-
-@pytest.mark.live
-@pytest.mark.skipif(not (LIVE_ENABLED and RESUME_S_3),
-                    reason="requires both live flags and LIVE_ACCEPTANCE_G2G4_RESUME_S=3")
-def test_live_run_g2g4_resume_s_1m_3():
-    """Continue only the paused 1M retry checkpoint after ordinals 18--20 with HEAD architect wording."""
-    if not RESUME_ROOT_RAW:
-        pytest.skip("needs LIVE_ACCEPTANCE_G2G4_RESUME_ROOT")
-    if not Path(RESUME_ROOT_RAW).is_absolute():
-        raise AssertionError("LIVE_ACCEPTANCE_G2G4_RESUME_ROOT must be absolute")
-    assert RESUME_ROOT is not None
-    root = RESUME_ROOT.resolve()
-    expected_root = _expected_resume_root()
-    if root != expected_root:
-        raise AssertionError(f"resume is authorized only for {expected_root}")
-    ids, retry_request = _resume_preflight(root, previous="resume-S-1m-2", artifact="resume-S-1m-3")
-    second = root / "resume-S-1m-2"
-    campaign = _ledger_totals_readonly(second / "campaign-spend.jsonl")
-    prior = campaign["global"]["non_cached"]
-    if prior != 620_517:
-        raise AssertionError(f"unexpected second-resume campaign spend: {prior}")
-    with oracle.Oracle(root / "app.db") as current:
-        runs = [row for row in current.process_runs(run_id=ids["run_id"])
-                if row["process_type"] == "team_hierarchy" and not row.get("superseded_by_id")]
-        frozen = current.process_input_snapshot(runs[0]["id"])
-    with oracle.Oracle(second / "snapshots" / "00-before.db") as saved:
-        saved_ids = _latest_ids(second / "snapshots" / "00-before.db")
-        saved_runs = [row for row in saved.process_runs(run_id=saved_ids["run_id"])
-                      if row["process_type"] == "team_hierarchy" and not row.get("superseded_by_id")]
-        saved_outputs = saved.process_outputs(saved_runs[0]["id"]) or {}
-        saved_request = (saved_outputs.get("_lm_retry") or {}).get("request")
-        saved_frozen = saved.process_input_snapshot(saved_runs[0]["id"])
-    if not isinstance(frozen, dict) or not isinstance(saved_frozen, dict):
-        raise AssertionError("current and saved hierarchy inputs must be frozen")
-    if _json_bytes(frozen) != _json_bytes(saved_frozen):
-        raise AssertionError("third resume would alter the frozen hierarchy input")
-    if not isinstance(saved_request, dict) or _json_bytes(retry_request) != _json_bytes(saved_request):
-        raise AssertionError("third resume would alter the saved retry request")
-    # Validate historical ordinals before any app.db mutation.
-    G2G4ThirdResumeScenario.__new__(G2G4ThirdResumeScenario)._historical_codex(root)
-    old_sha, new_sha = _refresh_retry_system_message(root / "app.db", runs[0]["id"])
-    with oracle.Oracle(root / "app.db") as refreshed_db:
-        refreshed_outputs = refreshed_db.process_outputs(runs[0]["id"]) or {}
-        refreshed_request = (refreshed_outputs.get("_lm_retry") or {}).get("request")
-        refreshed_frozen = refreshed_db.process_input_snapshot(runs[0]["id"])
-    if _json_bytes(refreshed_frozen) != _json_bytes(frozen):
-        raise AssertionError("system message refresh altered the frozen hierarchy input")
-    if not isinstance(refreshed_request, dict):
-        raise AssertionError("refreshed retry request is missing")
-    architect = "Act as the team architect."
-    if refreshed_request["messages"][1] != retry_request["messages"][1]:
-        raise AssertionError("system message refresh altered the user payload")
-    old_text, new_text = retry_request["messages"][0]["content"], refreshed_request["messages"][0]["content"]
-    if new_text[:new_text.index(architect)] != old_text[:old_text.index(architect)]:
-        raise AssertionError("system message refresh altered the preamble before the architect section")
-    unchanged = ("model", "response_format", "temperature", "max_tokens")
-    if {key: refreshed_request.get(key) for key in unchanged} != {key: retry_request.get(key) for key in unchanged}:
-        raise AssertionError("system message refresh altered non-message request keys")
-    artifact = root / "resume-S-1m-3"
-    with G2G4ThirdResumeScenario(
-        root, prior, "g2g4-S-resume-3", None, root.parent, 1_000_000,
-        hold_spec={"codex_each": True, "claude_each": True, "codex_match": [TH_MARKER]}, roster="g2g4",
-        campaign_ledger_path=artifact / "campaign-spend.jsonl", campaign_cap=1_000_000,
-    ) as sc:
-        sc.findings["historical_campaign_audit"] = {
-            "second_resume_total": prior, "cap": 1_000_000, "warn": 1_000_000 - WARNING_MARGIN,
-        }
-        sc.findings["system_message_refresh"] = {
-            "old_request_sha256": old_sha, "new_request_sha256": new_sha,
-            "scope": "messages[0] architect section replaced with HEAD wording; preamble and user payload unchanged",
-        }
-        _run_resume_s(sc, frozen, refreshed_request)
 
 
 @pytest.mark.live

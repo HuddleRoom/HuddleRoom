@@ -102,6 +102,14 @@ def build_run_dir(evidence_root: Path | None, label: str) -> RunDir:
     )
 
 
+DENY_PATTERNS_ENV = "LIVE_ACCEPTANCE_DENY_PATH_PATTERNS"
+
+
+def _deny_patterns() -> list[str]:
+    """Comma-separated, case-insensitive path substrings that must never be used."""
+    return [p.strip().lower() for p in os.environ.get(DENY_PATTERNS_ENV, "").split(",") if p.strip()]
+
+
 def _check_path(raw: Path, root: Path, what: str) -> Path:
     if not raw.is_absolute():
         raise IsolationError(f"{what} path must be absolute: {raw}")
@@ -112,8 +120,9 @@ def _check_path(raw: Path, root: Path, what: str) -> Path:
         raise IsolationError(f"{what} {resolved} is outside run dir {root}")
     if resolved.is_relative_to(_protected_dir()):
         raise IsolationError(f"{what} {resolved} is inside {_protected_dir()}")
-    if "mimlo-huddleroom" in str(resolved).lower():
-        raise IsolationError(f"{what} path {resolved} contains 'mimlo-huddleroom'")
+    for pattern in _deny_patterns():
+        if pattern in str(resolved).lower():
+            raise IsolationError(f"{what} path {resolved} contains denied pattern {pattern!r}")
     return resolved
 
 
@@ -124,9 +133,7 @@ def assert_isolated(run_dir: RunDir, db_path: Path, workspace: Path) -> None:
     _check_root_location(root)
 
     db = _check_path(Path(db_path), root, "database")
-    if fnmatch.fnmatchcase(db.name.lower(), "rally*.db*") or fnmatch.fnmatchcase(
-        db.name.lower(), "mimlo-huddleroom*"
-    ):
+    if fnmatch.fnmatchcase(db.name.lower(), "rally*.db*"):
         raise IsolationError(f"database name {db.name} is not allowed")
     _check_path(Path(workspace), root, "workspace")
 

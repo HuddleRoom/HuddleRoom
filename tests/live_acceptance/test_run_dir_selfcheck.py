@@ -47,20 +47,21 @@ def test_rejects_rally_test_db_name(run_dir):
 
 
 @pytest.mark.live
-def test_rejects_mimlo_path(run_dir):
+def test_rejects_configured_deny_pattern(run_dir, monkeypatch):
+    monkeypatch.setenv("LIVE_ACCEPTANCE_DENY_PATH_PATTERNS", "other,Private-Project-DB")
     with pytest.raises(IsolationError):
-        assert_isolated(run_dir, run_dir.root / "mimlo-huddleroom.db 2", run_dir.workspace)
+        assert_isolated(run_dir, run_dir.root / "private-project-db.db 2", run_dir.workspace)
 
 
 @pytest.mark.live
-@pytest.mark.parametrize("name", ["Rally.db", "MIMLO-HuddleRoom.db"])
+@pytest.mark.parametrize("name", ["Rally.db", "RALLY_Test.DB"])
 def test_rejects_case_variant_names(run_dir, name):
     with pytest.raises(IsolationError):
         assert_isolated(run_dir, run_dir.root / name, run_dir.workspace)
 
 
 @pytest.mark.live
-@pytest.mark.parametrize("name", ["rally_test.db-wal", "rally_test.db-shm", "mimlo-huddleroom.db-wal"])
+@pytest.mark.parametrize("name", ["rally_test.db-wal", "rally_test.db-shm", "rally.db-wal"])
 def test_rejects_sidecar_names(run_dir, name):
     with pytest.raises(IsolationError):
         assert_isolated(run_dir, run_dir.root / name, run_dir.workspace)
