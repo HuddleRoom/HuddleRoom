@@ -742,7 +742,9 @@ describe('Plan tab', () => {
         rendered_content_hash: 'rendered-review-4', review_cycle: 2,
       },
     }
-    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), { onViewDecision })
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), {
+      decisions: [decision({ id: 'decision-review-4', authority: 'human' })], onViewDecision,
+    })
     try {
       const text = textOf(view.container)
       expect(text).toContain('v3 · Current')
@@ -773,7 +775,9 @@ describe('Plan tab', () => {
         rendered_content_hash: 'rendered-stale-4', review_cycle: 3,
       },
     }
-    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), { onViewDecision: vi.fn() })
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), {
+      decisions: [decision({ id: 'decision-stale-4', authority: 'human' })], onViewDecision: vi.fn(),
+    })
     try {
       expect(textOf(view.container)).toContain('Stale candidate')
       expect(textOf(view.container)).toContain('This candidate remains readable for revision, but it cannot be approved or executed.')
@@ -800,6 +804,98 @@ describe('Plan tab', () => {
       expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
       expect(() => getButton(view.container, 'Request revision')).toThrow()
     } finally { view.cleanup() }
+  })
+
+  describe('non-human plan review authority', () => {
+    function pendingReview(overrides: { authority_decision_id?: string | null; authority_gate_id?: string | null; authority_status?: string | null } = {}) {
+      return {
+        artifact_id: 'artifact-nh-4', state: 'ready' as const, markdown: '# Non-human candidate', export_path: null,
+        reason: null, authority_decision_id: 'decision-nh-4', authority_gate_id: 'gate-nh-4', authority_status: 'Pending',
+        review_url: '/orchestration/goal-1#plan-review-artifact-nh-4',
+        identity: {
+          project_id: 'project-1', goal_id: 'goal-1', run_id: 'run-2', artifact_id: 'artifact-nh-4',
+          planning_task_id: 'task-nh-4', planning_version: 4, winning_session_id: null,
+          provenance_hash: 'provenance-nh-4', canonical_content_hash: 'canonical-nh-4', renderer_version: 1,
+          rendered_content_hash: 'rendered-nh-4', review_cycle: 1,
+        },
+        ...overrides,
+      }
+    }
+
+    it('shows awaiting manager review with the manager name and no human approval controls', async () => {
+      const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review: pendingReview() } }), {
+        decisions: [decision({ id: 'decision-nh-4', authority: 'manager', authority_agent_id: 'agent-ada' })],
+        agentRoles: { 'agent-ada': 'Manager Ada' }, onViewDecision: vi.fn(),
+      })
+      try {
+        const text = textOf(view.container)
+        expect(text).toContain('Awaiting manager review (Manager Ada)')
+        expect(text).not.toContain('Awaiting review')
+        expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
+        expect(() => getButton(view.container, 'Request revision')).toThrow()
+      } finally { view.cleanup() }
+    })
+
+    it('shows awaiting manager review without a name when the manager is unknown', async () => {
+      const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review: pendingReview() } }), {
+        decisions: [decision({ id: 'decision-nh-4', authority: 'manager', authority_agent_id: null })],
+        onViewDecision: vi.fn(),
+      })
+      try {
+        const text = textOf(view.container)
+        expect(text).toContain('Awaiting manager review')
+        expect(text).not.toContain('Awaiting manager review (')
+        expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
+      } finally { view.cleanup() }
+    })
+
+    it('shows awaiting verifier review with no decision and no human controls', async () => {
+      const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review: pendingReview({ authority_decision_id: null }) } }), {
+        decisions: [], onViewDecision: vi.fn(),
+      })
+      try {
+        expect(textOf(view.container)).toContain('Awaiting verifier review')
+        expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
+        expect(() => getButton(view.container, 'Request revision')).toThrow()
+      } finally { view.cleanup() }
+    })
+
+    it('shows neutral awaiting review and no human controls when the bound decision is not loaded', async () => {
+      const onViewDecision = vi.fn()
+      const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review: pendingReview() } }), {
+        decisions: [], onViewDecision,
+      })
+      try {
+        expect(textOf(view.container)).toContain('Awaiting review')
+        expect(textOf(view.container)).not.toContain('Awaiting verifier review')
+        expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
+        expect(() => getButton(view.container, 'Request revision')).toThrow()
+        expect(onViewDecision).not.toHaveBeenCalled()
+      } finally { view.cleanup() }
+    })
+
+    it('shows awaiting agent review for a team lead authority', async () => {
+      const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review: pendingReview() } }), {
+        decisions: [decision({ id: 'decision-nh-4', authority: 'team_lead', authority_agent_id: 'agent-lead' })],
+        agentRoles: { 'agent-lead': 'Lead Lin' }, onViewDecision: vi.fn(),
+      })
+      try {
+        expect(textOf(view.container)).toContain('Awaiting agent review (Lead Lin)')
+        expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
+      } finally { view.cleanup() }
+    })
+
+    it('keeps human approval controls when the bound decision is human', async () => {
+      const onViewDecision = vi.fn()
+      const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review: pendingReview() } }), {
+        decisions: [decision({ id: 'decision-nh-4', authority: 'human' })], onViewDecision,
+      })
+      try {
+        expect(textOf(view.container)).toContain('Awaiting review')
+        await act(async () => getButton(view.container, 'Approve plan v4').click())
+        expect(onViewDecision).toHaveBeenCalledWith('decision-nh-4')
+      } finally { view.cleanup() }
+    })
   })
 
   it('renders item cards with dependencies, artifacts, adoption, owner and priority', async () => {

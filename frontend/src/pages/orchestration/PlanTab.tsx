@@ -328,7 +328,15 @@ export interface PlanTabProps {
   focusArtifactId?: string | null
 }
 
-function PlanReviewCandidate({ review, onViewDecision, focus }: { review: OrchestrationPlanReviewView; onViewDecision?: (decisionId: string) => void; focus: boolean }) {
+function awaitingAuthorityLabel(decision: OrchestrationAuthorityDecisionRecord | undefined, agentRoles: Names): string {
+  // ponytail: no decision means a verifier gate; no name map entry means the bare label
+  if (!decision) return 'Awaiting verifier review'
+  const name = decision.authority_agent_id ? agentRoles[decision.authority_agent_id] : undefined
+  const suffix = name ? ` (${name})` : ''
+  return decision.authority === 'manager' ? `Awaiting manager review${suffix}` : `Awaiting agent review${suffix}`
+}
+
+function PlanReviewCandidate({ review, decisions = [], agentRoles = {}, onViewDecision, focus }: { review: OrchestrationPlanReviewView; decisions?: readonly OrchestrationAuthorityDecisionRecord[]; agentRoles?: Names; onViewDecision?: (decisionId: string) => void; focus: boolean }) {
   const candidateRef = useRef<HTMLElement>(null)
   useEffect(() => {
     if (!focus) return
@@ -338,7 +346,12 @@ function PlanReviewCandidate({ review, onViewDecision, focus }: { review: Orches
   const version = review.identity.planning_version
   const authorityStatus = review.authority_status?.trim() ?? null
   const authorityOpen = ['pending', 'open', 'awaiting approval', 'awaiting review'].includes(authorityStatus?.toLowerCase() ?? '')
-  const decisionAction = authorityOpen && review.authority_decision_id && onViewDecision
+  const decision = decisions.find((candidate) => candidate.id === review.authority_decision_id)
+  // ponytail: a bound decision we can't see is unknown, so it gets no human controls (could be manager-owned)
+  const unknownDecision = authorityOpen && Boolean(review.authority_decision_id) && !decision
+  const nonHuman = unknownDecision || (decision ? decision.authority !== 'human' : (!review.authority_decision_id && Boolean(review.authority_gate_id) && authorityOpen))
+  const awaiting = nonHuman && authorityOpen ? (unknownDecision ? 'Awaiting review' : awaitingAuthorityLabel(decision, agentRoles)) : null
+  const decisionAction = authorityOpen && !awaiting && review.authority_decision_id && onViewDecision
     ? <div className="flex flex-wrap gap-2">
       <Button type="button" className="min-h-11" disabled={review.state !== 'ready'} onClick={() => onViewDecision(review.authority_decision_id!)}>Approve plan v{version}</Button>
       <Button type="button" variant="secondary" className="min-h-11" onClick={() => onViewDecision(review.authority_decision_id!)}>Request revision</Button>
@@ -346,7 +359,7 @@ function PlanReviewCandidate({ review, onViewDecision, focus }: { review: Orches
   return <section id={`plan-review-${review.artifact_id}`} ref={candidateRef} tabIndex={-1} aria-label={`Plan candidate v${version}`} className="flex flex-col gap-3 rounded-md border border-huddleroom-border p-4">
     <div className="flex flex-wrap items-center gap-2">
       <h3 className={HEADING_CLASS}>Plan candidate v{version}</h3>
-      <StatusBadge status={review.state === 'stale' ? 'blocked' : authorityOpen ? 'pending' : authorityStatus?.toLowerCase() === 'accepted' ? 'accepted' : 'neutral'} label={review.state === 'stale' ? 'Stale — revision required' : authorityOpen ? 'Awaiting review' : authorityStatus ?? 'Authority unavailable'} />
+      <StatusBadge status={review.state === 'stale' ? 'blocked' : authorityOpen ? 'pending' : authorityStatus?.toLowerCase() === 'accepted' ? 'accepted' : 'neutral'} label={review.state === 'stale' ? 'Stale — revision required' : awaiting ?? (authorityOpen ? 'Awaiting review' : authorityStatus ?? 'Authority unavailable')} />
     </div>
     <p className="text-sm text-huddleroom-text-secondary">This Markdown is readable and editable, but only the canonical reviewed content can execute.</p>
     <Link to={review.review_url} className="inline-flex min-h-11 items-center text-sm text-huddleroom-primary hover:underline">Link to this candidate</Link>
@@ -357,7 +370,7 @@ function PlanReviewCandidate({ review, onViewDecision, focus }: { review: Orches
       { key: 'Provenance', value: <MonoId id={review.identity.provenance_hash} /> },
       { key: 'Canonical content', value: <MonoId id={review.identity.canonical_content_hash} /> },
       { key: 'Rendered content', value: <MonoId id={review.identity.rendered_content_hash} /> },
-      { key: 'Authority', value: review.authority_status ?? 'Awaiting authority decision' },
+      { key: 'Authority', value: awaiting ?? review.authority_status ?? 'Awaiting authority decision' },
       { key: 'Export', value: review.export_path ?? 'No safe export is available' },
     ]} />
     <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words rounded-md border border-huddleroom-border bg-huddleroom-depth p-3 text-sm">{review.markdown}</pre>
@@ -390,7 +403,7 @@ export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRo
       planStatus={plan?.status ?? run?.plan_state?.status ?? null}
       pendingDecisionId={pendingDecision?.id ?? null} onViewDecision={onViewDecision}
     />
-    {review && <PlanReviewCandidate review={review} onViewDecision={onViewDecision} focus={focusArtifactId === review.artifact_id} />}
+    {review && <PlanReviewCandidate review={review} decisions={decisions} agentRoles={agentRoles} onViewDecision={onViewDecision} focus={focusArtifactId === review.artifact_id} />}
     {plan && <PlanItemList
       plan={plan} evidence={detail.evidence} taskReports={detail.task_reports ?? []} goal={detail.goal}
       taskTitles={taskTitles} agentRoles={agentRoles}

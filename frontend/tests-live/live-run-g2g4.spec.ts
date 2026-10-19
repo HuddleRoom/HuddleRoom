@@ -129,8 +129,7 @@ test('start-planning', async ({ page }) => {
 
 // Manager authority: the decision is not in the human "Needs you" queue.  The Details > Plan tab
 // must expose the completed candidate with the pending authority state, before and after reload.
-// ponytail: PlanTab has no manager-specific text; it renders the generic "Awaiting review" badge and
-// "Authority: pending".  The Approve button's visibility is recorded, not asserted.
+// PlanTab renders "Awaiting manager review" (badge and Authority value) and hides the Approve/Request revision buttons.
 async function inspectManagerPlan(page: Page) {
   await openGoal(page)
   const view = async () => {
@@ -140,8 +139,9 @@ async function inspectManagerPlan(page: Page) {
     const content = await candidate.locator('pre').innerText()
     expect(content.trim()).toBeTruthy()
     expect(content).not.toMatch(/Reference unavailable|Being drafted/i)
-    await expect(candidate.getByText('Awaiting review', { exact: true })).toBeVisible()
-    await expect(candidate.getByText(/^pending$/i).first()).toBeVisible()
+    await expect(candidate.getByText(/^Awaiting manager review/).first()).toBeVisible()
+    await expect(candidate.getByRole('button', { name: /Approve plan v\d+/ })).toHaveCount(0)
+    await expect(candidate.getByRole('button', { name: 'Request revision' })).toHaveCount(0)
     return candidate.getByRole('button', { name: /Approve plan v\d+/ }).count()
   }
   const approveButtons = await view()
