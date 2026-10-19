@@ -70,7 +70,11 @@ class ApiAdapter:
             result = await db.execute(select(Task).where(Task.id == session.task_id))
             task = result.scalar_one_or_none()
 
-        messages, task_context, knowledge_count, channel_count = await self._build_messages(agent, task, db)
+        from huddleroom.services.session_service import SessionService
+        planning_only = await SessionService().runtime_execution_policy(db, task)
+        messages, task_context, knowledge_count, channel_count = await self._build_messages(
+            agent, task, db, planning_only=planning_only,
+        )
 
         session.input_context = {
             "system_prompt": agent.system_prompt or "You are a focused AI task executor. Complete assigned work efficiently.",
@@ -91,12 +95,15 @@ class ApiAdapter:
         await db.commit()
 
         if orchestration:
-            await self._run_with_retry(agent, session, messages, task_context, db, runner_task_id=runner_task_id)
+            await self._run_with_retry(
+                agent, session, messages, task_context, db, task=task, runner_task_id=runner_task_id,
+                planning_only=planning_only,
+            )
         else:
             await self._run_with_retry(agent, session, messages, task_context, db)
 
     async def _build_messages(
-        self, agent: Agent, task: Task | None, db: AsyncSession
+        self, agent: Agent, task: Task | None, db: AsyncSession, *, planning_only: bool = False,
     ) -> tuple[list[dict], str, int, int]:
         knowledge_items = []
         if task and task.project_id:
@@ -130,7 +137,7 @@ class ApiAdapter:
                 knowledge_context += f"- {k.title or 'Untitled'}: {k.content[:200]}\n"
 
         memory_context = ""
-        if agent.config.get("memory_enabled", False) and task:
+        if not planning_only and agent.config.get("memory_enabled", False) and task:
             try:
                 query = f"{task.title} {task.description or ''}"
                 memory_results = await memory_service_instance.search(
@@ -158,7 +165,7 @@ class ApiAdapter:
         system_prompt = f"You are {agent.name}, the {agent.role}."
         if agent.system_prompt:
             system_prompt = f"{system_prompt}\n{agent.system_prompt}"
-        if agent.config.get("memory_enabled", False):
+        if not planning_only and agent.config.get("memory_enabled", False):
             system_prompt += "\n\n" + get_memory_system_prompt()
         messages = [
             {"role": "system", "content": system_prompt},
@@ -173,8 +180,10 @@ class ApiAdapter:
         messages: list[dict],
         task_context: str,
         db: AsyncSession,
+        task: Task | None = None,
         runner_task_id: str | None = None,
         invocation: AgentResponseInvocation | None = None,
+        planning_only: bool = False,
     ) -> None:
         import litellm
 
@@ -271,12 +280,12 @@ class ApiAdapter:
         for attempt in range(4):
             try:
                 model_name, effective_model, provider_kwargs, _ = await request_settings()
-                tools = MEMORY_TOOLS if agent.config.get("memory_enabled", False) else None
+                tools = MEMORY_TOOLS if not planning_only and agent.config.get("memory_enabled", False) else None
 
                 last_resp_holder: dict = {}
 
                 async def _completion(**kwargs):
-                    nonlocal model_name, effective_model, provider_kwargs, token_in_total, token_out_total, token_usage_complete
+                    nonlocal model_name, effective_model, provider_kwargs, token_in_total, token_out_total, token_usage_complete, planning_only
                     model_name, effective_model, provider_kwargs, stale_provider_option_keys = await request_settings()
                     for key in stale_provider_option_keys:
                         kwargs.pop(key, None)
@@ -291,6 +300,14 @@ class ApiAdapter:
                             raise RuntimeError("claimed token budget exhausted")
                         kwargs["max_tokens"] = min(kwargs.get("max_tokens", remaining_tokens), remaining_tokens - prompt_tokens)
                     if orchestration:
+                        from huddleroom.services.session_service import SessionService
+                        planning_only = await SessionService().runtime_execution_policy(db, task)
+                        if planning_only:
+                            messages, _, _, _ = await self._build_messages(agent, task, db, planning_only=True)
+                            kwargs["messages"] = messages
+                            for key in ("tools", "functions", "function_call"):
+                                provider_kwargs.pop(key, None)
+                                kwargs.pop(key, None)
                         await ProjectService().require_runnable_project(db, session.project_id)
                         from huddleroom.workers.session_tasks import mark_attempt_effect_started
                         if not await mark_attempt_effect_started(db, session.id, runner_task_id):

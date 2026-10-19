@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import (
-    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun, OrchestrationWait,
+    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGate, OrchestrationGoal, OrchestrationRun, OrchestrationWait,
     compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import AUTHORITIES, OrchestrationAuthorityDecision
@@ -902,6 +903,121 @@ async def effective_authorization(
             and action.action_type in {"request_plan", "request_plan_revision"}
         )
 
+    async def current_candidate_verifier() -> bool:
+        """The only planning-only verifier is the live, independent plan gate task."""
+        if task is None:
+            return False
+        candidate = task
+        correction_parent_id = obj(task.metadata_).get("result_correction_parent_task_id")
+        if correction_parent_id:
+            try:
+                candidate = await db.get(Task, uuid.UUID(str(correction_parent_id)))
+                correction_action_id = uuid.UUID(str(obj(obj(task.metadata_).get("orchestration")).get("action_id")))
+            except (TypeError, ValueError):
+                return False
+            correction_action = await db.get(OrchestrationAction, correction_action_id)
+            if (
+                candidate is None
+                or obj(candidate.metadata_).get("result_correction_parent_task_id")
+                or task.assigned_to != candidate.assigned_to
+                or correction_action is None
+                or correction_action.run_id != run.id
+                or correction_action.status != "completed"
+                or correction_action.action_type != "create_delegation_task"
+                or correction_action.target_type != "task"
+                or correction_action.target_id != task.id
+                or obj(correction_action.request).get("parent_task_id") != str(candidate.id)
+                or obj(correction_action.request).get("agent_id") != str(candidate.assigned_to)
+            ):
+                return False
+        orchestration = obj(obj(candidate.metadata_).get("orchestration"))
+        action_id = orchestration.get("verification_action_id")
+        gate_id = orchestration.get("verification_gate_id")
+        try:
+            action = await db.get(OrchestrationAction, uuid.UUID(str(action_id)))
+            gate = await db.get(OrchestrationGate, uuid.UUID(str(gate_id)))
+        except (TypeError, ValueError):
+            return False
+        if (
+            action is None or gate is None or action.run_id != run.id or action.status != "completed"
+            or action.action_type != "request_verification" or action.target_id != candidate.id
+            or gate.run_id != run.id or gate.gate_type != "roadmap_plan_approval" or gate.status != "open"
+            or obj(action.request).get("gate_id") != str(gate.id)
+            or obj(action.request).get("verifier_agent_id") != str(candidate.assigned_to)
+        ):
+            return False
+        required = obj(gate.required_evidence)
+        if any(obj(action.request).get(key) != required.get(key) for key in (
+            "plan_review_identity", "plan_review_identity_hash",
+        )):
+            return False
+        from huddleroom.models.artifact import Artifact
+        from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+        from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
+
+        artifact_id = required.get("plan_artifact_id")
+        try:
+            artifact = await db.get(Artifact, uuid.UUID(str(artifact_id)))
+        except (TypeError, ValueError):
+            return False
+        if artifact is None or candidate.assigned_to == artifact.created_by_agent:
+            return False
+        if candidate.assigned_to not in {agent.id for agent in await OrchestrationRosterMapper().current_active_agents(db)}:
+            return False
+        try:
+            await OrchestrationRoadmapService(svc)._require_current_plan_review(
+                db, goal, run, artifact,
+                {key: required.get(key) for key in ("plan_review_identity", "plan_review_identity_hash")},
+                boundary="candidate verifier authorization",
+            )
+        except HTTPException:
+            return False
+        return True
+
+    async def current_candidate_manager() -> bool:
+        if task is None or task.assigned_to != goal.manager_agent_id:
+            return False
+        decision_id = obj(obj(task.metadata_).get("orchestration")).get("authority_decision_id")
+        try:
+            decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(str(decision_id)))
+            context = json.loads(decision.context or "null") if decision is not None else None
+            artifact_id = uuid.UUID(str(context["plan_review_identity"]["artifact_id"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            decision is None or decision.run_id != run.id or decision.status != "pending"
+            or decision.authority_agent_id != goal.manager_agent_id
+            or not decision.decision_key.startswith("roadmap_plan:")
+        ):
+            return False
+        related = await db.get(OrchestrationAction, decision.related_action_id) if decision.related_action_id else None
+        if (related is None or related.run_id != run.id or related.status != "completed"
+                or related.action_type != "create_delegation_task" or related.target_id != task.id):
+            return False
+        orchestration = obj(obj(task.metadata_).get("orchestration"))
+        if (orchestration.get("authority_decision_id") != str(decision.id)
+                or obj(related.request).get("authority_decision_id") != str(decision.id)
+                or orchestration.get("plan_review_identity_hash") != context.get("plan_review_identity_hash")
+                or obj(related.request).get("plan_review_identity_hash") != context.get("plan_review_identity_hash")):
+            return False
+        from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
+        if task.assigned_to not in {agent.id for agent in await OrchestrationRosterMapper().current_active_agents(db)}:
+            return False
+        from huddleroom.models.artifact import Artifact
+        from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+        artifact = await db.get(Artifact, artifact_id)
+        if artifact is None:
+            return False
+        try:
+            await OrchestrationRoadmapService(svc)._require_current_plan_review(
+                db, goal, run, artifact,
+                {key: context.get(key) for key in ("plan_review_identity", "plan_review_identity_hash")},
+                boundary="candidate manager authorization",
+            )
+        except HTTPException:
+            return False
+        return True
+
     if goal.status not in ("active", "blocked") or run.status not in ("running", "blocked"):
         return result("run_not_active", "resume" if "paused" in (goal.status, run.status) else None)
     budget = OrchestrationBudgetService()
@@ -940,7 +1056,9 @@ async def effective_authorization(
         # and the successor carries no authorize_execution action of its own.
         if grant is None:
             return result("start_required", "start")
-        if grant.scope != "execution" and not await planning_control_task():
+        if grant.scope != "execution" and not (
+            await planning_control_task() or await current_candidate_verifier() or await current_candidate_manager()
+        ):
             return result("execution_scope_required", "upgrade_execution")
         # NULL fingerprint = legacy run started before freezing; grandfathered.
         if run.goal_contract_fingerprint not in (None, fp) and not await completed(

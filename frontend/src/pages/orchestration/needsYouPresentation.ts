@@ -11,7 +11,7 @@ import type {
 } from '@/lib/types'
 import { warningMessage } from './humanize'
 
-export type NeedsYouSourceKind = 'gate' | 'process' | 'action'
+export type NeedsYouSourceKind = 'gate' | 'process' | 'action' | 'artifact'
 
 export type NeedsYouSourceTarget = {
   [Kind in NeedsYouSourceKind]: { kind: Kind; id: string; goalId: string }
@@ -158,7 +158,7 @@ const DEFAULT_TITLES: Record<QueueRow['kind'], string> = {
 const REFERENCE_UNAVAILABLE: Record<NeedsYouReference['kind'], string> = {
   task: 'Task unavailable', meeting: 'Meeting unavailable', agent: 'Agent unavailable',
   goal: 'Goal unavailable', gate: 'Gate unavailable', process: 'Process unavailable',
-  action: 'Action unavailable',
+  action: 'Action unavailable', artifact: 'Plan candidate unavailable',
 }
 
 function validInstant(value: unknown): string | null {
@@ -300,7 +300,7 @@ function sourceReferences(row: QueueRow): readonly NeedsYouReference[] {
 
 function validReferences(value: unknown): NeedsYouReference[] {
   if (!Array.isArray(value)) return []
-  const kinds = new Set<NeedsYouReference['kind']>(['task', 'meeting', 'agent', 'goal', 'gate', 'process', 'action'])
+  const kinds = new Set<NeedsYouReference['kind']>(['task', 'meeting', 'agent', 'goal', 'gate', 'process', 'action', 'artifact'])
   return value.filter((reference): reference is NeedsYouReference => {
     if (reference === null || typeof reference !== 'object') return false
     const candidate = reference as Record<string, unknown>
@@ -466,5 +466,6 @@ export function needsYouReferencePath(
   if (reference.kind === 'meeting') return `/meetings/${id}`
   if (reference.kind === 'agent') return `/agents/${id}`
   if (reference.kind === 'goal') return `/orchestration/${id}`
+  if (reference.kind === 'artifact' && reference.goal_id) return `/orchestration/${encodeURIComponent(reference.goal_id)}#plan-review-${id}`
   return null
 }

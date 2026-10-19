@@ -631,6 +631,29 @@ class SessionService:
             "reason": f"Task cannot be claimed: {result.reason_code}.",
         }, f"authorization_denied: {result.reason_code}")
 
+    async def runtime_execution_policy(self, db: AsyncSession, task: Task | None) -> bool:
+        """Re-read authority immediately before an adapter effect.
+
+        True is the narrowly admitted planning-control case.  Callers must not
+        infer it from session metadata: the current grant and review lineage are
+        database authority and may have changed after queue claim.
+        """
+        await self._orchestration_authorization(db, task)
+        if task is None:
+            return False
+        from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+        from huddleroom.services.orchestration_authority_service import execution_grant
+        from huddleroom.services.orchestration_service import OrchestrationService
+
+        orchestration = OrchestrationService._json_object_or_empty((task.metadata_ or {}).get("orchestration"))
+        run_id = OrchestrationService._optional_uuid(orchestration.get("run_id"), "run_id")
+        if run_id is None:
+            return False
+        run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+        goal = await db.get(OrchestrationGoal, run.goal_id, populate_existing=True) if run else None
+        grant = await execution_grant(db, goal, run) if goal and run else None
+        return grant is not None and grant.scope == "planning_only"
+
     async def preflight_claim(self, db: AsyncSession, task: Task, agent: Agent,
                               adapter_override: str | None = None) -> None:
         """Validate a claim and clear its authorization blocker when allowed."""

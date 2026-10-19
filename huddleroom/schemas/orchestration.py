@@ -1358,6 +1358,19 @@ class OrchestrationPlanItemView(BaseModel):
     state: PlanItemState
 
 
+class OrchestrationPlanReviewView(BaseModel):
+    artifact_id: uuid.UUID
+    identity: PlanReviewIdentity
+    state: Literal["ready", "stale"]
+    markdown: str
+    export_path: str | None = None
+    reason: str | None = None
+    authority_decision_id: uuid.UUID | None = None
+    authority_gate_id: uuid.UUID | None = None
+    authority_status: str | None = None
+    review_url: str
+
+
 class OrchestrationPlanView(BaseModel):
     status: str | None
     artifact_id: uuid.UUID | None
@@ -1368,6 +1381,7 @@ class OrchestrationPlanView(BaseModel):
     summary: str | None
     scope: str | None
     items: list[OrchestrationPlanItemView]
+    review: OrchestrationPlanReviewView | None = None
 
 
 class OrchestrationTaskReportResponse(BaseModel):
@@ -1533,7 +1547,7 @@ class OrchestrationWarningReasonRequest(BaseModel):
         return _require_nonblank_reason(value)
 
 
-NeedsYouReferenceKind = Literal["task", "meeting", "agent", "goal", "gate", "process", "action"]
+NeedsYouReferenceKind = Literal["task", "meeting", "agent", "goal", "gate", "process", "action", "artifact"]
 
 
 class NeedsYouReference(BaseModel):

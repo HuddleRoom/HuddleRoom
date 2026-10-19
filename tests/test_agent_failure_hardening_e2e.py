@@ -109,6 +109,50 @@ def _envelope(kind, research_keys, product_id, researcher_id):
     })
 
 
+async def _bind_accepted_plan_team(db, goal, planner, product, researcher, verifier):
+    """Record the accepted G2 evidence for the owners this scenario actually names."""
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+
+    current = {
+        process.process_type: process
+        for process in await db.scalars(select(OrchestrationProcessRun).where(
+            OrchestrationProcessRun.goal_id == goal.id,
+            OrchestrationProcessRun.superseded_by_id.is_(None),
+            OrchestrationProcessRun.process_type.in_(("agent_definition_review", "team_hierarchy")),
+        ))
+    }
+    eligibility = {
+        str(planner.id): ["planning"],
+        str(product.id): ["planning"],
+        str(researcher.id): ["investigation"],
+        str(verifier.id): ["validation"],
+    }
+    review = current["agent_definition_review"]
+    review.outputs = {**review.outputs, "eligibility": eligibility}
+    coverage = [
+        {"responsibility_id": function, "work_function": function, "agent_ref": agent_id,
+         "status": "covered", "evidence_ref": "agent_review:accepted"}
+        for function, agent_id in {
+            "planning": str(planner.id), "investigation": str(researcher.id), "validation": str(verifier.id),
+        }.items()
+    ]
+    hierarchy = current["team_hierarchy"]
+    hierarchy.outputs = {
+        **hierarchy.outputs,
+        "role_to_agent": {row["work_function"]: row["agent_ref"] for row in coverage},
+        "assignments": [{"work_function": row["work_function"], "agent_ref": row["agent_ref"]}
+                        for row in coverage],
+        "approval": "approve",
+        "approval_decision_id": str(uuid.uuid4()),
+        "accepted_responsibility_gap_ids": [],
+        "responsibility_coverage": coverage,
+        "gates": {"team_structure_reviewed": True, "required_work_functions_mapped": True,
+                  "agent_definitions_reviewed": True},
+    }
+    goal.orchestrator_context = {**(goal.orchestrator_context or {}), "team": hierarchy.outputs}
+    await db.flush()
+
+
 def _schema_in_prompt(description):
     tail = description.split("Read-only work reports its findings in this JSON.\n", 1)[1]
     return json.JSONDecoder().raw_decode(tail)[0]
@@ -192,6 +236,7 @@ async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
     db_session.add_all([planner, product, researcher, verifier])
     await db_session.flush()
     service, goal, run = await _authorized_run(db_session, test_project, success_criteria=CRITERIA, owns_setup=True)
+    await _bind_accepted_plan_team(db_session, goal, planner, product, researcher, verifier)
 
     # --- Planning: the lead is asked for a plan, which is late.
     await _tick(service, db_session, run, stub_decision, lambda _ctx: {
@@ -216,7 +261,7 @@ async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
 
     # The lead answers with a framing sentence around an envelope citing an unknown criterion key.
     failed_plan = "Now writing the plan envelope.\n" + _envelope(
-        kind, ["protocol_fallback"], str(product.id), str(researcher.id))
+        kind, ["protocol_fallback"], str(planner.id), str(researcher.id))
     planner_session = await _complete_task_session(
         db_session, test_project.id, planning_task, planner.id, failed_plan)
     await _tick(service, db_session, run, stub_decision)
@@ -234,7 +279,7 @@ async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
 
     # The output-only correction returns the fixed envelope: it lands under the original planning identity and
     # the orchestrator accepts it.
-    fixed_plan = _envelope(kind, ["research"], str(product.id), str(researcher.id))
+    fixed_plan = _envelope(kind, ["research"], str(planner.id), str(researcher.id))
     plan_fix_session = await _complete_task_session(db_session, test_project.id, plan_fix, planner.id, fixed_plan)
     await _tick(service, db_session, run, stub_decision)
 
@@ -256,7 +301,7 @@ async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
             if (task.metadata_ or {}).get("orchestration", {}).get("plan_item_gate_id")]
     checklist = next(task for task in work if service._task_work_function(task) == "planning")
     research = next(task for task in work if service._task_work_function(task) == "investigation")
-    assert (checklist.assigned_to, research.assigned_to) == (product.id, researcher.id)
+    assert (checklist.assigned_to, research.assigned_to) == (planner.id, researcher.id)
     # The gated planning-role checklist is briefed with, and validated against, the WorkReport.
     assert checklist.metadata_["orchestration_contract"]["expected_result"] == "work_report"
     assert _schema_in_prompt(checklist.description) == CANONICAL_WORK_REPORT_SCHEMA
@@ -276,7 +321,7 @@ async def test_misbehaving_agents_are_corrected_without_owner_or_duplicate_work(
                         "criterion_progress": {"checklist": "candidate"}}
     research_report = {**REPORT, "changes": ["Compared provider pricing from dated public sources."],
                        "evidence": [RESEARCH_EVIDENCE], "criterion_progress": {"research": "candidate"}}
-    await _complete_task_session(db_session, test_project.id, checklist, product.id, json.dumps(checklist_report))
+    await _complete_task_session(db_session, test_project.id, checklist, planner.id, json.dumps(checklist_report))
     # The research result exists only in the database: no workspace file, no artifact.
     await _complete_task_session(db_session, test_project.id, research, researcher.id, json.dumps(research_report))
     for _ in range(3):  # consume both reports, then the orchestrator verifies each gate

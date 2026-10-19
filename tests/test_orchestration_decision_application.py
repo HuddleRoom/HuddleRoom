@@ -1,19 +1,20 @@
 """Shared application retains the complete specialized decision paths."""
 import json
 import uuid
-
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from huddleroom.models import User
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGoal, OrchestrationRun
+from huddleroom.models.project import Project
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.schemas.orchestration import (
     OrchestrationAgentDefinitionReviewBatchAnswerRequest, OrchestrationDecisionAnswerRequest,
 )
 from huddleroom.services import orchestration_decision_application as application
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+from huddleroom.services.orchestration_plan_review import PlanReviewService
 from tests.test_orchestration_supervision_authority import _runtime_decision
 from tests.test_orchestration_supervision_authority import _text_runtime_decision
 from huddleroom.models.event_log import EventLog
@@ -26,6 +27,7 @@ from tests.test_orchestration_roster_mutation import (
     decisions_for, fresh_agent, interfere_after_roster_release, lock_tracer, outcome_or_conflict,
     proposed_agent_definition, seed_definition_proposal, seed_hierarchy_proposal, sessions, single_agent_write,
 )
+from tests.test_orchestration_roadmap_plans import _roadmap_acceptance
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("safe_goal_analysis")]
 
@@ -33,6 +35,61 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("safe_goal_analysis")
 async def _answer(db, goal, decision, user, **data):
     return await application.answer_decision(db, goal.project_id, goal.id, decision.id,
                                             OrchestrationDecisionAnswerRequest(**data), user)
+
+
+async def test_g3_stale_roadmap_answer_stays_stale_when_bytes_are_restored_before_rollback_marker(
+    sessions, tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "g3-stale-review"
+    workspace.mkdir()
+    async with sessions() as setup:
+        project = Project(name="G3 stale review", description="", workspace_path=str(workspace), config={})
+        user = User(email="g3-stale@example.com", hashed_password="x", display_name="G3", role="member")
+        setup.add_all([project, user])
+        await setup.flush()
+        _, goal, run, artifact, decision, _ = await _roadmap_acceptance(setup, project, user)
+        review = await PlanReviewService().ensure(setup, goal, run, artifact)
+        export = workspace / review.export_path
+        original = export.read_text(encoding="utf-8")
+        identifiers = project.id, goal.id, run.id, artifact.id, decision.id, user.id
+        await setup.commit()
+
+    export.write_text("changed after review", encoding="utf-8")
+    original_preserve = application._preserve_stale_roadmap_plan_answer
+
+    async def restore_then_preserve(db, decision_id, run_id, goal_id, stale_record):
+        export.write_text(original, encoding="utf-8")
+        async with sessions() as concurrent:
+            concurrent_run = await concurrent.get(OrchestrationRun, run_id)
+            concurrent_run.plan_state = {**concurrent_run.plan_state, "concurrent_control": "kept"}
+            concurrent_run.control_version += 1
+            await concurrent.commit()
+        await original_preserve(db, decision_id, run_id, goal_id, stale_record)
+
+    monkeypatch.setattr(application, "_preserve_stale_roadmap_plan_answer", restore_then_preserve)
+    async with sessions() as submit:
+        project_id, goal_id, _, _, decision_id, _ = identifiers
+        with pytest.raises(HTTPException, match="Roadmap plan") as error:
+            await application.answer_decision(
+                submit, project_id, goal_id, decision_id,
+                OrchestrationDecisionAnswerRequest(selected_option="approve", reason="Approve candidate."), user,
+            )
+        assert error.value.status_code == 409
+
+    async with sessions() as fresh:
+        _, _, run_id, artifact_id, decision_id, _ = identifiers
+        saved_run = await fresh.get(OrchestrationRun, run_id)
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision_id)
+        record = saved_run.plan_state["plan_reviews"][str(artifact_id)]
+        assert record["state"] == "stale"
+        assert saved_run.plan_state["concurrent_control"] == "kept"
+        assert (saved.status, saved.selected_option) == ("pending", None)
+    async with sessions() as retry:
+        with pytest.raises(HTTPException, match="Roadmap plan"):
+            await application.answer_decision(
+                retry, identifiers[0], identifiers[1], decision_id,
+                OrchestrationDecisionAnswerRequest(selected_option="approve", reason="Approve candidate."), user,
+            )
 
 
 @pytest.mark.parametrize("text", ["a\n😀" * 1333 + "z", "\uFEFFhello\uFEFF", "a\n😀" * 1333 + "zz"],

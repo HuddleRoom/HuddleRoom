@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 import uuid
 from decimal import Decimal
@@ -52,6 +53,11 @@ class CliAdapter:
         """Use the new sandbox root, retaining an existing one-release legacy sandbox."""
         legacy = workspace / ".rally" / Path(*parts)
         return legacy if legacy.exists() else workspace / ".huddleroom" / Path(*parts)
+
+    @staticmethod
+    def _planning_control_dir(session_id: uuid.UUID) -> Path:
+        """Keep planning-control files outside the repository being inspected."""
+        return Path(tempfile.gettempdir()) / "huddleroom-control" / str(session_id)
 
     @classmethod
     def _context_path(cls, sandbox_dir: Path) -> Path:
@@ -205,8 +211,10 @@ class CliAdapter:
     @staticmethod
     def _build_command(
         cli_runtime: str, task_content: str, agent_config: dict, workspace: Path, task_path: Path,
-        *, existing_session_id: str | None = None, model: str | None = None,
+        *, existing_session_id: str | None = None, model: str | None = None, planning_only: bool = False,
     ) -> list[str] | None:
+        if planning_only and cli_runtime != "codex":
+            raise RuntimeError(f"unsupported_planning_runtime: {cli_runtime}")
         effort = (agent_config or {}).get("reasoning_effort")
         effort = effort if isinstance(effort, str) and effort in (CLI_EFFORTS - {"max"} if cli_runtime == "codex" else CLI_EFFORTS) else None
         if cli_runtime == "claude_code":
@@ -230,12 +238,14 @@ class CliAdapter:
                 # resume accepts neither --sandbox nor --cd: sandbox via -c, workspace via subprocess cwd.
                 return [
                     "codex", "exec", "resume", "--json", "--skip-git-repo-check",
-                    "-c", "sandbox_mode=workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+                    "-c", "sandbox_mode=read-only" if planning_only else "sandbox_mode=workspace-write",
+                    *([] if planning_only else ["-c", "sandbox_workspace_write.network_access=true"]),
                     *model_args, existing_session_id, task_content or "proceed",
                 ]
             return [
-                "codex", "exec", "--json", "--sandbox", "workspace-write", "--cd", str(workspace),
-                "--skip-git-repo-check", "-c", "sandbox_workspace_write.network_access=true",
+                "codex", "exec", "--json", "--sandbox", "read-only" if planning_only else "workspace-write",
+                "--cd", str(workspace), "--skip-git-repo-check",
+                *([] if planning_only else ["-c", "sandbox_workspace_write.network_access=true"]),
                 *model_args, task_content or "proceed",
             ]
         elif cli_runtime == "aider":
@@ -315,17 +325,20 @@ class CliAdapter:
             **{f"RALLY_{key}": value for key, value in values.items()},
         }
 
-    def _build_env(self, session_id: uuid.UUID, task, agent, project) -> dict:
-        return self._base_env(agent, project, SESSION_ID=str(session_id), TASK_ID=str(task.id) if task else "")
+    def _build_env(self, session_id: uuid.UUID, task, agent, project, *, planning_only: bool = False) -> dict:
+        return self._base_env(
+            agent, project, SESSION_ID=str(session_id), TASK_ID=str(task.id) if task else "",
+            planning_only=planning_only,
+        )
 
-    def _base_env(self, agent, project, **context: str) -> dict:
+    def _base_env(self, agent, project, *, planning_only: bool = False, **context: str) -> dict:
         env = {k: v for k, v in os.environ.items() if k in self._ALLOWED_ENV_KEYS}
         env.update(self._context_env(
             **context, AGENT_ID=str(agent.id), PROJECT_ID=str(project.id) if project else "",
             API_KEY="", API_BASE=settings.api_base_url,
         ))
         runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code")
-        if agent.config.get("cli_env_extras"):
+        if not planning_only and agent.config.get("cli_env_extras"):
             env.update({
                 k: v for k, v in agent.config["cli_env_extras"].items()
                 if k not in self._SECRET_KEY_PATTERNS and k not in self._RUNTIME_API_KEYS
@@ -430,13 +443,17 @@ class CliAdapter:
         except HTTPException as exc:
             await self._fail_workspace_validation(db, session, exc, runner_task_id)
             return
-        sandbox_dir = self._sandbox_dir(workspace, "agents", str(agent.id), "sessions", str(session_id))
+        from huddleroom.services.session_service import SessionService
+        planning_only = await SessionService().runtime_execution_policy(db, task)
+        sandbox_dir = (
+            self._planning_control_dir(session_id) if planning_only
+            else self._sandbox_dir(workspace, "agents", str(agent.id), "sessions", str(session_id))
+        )
 
         # Build source-owned request display BEFORE composing task content
         request_display = self._build_cli_request_display(task)
 
         task_content = self._compose_task_content(task, agent, session_id)
-        self._setup_sandbox(sandbox_dir, session_id, task, agent, session.project_id, task_content)
 
         # Resume with the id the CLI reported; the CLI's "not found" answer triggers the fresh fallback.
         supports_resume = (
@@ -454,7 +471,7 @@ class CliAdapter:
         try:
             cmd = self._build_command(
                 cli_runtime, task_content, agent.config, workspace, sandbox_dir / "task.md",
-                existing_session_id=used_resume_id, model=effective_model,
+                existing_session_id=used_resume_id, model=effective_model, planning_only=planning_only,
             )
         except RuntimeError as exc:
             command_error = str(exc)
@@ -484,6 +501,7 @@ class CliAdapter:
                 rally_session_id=str(session_id),
             )
             return
+        self._setup_sandbox(sandbox_dir, session_id, task, agent, session.project_id, task_content)
 
         # 6. Mark session as running
         claimed = session.status == "running"
@@ -502,7 +520,6 @@ class CliAdapter:
         await db.commit()
 
         # 7. Build env and launch subprocess
-        env = self._build_env(session_id, task, agent, project)
         timeout = float(run_config.get("timeout") or agent.config.get("session_timeout_seconds", 3600))
         deadline = time.monotonic() + timeout
         try:
@@ -517,9 +534,17 @@ class CliAdapter:
             return
         # Release SQLite's writer lock before the subprocess/watcher race.
         await db.commit()
+        planning_only = await SessionService().runtime_execution_policy(db, task)
+        if planning_only and sandbox_dir != self._planning_control_dir(session_id):
+            sandbox_dir = self._planning_control_dir(session_id)
+            self._setup_sandbox(sandbox_dir, session_id, task, agent, session.project_id, task_content)
+        elif not planning_only and sandbox_dir == self._planning_control_dir(session_id):
+            sandbox_dir = self._sandbox_dir(workspace, "agents", str(agent.id), "sessions", str(session_id))
+            self._setup_sandbox(sandbox_dir, session_id, task, agent, session.project_id, task_content)
+        env = self._build_env(session_id, task, agent, project, planning_only=planning_only)
         cmd = self._build_command(
             cli_runtime, task_content, agent.config, workspace, sandbox_dir / "task.md",
-            existing_session_id=used_resume_id, model=effective_model,
+            existing_session_id=used_resume_id, model=effective_model, planning_only=planning_only,
         )
 
         try:

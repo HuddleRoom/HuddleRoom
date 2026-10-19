@@ -1217,7 +1217,30 @@ async def test_restart_records_one_action_per_fingerprint_and_authorizes(db_sess
 
 
 @pytest.mark.asyncio
-async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_session, test_project, owned_session_factory):
+async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(
+    db_session, test_project, owned_session_factory, monkeypatch,
+):
+    dispatches = []
+
+    def record_dispatch(*args, **kwargs):
+        dispatches.append((args, kwargs))
+        return "test-blocked-dispatch"
+
+    async def blocked_external_execution(*_args, **_kwargs):
+        raise AssertionError("legacy fingerprint tick attempted external execution")
+
+    async def no_decision_loop(*_args, **_kwargs):
+        return {"step": "waiting"}
+
+    monkeypatch.setattr("huddleroom.workers.task_runner.register_session", record_dispatch)
+    monkeypatch.setattr("huddleroom.workers.task_runner.publish_session_dispatch", record_dispatch)
+    monkeypatch.setattr("huddleroom.workers.session_tasks.execute_api_session", blocked_external_execution)
+    monkeypatch.setattr("huddleroom.workers.session_tasks.execute_cli_session", blocked_external_execution)
+    monkeypatch.setattr(
+        "huddleroom.services.orchestration_llm_decision_adapter.OrchestrationDecisionAdapter.decide",
+        blocked_external_execution,
+    )
+    monkeypatch.setattr(OrchestrationService, "_advance_authorized_execution", no_decision_loop)
     adopt_session(db_session)
     svc = OrchestrationService()
     goal, run = await _seed_baseline_terminal_run(db_session, test_project)
@@ -1237,6 +1260,7 @@ async def test_authorized_tick_freezes_legacy_null_fingerprint_on_roots_only(db_
     await svc.tick(db_session, child_run.id)
     await db_session.refresh(child_run)
     assert child_run.goal_contract_fingerprint is None
+    assert dispatches  # the inherited child can be queued without invoking a provider or worker
 
 
 # --- activation hook (activate_ready is_blocked) ---

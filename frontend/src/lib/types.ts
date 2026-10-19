@@ -1080,7 +1080,7 @@ export interface OrchestrationMeetingCommitment {
   reason: string | null
 }
 
-export type NeedsYouReferenceKind = 'task' | 'meeting' | 'agent' | 'goal' | 'gate' | 'process' | 'action'
+export type NeedsYouReferenceKind = 'task' | 'meeting' | 'agent' | 'goal' | 'gate' | 'process' | 'action' | 'artifact'
 
 export interface NeedsYouReference {
   kind: NeedsYouReferenceKind
@@ -1184,6 +1184,35 @@ export interface OrchestrationPlanView {
   summary: string | null
   scope: string | null
   items: OrchestrationPlanItemView[]
+  review?: OrchestrationPlanReviewView | null
+}
+
+export interface PlanReviewIdentity {
+  project_id: string
+  goal_id: string
+  run_id: string
+  artifact_id: string
+  planning_task_id: string
+  planning_version: number
+  winning_session_id: string | null
+  provenance_hash: string
+  canonical_content_hash: string
+  renderer_version: number
+  rendered_content_hash: string
+  review_cycle: number
+}
+
+export interface OrchestrationPlanReviewView {
+  artifact_id: string
+  identity: PlanReviewIdentity
+  state: 'ready' | 'stale'
+  markdown: string
+  export_path: string | null
+  reason: string | null
+  authority_decision_id: string | null
+  authority_gate_id: string | null
+  authority_status: string | null
+  review_url: string
 }
 
 export interface OrchestrationTaskReport {
@@ -1336,8 +1365,8 @@ export interface OrchestrationGoalCreateInput {
 
 export interface ProjectChatAction {
  action_id: string; operation: string; project_id: string; goal_id: string; run_id: string | null
- target_id: string | null; frozen_versions: Record<string, string | number | null>; payload: Record<string, unknown>
- summary: string; status: string; requires_confirmation: boolean
+ target_id: string | null; frozen_versions: Record<string, string | number | null>; payload: Record<string, unknown> & { start_scope?: 'planning_only' | 'execution' | null }
+ summary: string; status: string; requires_confirmation: boolean; start_scope?: 'planning_only' | 'execution' | null
 }
 export interface ProjectChatReceipt {
  action_id: string; operation: string; project_id: string; goal_id: string; run_id: string | null

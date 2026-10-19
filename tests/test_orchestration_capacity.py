@@ -574,28 +574,14 @@ async def test_racing_sibling_ticks_cannot_overfill_root_slots(
 
 
 async def _accept_child_roadmap(db, project, child, items):
-    from huddleroom.models.artifact import Artifact
-    from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
-    from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService, parse_roadmap_items
+    from tests.test_orchestration_roadmap_children import accept_child_roadmap_plan
 
     service = OrchestrationService()
     run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
-    artifact = Artifact(project_id=project.id, name="c-plan", artifact_type="plan", status="draft",
-                        metadata_={"plan_items": items})
-    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(items, set(child.budget["caps"]))]
-    decision = OrchestrationAuthorityDecision(
-        goal_id=child.id, run_id=run.id, authority="human", title="approve", question="approve",
-        decision_key=f"roadmap_plan:{service._accepted_plan_fingerprint(normalized)}", status="answered",
-        selected_option="approve", decided_by_user_id=child.manager_user_id,
-    )
-    db.add_all([artifact, decision]); await db.flush()
-    version = await OrchestrationRoadmapService(service).accept_version(
-        db, child, run, artifact, {"kind": "authority_decision", "id": str(decision.id)},
-    )
-    run.plan_state = {**run.plan_state, "status": "accepted", "accepted_artifact_id": str(artifact.id),
-                      "roadmap_version_id": str(version.id), "roadmap_version": version.version,
-                      "accepted_plan_fingerprint": version.fingerprint}
+    planner = _agent("capacity-child-planner", ["planning"])
+    db.add(planner)
     await db.flush()
+    await accept_child_roadmap_plan(db, project, service, child, run, planner, items)
     return run
 
 

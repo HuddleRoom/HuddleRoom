@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import event as sa_event
 
 from huddleroom.models.agent import Agent
+from huddleroom.models.artifact import Artifact
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
@@ -152,6 +153,42 @@ async def test_spr210_resolver_is_scoped_deduplicated_and_chunk_batched(
         [{"task_id": "malformed", "gate_id": str(gate.id), "reason": str(uuid.uuid4())}], goal_id=goal.id,
     ) == [NeedsYouReferenceRequest("gate", gate.id, goal.id)]
     assert (set(db_session.new), set(db_session.dirty), set(db_session.deleted)) == session_state
+
+
+@pytest.mark.asyncio
+async def test_artifact_reference_requires_matching_review_identity_artifact_id(db_session, test_project):
+    """A copied review record must not make a different artifact look reviewed."""
+    goal = OrchestrationGoal(project_id=test_project.id, objective="Artifact identity")
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id, status="running")
+    bound = Artifact(project_id=test_project.id, name="bound.md", artifact_type="plan", metadata_={})
+    copied = Artifact(project_id=test_project.id, name="copied.md", artifact_type="plan", metadata_={})
+    db_session.add_all([run, bound, copied])
+    await db_session.flush()
+    record = {
+        "identity": {
+            "project_id": str(test_project.id), "goal_id": str(goal.id), "run_id": str(run.id),
+            "artifact_id": str(bound.id), "planning_task_id": str(uuid.uuid4()), "planning_version": 1,
+            "winning_session_id": None, "provenance_hash": "a" * 64, "canonical_content_hash": "b" * 64,
+            "renderer_version": 1, "rendered_content_hash": "c" * 64, "review_cycle": 1,
+        },
+        "state": "ready", "markdown": "Bound candidate",
+    }
+    run.plan_state = {"plan_reviews": {str(bound.id): record, str(copied.id): record}}
+    await db_session.flush()
+
+    resolved = await resolve_needs_you_references(
+        db_session,
+        project_id=test_project.id,
+        requests=[
+            NeedsYouReferenceRequest("artifact", bound.id, goal.id, run.id),
+            NeedsYouReferenceRequest("artifact", copied.id, goal.id, run.id),
+        ],
+    )
+    labels = {reference.id: reference.label for reference in resolved}
+    assert labels[bound.id] == bound.name
+    assert labels[copied.id] is None
 
 
 @pytest.mark.asyncio

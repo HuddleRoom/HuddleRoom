@@ -196,6 +196,7 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
     from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate
     from huddleroom.models.session import Session
     from huddleroom.models.task import Task
+    from tests.conftest import bind_plan_author_team
     from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _planner_agent_id
 
     from huddleroom.services.session_service import SessionService
@@ -205,9 +206,14 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
     monkeypatch.setattr(SessionService, "_schedule_dispatch_after_commit", lambda *_args: None)
     planner = _agent("adopting-planner", ["planning"])
     auditor = _agent("auditor", ["investigation"])
-    db_session.add_all([planner, auditor])
+    producer = _agent("synthesis-producer", ["implementation"])
+    db_session.add_all([planner, auditor, producer])
     await db_session.flush()
     service, goal, run = await _authorized_run(db_session, test_project)
+    await bind_plan_author_team(
+        db_session, goal, planner,
+        role_agents={"planning": planner, "investigation": auditor, "implementation": producer},
+    )
     audit_ids = []
     for n in range(2):
         action = await service.execute_create_delegation_task_action(
@@ -250,13 +256,14 @@ async def test_audits_run_while_planning_and_concurrent_ticks_adopt_each_once(
     kind = planning_task.metadata_["orchestration_contract"]["report_schema"]["plan_kind"]
     audit_items = [
         {"id": f"audit-{n}", "work_function": "investigation", "scope": f"Audit area {n}.",
-         "deliverable": f"Findings {n}.", "why_runnable": "Already running.", "adopt_task_id": str(task_id)}
+             "deliverable": f"Findings {n}.", "why_runnable": "Already running.",
+             "adopt_task_id": str(task_id), "agent_id": str(auditor.id)}
         for n, task_id in enumerate(audit_ids)
     ]
     synthesis = {
         "id": "synthesis", "work_function": "implementation", "scope": "Combine the audit findings.",
         "deliverable": "One synthesis report.", "why_runnable": "Both audits accepted.",
-        "depends_on": ["audit-0", "audit-1"],
+            "depends_on": ["audit-0", "audit-1"], "agent_id": str(producer.id),
     }
     planner_session.output = json.dumps({
         "schema_version": 1, "plan_kind": kind, "summary": "Adopt both audits, then synthesize.",

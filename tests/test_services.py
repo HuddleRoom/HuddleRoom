@@ -1452,7 +1452,7 @@ async def test_api_adapter_commits_started_state_before_llm_call(test_engine):
 
         adapter = ApiAdapter()
 
-        async def fake_build_messages(_agent, _task, _db):
+        async def fake_build_messages(_agent, _task, _db, **_kwargs):
             return ([{"role": "user", "content": "review this"}], "task context", 0, 0)
 
         async def fake_run_with_retry(_agent, _session, _messages, _task_context, _db):

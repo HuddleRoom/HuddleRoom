@@ -1,4 +1,6 @@
 import uuid
+import hashlib
+import json
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -52,6 +54,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationGoalResponse,
     OrchestrationMeetingCommitmentResponse,
     OrchestrationPlanItemView,
+    OrchestrationPlanReviewView,
     OrchestrationPlanView,
     OrchestrationTaskReportResponse,
     OrchestrationSupersedeRequest,
@@ -80,6 +83,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationSupervisionResponse,
     OrchestrationTickResponse,
 )
+from huddleroom.services.orchestration_plan_review import PlanReviewService
 from huddleroom.services.orchestration_authority_service import effective_authorization
 from huddleroom.services.orchestration_recovery_presenter import present_decision_response
 from huddleroom.services.orchestration_needs_you_presenter import (
@@ -433,21 +437,78 @@ def _plan_item_view(raw: dict, key: str, links: dict, state: str) -> Orchestrati
     )
 
 
+def _review_binding_hash(identity) -> str:
+    encoded = json.dumps(identity.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+async def _plan_review_view(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, artifact: Artifact,
+) -> OrchestrationPlanReviewView | None:
+    reviews = (run.plan_state or {}).get("plan_reviews")
+    stored = reviews.get(str(artifact.id)) if isinstance(reviews, dict) else None
+    if not isinstance(stored, dict):
+        return None
+    try:
+        review = await PlanReviewService().check(db, goal, run, artifact, boundary="review projection")
+    except ValueError:
+        return None
+    if review.state not in {"ready", "stale"}:
+        return None
+    identity_hash = _review_binding_hash(review.identity)
+    gates = list((await db.scalars(select(OrchestrationGate).where(
+        OrchestrationGate.run_id == run.id,
+        OrchestrationGate.gate_type == "roadmap_plan_approval",
+    ))).all())
+    gate = next((item for item in gates if isinstance(item.required_evidence, dict)
+                 and item.required_evidence.get("plan_review_identity_hash") == identity_hash), None)
+    decisions = list((await db.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.goal_id == goal.id,
+        OrchestrationAuthorityDecision.run_id == run.id,
+    ))).all())
+    decision = next((item for item in decisions if item.decision_key.startswith("roadmap_plan:")
+                     and isinstance(item.context, str) and _decision_identity_hash(item.context) == identity_hash), None)
+    return OrchestrationPlanReviewView(
+        artifact_id=artifact.id, identity=review.identity, state=review.state, markdown=review.markdown,
+        export_path=review.export_path, reason=review.reason,
+        authority_decision_id=decision.id if decision else None,
+        authority_gate_id=gate.id if gate else None,
+        authority_status=(decision.status if decision else gate.status if gate else None),
+        review_url=f"/orchestration/{goal.id}#plan-review-{artifact.id}",
+    )
+
+
+def _decision_identity_hash(context: str) -> str | None:
+    try:
+        binding = json.loads(context)
+    except (TypeError, ValueError):
+        return None
+    return binding.get("plan_review_identity_hash") if isinstance(binding, dict) else None
+
+
 async def _plan_view(
     db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, version: OrchestrationRoadmapVersion | None,
 ) -> OrchestrationPlanView | None:
     """Read-only, lenient projection of the run's plan; never raises on malformed plan state."""
     state = run.plan_state if isinstance(run.plan_state, dict) else {}
-    # A not-yet-accepted proposal (first plan or replan) is shown whole; the old version's items would mix sources.
-    if state.get("status") != "accepted" and _uuid_or_none(state.get("plan_artifact_id")):
-        version = None
+    # The outer projection is always the accepted version. A pending candidate lives only in ``review``.
     artifact_id = next((u for u in (
         version.plan_artifact_id if version else None,
-        _uuid_or_none(state.get("accepted_artifact_id")), _uuid_or_none(state.get("plan_artifact_id")),
+        _uuid_or_none(state.get("accepted_artifact_id")),
+        _uuid_or_none(state.get("plan_artifact_id")) if state.get("status") == "accepted" else None,
     ) if u), None)
     artifact = await db.get(Artifact, artifact_id) if artifact_id else None
+    candidate_id = _uuid_or_none(state.get("plan_artifact_id"))
+    candidate = await db.get(Artifact, candidate_id) if candidate_id else None
+    review = (
+        await _plan_review_view(db, goal, run, candidate)
+        if candidate is not None and candidate.project_id == goal.project_id else None
+    )
     if artifact is None or artifact.project_id != goal.project_id:
-        return None
+        return OrchestrationPlanView(
+            status=_text(state.get("status")), artifact_id=None, kind=None, author_agent_id=None,
+            planning_version=None, planning_task_id=None, summary=None, scope=None, items=[], review=review,
+        ) if review is not None else None
     metadata = artifact.metadata_ if isinstance(artifact.metadata_, dict) else {}
     planning_task = await db.get(Task, artifact.linked_task_id) if artifact.linked_task_id else None
     contract = planning_task.metadata_.get("orchestration_contract") if planning_task and isinstance(planning_task.metadata_, dict) else None
@@ -504,7 +565,7 @@ async def _plan_view(
         author_agent_id=_uuid_or_none(metadata.get("plan_author_agent_id")) or artifact.created_by_agent,
         planning_version=planning_version if isinstance(planning_version, int) else None,
         planning_task_id=artifact.linked_task_id, summary=_text(metadata.get("summary")),
-        scope=scope if isinstance(scope, str) else None, items=items,
+        scope=scope if isinstance(scope, str) else None, items=items, review=review,
     )
 
 
@@ -751,7 +812,10 @@ async def _detail(
 
     commitments = await meeting_commitments(db, run) if run is not None else []
     open_commitments = [item for item in commitments if not item["fulfilled"]]
+    plan = await _plan_view(db, goal, run, version) if run is not None else None
     reference_requests = [NeedsYouReferenceRequest("goal", goal.id, goal.id)]
+    if run is not None and plan is not None and plan.review is not None:
+        reference_requests.append(NeedsYouReferenceRequest("artifact", plan.review.artifact_id, goal.id, run.id))
     if direction is not None:
         if direction.source_process_run_id is not None:
             reference_requests.append(NeedsYouReferenceRequest("process", direction.source_process_run_id, goal.id))
@@ -762,7 +826,7 @@ async def _detail(
         if direction.authority_agent_id is not None:
             reference_requests.append(NeedsYouReferenceRequest("agent", direction.authority_agent_id, goal.id))
     if run is not None:
-        reference_requests.extend(typed_blocker_reference_requests(run.active_blockers or [], goal_id=goal.id))
+        reference_requests.extend(typed_blocker_reference_requests(run.active_blockers or [], goal_id=goal.id, run_id=run.id))
         reference_requests.extend(
             NeedsYouReferenceRequest("gate", gate.id, goal.id) for gate in gate_models if gate.status == "failed"
         )
@@ -804,7 +868,7 @@ async def _detail(
             OrchestrationMeetingCommitmentResponse.model_validate(item)
             for item in open_commitments
         ] if run is not None else [],
-        plan=await _plan_view(db, goal, run, version) if run is not None else None,
+        plan=plan,
         effective_authorization=(
             await effective_authorization(db, goal, run)
             if run is not None and goal.status not in ("completed", "cancelled") else None
@@ -867,6 +931,31 @@ async def get_goal(
         raise HTTPException(status_code=404, detail="Orchestration goal not found")
     run = await service.get_run_for_goal(db, project_id, goal_id)
     return await _detail(db, goal, run)
+
+
+@router.get(
+    "/goals/{goal_id}/plans/{artifact_id}/review",
+    response_model=OrchestrationPlanReviewView,
+)
+async def get_plan_review(
+    project_id: uuid.UUID,
+    goal_id: uuid.UUID,
+    artifact_id: uuid.UUID,
+    _: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    goal = await service.get_goal(db, project_id, goal_id)
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Orchestration goal not found")
+    run = await service.get_run_for_goal(db, project_id, goal_id)
+    artifact = await db.get(Artifact, artifact_id)
+    if run is None or artifact is None or artifact.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Plan review not found")
+    review = await _plan_review_view(db, goal, run, artifact)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Plan review not found")
+    await db.commit()
+    return review
 
 
 @router.get(

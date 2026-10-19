@@ -54,7 +54,8 @@ class OrchestrationChatService:
                         ProjectChatTurn.client_request_id == data.client_request_id))
                     matching = turn and turn.content == data.content and (
                         turn.frozen_context.get("submitted_context_goal_id") == (str(data.context_goal_id) if data.context_goal_id else None)
-                        and turn.frozen_context.get("submitted_action_id") == (str(data.action_id) if data.action_id else None))
+                        and turn.frozen_context.get("submitted_action_id") == (str(data.action_id) if data.action_id else None)
+                        and turn.frozen_context.get("submitted_start_scope") == data.start_scope)
                     if matching and turn.status in {"pending", "running"}:
                         detail = error.detail if isinstance(error, HTTPException) else {"code": error.code, "message": error.message}
                         turn.error = detail if isinstance(detail, dict) else {"message": str(detail)}
@@ -64,7 +65,10 @@ class OrchestrationChatService:
 
     async def _submit(self, project_id, actor_id, data):
         identity = {"submitted_context_goal_id": str(data.context_goal_id) if data.context_goal_id else None,
-                    "submitted_action_id": str(data.action_id) if data.action_id else None}
+                    "submitted_action_id": str(data.action_id) if data.action_id else None,
+                    "submitted_start_scope": data.start_scope}
+        if data.action_id is not None and data.start_scope is not None:
+            raise ConversationDomainError("chat_idempotency_conflict", 409, "Confirmation cannot change the reviewed Start scope")
         async with self._session_factory() as db:
             existing = await db.scalar(select(ProjectChatTurn).where(
                 ProjectChatTurn.project_id == project_id, ProjectChatTurn.actor_id == actor_id,
@@ -216,6 +220,10 @@ class OrchestrationChatService:
                         project_id=project_id, goal_id=goal.id, run_id=run_id,
                         target_id=result.payload.target_id, payload=result.payload,
                         summary=result.answer or "Requested action")
+                    if result.operation in {"start_execution", "restart_execution"}:
+                        draft.payload.start_scope = data.start_scope or "execution"
+                    elif data.start_scope is not None:
+                        raise ConversationDomainError("chat_invalid_operation", 409, "Scope selection requires a Start action")
                     async def validate_submission(session):
                         await session.refresh(goal)
                         current_run_id, current_state = await self._state(session, goal)

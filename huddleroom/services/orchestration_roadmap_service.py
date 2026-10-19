@@ -1,4 +1,5 @@
 import hashlib
+import json
 import uuid
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
@@ -46,7 +47,7 @@ from huddleroom.services.orchestration_process_service import OrchestrationProce
 from huddleroom.services.orchestration_dependencies import RETAINED_GATE_TYPE
 from huddleroom.services.event_bus import emit_event_once
 from huddleroom.services.orchestration_authority_service import (
-    OrchestrationAuthorityDecisionService, inherit_execution_grant,
+    OrchestrationAuthorityDecisionService, execution_grant, inherit_execution_grant,
 )
 
 def retained_gate_id(run_id, source_gate_id) -> uuid.UUID:
@@ -407,11 +408,13 @@ class OrchestrationRoadmapService:
         )
 
     async def ensure_plan_approval(self, db, goal, run, artifact):
+        review = await self._current_plan_review(db, goal, run, artifact, boundary="approval")
         items = self.parse_items(artifact, goal)
         await self._require_expansion_limits(db, goal, items)
         await self._require_historical_keys(db, goal, run, items)
         fingerprint = await self.plan_fingerprint(db, run, [item.model_dump(mode="json") for item in items])
-        key = f"roadmap_plan:{fingerprint}"
+        review_binding = self._review_binding(review)
+        key = f"roadmap_plan:{fingerprint}:review:{review_binding['plan_review_identity_hash']}"
         if goal.authority_model == "no_manager":
             gate = await db.scalar(select(OrchestrationGate).where(
                 OrchestrationGate.run_id == run.id,
@@ -420,7 +423,11 @@ class OrchestrationRoadmapService:
             ))
             if gate is None:
                 gate = OrchestrationGate(
-                    id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:orchestration:gate:{run.id}:roadmap_plan_approval:{fingerprint}"),
+                    id=uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"rally:orchestration:gate:{run.id}:roadmap_plan_approval:{fingerprint}:"
+                        f"{review_binding['plan_review_identity_hash']}",
+                    ),
                     run_id=run.id, success_criterion_key=key, gate_type="roadmap_plan_approval",
                     required_evidence={
                         "required_source_types": ["verification"], "min_count": 1,
@@ -428,6 +435,7 @@ class OrchestrationRoadmapService:
                         "work_producer_agent_id": str(artifact.created_by_agent),
                         "planning_task_id": str(artifact.linked_task_id),
                         "plan_artifact_id": str(artifact.id),
+                        **review_binding,
                     },
                 )
                 try:
@@ -443,7 +451,7 @@ class OrchestrationRoadmapService:
             return gate
         authority = "human" if goal.authority_model == "human_manager" else "manager"
         agent_id = None if authority == "human" else goal.manager_agent_id
-        if (authority == "human" and goal.manager_user_id is None) or (authority != "human" and agent_id is None):
+        if (authority == "human" and (goal.manager_user_id or goal.created_by_user_id) is None) or (authority != "human" and agent_id is None):
             raise HTTPException(status_code=409, detail="Roadmap plan approval authority is invalid")
         answered = await db.scalar(select(OrchestrationAuthorityDecision).where(
             OrchestrationAuthorityDecision.goal_id == goal.id,
@@ -457,7 +465,31 @@ class OrchestrationRoadmapService:
             db, goal.id, decision_key=key, title="Approve Roadmap plan",
             question="Approve this immutable Roadmap plan version?", authority=authority,
             authority_agent_id=agent_id, options=[{"key": "approve"}, {"key": "reject"}], run_id=run.id,
+            context=json.dumps(review_binding, sort_keys=True, separators=(",", ":")),
         )
+
+    @staticmethod
+    def _review_binding(review):
+        identity = review.identity.model_dump(mode="json")
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return {"plan_review_identity": identity, "plan_review_identity_hash": hashlib.sha256(encoded.encode()).hexdigest()}
+
+    async def _current_plan_review(self, db, goal, run, artifact, *, boundary):
+        from huddleroom.services.orchestration_plan_review import PlanReviewService
+
+        try:
+            review = await PlanReviewService().check(db, goal, run, artifact, boundary=boundary)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"Roadmap plan review is not applicable: {exc}") from exc
+        if review.state != "ready":
+            raise HTTPException(status_code=409, detail=f"Roadmap plan review is not applicable: {review.reason or review.state}")
+        return review
+
+    async def _require_current_plan_review(self, db, goal, run, artifact, binding, *, boundary):
+        review = await self._current_plan_review(db, goal, run, artifact, boundary=boundary)
+        if binding != self._review_binding(review):
+            raise HTTPException(status_code=409, detail="Roadmap plan approval is stale")
+        return review
 
     async def bind_pending_replan(self, db, goal, run, artifact, approval):
         """Pin the one candidate a pending replan may dispatch or ingest."""
@@ -479,12 +511,17 @@ class OrchestrationRoadmapService:
         required = self.orchestration._json_object_or_empty(
             approval.required_evidence if isinstance(approval, OrchestrationGate) else {}
         )
+        review = await self._current_plan_review(db, goal, run, artifact, boundary="replan binding")
         if isinstance(approval, OrchestrationGate) and (
             approval.run_id != run.id or approval.gate_type != "roadmap_plan_approval"
-            or approval.success_criterion_key != f"roadmap_plan:{fingerprint}"
+            or approval.success_criterion_key != (
+                f"roadmap_plan:{fingerprint}:review:{self._review_binding(review)['plan_review_identity_hash']}"
+            )
             or required.get("planning_task_id") != str(task.id)
             or required.get("plan_artifact_id") != str(artifact.id)
             or required.get("work_producer_agent_id") != str(task.assigned_to)
+            or {key: required.get(key) for key in ("plan_review_identity", "plan_review_identity_hash")}
+            != self._review_binding(review)
         ):
             raise HTTPException(status_code=409, detail="Pending Roadmap replan gate binding does not match")
         binding = {
@@ -530,6 +567,18 @@ class OrchestrationRoadmapService:
             validate_declared_allocations(goal, items)
         normalized = [item.model_dump(mode="json") for item in items]
         fingerprint = await self.plan_fingerprint(db, run, normalized)
+        approval_reference = await self._require_plan_approval(
+            db, goal, run, fingerprint, approval_reference, artifact,
+        )
+        review = await self._current_plan_review(db, goal, run, artifact, boundary="ownership binding")
+        from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+        ownership = await PlanOwnershipService().validate_plan_owners(
+            db, goal, run, items, bind=True, review=review,
+        )
+        conflict = next((item for item in ownership if item["status"] != "eligible"), None)
+        if conflict is not None:
+            raise HTTPException(status_code=409, detail=f"Roadmap plan ownership is blocked: {conflict['reason']}")
         existing = await db.scalar(select(OrchestrationRoadmapVersion).where(
             OrchestrationRoadmapVersion.goal_id == goal.id,
             OrchestrationRoadmapVersion.fingerprint == fingerprint,
@@ -542,9 +591,6 @@ class OrchestrationRoadmapService:
         if previous is not None:
             await self._validate_replan(db, goal, run, previous, items)
             await self._require_expansion_approval(db, goal, run, previous, items, fingerprint)
-        approval_reference = await self._require_plan_approval(
-            db, goal, run, fingerprint, approval_reference
-        )
         project = await db.get(Project, goal.project_id)
         # The accepted hierarchy is a contract, not a roster suggestion.  A replan
         # must retain V1's team even if the live hierarchy has since changed.
@@ -661,7 +707,8 @@ class OrchestrationRoadmapService:
             raise HTTPException(status_code=409, detail="Released roadmap task is missing")
         metadata = await self._released_task_metadata(db, run, item, row, task)
         current = self.orchestration._json_object_or_empty(metadata.get("orchestration_plan_item"))
-        self.orchestration._validate_bound_plan_item(task, run, item, metadata)
+        bound_item = item if item.agent_id is not None else item.model_copy(update={"agent_id": task.assigned_to})
+        self.orchestration._validate_bound_plan_item(task, run, bound_item, metadata)
         if task.project_id != (await db.get(OrchestrationGoal, row.goal_id)).project_id:
             raise HTTPException(status_code=409, detail="Released roadmap task project changed")
         task.priority = item.priority
@@ -764,19 +811,26 @@ class OrchestrationRoadmapService:
         if isinstance(approval, OrchestrationGate) and approval.status != "accepted":
             await db.flush()
             raise HTTPException(status_code=409, detail="waiting_plan_authority")
-        await self._require_plan_approval(db, goal, run, fingerprint, None)
+        await self._require_plan_approval(db, goal, run, fingerprint, None, artifact)
         return approval
 
-    async def _require_plan_approval(self, db, goal, run, fingerprint, approval_reference):
+    async def _require_plan_approval(self, db, goal, run, fingerprint, approval_reference, artifact):
+        review = await self._current_plan_review(db, goal, run, artifact, boundary="approval consumption")
+        binding = self._review_binding(review)
+        key = f"roadmap_plan:{fingerprint}:review:{binding['plan_review_identity_hash']}"
         if goal.authority_model == "no_manager":
             gate = await db.scalar(select(OrchestrationGate).where(
                 OrchestrationGate.run_id == run.id,
-                OrchestrationGate.success_criterion_key == f"roadmap_plan:{fingerprint}",
+                OrchestrationGate.success_criterion_key == key,
                 OrchestrationGate.gate_type == "roadmap_plan_approval",
                 OrchestrationGate.status == "accepted",
             ))
             if gate is None:
                 raise HTTPException(status_code=409, detail="Roadmap plan approval is required")
+            required = self.orchestration._json_object_or_empty(gate.required_evidence)
+            await self._require_current_plan_review(db, goal, run, artifact, {
+                key: required.get(key) for key in binding
+            }, boundary="approval gate")
             evidence = list((await db.scalars(select(OrchestrationEvidence).where(
                 OrchestrationEvidence.gate_id == gate.id,
                 OrchestrationEvidence.verdict == "accepted",
@@ -789,12 +843,18 @@ class OrchestrationRoadmapService:
         decision = await db.scalar(select(OrchestrationAuthorityDecision).where(
             OrchestrationAuthorityDecision.goal_id == goal.id,
             OrchestrationAuthorityDecision.run_id == run.id,
-            OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
+            OrchestrationAuthorityDecision.decision_key == key,
         ).order_by(OrchestrationAuthorityDecision.created_at.desc()).limit(1))
         if decision is None or decision.status != "answered" or decision.selected_option != "approve":
             raise HTTPException(status_code=409, detail="Roadmap plan approval is required")
+        try:
+            stored = json.loads(decision.context or "null")
+        except (TypeError, ValueError):
+            stored = None
+        await self._require_current_plan_review(db, goal, run, artifact, stored, boundary="approval decision")
         if goal.authority_model == "human_manager":
-            if goal.manager_user_id is None or decision.decided_by_user_id != goal.manager_user_id:
+            authorized_user = goal.manager_user_id or goal.created_by_user_id
+            if authorized_user is None or decision.decided_by_user_id != authorized_user:
                 raise HTTPException(status_code=409, detail="Roadmap plan approval is not from the selected authority")
         elif goal.authority_model == "agent_manager":
             if goal.manager_agent_id is None or decision.decided_by_agent_id != goal.manager_agent_id:
@@ -978,7 +1038,46 @@ class OrchestrationRoadmapService:
                     return "waiting_unstaged_approval"
         return "waiting_dependencies"
 
+    async def _require_releasable_plan(self, db, goal, run, version, item):
+        artifact = await db.get(Artifact, version.plan_artifact_id)
+        if artifact is None:
+            raise HTTPException(status_code=409, detail="Roadmap plan artifact is missing")
+        await self._require_plan_approval(db, goal, run, version.fingerprint, None, artifact)
+        review = await self._current_plan_review(db, goal, run, artifact, boundary="roadmap release")
+        binding = self.orchestration._json_object_or_empty(
+            self.orchestration._json_object_or_empty(run.plan_state).get("accepted_plan_ownership")
+        )
+        if binding.get("review_identity") != review.identity.model_dump(mode="json"):
+            raise HTTPException(status_code=409, detail="Roadmap plan ownership binding is stale")
+        owner = self.orchestration._json_object_or_empty(binding.get("items")).get(item.item_key)
+        if item.owner_type == "human" or not isinstance(owner, dict):
+            raise HTTPException(status_code=409, detail="Roadmap plan ownership is blocked")
+        if item.unit_type == "goal":
+            if owner != {"unit_type": "goal"}:
+                raise HTTPException(status_code=409, detail="Roadmap plan ownership is blocked")
+            return item
+        elif (not isinstance(owner.get("agent_id"), str)
+              or owner.get("work_function") != item.work_function
+              or (item.agent_id is not None and owner.get("agent_id") != str(item.agent_id))):
+            raise HTTPException(status_code=409, detail="Roadmap plan ownership is blocked")
+        try:
+            frozen_item = item.model_copy(update={"agent_id": uuid.UUID(owner["agent_id"])})
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=409, detail="Roadmap plan ownership is blocked") from None
+        from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+        ownership = await PlanOwnershipService().validate_plan_owners(
+            db, goal, run, [frozen_item], bind=False, review=review,
+        )
+        if len(ownership) != 1 or ownership[0].get("status") != "eligible":
+            raise HTTPException(status_code=409, detail="Roadmap plan ownership is blocked")
+        return frozen_item
+
     async def release_task_item(self, db, goal, run, version, item):
+        grant = await execution_grant(db, goal, run)
+        if grant is None or grant.scope != "execution":
+            raise HTTPException(status_code=409, detail="roadmap_execution_scope_required")
+        frozen_item = await self._require_releasable_plan(db, goal, run, version, item)
         existing = await db.scalar(select(OrchestrationRoadmapItem).where(
             OrchestrationRoadmapItem.goal_id == goal.id, OrchestrationRoadmapItem.item_key == item.item_key,
         ))
@@ -1031,7 +1130,7 @@ class OrchestrationRoadmapService:
         gate = await db.get(OrchestrationGate, gate_id)
         task_item = OrchestrationPlanItem(
             id=item.item_key, title=item.title, work_function=item.work_function,
-            scope=item.scope, deliverable=item.deliverable, agent_id=item.agent_id,
+            scope=item.scope, deliverable=item.deliverable, agent_id=frozen_item.agent_id,
             inputs=item.inputs, forbidden_work=item.forbidden_work,
             success_evidence=item.success_evidence, required_capabilities=item.required_capabilities,
             depends_on=item.depends_on, priority=item.priority, artifact_ids=item.artifact_ids,
@@ -1180,6 +1279,10 @@ class OrchestrationRoadmapService:
         }
 
     async def release_goal_item(self, db, goal, run, version, item, shape=None):
+        grant = await execution_grant(db, goal, run)
+        if grant is None or grant.scope != "execution":
+            raise HTTPException(status_code=409, detail="roadmap_execution_scope_required")
+        item = await self._require_releasable_plan(db, goal, run, version, item)
         existing = await db.scalar(select(OrchestrationRoadmapItem).where(
             OrchestrationRoadmapItem.goal_id == goal.id,
             OrchestrationRoadmapItem.item_key == item.item_key,
@@ -1360,6 +1463,9 @@ class OrchestrationRoadmapService:
         )
 
     async def _advance_once(self, db, goal, run) -> dict:
+        grant = await execution_grant(db, goal, run)
+        if grant is None or grant.scope != "execution":
+            return {"step": "waiting_execution_scope"}
         await self.renew_corrected_children(db, goal, run)
         version = await self.current_version(db, goal.id)
         if version is None:
@@ -1538,6 +1644,16 @@ class OrchestrationRoadmapService:
 
     async def renew_corrected_children(self, db, goal, run) -> int:
         """Re-release type-corrected children (pending_renewal successor) that still hold an active reservation."""
+        grant = await execution_grant(db, goal, run)
+        if grant is None or grant.scope != "execution":
+            raise HTTPException(status_code=409, detail="roadmap_execution_scope_required")
+        version = await self.current_version(db, goal.id)
+        if version is None or version.run_id != run.id:
+            return 0
+        items = {
+            item.item_key: item
+            for item in parse_roadmap_items(version.snapshot["items"], set(parent_caps(goal)))
+        }
         children = list((await db.scalars(select(OrchestrationGoal).join(
             OrchestrationRoadmapItem, OrchestrationRoadmapItem.child_goal_id == OrchestrationGoal.id,
         ).join(
@@ -1550,11 +1666,15 @@ class OrchestrationRoadmapService:
         ).order_by(OrchestrationRoadmapItem.item_key))).all())
         renewed = 0
         for child in children:
+            item = items.get(child.roadmap_item_key)
+            if item is None or item.unit_type != "goal":
+                raise HTTPException(status_code=409, detail="Roadmap child renewal lineage is invalid")
             child_run = await self.orchestration.get_run_for_goal(db, child.project_id, child.id)
             plan_state = self.orchestration._json_object_or_empty(child_run.plan_state) if child_run else {}
             delta = self.orchestration._json_object_or_empty(plan_state.get("child_delta_baseline"))
             if delta.get("status") != "pending_renewal":
                 continue
+            await self._require_releasable_plan(db, goal, run, version, item)
             child_run.plan_state = {**plan_state, "child_delta_baseline": {
                 **delta, "status": "accepted",
                 "approval_reference": {"kind": "parent_renewal", "parent_run_id": str(run.id)},

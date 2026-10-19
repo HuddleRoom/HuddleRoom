@@ -855,7 +855,7 @@ PLAN_ITEM_KEYS = {
 }
 PLAN_KEYS = {
     "status", "artifact_id", "kind", "author_agent_id", "planning_version", "planning_task_id", "summary",
-    "scope", "items",
+    "scope", "items", "review",
 }
 
 
@@ -907,6 +907,7 @@ async def test_detail_outcome_plan_projects_every_item_state(client, db_session,
         "accepted", "implementation", str(author), 2, "The plan")
     assert (plan["artifact_id"], plan["planning_task_id"], plan["scope"]) == (
         str(artifact.id), str(planning_task.id), "Plan the work")
+    assert plan["review"] is None
     items = {i["key"]: i for i in plan["items"]}
     assert [i["key"] for i in plan["items"]] == [s[0] for s in seeds]
     assert all(set(i) == PLAN_ITEM_KEYS for i in items.values())
@@ -939,10 +940,7 @@ async def test_detail_plan_is_lenient_and_absent_without_artifact(client, db_ses
     await db_session.flush()
 
     plan = (await client.get(url)).json()["plan"]
-    assert (plan["status"], plan["kind"], plan["planning_version"], plan["author_agent_id"]) == (
-        "proposed", None, None, None)
-    assert [(i["key"], i["state"], i["priority"], i["depends_on"]) for i in plan["items"]] == [
-        ("a", "queued", 50, [])]
+    assert plan is None
 
 
 @pytest.mark.asyncio
@@ -956,6 +954,10 @@ async def test_detail_roadmap_plan_joins_released_items_and_hides_private_snapsh
     plan = detail["plan"]
 
     assert set(plan) == PLAN_KEYS and plan["artifact_id"]
+    assert plan["status"] == "accepted"
+    assert plan["review"] is not None
+    assert (plan["review"]["artifact_id"], plan["review"]["identity"]["artifact_id"], plan["review"]["state"]) == (
+        plan["artifact_id"], plan["artifact_id"], "ready")
     assert len(plan["items"]) == 1
     item = plan["items"][0]
     assert set(item) == PLAN_ITEM_KEYS
@@ -963,7 +965,7 @@ async def test_detail_roadmap_plan_joins_released_items_and_hides_private_snapsh
     assert item["child_goal_id"] == detail["children"][0] and item["gate_id"] and item["task_id"] is None
     dumped = json.dumps(plan)
     assert "parent_contract_snapshot" not in dumped and "workspace_policy" not in dumped
-    assert "allocation" not in dumped and "objective" not in dumped
+    assert "allocation" not in json.dumps(item) and "objective" not in json.dumps(item)
 
 
 @pytest.mark.asyncio
@@ -1093,17 +1095,19 @@ async def test_detail_exposes_capacity_wait_for_startable_queued_task(client, db
 
 
 @pytest.mark.asyncio
-async def test_detail_proposed_roadmap_plan_shows_item_key_items_queued(client, db_session, test_project):
-    url, body = await _create_detail(client, test_project)
-    run = await db_session.get(OrchestrationRun, uuid.UUID(body["run"]["id"]))
-    artifact = Artifact(project_id=test_project.id, name="plan", artifact_type="plan",
-                        metadata_={"plan_kind": "roadmap", "plan_items": [{"item_key": "alpha", "title": "A"}]})
-    db_session.add(artifact)
-    await db_session.flush()
-    run.plan_state = {"status": "proposed", "plan_artifact_id": str(artifact.id)}
+async def test_detail_proposed_roadmap_plan_shows_item_key_items_queued(client, owned_projection_setup):
+    from tests.test_orchestration_roadmap_children import accepted_goal_roadmap, goal_item
+
+    db_session, test_project = owned_projection_setup
+    _, parent, run, _ = await accepted_goal_roadmap(db_session, test_project, goal_item("alpha"))
+    run.plan_state = {**run.plan_state, "status": "proposed"}
     await db_session.flush()
 
-    plan = (await client.get(url)).json()["plan"]
+    plan = (await client.get(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{parent.id}"
+    )).json()["plan"]
+    assert plan["status"] == "proposed"
+    assert plan["review"] is not None
     assert [(i["key"], i["state"]) for i in plan["items"]] == [("alpha", "queued")]
 
 

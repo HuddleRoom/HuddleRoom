@@ -193,6 +193,7 @@ export interface DetailsTabsProps {
   debug: boolean
   decisionFocusId?: string | null
   decisionNavigation?: string | null
+  planReviewArtifactId?: string | null
   goalPlanContent: ReactNode
   // Optional lookups so the Plan tab can name agents and adopted tasks.
   taskTitles?: Readonly<Record<string, string>>
@@ -213,7 +214,7 @@ const BASE_TABS: { key: DetailsTabKey; label: string }[] = [
 
 export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(function DetailsTabs({
   projectId, goalId, detail, processes, sourceProcesses = processes, decisions, warnings, selectedStepType, memory, debug,
-  goalPlanContent, taskTitles, agentRoles, gatesContent, delegationsContent, suggestionsContent, debugContent, decisionFocusId = null, decisionNavigation = null,
+  goalPlanContent, taskTitles, agentRoles, gatesContent, delegationsContent, suggestionsContent, debugContent, decisionFocusId = null, decisionNavigation = null, planReviewArtifactId = null,
 }, ref) {
   const tabs = debug ? [...BASE_TABS, { key: 'debug' as const, label: 'Debug' }] : BASE_TABS
   const [activeTab, setActiveTab] = useState<DetailsTabKey>('ledger')
@@ -239,6 +240,7 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
 
   function showSourceRecord(target: NeedsYouSourceTarget) {
     if (target.goalId !== goalId) return
+    if (target.kind === 'artifact') return
     if (target.kind === 'gate') {
       if (!detail.gates.some((gate) => gate.id === target.id)) return
       setFocusDecisionId(null)
@@ -305,6 +307,10 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
     handledDecisionNavigation.current = decisionNavigation
     showDecisionActivity(decisionFocusId)
   }, [decisionFocusId, decisionNavigation])
+
+  useLayoutEffect(() => {
+    if (planReviewArtifactId) setActiveTab('plan')
+  }, [planReviewArtifactId])
 
   useImperativeHandle(ref, () => ({
     showStepActivity: () => {
@@ -389,7 +395,7 @@ export const DetailsTabs = forwardRef<DetailsTabsHandle, DetailsTabsProps>(funct
         <Panel>
           <div className="flex flex-col gap-4">
             {goalPlanContent}
-            <PlanTab projectId={projectId} detail={detail} decisions={decisions} taskTitles={taskTitles} agentRoles={agentRoles} onViewDecision={showDecisionActivity} />
+            <PlanTab projectId={projectId} detail={detail} decisions={decisions} taskTitles={taskTitles} agentRoles={agentRoles} onViewDecision={showDecisionActivity} focusArtifactId={planReviewArtifactId} />
             {suggestionsContent}
           </div>
         </Panel>

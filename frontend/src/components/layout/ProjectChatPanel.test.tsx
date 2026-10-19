@@ -219,6 +219,41 @@ describe('ProjectChatPanel', () => {
     } finally { view.cleanup() }
   })
 
+  it('confirms the reviewed planning scope without sending a mutable replacement scope', async () => {
+    const envelope = { contract: { objective: 'Frozen Alpha', goal_type: 'outcome', constraints: {}, budget: {}, authority_model: 'no_manager' }, authorization: {
+      allowed: true, required_decision: null, reason_code: null, authority_source: 'root_start', run_id: 'run-alpha',
+      contract_fingerprint: 'frozen', model_spend_remaining: {}, external_write_targets: [], live_send_channels: [], workspace_mutation: 'direct', tool_constraints: [],
+    } }
+    state.query.data = history([turn({ actions: [action({ operation: 'start_execution', payload: { start_scope: 'planning_only' }, start_scope: 'planning_only', summary: 'Authorize plan review.\n' + JSON.stringify(envelope) })] })])
+    const view = await mount()
+    try {
+      await React.act(async () => getButton(view.container, 'Review start execution').click())
+      expect(textOf(view.container)).toContain('Scope: Plan only')
+      await React.act(async () => getButton(view.container, 'Start work').click())
+      const request = state.mutation.mutate.mock.calls[0][0]
+      expect(request).toMatchObject({ actionId: 'action-alpha', content: 'yes', contextGoalId: 'goal-alpha' })
+      expect(request.startScope).toBeUndefined()
+    } finally { view.cleanup() }
+  })
+
+  it('re-reviews a changed chat Start scope with a fresh action request', async () => {
+    const envelope = { contract: { objective: 'Frozen Alpha', goal_type: 'outcome', constraints: {}, budget: {}, authority_model: 'no_manager' }, authorization: {
+      allowed: true, required_decision: null, reason_code: null, authority_source: 'root_start', run_id: 'run-alpha',
+      contract_fingerprint: 'frozen', model_spend_remaining: {}, external_write_targets: [], live_send_channels: [], workspace_mutation: 'direct', tool_constraints: [],
+    } }
+    state.query.data = history([turn({ actions: [action({ operation: 'start_execution', payload: { start_scope: 'planning_only' }, start_scope: 'planning_only', summary: 'Authorize plan review.\n' + JSON.stringify(envelope) })] })])
+    const view = await mount()
+    try {
+      await React.act(async () => getButton(view.container, 'Review start execution').click())
+      const scopes = descendants(view.container).filter((node) => node.tagName === 'INPUT' && node.name === 'start-scope')
+      await React.act(async () => changeControl(scopes[1], true))
+      await React.act(async () => getButton(view.container, 'Start work').click())
+      const request = state.mutation.mutate.mock.calls[0][0]
+      expect(request).toMatchObject({ content: 'Start execution work for this goal.', contextGoalId: 'goal-alpha', startScope: 'execution' })
+      expect(request.actionId).toBeUndefined()
+    } finally { view.cleanup() }
+  })
+
   it('supports Ctrl/Cmd+Enter while normal Enter remains multiline', async () => {
     const view = await mount()
     try {

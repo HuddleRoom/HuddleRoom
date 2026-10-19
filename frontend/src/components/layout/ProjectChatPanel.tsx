@@ -33,18 +33,18 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
   const [review, setReview] = useState<ProjectChatAction | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const reviewButton = useRef<HTMLButtonElement | null>(null)
-  const requestRef = useRef<{ content: string; actionId?: string; contextGoalId: string | null; id: string } | null>(null)
+  const requestRef = useRef<{ content: string; actionId?: string; startScope?: 'planning_only' | 'execution'; contextGoalId: string | null; id: string } | null>(null)
   const [announcement, setAnnouncement] = useState('')
   useEffect(() => { if (focusRequest && active) textareaRef.current?.focus() }, [focusRequest, active])
   const unavailable = query.isLoading || query.isError || !query.data
-  const send = (content: string, action?: ProjectChatAction, confirming = false) => {
+  const send = (content: string, action?: ProjectChatAction, confirming = false, startScope?: 'planning_only' | 'execution', targetGoalId?: string) => {
     if (mutation.isPending || !content.trim()) return
-    const goalId = action?.goal_id ?? draftGoalId ?? contextGoalId
+    const goalId = targetGoalId ?? action?.goal_id ?? draftGoalId ?? contextGoalId
     const previous = requestRef.current
-    const id = previous && previous.content === content && previous.actionId === action?.action_id && previous.contextGoalId === goalId
+    const id = previous && previous.content === content && previous.actionId === action?.action_id && previous.startScope === startScope && previous.contextGoalId === goalId
       ? previous.id : crypto.randomUUID()
-    requestRef.current = { content, actionId: action?.action_id, contextGoalId: goalId, id }
-    mutation.mutate({ content, clientRequestId: id, contextGoalId: goalId, actionId: action?.action_id }, {
+    requestRef.current = { content, actionId: action?.action_id, startScope, contextGoalId: goalId, id }
+    mutation.mutate({ content, clientRequestId: id, contextGoalId: goalId, actionId: action?.action_id, startScope }, {
       onSuccess: (turn) => {
         requestRef.current = null
         if (!confirming) { setDraft(''); setReplyAction(null); setDraftGoalId(null) }
@@ -58,6 +58,8 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
   const closeFocus = (event: Event) => { event.preventDefault(); reviewButton.current?.focus() }
   const envelope = review ? reviewEnvelope(review) : null
   const start = review && ['start_execution', 'restart_execution'].includes(review.operation)
+  const reviewedScope: 'planning_only' | 'execution' = review?.payload.start_scope === 'planning_only' || review?.payload.start_scope === 'execution'
+    ? review.payload.start_scope : review?.start_scope === 'planning_only' ? 'planning_only' : 'execution'
   const frozenGoal = start && envelope?.contract ? {
     ...envelope.contract, id: review.goal_id, project_id: projectId,
     constraints: envelope.contract.constraints ?? {}, budget: envelope.contract.budget ?? {},
@@ -79,6 +81,7 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
       <p className="font-medium">{action.operation.replace(/_/g, ' ')} · {terminalActionIds.has(action.action_id) ? 'Result recorded' : action.status}</p>
       <p className="break-words text-xs">Goal: {goalLabel(action.goal_id, turn)} ({action.goal_id}) · Run: {action.run_id ?? 'not started'}</p>
       <p className="whitespace-pre-wrap break-words text-xs">{action.requires_confirmation ? action.summary.split('\n')[0] : action.summary}</p>
+      {(['start_execution', 'restart_execution'].includes(action.operation)) && <p className="text-xs text-huddleroom-text-muted">Scope: {action.payload.start_scope === 'planning_only' ? 'Plan only' : 'Implementation'}</p>}
       {action.status === 'awaiting_confirmation' && !terminalActionIds.has(action.action_id) && <Button type="button" variant="secondary" onClick={(event) => { reviewButton.current = event.currentTarget; setReview(action) }}>Review {action.operation.replace(/_/g, ' ')}</Button>}
       {['suggested', 'prepared'].includes(action.status) && <Button type="button" variant="secondary" onClick={() => { setReplyAction(action); textareaRef.current?.focus() }}>Reply to this action</Button>}
     </section>)}
@@ -128,7 +131,10 @@ export function ProjectChatPanel({ projectId, contextGoalId = null, focusRequest
     </form>
     {mutation.isError && <ErrorRecord error={mutation.error} entity="conversation" />}
     {feedback.isError && <ErrorRecord error={feedback.error} entity="feedback" />}
-    {review && frozenGoal && <StartWorkDialog open targetSummary={`Goal: ${frozenGoal.objective ?? review.goal_id} (${review.goal_id}) · Run: ${review.run_id ?? 'not started'}`} goal={frozenGoal} authorization={envelope?.authorization ?? null} missingRecurringPolicy={frozenGoal.goal_type === 'continuous' && !frozenGoal.continuous_policy} restartReason={review.operation === 'restart_execution' ? 'Fresh authorization is required' : null} isPending={mutation.isPending} error={mutation.error} onOpenChange={(open) => { if (!open) setReview(null) }} onConfirm={() => send('yes', review, true)} onCloseAutoFocus={closeFocus} />}
+    {review && frozenGoal && <StartWorkDialog open targetSummary={`Goal: ${frozenGoal.objective ?? review.goal_id} (${review.goal_id}) · Run: ${review.run_id ?? 'not started'} · Scope: ${reviewedScope === 'planning_only' ? 'Plan only' : 'Implementation'}`} goal={frozenGoal} authorization={envelope?.authorization ?? null} missingRecurringPolicy={frozenGoal.goal_type === 'continuous' && !frozenGoal.continuous_policy} restartReason={review.operation === 'restart_execution' ? 'Fresh authorization is required' : null} isPending={mutation.isPending} error={mutation.error} initialScope={reviewedScope} onOpenChange={(open) => { if (!open) setReview(null) }} onConfirm={(scope) => {
+      if (scope === reviewedScope) send('yes', review, true)
+      else { setReview(null); send(`Start ${scope === 'planning_only' ? 'planning work' : 'execution work'} for this goal.`, undefined, false, scope, review.goal_id) }
+    }} onCloseAutoFocus={closeFocus} />}
     {review && !frozenGoal && <Dialog open title={`Confirm ${review.operation.replace(/_/g, ' ')}?`} role="alertdialog" onOpenChange={(open) => { if (!open) setReview(null) }} onCloseAutoFocus={closeFocus} footer={{ primaryLabel: 'Confirm', isPending: mutation.isPending, onPrimary: () => send('yes', review, true) }}>
       <p className="break-words">Goal: {envelope?.contract?.objective ?? review.goal_id} ({review.goal_id}) · Run: {review.run_id ?? 'not started'}</p><p className="whitespace-pre-wrap break-words">{review.summary.split('\n')[0]}</p>
       {review.operation === 'cancel' && <p>Cancels this goal and its children, tasks and sessions.</p>}

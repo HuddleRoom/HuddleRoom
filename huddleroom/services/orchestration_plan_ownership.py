@@ -102,10 +102,14 @@ class PlanOwnershipService:
             if getattr(item, "owner_type", "agent") == "human":
                 results.append({"item_id": item_id, "status": "blocked", "reason": "human executable work requires SPR254 workflow"})
                 continue
-            function = getattr(item, "work_function", None)
             if inventory["conflicts"]:
                 results.append({"item_id": item_id, "status": "conflict", "reason": inventory["conflicts"][0]})
                 continue
+            if getattr(item, "unit_type", None) == "goal":
+                results.append({"item_id": item_id, "status": "eligible", "unit_type": "goal"})
+                bindings[item_id] = {"unit_type": "goal"}
+                continue
+            function = getattr(item, "work_function", None)
             eligible_id = inventory["functions"].get(function)
             if not eligible_id:
                 results.append({"item_id": item_id, "status": "conflict", "reason": f"no accepted active agent for work_function '{function}'"})

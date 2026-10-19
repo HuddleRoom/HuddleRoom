@@ -5,9 +5,10 @@ import uuid
 
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.models.user import User
 from huddleroom.schemas.orchestration import (
     OrchestrationAgentDefinitionReviewBatchAnswer,
@@ -15,6 +16,7 @@ from huddleroom.schemas.orchestration import (
     OrchestrationAgentDefinitionReviewBatchAnswerResponse,
     OrchestrationDecisionAnswerResponse,
     OrchestrationDecisionAnswerRequest,
+    PlanReviewRecord,
 )
 from huddleroom.services.orchestration_blocker_recovery import (
     OrchestrationBlockerRecoveryService, RecoveryDiagnosisFailed, RecoveryProposalStale,
@@ -32,6 +34,95 @@ from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
 from huddleroom.services.orchestration_team_hierarchy_analyzer import canonical_agent_create
 from huddleroom.services.agent_service import AgentService
+from huddleroom.services.orchestration_control import acquire_control_writer
+
+
+async def _validate_roadmap_plan_answer(db, decision: OrchestrationAuthorityDecision) -> None:
+    """Keep a human answer attached to the exact rendered candidate it reviewed."""
+    if not decision.decision_key.startswith("roadmap_plan:"):
+        return
+    try:
+        context = json.loads(decision.context or "null")
+        identity = context["plan_review_identity"]
+        digest = context["plan_review_identity_hash"]
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(409, "Roadmap plan approval is stale") from None
+    run = await db.get(OrchestrationRun, decision.run_id)
+    goal = await db.get(OrchestrationGoal, decision.goal_id)
+    if run is None or goal is None or run.goal_id != goal.id:
+        raise HTTPException(409, "Roadmap plan approval is stale")
+    try:
+        artifact_id = uuid.UUID(identity["artifact_id"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(409, "Roadmap plan approval is stale") from None
+    from huddleroom.models.artifact import Artifact
+    from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+
+    artifact = await db.get(Artifact, artifact_id)
+    if artifact is None or artifact.project_id != goal.project_id:
+        raise HTTPException(409, "Roadmap plan approval is stale")
+    try:
+        await OrchestrationRoadmapService(OrchestrationService())._require_current_plan_review(
+            db, goal, run, artifact,
+            {"plan_review_identity": identity, "plan_review_identity_hash": digest},
+            boundary="answer",
+        )
+    except HTTPException as exc:
+        record = (run.plan_state or {}).get("plan_reviews", {}).get(str(artifact_id))
+        if exc.status_code == 409 and isinstance(record, dict) and record.get("state") == "stale":
+            exc.stale_plan_review = record
+        raise
+
+
+async def _preserve_stale_roadmap_plan_answer(
+    db, decision_id: uuid.UUID, run_id: uuid.UUID, goal_id: uuid.UUID, stale_record: dict,
+) -> None:
+    """Persist only a rejected candidate's stale marker after G1 rolls back its answer savepoint."""
+    if db.in_transaction():
+        await _merge_stale_roadmap_plan_answer(db, decision_id, run_id, goal_id, stale_record)
+        return
+    if db.bind is None:
+        return
+    async with async_sessionmaker(db.bind, expire_on_commit=False)() as stale_db:
+        if await _merge_stale_roadmap_plan_answer(stale_db, decision_id, run_id, goal_id, stale_record):
+            await stale_db.commit()
+
+
+async def _merge_stale_roadmap_plan_answer(db, decision_id, run_id, goal_id, stale_record) -> bool:
+    try:
+        record = PlanReviewRecord.model_validate(stale_record)
+    except ValueError:
+        return False
+    if record.state != "stale" or record.identity.run_id != run_id or record.identity.goal_id != goal_id:
+        return False
+    await acquire_control_writer(db, run_id)
+    decision = await db.get(OrchestrationAuthorityDecision, decision_id, populate_existing=True)
+    run = await db.get(OrchestrationRun, run_id, populate_existing=True)
+    goal = await db.get(OrchestrationGoal, goal_id, populate_existing=True)
+    if (decision is None or not decision.decision_key.startswith("roadmap_plan:")
+            or decision.run_id != run_id or decision.goal_id != goal_id
+            or run is None or goal is None or run.goal_id != goal.id):
+        return False
+    try:
+        context = json.loads(decision.context or "null")
+    except (TypeError, ValueError):
+        return False
+    if context.get("plan_review_identity") != record.identity.model_dump(mode="json"):
+        return False
+    state = dict(run.plan_state or {})
+    reviews = dict(state.get("plan_reviews") or {})
+    existing = reviews.get(str(record.identity.artifact_id))
+    if isinstance(existing, dict):
+        try:
+            existing_identity = PlanReviewRecord.model_validate(existing).identity
+        except ValueError:
+            return False
+        if existing_identity != record.identity:
+            return False
+    reviews[str(record.identity.artifact_id)] = record.model_dump(mode="json")
+    run.plan_state = {**state, "plan_reviews": reviews}
+    await db.flush()
+    return True
 
 orchestration_service = OrchestrationService()
 decision_service = OrchestrationAuthorityDecisionService()
@@ -156,6 +247,9 @@ async def answer_decision(
     owns = acceptance_owns(db, request_owns_transaction)
     await _goal_or_404(db, project_id, goal_id)
     decision = await _decision_or_404(db, goal_id, decision_id)
+    roadmap_decision_id = decision.id if decision.decision_key.startswith("roadmap_plan:") else None
+    roadmap_run_id = decision.run_id if roadmap_decision_id is not None else None
+    roadmap_goal_id = decision.goal_id if roadmap_decision_id is not None else None
     if is_recovery_decision(decision):
         async with orchestration_service._lock_goal_for_baseline_transition(db, goal_id):
             if validation_callback is not None:
@@ -208,13 +302,26 @@ async def answer_decision(
                 return response
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+    async def review_validation(session):
+        await _validate_roadmap_plan_answer(session, decision)
+        if validation_callback is not None:
+            await validation_callback(session)
+
     submission = canonical_answer_submission([decision], data, user.id)
     if owns:
         await db.commit()
     try:
         return await accept_answer(db, project_id, goal_id, submission, user,
-            validation_callback=validation_callback, reservation_callback=reservation_callback,
+            validation_callback=review_validation, reservation_callback=reservation_callback,
             completion_callback=completion_callback)
+    except HTTPException as exc:
+        stale_record = getattr(exc, "stale_plan_review", None)
+        if (exc.status_code == 409 and roadmap_decision_id is not None and roadmap_run_id is not None
+                and roadmap_goal_id is not None and isinstance(stale_record, dict)):
+            await _preserve_stale_roadmap_plan_answer(
+                db, roadmap_decision_id, roadmap_run_id, roadmap_goal_id, stale_record,
+            )
+        raise
     except (ValueError, ValidationError) as exc:
         raise HTTPException(400, str(exc)) from exc
 

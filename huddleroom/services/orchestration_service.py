@@ -2046,6 +2046,9 @@ class OrchestrationService:
             "action_id": str(action.id),
             "work_function": contract.work_function,
         }
+        for key in ("authority_decision_id", "plan_review_identity_hash"):
+            if key in stored_request:
+                orchestration_metadata[key] = stored_request[key]
         if ad_hoc and contract.work_function in ADHOC_GATED_WORK_FUNCTIONS:
             # Task id == action id, so the gate key is replay-stable. Completion alone never accepts it.
             adhoc_gate = await self._ensure_keyed_gate(
@@ -3023,6 +3026,18 @@ class OrchestrationService:
                 items = self._plan_items_from_artifact(artifact)
                 self._validate_plan_criterion_links(goal, items)
                 await self._validate_plan_adoptions(db, run, items)
+                from huddleroom.services.orchestration_plan_review import PlanReviewService
+                from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+                review = await PlanReviewService().check(db, goal, run, artifact, boundary="outcome acceptance")
+                if review.state != "ready":
+                    raise HTTPException(status_code=409, detail="Plan review is not applicable")
+                ownership = await PlanOwnershipService().validate_plan_owners(
+                    db, goal, run, items, bind=True, review=review,
+                )
+                conflict = next((item for item in ownership if item["status"] != "eligible"), None)
+                if conflict is not None:
+                    raise HTTPException(status_code=409, detail=f"Plan ownership is blocked: {conflict['reason']}")
                 version = None
         except HTTPException as exc:
             # Savepoint rollback expires a projection that was already flushed.
@@ -3137,6 +3152,32 @@ class OrchestrationService:
             raise HTTPException(status_code=404, detail=f"Plan item '{request_to_store['plan_item_id']}' not found")
         if item.id != request_to_store["plan_item_id"] or item.work_function != request_to_store["work_function"]:
             raise HTTPException(status_code=409, detail="Parsed plan item does not match expand request")
+        from huddleroom.services.orchestration_plan_review import PlanReviewService
+
+        review = await PlanReviewService().check(db, goal, run, artifact, boundary="plan expansion")
+        binding = self._json_object_or_empty(self._json_object_or_empty(run.plan_state).get("accepted_plan_ownership"))
+        owners = self._json_object_or_empty(binding.get("items"))
+        owner = owners.get(item.id)
+        if (
+            review.state != "ready"
+            or binding.get("review_identity") != review.identity.model_dump(mode="json")
+            or item.owner_type == "human"
+            or not isinstance(owner, dict)
+            or owner.get("work_function") != item.work_function
+            or (item.agent_id is not None and owner.get("agent_id") != str(item.agent_id))
+        ):
+            raise HTTPException(status_code=409, detail="Accepted plan ownership is not applicable")
+        try:
+            frozen_item = item.model_copy(update={"agent_id": uuid.UUID(str(owner["agent_id"]))})
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=409, detail="Accepted plan ownership is not applicable") from None
+        from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+        ownership = await PlanOwnershipService().validate_plan_owners(
+            db, goal, run, [frozen_item], bind=False, review=review,
+        )
+        if len(ownership) != 1 or ownership[0].get("status") != "eligible":
+            raise HTTPException(status_code=409, detail="Accepted plan ownership is not applicable")
         expanded_items = self._json_object_or_empty(run.plan_state).get("expanded_items")
         expanded_ids = {
             entry.get("plan_item_id")
@@ -3153,7 +3194,7 @@ class OrchestrationService:
             )
         if item.adopt_task_id is not None:
             return await self._expand_adopted_item(
-                db, run, artifact, item, request_to_store, idempotency_key, decision_id
+                db, run, artifact, frozen_item, item, request_to_store, idempotency_key, decision_id
             )
 
         existing = await self._existing_action_for_key(db, run_id, idempotency_key)
@@ -3161,7 +3202,7 @@ class OrchestrationService:
         if existing is None:
             project_id = await self._project_id_for_run(db, run_id)
             delegation_request = await self._plan_item_delegation_request(
-                db, run_id, project_id, artifact, item, discretionary_divisor=discretionary_divisor,
+                db, run_id, project_id, artifact, frozen_item, discretionary_divisor=discretionary_divisor,
             )
             # For accepted child plans, authority must be resolved before the
             # outer expansion reservation or its gate exists.  A budget wait is
@@ -3207,7 +3248,7 @@ class OrchestrationService:
         if delegation_request is None:
             try:
                 delegation_request = await self._plan_item_delegation_request(
-                    db, run_id, project_id, artifact, item, discretionary_divisor=discretionary_divisor,
+                    db, run_id, project_id, artifact, frozen_item, discretionary_divisor=discretionary_divisor,
                 )
             except HTTPException as exc:
                 if exc.status_code in {400, 404, 409}:
@@ -3244,19 +3285,28 @@ class OrchestrationService:
         db: AsyncSession,
         run: OrchestrationRun,
         artifact: Artifact,
+        frozen_item: OrchestrationPlanItem,
         item: OrchestrationPlanItem,
         request_to_store: dict,
         idempotency_key: str,
         decision_id: uuid.UUID | None,
     ) -> OrchestrationAction:
         """Bind the adopted task to its plan item: no delegation, no new task, its session untouched."""
+        task = await db.get(Task, frozen_item.adopt_task_id)
+        if task is None or task.assigned_to != frozen_item.agent_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"adoption_invalid: item {item.id}: adopted task is not assigned to the accepted owner",
+            )
+        # Ownership is frozen above, but the stored accepted projection keeps
+        # its canonical (possibly null) agent_id for replay identity.
+        self._validate_bound_plan_item(task, run, item)
         action = await self.reserve_action(
             db, run_id=run.id, idempotency_key=idempotency_key, action_type="expand_plan_item",
             request=request_to_store, decision_id=decision_id,
         )
         if action.status != "reserved":
             return action
-        task = await db.get(Task, item.adopt_task_id)
         delegation_action = await db.get(OrchestrationAction, item.adopt_task_id)
         if task is None or delegation_action is None:
             await self._fail_reserved_action_for_current_flow(db, action, "Adopted task not found")
@@ -3804,7 +3854,15 @@ class OrchestrationService:
                 escalated += 1
                 continue
 
-            if decision.related_action_id is not None:
+            try:
+                decision_context = json.loads(decision.context or "null")
+            except (TypeError, ValueError):
+                decision_context = None
+            review_bound_candidate = (
+                decision.decision_key.startswith("roadmap_plan:")
+                and isinstance(self._json_object_or_empty(decision_context).get("plan_review_identity_hash"), str)
+            )
+            if decision.related_action_id is not None and not review_bound_candidate:
                 action = await db.get(OrchestrationAction, decision.related_action_id)
                 task = await db.get(Task, action.target_id) if action is not None else None
                 if task is not None:
@@ -3812,10 +3870,7 @@ class OrchestrationService:
                     orchestration = self._json_object_or_empty(metadata.get("orchestration"))
                     task.metadata_ = {
                         **metadata,
-                        "orchestration": {
-                            **orchestration,
-                            "authority_decision_id": str(decision.id),
-                        },
+                        "orchestration": {**orchestration, "authority_decision_id": str(decision.id)},
                     }
 
             if decision.related_action_id is None:
@@ -3828,6 +3883,8 @@ class OrchestrationService:
                         request={
                             "action_type": "create_delegation_task",
                             "agent_id": str(decision.authority_agent_id),
+                            "authority_decision_id": str(decision.id),
+                            "plan_review_identity_hash": self._json_object_or_empty(decision_context).get("plan_review_identity_hash"),
                             "work_function": "decision",
                             "scope": decision.question,
                             "deliverable": "A decision report selecting one of the offered options.",
@@ -3859,17 +3916,18 @@ class OrchestrationService:
                     )
                     escalated += 1
                     continue
-                task = await db.get(Task, action.target_id)
-                if task is not None:
-                    metadata = self._json_object_or_empty(task.metadata_)
-                    orchestration = self._json_object_or_empty(metadata.get("orchestration"))
-                    task.metadata_ = {
-                        **metadata,
-                        "orchestration": {
-                            **orchestration,
-                            "authority_decision_id": str(decision.id),
-                        },
-                    }
+                # Review-bound Roadmap candidates must be bound at creation;
+                # older recovery decisions retain their established server
+                # reconciliation when a replayed action predates the link.
+                if not review_bound_candidate:
+                    task = await db.get(Task, action.target_id)
+                    if task is not None:
+                        metadata = self._json_object_or_empty(task.metadata_)
+                        orchestration = self._json_object_or_empty(metadata.get("orchestration"))
+                        task.metadata_ = {
+                            **metadata,
+                            "orchestration": {**orchestration, "authority_decision_id": str(decision.id)},
+                        }
                 await authority_service.link_delegation_action(db, decision, action_id=action.id)
                 if existing_action is None:
                     delegated += 1
@@ -5090,6 +5148,26 @@ class OrchestrationService:
                 raise
         if gate.gate_type == "roadmap_plan_approval" and run is not None:
             source_task = await self._planning_task_for_gate(db, run, gate)
+            if goal is None:
+                await self._fail_reserved_action_for_current_flow(db, action, "Roadmap goal is missing")
+                raise HTTPException(status_code=409, detail="Roadmap goal is missing")
+            artifact_id = self._event_uuid(self._json_object_or_empty(gate.required_evidence).get("plan_artifact_id"))
+            artifact = await db.get(Artifact, artifact_id) if artifact_id else None
+            if artifact is None:
+                await self._fail_reserved_action_for_current_flow(db, action, "Roadmap plan artifact is missing")
+                raise HTTPException(status_code=409, detail="Roadmap plan artifact is missing")
+            from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+
+            required = self._json_object_or_empty(gate.required_evidence)
+            try:
+                await OrchestrationRoadmapService(self)._require_current_plan_review(
+                    db, goal, run, artifact,
+                    {key: required.get(key) for key in ("plan_review_identity", "plan_review_identity_hash")},
+                    boundary="candidate verifier admission",
+                )
+            except HTTPException as exc:
+                await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
+                raise
         if goal is not None and goal.goal_type in {"outcome", "roadmap"} and gate.gate_type == PLAN_ITEM_GATE_TYPE:
             source_task = await self._plan_item_producer_task(db, gate)
         if gate.gate_type != "roadmap_integration" and (source_task is None or source_task.assigned_to is None):
@@ -5101,6 +5179,13 @@ class OrchestrationService:
             "producer_agent_id": str(source_task.assigned_to) if source_task is not None else None,
             "roadmap_version_id": self._json_object_or_empty(gate.required_evidence).get("roadmap_version_id"),
         }
+        if gate.gate_type == "roadmap_plan_approval":
+            required = self._json_object_or_empty(gate.required_evidence)
+            action.request = {
+                **action.request,
+                "plan_review_identity": required.get("plan_review_identity"),
+                "plan_review_identity_hash": required.get("plan_review_identity_hash"),
+            }
         found = await self._classify_review_inputs(db, run, gate, source_task) if goal is not None else None
         if found is not None:
             # No verifier judges work it cannot see: the request is settled on the gate, never as a failure, so
@@ -5585,6 +5670,9 @@ class OrchestrationService:
         if context:
             canonical["orchestrator_context"] = context
         canonical.update({key: request_obj[key] for key in REMEDIATION_REQUEST_KEYS if key in request_obj})
+        for key in ("authority_decision_id", "plan_review_identity_hash"):
+            if isinstance(request_obj.get(key), str) and request_obj[key]:
+                canonical[key] = request_obj[key]
         title = request_obj.get("title")
         if isinstance(title, str) and title.strip():
             canonical["title"] = title.strip()
@@ -5852,7 +5940,7 @@ class OrchestrationService:
             or pending.get("action_id") != orchestration.get("action_id")
             or pending.get("planner_agent_id") != str(task.assigned_to)
             or pending.get("artifact_id") != str(artifact.id)
-            or pending.get("fingerprint") != gate.success_criterion_key.removeprefix("roadmap_plan:")
+            or pending.get("fingerprint") != gate.success_criterion_key.split(":review:", 1)[0].removeprefix("roadmap_plan:")
             or pending.get("gate_id") != str(gate.id)
         ):
             raise HTTPException(status_code=409, detail="Planning task does not match current pending Roadmap replan")
@@ -8175,6 +8263,26 @@ class OrchestrationService:
         if version is None:
             version = plan_state.get("planning_version")
         goal = await db.get(OrchestrationGoal, run.goal_id)
+        provenance = self._json_object_or_empty(plan_state.get("plan_provenance"))
+        bound_artifact_id = self._event_uuid(plan_state.get("plan_artifact_id"))
+        bound = await db.get(Artifact, bound_artifact_id) if bound_artifact_id is not None else None
+        content_hash = ingested_plan_hash(bound.metadata_ or {}) if bound is not None else None
+        if (
+            bound is not None and session_id is not None
+            and provenance.get("winning_session_id") == str(session_id)
+            and provenance.get("planning_version") == version
+            and provenance.get("artifact_id") == plan_state.get("plan_artifact_id")
+            and provenance.get("planning_task_id") == str(task.id)
+            and bound.status != "deleted"
+            and content_hash == plan_state.get("plan_output_hash")
+            and provenance.get("canonical_content_hash", content_hash) == content_hash
+        ):
+            # G3: an ingested plan is bound to its immutable content; its own session's later output never re-parses it.
+            if marker is not None:
+                await self._mark_action_completed(db, marker, "artifact", bound.id)
+                if source is not task:
+                    self._set_result_correction_status(marker, "corrected")
+            return
         try:
             plan_text, how = normalize_result_output(output)
         except ValueError:
@@ -10380,6 +10488,20 @@ class OrchestrationService:
         elif gate.gate_type == "roadmap_plan_approval":
             try:
                 source_task = await self._planning_task_for_gate(db, run, gate)
+            except HTTPException:
+                return None
+            goal = await db.get(OrchestrationGoal, run.goal_id)
+            required = self._json_object_or_empty(gate.required_evidence)
+            artifact = await db.get(Artifact, self._event_uuid(required.get("plan_artifact_id")))
+            if goal is None or artifact is None:
+                return None
+            from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+            try:
+                await OrchestrationRoadmapService(self)._require_current_plan_review(
+                    db, goal, run, artifact,
+                    {key: required.get(key) for key in ("plan_review_identity", "plan_review_identity_hash")},
+                    boundary="candidate verifier verdict",
+                )
             except HTTPException:
                 return None
         else:
@@ -13686,7 +13808,7 @@ class OrchestrationService:
                         await db.flush()
                         return {"step": "plan_revision_required"}
                     try:
-                        await roadmap._require_plan_approval(db, goal, run, wait_state["fingerprint"], None)
+                        await roadmap._require_plan_approval(db, goal, run, wait_state["fingerprint"], None, artifact)
                     except HTTPException as exc:
                         self._set_plan_revision_required(run, str(exc.detail))
                         await db.flush()

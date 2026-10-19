@@ -163,6 +163,145 @@ async def test_api_session_failure_sets_resumable_and_redacts_secret_in_event(
 
 
 @pytest.mark.asyncio
+async def test_planning_api_omits_memory_context_and_tools(db_session, test_project, test_agent, monkeypatch):
+    """Planning control work must not receive the memory-tool capability."""
+    from huddleroom.adapters import api_adapter
+    from huddleroom.adapters.api_adapter import ApiAdapter
+
+    test_agent.config = {**test_agent.config, "memory_enabled": True}
+    task = Task(project_id=test_project.id, title="review candidate", description="review")
+    db_session.add(task)
+    await db_session.flush()
+
+    memory_search = AsyncMock(side_effect=AssertionError("planning must not query memory"))
+    monkeypatch.setattr(api_adapter.memory_service_instance, "search", memory_search)
+    monkeypatch.setattr(
+        api_adapter,
+        "get_memory_system_prompt",
+        lambda: (_ for _ in ()).throw(AssertionError("planning must not add memory prompt")),
+    )
+
+    messages, _context, _knowledge, _channels = await ApiAdapter()._build_messages(
+        test_agent, task, db_session, planning_only=True,
+    )
+
+    memory_search.assert_not_awaited()
+    assert len(messages) == 2
+    assert "memory" not in messages[0]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_planning_api_revocation_before_completion_avoids_provider(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    """A grant revoked after admission stops at the pre-provider authority fence."""
+    import litellm
+    from fastapi import HTTPException
+
+    from huddleroom.adapters import api_adapter
+    from huddleroom.adapters.api_adapter import ApiAdapter
+    from huddleroom.services.session_service import SessionService
+
+    task = Task(project_id=test_project.id, title="verify candidate", description="verify")
+    session = Session(
+        agent_id=test_agent.id,
+        project_id=test_project.id,
+        task_id=task.id,
+        adapter_type="api",
+        status="running",
+        metadata_={"attempt": {"claimed_runner_task_id": "runner-1"}},
+    )
+    db_session.add_all([task, session])
+    await db_session.flush()
+    session.task_id = task.id
+    await db_session.flush()
+
+    async def revoked_policy(*_args, **_kwargs):
+        raise HTTPException(status_code=409, detail="authorization_denied: review_stale")
+
+    seen_tools = []
+
+    async def run_once(**kwargs):
+        seen_tools.append(kwargs["tools"])
+        return await kwargs["completion_fn"](messages=kwargs["messages"])
+
+    provider = AsyncMock()
+    monkeypatch.setattr(SessionService, "runtime_execution_policy", revoked_policy)
+    monkeypatch.setattr(api_adapter, "run_tool_loop", run_once)
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    monkeypatch.setattr(
+        "huddleroom.workers.session_tasks._mark_attempt_result", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr("huddleroom.services.session_sync.sync_task_from_session", AsyncMock())
+
+    await ApiAdapter()._run_with_retry(
+        test_agent,
+        session,
+        [{"role": "user", "content": "review"}],
+        "review",
+        db_session,
+        task=task,
+        runner_task_id="runner-1",
+        planning_only=True,
+    )
+
+    assert seen_tools == [None]
+    provider.assert_not_awaited()
+    assert "authorization_denied: review_stale" in (session.error or "")
+
+
+@pytest.mark.asyncio
+async def test_planning_api_strips_legacy_tools_and_rebuilds_messages_at_effect(
+    db_session, test_project, test_agent, monkeypatch,
+):
+    import litellm
+    from huddleroom.adapters import api_adapter
+    from huddleroom.adapters.api_adapter import ApiAdapter
+    from huddleroom.services.session_service import SessionService
+
+    task = Task(project_id=test_project.id, title="verify candidate", description="verify")
+    session = Session(
+        agent_id=test_agent.id, project_id=test_project.id, task_id=task.id, adapter_type="api", status="running",
+        metadata_={"attempt": {"claimed_runner_task_id": "runner-1", "attempt_version": 1, "effect_state": "not_started"}},
+    )
+    test_agent.config = {**test_agent.config, "memory_enabled": True, "provider_extras": {
+        "functions": [{"name": "unsafe"}], "function_call": "auto",
+    }}
+    db_session.add_all([task, session])
+    await db_session.flush()
+
+    async def planning_policy(*_args, **_kwargs):
+        return True
+
+    async def run_once(**kwargs):
+        await kwargs["completion_fn"](messages=kwargs["messages"])
+        return "done"
+
+    captured = {}
+
+    async def provider(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))
+
+    monkeypatch.setattr(SessionService, "runtime_execution_policy", planning_policy)
+    monkeypatch.setattr(api_adapter, "run_tool_loop", run_once)
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    monkeypatch.setattr("huddleroom.workers.session_tasks.mark_attempt_effect_started", AsyncMock(return_value=True))
+    monkeypatch.setattr("huddleroom.workers.session_tasks._mark_attempt_result", AsyncMock(return_value=True))
+    monkeypatch.setattr("huddleroom.services.session_sync.sync_task_from_session", AsyncMock())
+
+    await ApiAdapter()._run_with_retry(
+        test_agent, session, [{"role": "system", "content": "memory: secret"}, {"role": "user", "content": "go"}],
+        "verify", db_session, task=task, runner_task_id="runner-1", planning_only=False,
+    )
+
+    assert "functions" not in captured
+    assert "function_call" not in captured
+    assert "tools" not in captured
+    assert "memory" not in captured["messages"][0]["content"].lower()
+
+
+@pytest.mark.asyncio
 async def test_api_budget_stop_persists_cumulative_authoritative_usage(
     db_session: AsyncSession, test_project, test_agent
 ):
@@ -637,6 +776,47 @@ async def test_cli_task_resume_launch_uses_resume_flag_and_continue_prompt(test_
     assert "--resume" in argv
     assert argv[argv.index("--resume") + 1] == "abcDEF1234567890"
     assert "continue" in argv
+
+
+@pytest.mark.asyncio
+async def test_codex_planning_resume_fallback_keeps_read_only_policy(test_engine, tmp_path, monkeypatch):
+    """A missing resumed thread may retry fresh, but it must not regain write access."""
+    from huddleroom.adapters.cli_adapter import CliAdapter
+    from huddleroom.services.session_service import SessionService
+
+    monkeypatch.setattr(
+        SessionService, "runtime_execution_policy", AsyncMock(return_value=True),
+    )
+    argvs, _kwargs, session, _started = await _run_scripted(
+        test_engine,
+        tmp_path,
+        "codex",
+        [_Proc(1, *NOT_FOUND["codex"]), _Proc(0, CODEX_OK)],
+    )
+
+    assert session.status == "completed"
+    assert argvs[0][0:3] == ["codex", "exec", "resume"]
+    assert "sandbox_mode=read-only" in argvs[0]
+    assert "sandbox_workspace_write.network_access=true" not in argvs[0]
+    assert argvs[1][argvs[1].index("--sandbox") + 1] == "read-only"
+    assert "sandbox_workspace_write.network_access=true" not in argvs[1]
+
+
+@pytest.mark.asyncio
+async def test_planning_cli_rejects_unsupported_runtime_before_launch(test_engine, tmp_path, monkeypatch):
+    """Planning-only work cannot silently use an unrestricted CLI runtime."""
+    from huddleroom.services.session_service import SessionService
+
+    monkeypatch.setattr(
+        SessionService, "runtime_execution_policy", AsyncMock(return_value=True),
+    )
+    argvs, _kwargs, session, _started = await _run_scripted(
+        test_engine, tmp_path, "claude_code", [],
+    )
+
+    assert argvs == []
+    assert session.status == "failed"
+    assert session.error == "unsupported_planning_runtime: claude_code"
 
 
 @pytest.mark.asyncio

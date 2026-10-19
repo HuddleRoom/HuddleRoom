@@ -728,6 +728,80 @@ describe('Plan tab', () => {
     } finally { roadmap.cleanup() }
   })
 
+  it('keeps accepted history separate while rendering the complete current candidate and its authority binding', async () => {
+    const onViewDecision = vi.fn()
+    const review = {
+      artifact_id: 'artifact-review-4444', state: 'ready' as const,
+      markdown: '# Candidate\n\n- Deliver the reviewed change', export_path: 'plans/candidate.md',
+      reason: null, authority_decision_id: 'decision-review-4', authority_gate_id: 'gate-review-4', authority_status: 'Awaiting approval',
+      review_url: '/orchestration/goal-1#plan-review-artifact-review-4444',
+      identity: {
+        project_id: 'project-1', goal_id: 'goal-1', run_id: 'run-2', artifact_id: 'artifact-review-4444',
+        planning_task_id: 'task-review-4', planning_version: 4, winning_session_id: 'session-review-4',
+        provenance_hash: 'provenance-review-4', canonical_content_hash: 'canonical-review-4', renderer_version: 1,
+        rendered_content_hash: 'rendered-review-4', review_cycle: 2,
+      },
+    }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), { onViewDecision })
+    try {
+      const text = textOf(view.container)
+      expect(text).toContain('v3 · Current')
+      expect(text).toContain('Plan candidate v4')
+      expect(text).toContain('Deliver the reviewed change')
+      expect(text).toContain('Review cycle2')
+      expect(text).toContain('Awaiting approval')
+      expect(text).toContain('plans/candidate.md')
+      expect(descendants(view.container).find((node) => node.getAttribute('id') === 'plan-review-artifact-review-4444')).toBeDefined()
+      expect(descendants(view.container).find((node) => node.tagName === 'A' && textOf(node) === 'Link to this candidate')?.getAttribute('href'))
+        .toBe('/orchestration/goal-1#plan-review-artifact-review-4444')
+      await act(async () => getButton(view.container, 'Approve plan v4').click())
+      await act(async () => getButton(view.container, 'Request revision').click())
+      expect(onViewDecision).toHaveBeenNthCalledWith(1, 'decision-review-4')
+      expect(onViewDecision).toHaveBeenNthCalledWith(2, 'decision-review-4')
+    } finally { view.cleanup() }
+  })
+
+  it('keeps a stale candidate readable for revision while blocking approval', async () => {
+    const review = {
+      artifact_id: 'artifact-stale-4', state: 'stale' as const, markdown: '# Stale candidate', export_path: null,
+      reason: 'The plan changed after this review.', authority_decision_id: 'decision-stale-4', authority_gate_id: 'gate-stale-4', authority_status: 'Pending',
+      review_url: '/orchestration/goal-1#plan-review-artifact-stale-4',
+      identity: {
+        project_id: 'project-1', goal_id: 'goal-1', run_id: 'run-2', artifact_id: 'artifact-stale-4',
+        planning_task_id: 'task-stale-4', planning_version: 4, winning_session_id: null,
+        provenance_hash: 'provenance-stale-4', canonical_content_hash: 'canonical-stale-4', renderer_version: 1,
+        rendered_content_hash: 'rendered-stale-4', review_cycle: 3,
+      },
+    }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), { onViewDecision: vi.fn() })
+    try {
+      expect(textOf(view.container)).toContain('Stale candidate')
+      expect(textOf(view.container)).toContain('This candidate remains readable for revision, but it cannot be approved or executed.')
+      expect(getButton(view.container, 'Approve plan v4').disabled).toBe(true)
+      expect(getButton(view.container, 'Request revision').disabled).toBe(false)
+    } finally { view.cleanup() }
+  })
+
+  it.each(['Accepted', 'Superseded', 'Answered'])('does not offer review actions after the bound authority decision is %s', async (authorityStatus) => {
+    const review = {
+      artifact_id: 'artifact-accepted-authority-4', state: 'ready' as const, markdown: '# Approved candidate', export_path: null,
+      reason: null, authority_decision_id: 'decision-accepted-4', authority_gate_id: 'gate-accepted-4', authority_status: authorityStatus,
+      review_url: '/orchestration/goal-1#plan-review-artifact-accepted-authority-4',
+      identity: {
+        project_id: 'project-1', goal_id: 'goal-1', run_id: 'run-2', artifact_id: 'artifact-accepted-authority-4',
+        planning_task_id: 'task-accepted-4', planning_version: 4, winning_session_id: null,
+        provenance_hash: 'provenance-accepted-4', canonical_content_hash: 'canonical-accepted-4', renderer_version: 1,
+        rendered_content_hash: 'rendered-accepted-4', review_cycle: 4,
+      },
+    }
+    const view = await mountPlan(goalDetail({ runs: [run()], run: null, plan: { ...planBase, items: [item()], review } }), { onViewDecision: vi.fn() })
+    try {
+      expect(textOf(view.container)).toContain('Approved candidate')
+      expect(() => getButton(view.container, 'Approve plan v4')).toThrow()
+      expect(() => getButton(view.container, 'Request revision')).toThrow()
+    } finally { view.cleanup() }
+  })
+
   it('renders item cards with dependencies, artifacts, adoption, owner and priority', async () => {
     const plan = { ...planBase, items: [
       item({ key: 'design', title: 'Design it', state: 'started', task_id: null, gate_id: null }),

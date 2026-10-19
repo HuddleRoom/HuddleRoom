@@ -750,6 +750,9 @@ async def test_unknown_criterion_key_plan_is_corrected_and_ingested_under_the_or
     assert failed in correction.description and error in correction.description
     assert correction.metadata_["orchestration_contract"]["expected_result"] == "planning_envelope"
 
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db_session, _goal, await db_session.get(Agent, task.assigned_to))
     fixed = await _complete(db_session, service, run, correction, _plan())
 
     artifact_id = plan_artifact_id(task.id, version)

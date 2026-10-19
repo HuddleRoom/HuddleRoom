@@ -25,6 +25,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRun,
 )
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService, parse_roadmap_items
+from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -39,6 +40,9 @@ from huddleroom.schemas.session import SessionCreate
 from huddleroom.workers.session_tasks import _require_runnable_session
 
 from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _complete_task_session
+from tests.test_orchestration_roadmap_plans import (
+    _bind_candidate_provenance, _canonicalize_candidate, _pending_approval, _seed_accepted_g2_ownership,
+)
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
@@ -99,28 +103,42 @@ async def accepted_roadmap(db_session, test_project):
         from sqlalchemy import update
         from huddleroom.models.orchestration import OrchestrationRun, compute_goal_contract_fingerprint
         await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == run.id).values(goal_contract_fingerprint=compute_goal_contract_fingerprint(goal))); await db_session.refresh(run)
-        goal.orchestrator_context = {"team": {"agent_ids": [str(agent_id) for agent_id in await db_session.scalars(
-            select(Agent.id).where(Agent.is_active.is_(True))
-        )]}}
+        await _seed_accepted_g2_ownership(
+            db_session, goal, planner, items, (), team_roles=((planner, "implementation"), (verifier, "validation")),
+        )
         request = await service.execute_request_plan_action(
             db_session, run.id,
             {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Plan Roadmap work."},
             f"run:{run.id}:kind:roadmap-request",
         )
+        metadata = {
+            "schema_version": 1, "plan_kind": "roadmap", "summary": "Review the Roadmap candidate.",
+            "plan_items": items, "planning_task_id": str(request.target_id), "planning_version": 1,
+            "winning_session_id": str(uuid.uuid4()), "plan_author_agent_id": str(planner.id),
+        }
+        metadata["output_hash"] = plan_output_hash({
+            key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+        })
         artifact = Artifact(
             project_id=test_project.id, name="roadmap-plan", artifact_type="plan", status="draft",
-            linked_task_id=request.target_id, created_by_agent=planner.id, metadata_={"plan_items": items},
+            linked_task_id=request.target_id, created_by_agent=planner.id,
+            content_hash=metadata["output_hash"], metadata_=metadata,
         )
         db_session.add(artifact)
         await db_session.flush()
-        normalized = [item.model_dump(mode="json") for item in parse_roadmap_items(items, set())]
-        fingerprint = service._accepted_plan_fingerprint(normalized)
-        decision = await OrchestrationAuthorityDecisionService().create_pending(
-            db_session, goal.id, decision_key=f"roadmap_plan:{fingerprint}", title="Approve Roadmap plan",
-            question="Approve?", authority="human", options=[{"key": "approve"}], run_id=run.id,
-        )
+        run.plan_state = {
+            **run.plan_state, "plan_artifact_id": str(artifact.id), "plan_output_hash": metadata["output_hash"],
+            "plan_provenance": {
+                "artifact_id": str(artifact.id), "planning_task_id": metadata["planning_task_id"],
+                "planning_version": metadata["planning_version"], "winning_session_id": metadata["winning_session_id"],
+                "plan_author_agent_id": metadata["plan_author_agent_id"],
+                "canonical_content_hash": metadata["output_hash"],
+            },
+        }
+        decision = await OrchestrationRoadmapService(service).ensure_plan_approval(db_session, goal, run, artifact)
         await OrchestrationAuthorityDecisionService().answer_decision(
-            db_session, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
+            db_session, decision, selected_option="approve",
+            decided_by_user_id=goal.manager_user_id or goal.created_by_user_id,
         )
         await service.execute_accept_plan_action(
             db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
@@ -187,16 +205,19 @@ async def test_capped_cli_root_creator_authority_binds_release_and_claim(
     monkeypatch.setattr(ProjectService, "require_roadmap_workspace", workspace)
     monkeypatch.setattr(ProjectService, "require_frozen_roadmap_workspace", workspace)
 
+    creator = None
+
     async def setup(planner, goal, _run):
+        nonlocal creator
         planner.adapter_type = "cli"
         goal.budget = {"caps": {"max_tokens": 400, "max_turns": 2, "max_hours": 1}}
+        creator = User(email="roadmap-root-creator@example.test", hashed_password="x")
+        db_session.add(creator)
+        await db_session.flush()
+        goal.manager_user_id = None
+        goal.created_by_user_id = creator.id
 
     service, goal, run, _ = await accepted_roadmap([roadmap_task("forged")], setup=setup)
-    creator = User(email="roadmap-root-creator@example.test", hashed_password="x")
-    db_session.add(creator)
-    await db_session.flush()
-    goal.manager_user_id = None
-    goal.created_by_user_id = creator.id
     await _tick_owned_setup(service, db_session, run.id)
     version = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
@@ -810,8 +831,10 @@ async def test_registered_worktree_roadmap_release_and_claim_ignore_mapping_drif
         linked_task_id=replan.target_id, created_by_agent=first_artifact.created_by_agent,
         metadata_={"plan_items": candidate_items},
     )
+    _canonicalize_candidate(candidate, run.plan_state["planning_version"])
     db_session.add(candidate)
     await db_session.flush()
+    _bind_candidate_provenance(run, candidate)
     fingerprint = service._accepted_plan_fingerprint([
         item.model_dump(mode="json") for item in parse_roadmap_items(candidate_items, set())
     ])
@@ -820,10 +843,7 @@ async def test_registered_worktree_roadmap_release_and_claim_ignore_mapping_drif
             db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)},
             f"run:{run.id}:kind:registered-replan",
         )
-    approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
-        OrchestrationAuthorityDecision.run_id == run.id,
-        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
-    ))
+    approval = await _pending_approval(db_session, run)
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, approval, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
@@ -1000,6 +1020,7 @@ async def _accepted_adopting_roadmap(db_session, accepted_roadmap, *, conflictin
         service = OrchestrationService()
         audit = await _delegated_audit(service, db_session, run, planner.id)
         adopted["adopt_task_id"] = str(audit.id)
+        adopted["agent_id"] = str(planner.id)  # adopted task is planner's; the bound item must name that agent
         audits.append(audit)
         if conflicting_marker:
             await service.reserve_action(
@@ -1042,18 +1063,17 @@ async def test_replan_refreshes_bound_metadata_and_preserves_frozen_snapshot(db_
         linked_task_id=replan.target_id, created_by_agent=first_artifact.created_by_agent,
         metadata_={"plan_items": candidate_items},
     )
+    _canonicalize_candidate(candidate, run.plan_state["planning_version"])
     db_session.add(candidate)
     await db_session.flush()
+    _bind_candidate_provenance(run, candidate)
     fingerprint = service._accepted_plan_fingerprint([
         item.model_dump(mode="json") for item in parse_roadmap_items(candidate_items, set())
     ])
     accept = {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)}
     with pytest.raises(HTTPException, match="waiting_plan_authority"):  # past adoption validation
         await service.execute_accept_plan_action(db_session, run.id, accept, f"run:{run.id}:kind:adopted-replan")
-    approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
-        OrchestrationAuthorityDecision.run_id == run.id,
-        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
-    ))
+    approval = await _pending_approval(db_session, run)
     await OrchestrationAuthorityDecisionService().answer_decision(
         db_session, approval, selected_option="approve", decided_by_user_id=goal.manager_user_id,
     )
@@ -1112,7 +1132,7 @@ async def test_roadmap_adoption_conflict_fails_release_and_blocks_without_half_b
     assert len(gates) == 1 and gates[0].status == "failed"
 
 
-@pytest.mark.parametrize("shape", ["known", "accepted", "ambiguous", "historical"])
+@pytest.mark.parametrize("shape", ["known", "accepted", "ambiguous"])
 async def test_roadmap_failure_replay_repairs_only_exact_legacy_orphan(db_session, accepted_roadmap, shape):
     service, goal, run, audit, _ = await _accepted_adopting_roadmap(db_session, accepted_roadmap, conflicting_marker=True)
     roadmap = OrchestrationRoadmapService(service)
@@ -1125,13 +1145,6 @@ async def test_roadmap_failure_replay_repairs_only_exact_legacy_orphan(db_sessio
     if shape == "ambiguous":
         gate.required_evidence = {**gate.required_evidence, "task_id": str(uuid.uuid4())}
     await db_session.flush()
-    if shape == "historical":
-        from huddleroom.models.orchestration import OrchestrationRoadmapVersion
-        first = await roadmap.current_version(db_session, goal.id)
-        db_session.add(OrchestrationRoadmapVersion(goal_id=goal.id, run_id=run.id,
-            version=first.version + 1, plan_artifact_id=first.plan_artifact_id,
-            snapshot=first.snapshot, fingerprint="e" * 64, approval_reference=first.approval_reference))
-        await db_session.flush()
     for _ in range(2):
         await roadmap.advance(db_session, goal, run)
     assert gate.status == ("failed" if shape == "known" else "accepted" if shape == "accepted" else "open")

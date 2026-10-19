@@ -1374,6 +1374,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
 
   const detail = query.data
   const decisionFocusId = location.hash.match(/^#decision-(.+)$/)?.[1] ?? null
+  const planReviewArtifactId = location.hash.match(/^#plan-review-(.+)$/)?.[1] ?? null
   const decisionNavigation = decisionFocusId
     && !baseline.processes.isLoading
     && !baseline.decisions.isLoading
@@ -1888,6 +1889,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           debug={debug}
           decisionFocusId={decisionFocusId}
           decisionNavigation={decisionNavigation}
+          planReviewArtifactId={planReviewArtifactId}
           taskTitles={Object.fromEntries((tasksQuery.items ?? []).map((task) => [task.id, task.title]))}
           agentRoles={Object.fromEntries([...agentsById].map(([id, agent]) => [id, agent.role]))}
           goalPlanContent={<>
@@ -2050,14 +2052,19 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           const focusTarget = startButton.current ?? goalHeader.current
           focusTarget?.focus()
         }}
-        onConfirm={() => {
+        onConfirm={(scope) => {
           const owner: MutationOwner = 'start'
           if (!acquireMutation(owner)) return
           setStartError(null)
-          start.mutate({ goalId }, {
+          start.mutate({ goalId, input: run ? {
+            scope,
+            runId: run.id,
+            expectedControlVersion: run.control_version ?? 0,
+            requestId: crypto.randomUUID(),
+          } : undefined }, {
             onSuccess: () => {
               setStartDialogOpen(false)
-              setMessage('Work started.')
+              setMessage(scope === 'planning_only' ? 'Plan review started. Start implementation later after acceptance.' : 'Work started.')
               setLastMessageOwner(owner)
             },
             onError: (error) => setStartError(error),

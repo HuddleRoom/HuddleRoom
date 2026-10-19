@@ -739,7 +739,7 @@ async def test_api_adapter_invocation_uses_task_source_before_extra_context(monk
     agent = SimpleNamespace(
         id=agent_id, name="Ada", role="developer", model="model", provider="openai", config={}, system_prompt=None
     )
-    task = SimpleNamespace(id=task_id, project_id=project_id, title="Ship", description="Now")
+    task = SimpleNamespace(id=task_id, project_id=project_id, title="Ship", description="Now", metadata_={})
     db = SimpleNamespace(
         execute=AsyncMock(side_effect=[
             SimpleNamespace(scalar_one_or_none=lambda: session),

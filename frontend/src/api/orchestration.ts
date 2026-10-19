@@ -478,10 +478,17 @@ export function postOrchestrationGoalCommand(
   })
 }
 
-export function startOrchestrationGoal(projectId: string, goalId: string) {
+export interface OrchestrationStartInput {
+  scope: 'planning_only' | 'execution'
+  runId: string
+  expectedControlVersion: number
+  requestId: string
+}
+
+export function startOrchestrationGoal(projectId: string, goalId: string, input?: OrchestrationStartInput) {
   return apiFetch<OrchestrationGoalDetail>(`${root(projectId)}/${goalId}/start`, {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(input ? { scope: input.scope, run_id: input.runId, expected_control_version: input.expectedControlVersion, request_id: input.requestId } : {}),
   })
 }
 
@@ -912,7 +919,7 @@ export function useOrchestrationGoalCommand(projectId: string | null) {
 export function useStartOrchestrationGoal(projectId: string | null) {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ goalId }: { goalId: string }) => startOrchestrationGoal(projectId!, goalId),
+    mutationFn: ({ goalId, input }: { goalId: string; input?: OrchestrationStartInput }) => startOrchestrationGoal(projectId!, goalId, input),
     onSuccess: (detail, { goalId }) => syncOrchestrationGoalCache(queryClient, projectId, goalId, detail),
   })
 }
@@ -1042,7 +1049,7 @@ export function useDismissOrchestrationSteeringProposal(projectId: string | null
 
 export const projectChatKey = (projectId: string | null) => ['project-chat', projectId] as const
 export interface ProjectChatSubmitInput {
- clientRequestId: string; content: string; contextGoalId?: string | null; actionId?: string | null
+ clientRequestId: string; content: string; contextGoalId?: string | null; actionId?: string | null; startScope?: 'planning_only' | 'execution' | null
 }
 export function fetchProjectChat(projectId: string) {
  return apiFetch<import('@/lib/types').ProjectChatHistory>(`/api/v1/projects/${projectId}/orchestration/chat`)
@@ -1050,7 +1057,8 @@ export function fetchProjectChat(projectId: string) {
 export function submitProjectChat(projectId: string, input: ProjectChatSubmitInput) {
  return apiFetch<import('@/lib/types').ProjectChatTurn>(`/api/v1/projects/${projectId}/orchestration/chat`, {
  method: 'POST', body: JSON.stringify({ client_request_id: input.clientRequestId, content: input.content,
- context_goal_id: input.contextGoalId ?? null, action_id: input.actionId ?? null }),
+ context_goal_id: input.contextGoalId ?? null, action_id: input.actionId ?? null,
+ ...(input.startScope ? { start_scope: input.startScope } : {}) }),
  })
 }
 export function useProjectChat(projectId: string | null) {

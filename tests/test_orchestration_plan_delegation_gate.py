@@ -26,12 +26,15 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate, planning_envelope_report_schema
 from huddleroom.schemas.task import TaskCreate
 from huddleroom.services.orchestration_decision_validator import validate_orchestration_decision
+from huddleroom.services.orchestration_plan_review import PlanReviewService
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.task_service import TaskService
 
 
 from tests.conftest import adopt_session
 from tests.conftest import bind_plan_author_team as _bind_team
+from tests.test_orchestration_roadmap_plans import _seed_accepted_g2_ownership
+from tests.test_orchestration_runtime_e2e import _canonicalize_plan_candidate
 
 
 async def _complete_goal_definition(db_session, goal, run):
@@ -113,6 +116,17 @@ def _accepted_plan_metadata() -> dict:
             "success_criterion_keys": ["plan"],
         }],
     }
+
+
+async def _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact):
+    """Give direct positive artifacts the same bindings as ingested output."""
+    for item in artifact.metadata_["plan_items"]:
+        if isinstance(item, dict) and item.get("unit_type") != "goal" and item.get("owner_type") != "human":
+            item.setdefault("agent_id", str(planner.id))
+    task = await db_session.get(Task, request_action.target_id)
+    await _canonicalize_plan_candidate(db_session, run, task, artifact)
+    await _seed_accepted_g2_ownership(db_session, goal, planner, artifact.metadata_["plan_items"], ())
+    await PlanReviewService().ensure(db_session, goal, run, artifact)
 
 
 async def _single_plan_gate(db_session, run_id):
@@ -1179,7 +1193,7 @@ async def test_execute_request_plan_revision_action_rejects_revision_after_accep
     planner = _agent("planner")
     db_session.add(planner)
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -1197,6 +1211,7 @@ async def test_execute_request_plan_revision_action_rejects_revision_after_accep
     )
     db_session.add(artifact)
     await db_session.flush()
+    await _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact)
     await service.execute_accept_plan_action(
         db_session,
         run_id=run.id,
@@ -1285,7 +1300,7 @@ async def test_execute_request_plan_revision_action_replay_after_acceptance_fail
     planner = _agent("planner")
     db_session.add(planner)
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -1314,6 +1329,7 @@ async def test_execute_request_plan_revision_action_replay_after_acceptance_fail
     )
     db_session.add(artifact)
     await db_session.flush()
+    await _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact)
     await service.execute_accept_plan_action(
         db_session,
         run_id=run.id,
@@ -1433,7 +1449,7 @@ async def test_execute_accept_plan_action_accepts_artifact_and_plan_gate(db_sess
     planner = _agent("planner")
     db_session.add(planner)
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -1451,6 +1467,7 @@ async def test_execute_accept_plan_action_accepts_artifact_and_plan_gate(db_sess
     )
     db_session.add(artifact)
     await db_session.flush()
+    await _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact)
 
     first = await service.execute_accept_plan_action(
         db_session,
@@ -1983,6 +2000,7 @@ async def test_execute_request_plan_revision_action_replay_failure_persists_afte
             )
             setup_db.add(artifact)
             await setup_db.flush()
+            await _prepare_valid_plan_candidate(setup_db, goal, run, request_action, planner, artifact)
             await service.execute_accept_plan_action(
                 setup_db,
                 run_id=run.id,
@@ -2166,6 +2184,7 @@ async def test_request_plan_revision_replay_failure_survives_caller_rollback(db_
     )
     db_session.add(artifact)
     await db_session.flush()
+    await _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact)
     await service.execute_accept_plan_action(
         db_session,
         run_id=run.id,
@@ -2336,7 +2355,7 @@ async def test_execute_accept_plan_action_adds_direct_evidence_when_event_linked
     planner = _agent("planner")
     db_session.add(planner)
     await db_session.flush()
-    service, _, run = await _make_run(db_session, test_project.id)
+    service, goal, run = await _make_run(db_session, test_project.id)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -2354,6 +2373,7 @@ async def test_execute_accept_plan_action_adds_direct_evidence_when_event_linked
     )
     db_session.add(artifact)
     await db_session.flush()
+    await _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact)
     gate = await _single_plan_gate(db_session, run.id)
     event = EventLog(
         project_id=test_project.id,
@@ -2423,7 +2443,7 @@ async def _accepted_run(db_session, project_id):
     planner = _agent("planner")
     db_session.add(planner)
     await db_session.flush()
-    service, _, run = await _make_run(db_session, project_id)
+    service, goal, run = await _make_run(db_session, project_id)
     request_action = await service.execute_request_plan_action(
         db_session, run_id=run.id, request=_plan_request(planner.id),
         idempotency_key="run:replay:kind:request_plan",
@@ -2435,6 +2455,7 @@ async def _accepted_run(db_session, project_id):
     )
     db_session.add(artifact)
     await db_session.flush()
+    await _prepare_valid_plan_candidate(db_session, goal, run, request_action, planner, artifact)
     first = await service.execute_accept_plan_action(
         db_session, run_id=run.id,
         request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},

@@ -227,6 +227,13 @@ async def test_spr213_startup_resume_periodic_effects_are_serialized(
     audit_task = await db_session.get(Task, audit_action.target_id)
     await TaskService().auto_start(db_session, audit_task)
     assert len(list(await db_session.scalars(select(Session).where(Session.task_id == audit_task.id)))) == 1
+    from tests.conftest import bind_plan_author_team
+    from tests.test_orchestration_runtime_e2e import _plan_ownership_source
+
+    await bind_plan_author_team(
+        db_session, goal, planner, team_goal=await _plan_ownership_source(db_session, goal),
+        role_agents={"planning": planner, "investigation": auditor},
+    )
     await _seed_accepted_plan(db_session, test_project, service, run, planner, plan_items=[{
         "id": "audit-0", "work_function": "investigation", "scope": "Audit the existing work.",
         "deliverable": "Concrete audit findings.", "why_runnable": "Already running.",

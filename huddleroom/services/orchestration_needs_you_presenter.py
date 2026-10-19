@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.agent import Agent
+from huddleroom.models.artifact import Artifact
 from huddleroom.models.meeting import Meeting
 from huddleroom.models.orchestration import (
     OrchestrationAction,
@@ -26,11 +27,12 @@ from huddleroom.schemas.orchestration import (
     NeedsYouReference,
     NeedsYouReferenceKind,
     OrchestrationAuthorityDecisionResponse,
+    PlanReviewRecord,
     OrchestrationWarningResponse,
 )
 
 _QUERY_CHUNK_SIZE = 500
-_TARGET_KINDS = frozenset(("task", "meeting", "agent", "goal", "gate", "process", "action"))
+_TARGET_KINDS = frozenset(("task", "meeting", "agent", "goal", "gate", "process", "action", "artifact"))
 _RECOVERY_EVIDENCE_KINDS = frozenset(("action", "task", "gate", "process", "agent"))
 _PROCESS_LABELS = {
     "goal_definition": "Goal definition",
@@ -47,6 +49,7 @@ class NeedsYouReferenceRequest:
     kind: NeedsYouReferenceKind
     id: uuid.UUID
     goal_id: uuid.UUID | None = None
+    run_id: uuid.UUID | None = None
 
 
 def _chunks(values: Sequence[uuid.UUID]) -> Iterable[Sequence[uuid.UUID]]:
@@ -71,7 +74,11 @@ def _criterion_label(goal: OrchestrationGoal, gate: OrchestrationGate) -> str:
 
 
 def _dedupe_requests(requests: Sequence[NeedsYouReferenceRequest]) -> list[NeedsYouReferenceRequest]:
-    return list({(request.kind, request.id): request for request in requests}.values())
+    return list({_reference_key(request): request for request in requests}.values())
+
+
+def _reference_key(request: NeedsYouReferenceRequest) -> tuple[str, uuid.UUID, uuid.UUID | None]:
+    return request.kind, request.id, request.run_id if request.kind == "artifact" else None
 
 
 def _action_related_requests(
@@ -79,7 +86,10 @@ def _action_related_requests(
 ) -> list[NeedsYouReferenceRequest]:
     related: list[NeedsYouReferenceRequest] = []
     if action.target_type in _TARGET_KINDS and action.target_id is not None:
-        related.append(NeedsYouReferenceRequest(action.target_type, action.target_id, goal_id))
+        related.append(NeedsYouReferenceRequest(
+            action.target_type, action.target_id, goal_id,
+            action.run_id if action.target_type == "artifact" else None,
+        ))
     return related
 
 
@@ -90,10 +100,10 @@ async def resolve_needs_you_references(
     requests: Sequence[NeedsYouReferenceRequest],
 ) -> list[NeedsYouReference]:
     """Resolve explicitly typed references without exposing foreign record labels."""
-    ordered: dict[tuple[str, uuid.UUID], NeedsYouReferenceRequest] = {}
+    ordered: dict[tuple[str, uuid.UUID, uuid.UUID | None], NeedsYouReferenceRequest] = {}
     for request in requests:
-        ordered.setdefault((request.kind, request.id), request)
-    labels: dict[tuple[str, uuid.UUID], tuple[str, uuid.UUID | None]] = {}
+        ordered.setdefault(_reference_key(request), request)
+    labels: dict[tuple[str, uuid.UUID, uuid.UUID | None], tuple[str, uuid.UUID | None]] = {}
 
     action_requests = [request for request in ordered.values() if request.kind == "action"]
     for chunk in _chunks([request.id for request in action_requests]):
@@ -104,10 +114,10 @@ async def resolve_needs_you_references(
             .where(OrchestrationAction.id.in_(chunk), OrchestrationGoal.project_id == project_id)
         )
         for action, goal_id in rows.all():
-            labels[("action", action.id)] = (action.action_type, goal_id)
+            labels[("action", action.id, None)] = (action.action_type, goal_id)
             for related in _action_related_requests(action, goal_id):
                 ordered.setdefault(
-                    (related.kind, related.id), related,
+                    _reference_key(related), related,
                 )
 
     by_kind: dict[str, list[NeedsYouReferenceRequest]] = {}
@@ -117,12 +127,12 @@ async def resolve_needs_you_references(
 
     for chunk in _chunks([request.id for request in by_kind.get("task", [])]):
         for row in (await db.scalars(select(Task).where(Task.id.in_(chunk), Task.project_id == project_id))).all():
-            labels[("task", row.id)] = (row.title, None)
+            labels[("task", row.id, None)] = (row.title, None)
     for chunk in _chunks([request.id for request in by_kind.get("meeting", [])]):
         for row in (await db.scalars(
             select(Meeting).where(Meeting.id.in_(chunk), Meeting.project_id == project_id)
         )).all():
-            labels[("meeting", row.id)] = (row.title, None)
+            labels[("meeting", row.id, None)] = (row.title, None)
     agent_requests = by_kind.get("agent", [])
     agent_goal_ids = {request.goal_id for request in agent_requests if request.goal_id is not None}
     authorized_goal_ids: set[uuid.UUID] = set()
@@ -135,14 +145,14 @@ async def resolve_needs_you_references(
     authorized_agent_ids = [request.id for request in agent_requests if request.goal_id in authorized_goal_ids]
     for chunk in _chunks(authorized_agent_ids):
         for row in (await db.scalars(select(Agent).where(Agent.id.in_(chunk)))).all():
-            labels[("agent", row.id)] = (row.name, None)
+            labels[("agent", row.id, None)] = (row.name, None)
     for chunk in _chunks([request.id for request in by_kind.get("goal", [])]):
         for row in (await db.scalars(
             select(OrchestrationGoal).where(
                 OrchestrationGoal.id.in_(chunk), OrchestrationGoal.project_id == project_id,
             )
         )).all():
-            labels[("goal", row.id)] = (row.objective, row.id)
+            labels[("goal", row.id, None)] = (row.objective, row.id)
     for chunk in _chunks([request.id for request in by_kind.get("process", [])]):
         rows = await db.execute(
             select(OrchestrationProcessRun, OrchestrationGoal.id)
@@ -150,7 +160,7 @@ async def resolve_needs_you_references(
             .where(OrchestrationProcessRun.id.in_(chunk), OrchestrationGoal.project_id == project_id)
         )
         for row, goal_id in rows.all():
-            labels[("process", row.id)] = (_PROCESS_LABELS.get(row.process_type, row.process_type), goal_id)
+            labels[("process", row.id, None)] = (_PROCESS_LABELS.get(row.process_type, row.process_type), goal_id)
     for chunk in _chunks([request.id for request in by_kind.get("gate", [])]):
         rows = await db.execute(
             select(OrchestrationGate, OrchestrationGoal)
@@ -159,7 +169,23 @@ async def resolve_needs_you_references(
             .where(OrchestrationGate.id.in_(chunk), OrchestrationGoal.project_id == project_id)
         )
         for gate, goal in rows.all():
-            labels[("gate", gate.id)] = (_criterion_label(goal, gate), goal.id)
+            labels[("gate", gate.id, None)] = (_criterion_label(goal, gate), goal.id)
+
+    for request in by_kind.get("artifact", []):
+        if request.goal_id is None or request.run_id is None:
+            continue
+        artifact = await db.get(Artifact, request.id)
+        run = await db.get(OrchestrationRun, request.run_id)
+        if artifact is None or artifact.project_id != project_id or run is None or run.goal_id != request.goal_id:
+            continue
+        raw = (run.plan_state or {}).get("plan_reviews", {}).get(str(artifact.id))
+        try:
+            record = PlanReviewRecord.model_validate(raw)
+        except (TypeError, ValueError):
+            continue
+        if (record.identity.project_id == project_id and record.identity.goal_id == request.goal_id
+                and record.identity.run_id == run.id and record.identity.artifact_id == artifact.id):
+            labels[("artifact", artifact.id, run.id)] = (artifact.name, request.goal_id)
 
     return [
         NeedsYouReference(
@@ -280,14 +306,14 @@ async def attach_warning_references(
 
 
 def typed_blocker_reference_requests(
-    blockers: Sequence[object], *, goal_id: uuid.UUID,
+    blockers: Sequence[object], *, goal_id: uuid.UUID, run_id: uuid.UUID | None = None,
 ) -> list[NeedsYouReferenceRequest]:
     requests: list[NeedsYouReferenceRequest] = []
-    fields: tuple[tuple[str, NeedsYouReferenceKind], ...] = (("task_id", "task"), ("gate_id", "gate"))
+    fields: tuple[tuple[str, NeedsYouReferenceKind], ...] = (("task_id", "task"), ("gate_id", "gate"), ("artifact_id", "artifact"))
     for blocker in blockers:
         if not isinstance(blocker, dict):
             continue
         for field, kind in fields:
             if (record_id := _uuid(blocker.get(field))) is not None:
-                requests.append(NeedsYouReferenceRequest(kind, record_id, goal_id))
+                requests.append(NeedsYouReferenceRequest(kind, record_id, goal_id, run_id if kind == "artifact" else None))
     return requests

@@ -1,6 +1,6 @@
 import React, { act } from 'react'
 import { describe, expect, it, vi } from 'vitest'
-import { descendants, getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
+import { changeControl, descendants, getButton, getByLabel, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import { ApiError } from '@/lib/api-client'
 import type { OrchestrationAuthorization, OrchestrationGoal } from '@/lib/types'
 
@@ -35,6 +35,21 @@ function renderDialog(overrides: Partial<React.ComponentProps<typeof StartWorkDi
 }
 
 describe('StartWorkDialog', () => {
+  it('makes the selected planning or implementation scope explicit before Start', async () => {
+    const onConfirm = vi.fn()
+    const view = await mountWithTestDom(() => renderDialog({ onConfirm, initialScope: 'planning_only' }), act)
+    try {
+      expect(textOf(view.document.body)).toContain('Plan only — review and verify the candidate. Implementation needs a later Start.')
+      expect(getByLabel(view.document.body, 'Plan only').checked).toBe(true)
+      const scopes = descendants(view.document.body).filter((node) => node.tagName === 'INPUT' && node.name === 'start-scope')
+      await act(async () => changeControl(scopes[1], true))
+      await act(async () => getButton(view.document.body, 'Start work').click())
+      expect(onConfirm).toHaveBeenCalledWith('execution')
+    } finally {
+      view.cleanup()
+    }
+  })
+
   it('shows the goal start summary and confirms once', async () => {
     const onConfirm = vi.fn()
     const view = await mountWithTestDom(() => renderDialog({ onConfirm }), act)

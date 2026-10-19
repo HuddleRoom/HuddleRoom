@@ -8,9 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.event_log import EventLog
-from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate
+from huddleroom.models.orchestration import OrchestrationAction, OrchestrationGate, OrchestrationGoal
+from huddleroom.models.orchestration_process import OrchestrationProcessRun
 from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import OrchestrationGoalCreate, OrchestrationPlanItem
+from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
@@ -96,6 +98,109 @@ async def _run_rows(db_session, model, run_id, **filters):
     return list(result.scalars().all())
 
 
+async def _seed_accepted_g2_ownership(db_session, goal, planner, plan_items):
+    """Give the candidate the accepted G2 facts its executable rows require."""
+    agents = list((await db_session.scalars(select(Agent).where(Agent.is_active.is_(True)))).all())
+    by_id = {str(agent.id): agent for agent in agents}
+    roles = {"planning": str(planner.id)}
+    eligibility = {str(planner.id): ["planning"]}
+    coverage = [{
+        "responsibility_id": "planning", "work_function": "planning", "agent_ref": str(planner.id),
+        "status": "covered", "evidence_ref": "agent_review:accepted",
+    }]
+    for item in plan_items:
+        function = item.get("work_function", "").strip()
+        if not function or function in roles:
+            continue
+        agent_id = str(item.get("agent_id", "")).strip()
+        agent = by_id.get(agent_id) or next(
+            (candidate for candidate in agents if function in (candidate.capabilities or [])), None
+        )
+        if agent is None:
+            continue
+        roles[function] = str(agent.id)
+        eligibility.setdefault(str(agent.id), []).append(function)
+        coverage.append({
+            "responsibility_id": function, "work_function": function, "agent_ref": str(agent.id),
+            "status": "covered", "evidence_ref": "agent_review:accepted",
+        })
+    team = {
+        "role_to_agent": roles,
+        "approval": "approve",
+        "approval_decision_id": str(uuid.uuid4()),
+        "gates": {"team_structure_reviewed": True},
+        "accepted_responsibility_gap_ids": [],
+        "responsibility_coverage": coverage,
+    }
+    goal.orchestrator_context = {**(goal.orchestrator_context or {}), "team": team}
+    for process_type, outputs in (
+        ("agent_definition_review", {"eligibility": eligibility}),
+        ("team_hierarchy", team),
+    ):
+        process = await db_session.scalar(select(OrchestrationProcessRun).where(
+            OrchestrationProcessRun.goal_id == goal.id,
+            OrchestrationProcessRun.process_type == process_type,
+            OrchestrationProcessRun.superseded_by_id.is_(None),
+        ))
+        if process is None:
+            process = OrchestrationProcessRun(
+                goal_id=goal.id, process_type=process_type, status="completed", trigger_reason="test",
+            )
+            db_session.add(process)
+        process.status = "completed"
+        process.outputs = {**(process.outputs or {}), **outputs}
+        process.skipped_by = None
+        process.superseded_by_id = None
+    await db_session.flush()
+
+
+async def _candidate_artifact(db_session, project_id, run, planner, request_action, name, plan_items):
+    normalized = OrchestrationService()._plan_items_from_raw(plan_items)
+    envelope = {
+        "schema_version": 1,
+        "plan_kind": "implementation",
+        "summary": "Implement the accepted plan.",
+        "plan_items": [item.model_dump(mode="json") for item in normalized],
+    }
+    output_hash = plan_output_hash(envelope)
+    artifact = Artifact(
+        project_id=project_id,
+        name=name,
+        artifact_type="plan",
+        status="draft",
+        linked_task_id=request_action.target_id,
+        created_by_agent=planner.id,
+        content_hash=output_hash,
+        metadata_={
+            "kind": "implementation_plan",
+            "source": "planning_output_ingestion",
+            **envelope,
+            "output_hash": output_hash,
+            "winning_session_id": str(uuid.uuid4()),
+            "planning_task_id": str(request_action.target_id),
+            "planning_version": run.plan_state["planning_version"],
+            "plan_author_agent_id": str(planner.id),
+        },
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    run.plan_state = {
+        **run.plan_state,
+        "plan_artifact_id": str(artifact.id),
+        "plan_output_hash": output_hash,
+        "plan_provenance": {
+            "artifact_id": str(artifact.id),
+            "planning_task_id": str(request_action.target_id),
+            "planning_version": run.plan_state["planning_version"],
+            "winning_session_id": artifact.metadata_["winning_session_id"],
+            "plan_author_agent_id": str(planner.id),
+            "canonical_content_hash": output_hash,
+        },
+    }
+    await db_session.flush()
+    return artifact
+
+
 async def _make_accepted_plan(db_session, project_id, planner: Agent, plan_items: list[dict]):
     service, goal, run = await _make_run(db_session, project_id)
     request_action = await service.execute_request_plan_action(
@@ -109,17 +214,10 @@ async def _make_accepted_plan(db_session, project_id, planner: Agent, plan_items
         },
         idempotency_key="run:phase12:kind:request_plan",
     )
-    artifact = Artifact(
-        project_id=project_id,
-        name="expansion-plan",
-        artifact_type="plan",
-        status="draft",
-        linked_task_id=request_action.target_id,
-        created_by_agent=planner.id,
-        metadata_={"kind": "implementation_plan", "plan_items": plan_items},
+    await _seed_accepted_g2_ownership(db_session, goal, planner, plan_items)
+    artifact = await _candidate_artifact(
+        db_session, project_id, run, planner, request_action, "expansion-plan", plan_items
     )
-    db_session.add(artifact)
-    await db_session.flush()
     await service.execute_accept_plan_action(
         db_session,
         run_id=run.id,
@@ -553,39 +651,36 @@ async def test_expand_plan_item_without_agent_id_uses_strong_roster_fit(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_expand_accepted_plan_rolls_back_when_roster_fit_is_weak(db_session, test_project):
+async def test_accept_plan_rejects_item_without_an_accepted_roster_owner(db_session, test_project):
     planner = _agent("planner", role="planner", capabilities=["planning"])
     developer = _agent("developer", role="developer", capabilities=["implementation"])
     db_session.add_all([planner, developer])
     await db_session.flush()
-    service, _, run, _ = await _make_accepted_plan(
+    service, goal, run = await _make_run(db_session, test_project.id)
+    request_action = await service.execute_request_plan_action(
         db_session,
-        test_project.id,
-        planner,
-        [
-            _raw_plan_item(
-                agent_id=developer.id,
-                item_id="implement-api",
-                work_function="implementation",
-            ),
-            {
-                **_raw_plan_item(
-                    agent_id=None,
-                    item_id="missing-validation",
-                    work_function="validation",
-                ),
-                "required_capabilities": [" validation "],
-            },
-        ],
+        run.id,
+        {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Plan."},
+        f"run:{run.id}:kind:request_plan:missing-validation",
     )
+    items = [
+        _raw_plan_item(agent_id=developer.id, item_id="implement-api", work_function="implementation"),
+        {**_raw_plan_item(agent_id=None, item_id="missing-validation", work_function="validation"),
+         "required_capabilities": [" validation "]},
+    ]
+    await _seed_accepted_g2_ownership(db_session, goal, planner, items)
+    artifact = await _candidate_artifact(db_session, test_project.id, run, planner, request_action, "weak-roster", items)
     run_id = run.id
     project_id = test_project.id
 
     with pytest.raises(HTTPException) as exc_info:
-        await service.expand_accepted_plan(db_session, run_id)
+        await service.execute_accept_plan_action(
+            db_session, run_id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+            f"run:{run_id}:kind:accept_plan:missing-validation",
+        )
 
     assert exc_info.value.status_code == 409
-    assert exc_info.value.detail == "No strong roster fit for plan item 'missing-validation'"
+    assert exc_info.value.detail == "Plan ownership is blocked: no accepted active agent for work_function 'validation'"
     assert await _run_rows(db_session, OrchestrationAction, run_id, action_type="expand_plan_item") == []
     assert await _run_rows(db_session, OrchestrationAction, run_id, action_type="create_delegation_task") == []
     assert await _run_rows(db_session, OrchestrationGate, run_id, gate_type="work_completed") == []
@@ -741,17 +836,12 @@ def _adopting_item(task_id, item_id="audit-api", **overrides) -> dict:
 
 
 async def _accept_with_items(db_session, project_id, service, run, planner, request_action, items):
-    artifact = Artifact(
-        project_id=project_id,
-        name="adoption-plan",
-        artifact_type="plan",
-        status="draft",
-        linked_task_id=request_action.target_id,
-        created_by_agent=planner.id,
-        metadata_={"kind": "implementation_plan", "plan_items": items},
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    assert goal is not None
+    await _seed_accepted_g2_ownership(db_session, goal, planner, items)
+    artifact = await _candidate_artifact(
+        db_session, project_id, run, planner, request_action, "adoption-plan", items
     )
-    db_session.add(artifact)
-    await db_session.flush()
     return await service.execute_accept_plan_action(
         db_session,
         run_id=run.id,
@@ -1127,6 +1217,51 @@ async def test_expanding_adopted_item_twice_binds_once(db_session, test_project)
 
 
 @pytest.mark.asyncio
+async def test_adopted_item_replays_from_a_fresh_session_without_new_effects(db_session, test_engine, test_project):
+    service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
+    first = await _expand(service, db_session, run, "audit-0")
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with sessions.begin() as replay_db:
+        persisted_goal = await replay_db.get(type(goal), goal.id)
+        persisted_run = await replay_db.get(type(run), run.id)
+        persisted_audit = await replay_db.get(Task, audit.id)
+        assert persisted_goal is not None and persisted_run is not None and persisted_audit is not None
+        replay = await _expand(OrchestrationService(), replay_db, persisted_run, "audit-0")
+        assert replay.id == first.id
+        assert persisted_audit.metadata_["orchestration_plan_item"]["agent_id"] is None
+        assert persisted_audit.assigned_to == audit.assigned_to
+        assert len(await _run_rows(replay_db, OrchestrationAction, persisted_run.id, action_type="adopt_task")) == 1
+        assert len(await _run_rows(replay_db, OrchestrationAction, persisted_run.id, action_type="expand_plan_item")) == 1
+        assert len(await _run_rows(replay_db, OrchestrationGate, persisted_run.id, gate_type="work_completed")) == 1
+
+
+@pytest.mark.asyncio
+async def test_frozen_adoption_owner_cannot_adopt_work_assigned_to_another_agent(db_session, test_project):
+    service, _, run, planner, developer, request_action, task = await _adoption_setup(db_session, test_project.id)
+    task.assigned_to = planner.id
+    await db_session.flush()
+    await _accept_with_items(
+        db_session, test_project.id, service, run, planner, request_action,
+        [_adopting_item(task.id, agent_id=str(planner.id))],
+    )
+    assert run.plan_state["accepted_plan_snapshot"]["items"][0]["agent_id"] == str(planner.id)
+    task.assigned_to = developer.id
+    await db_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _expand(service, db_session, run, "audit-api")
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail.startswith("adoption_invalid:")
+    assert await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task") == []
+    assert await _run_rows(db_session, OrchestrationAction, run.id, action_type="expand_plan_item") == []
+    assert await _run_rows(db_session, OrchestrationGate, run.id, gate_type="work_completed") == []
+    assert task.assigned_to == developer.id
+
+
+@pytest.mark.asyncio
 async def test_adoption_marker_for_another_item_conflicts(db_session, test_project):
     service, goal, run, (audit,) = await _adopted_audit_plan(db_session, test_project.id)
     await service.reserve_action(
@@ -1215,6 +1350,9 @@ async def test_unadopted_pre_plan_audit_must_be_explained_and_then_continues_unb
         idempotency_key="run:disposition:kind:request_plan_revision",
     )
     await finish_planning(f"Implement the API; audit {audit.id} keeps running as independent context.")
+    artifact = await db_session.get(Artifact, uuid.UUID(run.plan_state["plan_artifact_id"]))
+    assert artifact is not None
+    await _seed_accepted_g2_ownership(db_session, goal, planner, artifact.metadata_["plan_items"])
     await service.execute_accept_plan_action(
         db_session, run_id=run.id,
         request={"action_type": "accept_plan", "plan_artifact_id": run.plan_state["plan_artifact_id"]},
@@ -1254,7 +1392,7 @@ async def test_compatible_second_plan_refreshes_bound_task_without_rewriting_wor
     planner = await db_session.get(Agent, uuid.UUID(request_action.request["agent_id"]))
 
     # A replan: put the run back in the revision state a request_plan_revision would leave it in.
-    run.plan_state = {**run.plan_state, "status": "revision_requested"}
+    run.plan_state = {**run.plan_state, "status": "revision_requested", "planning_version": 2}
     await db_session.flush()
     # New plan metadata may refresh the stable binding.
     await _accept_with_items(
@@ -1276,7 +1414,7 @@ async def test_compatible_second_plan_refreshes_bound_task_without_rewriting_wor
     (marker,) = await _run_rows(db_session, OrchestrationAction, run.id, action_type="adopt_task")
     assert marker.request["plan_item_id"] == v1_request["plan_item_id"]
 
-    run.plan_state = {**run.plan_state, "status": "revision_requested"}
+    run.plan_state = {**run.plan_state, "status": "revision_requested", "planning_version": 3}
     await db_session.flush()
     # Different item id: the task is already bound to audit-0's gate, so acceptance rejects it.
     with pytest.raises(HTTPException) as exc_info:

@@ -13,6 +13,12 @@ async def _setup(db, project):
     run = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized", plan_state={"status": "accepted"})
     db.add(run)
     await db.flush()
+    # This isolated loop fixture models the unmarked pre-G3 authorization shape.
+    db.add(OrchestrationAction(
+        run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution",
+        action_type="authorize_execution", status="completed", request={},
+    ))
+    await db.flush()
     return goal, run
 
 

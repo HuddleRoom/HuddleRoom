@@ -403,10 +403,14 @@ async def test_auto_root_roadmap_plans_nested_roadmap_and_leaf_outcome_without_n
     assert (root_run.phase, root_run.status) == ("ready", "running")
     await service.start_run(db, project.id, root.id, actor="human:e2e")
     assert root_run.phase == "authorized"
-    await bind_plan_author_team(db, root, planner)
     await _team_context(db, root)
     root.weight = "trivial"  # keep the unrelated effectiveness analyzer deterministic
     await heal_baseline_drift_for_test(db, root, root_run)
+    # Bind after the heal: re-deriving the baseline supersedes the hierarchy this would otherwise publish.
+    await bind_plan_author_team(db, root, planner, role_agents={
+        "planning": planner, "implementation": builder, "investigation": auditor, "review": auditor,
+        "validation": verifier, "summarization": summarizer,
+    })
 
     root_audits = []
     for index, function in enumerate(("investigation", "review")):

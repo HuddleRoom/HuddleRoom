@@ -150,7 +150,7 @@ def test_tester_canonical_report_and_item_schemas_match_brief_literally():
         "criterion_progress": "dict[str,str]", "decisions": "list[str]", "risks": "list[str]",
         "open_questions": "list[str]", "next_step": "str", "collaboration_need": "str|null",
     }
-    new = {"adopt_task_id", "artifact_ids", "priority", "why_runnable"}
+    new = {"adopt_task_id", "artifact_ids", "priority", "why_runnable", "owner_type"}
     assert set(PLAN_ITEM_PROMPT_FIELDS) == {
         "id", "title", "work_function", "scope", "deliverable", "agent_id", "inputs", "forbidden_work",
         "success_evidence", "required_capabilities", "required_evidence", "success_criterion_keys", "depends_on",

@@ -26,7 +26,9 @@ from tests.test_orchestration_runtime_e2e import (
     _agent, _authorized_run, _complete_task_session, _run_actions, _seed_accepted_plan, _tasks_for_run,
 )
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService, parse_roadmap_items
+from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
 from huddleroom.services.orchestration_service import OrchestrationService
+from tests.test_orchestration_roadmap_plans import _seed_accepted_g2_ownership
 
 
 DONE_REPORT = json.dumps({"status": "done", "changes": ["Delivered."], "evidence": ["Delivered."], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None})  # a complete work report: no correction holds the verifier
@@ -123,21 +125,35 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, team_agent_ids=(), 
         {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Plan Roadmap work."},
         f"run:{run.id}:kind:mixed-roadmap-request",
     )
-    parent.orchestrator_context = {"team": {"agent_ids": [str(agent_id) for agent_id in (
-        team_agent_ids or await db.scalars(select(Agent.id).where(Agent.is_active.is_(True)))
-    )]}}
+    await _seed_accepted_g2_ownership(
+        db, parent, planner, items,
+        team_agent_ids or (await db.scalars(select(Agent.id).where(Agent.is_active.is_(True)))).all(),
+    )
+    metadata = {
+        "schema_version": 1, "plan_kind": "roadmap", "summary": "Review the Roadmap candidate.",
+        "plan_items": items, "planning_task_id": str(request.target_id), "planning_version": 1,
+        "winning_session_id": str(uuid.uuid4()), "plan_author_agent_id": str(planner.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
     artifact = Artifact(
         project_id=project.id, name="mixed-roadmap-plan", artifact_type="plan", status="draft",
-        linked_task_id=request.target_id, created_by_agent=planner.id, metadata_={"plan_items": items},
+        linked_task_id=request.target_id, created_by_agent=planner.id,
+        content_hash=metadata["output_hash"], metadata_=metadata,
     )
     db.add(artifact)
     await db.flush()
-    normalized = [item.model_dump(mode="json") for item in parse_roadmap_items(items, set(parent.budget["caps"]))]
-    fingerprint = service._accepted_plan_fingerprint(normalized)
-    decision = await OrchestrationAuthorityDecisionService().create_pending(
-        db, parent.id, decision_key=f"roadmap_plan:{fingerprint}", title="Approve Roadmap plan",
-        question="Approve?", authority="human", options=[{"key": "approve"}], run_id=run.id,
-    )
+    run.plan_state = {
+        **run.plan_state, "plan_artifact_id": str(artifact.id), "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": {
+            "artifact_id": str(artifact.id), "planning_task_id": metadata["planning_task_id"],
+            "planning_version": metadata["planning_version"], "winning_session_id": metadata["winning_session_id"],
+            "plan_author_agent_id": metadata["plan_author_agent_id"],
+            "canonical_content_hash": metadata["output_hash"],
+        },
+    }
+    decision = await OrchestrationRoadmapService(service).ensure_plan_approval(db, parent, run, artifact)
     await OrchestrationAuthorityDecisionService().answer_decision(
         db, decision, selected_option="approve", decided_by_user_id=parent.manager_user_id,
     )
@@ -261,13 +277,18 @@ async def _complete_child(db, project, roadmap, row, planner, producer, verifier
     child = await db.get(OrchestrationGoal, row.child_goal_id)
     child_run = await db.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     child.weight = "trivial"  # Fixture-only: avoid an unrelated human closeout decision.
+    child_items = [{
+        "id": "child-work", "work_function": "implementation", "scope": "Deliver the child outcome.",
+        "deliverable": "Independently verified child work.", "agent_id": str(producer.id),
+        "success_criterion_keys": ["local"],
+    }]
+    parent = await db.get(OrchestrationGoal, child.parent_goal_id)
+    await _seed_accepted_g2_ownership(
+        db, parent, planner, child_items, (),
+        team_roles=((producer, "implementation"), (verifier, "validation"), (summarizer, "summarization")),
+    )
     await _seed_accepted_plan(
-        db, project, service, child_run, planner,
-        [{
-            "id": "child-work", "work_function": "implementation", "scope": "Deliver the child outcome.",
-            "deliverable": "Independently verified child work.", "agent_id": str(producer.id),
-            "success_criterion_keys": ["local"],
-        }],
+        db, project, service, child_run, planner, child_items,
     )
     await finish_planning_tasks(db, child_run)
     assert (await service.tick(db, child_run.id))["authorized_execution"]["step"] == "release_work"
@@ -345,15 +366,13 @@ async def test_mixed_task_goal_task_graph_releases_in_gate_order(
     db_session, test_project, safe_effectiveness_review_continue,
 ):
     planner, producer, verifier, summarizer = await _child_actors(db_session)
-    build_agent = _agent("mixed-builder", ["implementation"])
-    db_session.add(build_agent)
-    await db_session.flush()
-    build = {**roadmap_task("build"), "agent_id": str(build_agent.id)}
+    # One owner per work_function: the child's implementation producer is also the parent's implementation owner.
+    build = {**roadmap_task("build"), "agent_id": str(producer.id)}
     rollout = {**child_item("rollout"), "depends_on": ["build"]}
-    docs = {**roadmap_task("docs", depends_on=["rollout"]), "agent_id": str(build_agent.id)}
+    docs = {**roadmap_task("docs", depends_on=["rollout"]), "agent_id": str(producer.id)}
     roadmap, parent, run, _ = await accepted_goal_roadmap(
         db_session, test_project, [build, rollout, docs],
-        team_agent_ids=[planner.id, producer.id, verifier.id, summarizer.id, build_agent.id],
+        team_agent_ids=[planner.id, producer.id, verifier.id, summarizer.id],
     )
     service = roadmap.orchestration
 
@@ -910,6 +929,26 @@ async def test_integration_gate_is_created_once_across_replay(
     )
     db_session.add(v2)
     await db_session.flush()
+    # Release requires approval keyed by the version's own fingerprint; reuse the accepted review identity.
+    accepted_decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id,
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_plan:%"),
+        OrchestrationAuthorityDecision.status == "answered",
+    ))
+    v2_approval = await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, parent.id, decision_key=f"roadmap_plan:{v2.fingerprint}:review:{accepted_decision.decision_key.rsplit(':', 1)[1]}",
+        title="Approve retained Roadmap version", question="Approve this retained Roadmap version?",
+        authority=accepted_decision.authority, authority_agent_id=accepted_decision.authority_agent_id,
+        options=[{"key": "approve"}, {"key": "reject"}], context=accepted_decision.context, run_id=run.id,
+    )
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, v2_approval, selected_option="approve", decided_by_user_id=parent.manager_user_id,
+    )
+    # Same for ownership: the retained item's owner is recorded as the accepted-plan binding would record it.
+    ownership = run.plan_state["accepted_plan_ownership"]
+    run.plan_state = {**run.plan_state, "accepted_plan_ownership": {
+        **ownership, "items": {**ownership["items"], "next": {"agent_id": str(builder.id), "work_function": "implementation"}},
+    }}
     await db_session.commit()  # Publish known scenario state before the native tick.
     assert (await roadmap.orchestration.tick(db_session, run.id))["authorized_execution"]["item_key"] == "next"
     next_row = await db_session.scalar(select(OrchestrationRoadmapItem).where(
@@ -993,7 +1032,8 @@ async def test_integration_gate_is_created_once_across_replay(
 async def test_integration_verifier_must_differ_from_every_item_producer(
     db_session, test_project, monkeypatch, safe_effectiveness_review_continue,
 ):
-    builders = (_agent("integration-producer-one", ["implementation"]), _agent("integration-producer-two", ["implementation"]))
+    # One owner per work_function: the two producers must own distinct functions.
+    builders = (_agent("integration-producer-one", ["implementation"]), _agent("integration-producer-two", ["investigation"]))
     verifier = _agent("integration-independent-verifier", ["validation"])
     db_session.add_all([*builders, verifier])
     await db_session.flush()
@@ -1007,11 +1047,26 @@ async def test_integration_verifier_must_differ_from_every_item_producer(
     await db_session.flush()
     roadmap, parent, run, version = await accepted_goal_roadmap(db_session, test_project, [
         {**roadmap_task("one", mutates_shared_state=False), "agent_id": str(builders[0].id)},
-        {**roadmap_task("two", mutates_shared_state=False), "agent_id": str(builders[1].id)},
+        {**roadmap_task("two", mutates_shared_state=False), "agent_id": str(builders[1].id), "work_function": "investigation"},
         child_item("managed-child"),
     ], budget_caps={"max_tokens": 2000, "max_turns": 40, "max_hours": 10},
        team_agent_ids=[*(agent.id for agent in builders), verifier.id, manager.id, *(agent.id for agent in actors)])
     parent.authority_model, parent.manager_user_id, parent.manager_agent_id = "agent_manager", None, manager.id
+    # Plan approval must come from the selected authority; re-approve the accepted plan as the agent manager.
+    accepted_decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id,
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_plan:%"),
+        OrchestrationAuthorityDecision.status == "answered",
+    ))
+    manager_approval = await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, parent.id, decision_key=accepted_decision.decision_key,
+        title="Approve Roadmap plan", question="Approve this immutable Roadmap plan version?",
+        authority="manager", authority_agent_id=manager.id,
+        options=[{"key": "approve"}, {"key": "reject"}], context=accepted_decision.context, run_id=run.id,
+    )
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, manager_approval, selected_option="approve", decided_by_agent_id=manager.id,
+    )
     await db_session.flush()
     service = roadmap.orchestration
     decision = {"action_type": "noop", "reason": "No integration verifier yet."}

@@ -198,8 +198,12 @@ async def _real_planning_expansion_run(db_session, project_id, planner: Agent, d
     )
     await _complete_goal_definition(db_session, goal, run)
     from tests.conftest import bind_plan_author_team
+    from tests.test_orchestration_runtime_e2e import _canonicalize_plan_candidate
 
-    await bind_plan_author_team(db_session, goal, planner)
+    await bind_plan_author_team(
+        db_session, goal, planner,
+        role_agents={"planning": planner, "implementation": developer},
+    )
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -239,6 +243,8 @@ async def _real_planning_expansion_run(db_session, project_id, planner: Agent, d
     db_session.add(artifact)
     await db_session.flush()
     planning_task = await db_session.get(Task, request_action.target_id)
+    await _canonicalize_plan_candidate(db_session, run, planning_task, artifact)
+    await db_session.flush()
     planning_task.status = "in_progress"
     planning_session = Session(
         agent_id=planner.id,

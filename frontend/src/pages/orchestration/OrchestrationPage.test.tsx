@@ -206,7 +206,7 @@ vi.mock('./StartWorkDialog', () => ({
     open: boolean
     isPending: boolean
     error: Error | null
-    onConfirm: () => void
+    onConfirm: (scope: 'planning_only' | 'execution') => void
     authorization?: { model_spend_remaining: Record<string, string>; workspace_mutation: string } | null
     restartReason?: string | null
   }) => open ? (
@@ -214,7 +214,7 @@ vi.mock('./StartWorkDialog', () => ({
       <p data-testid="start-authorization">{authorization ? `${JSON.stringify(authorization.model_spend_remaining)} ${authorization.workspace_mutation}` : 'no authorization'}</p>
       <p data-testid="start-restart-reason">{restartReason ?? 'first start'}</p>
       {error && <p role="alert">{error.message}</p>}
-      <button type="button" disabled={isPending} onClick={onConfirm}>Confirm start</button>
+      <button type="button" disabled={isPending} onClick={() => onConfirm('execution')}>Confirm start</button>
     </div>
   ) : null,
 }))
@@ -817,9 +817,9 @@ describe('OrchestrationPage', () => {
       await React.act(async () => getButton(view.container, 'Confirm start').click())
 
       expect(state.startMutation.mutate).toHaveBeenCalledTimes(1)
-      expect(state.startMutation.mutate).toHaveBeenCalledWith(
-        { goalId: 'goal-1' }, expect.any(Object),
-      )
+      expect(state.startMutation.mutate).toHaveBeenCalledWith(expect.objectContaining({
+        goalId: 'goal-1', input: expect.objectContaining({ scope: 'execution', runId: 'run-1', expectedControlVersion: 0 }),
+      }), expect.any(Object))
       expect(textOf(view.container)).toContain('Work started.')
       expect(() => getButton(view.container, 'Start work')).toThrow('Button not found')
     } finally {

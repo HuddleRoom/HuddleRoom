@@ -221,6 +221,16 @@ describe('SPR210 concise Needs You titles', () => {
 })
 
 describe('SPR211 verified reference presentation', () => {
+  it('routes only a current-project, bound artifact to its exact plan candidate hash', () => {
+    const artifact = reference({ kind: 'artifact', id: 'artifact-review-4', goal_id: 'goal-1', label: 'Plan candidate v4' })
+
+    expect(presentation.needsYouReferencePath(artifact, 'project-1'))
+      .toBe('/orchestration/goal-1#plan-review-artifact-review-4')
+    expect(presentation.needsYouReferencePath({ ...artifact, project_id: 'foreign-project' }, 'project-1')).toBeNull()
+    expect(presentation.needsYouReferencePath({ ...artifact, goal_id: null }, 'project-1')).toBeNull()
+    expect(presentation.needsYouReferencePath({ ...artifact, label: null }, 'project-1')).toBeNull()
+  })
+
   it('substitutes only exact typed identifier tokens and neutralizes unknown IDs and runtime keys outside Details', () => {
     const taskId = '10000000-0000-4000-8000-000000000001'
     const agentId = '20000000-0000-4000-8000-000000000002'

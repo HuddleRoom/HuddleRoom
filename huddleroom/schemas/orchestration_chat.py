@@ -18,6 +18,7 @@ class ChatSubmitRequest(BaseModel):
     client_request_id: uuid.UUID
     context_goal_id: uuid.UUID | None = None
     action_id: uuid.UUID | None = None
+    start_scope: Literal["planning_only", "execution"] | None = None
 
     @field_validator("content")
     @classmethod
@@ -105,6 +106,7 @@ class ChatActionPayload(BaseModel):
     edited_description: str | None = Field(default=None, max_length=12000)
     edited_persona: str | None = Field(default=None, max_length=12000)
     answers: list[ChatBatchAnswer] = Field(default_factory=list, max_length=100)
+    start_scope: Literal["planning_only", "execution"] | None = None
 
 class ChatActionDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")

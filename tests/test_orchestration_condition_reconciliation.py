@@ -184,6 +184,10 @@ async def test_late_plan_clears_its_warning_and_question_but_never_owner_or_unde
     assert warning.active and question.status == "pending"
 
     artifact = await ingest(db_session, goal, run, task, session.id, version, _db_output())
+    from huddleroom.models.agent import Agent
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
     await service.execute_accept_plan_action(
         db_session, run_id=run.id, request={"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
         idempotency_key=f"run:{run.id}:kind:accept_plan",
@@ -316,6 +320,10 @@ async def _accepted_plan(db, project_id, *, version=1):
         **task.metadata_["orchestration_plan"], "planning_version": version,
     }}
     artifact = await ingest(db, goal, run, task, session.id, version, _db_output())
+    from huddleroom.models.agent import Agent
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db, goal, await db.get(Agent, task.assigned_to))
     action = await service.execute_accept_plan_action(
         db, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
         f"run:{run.id}:kind:accept_plan",
@@ -480,13 +488,14 @@ async def test_spr208_roadmap_accepted_generation_survives_replanning(
 ):
     from huddleroom.models.task import Task
     from huddleroom.services.orchestration_plan_ingestion import ingest
+    from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
     from tests.test_orchestration_roadmap_plans import (
-        _approve, _roadmap_acceptance, _request_replan, _roadmap_task, _roadmap_fingerprint,
+        _approve, _roadmap_acceptance, _request_replan, _roadmap_task,
         _accept_replan_after_selected_authority,
     )
 
-    service, goal, run, _manual, approval, _fingerprint = await _owned_setup_call(
-        db_session, _roadmap_acceptance, test_project, test_user,
+    service, goal, run, _manual, _approval, _fingerprint = await _owned_setup_call(
+        db_session, _roadmap_acceptance, test_project, test_user, seed_approval=False,
     )
     task = await db_session.get(Task, uuid.UUID(run.plan_state["planning_task_id"]))
     # This helper requests the task before switching its goal to roadmap.
@@ -497,7 +506,9 @@ async def test_spr208_roadmap_accepted_generation_survives_replanning(
     output = json.dumps({"schema_version": 1, "plan_kind": "roadmap", "summary": "Roadmap",
                          "plan_items": [{**_roadmap_task(), "why_runnable": "Unstarted work."}]})
     artifact = await ingest(db_session, goal, run, task, None, run.plan_state["planning_version"], output)
-    approval.decision_key = f"roadmap_plan:{_roadmap_fingerprint(service, goal, artifact.metadata_['plan_items'])}"
+    # The ingested candidate has its own immutable review identity and export; approve that review, not the
+    # placeholder candidate created by the shared setup helper.
+    approval = await OrchestrationRoadmapService(service).ensure_plan_approval(db_session, goal, run, artifact)
     await _approve(db_session, goal, approval)
     await service.execute_accept_plan_action(
         db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},

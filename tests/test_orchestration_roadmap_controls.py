@@ -24,6 +24,7 @@ from huddleroom.services.orchestration_supersession import OrchestrationSuperses
 from huddleroom.routers.orchestration_goals import _detail, get_goal, pause_goal
 from tests.test_orchestration_roadmap_e2e import (
     _approved_roadmap, _ready_roadmap, _snapshot, _active_child_work, _active_session, _late_output,
+    _reseed_ownership_after_heal,
 )
 from tests.test_orchestration_roadmap_integration import (
     _child_actors, _complete_child, _local_decisions, child_item, release,
@@ -198,6 +199,8 @@ async def test_resume_settles_finished_child_and_continues(
     child_run, retained = await _complete_child_across_parent_pause(db_session, test_project, roadmap, row,
         (planner, producer, verifier, summarizer), monkeypatch)
     retained_id, retained_task_id, retained_output = retained.id, retained.task_id, retained.output
+    # The parent pause/heal re-derives team_hierarchy; re-bind the docs builder as the accepted implementation owner.
+    await _reseed_ownership_after_heal(db_session, parent, run, [docs], team_roles=((builder, "implementation"),))
     await roadmap.orchestration.resume_goal(db_session, test_project.id, parent.id)
     await service.tick(db_session, child_run.id)
     await db_session.refresh(child)

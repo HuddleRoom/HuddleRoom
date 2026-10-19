@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type * as RadixDialog from '@radix-ui/react-dialog'
 import { Dialog } from '@/components/common/Dialog'
 import { ApiError } from '@/lib/api-client'
@@ -79,17 +79,19 @@ interface StartWorkDialogProps {
   isPending: boolean
   error: unknown
   onOpenChange: (open: boolean) => void
-  onConfirm: () => void
+  onConfirm: (scope: 'planning_only' | 'execution') => void
+  initialScope?: 'planning_only' | 'execution'
   // Why the goal needs a fresh Start (re-Start); null/undefined for a first Start.
   restartReason?: string | null
   onCloseAutoFocus?: React.ComponentPropsWithoutRef<typeof RadixDialog.Content>['onCloseAutoFocus']
 }
 
 export function StartWorkDialog({
-  open, goal, targetSummary, authorization, missingRecurringPolicy, isPending, error, onOpenChange, onConfirm, restartReason, onCloseAutoFocus,
+  open, goal, targetSummary, authorization, missingRecurringPolicy, isPending, error, onOpenChange, onConfirm, initialScope = 'execution', restartReason, onCloseAutoFocus,
 }: StartWorkDialogProps) {
   const confirmFocusIntent = useRef(false)
   const primaryRef = useRef<HTMLButtonElement>(null)
+  const [scopeChoice, setScopeChoice] = useState<'planning_only' | 'execution'>(initialScope)
   const message = error ? conflictText(error) : null
   const blocked = blockedText(authorization, missingRecurringPolicy)
 
@@ -98,6 +100,7 @@ export function StartWorkDialog({
     confirmFocusIntent.current = false
     primaryRef.current?.focus()
   }, [isPending, message])
+  useEffect(() => { if (open) setScopeChoice(initialScope) }, [open, initialScope])
 
   return (
     <Dialog
@@ -114,13 +117,24 @@ export function StartWorkDialog({
         primaryLabel: restartReason ? 'Start again' : 'Start work',
         pendingLabel: 'Starting…',
         primaryRef,
-        onPrimary: () => { confirmFocusIntent.current = true; onConfirm() },
+        onPrimary: () => { confirmFocusIntent.current = true; onConfirm(scopeChoice) },
         isPending,
         primaryDisabled: blocked !== null,
       }}
     >
       {targetSummary && <p className="mb-4 break-words text-sm">{targetSummary}</p>}
       {blocked && <Callout variant="warning" className="mb-4">{blocked}</Callout>}
+      <fieldset className="mb-4 flex flex-col gap-2" disabled={isPending || blocked !== null}>
+        <legend className="text-xs font-medium text-huddleroom-text-muted">Start scope</legend>
+        <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded border border-huddleroom-border px-3 text-sm">
+          <input type="radio" name="start-scope" checked={scopeChoice === 'planning_only'} onChange={() => setScopeChoice('planning_only')} />
+          Plan only — review and verify the candidate. Implementation needs a later Start.
+        </label>
+        <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded border border-huddleroom-border px-3 text-sm">
+          <input type="radio" name="start-scope" checked={scopeChoice === 'execution'} onChange={() => setScopeChoice('execution')} />
+          Implementation — authorize eligible work after the reviewed plan is accepted.
+        </label>
+      </fieldset>
       <Record
         keyWidth={120}
         rows={[

@@ -463,6 +463,7 @@ async def test_nested_roadmap_outcome_loop_real(db_session, test_project, stub_d
     from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
     from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
     from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+    from tests.test_orchestration_roadmap_plans import _bind_candidate_provenance, _canonicalize_candidate
 
     adopt_session(db_session)
     cap = 3
@@ -518,7 +519,9 @@ async def test_nested_roadmap_outcome_loop_real(db_session, test_project, stub_d
         metadata_={"plan_items": [{**roadmap_task("build"), "agent_id": str(planner.id)}]},
     )
     db_session.add(artifact)
+    _canonicalize_candidate(artifact, run.plan_state["planning_version"])
     await db_session.flush()
+    _bind_candidate_provenance(run, artifact)
     for wait in waits:
         wait.status = "cleared"
     mode["accept_artifact"] = str(artifact.id)
@@ -529,8 +532,15 @@ async def test_nested_roadmap_outcome_loop_real(db_session, test_project, stub_d
     goal.orchestrator_context = {"team": {"agent_ids": [
         str(agent_id) for agent_id in await db_session.scalars(select(Agent.id).where(Agent.is_active.is_(True)))
     ]}}
+    planner.capabilities = ["planning", "implementation"]
     goal.weight = "trivial"  # keep the unrelated effectiveness analyzer deterministic
     await heal_baseline_drift_for_test(db_session, goal, run)
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(
+        db_session, goal, planner,
+        role_agents={"planning": planner, "implementation": planner},
+    )
     pending_tick = await service.tick(db_session, run.id)
     assert pending_tick["authorized_execution"]["step"] == "waiting_plan_authority"
     decision = await db_session.scalar(select(OrchestrationAuthorityDecision).where(

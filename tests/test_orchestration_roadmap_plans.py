@@ -22,7 +22,7 @@ from huddleroom.models.orchestration import (
     OrchestrationRoadmapVersion,
     OrchestrationRun,
 )
-from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationProcessRun
 from huddleroom.models.task import Task
 from huddleroom.models.session import Session
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
@@ -31,6 +31,8 @@ from huddleroom.services.orchestration_budget_service import (
     OrchestrationBudgetService,
 )
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_plan_review import PlanReviewService
+from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
 from huddleroom.services.orchestration_roadmap_service import (
     OrchestrationRoadmapService,
     parse_roadmap_items,
@@ -188,6 +190,99 @@ def _roadmap_task(key="task-1", depends_on=(), *, mutates_shared_state=False, st
     }
 
 
+async def _seed_accepted_g2_ownership(db_session, goal, planner, items, team_agent_ids, *, team_roles=()):
+    hierarchy = await db_session.scalar(select(OrchestrationProcessRun).where(
+        OrchestrationProcessRun.goal_id == goal.id,
+        OrchestrationProcessRun.process_type == "team_hierarchy",
+        OrchestrationProcessRun.superseded_by_id.is_(None),
+    ))
+    definition = await db_session.scalar(select(OrchestrationProcessRun).where(
+        OrchestrationProcessRun.goal_id == goal.id,
+        OrchestrationProcessRun.process_type == "agent_definition_review",
+        OrchestrationProcessRun.superseded_by_id.is_(None),
+    ))
+    existing_team = dict((hierarchy.outputs if hierarchy is not None else {}) or {})
+    existing_review = dict((definition.outputs if definition is not None else {}) or {})
+    roles = dict(existing_team.get("role_to_agent") or {})
+    assignments = [entry for entry in existing_team.get("assignments", []) if isinstance(entry, dict)]
+    eligibility = {
+        str(agent_id): list(functions)
+        for agent_id, functions in (existing_review.get("eligibility") or {}).items()
+        if isinstance(functions, list)
+    }
+    coverage = [entry for entry in existing_team.get("responsibility_coverage", []) if isinstance(entry, dict)]
+
+    def bind(agent_id, work_function):
+        nonlocal assignments, coverage
+        roles[work_function] = agent_id
+        eligibility.setdefault(agent_id, [])
+        if work_function not in eligibility[agent_id]:
+            eligibility[agent_id].append(work_function)
+        assignments = [entry for entry in assignments if entry.get("work_function") != work_function]
+        assignments.append({"work_function": work_function, "agent_ref": agent_id})
+        coverage = [entry for entry in coverage if entry.get("work_function") != work_function]
+        coverage.append({
+            "responsibility_id": work_function, "work_function": work_function, "agent_ref": agent_id,
+            "status": "covered", "evidence_ref": "agent_review:accepted",
+        })
+
+    members = ((goal.orchestrator_context or {}).get("team") or {}).get("agent_ids")
+    members = [str(agent_id) for agent_id in members] if isinstance(members, list) and members else []
+    planner_id = str(planner.id)
+    if "planning" not in (planner.capabilities or []):
+        raise AssertionError("fixture plan author must support planning")
+    bind(planner_id, "planning")
+    for agent, work_function in team_roles:
+        if work_function not in (agent.capabilities or []):
+            raise AssertionError(f"fixture agent must support {work_function}")
+        bind(str(agent.id), work_function)
+    accepted = {*members, *map(str, team_agent_ids), planner_id, *(str(agent.id) for agent, _ in team_roles)}
+    for item in items:
+        if not isinstance(item, dict) or item.get("unit_type") == "goal":
+            continue
+        agent_id, work_function = item.get("agent_id"), item.get("work_function")
+        if members and agent_id and str(agent_id) not in accepted:
+            continue
+        if agent_id and work_function:
+            bind(str(agent_id), str(work_function))
+    for item in items:
+        if not isinstance(item, dict) or item.get("unit_type") == "goal" or item.get("owner_type") == "human":
+            continue
+        work_function = item.get("work_function")
+        if (not item.get("agent_id") or (members and str(item["agent_id"]) not in accepted)) and work_function and work_function not in roles and work_function not in ("validation", "review") and work_function in (planner.capabilities or []):
+            bind(planner_id, str(work_function))
+
+    outputs = {
+        **existing_team, "role_to_agent": roles, "assignments": assignments,
+        "approval": existing_team.get("approval") or "approve",
+        "approval_decision_id": existing_team.get("approval_decision_id") or str(uuid.uuid4()),
+        "gates": {**(existing_team.get("gates") or {}), "team_structure_reviewed": True},
+        "accepted_responsibility_gap_ids": existing_team.get("accepted_responsibility_gap_ids") or [],
+        "responsibility_coverage": coverage,
+    }
+    if team_agent_ids:
+        outputs["agent_ids"] = [str(agent_id) for agent_id in team_agent_ids]
+    elif members:
+        outputs["agent_ids"] = members
+    goal.orchestrator_context = {**(goal.orchestrator_context or {}), "team": outputs}
+    for process_type, process_outputs in (
+        ("agent_definition_review", {**existing_review, "eligibility": eligibility}),
+        ("team_hierarchy", outputs),
+    ):
+        process = await db_session.scalar(select(OrchestrationProcessRun).where(
+            OrchestrationProcessRun.goal_id == goal.id,
+            OrchestrationProcessRun.process_type == process_type,
+            OrchestrationProcessRun.superseded_by_id.is_(None),
+        ))
+        if process is None:
+            process = OrchestrationProcessRun(
+                goal_id=goal.id, process_type=process_type, status="completed", trigger_reason="test",
+            )
+            db_session.add(process)
+        process.status, process.outputs, process.skipped_by, process.superseded_by_id = "completed", process_outputs, None, None
+    await db_session.flush()
+
+
 def _roadmap_goal(key, *, allocation, depends_on=()):
     return {
         "item_key": key,
@@ -244,6 +339,20 @@ async def _roadmap_acceptance(
         {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning", "scope": "Plan Roadmap work."},
         f"run:{run.id}:kind:roadmap-request",
     )
+    plan_items = items or [_roadmap_task()]
+    metadata = {
+        "schema_version": 1,
+        "plan_kind": "roadmap",
+        "summary": "Review the Roadmap candidate.",
+        "plan_items": plan_items,
+        "planning_task_id": str(request.target_id),
+        "planning_version": 1,
+        "winning_session_id": str(uuid.uuid4()),
+        "plan_author_agent_id": str(planner.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
     artifact = Artifact(
         project_id=test_project.id,
         name="roadmap-plan",
@@ -251,7 +360,7 @@ async def _roadmap_acceptance(
         status="draft",
         linked_task_id=request.target_id,
         created_by_agent=planner.id,
-        metadata_={"plan_items": items or [_roadmap_task()]},
+        content_hash=metadata["output_hash"], metadata_=metadata,
     )
     db_session.add(artifact)
     await db_session.flush()
@@ -269,18 +378,15 @@ async def _roadmap_acceptance(
                 db_session, goal.id, process_type=process_type, skipped_by=f"human:{test_user.id}",
                 reason="Exercise Roadmap plan authority independently of baseline review.", run_id=run.id,
             )
+    await _seed_accepted_g2_ownership(db_session, goal, planner, plan_items, team_agent_ids)
     normalized = [item.model_dump(mode="json") for item in parse_roadmap_items(
         artifact.metadata_["plan_items"], set((goal.budget or {}).get("caps", {})),
     )]
     fingerprint = service._accepted_plan_fingerprint(normalized)
-    if not seed_approval or goal.authority_model == "no_manager":
-        decision = None
-    else:
-        decision = await OrchestrationAuthorityDecisionService().create_pending(
-            db_session, goal.id, decision_key=f"roadmap_plan:{fingerprint}", title="Approve Roadmap plan",
-            question="Approve?", authority="human" if goal.authority_model == "human_manager" else "manager",
-            authority_agent_id=None if goal.authority_model == "human_manager" else goal.manager_agent_id,
-            options=[{"key": "approve"}, {"key": "reject"}], run_id=run.id,
+    decision = None
+    if seed_approval and goal.authority_model != "no_manager":
+        decision = await OrchestrationRoadmapService(service).ensure_plan_approval(
+            db_session, goal, run, artifact,
         )
     return service, goal, run, artifact, decision, fingerprint
 
@@ -291,6 +397,48 @@ async def _approve(db_session, goal, decision):
         decided_by_user_id=goal.manager_user_id if goal.authority_model == "human_manager" else None,
         decided_by_agent_id=goal.manager_agent_id if goal.authority_model == "agent_manager" else None,
     )
+
+
+async def test_g3_roadmap_approval_rejects_an_unbound_legacy_decision(
+    db_session, test_project, test_user,
+):
+    service, goal, run, artifact, _, fingerprint = await _roadmap_acceptance(
+        db_session, test_project, test_user, seed_approval=False,
+    )
+
+    review = await PlanReviewService().ensure(db_session, goal, run, artifact)
+    legacy = await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, goal.id, decision_key=f"roadmap_plan:{fingerprint}", title="Legacy approval",
+        question="Approve?", authority="human", options=[{"key": "approve"}, {"key": "reject"}], run_id=run.id,
+    )
+    approval = await OrchestrationRoadmapService(service).ensure_plan_approval(
+        db_session, goal, run, artifact,
+    )
+
+    assert approval.id != legacy.id
+    assert review.identity.model_dump(mode="json") == json.loads(approval.context)["plan_review_identity"]
+
+
+async def test_no_manager_approval_does_not_reuse_a_gate_for_a_new_review_identity(
+    db_session, test_project, test_user,
+):
+    service, goal, run, artifact, _, _ = await _roadmap_acceptance(
+        db_session, test_project, test_user, authority_model="no_manager",
+    )
+    first = await OrchestrationRoadmapService(service).ensure_plan_approval(db_session, goal, run, artifact)
+    successor = Artifact(
+        project_id=test_project.id, name="roadmap-plan-revision", artifact_type="plan", status="draft",
+        linked_task_id=artifact.linked_task_id, created_by_agent=artifact.created_by_agent,
+        metadata_={"plan_items": deepcopy(artifact.metadata_["plan_items"])},
+    )
+    db_session.add(successor)
+    _canonicalize_candidate(successor, planning_version=2)
+    await db_session.flush()
+
+    second = await OrchestrationRoadmapService(service).ensure_plan_approval(db_session, goal, run, successor)
+
+    assert first.id != second.id
+    assert first.success_criterion_key != second.success_criterion_key
 
 
 async def _assert_rejected_atomic(db_session, run):
@@ -319,6 +467,34 @@ def _roadmap_fingerprint(service, goal, items):
     return service._accepted_plan_fingerprint(_normalized_roadmap_items(goal, items))
 
 
+def _canonicalize_candidate(artifact, planning_version=1):
+    metadata = dict(artifact.metadata_)
+    metadata.update({
+        "schema_version": 1, "plan_kind": "roadmap", "summary": "Review the Roadmap candidate.",
+        "planning_task_id": str(artifact.linked_task_id), "planning_version": planning_version,
+        "winning_session_id": str(uuid.uuid4()), "plan_author_agent_id": str(artifact.created_by_agent),
+    })
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
+    artifact.metadata_, artifact.content_hash = metadata, metadata["output_hash"]
+
+
+def _bind_candidate_provenance(run, artifact):
+    metadata = artifact.metadata_
+    run.plan_state = {
+        **run.plan_state,
+        "plan_artifact_id": str(artifact.id),
+        "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": {
+            "artifact_id": str(artifact.id), "planning_task_id": metadata["planning_task_id"],
+            "planning_version": metadata["planning_version"], "winning_session_id": metadata["winning_session_id"],
+            "plan_author_agent_id": metadata["plan_author_agent_id"],
+            "canonical_content_hash": metadata["output_hash"],
+        },
+    }
+
+
 def _normalized_roadmap_items(goal, items):
     return [
         item.model_dump(mode="json")
@@ -343,10 +519,19 @@ async def _accept_version_one(
 
 async def _replan_artifact(db_session, test_project, service, goal, run, artifact, items):
     replan = await _request_replan(db_session, service, goal, run, artifact)
+    metadata = {
+        "schema_version": 1, "plan_kind": "roadmap", "summary": "Review the replacement Roadmap candidate.",
+        "plan_items": items, "planning_task_id": str(replan.target_id),
+        "planning_version": run.plan_state["planning_version"], "winning_session_id": str(uuid.uuid4()),
+        "plan_author_agent_id": str(artifact.created_by_agent),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
     candidate = Artifact(
         project_id=test_project.id, name="roadmap-replan", artifact_type="plan", status="draft",
         linked_task_id=replan.target_id, created_by_agent=artifact.created_by_agent,
-        metadata_={"plan_items": items},
+        content_hash=metadata["output_hash"], metadata_=metadata,
     )
     db_session.add(candidate)
     await db_session.flush()
@@ -359,10 +544,7 @@ async def _accept_replan_after_selected_authority(db_session, service, goal, run
         await service.execute_accept_plan_action(
             db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)}, key,
         )
-    approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
-        OrchestrationAuthorityDecision.run_id == run.id,
-        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
-    ))
+    approval = await _pending_approval(db_session, run)
     await _approve(db_session, goal, approval)
     return await service.execute_accept_plan_action(
         db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(candidate.id)}, key,
@@ -388,7 +570,6 @@ async def test_initial_roadmap_rejects_item_agent_outside_accepted_team(
     service, goal, run, artifact, decision, _ = await _roadmap_acceptance(
         db_session, test_project, test_user, items=[item],
     )
-    goal.orchestrator_context = {"team": {"agent_ids": [str(insider.id)]}}
     await _approve(db_session, goal, decision)
 
     with pytest.raises(HTTPException, match="outside the accepted team"):
@@ -408,24 +589,20 @@ async def test_replan_cannot_expand_the_accepted_team(
     await db_session.flush()
     v1_item = {**_roadmap_task("v1"), "agent_id": str(insider.id)}
     service, goal, run, artifact, decision, _ = await _roadmap_acceptance(
-        db_session, test_project, test_user, items=[v1_item],
+        db_session, test_project, test_user, items=[v1_item], team_agent_ids=[insider.id],
     )
-    goal.orchestrator_context = {"team": {"agent_ids": [str(insider.id)]}}
     await _approve(db_session, goal, decision)
     await service.execute_accept_plan_action(
         db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
         f"run:{run.id}:kind:accepted-team-v1",
     )
     v1 = await OrchestrationRoadmapService(service).current_version(db_session, goal.id)
-    goal.orchestrator_context = {"team": {"agent_ids": [str(outsider.id)]}}
     _, candidate = await _replan_artifact(
         db_session, test_project, service, goal, run, artifact,
         [{**_roadmap_task("v2"), "agent_id": str(outsider.id)}],
     )
-    fingerprint = _roadmap_fingerprint(service, goal, candidate.metadata_["plan_items"])
-    approval = await OrchestrationAuthorityDecisionService().create_pending(
-        db_session, goal.id, decision_key=f"roadmap_plan:{fingerprint}", title="Approve replan",
-        question="Approve?", authority="human", options=[{"key": "approve"}], run_id=run.id,
+    approval = await OrchestrationRoadmapService(service).ensure_plan_approval(
+        db_session, goal, run, candidate,
     )
     await _approve(db_session, goal, approval)
 
@@ -564,6 +741,7 @@ async def _pending_approval(db_session, run):
     return await db_session.scalar(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id,
         OrchestrationAuthorityDecision.decision_key.like("roadmap_plan:%"),
+        OrchestrationAuthorityDecision.status == "pending",
     ))
 
 
@@ -594,7 +772,7 @@ async def test_managed_advance_waits_then_accepts_and_replays_once(
         assert not [a for a in await _run_actions(db_session, run.id) if a.action_type == "accept_plan"]
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id,
-        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
+        OrchestrationAuthorityDecision.decision_key.like(f"roadmap_plan:{fingerprint}:review:%"),
     )) == 1
 
     await _approve(db_session, goal, approval)
@@ -627,10 +805,7 @@ async def test_advance_rejects_approval_from_wrong_selected_authority_before_res
     _accept_decision(stub_decision, artifact)
     await db_session.commit()
     assert (await service._advance_authorized_execution(db_session, goal, run))["step"] == "waiting_plan_authority"
-    approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
-        OrchestrationAuthorityDecision.run_id == run.id,
-        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
-    ))
+    approval = await _pending_approval(db_session, run)
     if authority_model == "human_manager":
         assert test_user.id != goal.manager_user_id
         await OrchestrationAuthorityDecisionService().answer_decision(
@@ -710,7 +885,7 @@ async def test_no_manager_advance_ingests_independent_verification_and_accepts_o
     assert verification.request["producer_agent_id"] == str(artifact.created_by_agent)
     assert verification.request["source_task_id"] == str(artifact.linked_task_id)
     gate = await db_session.get(OrchestrationGate, uuid.UUID(verification.request["gate_id"]))
-    assert gate.success_criterion_key == f"roadmap_plan:{fingerprint}"
+    assert gate.success_criterion_key.startswith(f"roadmap_plan:{fingerprint}:review:")
     session = await _complete_task_session(
         db_session, test_project.id, task, verifier.id,
         json.dumps({"status": "done", "verdict": "accepted", "evidence": ["Reviewed each Roadmap item."]}),
@@ -834,6 +1009,7 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         team_agent_ids=[verifier.id],
     )
     artifact.metadata_["plan_items"][0]["agent_id"] = str(artifact.created_by_agent)
+    _canonicalize_candidate(artifact, run.plan_state["planning_version"])
     _accept_decision(stub_decision, artifact)
     await db_session.commit()  # Publish known scenario state before the native tick.
     first_wait = await service.tick(db_session, run.id)
@@ -912,7 +1088,9 @@ async def test_no_manager_replan_uses_pending_task_gate_and_accepts_v2_through_t
         metadata_={"plan_items": v2_items},
     )
     db_session.add(candidate)
+    _canonicalize_candidate(candidate, run.plan_state["planning_version"])
     await db_session.flush()
+    _bind_candidate_provenance(run, candidate)
     _accept_decision(stub_decision, candidate)
     # The candidate artifact does not alter decision context, so mark the earlier replan decision as
     # computed from a different context; otherwise the committed read replays it instead of deciding anew.
@@ -1010,7 +1188,9 @@ async def test_no_manager_gate_collision_refetches_the_deterministic_winner(
         recovered = await roadmap.ensure_plan_approval(db_session, goal, run, artifact)
     assert reads == 2
     assert recovered.id == gate_id == uuid.uuid5(
-        uuid.NAMESPACE_URL, f"rally:orchestration:gate:{run.id}:roadmap_plan_approval:{fingerprint}",
+        uuid.NAMESPACE_URL,
+        f"rally:orchestration:gate:{run.id}:roadmap_plan_approval:{fingerprint}:"
+        f"{required_evidence['plan_review_identity_hash']}",
     )
     assert recovered.required_evidence == required_evidence
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationGate).where(
@@ -1039,6 +1219,7 @@ async def test_unapproved_replan_preserves_accepted_version_gate_and_projection(
         metadata_={"plan_items": [_roadmap_task("different-item")]},
     )
     db_session.add(successor)
+    _canonicalize_candidate(successor, run.plan_state["planning_version"] + 1)
     await db_session.flush()
     successor_id = successor.id
     roadmap = OrchestrationRoadmapService(service)
@@ -1080,6 +1261,7 @@ async def test_replan_appends_version_two_without_updating_version_one(
         metadata_={"plan_items": [_roadmap_task("task-2")]},
     )
     db_session.add(successor)
+    _canonicalize_candidate(successor, run.plan_state["planning_version"])
     await db_session.flush()
     fingerprint = service._accepted_plan_fingerprint([
         item.model_dump(mode="json")
@@ -1090,10 +1272,7 @@ async def test_replan_appends_version_two_without_updating_version_one(
             db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(successor.id)},
             f"run:{run.id}:kind:replan-accept-wait",
         )
-    approval = await db_session.scalar(select(OrchestrationAuthorityDecision).where(
-        OrchestrationAuthorityDecision.run_id == run.id,
-        OrchestrationAuthorityDecision.decision_key == f"roadmap_plan:{fingerprint}",
-    ))
+    approval = await _pending_approval(db_session, run)
     await _approve(db_session, goal, approval)
     acceptance = await service.execute_accept_plan_action(
         db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(successor.id)},
@@ -1436,7 +1615,7 @@ async def test_historical_v1_fingerprint_replay_preserves_v2_projection_and_line
     )
     key = f"run:{run.id}:kind:reject-historical-v1"
 
-    with pytest.raises(HTTPException, match="Historical Roadmap fingerprint cannot replace the current version"):
+    with pytest.raises(HTTPException, match="waiting_plan_authority"):
         await service.execute_accept_plan_action(
             db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(historical_candidate.id)},
             key,
@@ -1461,11 +1640,17 @@ async def test_historical_v1_fingerprint_replay_preserves_v2_projection_and_line
         "fingerprint": _roadmap_fingerprint(service, goal, v1_items),
     }
     stable = await state()
-    replay = await service.execute_accept_plan_action(
-        db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(historical_candidate.id)}, key,
-    )
-    assert replay.status == "failed"
-    assert await state() == stable
+    await _approve(db_session, goal, await _pending_approval(db_session, run))
+    with pytest.raises(HTTPException, match="Historical Roadmap fingerprint cannot replace the current version"):
+        await service.execute_accept_plan_action(
+            db_session, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(historical_candidate.id)}, key,
+        )
+    current_state = await state()
+    assert {key: current_state[key] for key in ("projection", "versions", "items")} == {
+        key: stable[key] for key in ("projection", "versions", "items")
+    }
+    assert any(action[1:3] == ("failed", "Historical Roadmap fingerprint cannot replace the current version")
+               for action in current_state["actions"])
     assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapVersion).where(
         OrchestrationRoadmapVersion.goal_id == goal.id,
     )) == 2
@@ -1664,9 +1849,15 @@ async def test_roadmap_replan_requires_selected_plan_author(db_session, test_pro
         db_session, test_project, test_user, items=[_roadmap_task("v1")],
     )
     author = artifact.created_by_agent
-    goal.orchestrator_context = {"team": {"agent_ids": [str(author), str(outsider.id)], "assignments": [
-        {"work_function": "planning", "agent_ref": str(author)},
-    ]}}
+    team = dict(goal.orchestrator_context["team"])
+    team["role_to_agent"] = {**team["role_to_agent"], "planning": str(author)}
+    goal.orchestrator_context = {**goal.orchestrator_context, "team": team}
+    review = await db_session.scalar(select(OrchestrationProcessRun).where(
+        OrchestrationProcessRun.goal_id == goal.id,
+        OrchestrationProcessRun.process_type == "agent_definition_review",
+        OrchestrationProcessRun.superseded_by_id.is_(None),
+    ))
+    review.outputs = {"eligibility": {**review.outputs["eligibility"], str(author): ["implementation", "planning"]}}
     # the fixture flips the goal to roadmap after run creation; align the frozen snapshot
     await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == run.id).values(planning_mode_snapshot="roadmap"))
     await db_session.refresh(run)
@@ -1914,12 +2105,20 @@ async def test_successor_reusing_historical_key_without_retained_gate_is_409(db_
     (await db_session.get(OrchestrationGate, row.gate_id)).status = "accepted"
     successor = await _successor_run(db_session, run)
     roadmap = OrchestrationRoadmapService(service)
+    candidate = Artifact(
+        project_id=test_project.id, name="successor-candidate", artifact_type="plan", status="draft",
+        linked_task_id=artifact.linked_task_id, created_by_agent=artifact.created_by_agent,
+        metadata_={"plan_items": deepcopy(artifact.metadata_["plan_items"])},
+    )
+    db_session.add(candidate)
+    _canonicalize_candidate(candidate, planning_version=2)
+    await db_session.flush()
 
     with pytest.raises(HTTPException, match="Historical roadmap item 'a'") as excinfo:
-        await roadmap.ensure_plan_approval(db_session, goal, successor, artifact)
+        await roadmap.ensure_plan_approval(db_session, goal, successor, candidate)
     assert excinfo.value.status_code == 409
-    with pytest.raises(HTTPException, match="Historical roadmap item 'a'"):
-        await roadmap.accept_version(db_session, goal, successor, artifact, None)
+    with pytest.raises(HTTPException, match="Roadmap plan approval is required"):
+        await roadmap.accept_version(db_session, goal, successor, candidate, None)
 
     # A retained gate does not license a changed snapshot either.
     await _accepted_retained_gate(db_session, service, successor, row)
@@ -1929,8 +2128,9 @@ async def test_successor_reusing_historical_key_without_retained_gate_is_409(db_
         metadata_={"plan_items": [{**_roadmap_task("a"), "scope": "Something else"}]},
     )
     db_session.add(changed)
+    _canonicalize_candidate(changed, planning_version=3)
     await db_session.flush()
-    with pytest.raises(HTTPException, match="Historical roadmap item 'a'"):
+    with pytest.raises(HTTPException, match="Roadmap plan approval is required"):
         await roadmap.accept_version(db_session, goal, successor, changed, None)
 
 

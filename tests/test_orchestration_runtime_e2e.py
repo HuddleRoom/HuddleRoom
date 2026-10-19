@@ -149,13 +149,102 @@ async def _run_actions(db_session, run_id):
     ).all()
 
 
+async def _plan_ownership_source(db_session, goal):
+    """Follow the same nearest-completed-hierarchy lookup as PlanOwnershipService."""
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    process_service = OrchestrationProcessService()
+    source = goal
+    while True:
+        hierarchy = await process_service.get_current(db_session, source.id, "team_hierarchy")
+        team = (source.orchestrator_context or {}).get("team") or None
+        if hierarchy is not None and hierarchy.status == "completed":
+            team = team or hierarchy.outputs
+        if team is not None and hierarchy is not None and hierarchy.status == "completed":
+            return source
+        if source.parent_goal_id is None:
+            return source
+        source = await db_session.get(OrchestrationGoal, source.parent_goal_id)
+
+
+def _bind_plan_author_fallback(role_agents, plan_author, function):
+    """Bind a no-agent_id plan item to the plan author only when the author has the capability.
+    validation/review and planning never fall back (fail-closed)."""
+    if function in ("planning", "validation", "review") or function in role_agents:
+        return
+    if function in (plan_author.capabilities or []):
+        role_agents[function] = plan_author
+
+
+async def _canonicalize_plan_candidate(db_session, run, task, artifact):
+    """Make an intentionally direct positive test candidate match ingestion output and ownership."""
+    from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
+    from tests.conftest import bind_plan_author_team
+
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    plan_author = await db_session.get(Agent, task.assigned_to)
+    role_agents = {"planning": plan_author}
+    for item in (artifact.metadata_ or {}).get("plan_items") or []:
+        if not isinstance(item, dict) or item.get("owner_type") == "human" or item.get("unit_type") == "goal":
+            continue
+        function, owner_id = item.get("work_function"), item.get("agent_id")
+        if not function:
+            continue
+        if not owner_id:
+            _bind_plan_author_fallback(role_agents, plan_author, function)
+            continue
+        try:
+            owner = await db_session.get(Agent, uuid.UUID(str(owner_id)))
+        except (TypeError, ValueError):
+            owner = None
+        if owner is not None:
+            role_agents[function] = owner
+    await bind_plan_author_team(
+        db_session, goal, plan_author, role_agents=role_agents,
+        team_goal=await _plan_ownership_source(db_session, goal),
+    )
+    artifact.created_by_agent = plan_author.id
+
+    metadata = {
+        **(artifact.metadata_ or {}),
+        "kind": "implementation_plan",
+        "source": "planning_output_ingestion",
+        "schema_version": 1,
+        "plan_kind": "implementation",
+        "summary": (artifact.metadata_ or {}).get("summary") or "Review the accepted outcome-plan candidate.",
+        "planning_task_id": str(task.id),
+        "planning_version": run.plan_state["planning_version"],
+        "winning_session_id": None,
+        "plan_author_agent_id": str(plan_author.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
+    artifact.metadata_, artifact.content_hash = metadata, metadata["output_hash"]
+    run.plan_state = {
+        **run.plan_state,
+        "plan_artifact_id": str(artifact.id),
+        "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": {
+            "artifact_id": str(artifact.id),
+            "planning_task_id": metadata["planning_task_id"],
+            "planning_version": metadata["planning_version"],
+            "winning_session_id": metadata["winning_session_id"],
+            "plan_author_agent_id": metadata["plan_author_agent_id"],
+            "canonical_content_hash": metadata["output_hash"],
+        },
+    }
+
+
 async def _seed_accepted_plan(db_session, test_project, service, run, planner, plan_items=None, finish_planning=True):
     """Drive a real request_plan -> accept_plan cycle (bypassing the LLM decision
     loop) so run.plan_state["status"] == "accepted" with the given plan items
     (defaults to one expandable item)."""
     from tests.conftest import bind_plan_author_team
 
-    await bind_plan_author_team(db_session, await db_session.get(OrchestrationGoal, run.goal_id), planner)
+    goal = await db_session.get(OrchestrationGoal, run.goal_id)
+    team_goal = await _plan_ownership_source(db_session, goal)
+    await bind_plan_author_team(db_session, goal, planner, team_goal=team_goal)
     request_action = await service.execute_request_plan_action(
         db_session,
         run_id=run.id,
@@ -167,28 +256,79 @@ async def _seed_accepted_plan(db_session, test_project, service, run, planner, p
         },
         idempotency_key=f"run:{run.id}:kind:test-request_plan",
     )
+    planning_task = await db_session.get(Task, request_action.target_id)
+    plan_author = await db_session.get(Agent, planning_task.assigned_to)
+    raw_items = plan_items or [
+        {
+            "id": "item-1",
+            "work_function": "planning",
+            "scope": "Implement the accepted plan item.",
+            "deliverable": "A code change plus test output.",
+            "agent_id": str(planner.id),
+        }
+    ]
+    role_agents = {"planning": plan_author}
+    for item in raw_items:
+        if not isinstance(item, dict) or item.get("owner_type") == "human" or item.get("unit_type") == "goal":
+            continue
+        function, owner_id = item.get("work_function"), item.get("agent_id")
+        if not function:
+            continue
+        if not owner_id:
+            _bind_plan_author_fallback(role_agents, plan_author, function)
+            continue
+        try:
+            owner = await db_session.get(Agent, uuid.UUID(str(owner_id)))
+        except (TypeError, ValueError):
+            owner = None
+        if owner is not None:
+            role_agents[function] = owner
+    await bind_plan_author_team(
+        db_session, goal, plan_author, role_agents=role_agents, team_goal=team_goal,
+    )
+    from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
+
+    metadata = {
+        "kind": "implementation_plan",
+        "source": "planning_output_ingestion",
+        "schema_version": 1,
+        "plan_kind": "implementation",
+        "summary": "Review the accepted outcome-plan candidate.",
+        "plan_items": raw_items,
+        "planning_task_id": str(planning_task.id),
+        "planning_version": run.plan_state["planning_version"],
+        "winning_session_id": None,
+        "plan_author_agent_id": str(plan_author.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
     artifact = Artifact(
         project_id=test_project.id,
         name="e2e-plan",
         artifact_type="plan",
         status="draft",
-        linked_task_id=request_action.target_id,
-        created_by_agent=planner.id,
-        metadata_={
-            "kind": "implementation_plan",
-            "plan_items": plan_items
-            or [
-                {
-                    "id": "item-1",
-                    "work_function": "planning",
-                    "scope": "Implement the accepted plan item.",
-                    "deliverable": "A code change plus test output.",
-                    "agent_id": str(planner.id),
-                }
-            ],
-        },
+        linked_task_id=planning_task.id,
+        created_by_agent=plan_author.id,
+        content_hash=metadata["output_hash"],
+        metadata_=metadata,
     )
     db_session.add(artifact)
+    await db_session.flush()
+    provenance = {
+        "artifact_id": str(artifact.id),
+        "planning_task_id": metadata["planning_task_id"],
+        "planning_version": metadata["planning_version"],
+        "winning_session_id": metadata["winning_session_id"],
+        "plan_author_agent_id": metadata["plan_author_agent_id"],
+        "canonical_content_hash": metadata["output_hash"],
+    }
+    run.plan_state = {
+        **run.plan_state,
+        "plan_artifact_id": str(artifact.id),
+        "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": provenance,
+    }
     await db_session.flush()
     await service.execute_accept_plan_action(
         db_session,
@@ -271,6 +411,9 @@ async def test_accept_plan_rejects_unknown_or_uncovered_criterion_links(
         }]},
     )
     db_session.add(artifact)
+    await db_session.flush()
+    planning_task = await db_session.get(Task, request_action.target_id)
+    await _canonicalize_plan_candidate(db_session, run, planning_task, artifact)
     await db_session.flush()
 
     with pytest.raises(HTTPException, match=reason):
@@ -374,6 +517,9 @@ async def test_malformed_plan_requires_revision_then_accepts_corrected_plan(
         },
     )
     db_session.add(corrected)
+    await db_session.flush()
+    revised_task = await db_session.get(Task, revised_task_id)
+    await _canonicalize_plan_candidate(db_session, run, revised_task, corrected)
     await db_session.flush()
     accepted = await service.execute_accept_plan_action(
         db_session,
@@ -489,6 +635,10 @@ async def test_runtime_commits_malformed_plan_failure_then_accepts_revision(
         },
     )
     execution_db.add(corrected)
+    await execution_db.commit()
+    execution_run = await execution_db.get(OrchestrationRun, run.id)
+    revised_task = await execution_db.get(Task, revised_task_id)
+    await _canonicalize_plan_candidate(execution_db, execution_run, revised_task, corrected)
     await execution_db.commit()
 
     stub_decision(lambda _ctx: {"action_type": "accept_plan", "plan_artifact_id": str(corrected.id)})
@@ -1341,6 +1491,8 @@ async def test_outcome_goal_golden_path_reaches_completed_phase(
             }],
         },
     )
+    await _canonicalize_plan_candidate(db_session, run, planning_task, artifact)
+    await db_session.flush()
     stub_decision(
         lambda _ctx: {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)}
     )
@@ -1451,15 +1603,15 @@ async def test_outcome_two_criterion_plan_requires_criterion_scoped_verification
     # following tick would fall through to a stub that still returns accept_plan (409).
     monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     planner = _agent("two-criterion-planner", ["planning"])
+    # G2 accepted teams hold one owner per work_function, so both implementation items share one producer.
     producer_a = _agent("two-criterion-producer-a", ["implementation"])
-    producer_b = _agent("two-criterion-producer-b", ["implementation"])
     verifier = _agent("two-criterion-verifier", ["validation"])
     summarizer = _agent("two-criterion-summarizer", ["summarization"])
     planner.role = "planner"
-    producer_a.role = producer_b.role = "developer"
+    producer_a.role = "developer"
     verifier.role = "validator"
     summarizer.role = "technical writer"
-    db_session.add_all([planner, producer_a, producer_b, verifier, summarizer])
+    db_session.add_all([planner, producer_a, verifier, summarizer])
     await db_session.flush()
 
     service, goal, run = await _authorized_run(
@@ -1514,12 +1666,14 @@ async def test_outcome_two_criterion_plan_requires_criterion_scoped_verification
                     "work_function": "implementation",
                     "scope": "Deliver the validation result.",
                     "deliverable": "An independently verified validation.",
-                    "agent_id": str(producer_b.id),
+                    "agent_id": str(producer_a.id),
                     "success_criterion_keys": ["validated"],
                 },
             ],
         },
     )
+    await _canonicalize_plan_candidate(db_session, run, planning_task, artifact)
+    await db_session.flush()
     stub_decision(lambda _ctx: {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)})
     await service.tick(db_session, run.id)
     await db_session.refresh(run)
@@ -1548,7 +1702,7 @@ async def test_outcome_two_criterion_plan_requires_criterion_scoped_verification
         json.dumps({"status": "done", "changes": ["Delivered implementation."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     await _complete_task_session(
-        db_session, test_project.id, work_tasks["validate"], producer_b.id,
+        db_session, test_project.id, work_tasks["validate"], producer_a.id,
         json.dumps({"status": "done", "changes": ["Delivered validation."], "evidence": [], "criterion_progress": {}, "decisions": [], "risks": [], "open_questions": [], "next_step": "verify", "collaboration_need": None}),
     )
     for item_id in ("implement", "validate"):
@@ -1576,9 +1730,7 @@ async def test_outcome_two_criterion_plan_requires_criterion_scoped_verification
     for item_id, task in verification_tasks.items():
         binding = task.metadata_["orchestration"]
         assert binding["verification_gate_id"] == str(gates[item_id].id)
-        assert binding["producer_agent_id"] == str(
-            producer_a.id if item_id == "implement" else producer_b.id
-        )
+        assert binding["producer_agent_id"] == str(producer_a.id)
         await _complete_task_session(
             db_session,
             test_project.id,
@@ -1764,9 +1916,14 @@ async def test_legacy_accepted_multi_criterion_plan_blocks_once_without_releasin
         ]
 
 
-async def test_accepted_snapshot_ignores_later_artifact_plan_mutation(
+async def test_accepted_plan_mutation_blocks_release_until_revision(
     db_session, test_project, safe_effectiveness_review_continue
 ):
+    """G3 rule: editing an accepted plan artifact after acceptance makes its review stale.
+
+    Release is then blocked with 409 "Accepted plan ownership is not applicable" until a
+    plan revision is accepted; nothing is released from the mutated artifact content.
+    """
     planner = _agent("snapshot-planner", ["planning"])
     db_session.add(planner)
     await db_session.flush()
@@ -1781,15 +1938,13 @@ async def test_accepted_snapshot_ignores_later_artifact_plan_mutation(
         "id": "injected-item", "work_function": "planning", "scope": "Injected scope",
         "deliverable": "Injected deliverable", "agent_id": str(planner.id),
     }]}
-    await service._release_ready_work(db_session, await db_session.get(OrchestrationGoal, run.goal_id), run)
+    with pytest.raises(HTTPException, match="Accepted plan ownership is not applicable"):
+        await service._release_ready_work(db_session, await db_session.get(OrchestrationGoal, run.goal_id), run)
     tasks = await _tasks_for_run(db_session, run.id)
-    task = next(
+    assert not [
         task for task in tasks
-        if task.metadata_.get("orchestration", {}).get("plan_item_id") == "frozen-item"
-    )
-    item = task.metadata_["orchestration_plan_item"]
-    assert item["id"] == "frozen-item"
-    assert item["scope"] == "Frozen scope"
+        if task.metadata_.get("orchestration", {}).get("plan_item_id") in {"frozen-item", "injected-item"}
+    ]
 
 
 @pytest.mark.parametrize("graph_bound", [False, True])
@@ -2944,7 +3099,13 @@ async def test_planning_envelope_is_ingested_accepted_and_released_by_tick(
     producer = _agent("envelope-producer", ["implementation"])
     db_session.add_all([planner, producer])
     await db_session.flush()
-    service, _, run = await _authorized_run(db_session, test_project)
+    service, goal, run = await _authorized_run(db_session, test_project)
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(
+        db_session, goal, planner,
+        role_agents={"planning": planner, "implementation": producer},
+    )
     planning_task = await _request_plan_by_tick(db_session, service, run, stub_decision)
 
     await _complete_task_session(
@@ -2967,9 +3128,15 @@ async def test_malformed_planning_output_requires_revision_then_accepts_valid_en
 ):
     monkeypatch.setattr(settings, "orchestration_max_actions_per_tick", 1)
     planner = _agent("revising-planner", ["planning"])
-    db_session.add(planner)
+    producer = _agent("revising-producer", ["implementation"])
+    db_session.add_all([planner, producer])
     await db_session.flush()
-    service, _, run = await _authorized_run(db_session, test_project)
+    service, goal, run = await _authorized_run(db_session, test_project)
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(
+        db_session, goal, planner, role_agents={"planning": planner, "implementation": producer},
+    )
     first_task = await _request_plan_by_tick(db_session, service, run, stub_decision)
     await _complete_task_session(
         db_session, test_project.id, first_task, first_task.assigned_to, "Here is the plan in prose."

@@ -5,7 +5,12 @@ import pytest
 from huddleroom.models.agent import Agent
 from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
 from huddleroom.models.orchestration_process import OrchestrationProcessRun
-from huddleroom.schemas.orchestration import OrchestrationPlanItem
+from huddleroom.schemas.orchestration import (
+    OrchestrationPlanItem,
+    OrchestrationRoadmapPlanItem,
+    PlanReviewIdentity,
+    PlanReviewRecord,
+)
 from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 
@@ -174,3 +179,70 @@ async def test_g3_human_prerequisite_stays_blocked(db_session, test_project):
     })
     result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
     assert result == [{"item_id": "consent", "status": "blocked", "reason": "human executable work requires SPR254 workflow"}]
+
+
+@pytest.mark.asyncio
+async def test_g3_goal_item_binds_after_accepted_g2_inventory(db_session, test_project):
+    agent = _agent("worker")
+    db_session.add(agent)
+    await db_session.flush()
+    goal = OrchestrationGoal(project_id=test_project.id, objective="o", original_request="o")
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    await _accepted_review(db_session, goal, agent.id)
+    db_session.add(OrchestrationProcessRun(
+        goal_id=goal.id, process_type="team_hierarchy", status="completed", trigger_reason="test",
+        outputs=_accepted_outputs(agent.id),
+    ))
+    await db_session.flush()
+    item = OrchestrationRoadmapPlanItem(
+        item_key="child", unit_type="goal", title="Child", objective="o", success_criteria=[{"key": "done"}],
+        allocation={"tokens": 1},
+    )
+    review = PlanReviewRecord.model_construct(
+        identity=PlanReviewIdentity.model_construct(project_id=test_project.id, goal_id=goal.id, run_id=run.id),
+    )
+    result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=True, review=review)
+    assert result == [{"item_id": "child", "status": "eligible", "unit_type": "goal"}]
+    assert run.plan_state["accepted_plan_ownership"]["items"] == {"child": {"unit_type": "goal"}}
+
+
+@pytest.mark.asyncio
+async def test_g3_goal_item_requires_complete_accepted_g2_inventory(db_session, test_project):
+    goal = OrchestrationGoal(project_id=test_project.id, objective="o", original_request="o")
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    await db_session.flush()
+    item = OrchestrationRoadmapPlanItem(
+        item_key="child", unit_type="goal", title="Child", objective="o", success_criteria=[{"key": "done"}],
+        allocation={"tokens": 1},
+    )
+    result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
+    assert result == [{"item_id": "child", "status": "conflict", "reason": "current accepted team hierarchy is missing"}]
+
+
+@pytest.mark.asyncio
+async def test_g3_goal_item_rejects_incomplete_g2_inventory(db_session, test_project):
+    agent = _agent("worker")
+    db_session.add(agent)
+    await db_session.flush()
+    goal = OrchestrationGoal(project_id=test_project.id, objective="o", original_request="o")
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    db_session.add(run)
+    db_session.add(OrchestrationProcessRun(
+        goal_id=goal.id, process_type="team_hierarchy", status="completed", trigger_reason="test",
+        outputs=_accepted_outputs(agent.id),
+    ))
+    await db_session.flush()
+    item = OrchestrationRoadmapPlanItem(
+        item_key="child", unit_type="goal", title="Child", objective="o", success_criteria=[{"key": "done"}],
+        allocation={"tokens": 1},
+    )
+    result = await PlanOwnershipService().validate_plan_owners(db_session, goal, run, [item], bind=False, review=None)
+    assert result == [{"item_id": "child", "status": "conflict", "reason": "current accepted agent review is missing"}]

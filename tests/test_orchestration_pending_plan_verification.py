@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from huddleroom.models.orchestration import OrchestrationAction, OrchestrationEvidence
+from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.task import Task
 from huddleroom.models.session import Session
@@ -117,6 +118,121 @@ async def test_pending_plan_verification_excludes_producer_from_verifier_selecti
             {"gate_id": str(gate.id), "work_function": "validation"}, f"self:{run.id}")
     assert exc.value.status_code == 409
     assert exc.value.detail == "No strong verification agent fit"
+
+
+@pytest.mark.asyncio
+async def test_manager_decision_task_is_bound_before_planning_only_admission(db_session, test_project):
+    """The real authority-delivery flow creates the only manager planning exception."""
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+    from huddleroom.services.orchestration_plan_review import PlanReviewService
+    from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+    from huddleroom.services.orchestration_authority_service import compute_goal_contract_fingerprint
+
+    service, goal, run, _, _, artifact, _ = await _pending(db_session, test_project.id)
+    # This delivery task is intentionally unbudgeted here; the test exercises
+    # the authority lineage rather than a separate capped-delegation policy.
+    goal.budget = {}
+    run.budget_state = {}
+    manager = _agent("current-manager", role="manager", capabilities=["management", "planning"])
+    db_session.add(manager)
+    await db_session.flush()
+    goal.manager_user_id = None
+    goal.manager_agent_id = manager.id
+    review = await PlanReviewService().check(db_session, goal, run, artifact, boundary="manager test")
+    assert review.state == "ready"
+    binding = OrchestrationRoadmapService._review_binding(review)
+    decision = OrchestrationAuthorityDecision(
+        goal_id=goal.id,
+        run_id=run.id,
+        decision_key="roadmap_plan:manager-test",
+        title="Manager plan review",
+        question="Review the current plan candidate.",
+        authority="manager",
+        authority_agent_id=manager.id,
+        options=[{"key": "approve"}],
+        context=json.dumps(binding),
+    )
+    db_session.add(decision)
+    fingerprint = compute_goal_contract_fingerprint(goal)
+    run.goal_contract_fingerprint = fingerprint
+    run.plan_state = {**run.plan_state, "scope_contract_version": 1}
+    db_session.add(OrchestrationAction(
+        run_id=run.id,
+        idempotency_key=f"run:{run.id}:kind:authorize_execution",
+        action_type="authorize_execution",
+        status="completed",
+        request={"scope": "planning_only", "contract_fingerprint": fingerprint},
+        target_type="run",
+        target_id=run.id,
+    ))
+    await db_session.flush()
+
+    summary = await service._sync_agent_authority_decisions(db_session, goal, run)
+    await db_session.refresh(decision)
+    assert summary == {
+        "delegated": 1, "recorded": 0, "escalated": 0,
+    }, decision.reason
+    action = await db_session.get(OrchestrationAction, decision.related_action_id)
+    task = await db_session.get(Task, action.target_id)
+    assert action.status == "completed"
+    assert action.request["authority_decision_id"] == str(decision.id)
+    assert action.request["plan_review_identity_hash"] == binding["plan_review_identity_hash"]
+    assert task.metadata_["orchestration"]["authority_decision_id"] == str(decision.id)
+    assert task.metadata_["orchestration"]["plan_review_identity_hash"] == binding["plan_review_identity_hash"]
+    assert (await effective_authorization(db_session, goal, run, task)).allowed
+
+
+@pytest.mark.asyncio
+async def test_verifier_verdict_correction_keeps_current_planning_only_authority(db_session, test_project):
+    """A server-dispatched correction inherits only its live verifier parent's authority."""
+    from huddleroom.services.orchestration_authority_service import (
+        compute_goal_contract_fingerprint,
+        effective_authorization,
+    )
+    from huddleroom.services.orchestration_result_contract import VERIFICATION_VERDICT
+
+    from huddleroom.services.orchestration_plan_review import PlanReviewService
+    from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+
+    service, goal, run, planning_task, _, artifact, gate = await _pending(db_session, test_project.id)
+    verifier = _agent("independent-verifier", role="validator", capabilities=["validation"])
+    db_session.add(verifier)
+    await db_session.flush()
+    review = await PlanReviewService().check(db_session, goal, run, artifact, boundary="verifier correction test")
+    binding = OrchestrationRoadmapService._review_binding(review)
+    gate.gate_type = "roadmap_plan_approval"
+    gate.required_evidence = {
+        **gate.required_evidence,
+        "plan_artifact_id": str(artifact.id),
+        "planning_task_id": str(planning_task.id),
+        "work_producer_agent_id": str(planning_task.assigned_to),
+        **binding,
+    }
+    action = await service.execute_request_verification_action(
+            db_session, run.id,
+            {"action_type": "request_verification", "gate_id": str(gate.id), "work_function": "validation"},
+            f"verifier-correction:{run.id}",
+    )
+    parent = await db_session.get(Task, action.target_id)
+    assert parent.assigned_to == verifier.id
+    fingerprint = compute_goal_contract_fingerprint(goal)
+    run.goal_contract_fingerprint = fingerprint
+    run.plan_state = {**run.plan_state, "scope_contract_version": 1}
+    db_session.add(OrchestrationAction(run_id=run.id, idempotency_key=f"run:{run.id}:kind:authorize_execution",
+        action_type="authorize_execution", status="completed", request={"scope": "planning_only", "contract_fingerprint": fingerprint}, target_type="run", target_id=run.id))
+    ledger = {"kind": VERIFICATION_VERDICT, "cycle": 1, "attempts": [], "status": "pending"}
+    await service._dispatch_result_correction(
+            db_session, goal, run, parent, ledger, "invalid verdict",
+            {"task_id": str(parent.id), "session_id": None, "errors": ["invalid verdict"]},
+            {}, f"task:{parent.id}:result_correction", [],
+            service._result_correction_version(goal, run),
+    )
+    assert "correction_task_id" in ledger, ledger.get("detail")
+    correction = await db_session.get(Task, uuid.UUID(ledger["correction_task_id"]))
+    correction_action = await db_session.get(OrchestrationAction, uuid.UUID(correction.metadata_["orchestration"]["action_id"]))
+    assert correction_action.status == "completed"
+    assert correction.metadata_["result_correction_parent_task_id"] == str(parent.id)
+    assert (await effective_authorization(db_session, goal, run, correction)).allowed
 
 
 @pytest.mark.asyncio

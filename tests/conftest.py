@@ -504,22 +504,66 @@ async def memory_agent(db_session: AsyncSession) -> Agent:
     return agent
 
 
-async def bind_plan_author_team(db_session, goal, agent):
-    """Make `agent` the accepted, review-eligible planning/implementation owner (baseline maps other agents)."""
+async def bind_plan_author_team(db_session, goal, agent, *, role_agents=None, team_goal=None):
+    """Publish exact accepted G2 ownership for a plan-fixture team."""
     from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 
-    functions = ["planning", "implementation"]
+    role_agents = role_agents or {"planning": agent, "implementation": agent}
+    role_agents = {function: owner for function, owner in role_agents.items() if owner is not None}
+    team_goal = team_goal or goal
     service = OrchestrationProcessService()
-    team = await service.get_current(db_session, goal.id, "team_hierarchy")
+    team = await service.get_current(db_session, team_goal.id, "team_hierarchy")
     if team is not None:
-        team.outputs = {
-            **(team.outputs or {}),
-            "role_to_agent": {},
-            "assignments": [{"work_function": fn, "agent_ref": str(agent.id)} for fn in functions],
+        previous = team.outputs or {}
+        roles = {**(previous.get("role_to_agent") or {})}
+        roles.update({function: str(owner.id) for function, owner in role_agents.items()})
+        assignments = [
+            item for item in previous.get("assignments") or []
+            if not isinstance(item, dict) or item.get("work_function") not in role_agents
+        ]
+        assignments.extend(
+            {"work_function": function, "agent_ref": str(owner.id)}
+            for function, owner in role_agents.items()
+        )
+        coverage = [
+            item for item in previous.get("responsibility_coverage") or []
+            if not isinstance(item, dict) or item.get("work_function") not in role_agents
+        ]
+        coverage.extend(
+            {
+                "responsibility_id": function,
+                "work_function": function,
+                "agent_ref": str(owner.id),
+                "status": "covered",
+                "evidence_ref": "agent_review:accepted",
+            }
+            for function, owner in role_agents.items()
+        )
+        gates = {**(previous.get("gates") or {})}
+        gates["team_structure_reviewed"] = True
+        outputs = {
+            **previous,
+            "role_to_agent": roles,
+            "assignments": assignments,
+            "responsibility_coverage": coverage,
+            "approval": previous.get("approval") if previous.get("approval") in {
+                "approve", "approve_with_documented_gaps"
+            } else "approve",
+            "approval_decision_id": previous.get("approval_decision_id") or str(uuid.uuid4()),
+            "accepted_responsibility_gap_ids": previous.get("accepted_responsibility_gap_ids") or [],
+            "gates": gates,
         }
-    review = await service.get_current(db_session, goal.id, "agent_definition_review")
+        team.outputs = outputs
+        # Keep an existing delegated team snapshot in sync; never invent one (it becomes a runtime allowlist).
+        for owner_goal in {id(g): g for g in (goal, team_goal)}.values():
+            if (owner_goal.orchestrator_context or {}).get("team"):
+                owner_goal.orchestrator_context = {**owner_goal.orchestrator_context, "team": outputs}
+    review = await service.get_current(db_session, team_goal.id, "agent_definition_review")
     if review is not None and isinstance((review.outputs or {}).get("eligibility"), dict):
-        review.outputs = {**review.outputs, "eligibility": {**review.outputs["eligibility"], str(agent.id): functions}}
+        eligibility = {**review.outputs["eligibility"]}
+        for function, owner in role_agents.items():
+            eligibility[str(owner.id)] = [*dict.fromkeys([*eligibility.get(str(owner.id), []), function])]
+        review.outputs = {**review.outputs, "eligibility": eligibility}
     await db_session.flush()
 
 

@@ -346,6 +346,24 @@ def test_codex_resume_command_uses_config_not_sandbox_flags(tmp_path):
     ]
 
 
+def test_codex_planning_commands_are_read_only_for_fresh_and_resume(tmp_path):
+    """A planning grant cannot be widened by the normal Codex launch defaults."""
+    workspace = tmp_path / "workspace"
+    fresh = CliAdapter._build_command(
+        "codex", "inspect", {"cli_env_extras": {"UNSAFE": "1"}}, workspace, workspace / "task.md",
+        planning_only=True,
+    )
+    resumed = CliAdapter._build_command(
+        "codex", "continue", {}, workspace, workspace / "task.md",
+        existing_session_id="thread-1", planning_only=True,
+    )
+
+    assert fresh[fresh.index("--sandbox") + 1] == "read-only"
+    assert "sandbox_workspace_write.network_access=true" not in fresh
+    assert resumed[resumed.index("-c") + 1] == "sandbox_mode=read-only"
+    assert "sandbox_workspace_write.network_access=true" not in resumed
+
+
 def test_reasoning_effort_flags(tmp_path):
     ws = tmp_path / "w"
     def build(rt, cfg):
@@ -452,6 +470,23 @@ def test_openrouter_fallback_is_missing_only_and_runtime_scoped(monkeypatch, run
         assert env["OPENROUTER_API_KEY"] == (defined if defined is not None else "onecli-openrouter-placeholder")
     else:
         assert "OPENROUTER_API_KEY" not in env
+
+
+def test_planning_env_ignores_agent_extras_that_can_replace_codex(monkeypatch):
+    monkeypatch.setenv("PATH", "/system/bin")
+    monkeypatch.setenv("CODEX_HOME", "/system/codex")
+    agent = Agent(
+        name="planner", role="reviewer", provider="openrouter", model="test", adapter_type="cli",
+        capabilities=[], config={"cli_runtime": "codex", "cli_env_extras": {
+            "PATH": "/tmp/agent-bin", "CODEX_HOME": "/tmp/agent-codex", "EXTRA": "widen",
+        }},
+    )
+
+    env = CliAdapter()._build_env(uuid.uuid4(), None, agent, None, planning_only=True)
+
+    assert env["PATH"] == "/system/bin"
+    assert env["CODEX_HOME"] == "/system/codex"
+    assert "EXTRA" not in env
 
 
 @pytest.mark.parametrize(
@@ -815,6 +850,34 @@ async def test_launch_revalidation_failure_terminalizes_running_session(test_eng
         assert session.ended_at is not None
         assert failure.payload["error"] == session.error
         launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_planning_runtime_writes_no_control_files(test_engine, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as db:
+        project = Project(name=f"Project-{uuid.uuid4()}", workspace_path=str(workspace), config={})
+        agent = Agent(
+            name=f"agent-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
+            adapter_type="cli", capabilities=[], config={"cli_runtime": "claude_code"},
+        )
+        db.add_all([project, agent])
+        await db.flush()
+        session = Session(agent_id=agent.id, project_id=project.id, adapter_type="cli", status="pending", metadata_={})
+        db.add(session)
+        await db.commit()
+
+        from huddleroom.services.session_service import SessionService
+        monkeypatch.setattr(SessionService, "runtime_execution_policy", AsyncMock(return_value=True))
+        with patch.object(CliAdapter, "_setup_sandbox") as setup:
+            await CliAdapter().run(session.id, db)
+
+        await db.refresh(session)
+        assert session.status == "failed"
+        assert session.error == "unsupported_planning_runtime: claude_code"
+        setup.assert_not_called()
 
 
 @pytest.mark.asyncio

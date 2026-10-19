@@ -39,7 +39,7 @@ async def test_planner_finishes_while_paused_survives_reload_and_consumes_once(
         setup.add_all([planner, producer])
         await setup.flush()
         service, goal, run = await _authorized_run(setup, project, owns_setup=True)
-        await bind_plan_author_team(setup, goal, planner)
+        await bind_plan_author_team(setup, goal, planner, role_agents={"planning": planner, "implementation": producer})
         await setup.commit()
         action = await service.execute_request_plan_action(setup, run.id, {
             "action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",

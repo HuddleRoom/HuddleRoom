@@ -196,8 +196,10 @@ class OrchestrationChatActionService:
             if action.operation in {"start_execution", "restart_execution"}:
                 if run is None:
                     raise conflict("chat_stale_review", "Start requires an active run")
+                scope = action.payload.start_scope or "execution"
+                state["start_scope"] = scope
                 prepared.frozen_versions.update({
-                    "scope": "execution", "request_id": str(prepared.action_id),
+                    "scope": scope, "request_id": str(prepared.action_id),
                     "run_id": str(run.id), "control_version": str(run.control_version),
                 })
             elif action.operation == "pause" and run is not None:
@@ -205,7 +207,7 @@ class OrchestrationChatActionService:
             prepared.requires_confirmation = action.operation in CONFIRM_OPERATIONS
             prepared.status = "awaiting_confirmation" if prepared.requires_confirmation else "prepared"
             if prepared.requires_confirmation:
-                notice = "Cancels this goal and its children, tasks and sessions." if action.operation == "cancel" else "Pauses work; baseline authorization is cleared during baseline." if action.operation == "pause" else "Authorizes model spend and execution under these limits."
+                notice = "Cancels this goal and its children, tasks and sessions." if action.operation == "cancel" else "Pauses work; baseline authorization is cleared during baseline." if action.operation == "pause" else f"Authorizes {scope.replace('_', ' ')} under these limits."
                 prepared.summary = notice + "\n" + json.dumps(state, sort_keys=True, default=str)
             if len(prepared.summary) > 12000:
                 raise conflict("chat_review_too_large", "Review exceeds the bounded conversation; use the existing control")
@@ -224,10 +226,22 @@ class OrchestrationChatActionService:
             goal_lock = no_goal_lock() if action.operation in DECISION_OPERATIONS | {"pause"} else self._orchestration._lock_goal_for_baseline_transition(db, action.goal_id)
             async with goal_lock:
                 await db.refresh(turn)
-                receipt = await self._execute_locked(db, turn, action, confirmed=confirmed, owns_transaction=owns)
-                if owns:
-                    await db.commit()
-                return receipt
+                try:
+                    receipt = await self._execute_locked(db, turn, action, confirmed=confirmed, owns_transaction=owns)
+                    if owns:
+                        await db.commit()
+                    return receipt
+                except HTTPException as exc:
+                    stale_record = getattr(exc, "stale_plan_review", None)
+                    # The decision writer rolls back its savepoint; preserve only its observed stale marker.
+                    if (owns and exc.status_code == 409 and isinstance(stale_record, dict)
+                            and action.target_id is not None and action.run_id is not None):
+                        decision_id, run_id, goal_id = action.target_id, action.run_id, action.goal_id
+                        await db.rollback()
+                        await decisions._preserve_stale_roadmap_plan_answer(
+                            db, decision_id, run_id, goal_id, stale_record,
+                        )
+                    raise
 
     async def _execute_locked(self, db, turn, action, *, confirmed, owns_transaction=False):
         persisted = await db.get(ProjectChatTurn, turn.id)
@@ -279,8 +293,10 @@ class OrchestrationChatActionService:
                     if action.operation in {"start_execution", "restart_execution"}:
                         if run is None:
                             raise conflict("chat_stale_review", "Start requires an active run")
+                        scope = action.payload.start_scope or "execution"
+                        state["start_scope"] = scope
                         refreshed.frozen_versions.update({
-                            "scope": "execution", "request_id": str(refreshed.action_id),
+                            "scope": scope, "request_id": str(refreshed.action_id),
                             "run_id": str(run.id), "control_version": str(run.control_version),
                         })
                     elif action.operation == "pause" and run is not None:
@@ -352,7 +368,7 @@ class OrchestrationChatActionService:
                 expected_control_version = int(action.frozen_versions["control_version"])
             except (KeyError, TypeError, ValueError):
                 raise conflict("chat_stale_review", "Reviewed Start envelope is incomplete") from None
-            if scope != "execution" or request_id != action.action_id or expected_run_id != action.run_id:
+            if scope not in {"planning_only", "execution"} or scope != (action.payload.start_scope or "execution") or request_id != action.action_id or expected_run_id != action.run_id:
                 raise conflict("chat_stale_review", "Reviewed Start envelope changed")
             await self._orchestration.start_run(
                 db, project_id, goal_id, actor=f"human:{user.id}", scope=scope, commit=False,

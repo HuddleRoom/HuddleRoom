@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { useOrchestrationGoal } from '@/api/orchestration'
 import { Callout } from '@/components/common/Callout'
@@ -12,6 +12,7 @@ import type {
   OrchestrationGoal,
   OrchestrationGoalDetail,
   OrchestrationPlanItemView,
+  OrchestrationPlanReviewView,
   OrchestrationPlanView,
   OrchestrationRunSummary,
   OrchestrationTaskReport,
@@ -324,9 +325,48 @@ export interface PlanTabProps {
   taskTitles?: Names
   agentRoles?: Names
   onViewDecision?: (decisionId: string) => void
+  focusArtifactId?: string | null
 }
 
-export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRoles, onViewDecision }: PlanTabProps) {
+function PlanReviewCandidate({ review, onViewDecision, focus }: { review: OrchestrationPlanReviewView; onViewDecision?: (decisionId: string) => void; focus: boolean }) {
+  const candidateRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    if (!focus) return
+    candidateRef.current?.scrollIntoView?.({ block: 'start' })
+    candidateRef.current?.focus({ preventScroll: true })
+  }, [focus, review.artifact_id])
+  const version = review.identity.planning_version
+  const authorityStatus = review.authority_status?.trim() ?? null
+  const authorityOpen = ['pending', 'open', 'awaiting approval', 'awaiting review'].includes(authorityStatus?.toLowerCase() ?? '')
+  const decisionAction = authorityOpen && review.authority_decision_id && onViewDecision
+    ? <div className="flex flex-wrap gap-2">
+      <Button type="button" className="min-h-11" disabled={review.state !== 'ready'} onClick={() => onViewDecision(review.authority_decision_id!)}>Approve plan v{version}</Button>
+      <Button type="button" variant="secondary" className="min-h-11" onClick={() => onViewDecision(review.authority_decision_id!)}>Request revision</Button>
+    </div> : null
+  return <section id={`plan-review-${review.artifact_id}`} ref={candidateRef} tabIndex={-1} aria-label={`Plan candidate v${version}`} className="flex flex-col gap-3 rounded-md border border-huddleroom-border p-4">
+    <div className="flex flex-wrap items-center gap-2">
+      <h3 className={HEADING_CLASS}>Plan candidate v{version}</h3>
+      <StatusBadge status={review.state === 'stale' ? 'blocked' : authorityOpen ? 'pending' : authorityStatus?.toLowerCase() === 'accepted' ? 'accepted' : 'neutral'} label={review.state === 'stale' ? 'Stale — revision required' : authorityOpen ? 'Awaiting review' : authorityStatus ?? 'Authority unavailable'} />
+    </div>
+    <p className="text-sm text-huddleroom-text-secondary">This Markdown is readable and editable, but only the canonical reviewed content can execute.</p>
+    <Link to={review.review_url} className="inline-flex min-h-11 items-center text-sm text-huddleroom-primary hover:underline">Link to this candidate</Link>
+    {review.reason && <Callout variant={review.state === 'stale' ? 'warning' : 'info'}>{review.reason}</Callout>}
+    <RecordList keyWidth={150} rows={[
+      { key: 'Artifact', value: <MonoId id={review.artifact_id} /> },
+      { key: 'Review cycle', value: String(review.identity.review_cycle) },
+      { key: 'Provenance', value: <MonoId id={review.identity.provenance_hash} /> },
+      { key: 'Canonical content', value: <MonoId id={review.identity.canonical_content_hash} /> },
+      { key: 'Rendered content', value: <MonoId id={review.identity.rendered_content_hash} /> },
+      { key: 'Authority', value: review.authority_status ?? 'Awaiting authority decision' },
+      { key: 'Export', value: review.export_path ?? 'No safe export is available' },
+    ]} />
+    <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words rounded-md border border-huddleroom-border bg-huddleroom-depth p-3 text-sm">{review.markdown}</pre>
+    {review.state === 'stale' && <Callout variant="warning">This candidate remains readable for revision, but it cannot be approved or executed.</Callout>}
+    {decisionAction}
+  </section>
+}
+
+export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRoles, onViewDecision, focusArtifactId = null }: PlanTabProps) {
   const headingId = useId()
   const { plan, run } = detail
   const runs = detail.runs ?? []
@@ -342,6 +382,7 @@ export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRo
     : undefined
   const isRoadmap = detail.goal.goal_type === 'roadmap' || plan?.kind === 'roadmap'
   const currentRun = runs.find((candidate) => candidate.is_current)
+  const review = plan?.review ?? null
 
   return <section className="flex flex-col gap-4 border-t border-huddleroom-border pt-4">
     <PlanOverview
@@ -349,6 +390,7 @@ export function PlanTab({ projectId, detail, decisions = [], taskTitles, agentRo
       planStatus={plan?.status ?? run?.plan_state?.status ?? null}
       pendingDecisionId={pendingDecision?.id ?? null} onViewDecision={onViewDecision}
     />
+    {review && <PlanReviewCandidate review={review} onViewDecision={onViewDecision} focus={focusArtifactId === review.artifact_id} />}
     {plan && <PlanItemList
       plan={plan} evidence={detail.evidence} taskReports={detail.task_reports ?? []} goal={detail.goal}
       taskTitles={taskTitles} agentRoles={agentRoles}

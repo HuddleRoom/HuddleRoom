@@ -205,6 +205,89 @@ async def test_execution_start_keeps_confirmation_and_one_authorization(sessions
         assert len(actions) == 1
 
 
+@pytest.mark.parametrize(("content", "scope"), [
+    ("Start planning work for this goal.", "planning_only"),
+    ("Start execution work for this goal.", "execution"),
+])
+async def test_scope_change_ui_instructions_prepare_for_review(sessions, tmp_path, content, scope):
+    _, user, goal, _ = await _ready(sessions, tmp_path)
+    _, action = await _prepare(
+        sessions, user, goal, "start_execution", content=content,
+        payload={"start_scope": scope},
+    )
+    assert action.requires_confirmation
+    assert action.payload.start_scope == scope
+
+
+async def test_planning_start_freezes_scope_and_replay_stays_in_planning(sessions, tmp_path):
+    project, user, goal, run = await _ready(sessions, tmp_path)
+    turn, action = await _prepare(
+        sessions, user, goal, "start_execution", content="Start execution work for this goal",
+        payload={"start_scope": "planning_only"},
+    )
+    assert action.payload.start_scope == "planning_only"
+    assert action.frozen_versions["scope"] == "planning_only"
+    assert "planning only" in action.summary
+    async with sessions() as db:
+        pending = await _service(sessions).execute(db, await db.get(ProjectChatTurn, turn.id), action)
+        await db.commit()
+    assert pending.status == "pending"
+
+    service = _service(sessions)
+    request_id = uuid.uuid4()
+    first = await service.confirm(project.id, user.id, action.action_id, request_id)
+    second = await service.confirm(project.id, user.id, action.action_id, request_id)
+    assert first == second
+    async with sessions() as db:
+        starts = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "authorize_execution",
+        ))).all()
+    assert len(starts) == 1 and starts[0].request["scope"] == "planning_only"
+
+
+async def test_planning_start_rejects_scope_tampering_after_review(sessions, tmp_path):
+    project, user, goal, run = await _ready(sessions, tmp_path)
+    turn, action = await _prepare(
+        sessions, user, goal, "start_execution", content="Start execution work for this goal",
+        payload={"start_scope": "planning_only"},
+    )
+    async with sessions() as db:
+        row = await db.get(ProjectChatTurn, turn.id)
+        draft = dict(row.action_draft)
+        draft["payload"] = {**draft["payload"], "start_scope": "execution"}
+        row.action_draft = draft
+        await db.commit()
+    with pytest.raises(HTTPException) as error:
+        await _service(sessions).confirm(project.id, user.id, action.action_id, uuid.uuid4())
+    assert error.value.status_code == 409
+    assert (await _states(sessions, goal, run))[1].phase == "ready"
+
+
+async def test_stale_planning_start_refresh_preserves_scope_under_new_review_id(sessions, tmp_path):
+    project, user, goal, run = await _ready(sessions, tmp_path)
+    turn, action = await _prepare(
+        sessions, user, goal, "start_execution", content="Start execution work for this goal",
+        payload={"start_scope": "planning_only"},
+    )
+    async with sessions() as db:
+        (await db.get(OrchestrationGoal, goal.id)).budget = {"max_tokens": 200}
+        await db.commit()
+    stale = await _service(sessions).confirm(project.id, user.id, action.action_id, uuid.uuid4())
+    assert stale.status == "pending" and stale.error_code == "chat_stale_review"
+    async with sessions() as db:
+        refreshed = ChatActionDraft.model_validate((await db.get(ProjectChatTurn, turn.id)).action_draft)
+    assert refreshed.action_id != action.action_id
+    assert refreshed.payload.start_scope == "planning_only"
+    assert refreshed.frozen_versions["scope"] == "planning_only"
+    result = await _service(sessions).confirm(project.id, user.id, refreshed.action_id, uuid.uuid4())
+    assert result.status == "completed"
+    async with sessions() as db:
+        starts = (await db.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "authorize_execution",
+        ))).all()
+    assert len(starts) == 1 and starts[0].request["scope"] == "planning_only"
+
+
 async def test_start_envelope_drift_requires_refreshed_review_and_new_acceptance(sessions, tmp_path):
     project, user, goal, run = await _ready(sessions, tmp_path)
     turn, action = await _prepare(sessions, user, goal, "start_execution", content="Start execution work for this goal")

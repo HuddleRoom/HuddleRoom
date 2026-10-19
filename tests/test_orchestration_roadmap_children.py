@@ -26,6 +26,7 @@ from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import GoalShapeDecision
 from huddleroom.services.orchestration_goal_shape import GoalShapeResolutionError, OrchestrationGoalShapeService
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService
+from huddleroom.services.orchestration_plan_ingestion import plan_output_hash
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_roadmap_service import (
     OrchestrationRoadmapService, expansion_limit_error, parse_roadmap_items,
@@ -33,7 +34,8 @@ from huddleroom.services.orchestration_roadmap_service import (
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.session_service import SessionClaimAttention, SessionService
 from huddleroom.schemas.session import SessionCreate
-from tests.test_orchestration_runtime_e2e import _agent, _authorized_run, _seed_accepted_plan
+from tests.test_orchestration_runtime_e2e import _agent, _authorized_run
+from tests.test_orchestration_roadmap_plans import _seed_accepted_g2_ownership
 
 
 pytestmark = pytest.mark.asyncio
@@ -79,22 +81,44 @@ async def accepted_goal_roadmap(db, project, item, cap=1000, authority_model="hu
         **({"agent_ids": [str(planner.id)]} if include_planner_in_team else {}),
     }
     items = item if isinstance(item, list) else [item]
+    await _seed_accepted_g2_ownership(db, parent, planner, items, ())
+    request = await service.execute_request_plan_action(
+        db, run.id,
+        {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
+         "scope": "Plan child work."},
+        f"run:{run.id}:kind:child-roadmap-request",
+    )
+    metadata = {
+        "schema_version": 1, "plan_kind": "roadmap", "summary": "Review the child Roadmap candidate.",
+        "plan_items": items, "planning_task_id": str(request.target_id), "planning_version": 1,
+        "winning_session_id": str(uuid.uuid4()), "plan_author_agent_id": str(planner.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
     artifact = Artifact(project_id=project.id, name="child-plan", artifact_type="plan", status="draft",
-                        created_by_agent=planner.id, metadata_={"plan_items": items})
+                        linked_task_id=request.target_id, created_by_agent=planner.id,
+                        content_hash=metadata["output_hash"], metadata_=metadata)
     db.add(artifact); await db.flush()
+    run.plan_state = {
+        **run.plan_state, "plan_artifact_id": str(artifact.id), "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": {
+            "artifact_id": str(artifact.id), "planning_task_id": metadata["planning_task_id"],
+            "planning_version": metadata["planning_version"], "winning_session_id": metadata["winning_session_id"],
+            "plan_author_agent_id": metadata["plan_author_agent_id"],
+            "canonical_content_hash": metadata["output_hash"],
+        },
+    }
     roadmap = OrchestrationRoadmapService(service)
-    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(
-        artifact.metadata_["plan_items"], set(parent.budget["caps"])
-    )]
-    fingerprint = service._accepted_plan_fingerprint(normalized)
-    decision = OrchestrationAuthorityDecision(goal_id=parent.id, run_id=run.id, decision_key=f"roadmap_plan:{fingerprint}",
-        title="approve", question="approve", authority="human" if authority_model == "human_manager" else "manager",
-        authority_agent_id=parent.manager_agent_id, status="answered", selected_option="approve",
-        decided_by_user_id=parent.manager_user_id, decided_by_agent_id=parent.manager_agent_id)
-    db.add(decision); await db.flush()
+    decision = await roadmap.ensure_plan_approval(db, parent, run, artifact)
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option="approve",
+        decided_by_user_id=parent.manager_user_id if authority_model == "human_manager" else None,
+        decided_by_agent_id=parent.manager_agent_id if authority_model == "agent_manager" else None,
+    )
     version = await roadmap.accept_version(db, parent, run, artifact, {"kind": "authority_decision", "id": str(decision.id)})
     run.plan_state = {
-        "status": "accepted", "accepted_artifact_id": str(artifact.id),
+        **run.plan_state, "status": "accepted", "accepted_artifact_id": str(artifact.id),
         "roadmap_version_id": str(version.id), "roadmap_version": version.version,
         "accepted_plan_fingerprint": version.fingerprint,
     }
@@ -106,6 +130,99 @@ async def release(db, project, item= None, cap=1000, *, owns_setup=False):
     result = await roadmap.advance(db, parent, run)
     row = await db.scalar(select(OrchestrationRoadmapItem).where(OrchestrationRoadmapItem.goal_id == parent.id))
     return roadmap, parent, run, result, row
+
+
+async def accept_child_roadmap_plan(db, project, service, goal, run, planner, items):
+    """Build a canonical child Roadmap candidate through the same G3 bindings as its parent."""
+    await _seed_accepted_g2_ownership(db, goal, planner, items, ())
+    adapter_type = planner.adapter_type
+    planner.adapter_type = "api"
+    try:
+        request = await service.execute_request_plan_action(
+            db, run.id,
+            {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
+             "scope": "Plan nested work."},
+            f"run:{run.id}:kind:nested-roadmap-request",
+        )
+    finally:
+        planner.adapter_type = adapter_type
+    metadata = {
+        "schema_version": 1, "plan_kind": "roadmap", "summary": "Review the nested Roadmap candidate.",
+        "plan_items": items, "planning_task_id": str(request.target_id), "planning_version": 1,
+        "winning_session_id": str(uuid.uuid4()), "plan_author_agent_id": str(planner.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
+    artifact = Artifact(project_id=project.id, name="nested-plan", artifact_type="plan", status="draft",
+                        linked_task_id=request.target_id, created_by_agent=planner.id,
+                        content_hash=metadata["output_hash"], metadata_=metadata)
+    db.add(artifact)
+    await db.flush()
+    run.plan_state = {
+        **run.plan_state, "plan_artifact_id": str(artifact.id), "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": {
+            "artifact_id": str(artifact.id), "planning_task_id": metadata["planning_task_id"],
+            "planning_version": metadata["planning_version"], "winning_session_id": metadata["winning_session_id"],
+            "plan_author_agent_id": metadata["plan_author_agent_id"],
+            "canonical_content_hash": metadata["output_hash"],
+        },
+    }
+    roadmap = OrchestrationRoadmapService(service)
+    decision = await roadmap.ensure_plan_approval(db, goal, run, artifact)
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db, decision, selected_option="approve", decided_by_user_id=goal.manager_user_id,
+    )
+    version = await roadmap.accept_version(db, goal, run, artifact, {"kind": "authority_decision", "id": str(decision.id)})
+    (await db.get(Task, request.target_id)).status = "done"
+    run.plan_state = {
+        **run.plan_state, "status": "accepted", "accepted_artifact_id": str(artifact.id),
+        "roadmap_version_id": str(version.id), "roadmap_version": version.version,
+        "accepted_plan_fingerprint": version.fingerprint,
+    }
+    return version
+
+
+async def accept_child_implementation_plan(db, project, service, run, planner, items):
+    from tests.conftest import bind_plan_author_team
+
+    goal = await db.get(OrchestrationGoal, run.goal_id)
+    # The child has no team_hierarchy of its own, so its ownership resolves from the parent team.
+    parent = await db.get(OrchestrationGoal, goal.parent_goal_id)
+    await bind_plan_author_team(db, goal, planner, role_agents={"planning": planner, "implementation": planner}, team_goal=parent)
+    request = await service.execute_request_plan_action(
+        db, run.id,
+        {"action_type": "request_plan", "agent_id": str(planner.id), "work_function": "planning",
+         "scope": "Plan child work."},
+        f"run:{run.id}:kind:child-implementation-request",
+    )
+    metadata = {
+        "schema_version": 1, "plan_kind": "implementation", "summary": "Review the child implementation plan.",
+        "plan_items": items, "planning_task_id": str(request.target_id), "planning_version": 1,
+        "winning_session_id": str(uuid.uuid4()), "plan_author_agent_id": str(planner.id),
+    }
+    metadata["output_hash"] = plan_output_hash({
+        key: metadata[key] for key in ("schema_version", "plan_kind", "summary", "plan_items")
+    })
+    artifact = Artifact(project_id=project.id, name="child-implementation-plan", artifact_type="plan", status="draft",
+                        linked_task_id=request.target_id, created_by_agent=planner.id,
+                        content_hash=metadata["output_hash"], metadata_=metadata)
+    db.add(artifact)
+    await db.flush()
+    run.plan_state = {
+        **run.plan_state, "plan_artifact_id": str(artifact.id), "plan_output_hash": metadata["output_hash"],
+        "plan_provenance": {
+            "artifact_id": str(artifact.id), "planning_task_id": metadata["planning_task_id"],
+            "planning_version": metadata["planning_version"], "winning_session_id": metadata["winning_session_id"],
+            "plan_author_agent_id": metadata["plan_author_agent_id"],
+            "canonical_content_hash": metadata["output_hash"],
+        },
+    }
+    await service.execute_accept_plan_action(
+        db, run.id, {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)},
+        f"run:{run.id}:kind:child-implementation-accept",
+    )
+    (await db.get(Task, request.target_id)).status = "done"
 
 
 async def attach_claim_lineage(db, task, run, *, agent_id=None):
@@ -350,7 +467,7 @@ async def test_child_contract_preserves_parent_authority_team_criteria_and_works
         "authority": {"authority_model": authority_model,
                       "manager_agent_id": str(parent.manager_agent_id) if parent.manager_agent_id else None,
                       "manager_user_id": str(parent.manager_user_id) if parent.manager_user_id else None},
-            "team": {"team": "parent-team", "agent_ids": []},
+        "team": deepcopy(version.snapshot["team"]),
         "success_criteria": [{"key": "parent"}],
         "workspace_policy": {"mode": "isolated"},
     }
@@ -387,7 +504,8 @@ async def test_child_delta_rejects_conflicting_parent_constraint(db_session, tes
     await db_session.commit()
     writer, reader = concurrent_sessions
     for _ in range(2):
-        assert (await roadmap.orchestration.tick(writer, run_id))["authorized_execution"] == {"step": "needs_attention"}
+        execution = (await roadmap.orchestration.tick(writer, run_id))["authorized_execution"]
+        assert execution.get("reason", execution["step"]) == "needs_attention"
         assert not writer.in_transaction()
     persisted_run = await reader.get(OrchestrationRun, run_id)
     assert [x for x in persisted_run.active_blockers if x["kind"] == "child_contract"] == [{
@@ -774,7 +892,7 @@ async def test_accepted_child_plan_expansion_waits_before_creating_lineage(
     child_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == child.id))
     agent = await db_session.get(Agent, uuid.UUID(child.orchestrator_context["team"]["agent_ids"][0]))
     agent.adapter_type = "api"
-    await _seed_accepted_plan(
+    await accept_child_implementation_plan(
         db_session, test_project, roadmap.orchestration, child_run, agent,
         [{"id": "cli-work", "work_function": "implementation", "scope": "child work",
           "deliverable": "verified", "agent_id": str(agent.id)}],
@@ -1280,10 +1398,10 @@ async def test_rejected_auto_child_is_not_reclassified_until_a_new_version(db_se
     blocker, = [b for b in run.active_blockers if b["kind"] == "child_contract"]
     assert blocker["roadmap_version_id"] == str(version.id) and blocker["item_key"] == "child"
     assert await _row_counts(db_session, parent, run) == [0, 0, 0, 0, 0]
-    run.active_blockers = [{**blocker, "roadmap_version_id": str(uuid.uuid4())}]  # as if a new version was accepted
+    run.active_blockers = [{**blocker, "roadmap_version_id": str(uuid.uuid4())}]
     with patch.object(OrchestrationGoalShapeService, "_classify", classify):
         await roadmap.advance(db_session, parent, run)
-    assert len(calls) == 2  # stale blocker cleared, item re-classified under the current version
+    assert len(calls) == 1  # a forged version marker cannot reclassify without an accepted version
 
 
 async def test_continuous_child_item_is_rejected_with_reason():
@@ -1554,21 +1672,8 @@ async def test_nested_roadmap_first_version_freezes_the_parents_workspace_policy
     planner = _agent("nested-planner", ["planning"])
     db_session.add(planner); await db_session.flush()
     items = [goal_item("g1", {"max_tokens": 200, "max_turns": 1, "max_hours": 1})]
-    artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
-                        created_by_agent=planner.id, metadata_={"plan_items": items})
-    db_session.add(artifact); await db_session.flush()
     service = OrchestrationService()
-    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(items, {"max_tokens", "max_turns", "max_hours"})]
-    decision = OrchestrationAuthorityDecision(
-        goal_id=child.id, run_id=child_run.id, authority="human", title="approve", question="approve",
-        decision_key=f"roadmap_plan:{service._accepted_plan_fingerprint(normalized)}", status="answered",
-        selected_option="approve", decided_by_user_id=child.manager_user_id,
-    )
-    db_session.add(decision); await db_session.flush()
-
-    version = await OrchestrationRoadmapService(service).accept_version(
-        db_session, child, child_run, artifact, {"kind": "authority_decision", "id": str(decision.id)},
-    )
+    version = await accept_child_roadmap_plan(db_session, test_project, service, child, child_run, planner, items)
 
     assert version.snapshot["workspace_policy"] == {"mode": "isolated"}
 
@@ -1655,20 +1760,7 @@ async def test_nested_roadmap_own_cli_task_item_claim_keys_on_its_own_lineage(db
         db_session, parent, parent_run, child, child_run, actor=f"roadmap_parent:{parent.id}",
     ) is not None
     items = [{**roadmap_task("own-task"), "agent_id": str(agent.id)}]
-    artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
-                        created_by_agent=agent.id, metadata_={"plan_items": items})
-    db_session.add(artifact); await db_session.flush()
-    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(items, {"max_tokens", "max_turns", "max_hours"})]
-    approval = OrchestrationAuthorityDecision(
-        goal_id=child.id, run_id=child_run.id, authority="human", title="approve", question="approve",
-        decision_key=f"roadmap_plan:{service._accepted_plan_fingerprint(normalized)}", status="answered",
-        selected_option="approve", decided_by_user_id=child.manager_user_id)
-    db_session.add(approval); await db_session.flush()
-    version = await roadmap.accept_version(
-        db_session, child, child_run, artifact, {"kind": "authority_decision", "id": str(approval.id)})
-    child_run.plan_state = {**child_run.plan_state, "status": "accepted", "accepted_artifact_id": str(artifact.id),
-                            "roadmap_version_id": str(version.id), "roadmap_version": version.version,
-                            "accepted_plan_fingerprint": version.fingerprint}
+    version = await accept_child_roadmap_plan(db_session, test_project, service, child, child_run, agent, items)
 
     await roadmap.advance(db_session, child, child_run)
     decision = await _answer(db_session, child, "roadmap_budget_adapter:%:own-task:%:cli:max_tokens", child.manager_user_id)
@@ -1685,20 +1777,7 @@ async def test_grandchild_cli_cap_authority_lands_on_the_nested_roadmap(db_sessi
     roadmap, parent, child, child_run, agent = await _released_nested_roadmap_with_cli_planner(db_session, test_project)
     service = roadmap.orchestration
     items = [goal_item("grand", {"max_tokens": 300, "max_turns": 2, "max_hours": 1})]
-    artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
-                        created_by_agent=agent.id, metadata_={"plan_items": items})
-    db_session.add(artifact); await db_session.flush()
-    normalized = [x.model_dump(mode="json") for x in parse_roadmap_items(items, {"max_tokens", "max_turns", "max_hours"})]
-    approval = OrchestrationAuthorityDecision(
-        goal_id=child.id, run_id=child_run.id, authority="human", title="approve", question="approve",
-        decision_key=f"roadmap_plan:{service._accepted_plan_fingerprint(normalized)}", status="answered",
-        selected_option="approve", decided_by_user_id=child.manager_user_id)
-    db_session.add(approval); await db_session.flush()
-    version = await roadmap.accept_version(
-        db_session, child, child_run, artifact, {"kind": "authority_decision", "id": str(approval.id)})
-    child_run.plan_state = {**child_run.plan_state, "status": "accepted", "accepted_artifact_id": str(artifact.id),
-                            "roadmap_version_id": str(version.id), "roadmap_version": version.version,
-                            "accepted_plan_fingerprint": version.fingerprint}
+    version = await accept_child_roadmap_plan(db_session, test_project, service, child, child_run, agent, items)
     await roadmap.advance(db_session, child, child_run)
     grand = await db_session.scalar(select(OrchestrationGoal).where(OrchestrationGoal.parent_goal_id == child.id))
     grand_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == grand.id))

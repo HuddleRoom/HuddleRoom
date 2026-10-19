@@ -195,7 +195,10 @@ class PlanReviewService:
     def _store(run, record: PlanReviewRecord) -> None:
         state = dict(run.plan_state or {})
         reviews = dict(state.get("plan_reviews") or {})
-        reviews[str(record.identity.artifact_id)] = record.model_dump(mode="json")
+        serialized = record.model_dump(mode="json")
+        if reviews.get(str(record.identity.artifact_id)) == serialized:
+            return
+        reviews[str(record.identity.artifact_id)] = serialized
         run.plan_state = {**state, "plan_reviews": reviews}
 
     @staticmethod
