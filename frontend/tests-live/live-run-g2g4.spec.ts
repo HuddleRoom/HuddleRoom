@@ -97,7 +97,7 @@ test('approve-hierarchy', async ({ page }) => {
   await expect(row).toBeVisible({ timeout: 60_000 })
   await row.getByRole('button', { name: 'Choose differently…' }).click()
   await expect(row.getByRole('radio', { name: /^approve$/i })).toHaveCount(0)
-  const approveWithGaps = row.getByRole('radio', { name: /approve with documented gaps/i })
+  const approveWithGaps = row.getByRole('radio', { name: /approve.?with.?documented.?gaps/i })
   await expect(approveWithGaps).toBeVisible()
   await approveWithGaps.check()
   await row.getByRole('button', { name: /^(Submit )?answer$/i }).click()
