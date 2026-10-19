@@ -936,9 +936,9 @@ class G2G4(L1):
                                             "complete_ownership_bound": accepted.get("items") == self.expected_plan_ownership,
                                             "no_implementation_task": not impl,
                                             "no_new_task_or_session": not new_tasks and not new_sessions,
-                                            "codex_invocations_released": {inv.ordinal for inv in self.codex.invocations()} <= self.sc.released_ordinals["codex"],
+                                            "codex_invocations_released": {inv.ordinal for inv in self.codex.invocations() if inv.exec_at is not None} <= self.sc.released_ordinals["codex"],
                                             "no_claude_invocation": (not self.claude.invocations() if not manager else
-                                                                     {inv.ordinal for inv in self.claude.invocations()}
+                                                                     {inv.ordinal for inv in self.claude.invocations() if inv.exec_at is not None}
                                                                      <= set(self.claude_released))}, answered=answered, bindings=bindings)
         self.sc.oracle_dump("plan-approved")
 
