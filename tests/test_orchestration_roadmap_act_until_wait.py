@@ -6,11 +6,14 @@ from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadm
 from huddleroom.services.orchestration_service import OrchestrationService
 
 
-async def _setup(db, project):
+async def _setup(db, project, plan_state=None):
     goal = OrchestrationGoal(project_id=project.id, objective="Roadmap", status="active", goal_type="roadmap")
     db.add(goal)
     await db.flush()
-    run = OrchestrationRun(goal_id=goal.id, status="running", phase="authorized", plan_state={"status": "accepted"})
+    run = OrchestrationRun(
+        goal_id=goal.id, status="running", phase="authorized",
+        plan_state={"status": "accepted"} if plan_state is None else plan_state,
+    )
     db.add(run)
     await db.flush()
     # This isolated loop fixture models the unmarked pre-G3 authorization shape.
@@ -115,3 +118,132 @@ async def test_single_roadmap_result_shape_unchanged(db_session, test_project, m
     result = await roadmap.advance(db_session, goal, run)
     assert set(result) == {"step", "action_id"}
     assert result["step"] == "replan_decision"
+
+
+def _grant_stub(monkeypatch, scope):
+    from huddleroom.services import orchestration_roadmap_service as roadmap_module
+    from huddleroom.services.orchestration_authority_service import ExecutionGrant
+
+    async def grant(_db, _goal, _run):
+        return None if scope is None else ExecutionGrant(action=None, scope=scope)
+
+    monkeypatch.setattr(roadmap_module, "execution_grant", grant)
+
+
+async def test_planning_only_without_version_requests_plan(db_session, test_project, monkeypatch):
+    goal, run = await _setup(db_session, test_project, plan_state={"status": "requested"})
+    orchestration = OrchestrationService()
+    roadmap = OrchestrationRoadmapService(orchestration)
+    _grant_stub(monkeypatch, "planning_only")
+    sentinel = {"step": "request_plan_sentinel"}
+    calls = {"plan": 0, "renew": 0}
+
+    async def no_version(*_a, **_k):
+        return None
+
+    async def plan(*_a, **_k):
+        calls["plan"] += 1
+        return sentinel
+
+    async def renew(*_a, **_k):
+        calls["renew"] += 1
+
+    monkeypatch.setattr(roadmap, "current_version", no_version)
+    monkeypatch.setattr(orchestration, "_advance_authorized_execution", plan)
+    monkeypatch.setattr(roadmap, "renew_corrected_children", renew)
+    assert await roadmap._advance_once(db_session, goal, run) == sentinel
+    assert calls == {"plan": 1, "renew": 0}
+
+
+async def test_planning_only_accepted_plan_without_version_waits_for_execution_scope(db_session, test_project, monkeypatch):
+    goal, run = await _setup(db_session, test_project)
+    orchestration = OrchestrationService()
+    roadmap = OrchestrationRoadmapService(orchestration)
+    _grant_stub(monkeypatch, "planning_only")
+    calls = {"plan": 0, "renew": 0}
+
+    async def no_version(*_a, **_k):
+        return None
+
+    async def plan(*_a, **_k):
+        calls["plan"] += 1
+        raise AssertionError("accepted plan under planning-only must not reach the outcome release path")
+
+    async def renew(*_a, **_k):
+        calls["renew"] += 1
+
+    monkeypatch.setattr(roadmap, "current_version", no_version)
+    monkeypatch.setattr(orchestration, "_advance_authorized_execution", plan)
+    monkeypatch.setattr(roadmap, "renew_corrected_children", renew)
+    assert await roadmap._advance_once(db_session, goal, run) == {"step": "waiting_execution_scope"}
+    assert calls == {"plan": 0, "renew": 0}
+
+
+async def test_execution_grant_without_version_advances_and_renews_once(db_session, test_project, monkeypatch):
+    goal, run = await _setup(db_session, test_project)
+    orchestration = OrchestrationService()
+    roadmap = OrchestrationRoadmapService(orchestration)
+    _grant_stub(monkeypatch, "execution")
+    sentinel = {"step": "request_plan_sentinel"}
+    calls = {"plan": 0, "renew": 0}
+
+    async def no_version(*_a, **_k):
+        return None
+
+    async def plan(*_a, **_k):
+        calls["plan"] += 1
+        return sentinel
+
+    async def renew(*_a, **_k):
+        calls["renew"] += 1
+
+    monkeypatch.setattr(roadmap, "current_version", no_version)
+    monkeypatch.setattr(orchestration, "_advance_authorized_execution", plan)
+    monkeypatch.setattr(roadmap, "renew_corrected_children", renew)
+    assert await roadmap._advance_once(db_session, goal, run) == sentinel
+    assert calls == {"plan": 1, "renew": 1}
+
+
+async def test_planning_only_with_accepted_version_releases_nothing(db_session, test_project, monkeypatch):
+    goal, run = await _setup(db_session, test_project)
+    orchestration = OrchestrationService()
+    roadmap = OrchestrationRoadmapService(orchestration)
+    _grant_stub(monkeypatch, "planning_only")
+    calls = {"plan": 0, "release": 0, "settle": 0}
+
+    async def version(*_a, **_k):
+        return object()
+
+    async def plan(*_a, **_k):
+        calls["plan"] += 1
+        raise AssertionError("planning-only must not re-enter execution once a version exists")
+
+    async def renew(*_a, **_k):
+        calls["release"] += 1
+
+    async def settle(*_a, **_k):
+        calls["settle"] += 1
+        return 0
+
+    monkeypatch.setattr(roadmap, "current_version", version)
+    monkeypatch.setattr(orchestration, "_advance_authorized_execution", plan)
+    monkeypatch.setattr(roadmap, "renew_corrected_children", renew)
+    monkeypatch.setattr(roadmap, "settle_finished_children", settle)
+    assert await roadmap._advance_once(db_session, goal, run) == {"step": "waiting_execution_scope"}
+    assert calls == {"plan": 0, "release": 0, "settle": 0}
+
+
+async def test_missing_grant_waits_for_execution_scope(db_session, test_project, monkeypatch):
+    goal, run = await _setup(db_session, test_project)
+    orchestration = OrchestrationService()
+    roadmap = OrchestrationRoadmapService(orchestration)
+    _grant_stub(monkeypatch, None)
+    calls = {"plan": 0}
+
+    async def plan(*_a, **_k):
+        calls["plan"] += 1
+        raise AssertionError("no grant must not request a plan")
+
+    monkeypatch.setattr(orchestration, "_advance_authorized_execution", plan)
+    assert await roadmap._advance_once(db_session, goal, run) == {"step": "waiting_execution_scope"}
+    assert calls["plan"] == 0

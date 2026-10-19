@@ -1464,12 +1464,19 @@ class OrchestrationRoadmapService:
 
     async def _advance_once(self, db, goal, run) -> dict:
         grant = await execution_grant(db, goal, run)
-        if grant is None or grant.scope != "execution":
+        if grant is None:
             return {"step": "waiting_execution_scope"}
-        await self.renew_corrected_children(db, goal, run)
+        if grant.scope == "execution":
+            await self.renew_corrected_children(db, goal, run)
         version = await self.current_version(db, goal.id)
         if version is None:
+            # Planning-only Start permits planning; release paths below stay execution-only.
+            # ponytail: accepted plans always carry a version via accept_plan, so this only catches inconsistent state.
+            if grant.scope != "execution" and self.orchestration._json_object_or_empty(run.plan_state).get("status") == "accepted":
+                return {"step": "waiting_execution_scope"}
             return await self.orchestration._advance_authorized_execution(db, goal, run)
+        if grant.scope != "execution":
+            return {"step": "waiting_execution_scope"}
         settled = await self.settle_finished_children(db, goal, run)
         summary = await self.remaining_or_block(db, goal, run)
         if summary is None:
