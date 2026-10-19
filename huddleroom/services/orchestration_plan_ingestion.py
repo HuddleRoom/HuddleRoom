@@ -83,6 +83,10 @@ def parse_envelope(output: str | None, expected_kind: str, goal: Any) -> dict:
     if envelope.plan_kind != expected_kind:
         raise PlanIngestionError(f"plan_kind '{envelope.plan_kind}' does not match expected '{expected_kind}'")
     items = [item.model_dump(mode="json") for item in envelope.plan_items]
+    for item in items:
+        # ponytail: model_dump drops default-valued owner_type, so stored task items read as null. Goal items are agent-only.
+        if item.get("unit_type") != "goal" and item.get("owner_type") is None:
+            item["owner_type"] = "agent"
     try:
         if envelope.plan_kind == "roadmap":
             parse_roadmap_items(items, set(parent_caps(goal)))

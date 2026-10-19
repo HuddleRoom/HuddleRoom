@@ -15,10 +15,12 @@ from huddleroom.services.orchestration_plan_ingestion import (
     PlanIngestionError,
     check_disposition,
     ingest,
+    ingested_plan_hash,
     parse_envelope,
     plan_artifact_id,
     plan_output_hash,
 )
+from huddleroom.services.orchestration_plan_review import render_markdown
 
 GOAL = SimpleNamespace(success_criteria=[{"key": "c1"}], budget={"caps": {"max_tokens": "1000"}})
 
@@ -601,6 +603,36 @@ async def test_ingest_skips_human_and_goal_items_in_team_check(db_session, test_
     artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
 
     assert artifact.metadata_["plan_items"][0]["owner_type"] == "human"
+
+
+def test_parse_envelope_makes_omitted_task_owner_type_explicit_agent():
+    out = _parse(_env(items=[_item(), _item(id="human", owner_type="human", work_function=None)]))
+    assert [item["owner_type"] for item in out["plan_items"]] == ["agent", "human"]
+
+
+def test_roadmap_parse_makes_omitted_task_owner_type_explicit_agent():
+    item = {"item_key": "task", "unit_type": "task", "title": "Task", "work_function": "investigation",
+            "scope": "Inspect", "deliverable": "Audit", "why_runnable": "ready"}
+    assert _parse(_env("roadmap", [item]), "roadmap")["plan_items"][0]["owner_type"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_ingest_stores_explicit_owner_type_and_renders_no_null(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    human = _item(id="consent", owner_type="human", work_function=None, success_criterion_keys=["plan"])
+    output = json.dumps(_env(items=[human, _item(success_criterion_keys=["plan"])]))
+
+    artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert [item["owner_type"] for item in artifact.metadata_["plan_items"]] == ["human", "agent"]
+    assert ingested_plan_hash(artifact.metadata_) == artifact.content_hash
+    identity = SimpleNamespace(artifact_id=artifact.id, planning_task_id=task.id,
+                               planning_version=run.plan_state["planning_version"],
+                               canonical_content_hash=artifact.content_hash)
+    markdown = render_markdown(identity, artifact.metadata_, {})
+    assert "Owner type: null" not in markdown
+    assert '- Owner type: "agent"' in markdown and '- Owner type: "human"' in markdown
 
 
 @pytest.mark.asyncio
