@@ -1936,7 +1936,9 @@ async def test_manager_session_output_is_ingested_as_decision_report(
     assert reports[0].created_by_agent == manager.id
     assert reports[0].metadata_ == {"selected_option": "approve", "reason": "ok"}
     key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
-    assert (await service._existing_action_for_key(db_session, run.id, key)) is not None
+    marker = await service._existing_action_for_key(db_session, run.id, key)
+    assert marker is not None
+    assert marker.status == "completed" and marker.target_id == reports[0].id
 
     result = await service._sync_agent_authority_decisions(db_session, goal, run)
     assert result["recorded"] == 1

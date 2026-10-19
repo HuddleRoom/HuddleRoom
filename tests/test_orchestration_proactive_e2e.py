@@ -555,7 +555,7 @@ async def test_nested_roadmap_outcome_loop_real(db_session, test_project, stub_d
     await db_session.refresh(run)
     execution = accepted_tick["authorized_execution"]
     assert run.plan_state["status"] == "accepted", run.plan_state
-    assert len(calls) == before + 1, "the loop must stop right after accept_plan"
+    assert len(calls) == before, "an answered approval is applied without an LLM call and the loop stops"
     assert len(execution.get("action_ids") or [execution["action_id"]]) == 1
     assert not service._has_active_blocker(run, "plan_criterion_integrity")
     assert await OrchestrationRoadmapService(service).current_version(db_session, goal.id) is not None

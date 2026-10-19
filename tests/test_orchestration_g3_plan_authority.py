@@ -1,6 +1,7 @@
 """G3 Task 4 authority boundaries exercised through real service paths."""
 
 import uuid
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from huddleroom.models.session import Session
 from huddleroom.schemas.orchestration import OrchestrationDecisionAnswerRequest
 from huddleroom.services import orchestration_decision_application as application
 from huddleroom.services.orchestration_plan_review import PlanReviewService
+from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
 from huddleroom.services.orchestration_service import OrchestrationService
 from tests.conftest import adopt_session
@@ -448,3 +450,132 @@ async def test_chat_stale_answer_marker_survives_rollback_without_receipt_or_con
         sessions, ids, action_count, turn_id=turn_id, frozen_context=frozen_context,
     )
     assert safe_execution_boundary == []
+
+
+async def _manager_wait(db_session, test_project, test_user, option):
+    service, goal, run, artifact, decision, fingerprint = await _roadmap_acceptance(
+        db_session, test_project, test_user, authority_model="agent_manager",
+    )
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option=option, decided_by_agent_id=goal.manager_agent_id,
+    )
+    run.plan_state = {**run.plan_state, "roadmap_authority_wait": {
+        "artifact_id": str(artifact.id),
+        "fingerprint": await OrchestrationRoadmapService(service).plan_fingerprint(
+            db_session, run, [i.model_dump(mode="json") for i in OrchestrationRoadmapService(service).parse_items(artifact, goal)],
+        ),
+        "approval_id": str(decision.id), "approval_kind": "authority_decision",
+    }}
+    await db_session.flush()
+    return service, goal, run, artifact
+
+
+def _no_llm(service, monkeypatch):
+    calls = []
+
+    async def fake(*_args, **_kwargs):
+        calls.append(1)
+        raise TimeoutError("llm must not be needed")
+
+    monkeypatch.setattr(service, "request_llm_decision", fake)
+    return calls
+
+
+async def test_answered_roadmap_approval_is_applied_without_llm_and_idempotently(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, artifact = await _manager_wait(db_session, test_project, test_user, "approve")
+    calls = _no_llm(service, monkeypatch)
+
+    first = await service._advance_authorized_execution_once(db_session, goal, run)
+    await db_session.refresh(run)
+    assert first["step"] == "plan_decision" and calls == []
+    assert run.plan_state["status"] == "accepted"
+    assert run.plan_state["accepted_artifact_id"] == str(artifact.id)
+    action = await db_session.get(OrchestrationAction, uuid.UUID(first["action_id"]))
+    assert action.action_type == "accept_plan" and action.status == "completed"
+
+    # Replay: a second advance is a no-LLM-needed accepted step and creates nothing new.
+    again = await service._apply_answered_roadmap_approval(db_session, goal, run, run.plan_state)
+    assert again is not None and again["action_id"] == first["action_id"]
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapVersion)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "accept_plan",
+    )) == 1
+
+
+async def test_answered_roadmap_rejection_requires_revision_without_llm(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _manager_wait(db_session, test_project, test_user, "reject")
+    calls = _no_llm(service, monkeypatch)
+
+    result = await service._advance_authorized_execution_once(db_session, goal, run)
+    await db_session.refresh(run)
+    assert result["step"] == "plan_revision_required" and calls == []
+    assert run.plan_state["status"] == "revision_required"
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapVersion)) == 0
+
+
+async def test_stale_roadmap_wait_falls_through_to_llm(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _manager_wait(db_session, test_project, test_user, "approve")
+    wait = run.plan_state["roadmap_authority_wait"]
+    run.plan_state = {**run.plan_state, "roadmap_authority_wait": {**wait, "fingerprint": "stale"}}
+    await db_session.flush()
+    calls = _no_llm(service, monkeypatch)
+
+    with pytest.raises(TimeoutError):
+        await service._advance_authorized_execution_once(db_session, goal, run)
+    assert calls == [1]
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationRoadmapVersion)) == 0
+
+
+async def test_failed_accept_action_under_same_key_falls_through_to_llm(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _manager_wait(db_session, test_project, test_user, "approve")
+    calls = _no_llm(service, monkeypatch)
+
+    async def failed(*_args, **_kwargs):
+        return SimpleNamespace(id=uuid.uuid4(), status="failed")
+
+    monkeypatch.setattr(service, "execute_accept_plan_action", failed)
+    assert await service._apply_answered_roadmap_approval(db_session, goal, run, run.plan_state) is None
+    with pytest.raises(TimeoutError):
+        await service._advance_authorized_execution_once(db_session, goal, run)
+    assert calls == [1]
+
+
+async def test_accept_validation_error_requires_revision_under_goal_lock(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _manager_wait(db_session, test_project, test_user, "approve")
+    calls = _no_llm(service, monkeypatch)
+    locked = []
+    real_lock = service._lock_goal_for_baseline_transition
+
+    def spy(db, goal_id, **kw):
+        locked.append(goal_id)
+        return real_lock(db, goal_id, **kw)
+
+    async def boom(*_a, **_k):
+        raise HTTPException(409, "owners invalid")
+
+    monkeypatch.setattr(service, "_lock_goal_for_baseline_transition", spy)
+    from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+    monkeypatch.setattr(PlanOwnershipService, "validate_plan_owners", boom)
+    result = await service._advance_authorized_execution_once(db_session, goal, run)
+    assert result["step"] == "plan_revision_required" and calls == []
+    assert goal.id in locked
+    assert run.plan_state["status"] == "revision_required"
+
+
+async def test_revision_required_clears_roadmap_authority_wait(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, _ = await _manager_wait(db_session, test_project, test_user, "reject")
+    _no_llm(service, monkeypatch)
+    await service._advance_authorized_execution_once(db_session, goal, run)
+    assert "roadmap_authority_wait" not in run.plan_state

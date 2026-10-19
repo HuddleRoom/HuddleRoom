@@ -7741,6 +7741,7 @@ class OrchestrationService:
             "status": "revision_required",
             "revision_reason": reason,
         }
+        run.plan_state.pop("roadmap_authority_wait", None)
 
     async def _emit_plan_requested(
         self,
@@ -10106,12 +10107,17 @@ class OrchestrationService:
             if exc.status_code == 409:
                 return  # a nonwinning session never becomes the decision report
             raise
-        if await self._agent_decision_report(db, decision) is None:
-            db.add(Artifact(
+        report = await self._agent_decision_report(db, decision)
+        if report is None:
+            report = Artifact(
                 project_id=task.project_id, name=f"decision-report-{task.id}", artifact_type="decision_report",
                 linked_task_id=task.id, created_by_agent=decision.authority_agent_id, metadata_=fields,
-            ))
+            )
+            db.add(report)
             await db.flush()
+        marker = await self._existing_action_for_key(db, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+        if marker is not None and marker.status == "reserved":
+            await self._mark_action_completed(db, marker, "artifact", report.id)
 
     async def _consume_result_correction(
         self, db: AsyncSession, run: OrchestrationRun, task: Task, session_id: uuid.UUID | None,
@@ -13818,6 +13824,104 @@ class OrchestrationService:
             return {"step": "waiting", "reason": exc.detail}
         return None
 
+    async def _apply_answered_roadmap_approval(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, plan_state: dict,
+    ) -> dict | None:
+        """Apply an answered Roadmap plan approval without needing the LLM to choose accept_plan again.
+        Returns None when the stored wait is absent/stale so the normal LLM path runs unchanged."""
+        from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+        from huddleroom.services.orchestration_roadmap_service import OrchestrationRoadmapService
+
+        wait = self._json_object_or_empty(plan_state.get("roadmap_authority_wait"))
+        if wait.get("approval_kind") != "authority_decision":
+            return None
+        try:
+            approval_id = uuid.UUID(str(wait.get("approval_id")))
+            artifact_id = uuid.UUID(str(wait.get("artifact_id")))
+        except ValueError:
+            return None
+        waited = await db.get(OrchestrationAuthorityDecision, approval_id)
+        if waited is None or waited.run_id != run.id or waited.status != "answered":
+            return None
+        roadmap = OrchestrationRoadmapService(self)
+        try:
+            artifact = await self._plan_artifact_for_run(db, run, artifact_id)
+            fingerprint = await roadmap.plan_fingerprint(db, run, [
+                item.model_dump(mode="json") for item in roadmap.parse_items(artifact, goal)
+            ])
+            if fingerprint != wait.get("fingerprint"):
+                return None
+            approval = await roadmap.ensure_plan_approval(db, goal, run, artifact)
+        except HTTPException as exc:
+            if exc.status_code not in {404, 409, 422}:
+                raise
+            return None
+        if approval.id != waited.id:
+            return None
+        if approval.selected_option != "approve":
+            self._set_plan_revision_required(run, "Roadmap plan approval was rejected")
+            await db.flush()
+            return {"step": "plan_revision_required"}
+        try:
+            await roadmap._require_plan_approval(db, goal, run, fingerprint, None, artifact)
+        except HTTPException as exc:
+            self._set_plan_revision_required(run, str(exc.detail))
+            await db.flush()
+            return {"step": "plan_revision_required"}
+        from contextlib import nullcontext
+        from huddleroom.services.orchestration_baseline_runtime import (
+            BaselinePaused, control_operation_owner, require_control_admission,
+        )
+        request = self.canonical_decision_request(
+            "accept_plan", {"action_type": "accept_plan", "plan_artifact_id": str(artifact.id)}, run_id=run.id,
+        )
+        owns = await self._prepare_control_operation(db, goal_id=run.goal_id)
+        try:
+            async with control_operation_owner(db) if owns else nullcontext():
+                async with self._lock_goal_for_baseline_transition(db, run.goal_id):
+                    await require_control_admission(db, run.id)
+                    action = await self.execute_accept_plan_action(
+                        db, run.id, request, OrchestrationDecisionDispatcher.action_key(run.id, "accept_plan", request),
+                    )
+        except BaselinePaused:
+            return {"step": "waiting", "reason": "paused"}
+        except HTTPException as exc:
+            if (waiting := self._waiting_step_for_http_error(exc)) is not None:
+                return waiting
+            recovered = await self._recover_failed_accept_plan(db, run, request, None)
+            if recovered is None:
+                raise
+            return recovered
+        if action.status != "completed":
+            return None  # e.g. a prior failed attempt: let the LLM path's retry logic run
+        return {"step": "plan_decision", "action_id": str(action.id)}
+
+    async def _recover_failed_accept_plan(
+        self, db: AsyncSession, run: OrchestrationRun, parsed: dict, decision_id: uuid.UUID | None,
+    ) -> dict | None:
+        """After a failed accept_plan that set revision_required: fence the failed action and
+        report the revision. None means this is not that recovery (caller re-raises)."""
+        from huddleroom.services.orchestration_decision_dispatcher import OrchestrationDecisionDispatcher
+
+        await db.refresh(run)
+        revised_plan = self._json_object_or_empty(run.plan_state)
+        if revised_plan.get("status") != "revision_required":
+            return None
+        recovery_key = OrchestrationDecisionDispatcher.action_key(
+            run.id, "accept_plan", self.canonical_decision_request("accept_plan", parsed, run_id=run.id),
+        )
+        recovery_key, recovery_steering, recovery_versions, recovery_active_ids, recovery_goal, recovery_run = (
+            await self._steering_action_fence(db, run.id, recovery_key, decision_id)
+        )
+        failed_action = await self._existing_action_for_key(db, run.id, recovery_key)
+        if failed_action is None or failed_action.status != "failed":
+            return None
+        await self._fence_steering_action(
+            db, failed_action, recovery_steering, recovery_versions, recovery_active_ids,
+            recovery_goal, recovery_run, newly_reserved=False,
+        )
+        return {"step": "plan_revision_required", "reason": revised_plan.get("revision_reason")}
+
     async def _advance_authorized_execution_once(
         self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
     ) -> dict:
@@ -13843,6 +13947,11 @@ class OrchestrationService:
 
         # (1)/(2) plan not yet accepted -> ask + dispatch one decision.
         if plan_status != "accepted":
+            if (goal.goal_type == "roadmap" and plan_state.get("roadmap_authority_wait")
+                    and plan_status in {"requested", "revision_requested"}):
+                applied = await self._apply_answered_roadmap_approval(db, goal, run, plan_state)
+                if applied is not None:
+                    return applied
             decision = await self.request_llm_decision(db, run.id)
             decision_action_type = self._json_object_or_empty(decision.parsed_decision).get("action_type")
             if goal.goal_type == "roadmap" and decision_action_type == "accept_plan":
@@ -13907,33 +14016,12 @@ class OrchestrationService:
                     or plan_status not in {"requested", "revision_requested"}
                 ):
                     raise
-                await db.refresh(run)
-                revised_plan = self._json_object_or_empty(run.plan_state)
-                if revised_plan.get("status") != "revision_required":
+                recovered = await self._recover_failed_accept_plan(
+                    db, run, self._json_object_or_empty(decision.parsed_decision), decision.id,
+                )
+                if recovered is None:
                     raise
-                recovery_key = OrchestrationDecisionDispatcher.action_key(
-                    run.id,
-                    decision_action_type,
-                    self.canonical_decision_request(
-                        decision_action_type,
-                        self._json_object_or_empty(decision.parsed_decision),
-                        run_id=run.id,
-                    ),
-                )
-                recovery_key, recovery_steering, recovery_versions, recovery_active_ids, recovery_goal, recovery_run = (
-                    await self._steering_action_fence(db, run.id, recovery_key, decision.id)
-                )
-                failed_action = await self._existing_action_for_key(db, run.id, recovery_key)
-                if failed_action is None or failed_action.status != "failed":
-                    raise
-                await self._fence_steering_action(
-                    db, failed_action, recovery_steering, recovery_versions, recovery_active_ids,
-                    recovery_goal, recovery_run, newly_reserved=False,
-                )
-                return {
-                    "step": "plan_revision_required",
-                    "reason": revised_plan.get("revision_reason"),
-                }
+                return recovered
             if action is None:
                 return {"step": "waiting", "reason": "stale_steering_versions"}
             return {"step": "plan_decision", "action_id": str(action.id)}
