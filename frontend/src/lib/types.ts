@@ -1311,10 +1311,31 @@ export interface OrchestrationStatusEvent {
   occurred_at: string
 }
 
+export type OrchestrationWorkflowGuidanceKind = 'resume' | 'review_decision' | 'authorize_baseline' | 'wait_application' | 'review_blocker' | 'refresh' | 'none'
+
+export interface OrchestrationWorkflowFacts {
+  run_id: string
+  control_version: number | null
+  phase: string
+  phase_label: string
+  process: NeedsYouReference | null
+  process_type: string | null
+  process_status: string | null
+  task: NeedsYouReference | null
+  operation_summary: string
+  occurred_at: string | null
+  pending_decision_id: string | null
+  additional_pending_count: number
+  application: { action_id: string; decision_ids: string[]; state: 'pending' | 'blocked' | 'failed'; reason: string | null } | null
+  additional_application_count: number
+  guidance: { kind: OrchestrationWorkflowGuidanceKind; label: string; decision_id: string | null; reason: string | null }
+}
+
 export interface OrchestrationStatusLine {
   current_state: OrchestrationStatusCurrentState
   attention_summary: OrchestrationStatusAttention | null
   last_material_event: OrchestrationStatusEvent | null
+  workflow?: OrchestrationWorkflowFacts | null
 }
 
 export interface OrchestrationSupervision {

@@ -5,6 +5,8 @@ import type {
   OrchestrationGoal,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
+  OrchestrationStatusLine,
+  OrchestrationWorkflowFacts,
 } from '@/lib/types'
 import { ApiError } from '@/lib/api-client'
 import { absolute } from '@/lib/time'
@@ -137,6 +139,23 @@ export function stepActivityVerb(type: OrchestrationBaselineProcessType): string
   return STEP_ACTIVITY_VERB[type] ?? stepDisplayLabel(type)
 }
 
+// Truthful wording for a saved-but-not-yet-applied owner answer (SPR232).
+export function workflowApplicationText(workflow: OrchestrationWorkflowFacts): string | null {
+  const app = workflow.application
+  if (!app) return null
+  const more = workflow.additional_application_count > 0 ? ` · ${workflow.additional_application_count} more` : ''
+  const why = app.reason ? ` — ${app.reason}` : ''
+  const text = app.state === 'pending' ? 'Saved · not applied — Not in effect yet.'
+    : app.state === 'blocked' ? `Blocked${why}` : `Failed${why}`
+  return text + more
+}
+
+export const PAUSED_TEXT = 'Paused — new work is held. Work already started is not cancelled and may still finish.'
+
+export function workflowGuidanceText(workflow: OrchestrationWorkflowFacts): string {
+  return workflow.guidance.reason ? `${workflow.guidance.label} — ${workflow.guidance.reason}` : workflow.guidance.label
+}
+
 // A segment of the now-line — plain prose. (Kept as a segment list, not a
 // single string, only because a couple of earlier design passes needed mixed
 // styling; nothing currently needs more than one segment's worth of style, so
@@ -151,6 +170,7 @@ export function nowLine({
   processes,
   checkpointItems,
   run,
+  statusLine,
 }: {
   goal: Pick<OrchestrationGoal, 'status'>
   processes: readonly OrchestrationProcessRunRecord[]
@@ -159,13 +179,21 @@ export function nowLine({
   // working. Only affects the line while `run.phase === 'baseline'` and the
   // human hasn't authorized it yet.
   run?: Pick<OrchestrationRun, 'phase' | 'baseline_authorized'> | null
+  statusLine?: OrchestrationStatusLine | null
 }): NowLineSegment[] {
   if (goal.status === 'cancelled') return [{ text: 'This goal was cancelled.' }]
   if (goal.status === 'completed') return [{ text: 'All steps complete — goal closed.' }]
+  const workflow = statusLine?.workflow
+  if (goal.status === 'paused') return [{ text: workflow ? `${PAUSED_TEXT} ${workflowGuidanceText(workflow)}` : PAUSED_TEXT }]
   if (run && run.phase === 'baseline' && !run.baseline_authorized) {
+    if (workflow && workflow.guidance.kind !== 'authorize_baseline') return [{ text: workflowGuidanceText(workflow) }]
+    if (workflow) return [{ text: `Baseline is waiting — press ${workflow.guidance.label} to continue.` }]
     return processes.length === 0
       ? [{ text: 'Baseline is waiting — press Start baseline to begin.' }]
       : [{ text: 'Baseline is waiting — press Continue baseline to resume.' }]
+  }
+  if (workflow && ['review_decision', 'wait_application', 'review_blocker', 'resume'].includes(workflow.guidance.kind)) {
+    return [{ text: `${workflow.phase_label} — ${workflowGuidanceText(workflow)}` }]
   }
   if (processes.length === 0) return [{ text: 'Not started yet.' }]
 

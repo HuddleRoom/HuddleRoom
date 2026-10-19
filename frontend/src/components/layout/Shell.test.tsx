@@ -200,7 +200,7 @@ describe('Shell gaveUp banner', () => {
 
     try {
       const banner = descendants(view.container).find((node) =>
-        textOf(node).includes('Live updates stopped'))
+        textOf(node).includes('Live connection stopped'))
       expect(banner).toBeDefined()
 
       const reconnectButton = descendants(view.container).find((node) =>
@@ -221,7 +221,7 @@ describe('Shell gaveUp banner', () => {
 
     try {
       const banner = descendants(view.container).find((node) =>
-        textOf(node).includes('Live updates stopped'))
+        textOf(node).includes('Live connection stopped'))
       expect(banner).toBeUndefined()
     } finally {
       view.cleanup()

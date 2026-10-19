@@ -675,13 +675,6 @@ async def _detail(
             "matcher": dict((wait.awaited_event or {}).get("matcher") or {}),
             "due_recheck_at": wait.due_recheck_at, "fallback": dict(wait.fallback or {}),
         } for wait in open_waits]
-        direction = await db.scalar(
-            select(OrchestrationAuthorityDecision)
-            .where(OrchestrationAuthorityDecision.run_id == run.id,
-                   OrchestrationAuthorityDecision.status == "pending",
-                   OrchestrationAuthorityDecision.authority == "human")
-            .order_by(OrchestrationAuthorityDecision.asked_at.desc(), OrchestrationAuthorityDecision.id.asc())
-        )
         accepted_evidence = [item for item in evidence if item.verdict == "accepted"]
         gate = next((item for item in gates if item.status == "accepted"), None)
         if gate is None:
@@ -753,14 +746,8 @@ async def _detail(
         )
         operation = status_line.current_state.summary
         attention = status_line.attention_summary
-        next_action = (
-            "Answer pending direction" if condition == "needs_you" else
-            "Resolve current blocker" if condition == "needs_attention" else
-            ("Wait for scheduled check" if attention and attention.next_check_at else "Await recorded event")
-            if condition == "waiting" else
-            "Resume goal" if condition == "paused" else
-            "Await worker result" if condition == "working" else "No action"
-        )
+        workflow = status_line.workflow
+        next_action = workflow.guidance.label
         rationale = attention.summary if attention and condition not in {
             "completed", "cancelled", "stopped", "paused"
         } else operation
@@ -769,7 +756,9 @@ async def _detail(
             "id": latest.key, "key": latest.key, "kind": latest.kind,
             "message": latest.summary, "occurred_at": latest.occurred_at,
         } if latest else None)
-        if condition == "needs_you" and direction:
+        direction = (await db.get(OrchestrationAuthorityDecision, workflow.pending_decision_id)
+                     if workflow.pending_decision_id else None)
+        if direction is not None:
             safe_direction = await present_decision_response(db, direction)
             pending_direction = (await attach_decision_references(
                 db, project_id=goal.project_id, decisions=[direction], responses=[safe_direction],

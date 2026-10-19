@@ -908,7 +908,7 @@ describe('OrchestrationPage', () => {
 
     expect(markup).toContain('text-huddleroom-status-amber')
     expect(markup).toContain('· not updating')
-    expect((markup.match(/Data as of/g) ?? [])).toHaveLength(1)
+    expect((markup.match(/Status refreshed/g) ?? [])).toHaveLength(1)
     expect(markup).not.toContain('· refreshing…')
   })
 
@@ -1036,7 +1036,7 @@ describe('OrchestrationPage', () => {
       const withoutDebug = renderToStaticMarkup(<OrchestrationPage />)
       expect(withoutDebug).toContain('Current operation')
       expect(withoutDebug).not.toContain('Recovery linkage')
-      expect((withoutDebug.match(/Data as of/g) ?? [])).toHaveLength(1)
+      expect((withoutDebug.match(/Status refreshed/g) ?? [])).toHaveLength(1)
 
       state.healthDebugEnabled = true
       const withDebug = renderToStaticMarkup(<OrchestrationPage />)
@@ -1555,7 +1555,7 @@ describe('authoritative baseline run replacement', () => {
 
 
 describe('SPR188 query freshness integration', () => {
-  it.each([{ fetching: true, error: false, cue: 'refreshing' }, { fetching: false, error: true, cue: 'not updating' }, { fetching: false, error: false, cue: 'Data as of' }])('uses one last-success cue for $cue', async ({ fetching, error, cue }) => {
+  it.each([{ fetching: true, error: false, cue: 'refreshing' }, { fetching: false, error: true, cue: 'not updating' }, { fetching: false, error: false, cue: 'Status refreshed' }])('uses one last-success cue for $cue', async ({ fetching, error, cue }) => {
     state.activeProjectId = 'project-1'; state.goalId = 'goal-1'
     state.dataUpdatedAt = Date.parse('2026-10-14T12:00:00Z')
     state.detailFetching = fetching; state.detailError = error
@@ -1568,7 +1568,7 @@ describe('SPR188 query freshness integration', () => {
     const html = renderToStaticMarkup(<OrchestrationPage />)
     expect(html).toContain('No active worker confirmed.')
     expect(html).toContain(cue)
-    expect((html.match(/Data as of/g) ?? [])).toHaveLength(1)
+    expect((html.match(/Status refreshed/g) ?? [])).toHaveLength(1)
   })
   it('keeps initial failure in the existing error state without fabricated status', async () => {
     state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = undefined; state.detailError = true

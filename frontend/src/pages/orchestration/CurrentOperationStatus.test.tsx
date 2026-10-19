@@ -4,7 +4,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 import { descendants, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import { absolute } from '@/lib/time'
-import type { NeedsYouReference, OrchestrationStatusLine } from '@/lib/types'
+import type { NeedsYouReference, OrchestrationAuthorityDecisionRecord, OrchestrationStatusLine, OrchestrationWorkflowFacts } from '@/lib/types'
 import { CurrentOperationStatus } from './CurrentOperationStatus.tsx'
 import { GoalAnnouncerProvider } from './goalAnnouncer'
 
@@ -18,6 +18,11 @@ function line(): OrchestrationStatusLine {
   ] }, attention_summary: { key: 'wait:1', kind: 'waiting', summary: 'Planning is waiting. Reason unknown.',
     subject: reference('task', 'planning', 'project-1', 'Planning'), unblock_actor: 'unknown', unblock_actor_label: 'Unknown', next_check_at: '2099-10-14T12:00:00Z', occurred_at: NOW, additional_count: 1 },
     last_material_event: { key: 'event:1', kind: 'accepted_evidence', summary: 'Verification accepted for Checkout.', subject: reference('gate'), occurred_at: NOW } }
+}
+function wf(overrides: Partial<OrchestrationWorkflowFacts> = {}): OrchestrationWorkflowFacts {
+  return { run_id: 'run-1', control_version: 1, phase: 'baseline', phase_label: 'Baseline', process: null, process_type: null, process_status: null, task: null,
+    operation_summary: 'Baseline step running.', occurred_at: '2026-10-14T12:00:00Z', pending_decision_id: null, additional_pending_count: 0,
+    application: null, additional_application_count: 0, guidance: { kind: 'none', label: 'Nothing to do', decision_id: null, reason: null }, ...overrides }
 }
 function props(statusLine: OrchestrationStatusLine | null = line()): ComponentProps<typeof CurrentOperationStatus> {
   return { statusLine, condition: 'waiting', activeProjectId: 'project-1', dataUpdatedAt: Date.parse(NOW), isFetching: false, isError: false, onRevealSource: vi.fn(), goalKey: 'goal-1' }
@@ -33,21 +38,21 @@ async function mounted(initial = props()) {
 describe('CurrentOperationStatus', () => {
   it('preserves separate concurrent branches and activity/attention/event/freshness reading order', () => {
     const html = markup()
-    const positions = ['Maya was reported validating Checkout.', 'Planning is waiting.', 'Last update:', 'Data as of'].map((text) => html.indexOf(text))
+    const positions = ['Maya was reported validating Checkout.', 'Planning is waiting.', 'Last update:', 'Status refreshed'].map((text) => html.indexOf(text))
     expect(positions.every((position) => position >= 0)).toBe(true)
     expect(positions).toEqual([...positions].sort((a, b) => a - b))
     expect(html).toContain('Who can unblock:')
     expect(html).toContain('Unknown')
     expect(html).toContain('Next check:')
     expect(html).toMatch(/break-words|break-all|overflow-wrap/)
-    expect((html.match(/Data as of/g) ?? [])).toHaveLength(1)
+    expect((html.match(/Status refreshed/g) ?? [])).toHaveLength(1)
   })
   it.each(['unknown', 'working', 'waiting', 'needs_you', 'needs_attention', 'paused', 'stopped', 'cancelled', 'completed'] as const)('supports the %s condition without false fallback', (condition) => {
     const status = line()
     status.current_state = { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }
     status.attention_summary = null; status.last_material_event = null
     const html = markup({ ...props(status), condition })
-    expect(html).toContain('No active worker confirmed.')
+    expect(html).toContain(condition === 'paused' ? 'Paused — new work is held.' : 'No active worker confirmed.')
     expect(html).toContain('No recorded update yet')
     expect(html).not.toContain('Work in progress')
   })
@@ -114,7 +119,7 @@ describe('CurrentOperationStatus', () => {
   it('treats a zero query timestamp as absent rather than a 1970 success', () => {
     const html = markup({ ...props(), dataUpdatedAt: 0 })
     expect(html).not.toContain('1970')
-    expect(html).toContain('Data as of Unknown')
+    expect(html).toContain('Status refreshed Unknown')
   })
   it.each(['needs_you', 'needs_attention'] as const)('does not invent a scheduled check cue for %s attention', (kind) => {
     const status = line(); status.attention_summary = { ...status.attention_summary!, kind, next_check_at: null }
@@ -204,4 +209,50 @@ it('preserves an older-run gate name as text when its record has no supported cu
     expect(descendants(view.container).some((node) => ['BUTTON', 'A'].includes(node.tagName) && textOf(node).includes('Historical Checkout criterion'))).toBe(false)
     expect(p.onRevealSource).not.toHaveBeenCalled()
   } finally { view.cleanup() }
+})
+
+describe('CurrentOperationStatus workflow facts', () => {
+  const withWf = (w: OrchestrationWorkflowFacts | null, condition: ComponentProps<typeof CurrentOperationStatus>['condition'] = 'waiting') => {
+    const status = line(); status.workflow = w
+    return markup({ ...props(status), condition })
+  }
+  it('shows phase, recorded operation without a worker, and never says live', () => {
+    const html = withWf(wf())
+    expect(html).toContain('Phase: Baseline')
+    expect(html).toContain('Baseline step running.')
+    expect(html).toContain('Recorded at')
+    expect(html).not.toMatch(/\blive\b/i)
+  })
+  it('paused with a pending decision shows the badge, decision and Resume guidance', () => {
+    const html = withWf(wf({ pending_decision_id: 'd1', additional_pending_count: 2, guidance: { kind: 'resume', label: 'Resume goal', decision_id: null, reason: null } }), 'paused')
+    expect(html).toContain('Paused')
+    expect(html).toContain('Waiting for your decision:')
+    expect(html).toContain('Decision details not loaded yet')
+    expect(html).toContain('Answer in Needs You')
+    expect(html).toContain('2 more')
+    expect(html).not.toContain('Maya was reported validating Checkout.</p>')
+    expect(html).toContain('Paused — new work is held. Work already started is not cancelled and may still finish.')
+    expect(html).toContain('Next: Resume goal')
+  })
+  it.each([
+    ['pending', null, 'Saved · not applied — Not in effect yet.'],
+    ['blocked', 'gate closed', 'Blocked — gate closed'],
+    ['failed', 'boom', 'Failed — boom'],
+  ] as const)('renders %s application wording', (state, reason, text) => {
+    expect(withWf(wf({ application: { action_id: 'a', decision_ids: ['d'], state, reason }, additional_application_count: 1 }))).toContain(text)
+    expect(withWf(wf({ application: { action_id: 'a', decision_ids: ['d'], state, reason }, additional_application_count: 1 }))).toContain('1 more')
+  })
+  it('renders an unavailable fallback when workflow is null', () => {
+    const html = withWf(null)
+    expect(html).toContain('Workflow details unavailable.')
+    expect(html).not.toContain('None')
+  })
+  it('shows the question only when pending_direction matches, and R5 unknown time', () => {
+    const status = line(); status.workflow = wf({ pending_decision_id: 'd1', occurred_at: null })
+    const dir = { id: 'd1', question: 'Ship it?' } as OrchestrationAuthorityDecisionRecord
+    const html = markup({ ...props(status), pendingDirection: dir })
+    expect(html).toContain('&quot;Ship it?&quot;')
+    expect(html).toContain('Recorded time unknown')
+    expect(markup({ ...props(status), pendingDirection: { ...dir, id: 'other' } })).not.toContain('Ship it?')
+  })
 })

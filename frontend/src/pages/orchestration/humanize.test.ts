@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, OrchestrationProcessRunRecord } from '@/lib/types'
+import type { OrchestrationAuthorityDecisionRecord, OrchestrationGoal, OrchestrationProcessRunRecord, OrchestrationStatusLine } from '@/lib/types'
 import {
   acceptanceVerdictLabel,
   budgetLeftText,
@@ -221,6 +221,24 @@ describe('nowLine', () => {
     const run = { phase: 'baseline', baseline_authorized: false }
     const processes = [process({ process_type: 'goal_definition', status: 'completed' })]
     expect(text(nowLine({ goal, processes, checkpointItems: [], run }))).toBe('Baseline is waiting — press Continue baseline to resume.')
+  })
+
+  it('uses workflow guidance instead of the press-Start line unless guidance is authorize_baseline', () => {
+    const goal: Pick<OrchestrationGoal, 'status'> = { status: 'active' }
+    const run = { phase: 'baseline', baseline_authorized: false }
+    const sl = (kind: string, label: string, reason: string | null = null) => ({ workflow: { guidance: { kind, label, reason, decision_id: null } } }) as unknown as OrchestrationStatusLine
+    expect(text(nowLine({ goal, processes: [], checkpointItems: [], run, statusLine: sl('resume', 'Resume goal', 'Goal is paused') }))).toBe('Resume goal — Goal is paused')
+    expect(text(nowLine({ goal, processes: [], checkpointItems: [], run, statusLine: sl('review_decision', 'Review owner decision') }))).toBe('Review owner decision')
+    expect(text(nowLine({ goal, processes: [], checkpointItems: [], run, statusLine: sl('authorize_baseline', 'Authorize remaining baseline') }))).toBe('Baseline is waiting — press Authorize remaining baseline to continue.')
+    expect(text(nowLine({ goal, processes: [], checkpointItems: [], run, statusLine: { workflow: null } as OrchestrationStatusLine }))).toBe('Baseline is waiting — press Start baseline to begin.')
+  })
+
+  it('narrates paused goals and workflow guidance after baseline is authorized', () => {
+    const sl = (kind: string) => ({ workflow: { phase_label: 'Baseline', guidance: { kind, label: 'Resume goal', reason: null, decision_id: null } } }) as unknown as OrchestrationStatusLine
+    const run = { phase: 'baseline', baseline_authorized: true }
+    expect(text(nowLine({ goal: { status: 'paused' }, processes: [], checkpointItems: [], run, statusLine: sl('resume') })))
+      .toBe('Paused — new work is held. Work already started is not cancelled and may still finish. Resume goal')
+    expect(text(nowLine({ goal: { status: 'active' }, processes: [process()], checkpointItems: [], run, statusLine: sl('review_decision') }))).toBe('Baseline — Resume goal')
   })
 
   it('ignores the baseline gate once authorized (falls through to normal step narration)', () => {

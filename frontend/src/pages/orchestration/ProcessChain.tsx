@@ -8,6 +8,7 @@ import type {
   OrchestrationGoal,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
+  OrchestrationStatusLine,
 } from '@/lib/types'
 import { BASELINE_PROCESS_TYPES, nowLine, statusPhrase, stepDisplayLabel } from './humanize'
 import { NowLine } from './NowLine'
@@ -108,20 +109,23 @@ export interface ProcessChainProps {
   // visible only while run.phase === 'baseline' && !run.baseline_authorized.
   // Optional so callers/tests that don't exercise the gate keep working.
   run?: OrchestrationRun | null
+  // Canonical workflow facts; absent keeps legacy gate behaviour.
+  statusLine?: OrchestrationStatusLine | null
   onAuthorize?: (trigger: HTMLButtonElement | null) => void
   chainPending?: boolean
   authorizePending?: boolean
   authorizeError?: string | null
 }
 
-export function ProcessChain({ processes, processState, selectedProcessType, onSelect, goal, checkpointItems = [], run, onAuthorize, chainPending = false, authorizePending = false, authorizeError = null }: ProcessChainProps) {
+export function ProcessChain({ processes, processState, selectedProcessType, onSelect, goal, checkpointItems = [], run, statusLine, onAuthorize, chainPending = false, authorizePending = false, authorizeError = null }: ProcessChainProps) {
   const [focusedType, setFocusedType] = useState(selectedProcessType)
   const selectButtonRefs = useRef<Partial<Record<OrchestrationBaselineProcessType, HTMLButtonElement | null>>>({})
   const authorizeButtonRef = useRef<HTMLButtonElement | null>(null)
   const rows = processByType(processes)
   const { announceQueue, announceError } = useGoalAnnouncer()
-  const showAuthorize = !!(onAuthorize && run && run.phase === 'baseline' && !run.baseline_authorized)
-  const authorizeLabel = rows.size === 0 ? 'Start baseline' : 'Continue baseline'
+  const workflow = statusLine?.workflow
+  const showAuthorize = !!(onAuthorize && run && run.phase === 'baseline' && !run.baseline_authorized) && (!workflow || workflow.guidance.kind === 'authorize_baseline')
+  const authorizeLabel = workflow ? workflow.guidance.label : rows.size === 0 ? 'Start baseline' : 'Continue baseline'
 
   useEffect(() => {
     setFocusedType(selectedProcessType)
@@ -153,14 +157,14 @@ export function ProcessChain({ processes, processState, selectedProcessType, onS
 
   return (
     <section aria-labelledby="baseline-process-chain-heading" className="rounded-md border border-huddleroom-border bg-huddleroom-surface p-4">
-      <div className="flex items-center justify-between gap-2">
-        <h2 id="baseline-process-chain-heading" className={ZONE_TITLE_CLASS}>Orchestrator steps</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 id="baseline-process-chain-heading" className={`${ZONE_TITLE_CLASS} min-w-0`}>Orchestrator steps</h2>
         {showAuthorize && (
           <Button
             ref={authorizeButtonRef}
             type="button"
             size="sm"
-            className="min-h-11"
+            className="min-h-11 max-w-full whitespace-normal"
             disabled={authorizePending || chainPending || goal?.status === 'paused'}
             aria-describedby={goal?.status === 'paused' ? 'baseline-paused-hint' : undefined}
             onClick={() => onAuthorize?.(authorizeButtonRef.current)}
@@ -232,7 +236,7 @@ export function ProcessChain({ processes, processState, selectedProcessType, onS
             )
           })}
         </ol>
-        {goal && <NowLine segments={nowLine({ goal, processes, checkpointItems, run })} />}
+        {goal && <NowLine segments={nowLine({ goal, processes, checkpointItems, run, statusLine })} />}
       </>
       )}
     </section>

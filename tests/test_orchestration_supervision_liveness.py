@@ -597,7 +597,10 @@ async def test_goal_detail_http_control_state_outranks_stale_pending_direction(
     assert first.status_code == second.status_code == 200
     supervision = first.json()["supervision"]
     assert (supervision["condition"], supervision["operation"].rstrip("."), supervision["next_action"]) == (state, operation, next_action)
-    assert supervision["pending_direction"] is None
+    # An applicable paused question stays visible (and answerable after Resume); terminal/stale ones are inert.
+    assert (supervision["pending_direction"] is not None) is (state == "paused")
+    if state == "paused":
+        assert supervision["status_line"]["workflow"]["guidance"]["decision_id"] == supervision["pending_direction"]["id"]
     assert supervision["status_line"]["current_state"]["kind"] == state
     assert supervision["transition"]["key"] == supervision["status_line"]["last_material_event"]["key"]
     assert supervision["transition"] == second.json()["supervision"]["transition"]

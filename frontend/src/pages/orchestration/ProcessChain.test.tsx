@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import React, { act } from 'react'
 import { getButton, mountWithTestDom, textOf } from '../../../tests/support/dom'
-import type { OrchestrationGoal, OrchestrationProcessRunRecord, OrchestrationRun } from '@/lib/types'
+import type { OrchestrationGoal, OrchestrationProcessRunRecord, OrchestrationRun, OrchestrationStatusLine } from '@/lib/types'
 import { ProcessChain } from './ProcessChain'
 
 const ISO = '2026-08-05T08:00:00Z'
@@ -140,5 +140,25 @@ describe('ProcessChain baseline authorization button', () => {
     } finally {
       view.cleanup()
     }
+  })
+})
+
+describe('ProcessChain workflow guidance', () => {
+  const sl = (kind: string, label: string) => ({ workflow: { guidance: { kind, label, reason: null, decision_id: null } } }) as unknown as OrchestrationStatusLine
+  it('labels the button with authorize_baseline guidance', async () => {
+    const view = await mountChain({ goal: goal(), run: run(), onAuthorize: vi.fn(), processes: [process()], statusLine: sl('authorize_baseline', 'Authorize remaining baseline') })
+    try { expect(textOf(getButton(view.container, 'Authorize remaining baseline'))).toBe('Authorize remaining baseline') } finally { view.cleanup() }
+  })
+  it.each(['review_decision', 'resume', 'wait_application', 'review_blocker'])('offers no authorize button for %s guidance', async (kind) => {
+    const view = await mountChain({ goal: goal(), run: run(), onAuthorize: vi.fn(), processes: [process()], statusLine: sl(kind, 'Do something else') })
+    try {
+      expect(textOf(view.container)).not.toContain('Continue baseline')
+      expect(textOf(view.container)).toContain('Do something else')
+      expect(() => getButton(view.container, 'Do something else')).toThrow()
+    } finally { view.cleanup() }
+  })
+  it('keeps legacy behaviour when workflow is null', async () => {
+    const view = await mountChain({ goal: goal(), run: run(), onAuthorize: vi.fn(), processes: [process()], statusLine: { workflow: null } as OrchestrationStatusLine })
+    try { expect(textOf(getButton(view.container, 'Continue baseline'))).toBe('Continue baseline') } finally { view.cleanup() }
   })
 })

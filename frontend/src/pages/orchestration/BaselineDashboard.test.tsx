@@ -4023,6 +4023,40 @@ it('SPR231 accepts a null action/run receipt only for exact applied legacy runle
   } finally { view.cleanup() }
 })
 
+it('R3 server application line wins over the local receipt sentence', async () => {
+  const pending = decision()
+  api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  const result = await spr231OrdinaryResult(pending, 'approve')
+  api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(result); callbacks.onSettled?.() })
+  const statusLine = { current_state: { kind: 'unknown', summary: 's', activities: [] }, attention_summary: null, last_material_event: null,
+    workflow: { phase_label: 'Baseline', operation_summary: 'Op', guidance: { kind: 'wait_application', label: 'Wait', reason: null, decision_id: null }, additional_pending_count: 0, additional_application_count: 0,
+      application: { action_id: 'a', decision_ids: [pending.id], state: 'pending', reason: null } } } as unknown as ComponentProps<typeof BaselineDashboard>['statusLine']
+  const view = await mountDashboard({ statusLine })
+  try {
+    await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
+    expect(textOf(view.container)).toContain('Saved.')
+    expect(textOf(view.container)).not.toContain('Application pending')
+    expect(textOf(view.container)).toContain('Saved · not applied — Not in effect yet.')
+  } finally { view.cleanup() }
+})
+
+it('m2 workflow present: another answer pending on the server leaves local receipt as Saved. only', async () => {
+  const pending = decision()
+  api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })
+  const result = await spr231OrdinaryResult(pending, 'approve')
+  Object.assign(result.answer_receipt, { application_state: 'applied' })
+  api.answer.mutate.mockImplementation((_variables, callbacks) => { callbacks.onSuccess?.(result); callbacks.onSettled?.() })
+  const statusLine = { current_state: { kind: 'unknown', summary: 's', activities: [] }, attention_summary: null, last_material_event: null,
+    workflow: { phase_label: 'Baseline', operation_summary: 'Op', guidance: { kind: 'wait_application', label: 'Wait', reason: null, decision_id: null }, additional_pending_count: 0, additional_application_count: 0,
+      application: { action_id: 'a', decision_ids: ['answer-A'], state: 'pending', reason: null } } } as unknown as ComponentProps<typeof BaselineDashboard>['statusLine']
+  const view = await mountDashboard({ statusLine })
+  try {
+    await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
+    const saved = descendants(view.container).find((n) => n.getAttribute('aria-label') === 'Saved answers')!
+    expect(textOf(saved)).toBe('Saved.')
+  } finally { view.cleanup() }
+})
+
 it.each(['applied', 'failed'] as const)('SPR231 retains Saved while exact application status advances to %s', async (applicationState) => {
   const pending = decision()
   api.dashboard = dashboardData({ checkpoint: query({ goal_id: goal().id, items: [pending], deferred_count: 0, max_questions: 3 }) })

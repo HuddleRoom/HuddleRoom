@@ -1844,6 +1844,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
 
       <CurrentOperationStatus
         statusLine={detail.supervision?.status_line ?? null}
+        pendingDirection={detail.supervision?.pending_direction ?? null}
         condition={detail.supervision?.condition ?? 'unknown'}
         activeProjectId={projectId}
         dataUpdatedAt={query.dataUpdatedAt}
@@ -1859,6 +1860,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         goalId={goalId}
         goal={goal}
         run={run}
+        statusLine={detail.supervision?.status_line ?? null}
         gates={detail.gates}
         meetingCommitments={detail.meeting_commitments ?? []}
         needsYouReferences={detail.needs_you_references ?? []}

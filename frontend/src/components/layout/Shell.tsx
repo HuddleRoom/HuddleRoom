@@ -110,14 +110,14 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
   const paneNotice = showConnectingNotice
     ? {
         tone: 'info' as const,
-        title: 'Connecting live updates',
-        message: 'This pane is waiting for the project stream. Content is not live yet.',
+        title: 'Connecting to project stream',
+        message: 'This pane is waiting for the project stream. Recorded content may be out of date until it connects.',
       }
     : showPausedNotice
       ? {
           tone: 'warning' as const,
-          title: 'Live updates paused',
-          message: 'Reconnecting automatically. Content in this pane may be stale until the stream reconnects.',
+          title: 'Connection paused',
+          message: 'Reconnecting automatically. Recorded content in this pane may be out of date until the connection resumes.',
         }
       : null
 
@@ -134,11 +134,11 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
   }, [lifecycleAnnouncement])
 
   const connectivityAnnouncement = showConnectingNotice
-    ? 'Live updates are connecting. This pane is not receiving live project data yet.'
+    ? 'Connecting to the project stream. Recorded content may be out of date until it connects.'
     : showPausedNotice
-      ? 'Live updates are paused while the connection retries automatically. Content in this pane may be stale until reconnection succeeds.'
+      ? 'Connection paused while it retries automatically. Recorded content in this pane may be out of date until reconnection succeeds.'
       : showLiveNotice
-        ? 'Live updates are active. This pane is receiving current project data.'
+        ? 'Live connection is active. Operation status is shown as last recorded.'
         : ''
 
   const liveRegionText = [connectivityAnnouncement, lifecycleAnnouncement]
@@ -177,7 +177,7 @@ export function Shell({ configLoading = false }: { configLoading?: boolean } = {
                 {gaveUp && !!activeProjectId ? (
                   <Banner
                     variant="offline"
-                    title="Live updates stopped"
+                    title="Live connection stopped"
                     message="This pane could not reconnect after several attempts. Content may be stale until you reconnect."
                     action={{ label: 'Reconnect', onClick: () => useWSStore.getState().manualReconnect() }}
                   />
