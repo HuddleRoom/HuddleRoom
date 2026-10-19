@@ -274,6 +274,62 @@ def test_hierarchy_parser_binds_frozen_feedback_items_and_real_applied_reference
             parse_team_hierarchy_analysis(payload, request)
 
 
+def test_hierarchy_parser_normalizes_gap_evidence_before_detecting_changed_responsibilities():
+    previous_gap = {
+        "responsibility_id": "review-owner",
+        "responsibility": "Review the accepted scope.",
+        "source_ref": "objective",
+        "work_function": "review",
+        "agent_ref": None,
+        "status": "gap",
+        "reason": "No eligible reviewer exists.",
+        "evidence_ref": "gap:review-owner",
+    }
+    request = _task2_revision_request()
+    request["required_work_functions"].append("review")
+    request["hierarchy_context"]["revision"]["previous_proposal"] = {
+        "assignments": [{"work_function": "implementation", "agent_ref": "worker"}],
+        "reporting_lines": [{"agent_ref": "worker", "reports_to": "manager"}],
+        "documented_gaps": ["review"],
+        "responsibility_coverage": [
+            _task1_analysis_payload()["responsibility_coverage"][0],
+            previous_gap,
+        ],
+    }
+
+    def payload_with(gap):
+        payload = _task2_revision_payload(feedback_results=[
+            {
+                "item_id": "feedback:1",
+                "source_excerpt": "Move implementation ownership.",
+                "disposition": "applied",
+                "reason": "The review gap row now carries its own change.",
+                "change_refs": ["responsibility:review-owner"],
+            },
+            {
+                "item_id": "feedback:2",
+                "source_excerpt": "Document the remaining constraint.",
+                "disposition": "impossible",
+                "reason": "No eligible owner exists for the requested constraint.",
+                "change_refs": [],
+            },
+        ])
+        payload["documented_gaps"] = ["review"]
+        payload["responsibility_coverage"] = [
+            _task1_analysis_payload()["responsibility_coverage"][0],
+            gap,
+        ]
+        return payload
+
+    unchanged_gap = {**previous_gap, "evidence_ref": None}
+    with pytest.raises(ValueError, match="must reference actual changed hierarchy facts"):
+        parse_team_hierarchy_analysis(payload_with(unchanged_gap), request)
+
+    changed_gap = {**unchanged_gap, "responsibility": "Review the accepted scope and release notes."}
+    accepted = parse_team_hierarchy_analysis(payload_with(changed_gap), request)
+    assert accepted.feedback_results[0]["change_refs"] == ["responsibility:review-owner"]
+
+
 def test_hierarchy_parser_accepts_only_current_accepted_hierarchy_decision_coverage_for_new_agents():
     request = _task2_revision_request()
     request["hierarchy_context"]["agent_reviews"].append({
@@ -601,6 +657,109 @@ def test_hierarchy_parser_rejects_invalid_feedback_and_coverage_contract(mutate,
         parse_team_hierarchy_analysis(payload, _task1_analysis_request())
 
 
+@pytest.mark.parametrize("evidence_ref", [None, "", "   "], ids=["null", "empty", "blank"])
+def test_hierarchy_parser_derives_gap_evidence_ref_when_missing(evidence_ref):
+    payload = _task1_analysis_payload(responsibility_coverage=[{
+        "responsibility_id": "implementation-owner",
+        "responsibility": "Implement the accepted scope.",
+        "source_ref": "objective",
+        "work_function": "implementation",
+        "agent_ref": None,
+        "status": "gap",
+        "reason": "No accepted implementation owner exists.",
+        "evidence_ref": evidence_ref,
+    }])
+
+    result = parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+    assert result.responsibility_coverage[0]["status"] == "gap"
+    assert result.responsibility_coverage[0]["evidence_ref"] == "gap:implementation-owner"
+
+
+def test_hierarchy_parser_still_requires_evidence_ref_for_covered_entries():
+    payload = _task1_analysis_payload()
+    payload["responsibility_coverage"][0]["evidence_ref"] = None
+
+    with pytest.raises(ValueError, match="evidence_ref"):
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+
+def test_hierarchy_parser_reports_all_independent_coverage_errors_in_one_error():
+    payload = _task1_analysis_payload(responsibility_coverage=[
+        {
+            "responsibility_id": "gap-owner",
+            "responsibility": "Own the review work.",
+            "source_ref": "objective",
+            "work_function": None,
+            "agent_ref": None,
+            "status": "gap",
+            "reason": "No reviewer exists.",
+            "evidence_ref": "gap:gap-owner",
+        },
+        {
+            "responsibility_id": "implementation-owner",
+            "responsibility": "Implement the accepted scope.",
+            "source_ref": "objective",
+            "work_function": "implementation",
+            "agent_ref": "worker",
+            "status": "covered",
+            "reason": "The accepted review approves this exact work function.",
+            "evidence_ref": "",
+        },
+    ])
+
+    with pytest.raises(ValueError) as exc_info:
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+    message = str(exc_info.value)
+    assert "work_function must be non-empty" in message
+    assert "evidence_ref must be non-empty" in message
+
+
+def test_hierarchy_parser_reports_gap_mismatch_alongside_coverage_error_in_one_error():
+    payload = _task1_analysis_payload()
+    payload["documented_gaps"] = ["implementation"]
+    payload["responsibility_coverage"][0]["work_function"] = None
+
+    with pytest.raises(ValueError) as exc_info:
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+    message = str(exc_info.value)
+    assert "documented gaps must exactly match unassigned required work" in message
+    assert "work_function must be non-empty" in message
+
+
+def test_hierarchy_parser_keeps_single_gap_mismatch_message_exact():
+    payload = _task1_analysis_payload()
+    payload["documented_gaps"] = ["implementation"]
+
+    with pytest.raises(ValueError) as exc_info:
+        parse_team_hierarchy_analysis(payload, _task1_analysis_request())
+
+    assert str(exc_info.value) == "documented gaps must exactly match unassigned required work"
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_repair_receives_all_independent_errors_in_one_attempt():
+    invalid = _task1_analysis_payload()
+    invalid["documented_gaps"] = ["implementation"]
+    invalid["responsibility_coverage"][0]["work_function"] = None
+    responses = iter((invalid, _task1_analysis_payload()))
+    requests = []
+
+    async def completion(**call_request):
+        requests.append(call_request)
+        return {"choices": [{"message": {"content": json.dumps(next(responses))}}]}
+
+    result = await TeamHierarchyAnalyzer(completion).review(_task1_analysis_request())
+
+    assert len(requests) == 2
+    repair = requests[1]["messages"][-1]["content"]
+    assert "documented gaps must exactly match unassigned required work" in repair
+    assert "work_function must be non-empty" in repair
+    assert result.responsibility_coverage[0]["responsibility_id"] == "implementation-owner"
+
+
 def test_hierarchy_parser_rejects_feedback_without_a_revision_context():
     payload = _task1_analysis_payload(feedback_results=[{
         "item_id": "one", "source_excerpt": "Add product ownership.", "disposition": "declined",
@@ -822,6 +981,23 @@ def test_hierarchy_request_prompt_allows_defaults_and_constrains_reporting_lines
     assert "never the selected manager's UUID" in prompt
 
 
+def test_hierarchy_request_prompt_requires_exact_work_function_and_gap_evidence():
+    system = TeamHierarchyAnalyzer.build_request({})["messages"][0]["content"]
+
+    assert "gap:<short-reason-slug>" in system
+    assert "never null" in system
+    assert system.index("never null") < system.index("Use only accepted agent_review evidence")
+
+
+@pytest.mark.parametrize("context", [{}, {"revision": None}], ids=["absent", "null"])
+def test_hierarchy_request_prompt_requires_empty_feedback_without_revision(context):
+    prompt = TeamHierarchyAnalyzer.build_request(
+        {"hierarchy_context": context}
+    )["messages"][0]["content"]
+
+    assert "When hierarchy_context is present and revision is null or absent, return feedback_results: []." in prompt
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model,uses_json_mode", [
     ("openrouter/minimax/minimax-m3", False),
@@ -887,6 +1063,36 @@ async def test_hierarchy_prompt_and_repair_name_the_agent_create_contract():
     assert result.proposed_agents[0]["definition"]["provider"] == "p"
     repair = requests[1]["messages"][-1]["content"]
     assert "missing required keys: provider; extra keys: extra" in repair
+
+
+@pytest.mark.asyncio
+async def test_hierarchy_repair_names_indexed_accepted_coverage_source_refs():
+    request_payload = _task1_analysis_request()
+    request_payload["goal"] = {"success_criteria": ["Publish the pricing table."]}
+    invalid = _task1_analysis_payload()
+    invalid["responsibility_coverage"][0]["source_ref"] = "made-up-ref"
+    corrected = copy.deepcopy(invalid)
+    corrected["responsibility_coverage"][0]["source_ref"] = "criterion:1"
+    requests = []
+    responses = iter((invalid, corrected))
+
+    async def completion(**call_request):
+        requests.append(call_request)
+        return {"choices": [{"message": {"content": json.dumps(next(responses))}}]}
+
+    result = await TeamHierarchyAnalyzer(completion).review_request(
+        TeamHierarchyAnalyzer.build_request(request_payload)
+    )
+
+    assert result.responsibility_coverage[0]["source_ref"] == "criterion:1"
+    assert requests[1]["messages"][-2] == {"role": "assistant", "content": json.dumps(invalid)}
+    repair = requests[1]["messages"][-1]["content"]
+    assert "responsibility_coverage[0].source_ref must be one of: criterion:1, objective" in repair
+    prompt = requests[0]["messages"][0]["content"]
+    assert (
+        "For each responsibility_coverage source_ref, use only objective, "
+        "criterion:<1-based success-criteria index>, or an exact current/frozen feedback item_id."
+    ) in prompt
 
 
 @pytest.mark.parametrize(
@@ -1396,6 +1602,68 @@ def test_infer_required_work_functions_compresses_trivial_and_falls_back_to_impl
         "implementation",
         "summarization",
     ]
+
+
+def test_infer_required_work_functions_artifact_verbs_require_implementation(make_goal):
+    result = infer_required_work_functions(
+        make_goal(
+            objective=(
+                "Add a one-page pricing section to README.md for a fictional demo product with "
+                "Free, Pro, and Team tiers. Research and compare those tiers, write the Markdown, "
+                "and have it reviewed. Also save the draft plan to PLAN.md."
+            ),
+            weight="substantial",
+            success_criteria=[],
+            constraints={
+                "roster_policy": (
+                    "Use only the supplied active roster. Do not propose or create agents; "
+                    "record uncovered responsibilities as gaps with no owner."
+                ),
+            },
+        )
+    )
+    assert "implementation" in result
+    assert result == ["planning", "investigation", "implementation", "review", "validation", "summarization"]
+
+
+def test_infer_required_work_functions_constraint_text_does_not_trigger_artifact_verbs(make_goal):
+    result = infer_required_work_functions(
+        make_goal(
+            objective="Research the options",
+            weight="standard",
+            constraints={"roster_policy": "Do not create agents"},
+        )
+    )
+    assert "implementation" not in result
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "Review the authority model and address additional edition notes",
+        "Update the roadmap and add a review step",
+    ],
+)
+def test_infer_required_work_functions_authority_and_roadmap_verbs_do_not_require_implementation(
+    make_goal, objective
+):
+    result = infer_required_work_functions(make_goal(objective=objective, weight="standard"))
+    assert "review" in result
+    assert "implementation" not in result
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "Review and keep writing the report",
+        "Review the doc that was written",
+        "Investigate and save results",
+        "Investigate and summarize generated output",
+    ],
+)
+def test_infer_required_work_functions_artifact_forms_require_implementation(make_goal, objective):
+    result = infer_required_work_functions(make_goal(objective=objective, weight="standard"))
+    assert "implementation" in result
 
 
 def _agent(name: str, role: str, capabilities: list[str]) -> Agent:

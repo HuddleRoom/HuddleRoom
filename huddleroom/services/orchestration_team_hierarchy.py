@@ -72,6 +72,9 @@ WORK_FUNCTION_ORDER = (
 )
 _SPECIALIST_FUNCTIONS = ("investigation", "implementation", "review", "validation")
 _VERIFIER_FUNCTIONS = {"review", "validation"}
+_ARTIFACT_VERB_RE = re.compile(
+    r"\b(?:write|writes|writing|wrote|written|save|saves|saving|saved|generate|generates|generating|generated|drafting|drafted)\b"
+)
 _STANDARD_TIER_BLOCKING_GAPS = frozenset({
     "no_independent_verifier",
     "agent_definition_review_skipped",
@@ -211,6 +214,15 @@ def infer_required_work_functions(goal: OrchestrationGoal) -> list[str]:
         sort_keys=True,
         default=str,
     ).lower()
+    # Constraints are excluded here: roster boilerplate such as "Do not create agents" must not match.
+    artifact_text = json.dumps(
+        {
+            "objective": goal_objective_with_clarifications(goal),
+            "success_criteria": goal.success_criteria,
+        },
+        sort_keys=True,
+        default=str,
+    ).lower()
     required = {"planning", "summarization"}
     for work_function in _SPECIALIST_FUNCTIONS:
         if any(
@@ -224,6 +236,10 @@ def infer_required_work_functions(goal: OrchestrationGoal) -> list[str]:
         goal.success_criteria, goal_objective_with_clarifications(goal)
     ):
         required.update(_VERIFIER_FUNCTIONS)
+    # ponytail: verb heuristic local to inference; shared PROFILES keywords untouched (roster scoring uses them).
+    # no add/update/edit/author: they match authority/address/roadmap-update goals
+    if _ARTIFACT_VERB_RE.search(artifact_text):
+        required.add("implementation")
     if not required.intersection(_SPECIALIST_FUNCTIONS):
         required.add("implementation")
     return [name for name in WORK_FUNCTION_ORDER if name in required]

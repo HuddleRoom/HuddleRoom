@@ -210,8 +210,11 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
 
     gaps = _text_list(payload, "documented_gaps")
     missing_work = required_work - assigned_functions
+    # ponytail: collect independent errors so the repair loop fixes them in one attempt;
+    # feedback/revision checks still raise immediately.
+    errors: list[tuple[str, str]] = []  # (prefix, raw message)
     if len(gaps) != len(set(gaps)) or set(gaps) != missing_work:
-        raise ValueError("documented gaps must exactly match unassigned required work")
+        errors.append(("", "documented gaps must exactly match unassigned required work"))
     feedback_results: list[dict[str, Any]] = []
     responsibility_coverage: list[dict[str, Any]] = []
     if has_context:
@@ -304,9 +307,14 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
                 for agent_ref in set(previous_reporting) | set(current_reporting)
                 if previous_reporting.get(agent_ref) != current_reporting.get(agent_ref)
             )
-            coverage_fact = lambda item: {
-                key: value for key, value in item.items() if key not in {"reason"}
-            }
+            def coverage_fact(item: Mapping[str, Any]) -> dict[str, Any]:
+                fact = {key: value for key, value in item.items() if key != "reason"}
+                if fact.get("status") == "gap" and (
+                    fact.get("evidence_ref") is None or not str(fact.get("evidence_ref")).strip()
+                ):
+                    fact["evidence_ref"] = f"gap:{fact.get('responsibility_id')}"
+                return fact
+
             previous_coverage = {
                 item.get("responsibility_id"): coverage_fact(item)
                 for item in previous.get("responsibility_coverage", []) if isinstance(item, Mapping)
@@ -335,32 +343,37 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
                     raise ValueError("applied feedback references must reference actual changed hierarchy facts")
 
         responsibility_ids: set[str] = set()
-        for item in _object_list(payload, "responsibility_coverage"):
-            expected = {
-                "responsibility_id", "responsibility", "source_ref", "work_function", "agent_ref",
-                "status", "reason", "evidence_ref",
-            }
-            if set(item) != expected:
-                raise ValueError("each responsibility coverage entry must contain the required fields")
+        criteria = request_payload.get("goal", {}).get("success_criteria", [])
+        criterion_refs = (
+            {f"criterion:{index}" for index, _ in enumerate(criteria, start=1)}
+            if isinstance(criteria, list) else set()
+        )
+        frozen_feedback_refs = {
+            str(frozen.get("item_id"))
+            for frozen in (revision.get("feedback_items", []) if isinstance(revision, Mapping) else [])
+            if isinstance(frozen, Mapping) and isinstance(frozen.get("item_id"), str)
+        }
+        feedback_refs = frozen_feedback_refs or {item["item_id"] for item in feedback_results}
+        accepted_source_refs = sorted({"objective", *criterion_refs, *feedback_refs})
+
+        def _coverage_entry(index: int, item: Mapping[str, Any]) -> dict[str, Any]:
             responsibility_id = _required_text(item, "responsibility_id")
-            if responsibility_id in responsibility_ids:
-                raise ValueError("responsibility coverage requires unique ids")
             work_function = _required_text(item, "work_function")
             if work_function not in required_work:
                 raise ValueError("responsibility coverage work_function must be required")
             source_ref = _required_text(item, "source_ref")
-            criteria = request_payload.get("goal", {}).get("success_criteria", [])
-            criterion_refs = {f"criterion:{index}" for index, _ in enumerate(criteria, start=1)} if isinstance(criteria, list) else set()
-            frozen_feedback_refs = {
-                str(frozen.get("item_id")) for frozen in (revision.get("feedback_items", []) if isinstance(revision, Mapping) else [])
-                if isinstance(frozen, Mapping) and isinstance(frozen.get("item_id"), str)
-            }
-            feedback_refs = frozen_feedback_refs or {item["item_id"] for item in feedback_results}
-            if source_ref != "objective" and source_ref not in criterion_refs and source_ref not in feedback_refs:
-                raise ValueError("responsibility coverage source_ref must identify the objective, criterion, or feedback")
+            if source_ref not in accepted_source_refs:
+                raise ValueError(
+                    f"responsibility_coverage[{index}].source_ref must be one of: "
+                    f"{', '.join(accepted_source_refs)}"
+                )
             status = _required_text(item, "status")
             agent_ref = item.get("agent_ref")
-            evidence_ref = _required_text(item, "evidence_ref")
+            raw_evidence_ref = item.get("evidence_ref")
+            if status == "gap" and (raw_evidence_ref is None or (isinstance(raw_evidence_ref, str) and not raw_evidence_ref.strip())):
+                evidence_ref = f"gap:{responsibility_id}"
+            else:
+                evidence_ref = _required_text(item, "evidence_ref")
             if status == "proposed":
                 if not isinstance(agent_ref, str) or agent_ref not in valid_refs or not agent_ref.startswith("proposal:") or evidence_ref != agent_ref:
                     raise ValueError("proposed responsibility coverage requires its proposal evidence")
@@ -388,8 +401,7 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
                     raise ValueError("gap responsibility coverage must have no owner")
             else:
                 raise ValueError("responsibility coverage status must be covered, proposed, or gap")
-            responsibility_ids.add(responsibility_id)
-            responsibility_coverage.append({
+            return {
                 "responsibility_id": responsibility_id,
                 "responsibility": _required_text(item, "responsibility"),
                 "source_ref": source_ref,
@@ -398,8 +410,32 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
                 "status": status,
                 "reason": _required_text(item, "reason"),
                 "evidence_ref": evidence_ref,
-            })
+            }
 
+        for index, item in enumerate(_object_list(payload, "responsibility_coverage")):
+            expected = {
+                "responsibility_id", "responsibility", "source_ref", "work_function", "agent_ref",
+                "status", "reason", "evidence_ref",
+            }
+            if set(item) != expected:
+                raise ValueError("each responsibility coverage entry must contain the required fields")
+            raw_id = item.get("responsibility_id")
+            if isinstance(raw_id, str) and raw_id.strip() in responsibility_ids:
+                raise ValueError("responsibility coverage requires unique ids")
+            try:
+                entry = _coverage_entry(index, item)
+            except ValueError as exc:
+                message = str(exc)
+                prefix = "" if message.startswith("responsibility_coverage[") else f"responsibility_coverage[{index}]: "
+                errors.append((prefix, message))
+                continue
+            responsibility_ids.add(entry["responsibility_id"])
+            responsibility_coverage.append(entry)
+
+    if errors:
+        if len(errors) == 1:
+            raise ValueError(errors[0][1])
+        raise ValueError("; ".join(prefix + message for prefix, message in errors))
     return TeamHierarchyAnalysis(
         tuple(proposed), tuple(assignments), tuple(reporting), gaps,
         _required_text(payload, "rationale"), _required_text(payload, "self_review"),
@@ -448,6 +484,11 @@ class TeamHierarchyAnalyzer:
                 "When hierarchy_context is present, also return feedback_results "
                 "[{item_id, source_excerpt, disposition, reason, change_refs}] and responsibility_coverage "
                 "[{responsibility_id, responsibility, source_ref, work_function, agent_ref, status, reason, evidence_ref}]. "
+                "When hierarchy_context is present and revision is null or absent, return feedback_results: []. "
+                "For each responsibility_coverage source_ref, use only objective, "
+                "criterion:<1-based success-criteria index>, or an exact current/frozen feedback item_id. "
+                "Every responsibility_coverage entry, including a gap, must use one exact required_work_functions value for "
+                "work_function (choose the closest; never null) and a non-empty evidence_ref; for a gap use gap:<short-reason-slug>. "
                 "Use only accepted agent_review evidence for covered existing agents, accepted agent_decision evidence for "
                 "covered newly approved agents, proposal:<id> evidence for proposed agents, "
                 "and a gap with no owner when evidence is missing. Treat each independent requested change as a "
