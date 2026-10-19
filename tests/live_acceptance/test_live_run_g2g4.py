@@ -1335,7 +1335,28 @@ def test_live_run_g2g4_l():
     if os.environ.get("LIVE_ACCEPTANCE_RETRY_FROM"):
         pytest.fail("automatic retry is not implemented; preserve evidence and start no replacement run")
     root = Path(ROOT)
-    seed_campaign(root / "campaign-spend.jsonl", CAMPAIGN_CAP, CAMPAIGN_PRIOR)
     spec = {"codex_each": True, "claude_each": True, "codex_match": [PLAN_MARKER]}
-    with G2G4Scenario("g2g4-L", Path(SNAP), root, CAP, hold_spec=spec, roster="g2g4") as sc:
+    raw = os.environ.get("LIVE_ACCEPTANCE_G2G4_L_CAMPAIGN_CAP")
+    if raw is None:
+        seed_campaign(root / "campaign-spend.jsonl", CAMPAIGN_CAP, CAMPAIGN_PRIOR)
+        with G2G4Scenario("g2g4-L", Path(SNAP), root, CAP, hold_spec=spec, roster="g2g4") as sc:
+            _run_l(sc)
+        return
+    try:
+        cap = int(raw)
+    except ValueError:
+        pytest.fail("LIVE_ACCEPTANCE_G2G4_L_CAMPAIGN_CAP must be a positive integer")
+    if cap <= 0:
+        pytest.fail("LIVE_ACCEPTANCE_G2G4_L_CAMPAIGN_CAP must be a positive integer")
+    # Historical campaign ledger keeps its original cap on line 1; the authorized cap goes to a fresh ledger.
+    historical = root / "campaign-spend.jsonl"
+    prior = _ledger_totals_readonly(historical)["global"]["non_cached"]
+    campaign_path = root / f"campaign-spend-g2g4-L-{cap}.jsonl"
+    seed_campaign(campaign_path, cap, {"prior_campaign_total": prior})
+    with G2G4Scenario("g2g4-L", Path(SNAP), root, CAP, hold_spec=spec, roster="g2g4",
+                      campaign_ledger_path=campaign_path, campaign_cap=cap) as sc:
+        sc.continue_through_warning = True
+        if not hasattr(sc, "warning_recorded"):
+            sc.warning_recorded = set()
+        sc.findings["historical_campaign_audit"] = {"path": str(historical), "prior_total": prior, "cap": cap}
         _run_l(sc)
