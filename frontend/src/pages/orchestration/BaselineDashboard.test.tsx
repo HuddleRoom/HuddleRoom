@@ -49,6 +49,7 @@ vi.mock('reactflow', () => ({
 }))
 
 vi.mock('@/api/auth', () => ({ useCurrentUser: () => ({ data: { id: '10000000-0000-4000-8000-000000000001' }, isLoading: false, isError: false }) }))
+vi.mock('@/api/agents', () => ({ useAgents: () => ({ data: { items: [], next_cursor: null }, isSuccess: true, isError: false, isPending: false }) }))
 
 vi.mock('@/api/orchestration', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/api/orchestration')>(),
@@ -4149,5 +4150,26 @@ it.each([false, true])('SPR231 typed edit confirms only matching frozen edited p
     expect(textOf(view.container).includes('Saved.')).toBe(!changedEdit)
     expect(api.answer.mutate).toHaveBeenCalledOnce()
     if (changedEdit) expect(api.answer.acceptResult).not.toHaveBeenCalled()
+  } finally { view.cleanup() }
+})
+
+
+it('G4 an already-open skip callback cannot mutate a replacement process', async () => {
+  const original = process({ status: 'running' })
+  api.dashboard = dashboardData({ processes: query([original]) })
+  const view = await mountDashboard()
+  try {
+    await act(async () => getButton(view.container, 'Skip').click())
+    await act(async () => changeControl(getByLabel(view.container, 'Reason (required)', 'textarea'), 'Operator accepted gap.'))
+    const form = descendants(view.container).find((node) => node.tagName === 'FORM')!
+    const submit = currentReactProp(form, 'onSubmit') as (event: { preventDefault: () => void }) => void
+    expect(submit).toBeTypeOf('function')
+    api.dashboard = dashboardData({ processes: query([
+      { ...original, superseded_by_id: 'replacement' },
+      process({ id: 'replacement', status: 'running' }),
+    ]) })
+    await view.rerender()
+    await act(async () => submit({ preventDefault() {} }))
+    expect(api.skip.mutate).not.toHaveBeenCalled()
   } finally { view.cleanup() }
 })

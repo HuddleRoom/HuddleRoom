@@ -422,7 +422,12 @@ class TeamHierarchyAnalyzer:
             {"role": "system", "content": (
                 orchestrator_preamble(project, goal=payload.get("goal")) + "\n\n"
                 "Act as the team architect. Design the smallest team and reporting structure that covers "
-                "the required work using the supplied active roster before proposing new agents. For every "
+                "the required work using the supplied active roster before proposing new agents. "
+                "The structured agents roster is authoritative for this request's agent configuration, including "
+                "runtime and model. Project, goal and preparation prose is unversioned background and must not "
+                "override that roster. Reviewed definition snapshots are historical review evidence; they do not "
+                "override current roster settings or establish the runtime/model used by an earlier call. "
+                "An unspecified or native-default model remains unknown/default. For every "
                 "new agent, design a complete AgentCreate-compatible definition. Its required keys: "
                 f"{required_agent_create_keys}; allowed keys: {allowed_agent_create_keys}; defaulted AgentCreate "
                 "fields may be omitted. Include a role-specific "

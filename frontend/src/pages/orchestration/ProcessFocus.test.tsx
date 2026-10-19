@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import React, { act, createRef } from 'react'
 import { descendants, mountWithTestDom, textOf } from '../../../tests/support/dom'
 import type {
+  Agent,
   OrchestrationAgentReviewRecord,
   OrchestrationAuthorityDecisionRecord,
   OrchestrationGoal,
@@ -9,6 +10,10 @@ import type {
   OrchestrationWarningRecord,
 } from '@/lib/types'
 import { ProcessFocus, type ProcessFocusProps } from './ProcessFocus'
+
+const agentsQuery = vi.hoisted(() => ({ data: { items: [] as Agent[], next_cursor: null }, isSuccess: true, isError: false, isPending: false }))
+vi.mock('@/api/agents', () => ({ useAgents: () => agentsQuery }))
+beforeEach(() => Object.assign(agentsQuery, { data: { items: [], next_cursor: null }, isSuccess: true, isError: false, isPending: false }))
 
 const ISO = { started: '2026-08-05T08:00:00Z' }
 
@@ -69,6 +74,105 @@ async function mount(props: Partial<ProcessFocusProps> = {}) {
   const view = await mountWithTestDom(render, act)
   return view
 }
+
+function review(index = 1): OrchestrationAgentReviewRecord {
+  return {
+    id: `review-${index}`, goal_id: 'goal-1', run_id: 'run-1', agent_id: `agent-${index}`,
+    source_process_run_id: 'process-1', review_context: null, proposed_work_functions: ['review'],
+    definition_snapshot: { name: `Reviewed agent ${index}`, provider: 'historic-provider', model: `historic-model-${index}` },
+    fit_summary: 'Saved assessment', strengths: [], risks: [], recommended_changes: [],
+    approved_for_work_functions: ['review'], created_at: ISO.started, updated_at: ISO.started,
+  }
+}
+
+function agent(index = 1): Agent {
+  return {
+    id: `agent-${index}`, name: `Current agent ${index}`, role: 'reviewer', provider: 'current-provider',
+    model: `current-model-${index}`, adapter_type: 'api', cli_runtime: null, system_prompt: null,
+    description: null, capabilities: ['review'], is_active: true, config: {},
+    created_at: ISO.started, updated_at: ISO.started,
+  }
+}
+
+describe('retained G4 identity and roster', () => {
+  it.each(['Run', 'Re-run', 'Retry', 'Skip'])('retained old %s callback is inert after a successor arrives', async (label) => {
+    const callback = vi.fn()
+    let props = makeProps({
+      process: process({ outputs: label === 'Retry' ? { lm_retry: { available: true, kind: 'team_hierarchy', warning_id: null, model: null, hint: null } } : {} }),
+      canRun: true, canRerun: true, canSkip: true,
+      onRun: callback, onRerun: callback, onRetry: callback, onOpenAction: callback,
+    })
+    const view = await mountWithTestDom(() => <ProcessFocus {...props} />, act)
+    try {
+      const button = descendants(view.container).find((node) => node.tagName === 'BUTTON' && textOf(node) === label)!
+      expect(button).toBeDefined()
+      const key = Object.keys(button).find((value) => value.startsWith('__reactProps$'))!
+      const retained = (button as unknown as Record<string, { onClick: (event: unknown) => void }>)[key].onClick
+      props = { ...props, process: { ...props.process!, superseded_by_id: 'replacement' } }
+      await view.rerender()
+      await act(async () => retained({ currentTarget: button }))
+      expect(callback).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('test_g4_superseded_history_is_inert even with enabled parent controls and an open form', async () => {
+    const callbacks = { onRun: vi.fn(), onRerun: vi.fn(), onRetry: vi.fn(), onOpenAction: vi.fn() }
+    const renderActionForm = vi.fn(() => <button>Confirm skip</button>)
+    const props = makeProps({
+      ...callbacks, canRun: true, canRerun: true, canSkip: true,
+      process: process({ status: 'running', superseded_by_id: 'replacement-process', outputs: { lm_retry: { available: true, kind: 'team_hierarchy', warning_id: null, model: null, hint: null } } }),
+      reviews: [review()], openAction: { kind: 'skip', id: 'process-1' }, renderActionForm,
+    })
+    const view = await mountWithTestDom(() => <ProcessFocus {...props} />, act)
+    try {
+      expect(textOf(view.container)).toContain('Superseded')
+      expect(textOf(view.container)).toContain('replacement-process')
+      expect(textOf(view.container)).toContain('Saved assessment')
+      expect(descendants(view.container).filter((node) => node.tagName === 'BUTTON')).toHaveLength(0)
+      expect(renderActionForm).not.toHaveBeenCalled()
+      for (const callback of Object.values(callbacks)) expect(callback).not.toHaveBeenCalled()
+    } finally { view.cleanup() }
+  })
+
+  it('test_g4_current_and_reviewed_roster_are_separate for five agents and runtime updates', async () => {
+    agentsQuery.data.items = Array.from({ length: 5 }, (_, i) => agent(i + 1))
+    const reviews = Array.from({ length: 5 }, (_, i) => review(i + 1))
+    const props = makeProps({ selectedProcessType: 'agent_definition_review', process: process({ process_type: 'agent_definition_review', status: 'completed' }), reviews })
+    const view = await mountWithTestDom(() => <ProcessFocus {...props} />, act)
+    try {
+      for (let i = 1; i <= 5; i++) {
+        expect(textOf(view.container)).toContain(`historic-model-${i}`)
+        expect(textOf(view.container)).toContain(`current-model-${i}`)
+      }
+      expect(textOf(view.container)).toContain('Reviewed configuration')
+      expect(textOf(view.container)).toContain('Current settings')
+      agentsQuery.data.items = agentsQuery.data.items.map((row) => ({ ...row, model: 'updated-runtime' }))
+      await view.rerender()
+      expect(textOf(view.container)).toContain('updated-runtime')
+      expect(textOf(view.container)).toContain('historic-model-1')
+      expect(reviews[0].definition_snapshot.model).toBe('historic-model-1')
+    } finally { view.cleanup() }
+  })
+
+  it.each(['failed', 'loading', 'missing'] as const)('current %s never falls back to cached or reviewed settings', async (state) => {
+    Object.assign(agentsQuery, { data: { items: state === 'missing' ? [] : [agent()], next_cursor: null }, isSuccess: state === 'missing', isError: state === 'failed', isPending: state === 'loading' })
+    const view = await mount({ selectedProcessType: 'agent_definition_review', process: process(), reviews: [review()] })
+    try {
+      expect(textOf(view.container)).toContain(state === 'loading' ? 'Current settings loading' : 'Current settings unavailable')
+      expect(textOf(view.container)).toContain('historic-model-1')
+      expect(textOf(view.container)).not.toContain('current-model-1')
+    } finally { view.cleanup() }
+  })
+
+  it('unknown current native model remains unknown after a fresh mount', async () => {
+    agentsQuery.data.items = [{ ...agent(), model: '', adapter_type: 'cli', cli_runtime: 'codex' }]
+    const view = await mount({ process: process(), reviews: [review()] })
+    try {
+      expect(textOf(view.container)).toContain('Unknown / provider default')
+      expect(textOf(view.container)).toContain('historic-model-1')
+    } finally { view.cleanup() }
+  })
+})
 
 describe('ProcessFocus', () => {
   it('renders lm_retry hint text when present and retry control is shown', async () => {

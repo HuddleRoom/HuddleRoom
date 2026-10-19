@@ -681,6 +681,8 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
   const reasonRef = useRef<HTMLTextAreaElement>(null)
   const submitRef = useRef<HTMLButtonElement>(null)
   const processes = currentProcesses(dashboard.processes.data)
+  const currentSkipProcesses = useRef({ goalId, processes, ready: !dashboard.processes.isLoading && !dashboard.processes.isError })
+  currentSkipProcesses.current = { goalId, processes, ready: !dashboard.processes.isLoading && !dashboard.processes.isError }
   const decisions = useMemo(() => dashboard.decisions.data ?? [], [dashboard.decisions.data])
   const warnings = dashboard.warnings.data ?? []
   const checkpointItems = dashboard.checkpoint.data?.items ?? []
@@ -1080,7 +1082,11 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
       selectedOption={selectedOption} reason={reason} error={formErrorSource === 'action' ? formError : null}
       firstOptionRef={firstOptionRef} reasonRef={reasonRef} submitRef={submitRef}
       onAnswer={(decision, option, submitReason) => { void submitDecision(decision, option, submitReason, 'Answer received.', onSuccessFocus) }}
-      onSkip={(process, submitReason) => runMutation(action, (callbacks) => skip.mutate({ goalId, processType: process.process_type, reason: submitReason }, callbacks), 'Process skipped.', onSuccessFocus)}
+      onSkip={(process, submitReason) => {
+        const current = currentSkipProcesses.current
+        if (!current.ready || current.goalId !== goalId || !current.processes.some((row) => row.id === process.id)) return
+        runMutation(action, (callbacks) => skip.mutate({ goalId, processType: process.process_type, reason: submitReason }, callbacks), 'Process skipped.', onSuccessFocus)
+      }}
       onAcknowledge={(warning, submitReason) => runMutation(action, (callbacks) => acknowledge.mutate({ goalId, warningId: warning.id, reason: submitReason }, callbacks), 'Risk acknowledged.', onSuccessFocus)}
       onResolve={(warning, submitReason) => runMutation(action, (callbacks) => resolve.mutate({ goalId, warningId: warning.id, reason: submitReason }, callbacks), 'Risk resolved.', onSuccessFocus)}
       onSelectedOptionChange={setSelectedOption} onReasonChange={setReason} onCancel={() => closeForm(action)}

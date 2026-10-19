@@ -1,4 +1,5 @@
-import { Suspense, lazy, useEffect, useState, type ReactNode, type RefObject } from 'react'
+import { Suspense, lazy, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
+import { useAgents } from '@/api/agents'
 import { Button, StatusBadge } from '@/components/common/uiPrimitives'
 import { STATUS_COLORS } from '@/lib/statusColors'
 import type {
@@ -77,7 +78,7 @@ function reviewCards(reviews: readonly OrchestrationAgentReviewRecord[], process
     const capabilities = Array.isArray(snapshot.capabilities) ? snapshot.capabilities.filter((item): item is string => typeof item === 'string') : []
     const tools = isRecord(snapshot.config) ? stringItems(snapshot.config.tools) : []
     return {
-      id: review.id, name, role, provider, model, capabilities, tools, assessment: review.fit_summary,
+      id: review.id, agentId: review.agent_id, name, role, provider, model, capabilities, tools, assessment: review.fit_summary,
       proposed: stringItems(review.proposed_work_functions),
       approved: stringItems(review.approved_for_work_functions),
       risks: stringItems(review.risks),
@@ -428,7 +429,12 @@ export function ProcessFocus({
   onViewActivity,
 }: ProcessFocusProps) {
   const [rawOpen, setRawOpen] = useState(false)
-  const phrase = process ? statusPhrase(process.status) : { label: 'Not started', tone: 'idle' as const }
+  const agents = useAgents()
+  const superseded = process?.superseded_by_id != null
+  const currentProcess = useRef(process)
+  currentProcess.current = process
+  const canMutate = () => currentProcess.current?.id === process?.id && currentProcess.current?.superseded_by_id == null
+  const phrase = superseded ? { label: 'Superseded', tone: 'idle' as const } : process ? statusPhrase(process.status) : { label: 'Not started', tone: 'idle' as const }
   const processDecisions = scoped(decisions, process)
   const processWarnings = scoped(warnings, process)
   const processReviews = scoped(reviews, process)
@@ -439,8 +445,8 @@ export function ProcessFocus({
   // running the failed LM request — a step waiting on a decision recovers
   // through the decision, and a terminal step with stale retry metadata
   // just shows Re-run instead.
-  const showRetryControl = process?.status === 'running' && retryable
-  const showRun = canRun && !showRetryControl
+  const showRetryControl = !superseded && process?.status === 'running' && retryable
+  const showRun = !superseded && canRun && !showRetryControl
   const { announceError } = useGoalAnnouncer()
   useEffect(() => { if (runRerunError) announceError(runRerunError) }, [runRerunError, announceError])
   useEffect(() => { if (outputError) announceError(outputError) }, [outputError, announceError])
@@ -459,21 +465,24 @@ export function ProcessFocus({
         {showRun && <Button
           ref={(element) => { if (element) element.disabled = controlsBusy }}
           type="button" variant="secondary" size="sm" className="min-h-11" aria-label={`Run ${processLabel(selectedProcessType)}`}
-          disabled={controlsBusy} onClick={(event) => { if (!controlsBusy) onRun(event.currentTarget) }}
+          disabled={controlsBusy} onClick={(event) => { if (!controlsBusy && canMutate()) onRun(event.currentTarget) }}
         >{runPending ? 'Running…' : 'Run'}</Button>}
-        {canRerun && <Button
+        {!superseded && canRerun && <Button
           ref={(element) => { if (element) element.disabled = controlsBusy }}
           type="button" variant="secondary" size="sm" className="min-h-11" aria-label={`Re-run ${processLabel(selectedProcessType)}`}
-          disabled={controlsBusy} onClick={(event) => { if (!controlsBusy) onRerun(event.currentTarget) }}
+          disabled={controlsBusy} onClick={(event) => { if (!controlsBusy && canMutate()) onRerun(event.currentTarget) }}
         >{rerunPending ? 'Re-running…' : 'Re-run'}</Button>}
-        {canSkip && skipAction && <Button ref={(element) => onActionTrigger(skipAction, element)} type="button" variant="secondary" size="sm" className="min-h-11" disabled={mutationBusy} onClick={() => onOpenAction(skipAction)}>Skip</Button>}
+        {!superseded && canSkip && skipAction && <Button ref={(element) => onActionTrigger(skipAction, element)} type="button" variant="secondary" size="sm" className="min-h-11" disabled={mutationBusy} onClick={() => { if (canMutate()) onOpenAction(skipAction) }}>Skip</Button>}
       </div>
-      {canSkip && <p className="mt-1 text-xs text-huddleroom-text-muted">Skip this process if it isn't needed for this goal — you can re-run it later.</p>}
-      {skipAction && openAction?.kind === 'skip' && openAction.id === skipAction.id && process && renderActionForm(skipAction, process)}
+      {!superseded && canSkip && <p className="mt-1 text-xs text-huddleroom-text-muted">Skip this process if it isn't needed for this goal — you can re-run it later.</p>}
+      {!superseded && skipAction && openAction?.kind === 'skip' && openAction.id === skipAction.id && process && renderActionForm(skipAction, process)}
+
+      {superseded && <p className="mt-2 break-all text-sm text-huddleroom-text-secondary">Replaced by process {process?.superseded_by_id}. This historical step is read-only.</p>}
+      {process && <p className="mt-2 text-xs text-huddleroom-text-muted">Captured input: {isRecord(process.input_snapshot.capture) && process.input_snapshot.capture.original_available === true ? 'Recorded' : isRecord(process.input_snapshot.capture) && process.input_snapshot.capture.source === 'legacy_first_observed' ? 'Original unavailable (legacy)' : 'Unavailable'}. Effective comparison: {isRecord(process.input_snapshot.effective_comparison) && typeof process.input_snapshot.effective_comparison.fingerprint === 'string' ? 'Recorded separately' : 'Unavailable'}.</p>}
 
       {runRerunError && <p className="mt-3 text-sm text-huddleroom-status-red">{runRerunError}</p>}
       {showRetryControl && <div className="mt-3">
-        <RetryControl onRetry={onRetry} retryPending={retryPending} retryError={retryError} disabled={controlsBusy} />
+        <RetryControl onRetry={(trigger) => { if (canMutate()) onRetry(trigger) }} retryPending={retryPending} retryError={retryError} disabled={controlsBusy} />
         {retry?.hint && <p className="mt-2 text-xs text-huddleroom-text-muted">{retry.hint}</p>}
       </div>}
 
@@ -492,22 +501,36 @@ export function ProcessFocus({
         const warningCount = typeof outputs.warning_count === 'number' ? outputs.warning_count : processWarnings.length
         return <p className="mt-4 border-t border-huddleroom-border pt-3 text-sm text-huddleroom-text-secondary">
           <span className="block font-semibold text-huddleroom-text-primary">Who the orchestrator reviewed and approved</span>
+          <span className="mt-1 block text-xs text-huddleroom-text-muted">Reviewed configuration is historical. Current agent settings are authoritative for runtime and model.</span>
           {processReviews.length} agent{processReviews.length === 1 ? '' : 's'} reviewed · {warningCount} warning{warningCount === 1 ? '' : 's'}
           {outputs.compressed === true && ' · Compressed (trivial goal)'}
         </p>
       })()}
 
-      {reviewCards(reviews, process).map((review) => <article key={review.id} className="mt-4 border-t border-huddleroom-border pt-3">
+      {reviewCards(reviews, process).map((review) => {
+        const current = agents.isSuccess && !agents.isError ? agents.data?.items.find((agent) => agent.id === review.agentId) : undefined
+        return <article key={review.id} className="mt-4 border-t border-huddleroom-border pt-3">
         <h3 className="text-sm font-semibold text-huddleroom-text-primary">{review.name}{review.role ? ` · ${review.role}` : ''}</h3>
+        <p className="mt-2 text-xs font-medium text-huddleroom-text-muted">Reviewed configuration</p>
         {(review.provider || review.model) && <p className="mt-1 text-sm text-huddleroom-text-secondary">{review.provider ?? '—'} / {review.model ?? '—'}</p>}
         {review.capabilities.length > 0 && <p className="mt-1 text-sm text-huddleroom-text-secondary">Capabilities: {review.capabilities.join(', ')}</p>}
         {review.tools.length > 0 && <p className="mt-1 text-sm text-huddleroom-text-secondary">Tools: {review.tools.join(', ')}</p>}
+        <div className="mt-3 text-sm text-huddleroom-text-secondary">
+          <p className="text-xs font-medium text-huddleroom-text-muted">Current settings</p>
+          {current ? <>
+            <p className="mt-1 break-words">{current.name} · {current.role}</p>
+            <p className="mt-1 break-words">{current.provider || 'Unknown provider'} / {current.model || 'Unknown / provider default'}</p>
+            <p className="mt-1 break-words">Runtime: {current.cli_runtime || current.adapter_type || 'Unknown'}</p>
+            {current.capabilities.length > 0 && <p className="mt-1 break-words">Capabilities: {current.capabilities.join(', ')}</p>}
+            {stringItems(current.config.tools).length > 0 && <p className="mt-1 break-words">Tools: {stringItems(current.config.tools).join(', ')}</p>}
+          </> : <p className="mt-1">{agents.isPending && !agents.isError ? 'Current settings loading' : 'Current settings unavailable'}</p>}
+        </div>
         {review.proposed.length > 0 && <p className="mt-1 text-sm text-huddleroom-text-secondary">Proposed work functions: {review.proposed.join(', ')}</p>}
         {review.approved.length > 0 && <p className="mt-1 text-sm text-huddleroom-text-secondary">Approved work functions: {review.approved.join(', ')}</p>}
         {review.risks.length > 0 && <p className="mt-1 text-sm text-huddleroom-text-secondary">Risks: {review.risks.join(', ')}</p>}
         {review.recommendations.length > 0 && <p className="mt-1 text-sm text-huddleroom-text-secondary">Recommendations: {review.recommendations.join(', ')}</p>}
         {review.assessment && <p className="mt-1 text-sm text-huddleroom-text-secondary">Assessment: {review.assessment}</p>}
-      </article>)}
+      </article>})}
 
       {selectedProcessType === 'agent_definition_review' && processReviews.length === 0 && <OutcomeFallback type="agent_definition_review" />}
 
