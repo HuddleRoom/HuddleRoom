@@ -330,6 +330,34 @@ def test_hierarchy_parser_normalizes_gap_evidence_before_detecting_changed_respo
     assert accepted.feedback_results[0]["change_refs"] == ["responsibility:review-owner"]
 
 
+def test_hierarchy_parser_lists_actual_changed_facts_for_invalid_applied_reference():
+    request = _task2_revision_request()
+    request["required_work_functions"].append("summarization")
+    request["hierarchy_context"]["revision"]["previous_proposal"]["assignments"].append(
+        {"work_function": "summarization", "agent_ref": "worker"}
+    )
+    payload = _task2_revision_payload(feedback_results=[
+        {
+            "item_id": "feedback:1",
+            "source_excerpt": "Move implementation ownership.",
+            "disposition": "applied",
+            "reason": "Summarization ownership moved to the replacement.",
+            "change_refs": ["assignments:summarization"],
+        },
+        {
+            "item_id": "feedback:2",
+            "source_excerpt": "Document the remaining constraint.",
+            "disposition": "impossible",
+            "reason": "No eligible owner exists for the requested constraint.",
+            "change_refs": [],
+        },
+    ])
+    payload["assignments"].append({"work_function": "summarization", "agent_ref": "replacement"})
+
+    with pytest.raises(ValueError, match=r"changed facts: .*assignment:summarization"):
+        parse_team_hierarchy_analysis(payload, request)
+
+
 def test_hierarchy_parser_accepts_only_current_accepted_hierarchy_decision_coverage_for_new_agents():
     request = _task2_revision_request()
     request["hierarchy_context"]["agent_reviews"].append({
@@ -996,6 +1024,15 @@ def test_hierarchy_request_prompt_requires_empty_feedback_without_revision(conte
     )["messages"][0]["content"]
 
     assert "When hierarchy_context is present and revision is null or absent, return feedback_results: []." in prompt
+
+
+def test_hierarchy_request_prompt_states_feedback_disposition_and_change_ref_formats():
+    prompt = TeamHierarchyAnalyzer.build_request(
+        {"hierarchy_context": {"revision": None}}
+    )["messages"][0]["content"]
+
+    assert "assignment:<work_function>" in prompt
+    assert "applied, declined, or impossible" in prompt
 
 
 @pytest.mark.asyncio

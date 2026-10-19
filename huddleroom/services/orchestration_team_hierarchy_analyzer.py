@@ -340,7 +340,10 @@ def parse_team_hierarchy_analysis(payload: Any, request_payload: Mapping[str, An
                 ):
                     if not item["change_refs"]:
                         raise ValueError("applied feedback requires a changed reference")
-                    raise ValueError("applied feedback references must reference actual changed hierarchy facts")
+                    raise ValueError(
+                        "applied feedback references must reference actual changed hierarchy facts; "
+                        f"changed facts: {', '.join(sorted(changed_refs)) or 'none'}"
+                    )
 
         responsibility_ids: set[str] = set()
         criteria = request_payload.get("goal", {}).get("success_criteria", [])
@@ -485,6 +488,11 @@ class TeamHierarchyAnalyzer:
                 "[{item_id, source_excerpt, disposition, reason, change_refs}] and responsibility_coverage "
                 "[{responsibility_id, responsibility, source_ref, work_function, agent_ref, status, reason, evidence_ref}]. "
                 "When hierarchy_context is present and revision is null or absent, return feedback_results: []. "
+                "Each feedback_results disposition must be exactly applied, declined, or impossible (impossible when the "
+                "requested change conflicts with eligibility, reviewer independence, or roster policy). For applied results, "
+                "change_refs must list only hierarchy facts that actually changed from previous_proposal, using exactly "
+                "assignment:<work_function>, reporting:<agent_ref>, responsibility:<responsibility_id>, or "
+                "generic_gap:<work_function>; declined and impossible results may use []. "
                 "For each responsibility_coverage source_ref, use only objective, "
                 "criterion:<1-based success-criteria index>, or an exact current/frozen feedback item_id. "
                 "Every responsibility_coverage entry, including a gap, must use one exact required_work_functions value for "
