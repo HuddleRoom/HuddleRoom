@@ -10048,6 +10048,10 @@ class OrchestrationService:
             await self._consume_result_correction(db, run, task, session_id, event_id)
             return
         orchestration = self._json_object_or_empty(metadata.get("orchestration"))
+        if orchestration.get("work_function") == "decision" and orchestration.get("authority_decision_id"):
+            if task.status == "done":
+                await self._ingest_decision_output(db, run, task, session_id)
+            return
         if orchestration.get("work_function") != PLAN_WORK_FUNCTION or orchestration.get("run_id") != str(run.id):
             return
         kind = expected_result_kind(self._json_object_or_empty(metadata.get("orchestration_contract")), False)
@@ -10055,6 +10059,59 @@ class OrchestrationService:
             await self._ingest_planning_output(db, run, task, session_id)
         elif kind == WORK_REPORT and task.status == "done":
             await self.consume_canonical_report(db, run, task, session_id, event_id)
+
+    async def _ingest_decision_output(
+        self, db: AsyncSession, run: OrchestrationRun, task: Task, session_id: uuid.UUID | None,
+    ) -> None:
+        """Turn a delegated decision task's {"selected_option","reason"} output into the decision_report Artifact
+        that the authority sync applies. Invalid output escalates the decision to a human.
+        ponytail: no correction round for decision reports (not in CORRECTABLE_KINDS); add when live runs need it."""
+        decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(
+            self._json_object_or_empty(self._json_object_or_empty(task.metadata_).get("orchestration"))["authority_decision_id"]
+        ))
+        if decision is None or decision.authority_agent_id is None or task.assigned_to != decision.authority_agent_id:
+            logger.warning("decision task %s ignored: not assigned to the decision's authority agent", task.id)
+            return
+        action = await db.get(OrchestrationAction, decision.related_action_id) if decision.related_action_id else None
+        if decision.status != "pending" or action is None or action.target_id != task.id:
+            return  # only the decision's own delegated task, and only while the decision is open
+        if session_id is None:
+            sessions = list(await db.scalars(select(Session.id).where(
+                Session.task_id == task.id, Session.status == "completed",
+            )))
+            if len(sessions) != 1:
+                return
+            session_id = sessions[0]
+        session = await db.get(Session, session_id)
+        if session is None or session.agent_id != decision.authority_agent_id:
+            logger.warning("decision task %s ignored: session %s missing or ran under another agent", task.id, session_id)
+            return
+        try:
+            payload = json.loads(normalize_result_output(session.output)[0])
+            fields = {key: payload.get(key) for key in ("selected_option", "reason")}
+            valid = all(isinstance(value, str) and value.strip() for value in fields.values())
+        except (ValueError, AttributeError):
+            valid = False
+        if not valid:
+            # Invalid output is never consumed; a human decision replaces the stranded one.
+            goal = await db.get(OrchestrationGoal, run.goal_id)
+            if goal is not None:
+                await self._escalate_authority_decision(
+                    db, goal, run, decision, reason="agent decision output was not valid selected_option/reason JSON",
+                )
+            return
+        try:
+            await self.consume_terminal_task_output(db, run, task, session_id)
+        except HTTPException as exc:
+            if exc.status_code == 409:
+                return  # a nonwinning session never becomes the decision report
+            raise
+        if await self._agent_decision_report(db, decision) is None:
+            db.add(Artifact(
+                project_id=task.project_id, name=f"decision-report-{task.id}", artifact_type="decision_report",
+                linked_task_id=task.id, created_by_agent=decision.authority_agent_id, metadata_=fields,
+            ))
+            await db.flush()
 
     async def _consume_result_correction(
         self, db: AsyncSession, run: OrchestrationRun, task: Task, session_id: uuid.UUID | None,

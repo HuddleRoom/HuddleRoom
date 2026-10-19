@@ -1870,3 +1870,207 @@ async def test_record_authority_decision_fails_reserved_action_when_report_missi
     stuck = await service._existing_action_for_key(db_session, run.id, "test:missing-option-record")
     assert stuck is not None
     assert stuck.status == "failed"
+
+
+async def _delegated_manager_decision(db_session, test_project):
+    """Delegated manager decision; returns service, goal, run, decision, manager, task."""
+    service = OrchestrationService()
+    goal, run = await service.create_goal(
+        db_session, project_id=test_project.id,
+        data=OrchestrationGoalCreate(
+            objective="Decision ingestion test", success_criteria=[{"key": "done", "description": "Done"}],
+        ),
+        created_by_user_id=None,
+    )
+    manager = _agent()
+    db_session.add(manager)
+    await db_session.flush()
+    decision = await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, goal.id, decision_key="test:ingest-decision", title="Approve",
+        question="Approve?", authority="manager", authority_agent_id=manager.id,
+        options=["approve", "reject"], run_id=run.id,
+    )
+    await service._sync_agent_authority_decisions(db_session, goal, run)
+    await db_session.refresh(decision)
+    action = await db_session.get(OrchestrationAction, decision.related_action_id)
+    return service, goal, run, decision, manager, await db_session.get(Task, action.target_id)
+
+
+async def _complete_decision_session(db_session, service, run, task, agent_id, output):
+    from types import SimpleNamespace
+
+    from huddleroom.models.session import Session
+
+    session = Session(
+        task_id=task.id, agent_id=agent_id, project_id=task.project_id, adapter_type="api",
+        status="completed", output=output,
+    )
+    db_session.add(session)
+    task.status = "done"
+    await db_session.flush()
+    event = SimpleNamespace(
+        id=uuid.uuid4(), event_type="session.completed", payload={"session_id": str(session.id)},
+    )
+    await service._ingest_session_evidence(db_session, run, event)
+    await db_session.flush()
+    return event
+
+
+async def _decision_reports(db_session, task):
+    return list(await db_session.scalars(select(Artifact).where(
+        Artifact.artifact_type == "decision_report", Artifact.linked_task_id == task.id,
+    )))
+
+
+@pytest.mark.asyncio
+async def test_manager_session_output_is_ingested_as_decision_report(
+    db_session, test_project
+):
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    output = '{"selected_option":"approve","reason":"ok"}'
+    event = await _complete_decision_session(db_session, service, run, task, manager.id, output)
+    await service._ingest_session_evidence(db_session, run, event)  # exact replay
+
+    reports = await _decision_reports(db_session, task)
+    assert len(reports) == 1
+    assert reports[0].created_by_agent == manager.id
+    assert reports[0].metadata_ == {"selected_option": "approve", "reason": "ok"}
+    key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
+    assert (await service._existing_action_for_key(db_session, run.id, key)) is not None
+
+    result = await service._sync_agent_authority_decisions(db_session, goal, run)
+    assert result["recorded"] == 1
+    await db_session.refresh(decision)
+    assert decision.status == "answered"
+    assert decision.selected_option == "approve"
+    assert decision.decided_by_agent_id == manager.id
+
+
+@pytest.mark.asyncio
+async def test_decision_output_with_invalid_option_is_not_answered(
+    db_session, test_project
+):
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    await _complete_decision_session(
+        db_session, service, run, task, manager.id, '{"selected_option":"maybe","reason":"hmm"}',
+    )
+    # Existing validation rejects the unknown key and escalates; the manager's answer never lands.
+    result = await service._sync_agent_authority_decisions(db_session, goal, run)
+    assert result["recorded"] == 0
+    await db_session.refresh(decision)
+    assert decision.status != "answered" or decision.selected_option != "maybe"
+
+
+@pytest.mark.asyncio
+async def test_decision_non_json_output_escalates_to_human(
+    db_session, test_project
+):
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    await _complete_decision_session(db_session, service, run, task, manager.id, "I approve.")
+    assert await _decision_reports(db_session, task) == []
+    key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
+    assert (await service._existing_action_for_key(db_session, run.id, key)) is None
+    await db_session.refresh(decision)
+    assert decision.status == "cancelled"
+    replacement = (await db_session.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.goal_id == goal.id,
+        OrchestrationAuthorityDecision.decision_key == decision.decision_key,
+        OrchestrationAuthorityDecision.status == "pending",
+    ))).one()
+    assert replacement.authority == "human"
+
+
+@pytest.mark.asyncio
+async def test_decision_task_done_event_then_session_completed_creates_one_report(
+    db_session, test_project
+):
+    from huddleroom.models.session import Session
+
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    task.status = "done"
+    await service._ingest_ungated_output(db_session, run, task, None, uuid.uuid4())  # no session yet: no-op
+    key = f"run:{run.id}:kind:report_consumed:task:{task.id}"
+    assert (await service._existing_action_for_key(db_session, run.id, key)) is None
+    db_session.add(Session(
+        task_id=task.id, agent_id=manager.id, project_id=task.project_id, adapter_type="api",
+        status="completed", output='{"selected_option":"approve","reason":"ok"}',
+    ))
+    await db_session.flush()
+    await service._ingest_ungated_output(db_session, run, task, None, uuid.uuid4())  # resolves the one session
+    await _complete_decision_session(
+        db_session, service, run, task, manager.id, '{"selected_option":"reject","reason":"later"}',
+    )  # a second session is a benign no-op, not a 409
+    reports = await _decision_reports(db_session, task)
+    assert len(reports) == 1
+    assert reports[0].metadata_["selected_option"] == "approve"
+
+
+@pytest.mark.asyncio
+async def test_decision_second_session_after_valid_first_is_noop(
+    db_session, test_project
+):
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    await _complete_decision_session(
+        db_session, service, run, task, manager.id, '{"selected_option":"approve","reason":"ok"}',
+    )
+    await _complete_decision_session(
+        db_session, service, run, task, manager.id, '{"selected_option":"reject","reason":"again"}',
+    )
+    reports = await _decision_reports(db_session, task)
+    assert len(reports) == 1 and reports[0].metadata_["selected_option"] == "approve"
+
+
+@pytest.mark.asyncio
+async def test_decision_id_copied_to_other_task_is_ignored(
+    db_session, test_project
+):
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    copy = Task(
+        project_id=task.project_id, title="copy", assigned_to=manager.id, status="done",
+        metadata_=dict(task.metadata_),
+    )
+    db_session.add(copy)
+    await db_session.flush()
+    await _complete_decision_session(
+        db_session, service, run, copy, manager.id, '{"selected_option":"approve","reason":"ok"}',
+    )
+    assert await _decision_reports(db_session, copy) == []
+    await db_session.refresh(decision)
+    assert decision.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_decision_bridge_answers_under_planning_only_grant(
+    db_session, test_project
+):
+    """record_authority_decision is not gated on execution scope: a planning_only run still answers."""
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    grant = await service.reserve_action(db_session, run.id, f"run:{run.id}:kind:authorize_execution", "authorize_execution", {
+        "scope": "planning_only", "contract_fingerprint": run.goal_contract_fingerprint,
+    })
+    await service._mark_action_completed(db_session, grant, target_type="run", target_id=run.id)
+    run.plan_state = {**(run.plan_state or {}), "scope_contract_version": 1}
+    await _complete_decision_session(
+        db_session, service, run, task, manager.id, '{"selected_option":"approve","reason":"ok"}',
+    )
+    result = await service._sync_agent_authority_decisions(db_session, goal, run)
+    assert result["recorded"] == 1
+    await db_session.refresh(decision)
+    assert decision.status == "answered"
+
+
+@pytest.mark.asyncio
+async def test_decision_output_from_other_agent_is_not_applied(
+    db_session, test_project
+):
+    service, goal, run, decision, manager, task = await _delegated_manager_decision(db_session, test_project)
+    other = _agent()
+    db_session.add(other)
+    await db_session.flush()
+    await _complete_decision_session(
+        db_session, service, run, task, other.id, '{"selected_option":"approve","reason":"ok"}',
+    )
+    assert await _decision_reports(db_session, task) == []
+    await service._sync_agent_authority_decisions(db_session, goal, run)
+    await db_session.refresh(decision)
+    assert decision.status == "pending"
