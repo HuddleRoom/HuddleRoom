@@ -135,6 +135,12 @@ class ShimHandle:
         (self._gates / token).write_text(regex)
         return token
 
+    def release_invocation(self, ordinal: int) -> None:
+        """Release only this ``hold_each`` call; subsequent calls stay held."""
+        if ordinal < 1:
+            raise ValueError("ordinal must be >= 1")
+        (self._gates / f"{self.tool}.each.{ordinal}").unlink(missing_ok=True)
+
     def release(self, name: str = "all") -> None:
         (self._gates / name).unlink(missing_ok=True)
 
@@ -189,6 +195,20 @@ class ShimHandle:
             except ValueError:
                 continue
         return result
+
+    def settled_ordinals(self) -> set[int]:
+        """Completed model calls parsed from the append-only shim log."""
+        if not self._log.exists():
+            return set()
+        out = set()
+        for line in self._log.read_text(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == "settled" and parts[1] == self.tool:
+                try:
+                    out.add(int(parts[4]))
+                except ValueError:
+                    pass
+        return out
 
     def deny(self) -> None:
         """Global DENY gate: every running and future call of any tool exits 76."""
@@ -275,6 +295,7 @@ def make_shim(
     scenario_cap: int | None = None,
     output_ceiling: int = DEFAULT_OUTPUT_CEILING,
     campaign_ledger: dict | None = None,
+    hold_each: bool = False,
 ) -> ShimHandle:
     """campaign_ledger: optional {"path": Path, "cap": int, "scenario": str}.
 
@@ -323,6 +344,7 @@ def make_shim(
         "output_ceiling": int(output_ceiling),
         "stdin_timeout": float(stdin_timeout),
         "ledger": ledger,
+        "hold_each": bool(hold_each),
     }
     config_path = shim_dir / f"{tool}.json"
     _atomic_write(config_path, json.dumps(config))

@@ -190,6 +190,39 @@ def test_gate_blocks_until_release(shim):
     assert b"arg=[go]" in out
 
 
+def test_hold_each_releases_only_the_selected_call(shim_dir, real_tool):
+    """A later call stays held when the first private ordinal gate is released."""
+    shim = make_shim(shim_dir, "claude", real_tool, hold_each=True)
+    first = _spawn(shim.path, ["first"])
+    second = None
+    try:
+        assert shim.wait_invocations(1, timeout=10)
+        second = _spawn(shim.path, ["second"])
+        assert shim.wait_invocations(2, timeout=10)
+        shim.release_invocation(1)
+        _finish(first)
+        time.sleep(0.3)
+        assert second.poll() is None
+        shim.release_invocation(2)
+        _finish(second)
+    finally:
+        _reap(first, *([second] if second is not None else []))
+
+
+def test_model_call_stdin_and_stdout_copied_to_calls_dir(shim_dir, fake_codex, tmp_path):
+    h = make_shim(shim_dir, "codex", fake_codex)
+    stdin = b"prompt \xff\n" * 3
+    out = b"reply \x00\xfe\n"
+    emit = tmp_path / "emit.bin"
+    emit.write_bytes(out)
+    r = subprocess.run([str(h.path), "exec", "--emit-file", str(emit)], input=stdin,
+                       capture_output=True, timeout=10)
+    assert r.returncode == 0
+    assert r.stdout == out
+    assert (shim_dir / "calls" / "codex.1.stdin").read_bytes() == stdin
+    assert (shim_dir / "calls" / "codex.1.stdout").read_bytes() == out
+
+
 @pytest.mark.live
 def test_log_has_start_and_exec(shim):
     subprocess.run([str(shim.path), "a", "b c"], input=b"", capture_output=True, timeout=30)

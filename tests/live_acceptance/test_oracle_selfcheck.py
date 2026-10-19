@@ -52,9 +52,9 @@ def _connect(path) -> sqlite3.Connection:
 
 def _seed(path) -> dict[str, str]:
     """Column ids are hex (as stored); product-built keys and dedup keys use dashed UUIDs."""
-    names = ("project", "goal", "agent", "task", "meta_task", "run", "process", "decision", "decision2",
-             "session", "pause_action", "admit_action", "consumed_action", "answer_action", "roadmap_item",
-             "version")
+    names = ("project", "goal", "agent", "task", "second_task", "meta_task", "run", "process", "decision",
+             "decision2", "session", "pause_action", "admit_action", "consumed_action", "second_consumed_action",
+             "answer_action", "roadmap_item", "version")
     ids = {k: _id() for k in names}
     dashed = {k: str(uuid.UUID(ids[k])) for k in ("goal", "run", "task", "decision")}
     dashed["request"] = _dash()
@@ -75,6 +75,9 @@ def _seed(path) -> dict[str, str]:
             (ids["task"], ids["project"], "task", json.dumps({"k": "v"}), NOW, NOW))
         conn.execute(
             "INSERT INTO tasks (id, project_id, title, metadata, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            (ids["second_task"], ids["project"], "second task", "{}", NOW, NOW))
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, metadata, created_at, updated_at) VALUES (?,?,?,?,?,?)",
             (ids["meta_task"], ids["project"], "meta task",
              json.dumps({"orchestration": {"goal_id": dashed["goal"]}}), NOW, NOW))
         conn.execute(
@@ -85,7 +88,10 @@ def _seed(path) -> dict[str, str]:
             "INSERT INTO orchestration_runs (id, goal_id, status, pause_requested, control_version, plan_state, "
             "active_blockers, budget_state, retry_state, supervision_state, phase, baseline_authorized, "
             "started_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ids["run"], ids["goal"], "running", 0, 1, json.dumps({"p": 1}), "[]", "{}", "{}", "{}",
+            (ids["run"], ids["goal"], "running", 0, 1, json.dumps({
+                "p": 1,
+                "plan_reviews": {"artifact": {"identity": {"review_cycle": 1}}},
+            }), "[]", "{}", "{}", "{}",
              "baseline", 0, NOW, NOW, NOW))
         run = dashed["run"]
         for key, action_type, idem in (
@@ -93,6 +99,8 @@ def _seed(path) -> dict[str, str]:
             ("admit_action", "admit_control_call", f"run:{run}:admit:1"),
             ("consumed_action", "record_event",
              f"run:{run}:kind:report_consumed:task:{dashed['task']}"),
+            ("second_consumed_action", "record_event",
+             f"run:{run}:kind:report_consumed:task:{str(uuid.UUID(ids['second_task']))}"),
             ("answer_action", "apply_authority_answer",
              f"apply_authority_answer:{dashed['decision']}"),
         ):
@@ -105,8 +113,14 @@ def _seed(path) -> dict[str, str]:
             "INSERT INTO orchestration_process_runs (id, goal_id, run_id, process_type, process_version, status, "
             "trigger_reason, input_snapshot, outputs, started_at, created_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ids["process"], ids["goal"], ids["run"], "planner", 1, "completed", "test", "{}",
-             json.dumps({"ok": True}), NOW, NOW, NOW))
+            (ids["process"], ids["goal"], ids["run"], "team_hierarchy", 1, "completed", "test",
+             json.dumps({"fingerprint": "f", "capture": {"c": 1}, "effective_comparison": {"e": 1},
+                         "rerun_intent": {"reason": "hierarchy_changes_requested"}}),
+             json.dumps({"ok": True, "analysis": {"feedback_results": [{"item_id": "feedback:1"}]},
+                         "revision_context": {"source_process_id": "p1"},
+                         "proposal": {"responsibility_coverage": [{"status": "gap"}]},
+                         "approval": "approve_with_documented_gaps",
+                         "accepted_responsibility_gap_ids": ["gap:1"]}), NOW, NOW, NOW))
         conn.execute(
             "INSERT INTO orchestration_authority_decisions (id, goal_id, run_id, decision_key, title, authority, "
             "question, options, status, continuation, continuation_action_id, asked_at, created_at, updated_at) "
@@ -173,14 +187,15 @@ def test_readers_return_rowid_order_and_decode_json(db):
     with Oracle(db) as oracle:
         run = oracle.run_state(ids["run"])
         assert run["id"] == ids["run"]
-        assert run["plan_state"] == {"p": 1}
+        assert run["plan_state"]["p"] == 1
         assert oracle.run_state(_id()) is None
 
         assert [r["id"] for r in oracle.runs(ids["goal"])] == [ids["run"]]
 
         actions = oracle.actions(ids["run"])
         assert [a["id"] for a in actions] == [
-            ids["pause_action"], ids["admit_action"], ids["consumed_action"], ids["answer_action"]]
+            ids["pause_action"], ids["admit_action"], ids["consumed_action"], ids["second_consumed_action"],
+            ids["answer_action"]]
         assert actions[0]["dispatch_contract"] == {"state": "applied"}
         assert actions[0]["request"] == {"target": "pause_action"}
         assert [a["id"] for a in oracle.actions(ids["run"], action_type="admit_control_call")] == [ids["admit_action"]]
@@ -191,10 +206,26 @@ def test_readers_return_rowid_order_and_decode_json(db):
         assert decisions[0]["continuation"] == {"c": 1}
         assert decisions[1]["continuation"] is None
 
-        assert oracle.process_runs(goal_id=ids["goal"])[0]["outputs"] == {"ok": True}
+        assert oracle.process_runs(goal_id=ids["goal"])[0]["outputs"]["ok"] is True
         assert oracle.process_runs(run_id=ids["run"])[0]["id"] == ids["process"]
         with pytest.raises(ValueError):
             oracle.process_runs(goal_id=ids["goal"], run_id=ids["run"])
+
+        assert oracle.team_hierarchy_outputs(ids["process"]) == {
+            "feedback_results": [{"item_id": "feedback:1"}],
+            "revision_context": {"source_process_id": "p1"},
+            "responsibility_coverage": [{"status": "gap"}],
+            "approval": "approve_with_documented_gaps",
+            "accepted_responsibility_gap_ids": ["gap:1"],
+        }
+        assert oracle.process_input_evidence(ids["process"]) == {
+            "fingerprint": "f", "capture": {"c": 1}, "effective_comparison": {"e": 1},
+            "rerun_intent": {"reason": "hierarchy_changes_requested"},
+        }
+        assert oracle.plan_state_bindings(ids["run"]) == {
+            "accepted_plan_ownership": None,
+            "plan_review_identities": {"artifact": {"review_cycle": 1}},
+        }
 
         events = oracle.event_log(ids["project"])
         assert [e["event_type"] for e in events] == ["authority.decision_resolved", "run.paused"]
@@ -211,7 +242,10 @@ def test_readers_return_rowid_order_and_decode_json(db):
 def test_product_dashed_keys_are_found(db):
     ids = _seed(db)
     with Oracle(db) as oracle:
-        assert [a["id"] for a in oracle.report_consumed(ids["run"])] == [ids["consumed_action"]]
+        assert [a["id"] for a in oracle.report_consumed(ids["run"])] == [
+            ids["consumed_action"], ids["second_consumed_action"]]
+        assert oracle.report_consumed_count(ids["run"]) == 2
+        assert oracle.report_consumed_count(ids["run"], ids["task"]) == 1
         assert [a["id"] for a in oracle.pause_control(ids["run"])] == [ids["pause_action"]]
         assert [a["id"] for a in oracle.pause_control(ids["run"], ids["request_dashed"])] == [ids["pause_action"]]
         assert oracle.pause_control(ids["run"], _id()) == []
@@ -273,7 +307,9 @@ def test_dump_writes_all_readers_and_rejects_unknown_types(db, tmp_path):
     assert data["run_state"]["id"] == ids["run"]
     assert len(data["decisions"]) == 2
     assert len(data["tasks"]) == 2
-    assert len(data["report_consumed"]) == 1
+    assert len(data["report_consumed"]) == 2
+    assert data["report_consumed_count"] == 2
+    assert data["plan_state_bindings"]["plan_review_identities"] == {"artifact": {"review_cycle": 1}}
     with pytest.raises(TypeError):
         _json_default(object())
 

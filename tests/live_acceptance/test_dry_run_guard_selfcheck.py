@@ -1,6 +1,8 @@
 """Zero-token guards for the dry-run driver, using fake codex/claude binaries."""
 
+import ast
 import json
+from pathlib import Path
 import stat
 import sys
 
@@ -768,10 +770,39 @@ def test_retry_route_and_body(monkeypatch):
 
     class R:
         status_code = 200
-    monkeypatch.setattr(api, "_do", lambda m, path, body=None: (seen.append((m, path, body)), R())[1])
+    monkeypatch.setattr(api, "_do", lambda m, path, body=None, timeout=60: (seen.append((m, path, body, timeout)), R())[1])
     res = api.retry_async("agent_definition_review")
     res["thread"].join(5)
-    assert seen == [("POST", "/baseline/retry", {"process_type": "agent_definition_review"})] and res["status"] == 200
+    assert seen == [("POST", "/baseline/retry", {"process_type": "agent_definition_review"}, 60)] and res["status"] == 200
+
+
+def test_api_request_timeout_defaults_and_accepts_override(monkeypatch):
+    api = dry_run.Api("http://x", "p", "g")
+    seen = []
+
+    class R:
+        status_code = 200
+
+    monkeypatch.setattr(dry_run.httpx, "request", lambda *args, **kwargs: (seen.append((args, kwargs)), R())[1])
+    api._do("GET", "")
+    api._do("POST", "/baseline/retry", {"process_type": "team_hierarchy"}, timeout=300)
+    assert [kwargs["timeout"] for _, kwargs in seen] == [60, 300]
+
+
+def test_second_resume_keeps_the_authorized_budget_and_ordinal_contract():
+    source = Path(__file__).with_name("test_live_run_g2g4.py").read_text()
+    tree = ast.parse(source)
+    second = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "G2G4SecondResumeScenario")
+    text = ast.unparse(second)
+    assert "artifact_name = 'resume-S-1m-2'" in text
+    assert "return (historical, 17)" in text
+    assert "[15, 16, 17]" in text
+    assert 'write_text(str(self.historical_codex_last))' in source
+    assert "prior != 562663" in source.replace("_", "")
+    assert 'api.retry_async("team_hierarchy", timeout=300)' in source
+    assert "driver.drive_codex(360" in source
+    assert "EXPECTED_RESUME_LEAF" in source and "/Users/yaron/" not in source
+    assert "RESUME_ROOT_RAW" in source and "Path(RESUME_ROOT_RAW).is_absolute()" in source
 
 
 def test_existing_snap_a_is_not_overwritten_and_counts_dirty(tmp_path, fakes, monkeypatch):

@@ -127,8 +127,8 @@ class Api:
         self.base = f"{base_url}/api/v1/projects/{project_id}/orchestration/goals/{goal_id}"
         self.calls: list[dict] = []
 
-    def _do(self, method: str, path: str, body: dict | None = None) -> httpx.Response:
-        r = httpx.request(method, self.base + path, json=body, timeout=60)
+    def _do(self, method: str, path: str, body: dict | None = None, timeout: float = 60) -> httpx.Response:
+        r = httpx.request(method, self.base + path, json=body, timeout=timeout)
         self.calls.append({"t": _now(), "method": method, "route": path, "status": r.status_code})
         return r
 
@@ -172,14 +172,14 @@ class Api:
     def resume(self) -> int:
         return self._do("POST", "/resume").status_code
 
-    def retry_async(self, process_type: str) -> dict:
+    def retry_async(self, process_type: str, timeout: float = 60) -> dict:
         """POST baseline/retry in a thread: it blocks while the retried model call is held by the shim."""
         import threading
         result: dict = {"done": False, "status": None}
 
         def go():
             try:
-                result["status"] = self._do("POST", "/baseline/retry", {"process_type": process_type}).status_code
+                result["status"] = self._do("POST", "/baseline/retry", {"process_type": process_type}, timeout).status_code
             except Exception as e:  # noqa: BLE001
                 result["error"] = str(e)
             result["done"] = True

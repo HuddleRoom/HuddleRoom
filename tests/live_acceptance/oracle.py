@@ -44,6 +44,7 @@ REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "orchestration_process_runs": (
         "id", "goal_id", "run_id", "process_type", "status", "outputs", "input_snapshot", "created_at",
+        "superseded_by_id",
     ),
     "event_log": ("seq", "project_id", "event_type", "dedup_key", "payload", "emitted_at"),
     "sessions": ("id", "task_id", "status", "created_at", "input_context", "metadata"),
@@ -241,6 +242,69 @@ class Oracle:
             return self._rows("orchestration_process_runs", ("goal_id = ?",), (_hex(goal_id),))
         return self._rows("orchestration_process_runs", ("run_id = ?",), (_hex(run_id),))
 
+    def process_outputs(self, process_id: Any) -> dict[str, Any] | None:
+        """Persisted outputs for one process run, or None when it is absent."""
+        rows = self._rows("orchestration_process_runs", ("id = ?",), (_hex(process_id),))
+        return rows[0]["outputs"] if rows else None
+
+    def process_input_snapshot(self, process_id: Any) -> dict[str, Any] | None:
+        """Persisted input snapshot for one process run, or None when it is absent."""
+        rows = self._rows("orchestration_process_runs", ("id = ?",), (_hex(process_id),))
+        return rows[0]["input_snapshot"] if rows else None
+
+    def team_hierarchy_outputs(self, process_id: Any) -> dict[str, Any] | None:
+        """The durable G2 proposal and approval fields for one hierarchy process.
+
+        Missing fields remain None so a live assertion cannot mistake an omitted
+        product value for an empty result.
+        """
+        outputs = self.process_outputs(process_id)
+        if outputs is None:
+            return None
+        analysis = outputs.get("analysis") if isinstance(outputs.get("analysis"), dict) else {}
+        proposal = outputs.get("proposal") if isinstance(outputs.get("proposal"), dict) else {}
+        return {
+            "feedback_results": analysis.get("feedback_results"),
+            "revision_context": outputs.get("revision_context"),
+            "responsibility_coverage": proposal.get("responsibility_coverage"),
+            "approval": outputs.get("approval"),
+            "accepted_responsibility_gap_ids": outputs.get("accepted_responsibility_gap_ids"),
+        }
+
+    def process_input_evidence(self, process_id: Any) -> dict[str, Any] | None:
+        """The G2 lineage fields from a process input snapshot."""
+        snapshot = self.process_input_snapshot(process_id)
+        if snapshot is None:
+            return None
+        return {
+            "fingerprint": snapshot.get("fingerprint"),
+            "capture": snapshot.get("capture"),
+            "effective_comparison": snapshot.get("effective_comparison"),
+            "rerun_intent": snapshot.get("rerun_intent"),
+        }
+
+    def plan_state_bindings(self, run_id: Any, artifact_id: Any = None) -> dict[str, Any] | None:
+        """Ownership plus plan-review identities persisted for a run.
+
+        Review identity lives in plan_state.plan_reviews[artifact_id], while
+        accepted_plan_ownership is absent until a plan is accepted.
+        """
+        run = self.run_state(run_id)
+        if run is None:
+            return None
+        state = run["plan_state"] if isinstance(run["plan_state"], dict) else {}
+        ownership = state.get("accepted_plan_ownership")
+        reviews = state.get("plan_reviews") if isinstance(state.get("plan_reviews"), dict) else {}
+        if artifact_id is not None:
+            reviews = {str(artifact_id): reviews.get(str(artifact_id))}
+        return {
+            "accepted_plan_ownership": ownership,
+            "plan_review_identities": {
+                key: value.get("identity") if isinstance(value, dict) else None
+                for key, value in reviews.items()
+            },
+        }
+
     def event_log(self, project_id: Any, event_type_prefix: str | None = None) -> list[dict[str, Any]]:
         clauses, params = ["project_id = ?"], [_hex(project_id)]
         if event_type_prefix is not None:
@@ -275,6 +339,13 @@ class Oracle:
             (_hex(run_id), len(prefix), prefix),
         )
 
+    def report_consumed_count(self, run_id: Any, task_id: Any = None) -> int:
+        actions = self.report_consumed(run_id)
+        if task_id is not None:
+            key = f"run:{_dash(run_id)}:kind:report_consumed:task:{_dash(task_id)}"
+            actions = [action for action in actions if action["idempotency_key"] == key]
+        return len(actions)
+
     def dump(self, label: str, dest_dir: str | Path, *, run_id: Any = None, goal_id: Any = None,
              project_id: Any = None, task_id: Any = None) -> Path:
         def opt(reader, value):
@@ -289,6 +360,8 @@ class Oracle:
                 "actions": opt(self.actions, run_id),
                 "pause_control": opt(self.pause_control, run_id),
                 "report_consumed": opt(self.report_consumed, run_id),
+                "report_consumed_count": opt(self.report_consumed_count, run_id),
+                "plan_state_bindings": opt(self.plan_state_bindings, run_id),
                 "decisions": opt(self.decisions, goal_id),
                 "process_runs": (
                     self.process_runs(goal_id=goal_id) if goal_id is not None

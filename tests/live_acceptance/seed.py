@@ -5,7 +5,8 @@ from __future__ import annotations
 import httpx
 
 from tests.live_acceptance.fixtures import (
-    AGENT_EFFORT, AGENT_MODEL, CLI_RUNTIME, DEFAULT_GOAL_WEIGHT, DISCOVERY_ROSTER_KEYS, PROVIDER, ROSTER,
+    AGENT_EFFORT, AGENT_MODEL, CLI_RUNTIME, DEFAULT_GOAL_WEIGHT, DISCOVERY_ROSTER_KEYS, G2G4_ROSTER, PROVIDER,
+    ROSTER,
 )
 from tests.live_acceptance.run_dir import RunDir, assert_isolated
 
@@ -18,12 +19,15 @@ def _post(base_url: str, path: str, body: dict) -> dict:
 
 def seed_minimal_roster(base_url: str, run_dir: RunDir, roster: str = "discovery",
                         blank_definition_key: str | None = "dev1") -> dict:
-    """Create the project and CLI agents. roster 'discovery' = 3 agents, 'full' = all 4 ROSTER agents.
+    """Create the project and CLI agents. roster 'discovery' = 3 agents, 'full' = all 4 ROSTER agents,
+    and 'g2g4' = the G2–G4 acceptance roster.
     The agent named by blank_definition_key gets empty description and system_prompt (None keeps all full).
     The server must be running on run_dir with auth disabled."""
-    if roster not in ("discovery", "full"):
+    if roster not in ("discovery", "full", "g2g4"):
         raise ValueError(f"unknown roster {roster!r}")
-    specs = [s for s in ROSTER if roster == "full" or s["key"] in DISCOVERY_ROSTER_KEYS]
+    specs = list(G2G4_ROSTER) if roster == "g2g4" else [
+        s for s in ROSTER if roster == "full" or s["key"] in DISCOVERY_ROSTER_KEYS
+    ]
     if blank_definition_key is not None and blank_definition_key not in {s["key"] for s in specs}:
         raise ValueError(f"blank_definition_key {blank_definition_key!r} is not in roster {roster!r}")
     assert_isolated(run_dir, run_dir.db, run_dir.workspace)
@@ -39,8 +43,11 @@ def seed_minimal_roster(base_url: str, run_dir: RunDir, roster: str = "discovery
         if spec["key"] == blank_definition_key:
             body["description"] = ""
             body["system_prompt"] = ""
-        body |= {"adapter_type": "cli", "cli_runtime": CLI_RUNTIME, "provider": PROVIDER, "model": AGENT_MODEL,
-                    "config": {"reasoning_effort": AGENT_EFFORT}}
+        body |= {
+            "adapter_type": "cli", "cli_runtime": spec.get("cli_runtime", CLI_RUNTIME),
+            "provider": spec.get("provider", PROVIDER), "model": spec.get("model", AGENT_MODEL),
+            "config": {"reasoning_effort": spec.get("reasoning_effort", AGENT_EFFORT)},
+        }
         ids[f"{spec['key']}_id"] = _post(base_url, "/api/v1/agents", body)["id"]
     return ids
 

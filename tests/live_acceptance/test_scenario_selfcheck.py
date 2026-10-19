@@ -11,9 +11,35 @@ import pytest
 
 from tests.live_acceptance import oracle
 from tests.live_acceptance.dry_run import _sha256, _snapshot_dir
+from tests.live_acceptance.run_dir import RunDir
 from tests.live_acceptance.scenario import LiveScenario, RestoreError, find_path_columns, restore_snapshot
 
 pytestmark = pytest.mark.live
+
+
+def _bare_run_dir(root):
+    return RunDir(root, root / "app.db", root / "workspace", root / "snapshots", root / "shim",
+                  root / "proxy.jsonl", root / "spend.jsonl", root / "config.json")
+
+
+def test_artifact_root_defaults_and_can_be_overridden(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    default = LiveScenario("default", None, tmp_path, 1)
+    default.run_dir = _bare_run_dir(run_root)
+    default._set_artifact_root()
+    default.mark("default")
+    assert default.artifact_root == run_root.resolve()
+    assert (run_root / "timeline.md").exists()
+
+    artifacts = tmp_path / "artifacts"
+    redirected = LiveScenario("redirected", None, tmp_path, 1, artifact_root=artifacts)
+    redirected.run_dir = _bare_run_dir(run_root)
+    redirected._set_artifact_root()
+    redirected.mark("redirected")
+    assert redirected.artifact_root == artifacts.resolve()
+    assert "redirected" in (artifacts / "timeline.md").read_text()
+    assert "redirected" not in (run_root / "timeline.md").read_text()
 
 
 @pytest.fixture
@@ -67,6 +93,15 @@ def test_restore_and_scenario(tmp_path, fakes, snapshot):
         httpx.get(f"{sc.base_url}/health", timeout=1)
     assert sc.findings["ledger_reaped"] is not None
     assert not sc.errors
+
+
+def test_scenario_accepts_g2g4_roster(tmp_path, fakes):
+    with LiveScenario("g2g4", None, tmp_path / "ev", 1000, real_paths=fakes, roster="g2g4") as sc:
+        agents = httpx.get(f"{sc.base_url}/api/v1/agents").json()["items"]
+        assert {agent["name"] for agent in agents} == {
+            "live-manager", "live-writer", "live-analyst", "live-reviewer",
+        }
+        sc.set_verdict(True)
 
 
 def test_tampered_snapshot_refused(tmp_path, snapshot):

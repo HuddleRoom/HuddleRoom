@@ -199,17 +199,21 @@ class LiveScenario:
     hold_spec: {"codex": [ordinals...], "claude": [...]} for hold_nth, plus optional
     {"codex_match": [regex...], "claude_match": [...]}. Armed before the server starts.
     real_paths: {"codex": Path, "claude": Path} to override CLI resolution (tests pass fakes).
+    artifact_root redirects human-readable run evidence; it defaults to the run directory.
     """
 
     def __init__(self, name: str, snapshot_dir: Path | None, evidence_root: Path, budget: int,
                  hold_spec: dict | None = None, real_paths: dict | None = None, port: int = 0,
                  output_ceiling: int = 3000, campaign_ledger_path: Path | None = None,
-                 campaign_cap: int = 800_000):
+                 campaign_cap: int = 800_000, roster: str = "discovery",
+                 artifact_root: Path | None = None):
         self.name, self.snapshot_dir, self.evidence_root = name, snapshot_dir, Path(evidence_root)
         self.budget, self.hold_spec, self.real_paths = budget, hold_spec or {}, real_paths or {}
         self.port, self.output_ceiling = port, output_ceiling
         self.campaign_ledger_path = Path(campaign_ledger_path or self.evidence_root / "campaign-spend.jsonl")
         self.campaign_cap = campaign_cap
+        self.roster = roster
+        self._artifact_root = Path(artifact_root) if artifact_root is not None else None
         self.errors: list[str] = []
         self.findings: dict = {"scenario": name, "budget": budget}
         self.verdict: dict | None = None
@@ -225,7 +229,7 @@ class LiveScenario:
         return self.sup.base_url
 
     def mark(self, event: str) -> None:
-        with open(self.run_dir.root / "timeline.md", "a") as f:
+        with open(self.artifact_root / "timeline.md", "a") as f:
             f.write(f"- {_now()} {_scrub(event)}\n")
 
     def oracle_dump(self, label: str, **ids) -> Path:
@@ -254,6 +258,10 @@ class LiveScenario:
     def set_verdict(self, passed: bool, **notes) -> None:
         self.verdict = {"passed": bool(passed), **notes}
 
+    def _set_artifact_root(self) -> None:
+        self.artifact_root = (self._artifact_root or self.run_dir.root).resolve()
+        self.artifact_root.mkdir(parents=True, exist_ok=True)
+
     # -- lifecycle
     def __enter__(self) -> "LiveScenario":
         try:
@@ -266,9 +274,11 @@ class LiveScenario:
     def _start(self) -> None:
         if self.snapshot_dir is not None:
             self.run_dir = restore_snapshot(self.snapshot_dir, self.evidence_root, self.name)
+            self._set_artifact_root()
             self.ids = _latest_ids(self.run_dir.db)
         else:
             self.run_dir = rd = build_run_dir(self.evidence_root, self.name)
+            self._set_artifact_root()
             rd.workspace.rmdir()  # build_run_dir pre-creates it; init_workspace_repo wants to mkdir it
             init_workspace_repo(rd.workspace, rd)
         rd = self.run_dir
@@ -277,7 +287,7 @@ class LiveScenario:
             self.mark("restored snapshot has stale pids/sessions from snapshot time; product recovery may act "
                       "when the server starts (pre-start DB: snapshots/00-restored.db)")
         self.auth_before = auth_dir_watch.listing(_auth_roots())
-        auth_dir_watch.write_listing(rd.root / "auth-before.json", self.auth_before)
+        auth_dir_watch.write_listing(self.artifact_root / "auth-before.json", self.auth_before)
         self.ledger = Ledger(rd.spend, self.budget, {self.name: self.budget})
         self._reap()
         if "campaign_ledger" not in inspect.signature(make_shim).parameters:
@@ -290,7 +300,8 @@ class LiveScenario:
             real = self.real_paths.get(tool) or resolve_real(tool, rd.shim)
             h = self.shims[tool] = make_shim(rd.shim, tool, Path(real), ledger_path=rd.spend, scenario=self.name,
                                              global_cap=self.budget, scenario_cap=self.budget,
-                                             output_ceiling=self.output_ceiling, **extra)
+                                             output_ceiling=self.output_ceiling,
+                                             hold_each=bool(self.hold_spec.get(f"{tool}_each")), **extra)
             for n in self.hold_spec.get(tool, ()):
                 h.hold_nth(n)
             for rx in self.hold_spec.get(f"{tool}_match", ()):
@@ -300,7 +311,10 @@ class LiveScenario:
         self.sup.start()
         self.mark(f"server up at {self.sup.base_url}")
         if self.snapshot_dir is None:
-            self.ids = seed_minimal_roster(self.sup.base_url, rd)
+            self.ids = seed_minimal_roster(
+                self.sup.base_url, rd, roster=self.roster,
+                blank_definition_key=None if self.roster == "g2g4" else "dev1",
+            )
         self.oracle = oracle.Oracle(rd.db)
         oracle.snapshot(rd.db, rd.snapshots / "00-before.db")
         self.mark("snapshot 00-before")
@@ -370,7 +384,7 @@ class LiveScenario:
 
         def auth_after():
             after = auth_dir_watch.listing(_auth_roots())
-            auth_dir_watch.write_listing(rd.root / "auth-after.json", after)
+            auth_dir_watch.write_listing(self.artifact_root / "auth-after.json", after)
             cls = auth_dir_watch.classify(auth_dir_watch.diff(self.auth_before, after))
             self.findings["auth_diff"] = cls
             if cls["config_changed"]:
@@ -386,7 +400,8 @@ class LiveScenario:
             verdict["passed"] = False
         texts = {"findings.json": json.dumps({**self.findings, "errors": self.errors}, indent=2, default=str),
                  "verdict.json": json.dumps({**verdict, "errors": self.errors}, indent=2, default=str),
-                 "timeline.md": (rd.root / "timeline.md").read_text() if (rd.root / "timeline.md").exists() else ""}
+                 "timeline.md": (self.artifact_root / "timeline.md").read_text()
+                 if (self.artifact_root / "timeline.md").exists() else ""}
         leaks = {n: _leaks(t) for n, t in texts.items() if _leaks(t)}
         if leaks:
             self.errors.append(f"secret-looking content scrubbed: {leaks}")
@@ -394,4 +409,4 @@ class LiveScenario:
             texts["verdict.json"] = json.dumps({**verdict, "errors": self.errors}, indent=2, default=str)
             texts["findings.json"] = json.dumps({**self.findings, "errors": self.errors}, indent=2, default=str)
         for n, t in texts.items():
-            (rd.root / n).write_text(_scrub(t))
+            (self.artifact_root / n).write_text(_scrub(t))

@@ -14,6 +14,7 @@ Model calls:
 - run the real CLI with stdin forwarded byte-identical and stdout teed unchanged.
   stderr and --output-last-message files are left to the real CLI.
 - settle usage from the terminal usage record, or the estimate if absent.
+- best effort: per-call stdin/stdout copies are written to `<shim_dir>/calls/<tool>.<n>.stdin|.stdout`.
 
 Signals SIGTERM/SIGINT/SIGHUP are forwarded to the child, which is then reaped.
 A closed stdout pipe terminates the child and exits 141.
@@ -112,7 +113,10 @@ def _ordinal(cfg):
 def _matched_gates(cfg, ordinal, text):
     gates = Path(cfg["gates"])
     tool = cfg["tool"]
-    names = [n for n in (tool, "all", f"{tool}.nth.{ordinal}") if (gates / n).exists()]
+    if cfg.get("hold_each"):
+        # Private gate is armed atomically before this call can execute.
+        (gates / f"{tool}.each.{ordinal}").touch(exist_ok=True)
+    names = [n for n in (tool, "all", f"{tool}.nth.{ordinal}", f"{tool}.each.{ordinal}") if (gates / n).exists()]
     for f in sorted(gates.glob(f"{tool}.match.*")):
         try:
             pattern = f.read_text()
@@ -160,7 +164,7 @@ def _read_stdin(cfg, ordinal):
         buf += chunk
 
 
-def _feed(proc, prefix, rest_fd):
+def _feed(proc, prefix, rest_fd, fed):
     try:
         proc.stdin.write(prefix)
         proc.stdin.flush()
@@ -171,6 +175,7 @@ def _feed(proc, prefix, rest_fd):
                     break
                 proc.stdin.write(chunk)
                 proc.stdin.flush()
+                fed.append(chunk)
     except (OSError, ValueError):
         pass  # child exited or was stopped
     finally:
@@ -261,6 +266,17 @@ def _settle(cfg, targets, estimate, tool, ordinal, captured):
     _log(cfg, f"settled {tool} {int(time.time())} {os.getpid()} {ordinal} {source}")
 
 
+def _capture(cfg, ordinal, stdin_bytes, stdout_bytes):
+    try:
+        d = Path(cfg["log"]).parent / "calls"
+        d.mkdir(parents=True, exist_ok=True)
+        tool = cfg["tool"]
+        (d / f"{tool}.{ordinal}.stdin").write_bytes(stdin_bytes)
+        (d / f"{tool}.{ordinal}.stdout").write_bytes(stdout_bytes)
+    except OSError:
+        pass
+
+
 def _model_call(cfg, args):
     tool = cfg["tool"]
     if _denied(cfg):
@@ -279,8 +295,10 @@ def _model_call(cfg, args):
                 schema = ""
     text = " ".join(args) + "\n" + schema + "\n" + prefix[:MATCH_BYTES].decode("utf-8", "replace")
 
-    _log(cfg, f"start {tool} {int(time.time())} {os.getpid()} {ordinal} {' '.join(args)}")
     names = _matched_gates(cfg, ordinal, text)
+    # ``hold_each`` creates its private gate inside _matched_gates.  Log start only
+    # after that creation so a harness cannot observe and release a nonexistent gate.
+    _log(cfg, f"start {tool} {int(time.time())} {os.getpid()} {ordinal} {' '.join(args)}")
     _block(cfg, ordinal, names, time.time() + cfg["gate_timeout"])
     if _denied(cfg):
         _deny_exit(cfg, ordinal)
@@ -288,9 +306,8 @@ def _model_call(cfg, args):
     ledger_cfg = cfg.get("ledger")
     campaign_cfg = cfg.get("campaign")
     targets = []  # (ledger, scenario, rid) for every reservation actually held
-    if ledger_cfg or campaign_cfg:
-        prompt_bytes = len(prefix) + sum(len(a.encode()) for a in args)
-        estimate = math.ceil(prompt_bytes / 3) + cfg["output_ceiling"]
+    prompt_bytes = len(prefix) + sum(len(a.encode()) for a in args)
+    estimate = math.ceil(prompt_bytes / 3) + cfg["output_ceiling"]
     if campaign_cfg:
         cled = Ledger(campaign_cfg["path"], campaign_cfg["cap"])
         try:
@@ -331,7 +348,8 @@ def _model_call(cfg, args):
         _register(cfg, child=proc.pid)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-    writer = threading.Thread(target=_feed, args=(proc, prefix, rest_fd), daemon=True)
+    fed = []
+    writer = threading.Thread(target=_feed, args=(proc, prefix, rest_fd, fed), daemon=True)
     writer.start()
 
     captured = []
@@ -352,6 +370,7 @@ def _model_call(cfg, args):
         _stop_child(proc.pid, signal.SIGTERM, TERM_WAIT)
         if targets:
             _settle(cfg, targets, estimate, tool, ordinal, captured)
+        _capture(cfg, ordinal, prefix + b"".join(fed), b"".join(captured))
         _log(cfg, f"broken_pipe {tool} {int(time.time())} {os.getpid()} {ordinal}")
         _exit(BROKEN_PIPE_EXIT)
 
@@ -360,6 +379,7 @@ def _model_call(cfg, args):
     rc = proc.wait()
     if targets:
         _settle(cfg, targets, estimate, tool, ordinal, captured)
+    _capture(cfg, ordinal, prefix + b"".join(fed), b"".join(captured))
     return rc
 
 
