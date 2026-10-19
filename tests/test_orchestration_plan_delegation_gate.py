@@ -279,6 +279,32 @@ async def test_execute_request_plan_action_creates_planning_task_and_gate(db_ses
 
 
 @pytest.mark.asyncio
+async def test_execute_request_plan_action_passes_accepted_team_to_task_description(db_session, test_project, monkeypatch):
+    from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+    sentinel = "Accepted team (use only these agents):\n- sentinel-agent"
+
+    async def fake_team_prompt(self, db, goal, run):
+        return sentinel
+
+    monkeypatch.setattr(PlanOwnershipService, "team_prompt", fake_team_prompt)
+    planner = _agent("planner")
+    db_session.add(planner)
+    await db_session.flush()
+    service, goal, run = await _make_run(db_session, test_project.id)
+    await _bind_team(db_session, goal, planner)
+
+    action = await service.execute_request_plan_action(
+        db_session,
+        run_id=run.id,
+        request=_plan_request(planner.id),
+        idempotency_key="run:accepted-team:kind:request_plan",
+    )
+
+    task = await db_session.get(Task, action.id)
+    assert sentinel in task.description
+
+
 async def test_execute_request_plan_action_rejects_non_planning_work_function_before_reserving(
     db_session,
     test_project,

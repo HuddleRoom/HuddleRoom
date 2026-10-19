@@ -2597,12 +2597,15 @@ class OrchestrationService:
             contract = self._planning_contract(
                 goal, run, action, stored_request, pre_plan_lines=await self._pre_plan_lines(db, run, pre_plan_tasks)
             )
+            from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+            accepted_team = await PlanOwnershipService().team_prompt(db, goal, run)
             task = await TaskService().create(
                 db,
                 project_id,
                 TaskCreate(
                     title=self._delegation_task_title(contract.work_function, contract.deliverable),
-                    description=self._delegation_task_description(goal, contract),
+                    description=self._delegation_task_description(goal, contract, accepted_team=accepted_team),
                     assigned_to=agent.id,
                     metadata={
                         "orchestration": {
@@ -2872,10 +2875,16 @@ class OrchestrationService:
         )
         task = await self._find_task_for_action(db, project_id, action, run_id=run_id, work_function=PLAN_WORK_FUNCTION)
         if task is None:
+            from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
             planning_version = int(state.get("planning_version") or 0) + 1
             released = list((await db.scalars(select(OrchestrationRoadmapItem).where(
                 OrchestrationRoadmapItem.goal_id == goal.id
             ))).all())
+            description = "Produce a replacement plan for unstarted Roadmap work."
+            team = await PlanOwnershipService().team_prompt(db, goal, run)
+            if team:
+                description = description + "\n\n" + team
             contract = self._planning_contract(goal, run, action, {**stored, "work_function": PLAN_WORK_FUNCTION})
             contract = contract.model_copy(update={
                 "inputs": [*contract.inputs, *extra_inputs, f"Current immutable Roadmap version: {json.dumps(version.snapshot, sort_keys=True)}",
@@ -2886,7 +2895,7 @@ class OrchestrationService:
             })
             task = await TaskService().create(
                 db, project_id,
-                TaskCreate(title="Planning: Roadmap replan", description="Produce a replacement plan for unstarted Roadmap work.",
+                TaskCreate(title="Planning: Roadmap replan", description=description,
                     assigned_to=agent.id, metadata={
                         "orchestration": {"goal_id": str(goal.id), "run_id": str(run.id), "action_id": str(action.id), "work_function": PLAN_WORK_FUNCTION},
                         "orchestration_plan": {
@@ -7817,7 +7826,9 @@ class OrchestrationService:
         return item
 
     @staticmethod
-    def _delegation_task_description(goal: OrchestrationGoal, contract: OrchestrationDelegationContract) -> str:
+    def _delegation_task_description(
+        goal: OrchestrationGoal, contract: OrchestrationDelegationContract, accepted_team: str = ""
+    ) -> str:
         from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 
         sections = [
@@ -7855,6 +7866,8 @@ class OrchestrationService:
         kind = expected_result_kind({"expected_result": contract.expected_result, "report_schema": report_schema}, False)
         schema = OrchestrationService._result_schema(goal, kind, report_schema)
         if kind == PLANNING_ENVELOPE:
+            if accepted_team:
+                sections.append(accepted_team)
             rules = [
                 "Planning rules:",
                 "Adoption: use only a supplied existing task ID from the same run, in one item only, with a "

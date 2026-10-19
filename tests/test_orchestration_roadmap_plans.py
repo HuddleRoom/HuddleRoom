@@ -1681,6 +1681,24 @@ async def test_replan_request_replay_creates_one_planning_task(db_session, test_
     assert await db_session.scalar(select(func.count()).select_from(Task).where(Task.id == first.target_id)) == 1
 
 
+async def test_replan_task_description_includes_accepted_team(db_session, test_project, test_user, monkeypatch):
+    from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService
+
+    sentinel = "Accepted team (use only these agents):\n- sentinel-agent"
+
+    async def fake_team_prompt(self, db, goal, run):
+        return sentinel
+
+    monkeypatch.setattr(PlanOwnershipService, "team_prompt", fake_team_prompt)
+    service, goal, run, artifact = await _accept_version_one(
+        db_session, test_project, test_user, items=[_roadmap_task("a")],
+    )
+    replan = await _request_replan(db_session, service, goal, run, artifact)
+    task = await db_session.get(Task, replan.target_id)
+    assert "Produce a replacement plan for unstarted Roadmap work." in task.description
+    assert task.description.endswith("\n\n" + sentinel)
+
+
 async def test_replan_task_budget_lineage_ignores_task_metadata(db_session, test_project, test_user):
     service, goal, run, artifact = await _accept_version_one(
         db_session, test_project, test_user, items=[_roadmap_task("a")],

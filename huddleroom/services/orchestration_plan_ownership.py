@@ -35,6 +35,9 @@ class PlanOwnershipService:
                 team = None
                 break
             root = await db.get(OrchestrationGoal, root.parent_goal_id)
+            if root is None:  # dangling parent_goal_id: no accepted team reachable
+                team = None
+                break
         if hierarchy is None or hierarchy.status != "completed" or not isinstance(team, dict):
             return {"agents": [], "functions": {}, "coverage": [], "conflicts": ["current accepted team hierarchy is missing"]}
         outputs = hierarchy.outputs if isinstance(hierarchy.outputs, dict) else {}
@@ -77,6 +80,29 @@ class PlanOwnershipService:
             "hierarchy_process_id": str(hierarchy.id),
             "conflicts": conflicts,
         }
+
+    async def team_prompt(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> str:
+        inventory = await self.planning_inventory(db, goal, run)
+        if inventory["conflicts"] or not inventory["functions"]:
+            return ""
+        names = {agent["id"]: agent["name"] for agent in inventory["agents"]}
+        functions = inventory["functions"]
+        lines = ["Accepted team (use only these agents):"]
+        lines += [f"- {function}: {names.get(agent_id, agent_id)} ({agent_id})" for function, agent_id in sorted(functions.items())]
+        lines.append(f"Allowed work_function values: {', '.join(sorted(functions))}")
+        gap_ids = [str(row.get("responsibility_id")) for row in inventory["coverage"] if row.get("status") == "gap"]
+        if gap_ids:
+            lines.append(
+                "Documented gaps (accepted with no owner; do not create plan items for them and never invent an agent; "
+                "mention them in the summary): " + ", ".join(gap_ids)
+            )
+        lines.append(
+            "Each task item's work_function must be one of the allowed values and agent_id must be that function's "
+            "accepted agent id (or null to let HuddleRoom pick it). Set owner_type explicitly to agent for every task item. "
+            "Do not use labels such as documentation or research. "
+            "Ignore work_function values shown in examples; use only the allowed values above."
+        )
+        return "\n".join(lines)
 
     async def validate_plan_owners(
         self,

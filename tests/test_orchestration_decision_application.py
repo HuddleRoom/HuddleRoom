@@ -245,6 +245,24 @@ async def test_designated_agent_authority_cannot_be_answered_by_human(
     assert error.value.status_code == 409 and decision.status == "pending"
 
 
+async def test_manager_authority_decision_rejects_human_http_answer(
+    db_session, client, auth_headers, test_project, conversation_goal_run, test_agent
+):
+    goal, _ = conversation_goal_run
+    decision = await OrchestrationAuthorityDecisionService().create_pending(
+        db_session, goal.id, decision_key="manager-http-test", title="Choose", question="Continue?",
+        options=["approve"], authority="manager", authority_agent_id=test_agent.id,
+    )
+    await db_session.commit()
+    response = await client.post(
+        f"/api/v1/projects/{test_project.id}/orchestration/goals/{goal.id}/decisions/{decision.id}/answer",
+        headers=auth_headers, json={"selected_option": "approve", "reason": "human answer"},
+    )
+    assert 400 <= response.status_code < 500, response.text
+    await db_session.refresh(decision)
+    assert decision.status == "pending"
+
+
 async def test_runtime_version_and_duplicate_protections(db_session, test_project, test_user):
     _, goal, run, decision = await _runtime_decision(db_session, test_project)
     with pytest.raises(HTTPException) as error:

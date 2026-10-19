@@ -175,13 +175,31 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
     service = OrchestrationService()
     raw_items = normalized["plan_items"]
     try:
-        # Validated before disposition: an invalid adoption never counts as disposing of pre-plan work.
-        await service._validate_plan_adoptions(db, run, (
+        parsed = (
             parse_roadmap_items(raw_items, set(parent_caps(goal))) if kind == "roadmap"
             else service._plan_items_from_raw(raw_items)
-        ))
+        )
+        # Validated before disposition: an invalid adoption never counts as disposing of pre-plan work.
+        await service._validate_plan_adoptions(db, run, parsed)
     except HTTPException as exc:
         raise PlanIngestionError(str(exc.detail)) from exc
+    from huddleroom.services.orchestration_plan_ownership import PlanOwnershipService  # circular at import time
+    inventory = await PlanOwnershipService().planning_inventory(db, goal, run)
+    if not inventory["conflicts"] and inventory["functions"]:
+        # ponytail: function/agent membership only; coverage/gap checks stay at acceptance
+        functions = inventory["functions"]
+        errors = []
+        for item in parsed:
+            item_key = getattr(item, "item_key", None) or item.id
+            if getattr(item, "unit_type", "task") == "goal" or item.owner_type == "human" or item.adopt_task_id is not None:
+                continue
+            if item.work_function not in functions:
+                errors.append(f"item '{item_key}': work_function '{item.work_function}' is not in the accepted set "
+                              f"[{', '.join(sorted(functions))}]")
+            elif item.agent_id is not None and str(item.agent_id) != functions[item.work_function]:
+                errors.append(f"item '{item_key}': agent_id is outside the accepted team for '{item.work_function}'")
+        if errors:
+            raise PlanIngestionError("; ".join(errors[:3]), diagnostics=errors)
     required = [uuid.UUID(str(i)) for i in plan_meta.get("pre_plan_task_ids") or []]
     live = (
         await db.execute(select(Task.id).where(Task.id.in_(required), Task.status != "cancelled"))

@@ -7,6 +7,7 @@ import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from huddleroom.models.agent import Agent
 from huddleroom.models.artifact import Artifact
 from huddleroom.models.session import Session
 from huddleroom.models.task import Task
@@ -547,3 +548,81 @@ async def budget_session(db_session, test_project, test_user, test_engine):
     async with AsyncSession(test_engine, expire_on_commit=False) as independent:
         yield independent
         await independent.rollback()
+
+
+async def _accepted_team(db_session, goal, agent):
+    from tests.conftest import bind_plan_author_team
+
+    await bind_plan_author_team(db_session, goal, agent, role_agents={"implementation": agent})
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_work_function_outside_accepted_team(db_session, test_project):
+    service, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    version = run.plan_state["planning_version"]
+    output = json.dumps(_env(items=[_item(work_function="documentation", success_criterion_keys=["plan"])]))
+
+    with pytest.raises(PlanIngestionError) as exc:
+        await ingest(db_session, goal, run, task, session.id, version, output)
+
+    assert exc.value.correctable and not exc.value.stale
+    [diagnostic] = exc.value.diagnostics
+    assert "documentation" in diagnostic and "[implementation]" in diagnostic
+    assert await _plan_artifacts(db_session, task.id) == 0
+    assert await ingest(db_session, goal, run, task, session.id, version, _db_output()) is not None
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_foreign_agent_for_accepted_function(db_session, test_project):
+    from tests.test_orchestration_plan_delegation_gate import _agent
+
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    foreign = _agent("intruder")
+    db_session.add(foreign)
+    await db_session.flush()
+    output = json.dumps(_env(items=[_item(agent_id=str(foreign.id), success_criterion_keys=["plan"])]))
+
+    with pytest.raises(PlanIngestionError) as exc:
+        await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert exc.value.correctable
+    assert exc.value.diagnostics == ["item 'a': agent_id is outside the accepted team for 'implementation'"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_skips_human_and_goal_items_in_team_check(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    human = _item(id="consent", owner_type="human", work_function=None, success_criterion_keys=["plan"])
+    output = json.dumps(_env(items=[human, _item(success_criterion_keys=["plan"])]))
+
+    artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert artifact.metadata_["plan_items"][0]["owner_type"] == "human"
+
+
+@pytest.mark.asyncio
+async def test_ingest_skips_goal_items_in_team_check(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(
+        db_session, test_project.id, roadmap_budget={"caps": {"max_tokens": "1000"}},
+    )
+    await _accepted_team(db_session, goal, await db_session.get(Agent, task.assigned_to))
+    child = {"item_key": "child", "unit_type": "goal", "title": "Child", "objective": "Deliver child",
+             "success_criteria": [{"key": "done"}], "allocation": {"max_tokens": 1}, "why_runnable": "ready"}
+
+    artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"],
+                            json.dumps(_env("roadmap", [child])))
+
+    assert artifact.metadata_["plan_items"][0]["item_key"] == "child"
+
+
+@pytest.mark.asyncio
+async def test_ingest_without_accepted_team_skips_membership_check(db_session, test_project):
+    _, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    output = json.dumps(_env(items=[_item(work_function="documentation", success_criterion_keys=["plan"])]))
+
+    artifact = await ingest(db_session, goal, run, task, session.id, run.plan_state["planning_version"], output)
+
+    assert artifact.metadata_["plan_items"][0]["work_function"] == "documentation"

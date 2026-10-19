@@ -210,3 +210,17 @@ def test_unstamped_planning_contract_without_plan_kind_renders_work_report_promp
         _goal(), _contract(work_function="planning", report_schema={"artifact_id": "uuid"}))
     assert "Planning rules:" not in text
     assert '"criterion_progress"' in text and "Use only IDs given in this task" in text
+
+
+def test_planning_envelope_renders_accepted_team_before_planning_rules():
+    team = "Accepted team (use only these agents):\n- x"
+    contract = _contract(work_function="planning", report_schema={}, expected_result="planning_envelope")
+    text = OrchestrationService._delegation_task_description(_goal(), contract, accepted_team=team)
+    assert team in text
+    assert text.index(team) < text.index("Planning rules:")
+
+
+def test_accepted_team_kw_default_is_byte_identical_to_empty_string():
+    contract = _contract(work_function="planning", report_schema={}, expected_result="planning_envelope")
+    baseline = OrchestrationService._delegation_task_description(_goal(), contract)
+    assert OrchestrationService._delegation_task_description(_goal(), contract, accepted_team="") == baseline

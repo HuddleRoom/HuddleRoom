@@ -548,6 +548,27 @@ async def test_planning_envelope_failure_dispatches_correction_with_its_own_sche
     assert other is None and len(await _corrections(db_session, task)) == 1
 
 
+@pytest.mark.asyncio
+async def test_plan_work_function_outside_accepted_team_dispatches_correction_not_revision(db_session, test_project):
+    from tests.conftest import bind_plan_author_team
+    from tests.test_orchestration_plan_ingestion import _completed, _env, _finish, _item, _planning_run
+
+    service, goal, run, task, session = await _planning_run(db_session, test_project.id)
+    await bind_plan_author_team(db_session, goal, await db_session.get(Agent, task.assigned_to),
+                                role_agents={"implementation": await db_session.get(Agent, task.assigned_to)})
+    output = json.dumps(_env(items=[_item(work_function="documentation", success_criterion_keys=["plan"])]))
+    await _finish(db_session, task, session, output)
+
+    await service._ingest_session_evidence(db_session, run, _completed(session.id))
+
+    assert run.plan_state.get("status") != "revision_required"
+    marker = await service._existing_action_for_key(db_session, run.id, f"run:{run.id}:kind:report_consumed:task:{task.id}")
+    assert "documentation" in marker.request["plan_ingestion_error"]
+    [correction] = await _corrections(db_session, task)
+    assert correction.metadata_["orchestration_contract"]["expected_result"] == "planning_envelope"
+    assert "documentation" in correction.description
+
+
 @pytest.mark.usefixtures("safe_goal_analysis", "safe_agent_definition_review", "safe_effectiveness_review_continue")
 async def test_final_summary_failure_dispatches_correction_with_summary_schema(db_session, test_project):
     from tests.test_orchestration_final_summary_request import _request_summary
