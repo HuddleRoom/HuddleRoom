@@ -20,7 +20,7 @@ test('agent activity panel is always visible at 1280px+, even with zero calls', 
   const callsTab = page.getByRole('tab', { name: 'Calls' })
   await expect(callsTab).toBeVisible()
   await callsTab.click()
-  await expect(page.getByText('No activity yet.')).toBeVisible()
+  await expect(page.getByText('No live calls captured in this view.')).toBeVisible()
 })
 
 

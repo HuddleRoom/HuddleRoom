@@ -473,8 +473,8 @@ describe('OrchestrationPage', () => {
     // Each action surfaces its linked decision, not just time proximity.
     expect(markup).toContain('Caused by decision')
     expect(markup).toContain('#decision-decision-1')
-    // The goal title now lives in RoomPanel's <h2>, not a standalone header <h1>.
-    expect(markup).toMatch(/<h2 id="room-panel-title" class="[^"]*">Ship an evidence-backed release/)
+    // The goal title is the single visible header <h1>; RoomPanel omits it.
+    expect(markup).toMatch(/<h1 class="[^"]*">Ship an evidence-backed release/)
     // Raw key/type are tucked into a title attribute once a human description leads.
     expect(markup).toContain('Release is independently validated.')
     expect(markup).toMatch(/title="release-ready[^"]*"/)
@@ -712,6 +712,135 @@ describe('OrchestrationPage', () => {
     expect(markup).not.toContain('Pause goal')
   })
 
+  const g6Supervision = (workflow: unknown) => ({
+    condition: 'unknown', operation: 'Unknown', next_action: 'No action', rationale: 'Unknown', criterion: null, verified_progress: [], useful_learning: [],
+    accepted_evidence: [], workers: [], waits: [], recovery_history: [], pending_direction: null, budget: {}, transition: null,
+    status_line: { current_state: { kind: 'unknown', summary: 'No active worker confirmed.', activities: [] }, attention_summary: null, last_material_event: null, workflow },
+  }) as unknown as typeof richDetail.supervision
+  const g6Workflow = (guidance: object, pending: string | null = null) => ({
+    run_id: 'run-1', control_version: 1, phase: 'baseline', phase_label: 'Baseline', process: null, process_type: null, process_status: null, task: null,
+    operation_summary: 'Baseline step running.', occurred_at: '2026-10-14T12:00:00Z', pending_decision_id: pending, additional_pending_count: 0,
+    application: null, additional_application_count: 0, guidance,
+  })
+
+  it('g6 compact controls precede the room panel and the objective has exactly one heading', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = { ...richDetail, supervision: g6Supervision(g6Workflow({ kind: 'none', label: 'Nothing to do', decision_id: null, reason: null })) }
+
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const markup = renderToStaticMarkup(<OrchestrationPage />)
+
+    const header = markup.indexOf('data-testid="orchestration-goal-header"')
+    const bar = markup.indexOf('data-testid="orchestration-sticky-bar"')
+    const room = markup.indexOf('aria-label="Delegated work"')
+    expect(header).toBeGreaterThan(-1)
+    expect(header).toBeLessThan(bar)
+    expect(bar).toBeLessThan(markup.indexOf('Cancel goal'))
+    expect(markup.indexOf('Cancel goal')).toBeLessThan(room)
+    expect(room).toBeLessThan(markup.indexOf('Current operation'))
+    expect(markup).not.toContain('id="room-panel-title"')
+    expect(markup.match(/<h1[ >]/g) ?? []).toHaveLength(1)
+    expect(markup).toContain('Goal: Blocked')
+    expect(markup).not.toMatch(/>Next:/)
+    expect(markup).not.toContain('Show full objective')
+  })
+
+  it('g6 shows the Next cue only for actionable guidance and hides it when the status refresh failed', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const bar = (html: string) => html.slice(html.indexOf('data-testid="orchestration-sticky-bar"'), html.indexOf('Cancel goal'))
+    state.detail = { ...richDetail, supervision: g6Supervision(g6Workflow({ kind: 'resume', label: 'Resume goal', decision_id: null, reason: null })) }
+    expect(bar(renderToStaticMarkup(<OrchestrationPage />))).toMatch(/title="Resume goal"[^>]*>Next: Resume goal/)
+    state.detailError = true
+    expect(bar(renderToStaticMarkup(<OrchestrationPage />))).not.toMatch(/>Next:/)
+  })
+
+  it.each(['completed', 'cancelled'] as const)('g6 terminal %s goal renders no Next cue in the sticky bar', async (status) => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = { ...richDetail, goal: { ...richDetail.goal, status }, supervision: g6Supervision(g6Workflow({ kind: 'resume', label: 'Resume goal', decision_id: null, reason: null })) }
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const html = renderToStaticMarkup(<OrchestrationPage />)
+    const bar = html.slice(html.indexOf('data-testid="orchestration-sticky-bar"'), html.indexOf('aria-label="Delegated work"'))
+    expect(bar).not.toMatch(/>Next:/)
+  })
+
+  it('g6 objective disclosure threshold is 50 characters', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    state.detail = { ...richDetail, goal: { ...richDetail.goal, objective: 'a'.repeat(70) } }
+    const long = renderToStaticMarkup(<OrchestrationPage />)
+    expect(long).toContain('group-open:hidden">Show full objective')
+    expect(long).toContain('group-open:inline">Hide full objective')
+    state.detail = { ...richDetail, goal: { ...richDetail.goal, objective: 'a'.repeat(40) } }
+    expect(renderToStaticMarkup(<OrchestrationPage />)).not.toContain('Show full objective')
+  })
+
+  it('g6 pause feedback renders inside the sticky wrapper (not the header) and focus lands on a live control', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = richDetail
+    state.pauseControl.mockImplementation((_p: string, _g: string, input: { runId: string; expectedControlVersion: number; requestId: string }) => Promise.resolve(spr230PauseReceipt(input)))
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      const confirm = getButton(view.container, 'Confirm pause')
+      confirm.focus()
+      await React.act(async () => confirm.click())
+      const nodes = descendants(view.container)
+      const wrap = nodes.find((n) => n.getAttribute('data-testid') === 'orchestration-sticky-bar')!
+      const header = nodes.find((n) => n.getAttribute('data-testid') === 'orchestration-goal-header')!
+      expect(wrap.textContent).toContain('Pause accepted')
+      expect(header.textContent).not.toContain('Pause accepted')
+      const active = view.document.activeElement
+      expect(active === wrap || active === getButton(view.container, 'Pause goal')).toBe(true)
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('g6 long multi-paragraph objective keeps the full text in a disclosure and renders controls once', async () => {
+    const objective = `First paragraph. ${'x'.repeat(200)}\n\nSecond paragraph tail-marker.`
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = { ...richDetail, goal: { ...richDetail.goal, objective } }
+
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
+    try {
+      expect(textOf(view.container)).toContain('Show full objective')
+      expect(textOf(view.container)).toContain('Second paragraph tail-marker.')
+      expect(descendants(view.container).filter((n) => n.textContent === 'Pause goal')).toHaveLength(1)
+      await React.act(async () => getButton(view.container, 'Pause goal').click())
+      await React.act(async () => getButton(view.container, 'Confirm pause').click())
+      expect(state.pauseControl).toHaveBeenCalledOnce()
+    } finally {
+      view.cleanup()
+    }
+  })
+
+  it('g6 paused goal shows Resume in the sticky bar and a pending decision keeps the Needs You pointer', async () => {
+    state.activeProjectId = 'project-1'
+    state.goalId = 'goal-1'
+    state.detail = {
+      ...richDetail,
+      goal: { ...richDetail.goal, status: 'paused' },
+      run: { ...richDetail.run!, status: 'paused' },
+      supervision: g6Supervision(g6Workflow({ kind: 'review_decision', label: 'Answer in Needs You', decision_id: 'd1', reason: null }, 'd1')),
+    }
+
+    const { OrchestrationPage } = await import('./OrchestrationPage')
+    const markup = renderToStaticMarkup(<OrchestrationPage />)
+    const bar = markup.slice(markup.indexOf('data-testid="orchestration-sticky-bar"'), markup.indexOf('Cancel goal'))
+
+    expect(bar).toContain('Resume goal')
+    expect(markup).toContain('Answer in Needs You')
+  })
+
   it('only offers Start work to ready goals of any type that are active or blocked', async () => {
     state.activeProjectId = 'project-1'
     state.goalId = 'goal-1'
@@ -907,8 +1036,8 @@ describe('OrchestrationPage', () => {
     const markup = renderToStaticMarkup(<OrchestrationPage />)
 
     expect(markup).toContain('text-huddleroom-status-amber')
-    expect(markup).toContain('· not updating')
-    expect((markup.match(/Status refreshed/g) ?? [])).toHaveLength(1)
+    expect(markup).toContain('refresh failed; this status may be out of date')
+    expect((markup.match(/Status (last |not yet )?refreshed/g) ?? [])).toHaveLength(1)
     expect(markup).not.toContain('· refreshing…')
   })
 
@@ -957,7 +1086,7 @@ describe('OrchestrationPage', () => {
 
         expect(textOf(view.container)).toContain('Pause goal? Running agents finish their current step, then stop.')
         expect(() => getButton(view.container, 'Confirm pause')).not.toThrow()
-        expect(() => getButton(view.container, 'Cancel')).not.toThrow()
+        expect(() => getButton(view.container, 'Keep running')).not.toThrow()
         expect(state.commandMutation.mutate).not.toHaveBeenCalled()
       } finally {
         view.cleanup()
@@ -994,8 +1123,9 @@ describe('OrchestrationPage', () => {
       const view = await mountWithTestDom(() => <OrchestrationPage />, React.act)
       try {
         await React.act(async () => getButton(view.container, 'Pause goal').click())
-        await React.act(async () => getButton(view.container, 'Cancel').click())
+        await React.act(async () => getButton(view.container, 'Keep running').click())
 
+        expect(view.document.activeElement === getButton(view.container, 'Pause goal')).toBe(true)
         expect(textOf(view.container)).not.toContain('Running agents finish their current step, then stop.')
         expect(() => getButton(view.container, 'Pause goal')).not.toThrow()
         expect(state.commandMutation.mutate).not.toHaveBeenCalled()
@@ -1036,7 +1166,7 @@ describe('OrchestrationPage', () => {
       const withoutDebug = renderToStaticMarkup(<OrchestrationPage />)
       expect(withoutDebug).toContain('Current operation')
       expect(withoutDebug).not.toContain('Recovery linkage')
-      expect((withoutDebug.match(/Status refreshed/g) ?? [])).toHaveLength(1)
+      expect((withoutDebug.match(/Status (last |not yet )?refreshed/g) ?? [])).toHaveLength(1)
 
       state.healthDebugEnabled = true
       const withDebug = renderToStaticMarkup(<OrchestrationPage />)
@@ -1555,7 +1685,7 @@ describe('authoritative baseline run replacement', () => {
 
 
 describe('SPR188 query freshness integration', () => {
-  it.each([{ fetching: true, error: false, cue: 'refreshing' }, { fetching: false, error: true, cue: 'not updating' }, { fetching: false, error: false, cue: 'Status refreshed' }])('uses one last-success cue for $cue', async ({ fetching, error, cue }) => {
+  it.each([{ fetching: true, error: false, cue: 'refreshing' }, { fetching: false, error: true, cue: 'refresh failed' }, { fetching: false, error: false, cue: 'Status refreshed' }])('uses one last-success cue for $cue', async ({ fetching, error, cue }) => {
     state.activeProjectId = 'project-1'; state.goalId = 'goal-1'
     state.dataUpdatedAt = Date.parse('2026-10-14T12:00:00Z')
     state.detailFetching = fetching; state.detailError = error
@@ -1568,7 +1698,7 @@ describe('SPR188 query freshness integration', () => {
     const html = renderToStaticMarkup(<OrchestrationPage />)
     expect(html).toContain('No active worker confirmed.')
     expect(html).toContain(cue)
-    expect((html.match(/Status refreshed/g) ?? [])).toHaveLength(1)
+    expect((html.match(/Status (last |not yet )?refreshed/g) ?? [])).toHaveLength(1)
   })
   it('keeps initial failure in the existing error state without fabricated status', async () => {
     state.activeProjectId = 'project-1'; state.goalId = 'goal-1'; state.detail = undefined; state.detailError = true

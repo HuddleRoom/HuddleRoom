@@ -476,7 +476,14 @@ export function AgentActivityPanel({ projectId }: AgentActivityPanelProps) {
         >
           <div>
             {displayedCalls.length === 0 && (
-              <p className="text-[13px] text-huddleroom-text-muted" style={{ margin: 0 }}>No activity yet.</p>
+              <>
+                <p className="text-[13px] text-huddleroom-text-muted" style={{ margin: 0 }}>No live calls captured in this view.</p>
+                <p className="text-[13px] text-huddleroom-text-muted" style={{ margin: '4px 0 0' }}>
+                  {wsState.connected
+                    ? 'Calls appear here live while this page is open; earlier calls and calls from before a reload are not shown.'
+                    : 'Live call capture is unavailable while disconnected; calls made during that time will not appear.'}
+                </p>
+              </>
             )}
             {displayedCalls.map((call) => (
               <CallBlock key={call.callId} call={call} onVisibleContent={onVisibleContent} />

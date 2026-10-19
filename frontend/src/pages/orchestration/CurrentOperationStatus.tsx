@@ -153,6 +153,6 @@ export function CurrentOperationStatus({ statusLine, pendingDirection = null, co
       </p>}
       <p>Last update: {event ? <>{event.summary}{' '}{event.subject && <>Source: <Reference reference={event.subject} activeProjectId={activeProjectId} onRevealSource={onRevealSource} />{' · '}</>}<Time value={event.occurred_at} /></> : 'No recorded update yet'}</p>
     </div>
-    <p className="mt-2 text-xs text-huddleroom-text-muted">Status refreshed {freshness ? <Time value={dataUpdatedAt} /> : 'Unknown'}{isError ? ' · not updating' : isFetching ? ' · refreshing…' : ''}</p>
+    <p className="mt-2 text-xs text-huddleroom-text-muted">{freshness ? <>{isError ? 'Status last refreshed' : 'Status refreshed'} <Time value={dataUpdatedAt} /></> : 'Status not yet refreshed'}{isError ? ' · refresh failed; this status may be out of date' : isFetching ? ' · refreshing…' : ''}</p>
   </section>
 }

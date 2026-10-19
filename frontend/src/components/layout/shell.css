@@ -97,7 +97,7 @@
   .huddleroom-logout-label { display: none; }
 }
 
-/* Agent Activity Panel: persistent rail at 1280px+, always visible (idle shows "No activity yet.") */
+/* Agent Activity Panel: persistent rail at 1280px+, always visible (idle shows "No live calls captured in this view.") */
 @media (min-width: 1280px) {
   .agent-activity-panel-container {
     display: flex;

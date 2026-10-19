@@ -19,7 +19,7 @@ function workflow(over: Partial<OrchestrationWorkflowFacts> = {}): Orchestration
 interface Scenario {
   goalStatus: string; runStatus: string; authorized: boolean; condition: OrchestrationSupervisionCondition
   workflow: OrchestrationWorkflowFacts | null; currentState?: OrchestrationStatusLine['current_state']
-  supervision?: Partial<OrchestrationSupervision>; processStatus?: 'running' | 'waiting_decision' | 'completed'
+  supervision?: Partial<OrchestrationSupervision>; processStatus?: 'running' | 'waiting_decision' | 'completed'; objective?: string
 }
 
 function build(s: Scenario) {
@@ -30,6 +30,7 @@ function build(s: Scenario) {
   }
   return {
     ...base,
+    ...(s.objective ? { goal: { ...base.goal, objective: s.objective } } : {}),
     run: { ...base.run, phase: 'baseline', condition: s.condition, baseline_authorized: s.authorized, control_version: 1, active_blockers: [] },
     supervision: { ...supervisionFor(s.condition), workers: [], status_line, ...s.supervision },
   }
@@ -82,7 +83,7 @@ async function answerInNeedsYou(page: Page) {
 }
 const noActions = /^(Start baseline|Continue baseline|Authorize|Start work)/
 
-for (const vp of [{ name: '1440x900', width: 1440, height: 900 }, { name: '390x844', width: 390, height: 844 }]) {
+for (const vp of [{ name: '1440x900', width: 1440, height: 900 }, { name: '390x844', width: 390, height: 844 }, { name: '375x812', width: 375, height: 812 }]) {
   test.describe(`G5 ${vp.name}`, () => {
     test.use({ viewport: { width: vp.width, height: vp.height } })
 
@@ -224,6 +225,106 @@ for (const vp of [{ name: '1440x900', width: 1440, height: 900 }, { name: '390x8
       const shot = await open(page, 'h-long-names', vp.name)
       await expect(page.getByText('Live connection', { exact: true }).first()).toBeVisible()
       await shot(); h.assertMutations()
+    })
+  })
+}
+
+// ---- G6 compact controls (SPR235) ----
+const LONG = Array.from({ length: 3 }, (_, i) => `Paragraph ${i + 1}: ` + 'ship the evidence-backed release with full validation across every environment. '.repeat(2).trim()).join('\n\n')
+const g6 = (name: string) => path.resolve(process.cwd(), `test-results/g6/g6-${name}.png`)
+const bar = (page: Page) => page.getByTestId('orchestration-sticky-bar')
+
+const inViewport = async (page: Page, loc: ReturnType<Page['locator']>) => {
+  const b = (await loc.boundingBox())!
+  const vp = page.viewportSize()!
+  expect(b, 'has box').toBeTruthy()
+  expect(b.y).toBeGreaterThanOrEqual(0); expect(b.x).toBeGreaterThanOrEqual(0)
+  expect(b.y + b.height).toBeLessThanOrEqual(vp.height); expect(b.x + b.width).toBeLessThanOrEqual(vp.width)
+}
+const noHScroll = (page: Page) => page.evaluate(() => {
+  const e = document.scrollingElement!
+  const sc = document.querySelector('[data-testid="orchestration-sticky-bar"]')
+  let n = sc?.parentElement ?? null; let ok = e.scrollWidth <= e.clientWidth
+  while (n) { if (n.scrollWidth > n.clientWidth + 1 && getComputedStyle(n).overflowX !== 'visible') ok = false; n = n.parentElement }
+  return ok
+})
+const scrollAllToBottom = (page: Page) => page.evaluate(() => {
+  let n: Element | null = document.querySelector('[data-testid="orchestration-sticky-bar"]')
+  while (n) { n.scrollTop = n.scrollHeight; n = n.parentElement }
+  window.scrollTo(0, document.body.scrollHeight)
+})
+
+for (const vp of [{ name: '1440x900', width: 1440, height: 900 }, { name: '375x812', width: 375, height: 812 }]) {
+  test.describe(`G6 compact controls (SPR235) ${vp.name}`, () => {
+    test.use({ viewport: { width: vp.width, height: vp.height } })
+    const desktop = vp.width >= 768
+
+    async function common(page: Page, shot: string, controls: RegExp) {
+      await expect(bar(page)).toBeVisible()
+      const btn = bar(page).getByRole('button', { name: controls })
+      await expect(btn).toBeVisible()
+      await inViewport(page, btn); await inViewport(page, bar(page))
+      expect(await noHScroll(page)).toBe(true)
+      await page.screenshot({ path: g6(`${shot}-${vp.name}-viewport`) })
+      await scrollAllToBottom(page)
+      await page.waitForTimeout(100)
+      if (desktop) { await inViewport(page, bar(page)); await page.screenshot({ path: g6(`${shot}-${vp.name}-scrolled`) }) }
+      expect(await noHScroll(page)).toBe(true)
+    }
+
+    test('a long multi-paragraph objective, running', async ({ page }) => {
+      const h = await setup(page, { goalStatus: 'active', runStatus: 'running', authorized: true, condition: 'working', objective: LONG,
+        workflow: workflow(), currentState: { kind: 'working', summary: 'Working.', activities: [] } })
+      await open(page, 'g6a', vp.name)
+      await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+      await common(page, 'a-long-objective', /^Pause goal/)
+      const summary = page.locator('summary', { hasText: /full objective/ })
+      await summary.focus(); await page.keyboard.press('Enter')
+      const det = summary.locator('..')
+      await expect(det).toHaveAttribute('open', '')
+      await expect(det).toContainText('Paragraph 3:')
+      await expect(det.locator('p')).toHaveText(LONG)
+      await page.screenshot({ path: g6(`a-disclosure-open-${vp.name}`) })
+      await page.keyboard.press('Enter')
+      await expect(det).not.toHaveAttribute('open', '')
+      if (desktop) { // Tab onward from the sticky bar: focused element is never hidden under it.
+        await page.evaluate(() => (document.querySelector('[data-testid="orchestration-sticky-bar"]') as HTMLElement).focus())
+        for (let i = 0; i < 25; i++) {
+          await page.keyboard.press('Tab')
+          const covered = await page.evaluate(() => {
+            const a = document.activeElement as HTMLElement | null; const b = document.querySelector('[data-testid="orchestration-sticky-bar"]')!
+            if (!a || a === document.body || b.contains(a)) return false
+            const r = a.getBoundingClientRect(); const s = b.getBoundingClientRect()
+            return r.bottom > s.top && r.top < s.bottom && r.right > s.left && r.left < s.right
+          })
+          expect(covered, `Tab step ${i} covered by sticky bar`).toBe(false)
+        }
+      }
+      h.assertMutations()
+    })
+
+    test('b paused with pending decision and saved answer', async ({ page }) => {
+      const h = await setup(page, { goalStatus: 'paused', runStatus: 'paused', authorized: false, condition: 'paused', objective: LONG,
+        workflow: workflow({ pending_decision_id: 'direction-release', application: { action_id: 'a1', decision_ids: ['d1'], state: 'pending', reason: null },
+          guidance: { kind: 'resume', label: 'Resume goal', decision_id: null, reason: null } }),
+        currentState: { kind: 'paused', summary: 'Goal is paused.', activities: [] }, supervision: { pending_direction: supervisionFor('needs_you').pending_direction } })
+      await open(page, 'g6b', vp.name)
+      await common(page, 'b-paused', /^Resume goal/)
+      await expect(bar(page)).toContainText('Goal: Paused')
+      await expect(bar(page).getByRole('button', { name: /^Pause goal/ })).toHaveCount(0)
+      await expect(page.getByRole('button', { name: 'Answer in Needs You' })).toBeVisible()
+      await expect(op(page)).toContainText('Saved · not applied')
+      h.assertMutations()
+    })
+
+    test('c blocked saved answer (needs attention)', async ({ page }) => {
+      const h = await setup(page, { goalStatus: 'active', runStatus: 'running', authorized: true, condition: 'needs_attention', objective: LONG,
+        workflow: workflow({ application: { action_id: 'a1', decision_ids: ['d1'], state: 'blocked', reason: 'authority revoked' },
+          guidance: { kind: 'review_blocker', label: 'Review blocker', decision_id: null, reason: null } }) })
+      await open(page, 'g6c', vp.name)
+      await common(page, 'c-blocked', /^Pause goal/)
+      await expect(op(page)).toContainText('Blocked — authority revoked')
+      h.assertMutations()
     })
   })
 }

@@ -57,7 +57,7 @@ import type {
 import { useUIStore } from '@/stores/ui'
 import { BaselineDashboard, currentProcesses, type BaselineMutationOwner } from './BaselineDashboard'
 import { DetailsTabs, type DetailsTabsHandle } from './DetailsTabs'
-import { authorizationReasonLabel, budgetLeftText, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planStatusLabel, planningModeLabel, requiredDecisionLabel, runStatusLabel } from './humanize'
+import { authorizationReasonLabel, budgetLeftText, correctionAuthorityLabel, errorRecord, gateOverrideDecisionLabel, goalStatusLabel, goalTypeLabel, goalTypeSourceLabel, planStatusLabel, planningModeLabel, requiredDecisionLabel, runStatusLabel, workflowGuidanceText } from './humanize'
 import { ZONE_TITLE_CLASS } from './zoneTitle'
 import { StartWorkDialog } from './StartWorkDialog'
 import { ExecutionSupervision } from './ExecutionSupervision'
@@ -1220,6 +1220,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
   const lifecycleButton = useRef<HTMLButtonElement>(null)
   const lifecycleFocusIntent = useRef(false)
   const goalHeader = useRef<HTMLElement>(null)
+  const stickyWrap = useRef<HTMLDivElement>(null)
   const overrideButtons = useRef<Record<string, HTMLButtonElement | null>>({})
   const overrideFocusGateId = useRef<string | null>(null)
   const cancelFocusTarget = useRef<'trigger' | 'header'>('trigger')
@@ -1255,10 +1256,10 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
     if (pauseBusy || !pauseFocusReturn.current) return
     pauseFocusReturn.current = false
     const active = document.activeElement
-    if (active !== goalHeader.current && active !== document.body) return
+    if (active !== goalHeader.current && active !== stickyWrap.current && active !== document.body) return
     const replacement = lifecycleButton.current
     if (replacement && !replacement.disabled) replacement.focus()
-    else goalHeader.current?.focus()
+    else stickyWrap.current?.focus()
   }, [pauseBusy, scopedPause?.phase])
 
   useEffect(() => {
@@ -1637,8 +1638,11 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
     </>
   )
 
+  const workflowFacts = detail.supervision?.status_line?.workflow
+  const cueText = workflowFacts && !terminal && !query.isError && workflowFacts.guidance.kind !== 'none' ? workflowGuidanceText(workflowFacts) : null
+
   return (
-    <div className="flex min-w-0 flex-col gap-4">
+    <div className="flex min-w-0 flex-col gap-4 md:[&_[id]]:scroll-mt-28">
       <button
         type="button"
         className="min-h-11 self-start text-sm text-huddleroom-text-secondary hover:text-huddleroom-text-primary focus:outline-2 focus:outline-huddleroom-primary"
@@ -1647,8 +1651,6 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         ← Orchestration goals
       </button>
 
-      <RoomPanel goalTitle={goal.objective} agentRows={agentRows} meetingRow={meetingRow} gates={roomGates} />
-
       <header
         ref={goalHeader}
         tabIndex={-1}
@@ -1656,18 +1658,25 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
         className="rounded-md border border-huddleroom-border bg-huddleroom-surface p-4"
       >
         <div className="min-w-0">
-          <PageHeader title={goal.objective} className="sr-only" />
+          <PageHeader title={goal.objective} className="line-clamp-2 break-words" />
+          {(goal.objective.length > 50 || goal.objective.includes('\n')) && (
+            <details className="group mt-1 text-sm text-huddleroom-text-secondary">
+              <summary className="flex min-h-11 cursor-pointer items-center">
+                <span className="group-open:hidden">Show full objective</span>
+                <span className="hidden group-open:inline">Hide full objective</span>
+              </summary>
+              <p className="m-0 whitespace-pre-wrap break-words">{goal.objective}</p>
+            </details>
+          )}
 
-          {/* PRIMARY: goal status + current phase */}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <StatusBadge status={goal.status} label={goalStatusLabel(goal.status)} className="text-sm font-semibold" />
-            {run && run.status !== goal.status && (
+          {run && run.status !== goal.status && (
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
               <span data-testid="orchestration-run-status" className="flex items-center gap-1 text-sm text-huddleroom-text-secondary">
-                <span aria-hidden="true">·</span>
+                <span>Run:</span>
                 <StatusBadge status={run.status} label={runStatusLabel(run.status)} />
               </span>
-            )}
-          </div>
+            </div>
+          )}
 
           {/* SECONDARY: compact reference cluster; gate counts grouped */}
           <div className="mt-2 flex flex-wrap gap-x-6 gap-y-2 text-xs">
@@ -1729,14 +1738,15 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           ) : null}
 
         </div>
-        <div className="mt-2 min-h-5 text-xs text-huddleroom-text-secondary">{lastMessageOwner?.startsWith('override:') ? '' : message}</div>
-        {pauseMessage && <p className="mt-2 text-sm text-huddleroom-text-secondary">{pauseMessage}</p>}
-        {scopedPause?.phase === 'checking' && <Button size="sm" variant="secondary" className="mt-2 min-h-11" disabled={pauseBusy} onClick={() => { void requestPause(true) }}>Check pause request</Button>}
-        {commandError && <p className="text-xs text-huddleroom-status-red">{commandError}</p>}
       </header>
 
-      {!terminal && (
-        <div className="mt-3 flex items-center justify-between">
+      <div ref={stickyWrap} tabIndex={-1} data-testid="orchestration-sticky-bar" className="z-10 rounded-md border border-huddleroom-border bg-huddleroom-surface px-4 py-2 md:sticky md:top-0">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <StatusBadge status={goal.status} label={`Goal: ${goalStatusLabel(goal.status)}`} className="text-sm font-semibold" />
+        {cueText && (
+          <span title={cueText} className="min-w-0 flex-1 basis-40 truncate text-xs text-huddleroom-text-secondary">Next: {cueText}</span>
+        )}
+        {!terminal && (
           <div aria-busy={lifecycleCommand === 'pause' ? pauseBusy : lifecycleBusy} className="flex flex-wrap items-center gap-2">
             {lifecycleCommand && (
               lifecycleCommand === 'pause' && pauseConfirming ? (
@@ -1757,14 +1767,14 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                         if (scope !== pauseScopeRef.current) return
                         const next = lifecycleButton.current
                         if (next && !next.disabled) next.focus()
-                        else goalHeader.current?.focus()
+                        else stickyWrap.current?.focus()
                       })
                     }}
                   >
                     {pauseRequestBusy ? 'Requesting pause…' : 'Confirm pause'}
                   </Button>
                   <Button size="sm" variant="ghost" className="min-h-11" disabled={pauseBusy} onClick={() => { setPauseConfirming(false); queueMicrotask(() => lifecycleButton.current?.focus()) }}>
-                    Cancel
+                    Keep running
                   </Button>
                 </div>
               ) : (
@@ -1800,6 +1810,18 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
                 Start work
               </Button>
             )}
+          </div>
+        )}
+      </div>
+      {!(lastMessageOwner?.startsWith('override:') || !message) && <div className="mt-2 text-xs text-huddleroom-text-secondary">{message}</div>}
+      {pauseMessage && <p className="mt-2 text-sm text-huddleroom-text-secondary">{pauseMessage}</p>}
+      {scopedPause?.phase === 'checking' && <Button size="sm" variant="secondary" className="mt-2 min-h-11" disabled={pauseBusy} onClick={() => { void requestPause(true) }}>Check pause request</Button>}
+      {commandError && <p className="mt-2 text-xs text-huddleroom-status-red">{commandError}</p>}
+      </div>
+
+      {!terminal && (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {run && detail.contract_fingerprint ? (
               <Button
                 ref={correctButton}
@@ -1841,6 +1863,8 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           )}
         </div>
       )}
+
+      <RoomPanel goalTitle={goal.objective} showGoalTitle={false} agentRows={agentRows} meetingRow={meetingRow} gates={roomGates} />
 
       <CurrentOperationStatus
         statusLine={detail.supervision?.status_line ?? null}

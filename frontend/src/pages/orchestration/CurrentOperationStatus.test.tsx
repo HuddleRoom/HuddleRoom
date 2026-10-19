@@ -58,7 +58,8 @@ describe('CurrentOperationStatus', () => {
   })
   it('renders refresh/cached-error honesty without inventing activity on an initial absence', () => {
     expect(markup({ ...props(), isFetching: true })).toContain('refreshing')
-    expect(markup({ ...props(), isError: true })).toContain('not updating')
+    expect(markup({ ...props(), isError: true })).toContain('Status last refreshed')
+    expect(markup({ ...props(), isError: true })).toContain('refresh failed; this status may be out of date')
     expect(markup(props(null))).not.toContain('No active worker confirmed')
   })
   it.each(['2026-10-14T12:00:00', '2026-10-14T14:00:00+02:00'])('uses semantic UTC time and absolute accessible time for %s', (occurred_at) => {
@@ -119,7 +120,7 @@ describe('CurrentOperationStatus', () => {
   it('treats a zero query timestamp as absent rather than a 1970 success', () => {
     const html = markup({ ...props(), dataUpdatedAt: 0 })
     expect(html).not.toContain('1970')
-    expect(html).toContain('Status refreshed Unknown')
+    expect(html).toContain('Status not yet refreshed')
   })
   it.each(['needs_you', 'needs_attention'] as const)('does not invent a scheduled check cue for %s attention', (kind) => {
     const status = line(); status.attention_summary = { ...status.attention_summary!, kind, next_check_at: null }
