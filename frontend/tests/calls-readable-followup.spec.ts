@@ -25,6 +25,8 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
     await expect.poll(() => !!socket).toBe(true)
     if (viewport.name === 'mobile') await page.getByRole('button', { name: /Activity/ }).click()
     await page.getByRole('tab', { name: 'Calls', exact: true }).click()
+    await expect(page.getByText('No live calls captured in this view.')).toBeVisible()
+    await page.screenshot({ path: `test-results/g6/calls-empty-${viewport.name}.png` })
     const emit = (callId: string, sequence: number, type: string, payload: Record<string, unknown>, actor = 'orchestrator') => socket!.send(JSON.stringify({
       id: `${callId}-${sequence}`, project_id: projectId, call_id: callId, sequence, event_type: `agent_response.${type}`, emitted_at: now,
       call_started_at: now, invocation_kind: 'cli_main', operation: actor === 'orchestrator' ? 'recovery' : 'planning', parent_call_id: null,

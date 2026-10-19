@@ -265,3 +265,389 @@ async def test_current_evidence_resolves_older_run_gate_only_inside_project(db_s
         assert event["subject"]["label"] == "Checkout verified"
         assert event["subject"]["goal_id"] is None
         assert "Checkout verified" in event["summary"]
+
+
+# --- SPR188/SPR232 (G5): workflow facts ------------------------------------------------------
+
+def _g5_decision(goal, run, key, *, minutes=0, **kwargs):
+    return OrchestrationAuthorityDecision(goal_id=goal.id, run_id=run.id, decision_key=key, title=key,
+        authority="human", question="Proceed?", options=[{"key": "yes"}],
+        asked_at=_utcnow() + timedelta(minutes=minutes), **kwargs)
+
+
+async def _g5_process(db, goal, run, process_type="agent_definition_review", **kwargs):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    row = OrchestrationProcessRun(goal_id=goal.id, run_id=run.id, process_type=process_type,
+                                  trigger_reason="test", **kwargs)
+    db.add(row); await db.flush()
+    return row
+
+
+def _g5_answer(run, decisions, **contract):
+    return OrchestrationAction(run_id=run.id, idempotency_key=f"answer-{uuid.uuid4()}", action_type="apply_authority_answer",
+        request={"submission": {"decision_ids": [str(d.id) for d in decisions]}},
+        status=contract.pop("status", "reserved"), dispatch_contract=contract)
+
+
+async def test_g5_baseline_process_without_session_is_qualified_not_live(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    run.phase, run.baseline_authorized = "baseline", True
+    process = await _g5_process(db_session, goal, run, started_at=_utcnow() - timedelta(minutes=3))
+    await db_session.flush()
+    result = await _status(db_session, goal, run)
+    workflow = result["status_line"]["workflow"]
+    assert workflow["phase"] == "baseline" and workflow["phase_label"] == "Baseline setup"
+    assert workflow["process"]["id"] == str(process.id) and workflow["process_status"] == "running"
+    assert workflow["operation_summary"] == (
+        "Last recorded: reviewing agent definitions. Result not yet recorded; live activity unavailable.")
+    assert workflow["occurred_at"] is not None
+    state = result["status_line"]["current_state"]
+    assert state["kind"] == "unknown" and state["summary"] == workflow["operation_summary"]
+    assert "No active worker" not in state["summary"] and state["activities"] == []
+
+
+async def test_g5_superseded_and_foreign_run_processes_and_decisions_are_excluded(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    _, other_run = await _run(db_session, test_project)
+    old = await _g5_process(db_session, goal, run, "goal_definition")
+    new = await _g5_process(db_session, goal, run, "team_hierarchy", status="completed")
+    old.superseded_by_id = new.id
+    await _g5_process(db_session, goal, other_run, "manager_selection")
+    await db_session.flush()
+    stale = _g5_decision(goal, run, "stale-source", minutes=5, source_process_run_id=old.id)
+    foreign = _g5_decision(goal, other_run, "foreign", minutes=6)
+    keep = _g5_decision(goal, run, "keep", minutes=1)
+    db_session.add_all([stale, foreign, keep]); await db_session.flush()
+    result = await _status(db_session, goal, run)
+    workflow = result["status_line"]["workflow"]
+    assert workflow["process"] is None and workflow["operation_summary"].startswith("No recorded operation")
+    assert workflow["pending_decision_id"] == str(keep.id) and workflow["additional_pending_count"] == 0
+    assert result["pending_direction"]["id"] == str(keep.id)
+    assert result["status_line"]["attention_summary"]["key"] == f"decision:{keep.id}:pending"
+    assert result["status_line"]["attention_summary"]["additional_count"] == 0
+
+
+async def test_g5_multiple_pending_decisions_agree_across_attention_workflow_and_debug(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    older, newest = _g5_decision(goal, run, "older", minutes=-5), _g5_decision(goal, run, "newest", minutes=5)
+    db_session.add_all([older, newest]); await db_session.flush()
+    result = await _status(db_session, goal, run)
+    workflow = result["status_line"]["workflow"]
+    assert workflow["pending_decision_id"] == str(newest.id) and workflow["additional_pending_count"] == 1
+    assert result["pending_direction"]["id"] == str(newest.id)
+    assert result["status_line"]["attention_summary"]["key"] == f"decision:{newest.id}:pending"
+    assert workflow["guidance"] == {"kind": "review_decision", "label": "Answer the owner decision",
+                                    "decision_id": str(newest.id), "reason": None}
+    assert result["next_action"] == "Answer the owner decision"
+
+
+async def test_g5_paused_goal_keeps_owner_question_and_saved_answer(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    goal.status = run.status = "paused"
+    pending = _g5_decision(goal, run, "paused-question")
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add_all([pending, answered]); await db_session.flush()
+    action = _g5_answer(run, [answered], application_state="pending")
+    db_session.add(action); await db_session.flush()
+    result = await _status(db_session, goal, run)
+    workflow = result["status_line"]["workflow"]
+    assert result["condition"] == "paused" and result["status_line"]["current_state"]["summary"] == "Paused."
+    assert result["pending_direction"]["id"] == str(pending.id)
+    assert workflow["guidance"]["kind"] == "resume" and workflow["guidance"]["decision_id"] == str(pending.id)
+    assert workflow["application"] == {"action_id": str(action.id), "decision_ids": [str(answered.id)],
+                                       "state": "pending", "reason": None}
+    assert result["next_action"] == "Resume goal"
+
+
+@pytest.mark.parametrize("contract,status,state,kind,reason", [
+    ({"application_state": "pending"}, "reserved", "pending", "wait_application", None),
+    ({"application_state": "pending", "reason": "database is locked"}, "reserved", "pending", "wait_application",
+     "The database was busy; it will be retried."),
+    ({"application_state": "blocked", "reason": "source_process_superseded"}, "failed", "blocked", "review_blocker",
+     "The step that asked was replaced."),
+    ({"application_state": "failed", "reason": "x" * 400}, "failed", "failed", "review_blocker", "Application failed."),
+])
+async def test_g5_saved_answer_application_state_and_guidance(db_session, test_project, contract, status, state, kind, reason):
+    goal, run = await _run(db_session, test_project)
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add(answered); await db_session.flush()
+    db_session.add(_g5_answer(run, [answered], status=status, **contract)); await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["application"]["state"] == state and workflow["application"]["reason"] == reason
+    assert workflow["guidance"]["kind"] == kind
+
+
+async def test_g5_applied_answer_is_not_pending_and_extra_applications_are_counted(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    answered = [_g5_decision(goal, run, f"saved-{i}", status="answered", selected_option="yes") for i in range(3)]
+    db_session.add_all(answered); await db_session.flush()
+    done = _g5_answer(run, answered[:1], status="completed", application_state="applied")
+    first, second = (_g5_answer(run, [d], application_state="pending") for d in answered[1:])
+    first.created_at, second.created_at = _utcnow() - timedelta(minutes=2), _utcnow() - timedelta(minutes=1)
+    db_session.add_all([done, second, first]); await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["application"]["action_id"] == str(first.id) and workflow["additional_application_count"] == 1
+    done.created_at = _utcnow() - timedelta(minutes=9)
+    for action in (first, second):
+        action.status, action.dispatch_contract = "completed", {"application_state": "applied"}
+    await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["application"] is None and workflow["additional_application_count"] == 0
+
+
+async def test_g5_unapplied_answer_needing_baseline_authorization_points_to_authorization(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    run.phase, run.baseline_authorized = "baseline", False
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add(answered); await db_session.flush()
+    db_session.add(_g5_answer(run, [answered], application_state="pending", reason="Orchestration admission paused"))
+    await db_session.flush()
+    guidance = (await _status(db_session, goal, run))["status_line"]["workflow"]["guidance"]
+    assert (guidance["kind"], guidance["label"]) == ("authorize_baseline", "Authorize remaining baseline")
+
+
+async def test_g5_stale_plan_review_decision_is_not_selected(db_session, test_project):
+    import json
+    goal, run = await _run(db_session, test_project)
+    artifact_id = uuid.uuid4()
+    digest = "a" * 64
+    identity = {"project_id": str(test_project.id), "goal_id": str(goal.id), "run_id": str(run.id),
+                "artifact_id": str(artifact_id), "planning_task_id": str(uuid.uuid4()), "planning_version": 1,
+                "winning_session_id": None, "provenance_hash": digest, "canonical_content_hash": digest,
+                "renderer_version": 1, "rendered_content_hash": digest, "review_cycle": 1}
+    record = {"identity": identity, "state": "ready", "markdown": "# Plan"}
+    run.plan_state = {"plan_reviews": {str(artifact_id): record}}
+    current = _g5_decision(goal, run, "roadmap_plan:current", minutes=1,
+                           context=json.dumps({"plan_review_identity": identity}))
+    cycle2 = {**identity, "review_cycle": 2}
+    stale = _g5_decision(goal, run, "roadmap_plan:stale", minutes=9,
+                         context=json.dumps({"plan_review_identity": cycle2}))
+    malformed = _g5_decision(goal, run, "roadmap_plan:bad", minutes=8, context="not json")
+    db_session.add_all([current, stale, malformed]); await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["pending_decision_id"] == str(current.id) and workflow["additional_pending_count"] == 0
+    run.plan_state = {"plan_reviews": {str(artifact_id): {**record, "state": "stale"}}}
+    await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["pending_decision_id"] is None
+
+
+async def test_g5_planning_requires_exact_planner_binding(db_session, test_project, test_agent):
+    goal, run = await _run(db_session, test_project)
+    request = OrchestrationAction(run_id=run.id, idempotency_key="plan-request", action_type="request_plan",
+                                  request={}, status="completed")
+    db_session.add(request); await db_session.flush()
+    task = await _task(db_session, test_project, test_agent, run, "Draft the plan")
+    task.metadata_ = {"orchestration": {"run_id": str(run.id), "action_id": str(request.id), "work_function": "planning"}}
+    run.plan_state = {"status": "requested", "planning_task_id": str(task.id), "request_action_id": str(request.id)}
+    await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["phase"] == "planning" and workflow["task"]["id"] == str(task.id)
+    assert "Draft the plan" in workflow["operation_summary"] and "live activity unavailable" in workflow["operation_summary"]
+    task.metadata_ = {"orchestration": {"run_id": str(uuid.uuid4()), "action_id": str(request.id), "work_function": "planning"}}
+    await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["task"] is None and "planner task unavailable" in workflow["operation_summary"]
+
+
+async def test_g5_detail_get_is_read_only(db_session, test_project):
+    from sqlalchemy import event
+    goal, run = await _run(db_session, test_project)
+    run.phase, run.baseline_authorized = "baseline", True
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add_all([_g5_decision(goal, run, "q"), answered]); await db_session.flush()
+    db_session.add(_g5_answer(run, [answered], application_state="pending"))
+    await _g5_process(db_session, goal, run)
+    await db_session.flush()
+    writes = []
+    def capture(conn, cursor, statement, parameters, context, many):
+        if statement.lstrip().split(None, 1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}:
+            writes.append(statement)
+    engine = db_session.bind.sync_engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        await _status(db_session, goal, run)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert writes == []
+
+
+async def test_g5_paused_with_recorded_running_process_stays_paused_without_liveness_claim(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    goal.status = run.status = "paused"
+    process = await _g5_process(db_session, goal, run, started_at=_utcnow() - timedelta(minutes=3))
+    await db_session.flush()
+    result = await _status(db_session, goal, run)
+    workflow = result["status_line"]["workflow"]
+    assert result["condition"] == "paused" and result["status_line"]["current_state"]["summary"] == "Paused."
+    assert workflow["process"]["id"] == str(process.id) and workflow["process_status"] == "running"
+    assert "Last recorded" in workflow["operation_summary"] and "live activity unavailable" in workflow["operation_summary"]
+    assert "Working" not in result["status_line"]["current_state"]["summary"]
+    assert result["status_line"]["current_state"]["activities"] == []
+    assert workflow["guidance"]["kind"] == "resume"
+
+
+async def test_g5_applied_answer_guidance_is_not_waiting_for_application(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add(answered); await db_session.flush()
+    db_session.add(_g5_answer(run, [answered], status="completed", application_state="applied")); await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["application"] is None and workflow["pending_decision_id"] is None
+    assert workflow["guidance"]["kind"] not in {"wait_application", "review_blocker", "authorize_baseline", "review_decision"}
+
+
+async def test_g5_saved_answer_with_paused_baseline_resumes_first_then_authorizes(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    run.phase, run.baseline_authorized = "baseline", False
+    goal.status = run.status = "paused"
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add(answered); await db_session.flush()
+    db_session.add(_g5_answer(run, [answered], application_state="pending", reason="Orchestration admission paused"))
+    await db_session.flush()
+    first = (await _status(db_session, goal, run))["status_line"]["workflow"]["guidance"]
+    assert first["kind"] == "resume" and first["label"] == "Resume goal"
+    goal.status, run.status = "active", "running"
+    await db_session.flush()
+    after = (await _status(db_session, goal, run))["status_line"]["workflow"]["guidance"]
+    assert (after["kind"], after["label"]) == ("authorize_baseline", "Authorize remaining baseline")
+
+
+async def test_g5_detail_get_over_http_in_fresh_session_issues_no_writes(client, test_engine):
+    from sqlalchemy import event, select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from huddleroom.dependencies import get_db
+    from huddleroom.models.orchestration import OrchestrationGoal, OrchestrationRun
+    from huddleroom.models.project import Project
+    factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as seed:
+        project = Project(name="g5-http", config={})
+        seed.add(project); await seed.flush()
+        goal = OrchestrationGoal(project_id=project.id, objective="Keep moving", status="active", goal_type="outcome")
+        seed.add(goal); await seed.flush()
+        run = OrchestrationRun(goal_id=goal.id, status="running", phase="baseline", baseline_authorized=True)
+        seed.add(run); await seed.flush()
+        answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+        seed.add_all([_g5_decision(goal, run, "q"), answered]); await seed.flush()
+        seed.add(_g5_answer(run, [answered], application_state="pending"))
+        await _g5_process(seed, goal, run)
+        await seed.commit()
+        ids = (project.id, goal.id, run.id)
+
+    async def snapshot():
+        async with factory() as s:
+            from sqlalchemy import text
+            return {t: (await s.execute(text(f"select * from {t} order by 1"))).fetchall() for t in (
+                "orchestration_goals", "orchestration_runs", "orchestration_actions",
+                "orchestration_authority_decisions", "orchestration_process_runs")}
+    before = await snapshot()
+
+    async def fresh_db():
+        async with factory() as s:
+            yield s
+    client._transport.app.dependency_overrides[get_db] = fresh_db
+    writes = []
+    def capture(conn, cursor, statement, parameters, context, many):
+        if statement.lstrip().split(None, 1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}:
+            writes.append(statement)
+    sync_engine = test_engine.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", capture)
+    try:
+        resp = await client.get(f"/api/v1/projects/{ids[0]}/orchestration/goals/{ids[1]}")
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", capture)
+    assert resp.status_code == 200, resp.text
+    workflow = resp.json()["supervision"]["status_line"]["workflow"]
+    assert workflow["pending_decision_id"] is not None and workflow["application"]["state"] == "pending"
+    assert writes == []
+    assert await snapshot() == before
+
+
+@pytest.mark.parametrize("state", ["completed", "cancelled"])
+async def test_g5_terminal_goal_has_no_needs_you_attention_or_pending(db_session, test_project, state):
+    goal, run = await _run(db_session, test_project)
+    goal.status = run.status = state
+    run.completed_at = _utcnow()
+    db_session.add(_g5_decision(goal, run, "late-question")); await db_session.flush()
+    result = await _status(db_session, goal, run)
+    assert result["status_line"]["attention_summary"] is None
+    assert result["status_line"]["workflow"]["pending_decision_id"] is None and result["pending_direction"] is None
+
+
+async def test_g5_other_run_source_process_decision_is_excluded(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    from huddleroom.models.orchestration import OrchestrationRun
+    other_run = OrchestrationRun(goal_id=goal.id, status="completed", phase="authorized")
+    db_session.add(other_run); await db_session.flush()
+    foreign = await _g5_process(db_session, goal, other_run, "manager_selection")
+    own = await _g5_process(db_session, goal, run, "goal_definition")
+    db_session.add_all([_g5_decision(goal, run, "other-run-source", minutes=5, source_process_run_id=foreign.id),
+                        _g5_decision(goal, run, "own-source", source_process_run_id=own.id)])
+    await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["additional_pending_count"] == 0
+    assert workflow["pending_decision_id"] is not None
+
+
+async def test_g5_initial_authorize_baseline_positive_and_negatives(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    run.phase, run.baseline_authorized = "baseline", False
+    await db_session.flush()
+    async def guidance():
+        return (await _status(db_session, goal, run))["status_line"]["workflow"]["guidance"]["kind"]
+    assert await guidance() == "authorize_baseline"
+    run.baseline_authorized = True; await db_session.flush()
+    assert await guidance() != "authorize_baseline"
+    run.baseline_authorized, run.pause_requested = False, True; await db_session.flush()
+    assert await guidance() != "authorize_baseline"
+    run.pause_requested, goal.status = False, "paused"; await db_session.flush()
+    assert await guidance() == "resume"
+    goal.status = "active"
+    run.active_blockers = [{"kind": "budget_integrity", "scope": "x"}]; await db_session.flush()
+    assert await guidance() == "review_blocker"
+
+
+async def test_g5_saved_answer_blocker_outranks_authorize_baseline_and_failed_does_not_authorize(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    run.phase, run.baseline_authorized = "baseline", False
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add(answered); await db_session.flush()
+    action = _g5_answer(run, [answered], application_state="pending", reason="Orchestration admission paused")
+    db_session.add(action); await db_session.flush()
+    run.active_blockers = [{"kind": "budget_integrity", "scope": "x"}]; await db_session.flush()
+    assert (await _status(db_session, goal, run))["status_line"]["workflow"]["guidance"]["kind"] == "review_blocker"
+    run.active_blockers = []
+    action.status, action.dispatch_contract = "failed", {"application_state": "failed"}
+    await db_session.flush()
+    assert (await _status(db_session, goal, run))["status_line"]["workflow"]["guidance"]["kind"] == "review_blocker"
+
+
+async def test_g5_occurred_at_is_a_real_occurrence_not_updated_at(db_session, test_project, test_agent):
+    goal, run = await _run(db_session, test_project)
+    started = _utcnow() - timedelta(hours=2)
+    process = await _g5_process(db_session, goal, run, started_at=started)
+    process.updated_at = _utcnow() + timedelta(days=1); await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["occurred_at"] == started.isoformat().replace("+00:00", "Z")
+    process.status = "completed"
+    request = OrchestrationAction(run_id=run.id, idempotency_key="plan-req2", action_type="request_plan", request={},
+                                  status="completed", created_at=started)
+    db_session.add(request); await db_session.flush()
+    task = await _task(db_session, test_project, test_agent, run, "Plan")
+    task.metadata_ = {"orchestration": {"run_id": str(run.id), "action_id": str(request.id), "work_function": "planning"}}
+    run.plan_state = {"status": "requested", "planning_task_id": str(task.id), "request_action_id": str(request.id)}
+    request.updated_at = _utcnow() + timedelta(days=1); await db_session.flush()
+    workflow = (await _status(db_session, goal, run))["status_line"]["workflow"]
+    assert workflow["occurred_at"] == started.isoformat().replace("+00:00", "Z")
+
+
+async def test_g5_terminal_goal_hides_leftover_running_process(db_session, test_project):
+    goal, run = await _run(db_session, test_project)
+    await _g5_process(db_session, goal, run)
+    goal.status = run.status = "cancelled"; run.completed_at = _utcnow()
+    await db_session.flush()
+    result = await _status(db_session, goal, run)
+    workflow = result["status_line"]["workflow"]
+    assert workflow["process"] is None and workflow["task"] is None and workflow["occurred_at"] is None
+    assert workflow["operation_summary"] == "Goal cancelled."
+    assert result["status_line"]["current_state"]["summary"] == "Cancelled."

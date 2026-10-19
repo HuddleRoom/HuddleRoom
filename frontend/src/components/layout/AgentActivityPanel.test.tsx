@@ -1594,13 +1594,34 @@ describe('AgentActivityPanel - DOM rendering', () => {
   })
 
   describe('Empty state', () => {
-    it('shows "No activity yet."', async () => {
+    it('shows honest live-only copy when connected', async () => {
+      useWSStore.setState({ connected: true })
       const view = await mountWithTestDom(
         () => <AgentActivityPanel projectId="proj-1" />,
         React.act,
       )
       try {
-        expect(textOf(view.container)).toContain('No activity yet.')
+        const text = textOf(view.container)
+        expect(text).toContain('No live calls captured in this view.')
+        expect(text).toContain('Calls appear here live while this page is open; earlier calls and calls from before a reload are not shown.')
+        expect(text).not.toContain('Live call capture is unavailable')
+        expect(text).not.toContain('No activity yet.')
+      } finally {
+        view.cleanup()
+      }
+    })
+
+    it('shows paused copy when the connection is not connected', async () => {
+      useWSStore.setState({ connected: false })
+      const view = await mountWithTestDom(
+        () => <AgentActivityPanel projectId="proj-1" />,
+        React.act,
+      )
+      try {
+        const text = textOf(view.container)
+        expect(text).toContain('No live calls captured in this view.')
+        expect(text).toContain('Live call capture is unavailable while disconnected; calls made during that time will not appear.')
+        expect(text).not.toContain('Calls appear here live while this page is open')
       } finally {
         view.cleanup()
       }

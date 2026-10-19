@@ -2,9 +2,10 @@ import { useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { StatusBadge, type StatusVariant } from '@/components/common/uiPrimitives'
 import { absolute, parseUtc } from '@/lib/time'
-import type { NeedsYouReference, OrchestrationStatusLine, OrchestrationSupervisionCondition } from '@/lib/types'
+import type { NeedsYouReference, OrchestrationAuthorityDecisionRecord, OrchestrationStatusLine, OrchestrationSupervisionCondition } from '@/lib/types'
 import { compareStatusOccurrences, currentOperationAnnouncementCandidates, type StatusOccurrence } from './currentOperationStatus'
 import { useGoalAnnouncer } from './goalAnnouncer'
+import { PAUSED_TEXT, workflowApplicationText, workflowGuidanceText } from './humanize'
 import { needsYouReferencePath } from './needsYouPresentation'
 
 const BADGES: Record<OrchestrationSupervisionCondition, { status: StatusVariant; label: string }> = {
@@ -23,6 +24,7 @@ type RevealTarget = { kind: 'gate' | 'process' | 'action'; id: string; goalId: s
 
 export interface CurrentOperationStatusProps {
   statusLine: OrchestrationStatusLine | null
+  pendingDirection?: OrchestrationAuthorityDecisionRecord | null
   condition: OrchestrationSupervisionCondition
   activeProjectId: string
   dataUpdatedAt: number
@@ -50,17 +52,17 @@ function Reference({ reference, activeProjectId, onRevealSource }: {
 }) {
   if (!reference) return null
   const label = reference.label?.trim()
-  if (!label || reference.project_id !== activeProjectId) return <span>Reference unavailable</span>
+  if (!label || reference.project_id !== activeProjectId) return <span className="[overflow-wrap:anywhere]">Reference unavailable</span>
   const path = needsYouReferencePath(reference, activeProjectId)
-  if (path) return <Link className="underline break-words" to={path}>{label}</Link>
+  if (path) return <Link className="underline break-words [overflow-wrap:anywhere]" to={path}>{label}</Link>
   if (reference.goal_id && ['gate', 'process', 'action'].includes(reference.kind)) {
     const kind = reference.kind as RevealTarget['kind']
-    return <button type="button" className="underline break-words" onClick={() => onRevealSource({ kind, id: reference.id, goalId: reference.goal_id! })}>{label}</button>
+    return <button type="button" className="underline break-words [overflow-wrap:anywhere]" onClick={() => onRevealSource({ kind, id: reference.id, goalId: reference.goal_id! })}>{label}</button>
   }
-  return <span className="break-words">{label}</span>
+  return <span className="break-words [overflow-wrap:anywhere]">{label}</span>
 }
 
-export function CurrentOperationStatus({ statusLine, condition, activeProjectId, dataUpdatedAt, isFetching, isError,
+export function CurrentOperationStatus({ statusLine, pendingDirection = null, condition, activeProjectId, dataUpdatedAt, isFetching, isError,
   onRevealSource, goalKey }: CurrentOperationStatusProps) {
   const { announceQueue } = useGoalAnnouncer()
   const history = useRef<{ goalKey: string; initialized: boolean; seen: Set<string>; newest: StatusOccurrence | null }>({
@@ -108,13 +110,35 @@ export function CurrentOperationStatus({ statusLine, condition, activeProjectId,
   const nextCheck = attention ? validTime(attention.next_check_at) : null
   const freshness = validTime(dataUpdatedAt)
   const badge = BADGES[condition]
+  const workflow = statusLine.workflow
+  const application = workflow ? workflowApplicationText(workflow) : null
   return <section aria-labelledby="current-operation-title" className="min-w-0 rounded-md border border-huddleroom-border bg-huddleroom-surface p-4 break-words">
     <div className="flex flex-wrap items-center justify-between gap-2">
       <h2 id="current-operation-title" className="min-w-0 text-sm font-bold tracking-[0.05em] text-huddleroom-text-primary">Current operation</h2>
       <StatusBadge status={badge.status} label={badge.label} />
     </div>
     <div className="mt-2 space-y-1 text-sm text-huddleroom-text-secondary">
-      {(current.kind !== 'working' || current.activities.length === 0) && <p>{current.summary}</p>}
+      {condition === 'paused' && <p>{PAUSED_TEXT}</p>}
+      {workflow ? <>
+        <p>Phase: {workflow.phase_label}</p>
+        <p className="min-w-0">{workflow.operation_summary}{' '}
+          {workflow.process && <>Process: <Reference reference={workflow.process} activeProjectId={activeProjectId} onRevealSource={onRevealSource} />{' · '}</>}
+          {workflow.task && <>Task: <Reference reference={workflow.task} activeProjectId={activeProjectId} onRevealSource={onRevealSource} />{' · '}</>}
+          {workflow.occurred_at ? <>Recorded at <Time value={workflow.occurred_at} /></> : 'Recorded time unknown'}
+        </p>
+        {workflow.pending_decision_id && <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <p className="min-w-0 [overflow-wrap:anywhere]">Waiting for your decision: <span className="line-clamp-2">{pendingDirection && pendingDirection.id === workflow.pending_decision_id ? `"${pendingDirection.question}"` : 'Decision details not loaded yet'}</span>
+            {workflow.additional_pending_count > 0 && <> · {workflow.additional_pending_count} more</>}</p>
+          <button type="button" className="inline-flex min-h-11 items-center underline" onClick={() => {
+            const heading = document.getElementById('needs-you-queue-heading')
+            heading?.scrollIntoView?.({ block: 'start' })
+            heading?.focus()
+          }}>Answer in Needs You</button>
+        </div>}
+        {application && <p>{application}</p>}
+        {workflow.guidance.kind !== 'none' && <p>Next: {workflowGuidanceText(workflow)}</p>}
+      </> : <p>Workflow details unavailable.</p>}
+      {(current.kind !== 'working' || current.activities.length === 0) && condition !== 'paused' && <p>{current.summary}</p>}
       {current.activities.map((activity) => <p key={activity.key} className="min-w-0">
         {(current.kind === 'working' || activity.summary !== current.summary) && <>{activity.summary}{' '}</>}
         {activity.actor && <>Agent: <Reference reference={activity.actor} activeProjectId={activeProjectId} onRevealSource={onRevealSource} />{' · '}</>}
@@ -129,6 +153,6 @@ export function CurrentOperationStatus({ statusLine, condition, activeProjectId,
       </p>}
       <p>Last update: {event ? <>{event.summary}{' '}{event.subject && <>Source: <Reference reference={event.subject} activeProjectId={activeProjectId} onRevealSource={onRevealSource} />{' · '}</>}<Time value={event.occurred_at} /></> : 'No recorded update yet'}</p>
     </div>
-    <p className="mt-2 text-xs text-huddleroom-text-muted">Data as of {freshness ? <Time value={dataUpdatedAt} /> : 'Unknown'}{isError ? ' · not updating' : isFetching ? ' · refreshing…' : ''}</p>
+    <p className="mt-2 text-xs text-huddleroom-text-muted">{freshness ? <>{isError ? 'Status last refreshed' : 'Status refreshed'} <Time value={dataUpdatedAt} /></> : 'Status not yet refreshed'}{isError ? ' · refresh failed; this status may be out of date' : isFetching ? ' · refreshing…' : ''}</p>
   </section>
 }

@@ -26,6 +26,16 @@ describe('RoomPanel', () => {
     expect(markup).not.toContain('criteria')
   })
 
+  it('shows the goal title by default and hides it with showGoalTitle=false', () => {
+    const shown = renderToStaticMarkup(<RoomPanel goalTitle="Ship the release" agentRows={[]} meetingRow={null} gates={null} />)
+    expect(shown).toContain('<h2')
+    expect(shown).toContain('aria-labelledby="room-panel-title"')
+    const hidden = renderToStaticMarkup(<RoomPanel goalTitle="Ship the release" showGoalTitle={false} agentRows={[]} meetingRow={null} gates={null} />)
+    expect(hidden).not.toContain('Ship the release')
+    expect(hidden).not.toContain('<h2')
+    expect(hidden).toContain('aria-label="Delegated work"')
+  })
+
   it('renders partial agent rows: pill only when adapterType+provider present, dot state reflects working', () => {
     const rows: RoomPanelAgentRow[] = [
       agentRow({ agentId: 'agent-1', role: 'Validator', adapterType: 'api', provider: 'openai', working: true }),

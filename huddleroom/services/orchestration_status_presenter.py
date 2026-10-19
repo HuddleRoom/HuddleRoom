@@ -13,14 +13,36 @@ from huddleroom.models.orchestration import (
     OrchestrationAction, OrchestrationEvidence, OrchestrationGate, OrchestrationGoal,
     OrchestrationRun, OrchestrationWait,
 )
-from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
+from huddleroom.models.orchestration_process import (
+    PROCESS_TYPE_VALUES, OrchestrationAuthorityDecision, OrchestrationProcessRun,
+)
+from huddleroom.models.task import Task
 from huddleroom.schemas.orchestration import (
     OrchestrationStatusActivity, OrchestrationStatusAttention, OrchestrationStatusCurrentState,
     OrchestrationStatusEvent, OrchestrationStatusLine, OrchestrationSupervisionCondition,
+    OrchestrationWorkflowApplication, OrchestrationWorkflowFacts, OrchestrationWorkflowGuidance,
+    PlanReviewRecord,
 )
 from huddleroom.services.orchestration_needs_you_presenter import (
-    NeedsYouReferenceRequest, resolve_needs_you_references,
+    _PROCESS_LABELS, NeedsYouReferenceRequest, resolve_needs_you_references,
 )
+
+_PHASE_LABELS = {
+    "baseline": "Baseline setup", "ready": "Baseline complete", "waiting_activation": "Waiting for start",
+    "authorized": "Executing", "completed": "Completed", "planning": "Planning",
+}
+_TERMINAL = frozenset({"completed", "cancelled", "stopped"})
+_REASON_LIMIT = 160
+_ADMISSION_REASON = "Waiting for the goal to be admitted."
+_APPLICATION_FAILED = "Application failed."
+_APPLICATION_REASONS = {
+    "Orchestration admission paused": _ADMISSION_REASON,
+    "Baseline operation discarded by reset": "The baseline operation was discarded by a reset.",
+    "database is locked": "The database was busy; it will be retried.",
+    "source_process_missing": "The step that asked is missing.",
+    "source_process_superseded": "The step that asked was replaced.",
+    "source_process_did_not_advance": "The step that asked did not advance.",
+}
 
 
 def _time(value: object) -> datetime | None:
@@ -41,16 +63,176 @@ def _id(value: object) -> uuid.UUID | None:
         return None
 
 
+def _plan_review_current(decision: OrchestrationAuthorityDecision, run: OrchestrationRun) -> bool:
+    """A G3 plan-approval question applies only to the persisted ready review it was asked about."""
+    if not decision.decision_key.startswith("roadmap_plan:"):
+        return True
+    try:
+        identity = json.loads(decision.context or "null")["plan_review_identity"]
+        raw = ((run.plan_state or {}).get("plan_reviews") or {})[str(identity["artifact_id"])]
+        record = PlanReviewRecord.model_validate(raw)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+    return record.state == "ready" and record.identity.model_dump(mode="json") == identity
+
+
+async def pending_owner_decisions(
+    db: AsyncSession, *, goal: OrchestrationGoal, run: OrchestrationRun,
+    decisions: Sequence[OrchestrationAuthorityDecision],
+) -> list[OrchestrationAuthorityDecision]:
+    """Applicable pending human decisions, filtered before ordering (asked_at DESC, id ASC)."""
+    pending = [d for d in decisions if d.status == "pending" and d.authority == "human" and d.run_id == run.id]
+    source_ids = {d.source_process_run_id for d in pending if d.source_process_run_id is not None}
+    live_sources = set(await db.scalars(select(OrchestrationProcessRun.id).where(
+        OrchestrationProcessRun.id.in_(source_ids), OrchestrationProcessRun.goal_id == goal.id,
+        OrchestrationProcessRun.run_id == run.id,
+        OrchestrationProcessRun.superseded_by_id.is_(None),
+    ))) if source_ids else set()
+    applicable = [d for d in pending if (d.source_process_run_id is None or d.source_process_run_id in live_sources)
+                  and _plan_review_current(d, run)]
+    applicable.sort(key=lambda d: str(d.id))
+    applicable.sort(key=lambda d: _time(d.asked_at or d.created_at) or datetime.min.replace(tzinfo=timezone.utc),
+                    reverse=True)
+    return applicable
+
+
+def _unapplied_answers(actions: Sequence[OrchestrationAction]) -> list[OrchestrationWorkflowApplication]:
+    """Saved (G1) answers whose application has not landed, in drain order."""
+    rows = []
+    for action in sorted(actions, key=lambda a: (_time(a.created_at) or datetime.min.replace(tzinfo=timezone.utc), str(a.id))):
+        if action.action_type != "apply_authority_answer" or action.status not in {"reserved", "failed"}:
+            continue
+        contract = action.dispatch_contract if isinstance(action.dispatch_contract, dict) else {}
+        try:
+            ids = [uuid.UUID(str(i)) for i in action.request["submission"]["decision_ids"]]
+        except (KeyError, TypeError, ValueError):
+            continue
+        state = contract.get("application_state")
+        state = state if state in {"blocked", "failed"} else ("failed" if action.status == "failed" else "pending")
+        reason = contract.get("reason")
+        reason = _APPLICATION_REASONS.get(reason, _APPLICATION_FAILED) if reason else None
+        rows.append(OrchestrationWorkflowApplication(
+            action_id=action.id, decision_ids=ids, state=state, reason=reason,
+        ))
+    return rows
+
+
+async def _operation(
+    db: AsyncSession, *, goal: OrchestrationGoal, run: OrchestrationRun, actions: Sequence[OrchestrationAction],
+) -> dict:
+    """Qualified recorded operation (planner task or active process). Never claims live work."""
+    tail = "Live activity unavailable."
+    plan = run.plan_state if isinstance(run.plan_state, dict) else {}
+    pending_replan = plan.get("pending_replan") if isinstance(plan.get("pending_replan"), dict) else {}
+    if run.phase != "completed" and (pending_replan or plan.get("status") in {"requested", "revision_requested"}):
+        task_id = _id(pending_replan.get("task_id") if pending_replan else plan.get("planning_task_id"))
+        action_id = _id(pending_replan.get("action_id") if pending_replan else plan.get("request_action_id"))
+        request = next((a for a in actions if a.id == action_id), None) if action_id else None
+        task = await db.get(Task, task_id) if task_id else None
+        orchestration = ((task.metadata_ or {}).get("orchestration") if task is not None
+                         and isinstance(task.metadata_, dict) else None)
+        orchestration = orchestration if isinstance(orchestration, dict) else {}
+        bound = (task is not None and request is not None and task.project_id == goal.project_id
+                 and orchestration.get("run_id") == str(run.id) and orchestration.get("work_function") == "planning"
+                 and orchestration.get("action_id") == str(action_id))
+        if not bound:
+            return {"phase": "planning", "summary": f"Planning was requested; planner task unavailable. {tail}"}
+        reference = (await resolve_needs_you_references(
+            db, project_id=goal.project_id, requests=[NeedsYouReferenceRequest("task", task.id, goal.id)]))[0]
+        return {"phase": "planning", "task": reference, "occurred_at": request.created_at,
+                "summary": f"Last recorded: planning requested ({reference.label or 'planner task'}). "
+                           f"Result not yet recorded; {tail[0].lower() + tail[1:]}"}
+    rows = (await db.scalars(select(OrchestrationProcessRun).where(
+        OrchestrationProcessRun.goal_id == goal.id, OrchestrationProcessRun.run_id == run.id,
+        OrchestrationProcessRun.process_type.in_(PROCESS_TYPE_VALUES),
+        OrchestrationProcessRun.superseded_by_id.is_(None),
+        OrchestrationProcessRun.status.in_(("running", "waiting_decision")),
+    ).order_by(OrchestrationProcessRun.started_at, OrchestrationProcessRun.id).limit(len(PROCESS_TYPE_VALUES)))).all()
+    if not rows:
+        return {"summary": f"No recorded operation. {tail}"}
+    row = min(rows, key=lambda r: PROCESS_TYPE_VALUES.index(r.process_type))
+    name = _PROCESS_LABELS.get(row.process_type, row.process_type.replace("_", " ")).lower()
+    reference = (await resolve_needs_you_references(
+        db, project_id=goal.project_id, requests=[NeedsYouReferenceRequest("process", row.id, goal.id)]))[0]
+    state = ("waiting for a decision" if row.status == "waiting_decision"
+             else "result not yet recorded")
+    return {"process": reference, "row": row, "occurred_at": row.started_at,
+            "summary": f"Last recorded: {name}. {state[0].upper() + state[1:]}; "
+                       f"{tail[0].lower() + tail[1:]}"}
+
+
+async def build_workflow_facts(
+    db: AsyncSession, *, goal: OrchestrationGoal, run: OrchestrationRun, actions: Sequence[OrchestrationAction],
+    condition: str = "unknown", has_next_check: bool = False,
+    pending: Sequence[OrchestrationAuthorityDecision] | None = None,
+) -> OrchestrationWorkflowFacts:
+    """Compose phase, qualified operation, pending decision, saved-answer state and guidance (read-only)."""
+    if pending is None:
+        pending = await pending_owner_decisions(db, goal=goal, run=run, decisions=(await db.scalars(
+            select(OrchestrationAuthorityDecision).where(OrchestrationAuthorityDecision.run_id == run.id))).all())
+    terminal = condition in _TERMINAL
+    operation = ({"summary": f"Goal {condition}."} if terminal
+                 else await _operation(db, goal=goal, run=run, actions=actions))
+    phase = operation.get("phase") or run.phase
+    chosen = None if terminal else (pending[0] if pending else None)
+    applications = _unapplied_answers(actions)
+    app = applications[0] if applications else None
+    unauthorized = (run.phase == "baseline" and not run.baseline_authorized and not run.pause_requested
+                    and goal.status in {"active", "blocked"} and run.status in {"running", "blocked"})
+
+    def guide(kind, label, decision_id=None, reason=None):
+        return OrchestrationWorkflowGuidance(kind=kind, label=label, decision_id=decision_id, reason=reason)
+
+    if terminal:
+        guidance = guide("none", "No action")
+    elif condition == "paused":
+        reason = ("An owner decision is waiting." if chosen else "A saved answer is waiting to be applied."
+                  if app else None)
+        guidance = guide("resume", "Resume goal", chosen.id if chosen else None, reason)
+    elif chosen:
+        guidance = guide("review_decision", "Answer the owner decision", chosen.id)
+    elif (app and unauthorized and condition != "needs_attention"
+          and (app.state == "pending" or app.reason == _ADMISSION_REASON)):
+        guidance = guide("authorize_baseline", "Authorize remaining baseline", reason="Baseline is not authorized.")
+    elif condition == "needs_attention":
+        guidance = guide("review_blocker", "Resolve current blocker")
+    elif app and app.state == "pending":
+        guidance = guide("wait_application", "Saved — waiting to be applied", reason=app.reason)
+    elif app:
+        guidance = guide("review_blocker", "Resolve saved answer blocker", reason=app.reason or "Application failed.")
+    elif unauthorized and condition in {"unknown", "waiting"}:
+        guidance = guide("authorize_baseline", "Authorize baseline", reason="Baseline is not authorized.")
+    elif condition == "needs_attention":
+        guidance = guide("review_blocker", "Resolve current blocker")
+    elif condition == "waiting":
+        guidance = guide("none", "Wait for scheduled check" if has_next_check else "Await recorded event")
+    elif condition == "working":
+        guidance = guide("none", "Await worker result")
+    else:
+        guidance = guide("none", "No action")
+    return OrchestrationWorkflowFacts(
+        run_id=run.id, control_version=run.control_version, phase=phase,
+        phase_label=_PHASE_LABELS.get(phase, phase.replace("_", " ").capitalize()),
+        process=operation.get("process"), process_type=operation["row"].process_type if "row" in operation else None,
+        process_status=operation["row"].status if "row" in operation else None, task=operation.get("task"),
+        operation_summary=operation["summary"], occurred_at=_time(operation.get("occurred_at")),
+        pending_decision_id=chosen.id if chosen else None,
+        additional_pending_count=max(len(pending) - 1, 0) if chosen else 0,
+        application=app, additional_application_count=max(len(applications) - 1, 0), guidance=guidance,
+    )
+
+
 async def build_orchestration_status_line(
     db: AsyncSession, *, project_id: uuid.UUID, goal: OrchestrationGoal, run: OrchestrationRun,
     actions: Sequence[OrchestrationAction], gates: Sequence[OrchestrationGate],
     evidence: Sequence[OrchestrationEvidence], open_waits: Sequence[OrchestrationWait],
-    worker_facts: Sequence[Mapping[str, object]],
+    worker_facts: Sequence[Mapping[str, object]], workflow: OrchestrationWorkflowFacts | None = None,
 ) -> tuple[OrchestrationStatusLine, OrchestrationSupervisionCondition]:
     """Select current branches and the newest independently timed domain occurrence."""
     decisions = (await db.scalars(select(OrchestrationAuthorityDecision).where(
         OrchestrationAuthorityDecision.run_id == run.id,
     ))).all()
+    pending = await pending_owner_decisions(db, goal=goal, run=run, decisions=decisions)
     cleared = await db.scalar(select(OrchestrationWait).where(
         OrchestrationWait.run_id == run.id, OrchestrationWait.status == "cleared",
         OrchestrationWait.cleared_at.is_not(None),
@@ -118,6 +300,8 @@ async def build_orchestration_status_line(
                "stopped" if stopped_at else "paused" if goal.status == "paused" or run.status == "paused" else None)
     if control:
         activities = []
+    if control in _TERMINAL:
+        pending = []
     reported = [activity for activity in activities if activity.state == "reported_active"]
     current_kind = control or ("working" if reported else "unknown")
     current_summary = {
@@ -126,9 +310,7 @@ async def build_orchestration_status_line(
     }.get(current_kind, " ".join(item.summary for item in reported))
 
     attention: list[tuple[int, datetime | None, OrchestrationStatusAttention]] = []
-    for decision in decisions:
-        if decision.status != "pending" or decision.authority != "human":
-            continue
+    for decision in pending:
         subject = (ref("process", decision.source_process_run_id) or ref("gate", decision.related_gate_id)
                    or ref("action", decision.related_action_id))
         attention.append((0, _time(decision.asked_at or decision.created_at), OrchestrationStatusAttention(
@@ -208,7 +390,14 @@ async def build_orchestration_status_line(
     if stopped_at:
         event(f"goal:{goal.id}:stopped", "stopped", "Continuous policy stopped.", stopped_at)
     events.sort(key=lambda row: (-row.occurred_at.timestamp(), row.kind, row.key))
+    if workflow is None:
+        workflow = await build_workflow_facts(
+            db, goal=goal, run=run, actions=actions, condition=condition, pending=pending,
+            has_next_check=bool(selected and selected.next_check_at),
+        )
+    if current_kind == "unknown" and (workflow.process or workflow.task or workflow.phase == "planning"):
+        current_summary = workflow.operation_summary
     return OrchestrationStatusLine(
         current_state=OrchestrationStatusCurrentState(kind=current_kind, summary=current_summary, activities=activities),
-        attention_summary=selected, last_material_event=events[0] if events else None,
+        attention_summary=selected, last_material_event=events[0] if events else None, workflow=workflow,
     ), condition

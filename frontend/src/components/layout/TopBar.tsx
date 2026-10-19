@@ -40,11 +40,11 @@ export function TopBar({ menuButtonRef }: TopBarProps) {
   const liveStatus = !activeProjectId
     ? { color: STATUS_COLORS.neutral, label: 'No project' }
     : connected
-      ? { color: STATUS_COLORS.green, label: 'Live' }
+      ? { color: STATUS_COLORS.green, label: 'Live connection' }
       : connecting && !hasConnectedOnce
         ? { color: STATUS_COLORS.blue, label: 'Connecting' }
         : retrying || hasConnectedOnce
-          ? { color: STATUS_COLORS.amber, label: 'Reconnecting' }
+          ? { color: STATUS_COLORS.amber, label: 'Connection paused' }
           : { color: STATUS_COLORS.neutral, label: 'Off' }
 
   function handleLogout() {

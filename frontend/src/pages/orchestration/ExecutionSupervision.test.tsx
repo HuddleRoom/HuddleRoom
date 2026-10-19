@@ -41,7 +41,7 @@ async function mountSupervision(initial: OrchestrationSupervision | null) {
 describe('ExecutionSupervision', () => {
   it('renders all read-only sections in semantic order, with responsive wrapping and no controls', () => {
     const html = renderToStaticMarkup(<ExecutionSupervision supervision={supervision} />)
-    const labels = ['Verified progress', 'Useful learning', 'Accepted evidence', 'Workers', 'Open waits', 'Recovery linkage', 'Criterion', 'Criterion status', 'Pending question']
+    const labels = ['Verified progress', 'Useful learning', 'Accepted evidence', 'Workers', 'Runtime waits', 'Recovery linkage', 'Criterion', 'Criterion status', 'Pending owner decision']
     for (const label of ['Current operation', ...labels, 'Budget', 'consumed', 'committed', 'reserved', 'remaining']) expect(html).toContain(label)
     expect(html).toContain('committed tokens 30')
     expect(html).toContain('flex flex-wrap')
@@ -55,10 +55,19 @@ describe('ExecutionSupervision', () => {
     for (const value of ['build', 'verified', 'Build passed', 'cache', 'accepted', 'Cache miss explained', 'evidence-1', 'gate-1', 'report-1', 'event-1', 'producer-1', 'artifact-1', 'session-1', 'task-1', 'agent-1', 'runner-1', 'wait-1', 'session.completed', 'Timeout', 'action-1', 'stalled', 'missing']) expect(html).toContain(value)
     expect(html).not.toContain('private_value')
     expect(html).not.toContain('{&quot;')
-    expect(['Criterion', 'Criterion status', 'Verified progress', 'Useful learning', 'Accepted evidence', 'Workers', 'Open waits', 'Recovery linkage', 'Pending question'].map((label) => html.indexOf(label))).toEqual([
-      ...['Criterion', 'Criterion status', 'Verified progress', 'Useful learning', 'Accepted evidence', 'Workers', 'Open waits', 'Recovery linkage', 'Pending question'].map((label) => html.indexOf(label)),
+    expect(['Criterion', 'Criterion status', 'Verified progress', 'Useful learning', 'Accepted evidence', 'Workers', 'Runtime waits', 'Recovery linkage', 'Pending owner decision'].map((label) => html.indexOf(label))).toEqual([
+      ...['Criterion', 'Criterion status', 'Verified progress', 'Useful learning', 'Accepted evidence', 'Workers', 'Runtime waits', 'Recovery linkage', 'Pending owner decision'].map((label) => html.indexOf(label)),
     ].sort((a, b) => a - b))
     expect(html).not.toMatch(/<(?:button|input|select|textarea|a)\b/)
+  })
+
+  it('labels runtime waits and shows the pending owner decision even when paused', () => {
+    const html = renderToStaticMarkup(<ExecutionSupervision supervision={snapshot({ condition: 'paused', next_action: 'Resume goal' })} />)
+    expect(html).toContain('Recorded runtime waits; owner decisions are listed above.')
+    expect(html).toContain('Pending owner decision')
+    expect(html).toContain('Where should this deploy?')
+    expect(html).toContain('Resume goal')
+    expect(html).not.toContain('Open waits')
   })
 
   it('uses None fallbacks for absent optional facts', () => {

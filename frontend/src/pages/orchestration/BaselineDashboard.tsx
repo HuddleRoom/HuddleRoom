@@ -38,9 +38,10 @@ import type {
   NeedsYouReference,
   OrchestrationProcessRunRecord,
   OrchestrationRun,
+  OrchestrationStatusLine,
   OrchestrationWarningRecord,
 } from '@/lib/types'
-import { BASELINE_PROCESS_TYPES, processLabel, statusPhrase } from './humanize'
+import { BASELINE_PROCESS_TYPES, processLabel, statusPhrase, workflowApplicationText, workflowGuidanceText } from './humanize'
 import { frontierProcessType, isTerminalProcess, ProcessChain } from './ProcessChain'
 import { ProcessFocus } from './ProcessFocus'
 import { NeedsYouQueue, type RecoveryAnswerOption } from './NeedsYouQueue'
@@ -75,6 +76,7 @@ export interface BaselineDashboardProps {
   goalId: string
   goal: OrchestrationGoal
   run: OrchestrationRun | null
+  statusLine?: OrchestrationStatusLine | null
   // Fetched by the goal-detail query (not useBaselineDashboard) — threaded in
   // so the Needs-you queue can rank failed gates without a duplicate fetch.
   meetingCommitments?: readonly OrchestrationMeetingCommitment[]
@@ -619,7 +621,7 @@ function TeamHierarchyStatus({ decisions, process, reviews }: { decisions: reado
   </section>
 }
 
-export function BaselineDashboard({ projectId, goalId, goal, run, gates, meetingCommitments = [], needsYouReferences = [], sourceActionIds = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, onRevealSource, renderBlockerRecovery, suppressQueueAnnouncement, queueAnnouncementScope, getMutationGeneration }: BaselineDashboardProps) {
+export function BaselineDashboard({ projectId, goalId, goal, run, statusLine, gates, meetingCommitments = [], needsYouReferences = [], sourceActionIds = [], mutationBusy, acquireMutation, releaseMutation, onMessage, onSelectedProcessTypeChange, onViewActivity, onRevealSource, renderBlockerRecovery, suppressQueueAnnouncement, queueAnnouncementScope, getMutationGeneration }: BaselineDashboardProps) {
   const health = useOrchestrationHealth()
   const currentUser = useCurrentUser()
   const answer = useAnswerOrchestrationDecision(projectId)
@@ -1304,7 +1306,8 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
       onSettled: () => {
         if (!isCurrent()) return
         releaseMutation(owner)
-        trigger?.focus()
+        if (trigger?.isConnected) trigger.focus()
+        else focusHeadingRef.current?.focus()
       },
     })
   }
@@ -1391,16 +1394,21 @@ export function BaselineDashboard({ projectId, goalId, goal, run, gates, meeting
 
   return <div data-testid="baseline-dashboard" className="flex min-w-0 flex-col gap-4">
     <TeamHierarchyStatus decisions={decisions} reviews={dashboard.agentReviews.data ?? []} process={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)} />
-    <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
+    <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} statusLine={statusLine} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
     {processState === 'ready' && <>
       {savedAnswers.length > 0 && <section aria-label="Saved answers" className="mb-3 space-y-2">{savedAnswers.map((receipt) => <p key={receipt.action_id ?? receipt.decision_ids.join(':')} className="break-words rounded border border-huddleroom-border p-3 text-sm">
-        <strong>Saved.</strong> {receipt.application_state === 'pending' ? 'Application pending.'
+        <strong>Saved.</strong> {statusLine?.workflow ? (!statusLine.workflow.application && receipt.application_state === 'applied' ? 'Application complete.' : null) : receipt.application_state === 'pending' ? 'Application pending.'
           : receipt.application_state === 'failed' || receipt.application_state === 'blocked' ? `Application ${receipt.application_state}${receipt.reason ? `: ${receipt.reason}` : '.'}` : 'Application complete.'}
       </p>)}</section>}
       {checkingAnswer && <div className="mb-3 rounded border border-huddleroom-border p-3 text-sm">
         <p>Checking saved answer… Your frozen draft is retained.</p>
         <Button type="button" variant="secondary" className="mt-2 min-h-11" disabled={ordinarySubmitting || mutationBusy} onClick={() => { void checkFrozenAnswer() }}>Check saved answer</Button>
       </div>}
+      {statusLine?.workflow && <p className="mb-2 min-w-0 break-words text-sm text-huddleroom-text-secondary">
+        {statusLine.workflow.phase_label} · {statusLine.workflow.operation_summary}
+        {workflowApplicationText(statusLine.workflow) && <> · {workflowApplicationText(statusLine.workflow)}</>}
+        {statusLine.workflow.guidance.kind !== 'none' && <> · Next: {workflowGuidanceText(statusLine.workflow)}</>}
+      </p>}
       <NeedsYouQueue
         goal={goal} run={run} processes={processes} sourceProcesses={dashboard.processes.data ?? []} warnings={warnings} gates={gates} meetingCommitments={meetingCommitments}
         checkpointItems={checkpointItems} allDecisions={decisions} authorityReady={authorityReady} invalidatedDecisions={invalidatedDecisions} needsYouReferences={needsYouReferences} sourceActionIds={sourceActionIds}

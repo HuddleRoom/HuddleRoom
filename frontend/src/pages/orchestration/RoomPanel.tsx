@@ -17,6 +17,7 @@ export interface RoomPanelMeetingRow {
 
 export interface RoomPanelProps {
   goalTitle: string
+  showGoalTitle?: boolean
   agentRows: RoomPanelAgentRow[]
   meetingRow: RoomPanelMeetingRow | null
   gates: { total: number; accepted: number; open: number; failed: number } | null
@@ -33,21 +34,21 @@ function AgentPill({ adapterType, provider }: { adapterType?: AdapterType; provi
   )
 }
 
-export function RoomPanel({ goalTitle, agentRows, meetingRow, gates }: RoomPanelProps) {
+export function RoomPanel({ goalTitle, showGoalTitle = true, agentRows, meetingRow, gates }: RoomPanelProps) {
   const hasBelow = agentRows.length > 0 || meetingRow !== null || gates !== null
   const verified = gates !== null && gates.open === 0 && gates.failed === 0
 
   return (
     <section
-      aria-labelledby="room-panel-title"
+      {...(showGoalTitle ? { 'aria-labelledby': 'room-panel-title' } : { 'aria-label': 'Delegated work' })}
       className="w-full rounded-lg border border-huddleroom-border bg-white px-5 py-4 shadow-[0_1px_2px_rgba(31,34,38,.06),0_12px_32px_rgba(31,34,38,.06)] max-md:px-4 max-md:py-3"
     >
-      <h2
+      {showGoalTitle && <h2
         id="room-panel-title"
         className={`m-0 text-title font-semibold text-huddleroom-text-primary ${hasBelow ? 'border-b border-huddleroom-border pb-3 mb-3' : ''}`}
       >
         {goalTitle}
-      </h2>
+      </h2>}
 
       {!hasBelow && (
         <p className="m-0 pt-1 text-body text-huddleroom-text-muted">Agents appear here when work is delegated.</p>

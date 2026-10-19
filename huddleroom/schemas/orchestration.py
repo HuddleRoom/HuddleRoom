@@ -1277,10 +1277,54 @@ class OrchestrationStatusEvent(BaseModel):
     occurred_at: datetime
 
 
+WorkflowGuidanceKind = Literal[
+    "resume", "review_decision", "authorize_baseline", "wait_application", "review_blocker", "refresh", "none",
+]
+
+
+class OrchestrationWorkflowGuidance(BaseModel):
+    """Names an existing permitted action or prerequisite; grants nothing."""
+
+    kind: WorkflowGuidanceKind
+    label: str
+    decision_id: uuid.UUID | None = None
+    reason: str | None = None
+
+
+class OrchestrationWorkflowApplication(BaseModel):
+    """First saved-but-unapplied owner answer (G1); saved is not applied."""
+
+    action_id: uuid.UUID
+    decision_ids: list[uuid.UUID]
+    state: Literal["pending", "blocked", "failed"]
+    reason: str | None = None
+
+
+class OrchestrationWorkflowFacts(BaseModel):
+    """Derived, read-only workflow facts; absence means unavailable, never accepted-none."""
+
+    run_id: uuid.UUID
+    control_version: int | None = None
+    phase: str
+    phase_label: str
+    process: "NeedsYouReference | None" = None
+    process_type: str | None = None
+    process_status: str | None = None
+    task: "NeedsYouReference | None" = None
+    operation_summary: str
+    occurred_at: datetime | None = None
+    pending_decision_id: uuid.UUID | None = None
+    additional_pending_count: int = 0
+    application: OrchestrationWorkflowApplication | None = None
+    additional_application_count: int = 0
+    guidance: OrchestrationWorkflowGuidance
+
+
 class OrchestrationStatusLine(BaseModel):
     current_state: OrchestrationStatusCurrentState
     attention_summary: OrchestrationStatusAttention | None = None
     last_material_event: OrchestrationStatusEvent | None = None
+    workflow: OrchestrationWorkflowFacts | None = None
 
 
 class OrchestrationSupervisionResponse(BaseModel):

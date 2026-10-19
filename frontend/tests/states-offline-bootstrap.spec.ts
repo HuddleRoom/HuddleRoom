@@ -2,19 +2,19 @@ import { expect, test } from '@playwright/test'
 import { gotoDashboard, selectSeedProject } from './support/pages/app'
 import { detail, goal, interceptOrchestration, openOrchestrationGoal, run } from './support/orchestration-fixtures'
 
-// Phase 8 Verify bar: WS badge (TopBar) flips Live -> Reconnecting/Off within
+// Phase 8 Verify bar: WS badge (TopBar) flips Live connection -> Connection paused/Off within
 // ~12s of the socket dropping (client heartbeat deadline is 10s, checked
 // every 2s) and recovers once the network is restored.
-test('WS badge flips to Reconnecting/Off when offline and recovers on reconnect', async ({ page, context }) => {
+test('WS badge flips to Connection paused/Off when offline and recovers on reconnect', async ({ page, context }) => {
   await gotoDashboard(page)
   await selectSeedProject(page)
-  await expect(page.getByText('Live', { exact: true })).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText('Live connection', { exact: true })).toBeVisible({ timeout: 15_000 })
 
   await context.setOffline(true)
-  await expect(page.getByText(/^(Reconnecting|Off)$/)).toBeVisible({ timeout: 13_000 })
+  await expect(page.getByRole('banner').getByText(/^(Connection paused|Off)$/)).toBeVisible({ timeout: 13_000 })
 
   await context.setOffline(false)
-  await expect(page.getByText('Live', { exact: true })).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText('Live connection', { exact: true })).toBeVisible({ timeout: 20_000 })
 })
 
 // Phase 8 Verify bar: a delayed /api/v1/config response shows the neutral
@@ -38,7 +38,7 @@ test('shows the shell instead of a blank page while /config is delayed', async (
 test('has zero polling requests to hot query endpoints while the socket is connected', async ({ page }) => {
   await gotoDashboard(page)
   await selectSeedProject(page)
-  await expect(page.getByText('Live', { exact: true })).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText('Live connection', { exact: true })).toBeVisible({ timeout: 15_000 })
 
   const hotEndpoint = /\/tasks\/count|\/sessions\/count|\/graph-runs\/count|\/api\/v1\/events\b/
   const seen = new Set<string>()

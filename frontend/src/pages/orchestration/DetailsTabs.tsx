@@ -119,6 +119,7 @@ function MemoryTabContent({ projectId, goalId, memory }: { projectId: string; go
   ]
 
   return <div className="flex flex-col gap-4">
+    <p className="text-xs text-huddleroom-text-muted">Recorded history — see Current operation for current status.</p>
     <RecordList rows={rows.map(([key, value]) => ({ key, value }))} />
 
     {preface.active_warnings.length > 0 && <div>
