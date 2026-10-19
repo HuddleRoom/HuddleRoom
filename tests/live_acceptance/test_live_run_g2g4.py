@@ -1395,13 +1395,18 @@ def test_live_run_g2g4_l():
         pytest.fail("LIVE_ACCEPTANCE_G2G4_L_CAMPAIGN_CAP must be a positive integer")
     # Historical campaign ledger keeps its original cap on line 1; the authorized cap goes to a fresh ledger.
     historical = root / "campaign-spend.jsonl"
-    prior = _ledger_totals_readonly(historical)["global"]["non_cached"]
     campaign_path = root / f"campaign-spend-g2g4-L-{cap}.jsonl"
+    # Each earlier override ledger already carries the earlier prior plus its own spend, so take the max, not the sum.
+    prior_files = [historical, *sorted(root.glob("campaign-spend-g2g4-L-*.jsonl"))]
+    per_file = {p.name: _ledger_totals_readonly(p)["global"]["non_cached"] for p in prior_files if p != campaign_path}
+    prior_source = max(per_file, key=per_file.get)
+    prior = per_file[prior_source]
     seed_campaign(campaign_path, cap, {"prior_campaign_total": prior})
     with G2G4Scenario("g2g4-L", Path(SNAP), root, CAP, hold_spec=spec, roster="g2g4",
                       campaign_ledger_path=campaign_path, campaign_cap=cap) as sc:
         sc.continue_through_warning = True
         if not hasattr(sc, "warning_recorded"):
             sc.warning_recorded = set()
-        sc.findings["historical_campaign_audit"] = {"path": str(historical), "prior_total": prior, "cap": cap}
+        sc.findings["historical_campaign_audit"] = {"path": str(historical), "prior_total": prior, "cap": cap,
+                                                    "per_file_non_cached": per_file, "prior_source": prior_source}
         _run_l(sc)
