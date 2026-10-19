@@ -45,7 +45,9 @@ from huddleroom.services.orchestration_budget_service import (
 from huddleroom.services.orchestration_process_service import OrchestrationProcessService
 from huddleroom.services.orchestration_dependencies import RETAINED_GATE_TYPE
 from huddleroom.services.event_bus import emit_event_once
-from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+from huddleroom.services.orchestration_authority_service import (
+    OrchestrationAuthorityDecisionService, inherit_execution_grant,
+)
 
 def retained_gate_id(run_id, source_gate_id) -> uuid.UUID:
     """Successor gate retaining source_gate_id; equals _ensure_keyed_gate(run_id, RETAINED_GATE_TYPE, str(source_gate_id))."""
@@ -1331,13 +1333,11 @@ class OrchestrationRoadmapService:
                     goal_id=goal.id, first_version_id=version.id, item_key=item.item_key, unit_type="goal",
                     item_snapshot=item.model_dump(mode="json"), child_goal_id=child.id, task_id=None, gate_id=gate.id,
                 )
-                action = OrchestrationAction(
-                    id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:authorize-child:{child_run.id}"), run_id=child_run.id,
-                    idempotency_key=f"run:{child_run.id}:kind:authorize_execution", action_type="authorize_execution",
-                    status="completed", request={"action_type": "authorize_execution", "actor": f"roadmap_parent:{goal.id}"},
-                    target_type="run", target_id=child_run.id,
-                )
-                db.add_all([gate, lineage, action])
+                if await inherit_execution_grant(
+                    db, goal, run, child, child_run, actor=f"roadmap_parent:{goal.id}",
+                ) is None:
+                    raise HTTPException(status_code=409, detail="roadmap_execution_scope_required")
+                db.add_all([gate, lineage])
                 await db.flush()
                 await OrchestrationBudgetService().reserve_child(db, goal, lineage, item.allocation)
                 await emit_event_once(
@@ -1562,16 +1562,10 @@ class OrchestrationRoadmapService:
             child_run.phase = "authorized"
             if child_run.goal_contract_fingerprint is None:
                 child_run.goal_contract_fingerprint = compute_goal_contract_fingerprint(child)
-            if await db.get(OrchestrationAction, action_id := uuid.uuid5(
-                uuid.NAMESPACE_URL, f"rally:authorize-child:{child_run.id}",
-            )) is None:
-                db.add(OrchestrationAction(
-                    id=action_id, run_id=child_run.id,
-                    idempotency_key=f"run:{child_run.id}:kind:authorize_execution",
-                    action_type="authorize_execution", status="completed",
-                    request={"action_type": "authorize_execution", "actor": f"roadmap_parent:{goal.id}"},
-                    target_type="run", target_id=child_run.id,
-                ))
+            if await inherit_execution_grant(
+                db, goal, run, child, child_run, actor=f"roadmap_parent:{goal.id}",
+            ) is None:
+                raise HTTPException(status_code=409, detail="roadmap_execution_scope_required")
             renewed += 1
         if renewed:
             await db.flush()

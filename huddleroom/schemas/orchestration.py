@@ -712,6 +712,7 @@ _CONTRACT_NEW_DEFAULTS: dict[str, Any] = {
 }
 _ITEM_NEW_DEFAULTS: dict[str, Any] = {
     "adopt_task_id": None, "artifact_ids": [], "priority": 50, "why_runnable": "",
+    "owner_type": "agent",
 }
 
 
@@ -760,7 +761,7 @@ class OrchestrationPlanItem(BaseModel):
 
     id: str = Field(min_length=1, max_length=80)
     title: str | None = None
-    work_function: str = Field(min_length=1)
+    work_function: str | None = Field(default=None, min_length=1)
     scope: str = Field(min_length=1)
     deliverable: str = Field(min_length=1)
     agent_id: uuid.UUID | None = None
@@ -780,6 +781,7 @@ class OrchestrationPlanItem(BaseModel):
     artifact_ids: list[uuid.UUID] = Field(default_factory=list)
     priority: StrictInt = Field(50, ge=0, le=100)
     why_runnable: str = ""
+    owner_type: Literal["agent", "human"] = "agent"
 
     @field_validator("why_runnable", mode="before")
     @classmethod
@@ -812,6 +814,15 @@ class OrchestrationPlanItem(BaseModel):
             return value
         return list(dict.fromkeys(item_text for item in value if (item_text := str(item).strip())))
 
+    @model_validator(mode="after")
+    def validate_owner(self):
+        if self.owner_type == "agent":
+            if not self.work_function:
+                raise ValueError("agent plan item requires work_function")
+        elif self.work_function is not None or self.agent_id is not None or self.adopt_task_id is not None:
+            raise ValueError("human plan item cannot define agent work fields")
+        return self
+
 
 class OrchestrationRoadmapPlanItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -839,6 +850,7 @@ class OrchestrationRoadmapPlanItem(BaseModel):
     priority: StrictInt = Field(50, ge=0, le=100)
     why_runnable: str = ""
     goal_type: Literal["auto", "outcome", "roadmap"] | None = None
+    owner_type: Literal["agent", "human"] = "agent"
 
     @field_validator("goal_type", mode="before")
     @classmethod
@@ -893,8 +905,11 @@ class OrchestrationRoadmapPlanItem(BaseModel):
         if self.unit_type == "task":
             if self.goal_type is not None:
                 raise ValueError("task item cannot define goal_type")
-            if not all((self.work_function, self.scope, self.deliverable)):
+            if self.owner_type == "agent" and not all((self.work_function, self.scope, self.deliverable)):
                 raise ValueError("task item requires work_function, scope, and deliverable")
+            if self.owner_type == "human":
+                if self.work_function is not None or self.agent_id is not None or self.adopt_task_id is not None:
+                    raise ValueError("human task item cannot define agent work fields")
             if self.objective is not None or self.success_criteria or self.constraints or self.allocation:
                 raise ValueError("task item cannot define child goal fields or allocation")
         else:
@@ -902,16 +917,19 @@ class OrchestrationRoadmapPlanItem(BaseModel):
                 raise ValueError("goal item requires objective, success_criteria, and allocation")
             if any((self.work_function, self.scope, self.deliverable, self.agent_id)):
                 raise ValueError("goal item cannot define task-only fields")
+            if self.owner_type != "agent":
+                raise ValueError("goal item cannot define human ownership")
         return self
 
 
 PLAN_ITEM_PROMPT_FIELDS: dict[str, str] = {
-    "id": "str", "title": "str|null", "work_function": "str", "scope": "str", "deliverable": "str",
+    "id": "str", "title": "str|null", "work_function": "str|null", "scope": "str", "deliverable": "str",
     "agent_id": "uuid|null", "inputs": "list[str]", "forbidden_work": "list[str]",
     "success_evidence": "list[str]", "required_capabilities": "list[str]",
     "required_evidence": "dict", "success_criterion_keys": "list[str]", "depends_on": "list[str]",
     "adopt_task_id": "uuid|null", "artifact_ids": "list[uuid]",
     "priority": "int 0..100 (default 50)", "why_runnable": "str (required, nonblank)",
+    "owner_type": "agent|human (default agent)",
 }
 ROADMAP_ITEM_PROMPT_FIELDS: dict[str, str] = {
     "item_key": "str", "unit_type": "task|goal", "title": "str", "depends_on": "list[str]",
@@ -923,6 +941,7 @@ ROADMAP_ITEM_PROMPT_FIELDS: dict[str, str] = {
     "adopt_task_id": "uuid|null", "artifact_ids": "list[uuid]",
     "priority": "int 0..100 (default 50)", "why_runnable": "str (required, nonblank)",
     "goal_type": "auto|outcome|roadmap|null (goal items only)",
+    "owner_type": "agent|human (default agent)",
 }
 
 
@@ -968,6 +987,13 @@ class PauseControlRequest(BaseModel):
     run_id: uuid.UUID
     expected_control_version: int = Field(ge=0)
     request_id: uuid.UUID
+
+
+class OrchestrationStartRequest(BaseModel):
+    run_id: uuid.UUID
+    expected_control_version: int = Field(ge=0)
+    request_id: uuid.UUID
+    scope: Literal["planning_only", "execution"]
 
 
 class ControlSnapshot(BaseModel):
@@ -1278,6 +1304,40 @@ class OrchestrationSupervisionResponse(BaseModel):
 
 
 PlanItemState = Literal["queued", "started", "evidence_pending", "accepted", "failed", "cancelled"]
+
+
+class PlanReviewIdentity(BaseModel):
+    """The server-owned binding for one readable plan candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: uuid.UUID
+    goal_id: uuid.UUID
+    run_id: uuid.UUID
+    artifact_id: uuid.UUID
+    planning_task_id: uuid.UUID
+    planning_version: int = Field(gt=0)
+    winning_session_id: uuid.UUID | None = None
+    provenance_hash: ContractFingerprint
+    canonical_content_hash: ContractFingerprint
+    renderer_version: int = Field(gt=0)
+    rendered_content_hash: ContractFingerprint
+    review_cycle: int = Field(gt=0)
+
+
+class PlanReviewRecord(BaseModel):
+    """Persisted review applicability, kept in ``run.plan_state`` rather than Artifact metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    identity: PlanReviewIdentity
+    state: Literal["ready", "stale", "accepted", "superseded"]
+    export_path: str | None = None
+    markdown: str
+    owner_names: dict[str, str] = Field(default_factory=dict)
+    reason: str | None = None
+    authority_kind: str | None = None
+    authority_ref: uuid.UUID | None = None
 
 
 class OrchestrationPlanItemView(BaseModel):

@@ -184,6 +184,11 @@ async def test_execution_start_keeps_confirmation_and_one_authorization(sessions
     project, user, goal, run = await _ready(sessions, tmp_path)
     turn, action = await _prepare(sessions, user, goal, "start_execution", content="Start execution work for this goal")
     assert action.requires_confirmation
+    assert action.frozen_versions == {
+        "state": action.frozen_versions["state"], "scope": "execution",
+        "request_id": str(action.action_id), "run_id": str(run.id),
+        "control_version": str(run.control_version),
+    }
     async with sessions() as db:
         pending = await _service(sessions).execute(db, await db.get(ProjectChatTurn, turn.id), action)
         await db.commit()
@@ -215,11 +220,37 @@ async def test_start_envelope_drift_requires_refreshed_review_and_new_acceptance
         refreshed = ChatActionDraft.model_validate(row.action_draft)
     assert refreshed.frozen_versions != action.frozen_versions
     assert refreshed.action_id != action.action_id
+    assert refreshed.frozen_versions["request_id"] == str(refreshed.action_id)
+    assert refreshed.frozen_versions["run_id"] == str(run.id)
+    assert refreshed.frozen_versions["control_version"] == str(run.control_version)
     assert "200" in refreshed.summary
     # Explicitly accepting the newly shown summary is a fresh no-LLM confirmation.
     result = await _service(sessions).confirm(project.id, user.id, refreshed.action_id, uuid.uuid4())
     assert result.status == "completed"
     assert (await _states(sessions, goal, run))[1].phase == "authorized"
+
+
+@pytest.mark.parametrize("field,value", [("control_version", None), ("scope", "planning_only")])
+async def test_start_rejects_missing_or_changed_frozen_envelope(sessions, tmp_path, field, value):
+    project, user, goal, run = await _ready(sessions, tmp_path)
+    turn, action = await _prepare(sessions, user, goal, "start_execution", content="Start execution work for this goal")
+    async with sessions() as db:
+        row = await db.get(ProjectChatTurn, turn.id)
+        draft = dict(row.action_draft)
+        versions = dict(draft["frozen_versions"])
+        if value is None:
+            versions.pop(field)
+        else:
+            versions[field] = value
+        draft["frozen_versions"] = versions
+        row.action_draft = draft
+        await db.commit()
+    with pytest.raises(HTTPException) as error:
+        await _service(sessions).confirm(project.id, user.id, action.action_id, uuid.uuid4())
+    assert error.value.status_code == 409
+    assert (await _states(sessions, goal, run))[1].phase == "ready"
+    async with sessions() as db:
+        assert (await db.get(ProjectChatTurn, turn.id)).action_receipt is None
 
 
 async def test_baseline_authorization_never_chains_execution(sessions, tmp_path):

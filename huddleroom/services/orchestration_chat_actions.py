@@ -193,7 +193,14 @@ class OrchestrationChatActionService:
             prepared = action.model_copy(deep=True)
             prepared.run_id = run.id if run else None
             prepared.frozen_versions = {"state": fingerprint(state)}
-            if action.operation == "pause" and run is not None:
+            if action.operation in {"start_execution", "restart_execution"}:
+                if run is None:
+                    raise conflict("chat_stale_review", "Start requires an active run")
+                prepared.frozen_versions.update({
+                    "scope": "execution", "request_id": str(prepared.action_id),
+                    "run_id": str(run.id), "control_version": str(run.control_version),
+                })
+            elif action.operation == "pause" and run is not None:
                 prepared.frozen_versions["control_version"] = str(run.control_version)
             prepared.requires_confirmation = action.operation in CONFIRM_OPERATIONS
             prepared.status = "awaiting_confirmation" if prepared.requires_confirmation else "prepared"
@@ -269,7 +276,14 @@ class OrchestrationChatActionService:
                     refreshed = action.model_copy(deep=True)
                     refreshed.action_id = uuid.uuid4()
                     refreshed.frozen_versions = {"state": fingerprint(state)}
-                    if action.operation == "pause" and run is not None:
+                    if action.operation in {"start_execution", "restart_execution"}:
+                        if run is None:
+                            raise conflict("chat_stale_review", "Start requires an active run")
+                        refreshed.frozen_versions.update({
+                            "scope": "execution", "request_id": str(refreshed.action_id),
+                            "run_id": str(run.id), "control_version": str(run.control_version),
+                        })
+                    elif action.operation == "pause" and run is not None:
                         refreshed.frozen_versions["control_version"] = str(run.control_version)
                     refreshed.summary = "Limits changed. Review and confirm these current limits.\n" + json.dumps(state, sort_keys=True, default=str)
                     if len(refreshed.summary) > 12000:
@@ -331,7 +345,20 @@ class OrchestrationChatActionService:
         if op == "start_baseline":
             await self._orchestration.authorize_baseline(db, project_id, goal_id, actor=f"human:{user.id}")
         elif op in {"start_execution", "restart_execution"}:
-            await self._orchestration.start_run(db, project_id, goal_id, actor=f"human:{user.id}", commit=False)
+            try:
+                scope = action.frozen_versions["scope"]
+                request_id = uuid.UUID(str(action.frozen_versions["request_id"]))
+                expected_run_id = uuid.UUID(str(action.frozen_versions["run_id"]))
+                expected_control_version = int(action.frozen_versions["control_version"])
+            except (KeyError, TypeError, ValueError):
+                raise conflict("chat_stale_review", "Reviewed Start envelope is incomplete") from None
+            if scope != "execution" or request_id != action.action_id or expected_run_id != action.run_id:
+                raise conflict("chat_stale_review", "Reviewed Start envelope changed")
+            await self._orchestration.start_run(
+                db, project_id, goal_id, actor=f"human:{user.id}", scope=scope, commit=False,
+                request_id=request_id, expected_run_id=expected_run_id,
+                expected_control_version=expected_control_version,
+            )
         elif op == "pause":
             await self._orchestration.pause_goal(
                 db, project_id, goal_id, commit=False, actor_user_id=user.id, run_id=action.run_id,

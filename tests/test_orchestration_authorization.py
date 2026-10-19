@@ -2,6 +2,7 @@ import json
 import uuid
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -824,6 +825,362 @@ def test_plan_gate_type_is_a_readiness_gate():
 async def _actions(db, run, action_type):
     return (await db.scalars(select(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == action_type))).all()
+
+
+@pytest.mark.asyncio
+async def test_g3_planning_start_requires_explicit_execution_upgrade(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+                            request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version)
+    denied = await effective_authorization(db_session, goal, run)
+    assert (denied.allowed, denied.reason_code) == (False, "execution_scope_required")
+
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:a", scope="execution",
+                            request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version)
+    assert (await effective_authorization(db_session, goal, run)).allowed
+    grants = await _actions(db_session, run, "grant_execution")
+    assert len(grants) == 1 and grants[0].request["scope"] == "execution"
+
+
+@pytest.mark.asyncio
+async def test_g3_omitted_start_scope_keeps_legacy_execution_compatibility(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:a")
+    (start,) = await _actions(db_session, run, "authorize_execution")
+    assert "scope" not in start.request and "scope_contract_version" not in (run.plan_state or {})
+    assert (await effective_authorization(db_session, goal, run)).allowed
+
+
+@pytest.mark.asyncio
+async def test_g3_scoped_start_rejects_stale_control_without_authorizing(db_session, test_project):
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+
+    with pytest.raises(HTTPException) as error:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+            request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version + 1,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["conflict"] == "stale_start_request"
+    assert run.phase == "ready"
+    assert await _actions(db_session, run, "authorize_execution") == []
+
+
+@pytest.mark.asyncio
+async def test_g3_start_request_replay_is_idempotent_but_scope_change_conflicts(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    request_id = uuid.uuid4()
+    request = {
+        "scope": "planning_only", "request_id": request_id,
+        "expected_run_id": run.id, "expected_control_version": run.control_version,
+    }
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:a", **request)
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:a", **request)
+    assert len(await _actions(db_session, run, "authorize_execution")) == 1
+
+    with pytest.raises(HTTPException) as error:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="execution",
+            request_id=request_id, expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+
+    assert error.value.status_code == 409
+    assert (await effective_authorization(db_session, goal, run)).reason_code == "execution_scope_required"
+    assert await _actions(db_session, run, "grant_execution") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["control", "replacement"])
+async def test_g3_scoped_start_rereads_control_after_writer_admission(
+    db_session, test_project, monkeypatch, mutation,
+):
+    from huddleroom.services import orchestration_control
+
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    original = orchestration_control.acquire_control_writer
+
+    async def mutate_after_lock(db, run_id):
+        await original(db, run_id)
+        current = await db.get(OrchestrationRun, run_id)
+        if mutation == "control":
+            current.control_version += 1
+        else:
+            current.status = "cancelled"
+            db.add(OrchestrationRun(goal_id=goal.id))
+        await db.flush()
+
+    monkeypatch.setattr(orchestration_control, "acquire_control_writer", mutate_after_lock)
+    with pytest.raises(HTTPException) as error:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+            request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["conflict"] == "stale_start_request"
+    assert await _actions(db_session, run, "authorize_execution") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["planning_only", "execution"])
+async def test_g3_new_start_request_receipt_is_idempotent_and_scope_bound(db_session, test_project, scope):
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    await service.start_run(
+        db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+        request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version,
+    )
+    retry_id = uuid.uuid4()
+    await service.start_run(
+        db_session, test_project.id, goal.id, actor="human:a", scope=scope,
+        request_id=retry_id, expected_run_id=run.id, expected_control_version=run.control_version,
+    )
+    await service.start_run(
+        db_session, test_project.id, goal.id, actor="human:a", scope=scope,
+        request_id=retry_id, expected_run_id=run.id, expected_control_version=run.control_version,
+    )
+    receipts = [action for action in (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+    ))).all() if action.action_type == "start_receipt" and (action.request or {}).get("request_id") == str(retry_id)]
+    assert len(receipts) == 1 and receipts[0].status == "completed"
+
+    with pytest.raises(HTTPException) as error:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a",
+            scope="execution" if scope == "planning_only" else "planning_only",
+            request_id=retry_id, expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+
+    assert error.value.status_code == 409
+    assert len([action for action in (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+    ))).all() if action.action_type == "start_receipt" and (action.request or {}).get("request_id") == str(retry_id)]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("planning_precedes_upgrade", [False, True])
+async def test_g3_new_planning_start_cannot_downgrade_execution_grant(
+    db_session, test_project, planning_precedes_upgrade,
+):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    planning_id = uuid.uuid4()
+    if planning_precedes_upgrade:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+            request_id=planning_id, expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+    await service.start_run(
+        db_session, test_project.id, goal.id, actor="human:a", scope="execution",
+        request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version,
+    )
+    old_receipts = [action.id for action in (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+    ))).all() if (action.request or {}).get("request_id") == str(planning_id)]
+    control_version = run.control_version
+    if planning_precedes_upgrade:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+            request_id=planning_id, expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+        assert [action.id for action in (await db_session.scalars(select(OrchestrationAction).where(
+            OrchestrationAction.run_id == run.id,
+        ))).all() if (action.request or {}).get("request_id") == str(planning_id)] == old_receipts
+    rejected_id = uuid.uuid4()
+    with pytest.raises(HTTPException) as error:
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+            request_id=rejected_id, expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["conflict"] == "unsupported_scope_downgrade"
+    assert (await effective_authorization(db_session, goal, run)).allowed
+    assert run.control_version == control_version
+    assert not [action for action in (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+    ))).all() if (action.request or {}).get("request_id") == str(rejected_id)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["scope", "run", "control", "contract"])
+async def test_g3_start_request_reuse_rejects_changed_identity(db_session, test_project, conflict):
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    request_id = uuid.uuid4()
+    request = {
+        "scope": "planning_only", "request_id": request_id,
+        "expected_run_id": run.id, "expected_control_version": run.control_version,
+    }
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:a", **request)
+    before = await db_session.scalar(select(OrchestrationAction.id).where(
+        OrchestrationAction.run_id == run.id,
+    ).order_by(OrchestrationAction.created_at.desc()).limit(1))
+    if conflict == "scope":
+        request["scope"] = "execution"
+    elif conflict == "run":
+        request["expected_run_id"] = uuid.uuid4()
+    elif conflict == "control":
+        request["expected_control_version"] += 1
+    else:
+        goal.objective = "Changed after the reviewed Start request"
+
+    with pytest.raises(HTTPException) as error:
+        await service.start_run(db_session, test_project.id, goal.id, actor="human:a", **request)
+
+    assert error.value.status_code == 409
+    assert await db_session.scalar(select(OrchestrationAction.id).where(
+        OrchestrationAction.run_id == run.id,
+    ).order_by(OrchestrationAction.created_at.desc()).limit(1)) == before
+
+
+@pytest.mark.asyncio
+async def test_g3_failed_scoped_start_rolls_back_any_request_receipt(db_session, test_project, monkeypatch):
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    run_id = run.id
+    original = service._mark_action_completed
+
+    async def fail_start_completion(db, action, *args, **kwargs):
+        if action.action_type == "authorize_execution":
+            raise RuntimeError("fail Start after reservation")
+        return await original(db, action, *args, **kwargs)
+
+    monkeypatch.setattr(service, "_mark_action_completed", fail_start_completion)
+    with pytest.raises(RuntimeError, match="fail Start"):
+        await service.start_run(
+            db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+            request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version,
+        )
+    await db_session.rollback()
+
+    assert (await db_session.scalars(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == run_id,
+    ))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_g3_planning_scope_allows_only_server_bound_planner_lineage(db_session, test_project):
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    service = OrchestrationService()
+    goal, run = await _seed_baseline_terminal_run(db_session, test_project)
+    await service.tick(db_session, run.id)
+    await service.start_run(
+        db_session, test_project.id, goal.id, actor="human:a", scope="planning_only",
+        request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version,
+    )
+
+    planner_action_id = uuid.uuid4()
+    planner = Task(
+        project_id=test_project.id, title="planner", status="backlog",
+        metadata_={"orchestration": {"run_id": str(run.id), "action_id": str(planner_action_id)}},
+    )
+    unknown = Task(
+        project_id=test_project.id, title="unbound", status="backlog",
+        metadata_={"orchestration": {"run_id": str(run.id)}},
+    )
+    db_session.add_all([planner, unknown])
+    await db_session.flush()
+    correction_action_id = uuid.uuid4()
+    correction = Task(
+        project_id=test_project.id, title="correction", status="backlog",
+        metadata_={
+            "result_correction_parent_task_id": str(planner.id),
+            "orchestration": {"run_id": str(run.id), "action_id": str(correction_action_id)},
+        },
+    )
+    metadata_only_correction = Task(
+        project_id=test_project.id, title="spoofed correction", status="backlog",
+        metadata_={
+            "result_correction_parent_task_id": str(planner.id),
+            "orchestration": {"run_id": str(run.id)},
+        },
+    )
+    db_session.add_all([correction, metadata_only_correction])
+    await db_session.flush()
+    db_session.add_all([
+        OrchestrationAction(
+            id=planner_action_id, run_id=run.id, idempotency_key="test:g3:planner",
+            action_type="request_plan", status="completed", target_type="task", target_id=planner.id,
+        ),
+        OrchestrationAction(
+            id=correction_action_id, run_id=run.id, idempotency_key="test:g3:correction",
+            action_type="create_delegation_task", status="completed", target_type="task", target_id=correction.id,
+            request={"parent_task_id": str(planner.id)},
+        ),
+        OrchestrationAction(
+            run_id=run.id, idempotency_key=f"run:{run.id}:kind:report_consumed:task:{planner.id}",
+            action_type="report_consumed", status="completed", target_type="task", target_id=planner.id,
+            request={"result_correction": {
+                "kind": "planning_envelope", "status": "correcting", "correction_task_id": str(correction.id),
+            }},
+        ),
+    ])
+    await db_session.flush()
+
+    assert (await effective_authorization(db_session, goal, run, planner)).allowed
+    assert (await effective_authorization(db_session, goal, run, correction)).allowed
+    assert (await effective_authorization(db_session, goal, run, unknown)).reason_code == "execution_scope_required"
+    assert (await effective_authorization(
+        db_session, goal, run, metadata_only_correction,
+    )).reason_code == "execution_scope_required"
+
+    foreign_goal = OrchestrationGoal(project_id=test_project.id, objective="foreign")
+    db_session.add(foreign_goal)
+    await db_session.flush()
+    foreign_run = OrchestrationRun(goal_id=foreign_goal.id)
+    db_session.add(foreign_run)
+    await db_session.flush()
+    foreign_action = OrchestrationAction(
+        run_id=foreign_run.id, idempotency_key="test:g3:foreign", action_type="request_plan", status="completed",
+        target_type="task", target_id=unknown.id,
+    )
+    db_session.add(foreign_action)
+    await db_session.flush()
+    unknown.metadata_ = {"orchestration": {"run_id": str(run.id), "action_id": str(foreign_action.id)}}
+    assert (await effective_authorization(db_session, goal, run, unknown)).reason_code == "execution_scope_required"
+
+
+@pytest.mark.asyncio
+async def test_g3_inherited_grant_tampering_cannot_restore_child_execution(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import effective_authorization
+
+    _, parent, parent_run, child, child_run = await _released(db_session, test_project)
+    action = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == child_run.id,
+        OrchestrationAction.action_type == "authorize_execution",
+    ))
+    assert action is not None and action.request["source_run_id"] == str(parent_run.id)
+    action.request = {**action.request, "source_action_id": str(uuid.uuid4())}
+
+    assert _denial(await effective_authorization(db_session, child, child_run)) == (
+        False, "parent_release_missing", "parent_release",
+    )
 
 
 @pytest.mark.asyncio

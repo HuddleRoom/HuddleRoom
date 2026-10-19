@@ -236,9 +236,31 @@ async def ingest(db, goal, run, task, winning_session_id, plan_version, output) 
                 await nested.commit()
     if (artifact.metadata_ or {}).get("output_hash") != output_hash:
         raise PlanIngestionError("conflicting plan output for task/version", correctable=False)
-    run.plan_state = {**state, "plan_artifact_id": str(artifact_id), "plan_output_hash": output_hash}
+    persisted = artifact.metadata_ or {}
+    recorded_provenance = state.get("plan_provenance") if isinstance(state.get("plan_provenance"), dict) else None
+    if recorded_provenance is not None and (
+        persisted.get("planning_task_id") != str(task.id)
+        or persisted.get("planning_version") != plan_version
+        or persisted.get("winning_session_id") != (str(winning_session_id) if winning_session_id else None)
+        or persisted.get("plan_author_agent_id") != str(author)
+    ):
+        raise PlanIngestionError("conflicting plan provenance for task/version", correctable=False)
+    provenance = {
+        "artifact_id": str(artifact.id), "planning_task_id": persisted.get("planning_task_id"),
+        "planning_version": persisted.get("planning_version"), "winning_session_id": persisted.get("winning_session_id"),
+        "plan_author_agent_id": persisted.get("plan_author_agent_id"), "canonical_content_hash": persisted.get("output_hash"),
+    }
+    run.plan_state = {
+        **state, "plan_artifact_id": str(artifact_id), "plan_output_hash": output_hash,
+        "plan_provenance": provenance,
+    }
     return artifact
 
 
 def ingested_plan_hash(metadata: dict) -> str:
-    return plan_output_hash({key: metadata.get(key) for key in ("schema_version", "plan_kind", "summary", "plan_items")})
+    return plan_output_hash(canonical_plan_content(metadata))
+
+
+def canonical_plan_content(metadata: dict) -> dict:
+    """The immutable envelope used by ingestion, identity, and readable projections."""
+    return {key: metadata.get(key) for key in ("schema_version", "plan_kind", "summary", "plan_items")}

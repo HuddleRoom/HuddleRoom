@@ -24,7 +24,9 @@ from huddleroom.models.session import Session
 from huddleroom.models.agent import Agent
 from huddleroom.schemas.orchestration import OrchestrationContinuousPolicy, parse_discovery_batch
 from huddleroom.services.event_bus import emit_event_once
-from huddleroom.services.orchestration_authority_service import reauthorize_execution_key
+from huddleroom.services.orchestration_authority_service import (
+    effective_authorization, execution_grant, inherit_execution_grant, reauthorize_execution_key,
+)
 from huddleroom.services.orchestration_budget_service import BudgetMeasurementError, OrchestrationBudgetService, parent_caps
 from huddleroom.services.project_service import ProjectService
 from huddleroom.services.orchestration_capacity import CAPACITY_WAIT, available_slots
@@ -64,6 +66,11 @@ class OrchestrationContinuousService:
     @staticmethod
     def _state(goal: OrchestrationGoal) -> dict:
         return deepcopy(goal.continuous_state or {})
+
+    async def _require_execution(self, db, goal, run) -> None:
+        grant = await effective_authorization(db, goal, run)
+        if not grant.allowed:
+            raise HTTPException(status_code=409, detail="continuous_execution_scope_required")
 
     @staticmethod
     def _caller_owns_transaction(db):
@@ -193,6 +200,7 @@ class OrchestrationContinuousService:
     async def dispatch_discovery_source(self, db, goal, run, now, *, attempt: str | None = None):
         """Dispatch the cycle's source task; ``attempt`` (an approved fix's proposal id) dispatches one fresh,
         distinctly keyed source attempt after that fix resolved."""
+        await self._require_execution(db, goal, run)
         plan_state = self.orchestration._json_object_or_empty(run.plan_state)
         policy = self.orchestration._json_object_or_empty(plan_state.get("continuous_policy"))
         source = policy["discovery_source"]
@@ -489,6 +497,7 @@ class OrchestrationContinuousService:
 
     async def release_pending_candidates(self, db, goal, run, now):
         """Release durable FIFO backlog from the active successor before claiming work."""
+        await self._require_execution(db, goal, run)
         state = self._state(goal)
         pending = list(state.get("pending_candidates", []))
         if not pending:
@@ -603,14 +612,11 @@ class OrchestrationContinuousService:
                 or run.status != "running"
             ):
                 return await self._finish_locked(db, caller_owns_transaction, None)
-            authorization = await db.scalar(select(OrchestrationAction.id).where(
-                OrchestrationAction.run_id == run.id,
-                OrchestrationAction.action_type == "authorize_execution",
-                OrchestrationAction.status == "completed",
-            ).limit(1))
-            if authorization is None:
+            try:
+                await self._require_execution(db, goal, run)
+            except HTTPException:
                 self.orchestration._upsert_active_blocker(run, {
-                    "kind": "continuous_authorization", "reason": "Waiting cycle has no authorization action",
+                    "kind": "continuous_authorization", "reason": "Waiting cycle lacks execution scope",
                 })
                 await self.derive_health(db, goal, now)
                 return await self._finish_locked(db, caller_owns_transaction, None)
@@ -694,6 +700,7 @@ class OrchestrationContinuousService:
                 "workspace_policy": deepcopy(context.get("workspace_policy", {}))}
 
     async def _release_direct_child(self, db, goal, run, policy, candidate, now, *, origin_key=None):
+        await self._require_execution(db, goal, run)
         origin_key = origin_key or run.cycle_key
         existing = await db.scalar(select(OrchestrationGoal).where(
             OrchestrationGoal.parent_goal_id == goal.id, OrchestrationGoal.continuous_origin_key == origin_key,
@@ -723,11 +730,6 @@ class OrchestrationContinuousService:
             budget_state={"caps": deepcopy(policy["per_case_budget"])}, plan_state={"child_delta_baseline": {
                 "status": "accepted", "snapshot_version": 1, "parent_goal_id": str(goal.id),
                 "continuous_policy_version": policy["version"], "origin_key": origin_key}})
-        authorization = OrchestrationAction(id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:authorize-child:{child_run.id}"),
-            run_id=child_run.id, idempotency_key=f"run:{child_run.id}:kind:authorize_execution",
-            action_type="authorize_execution", status="completed",
-            request={"action_type": "authorize_execution", "actor": f"continuous_parent:{goal.id}"},
-            target_type="run", target_id=child_run.id)
         async with db.begin_nested():
             release = await self.orchestration.reserve_action(
                 db, run.id, f"run:{run.id}:kind:release_continuous_child:{origin_key}",
@@ -737,8 +739,10 @@ class OrchestrationContinuousService:
             await db.flush()
             db.add(child_run)
             await db.flush()
-            db.add(authorization)
-            await db.flush()
+            if await inherit_execution_grant(
+                db, goal, run, child, child_run, actor=f"continuous_parent:{goal.id}",
+            ) is None:
+                raise HTTPException(status_code=409, detail="continuous_execution_scope_required")
             await OrchestrationBudgetService().reserve_continuous_child(
                 db, goal, child, origin_key, policy["per_case_budget"], policy, now)
             await self.orchestration._mark_action_completed(db, release, target_type="goal", target_id=child.id)
@@ -771,6 +775,7 @@ class OrchestrationContinuousService:
         )
 
     async def _release_discovery_child(self, db, goal, run, policy, candidate, now):
+        await self._require_execution(db, goal, run)
         existing = await db.scalar(select(OrchestrationGoal).where(
             OrchestrationGoal.parent_goal_id == goal.id,
             OrchestrationGoal.continuous_origin_key == candidate.origin_key,
@@ -812,12 +817,6 @@ class OrchestrationContinuousService:
                 "continuous_policy_version": policy["version"], "origin_key": origin_key,
             }},
         )
-        authorization = OrchestrationAction(
-            id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:authorize-child:{child_run.id}"), run_id=child_run.id,
-            idempotency_key=f"run:{child_run.id}:kind:authorize_execution", action_type="authorize_execution",
-            status="completed", request={"action_type": "authorize_execution", "actor": f"continuous_parent:{goal.id}"},
-            target_type="run", target_id=child_run.id,
-        )
         async with db.begin_nested():
             release = await self.orchestration.reserve_action(
                 db, run.id, f"run:{run.id}:kind:release_continuous_child:{candidate_key}",
@@ -827,8 +826,10 @@ class OrchestrationContinuousService:
             await db.flush()
             db.add(child_run)
             await db.flush()
-            db.add(authorization)
-            await db.flush()
+            if await inherit_execution_grant(
+                db, goal, run, child, child_run, actor=f"continuous_parent:{goal.id}",
+            ) is None:
+                raise HTTPException(status_code=409, detail="continuous_execution_scope_required")
             await OrchestrationBudgetService().reserve_continuous_child(
                 db, goal, child, origin_key, policy["per_case_budget"], policy, now,
             )
@@ -854,6 +855,7 @@ class OrchestrationContinuousService:
         return candidate_origins | child_origins | pending_origins
 
     async def fan_out_discovery_batch(self, db, goal, run, now):
+        await self._require_execution(db, goal, run)
         plan_state = self.orchestration._json_object_or_empty(run.plan_state)
         discovery = self.orchestration._json_object_or_empty(plan_state.get("discovery"))
         policy = self.orchestration._json_object_or_empty(plan_state.get("continuous_policy"))
@@ -947,6 +949,10 @@ class OrchestrationContinuousService:
         return await self._complete_cycle(db, goal, run, outcome, now)
 
     async def _complete_cycle(self, db, goal, run, outcome, now):
+        if outcome != "stopped":
+            grant = await execution_grant(db, goal, run)
+            if grant is None or grant.scope != "execution":
+                raise HTTPException(status_code=409, detail="continuous_execution_scope_required")
         key = f"run:{run.id}:kind:complete_cycle:{run.cycle_key}"
         existing = await self.orchestration._existing_action_for_key(db, run.id, key)
         if existing is not None and run.status == "completed":
@@ -979,13 +985,11 @@ class OrchestrationContinuousService:
                 )
                 db.add(successor)
                 await db.flush()
-                db.add(OrchestrationAction(
-                    id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:authorize-successor:{successor.id}"),
-                    run_id=successor.id, idempotency_key=f"run:{successor.id}:kind:authorize_execution",
-                    action_type="authorize_execution", status="completed",
-                    request={"action_type": "authorize_execution", "actor": f"continuous_parent:{goal.id}"},
-                    target_type="run", target_id=successor.id,
-                ))
+                # Contract drift keeps the successor visible but ungrantable until
+                # a fresh explicit Start; never stamp its new contract as authorized.
+                await inherit_execution_grant(
+                    db, goal, run, goal, successor, actor=f"continuous_parent:{goal.id}",
+                )
         await db.flush()
         await self.derive_health(db, goal, now)
         return {"step": "complete_cycle", "outcome": outcome}
@@ -1249,6 +1253,10 @@ class OrchestrationContinuousService:
                 return {"step": "complete_cycle", "outcome": existing.request["outcome"]}
         if run.phase != "authorized" or not run.cycle_key:
             return {"step": "waiting_activation"}
+        try:
+            await self._require_execution(db, goal, run)
+        except HTTPException:
+            return {"step": "waiting_execution_scope"}
         policy = deepcopy(self.orchestration._json_object_or_empty(run.plan_state).get("continuous_policy"))
         if not policy:
             self.orchestration._upsert_active_blocker(run, {

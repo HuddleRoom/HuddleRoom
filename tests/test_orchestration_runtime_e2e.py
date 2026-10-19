@@ -129,7 +129,7 @@ async def _authorized_run(db_session, test_project, success_criteria=None, *, ow
     await db_session.refresh(run)
     assert run.phase == "ready"
     goal, run = await service.start_run(
-        db_session, test_project.id, goal.id, actor="human:test"
+        db_session, test_project.id, goal.id, actor="human:test",
     )
     assert run.phase == "authorized"
     return service, goal, run

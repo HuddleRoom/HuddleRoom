@@ -101,6 +101,8 @@ from huddleroom.services.orchestration_authority_interview import build_checkpoi
 from huddleroom.services.orchestration_authority_service import (
     OrchestrationAuthorityDecisionService,
     effective_authorization,
+    execution_grant,
+    execution_upgrade_key,
     reauthorize_execution_key,
     runtime_decision_identity,
 )
@@ -8963,10 +8965,18 @@ class OrchestrationService:
         goal_id: uuid.UUID,
         *,
         actor: str,
+        scope: str | None = None,
+        request_id: uuid.UUID | None = None,
+        expected_run_id: uuid.UUID | None = None,
+        expected_control_version: int | None = None,
         commit: bool = True,
     ) -> tuple[OrchestrationGoal, OrchestrationRun]:
-        """Explicit human authorization of spend + execution (spec: Start work).
+        """Explicit human authorization of planning, or an explicit execution upgrade.
         Idempotent. The scheduler never executes a run whose phase != authorized."""
+        if scope not in {None, "planning_only", "execution"}:
+            raise self._start_conflict("invalid_scope", "scope must be planning_only or execution")
+        if scope is not None and (request_id is None or expected_run_id is None or expected_control_version is None):
+            raise self._start_conflict("start_request_required", "Scoped Start requires run, control, and request identities")
         transaction = db.sync_session.get_transaction()
         caller_owns_transaction = not commit or (
             transaction is not None and transaction.origin != SessionTransactionOrigin.AUTOBEGIN
@@ -8982,16 +8992,89 @@ class OrchestrationService:
             run = await self.get_active_run_for_goal(db, project_id, goal_id)
             if run is None:
                 raise self._start_conflict("goal_not_runnable", "Goal has no active run")
-
-            if goal.goal_type == "continuous" and (goal.continuous_state or {}).get("started_at"):
-                await self._record_reauthorization(db, goal, run, actor, caller_owns_transaction)
-                return goal, run
+            if scope is not None:
+                from huddleroom.services.orchestration_baseline_runtime import BaselinePaused, require_control_admission
+                from huddleroom.services.orchestration_control import acquire_control_writer
+                await acquire_control_writer(db, run.id)
+                await db.refresh(run)
+                active_after_fence = await self.get_active_run_for_goal(db, project_id, goal_id)
+                if active_after_fence is None or active_after_fence.id != run.id:
+                    raise self._start_conflict("stale_start_request", "Start request changed while awaiting admission")
+                receipt_key = f"run:{run.id}:kind:start_receipt:{request_id}"
+                receipt = await self._existing_action_for_key(db, run.id, receipt_key)
+                if receipt is not None:
+                    stored = self._json_object_or_empty(receipt.request)
+                    if any(stored.get(key) != value for key, value in {
+                        "action_type": "start_receipt", "actor": actor, "scope": scope,
+                        "request_id": str(request_id), "goal_id": str(goal.id),
+                        "run_id": str(expected_run_id), "control_version": expected_control_version,
+                    }.items()):
+                        raise self._start_conflict("start_request_conflict", "Start request id was reused with different payload")
+                    if stored.get("contract_fingerprint") != compute_goal_contract_fingerprint(goal):
+                        raise self._start_conflict("start_request_conflict", "Start request contract is no longer current")
+                    return goal, run
+                if run.id != expected_run_id or run.control_version != expected_control_version:
+                    raise self._start_conflict("stale_start_request", "Start request changed while awaiting admission")
+                current_fingerprint = run.goal_contract_fingerprint or compute_goal_contract_fingerprint(goal)
+                canonical = {
+                    "action_type": "start_receipt", "actor": actor, "scope": scope,
+                    "request_id": str(request_id), "goal_id": str(goal.id),
+                    "run_id": str(run.id), "control_version": run.control_version,
+                    "contract_fingerprint": current_fingerprint,
+                }
+                prior = list((await db.scalars(select(OrchestrationAction).where(
+                    OrchestrationAction.run_id == run.id,
+                ))).all())
+                for prior_action in prior:
+                    prior_request = self._json_object_or_empty(prior_action.request)
+                    if prior_request.get("request_id") != str(request_id):
+                        continue
+                    if prior_action.action_type == "start_receipt" and any(
+                        prior_request.get(key) != value for key, value in canonical.items()
+                    ):
+                        raise self._start_conflict("start_request_conflict", "Start request id was reused with different payload")
+                try:
+                    await require_control_admission(db, run.id)
+                except BaselinePaused as exc:
+                    raise self._start_conflict("stale_start_request", "Start request is no longer admissible") from exc
 
             # Idempotent replay: already authorized -> return as-is.
             existing = await self._existing_action_for_key(
                 db, run.id, self._authorize_execution_key(run.id)
             )
-            if existing is not None and run.phase in {"authorized", "completed"}:
+            if existing is not None and (
+                run.phase in {"authorized", "completed"}
+                or (goal.goal_type == "continuous" and (goal.continuous_state or {}).get("started_at"))
+            ):
+                if scope == "planning_only":
+                    grant = await execution_grant(db, goal, run)
+                    if grant is not None and grant.scope == "execution":
+                        raise self._start_conflict(
+                            "unsupported_scope_downgrade", "Execution is already granted for this run"
+                        )
+                grant_action = existing
+                if scope == "execution":
+                    upgrade_request = {
+                        "action_type": "grant_execution", "scope": "execution",
+                        "contract_fingerprint": run.goal_contract_fingerprint,
+                    }
+                    grant_action = await self.reserve_action(
+                        db, run.id, execution_upgrade_key(run.id, run.goal_contract_fingerprint),
+                        "grant_execution", upgrade_request,
+                    )
+                    if grant_action.status == "reserved":
+                        await self._mark_action_completed(db, grant_action, target_type="run", target_id=run.id)
+                if scope is not None:
+                    receipt = await self.reserve_action(
+                        db, run.id, receipt_key, "start_receipt",
+                        {**canonical, "grant_action_id": str(grant_action.id)},
+                    )
+                    if receipt.status == "reserved":
+                        await self._mark_action_completed(db, receipt, target_type="run", target_id=run.id)
+                await self._record_reauthorization(db, goal, run, actor, caller_owns_transaction)
+                return goal, run
+
+            if goal.goal_type == "continuous" and (goal.continuous_state or {}).get("started_at"):
                 await self._record_reauthorization(db, goal, run, actor, caller_owns_transaction)
                 return goal, run
 
@@ -9020,6 +9103,9 @@ class OrchestrationService:
             # Baseline processes may still rewrite contract fields while ready; Start freezes them.
             if run.goal_contract_fingerprint is None:
                 run.goal_contract_fingerprint = compute_goal_contract_fingerprint(goal)
+            plan_state = self._json_object_or_empty(run.plan_state)
+            if scope is not None:
+                run.plan_state = {**plan_state, "scope_contract_version": 1}
             action = await self.reserve_action(
                 db,
                 run_id=run.id,
@@ -9028,10 +9114,13 @@ class OrchestrationService:
                 request={
                     "action_type": "authorize_execution",
                     "actor": actor,
+                    **({"request_id": str(request_id), "run_id": str(run.id),
+                        "control_version": run.control_version} if scope is not None else {}),
                     "baseline_version": self._json_object_or_empty(goal.orchestrator_context).get(
                         "baseline_version"
                     ),
                     "contract_fingerprint": run.goal_contract_fingerprint,
+                    **({"scope": scope} if scope is not None else {}),
                     "goal_type": goal.goal_type,
                     "planning_mode": goal.planning_mode,
                     "authorized_at": _utcnow().isoformat(),
@@ -9039,6 +9128,13 @@ class OrchestrationService:
             )
             if action.status == "reserved":
                 await self._mark_action_completed(db, action, target_type="run", target_id=run.id)
+            if scope is not None:
+                receipt = await self.reserve_action(
+                    db, run.id, receipt_key, "start_receipt",
+                    {**canonical, "grant_action_id": str(action.id)},
+                )
+                if receipt.status == "reserved":
+                    await self._mark_action_completed(db, receipt, target_type="run", target_id=run.id)
             if goal.goal_type == "continuous":
                 from huddleroom.services.orchestration_continuous_service import OrchestrationContinuousService
 

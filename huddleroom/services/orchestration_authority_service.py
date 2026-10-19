@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from huddleroom.models.base import _utcnow
 from huddleroom.models.orchestration import (
-    OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun, OrchestrationWait,
+    OrchestrationAction, OrchestrationBudgetReservation, OrchestrationGoal, OrchestrationRun, OrchestrationWait,
     compute_goal_contract_fingerprint,
 )
 from huddleroom.models.orchestration_process import AUTHORITIES, OrchestrationAuthorityDecision
@@ -676,11 +676,135 @@ class OrchestrationAuthorityDecisionService:
 
 
 _WORKSPACE_RANK = {"read_only": 0, "staged": 1, "direct": 2}
+_GRANT_SCOPES = frozenset({"planning_only", "execution"})
+
+
+@dataclass(frozen=True)
+class ExecutionGrant:
+    """A completed, server-owned execution grant for one run."""
+
+    action: object
+    scope: str
+    legacy: bool = False
+
+
+def _run_scope_version(run: OrchestrationRun) -> int | None:
+    state = run.plan_state if isinstance(run.plan_state, dict) else {}
+    return state.get("scope_contract_version") if isinstance(state.get("scope_contract_version"), int) else None
+
+
+async def execution_grant(
+    db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+) -> ExecutionGrant | None:
+    """Return only a valid explicit execution grant (or a genuinely old one).
+
+    New runs carry a marker in their existing JSON state.  That lets historical
+    unscoped actions retain their meaning without allowing newly-created child
+    actions to masquerade as history.
+    """
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    service = OrchestrationService()
+    action = await service._existing_action_for_key(
+        db, run.id, f"run:{run.id}:kind:authorize_execution",
+    )
+    if action is None or action.status != "completed":
+        return None
+    request = action.request if isinstance(action.request, dict) else {}
+    scope = request.get("scope")
+    marked = _run_scope_version(run) == 1
+    if not marked:
+        # Only the pre-G3 representation has compatibility semantics.
+        return ExecutionGrant(action, "execution", legacy=True) if scope is None else (
+            ExecutionGrant(action, scope) if scope in _GRANT_SCOPES else None
+        )
+    if scope not in _GRANT_SCOPES or request.get("contract_fingerprint") != run.goal_contract_fingerprint:
+        return None
+    if scope == "planning_only":
+        base_action = action
+        upgrade_action = await service._existing_action_for_key(
+            db, run.id, execution_upgrade_key(run.id, run.goal_contract_fingerprint),
+        )
+        upgrade = upgrade_action.request if upgrade_action is not None and isinstance(upgrade_action.request, dict) else {}
+        if upgrade_action is None or upgrade_action.status != "completed" or upgrade.get("scope") != "execution":
+            return ExecutionGrant(base_action, "planning_only")
+        action = upgrade_action
+        scope = "execution"
+    if goal.parent_goal_id is not None:
+        source_run_id = request.get("source_run_id")
+        source_goal_id = request.get("source_goal_id")
+        source_action_id = request.get("source_action_id")
+        if not all(isinstance(value, str) for value in (source_run_id, source_goal_id, source_action_id)):
+            return None
+        try:
+            source_run = await db.get(OrchestrationRun, uuid.UUID(source_run_id))
+            source_goal = await db.get(OrchestrationGoal, uuid.UUID(source_goal_id))
+            source_action = await db.get(type(action), uuid.UUID(source_action_id))
+        except ValueError:
+            return None
+        if (source_run is None or source_goal is None or source_action is None
+                or source_run.goal_id != source_goal.id or source_action.run_id != source_run.id):
+            return None
+        source_grant = await execution_grant(db, source_goal, source_run)
+        if source_grant is None or source_grant.scope != "execution" or source_grant.action.id != source_action.id:
+            return None
+    return ExecutionGrant(action, scope)
+
+
+async def inherit_execution_grant(
+    db: AsyncSession,
+    source_goal: OrchestrationGoal,
+    source_run: OrchestrationRun,
+    target_goal: OrchestrationGoal,
+    target_run: OrchestrationRun,
+    *,
+    actor: str,
+) -> ExecutionGrant | None:
+    """Create a lineage-bound child grant only from current execution authority."""
+    from huddleroom.models.orchestration import OrchestrationAction
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    source = await execution_grant(db, source_goal, source_run)
+    if source is None or source.scope != "execution":
+        return None
+    fingerprint = compute_goal_contract_fingerprint(target_goal)
+    if target_run.goal_contract_fingerprint not in (None, fingerprint):
+        return None
+    target_run.goal_contract_fingerprint = fingerprint
+    state = target_run.plan_state if isinstance(target_run.plan_state, dict) else {}
+    target_run.plan_state = {**state, "scope_contract_version": 1}
+    service = OrchestrationService()
+    request = {
+        "action_type": "authorize_execution", "actor": actor, "scope": "execution",
+        "contract_fingerprint": fingerprint, "source_goal_id": str(source_goal.id),
+        "source_run_id": str(source_run.id), "source_action_id": str(source.action.id),
+    }
+    key = service._authorize_execution_key(target_run.id)
+    action = await service._existing_action_for_key(db, target_run.id, key)
+    if action is None and target_goal.parent_goal_id is not None:
+        action = OrchestrationAction(
+            id=uuid.uuid5(uuid.NAMESPACE_URL, f"rally:authorize-child:{target_run.id}"),
+            run_id=target_run.id, idempotency_key=key, action_type="authorize_execution",
+            status="reserved", request=request,
+        )
+        db.add(action)
+        await db.flush()
+    elif action is None:
+        action = await service.reserve_action(db, target_run.id, key, "authorize_execution", request)
+    elif action.request != request:
+        return None
+    if action.status == "reserved":
+        await service._mark_action_completed(db, action, target_type="run", target_id=target_run.id)
+    return await execution_grant(db, target_goal, target_run)
 
 
 def reauthorize_execution_key(run_id: uuid.UUID, fingerprint: str) -> str:
     """Re-Start after a contract change; the run's frozen fingerprint is never rewritten."""
     return f"run:{run_id}:kind:reauthorize_execution:{fingerprint}"
+
+
+def execution_upgrade_key(run_id: uuid.UUID, fingerprint: str) -> str:
+    return f"run:{run_id}:kind:grant_execution:{fingerprint}"
 
 
 async def effective_authorization(
@@ -744,6 +868,40 @@ async def effective_authorization(
         action = await svc._existing_action_for_key(db, run.id, key)
         return action is not None and action.status == "completed"
 
+    async def planning_control_task() -> bool:
+        if task is None:
+            return False
+        candidate = task
+        parent_id = obj(task.metadata_).get("result_correction_parent_task_id")
+        if parent_id:
+            try:
+                candidate = await db.get(Task, uuid.UUID(str(parent_id)))
+            except ValueError:
+                return False
+            if candidate is None:
+                return False
+            correction_action = await db.scalar(select(OrchestrationAction).where(
+                OrchestrationAction.run_id == run.id,
+                OrchestrationAction.target_type == "task",
+                OrchestrationAction.target_id == task.id,
+                OrchestrationAction.action_type.in_(("create_delegation_task", "result_correction")),
+                OrchestrationAction.status == "completed",
+            ))
+            if (correction_action is None
+                    or obj(correction_action.request).get("parent_task_id") != str(candidate.id)):
+                return False
+        orchestration = obj((candidate.metadata_ or {}).get("orchestration"))
+        try:
+            action_id = uuid.UUID(str(orchestration.get("action_id")))
+        except (TypeError, ValueError):
+            return False
+        action = await db.get(OrchestrationAction, action_id)
+        return bool(
+            action and action.run_id == run.id and action.status == "completed" and action.target_type == "task"
+            and action.target_id == candidate.id
+            and action.action_type in {"request_plan", "request_plan_revision"}
+        )
+
     if goal.status not in ("active", "blocked") or run.status not in ("running", "blocked"):
         return result("run_not_active", "resume" if "paused" in (goal.status, run.status) else None)
     budget = OrchestrationBudgetService()
@@ -757,12 +915,15 @@ async def effective_authorization(
     except BudgetMeasurementError:
         raw = {}  # ponytail: parity with the Outcome stop: measurement error is an attention blocker, not a denial
     remaining = {key: Decimal(value) for key, value in raw.items()}
+    grant = await execution_grant(db, goal, run)
     if source == "parent_release":
         delta = obj(obj(run.plan_state).get("child_delta_baseline"))
         if delta and delta.get("status") != "accepted":
             return result("parent_release_pending", "parent_release")
-        if not await completed(svc._authorize_execution_key(run.id)):
+        if grant is None:
             return result("parent_release_missing", "parent_release")
+        if grant.scope != "execution":
+            return result("execution_scope_required", "upgrade_execution")
         reservation = await db.scalar(select(OrchestrationBudgetReservation.status).where(
             OrchestrationBudgetReservation.parent_goal_id == goal.parent_goal_id,
             OrchestrationBudgetReservation.child_goal_id == goal.id,
@@ -777,8 +938,10 @@ async def effective_authorization(
     else:
         # A predecessor run's Start is stale by construction: it is cancelled (check above)
         # and the successor carries no authorize_execution action of its own.
-        if not await completed(svc._authorize_execution_key(run.id)):
+        if grant is None:
             return result("start_required", "start")
+        if grant.scope != "execution" and not await planning_control_task():
+            return result("execution_scope_required", "upgrade_execution")
         # NULL fingerprint = legacy run started before freezing; grandfathered.
         if run.goal_contract_fingerprint not in (None, fp) and not await completed(
             reauthorize_execution_key(run.id, fp)

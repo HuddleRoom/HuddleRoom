@@ -245,7 +245,7 @@ async def assert_child_release(db, parent, run, version, item, *, failed_item_ke
     assert (child_run.goal_type_snapshot, child_run.planning_mode_snapshot) == ("outcome", "implementation")
     assert child_run.goal_contract_fingerprint == compute_goal_contract_fingerprint(child)
     assert child_run.supersedes_run_id is None
-    assert child_run.plan_state == {"child_delta_baseline": {
+    assert child_run.plan_state == {"scope_contract_version": 1, "child_delta_baseline": {
         "status": "accepted", "snapshot_version": 1, "parent_goal_id": str(parent.id),
         "roadmap_version_id": str(version.id), "roadmap_item_key": key,
         "approval_reference": version.approval_reference,
@@ -266,7 +266,11 @@ async def assert_child_release(db, parent, run, version, item, *, failed_item_ke
         "authorize_execution", "completed", "run", child_run_id,
     )
     assert auth.idempotency_key == f"run:{child_run_id}:kind:authorize_execution"
-    assert auth.request == {"action_type": "authorize_execution", "actor": f"roadmap_parent:{parent.id}"}
+    assert auth.request["action_type"] == "authorize_execution"
+    assert auth.request["actor"] == f"roadmap_parent:{parent.id}"
+    assert auth.request["scope"] == "execution"
+    assert auth.request["contract_fingerprint"] == child_run.goal_contract_fingerprint
+    assert (auth.request["source_goal_id"], auth.request["source_run_id"]) == (str(parent.id), str(run.id))
     releases = list(await db.scalars(select(OrchestrationAction).where(
         OrchestrationAction.run_id == run.id, OrchestrationAction.action_type == "release_roadmap_item",
     )))
@@ -1638,7 +1642,18 @@ async def test_nested_roadmap_own_cli_task_item_claim_keys_on_its_own_lineage(db
     child.budget = {"caps": {"max_tokens": 800, "max_turns": 5, "max_hours": 5}}
     from sqlalchemy import update
     from huddleroom.models.orchestration import OrchestrationRun, compute_goal_contract_fingerprint
+    from huddleroom.services.orchestration_authority_service import inherit_execution_grant
     await db_session.execute(update(OrchestrationRun).where(OrchestrationRun.id == child_run.id).values(goal_contract_fingerprint=compute_goal_contract_fingerprint(child))); await db_session.refresh(child_run)
+    inherited = await db_session.scalar(select(OrchestrationAction).where(
+        OrchestrationAction.run_id == child_run.id,
+        OrchestrationAction.action_type == "authorize_execution",
+    ))
+    await db_session.delete(inherited)
+    await db_session.flush()
+    parent_run = await db_session.scalar(select(OrchestrationRun).where(OrchestrationRun.goal_id == parent.id))
+    assert await inherit_execution_grant(
+        db_session, parent, parent_run, child, child_run, actor=f"roadmap_parent:{parent.id}",
+    ) is not None
     items = [{**roadmap_task("own-task"), "agent_id": str(agent.id)}]
     artifact = Artifact(project_id=test_project.id, name="c-plan", artifact_type="plan", status="draft",
                         created_by_agent=agent.id, metadata_={"plan_items": items})

@@ -1477,6 +1477,26 @@ async def test_start_freezes_goal_contract_fingerprint(db_session, test_project)
     assert run.goal_contract_fingerprint == frozen
 
 
+async def test_g3_started_continuous_run_accepts_idempotent_execution_upgrade(db_session, test_project):
+    goal, run = await continuous_ready(db_session, test_project)
+    service = OrchestrationService()
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:test", scope="planning_only",
+                            request_id=uuid.uuid4(), expected_run_id=run.id, expected_control_version=run.control_version)
+    due = datetime.fromisoformat(goal.continuous_state["next_due_at"])
+    continuous = OrchestrationContinuousService(service)
+    assert await continuous.claim_due_cycle(db_session, goal.id, due) is None
+    upgrade_request_id = uuid.uuid4()
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:test", scope="execution",
+                            request_id=upgrade_request_id, expected_run_id=run.id, expected_control_version=run.control_version)
+    assert (await continuous.claim_due_cycle(db_session, goal.id, due)).id == run.id
+    await service.start_run(db_session, test_project.id, goal.id, actor="human:test", scope="execution",
+                            request_id=upgrade_request_id, expected_run_id=run.id, expected_control_version=run.control_version)
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationAction).where(
+        OrchestrationAction.run_id == run.id,
+        OrchestrationAction.action_type == "grant_execution",
+    )) == 1
+
+
 async def test_claim_is_atomic_and_coalesces_missed_slots(db_session, test_project):
     goal, run = await started_continuous(db_session, test_project)
     due = datetime.fromisoformat(goal.continuous_state["next_due_at"])

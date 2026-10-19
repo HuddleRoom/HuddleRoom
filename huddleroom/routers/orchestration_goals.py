@@ -30,6 +30,7 @@ from huddleroom.models.task import Task
 from huddleroom.models.user import User
 from huddleroom.schemas.common import CursorPage
 from huddleroom.schemas.orchestration import (
+    OrchestrationStartRequest,
     PauseControlRequest,
     PauseReceipt,
     OrchestrationActionResponse,
@@ -1071,11 +1072,17 @@ async def dismiss_steering_proposal(
 async def start_goal(
     project_id: uuid.UUID,
     goal_id: uuid.UUID,
+    data: OrchestrationStartRequest | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     await ensure_project_exists(db, project_id)
-    goal, run = await service.start_run(db, project_id, goal_id, actor=f"human:{user.id}")
+    goal, run = await service.start_run(
+        db, project_id, goal_id, actor=f"human:{user.id}",
+        scope=data.scope if data else None, request_id=data.request_id if data else None,
+        expected_run_id=data.run_id if data else None,
+        expected_control_version=data.expected_control_version if data else None,
+    )
     return await _detail(db, goal, run)
 
 
