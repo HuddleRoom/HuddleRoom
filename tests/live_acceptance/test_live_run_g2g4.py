@@ -42,6 +42,14 @@ ROOT = os.environ.get("LIVE_ACCEPTANCE_EVIDENCE_ROOT")
 SNAP = os.environ.get("LIVE_ACCEPTANCE_SNAPSHOT_S")
 RESUME_S = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_S") == "1"
 RESUME_S_2 = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_S") == "2"
+
+
+def _argv(args: str) -> list[str]:
+    """Shim args are a flattened string; prompts may contain unbalanced quotes."""
+    try:
+        return shlex.split(args)
+    except ValueError:
+        return args.split()
 RESUME_S_3 = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_S") == "3"
 RESUME_ROOT_RAW = os.environ.get("LIVE_ACCEPTANCE_G2G4_RESUME_ROOT", "")
 RESUME_ROOT = Path(RESUME_ROOT_RAW) if RESUME_ROOT_RAW else None
@@ -638,7 +646,7 @@ class G2G4(L1):
         if candidates is None:
             raise AssertionError("planning task did not produce one held matcher-gated codex invocation")
         inv = candidates[0]
-        argv = shlex.split(inv.args)
+        argv = _argv(inv.args)
         sandbox = any(argv[index:index + 2] == ["--sandbox", "read-only"] for index in range(len(argv) - 1))
         self.planner_task, self.planner_inv = task["id"], inv
         self.verify("planning_only", {"planner_owned_by_manager": _same_uuid(task.get("assigned_to"), self.ids["manager_id"]),
@@ -686,11 +694,11 @@ class G2G4(L1):
             raise AssertionError("planner report consumption was not stable after resume")
         resumes = [inv for inv in self.codex.invocations()
                    if inv.ordinal not in pre_restart_ordinals
-                   and shlex.split(inv.args)[:2] == ["exec", "resume"]]
+                   and _argv(inv.args)[:2] == ["exec", "resume"]]
         self.notes["codex_resume"] = "not_exercised" if not resumes else [
             {"ordinal": inv.ordinal,
-             "read_only": any(shlex.split(inv.args)[index:index + 2] == ["-c", "sandbox_mode=read-only"]
-                              for index in range(len(shlex.split(inv.args)) - 1))}
+             "read_only": any(_argv(inv.args)[index:index + 2] == ["-c", "sandbox_mode=read-only"]
+                              for index in range(len(_argv(inv.args)) - 1))}
             for inv in resumes]
         if resumes and not all(item["read_only"] for item in self.notes["codex_resume"]):
             raise AssertionError("codex resume omitted read-only sandbox mode")
