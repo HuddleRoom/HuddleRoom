@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import signal
 import shlex
 import sqlite3
@@ -693,9 +694,25 @@ class G2G4(L1):
         if resumes and not all(item["read_only"] for item in self.notes["codex_resume"]):
             raise AssertionError("codex resume omitted read-only sandbox mode")
 
+    def workspace_violations(self) -> list[str]:
+        """Workspace changes other than the server-written designated plan projection."""
+        goal = str(uuid.UUID(str(self.goal_id)))
+        run = str(uuid.UUID(str(self.run_id)))
+        allowed = re.compile(rf"^plans/goal-{re.escape(goal)}/run-{re.escape(run)}/plan-v\d+-review-\d+\.md$")
+        lines = self._git("status", "--porcelain", "--untracked-files=all").splitlines()
+        projection = [line[3:] for line in lines if line.startswith("?? ") and allowed.match(line[3:])]
+        self.notes["plan_projection_files"] = projection
+        bad = [line for line in lines if not (line.startswith("?? ") and allowed.match(line[3:]))]
+        if self._git("rev-parse", "HEAD").strip() != self.workspace_head:
+            bad.append("HEAD moved")
+        if (self.sc.run_dir.workspace / "PLAN.md").exists():
+            bad.append("PLAN.md exists")
+        return bad
+
     def inspect_plan(self) -> None:
-        if self._git("rev-parse", "HEAD").strip() != self.workspace_head or self._git("status", "--porcelain") or (self.sc.run_dir.workspace / "PLAN.md").exists():
-            raise AssertionError("planner changed the workspace")
+        violations = self.workspace_violations()
+        if violations:
+            raise AssertionError(f"planner changed the workspace: {violations}")
         def plan_decisions():
             found = [d for d in self.sc.oracle.decisions(self.goal_id)
                      if d["status"] == "pending" and str(d["decision_key"]).startswith("roadmap_plan:")]
@@ -734,8 +751,9 @@ class G2G4(L1):
                         })
             time.sleep(1)
         decisions = decisions or []
-        if self._git("rev-parse", "HEAD").strip() != self.workspace_head or self._git("status", "--porcelain") or (self.sc.run_dir.workspace / "PLAN.md").exists():
-            raise AssertionError("planner or verifier changed the workspace")
+        violations = self.workspace_violations()
+        if violations:
+            raise AssertionError(f"planner or verifier changed the workspace: {violations}")
         if len(decisions) != 1:
             raise AssertionError(f"expected one plan review decision, got {[d['decision_key'] for d in decisions]}")
         self.plan_decision = decisions[0]
@@ -767,7 +785,7 @@ class G2G4(L1):
         self.plan_items = metadata.get("plan_items") or []
         ui = self.pw_ok("inspect-plan", LIVE_ACCEPTANCE_PLAN_DECISION_TITLE=str(self.plan_decision.get("title") or ""))
         self.verify("read_only_planner", {"head_unchanged": self._git("rev-parse", "HEAD").strip() == self.workspace_head,
-                                          "workspace_clean": not self._git("status", "--porcelain"),
+                                          "workspace_clean": not self.workspace_violations(),
                                           "plan_canary_absent": not (self.sc.run_dir.workspace / "PLAN.md").exists(),
                                           "planner_consumed_once": self.sc.oracle.report_consumed_count(self.run_id, self.planner_task) == 1})
         self.verify("plan_review_binding", {"decision_readable": ui.get("decision_readable") is True,
