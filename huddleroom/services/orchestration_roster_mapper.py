@@ -222,6 +222,10 @@ class OrchestrationRosterMapper:
         return snapshot
 
     async def _active_agents(self, db: AsyncSession) -> list[Agent]:
+        return await self.current_active_agents(db)
+
+    async def current_active_agents(self, db: AsyncSession) -> list[Agent]:
+        """Authoritative current roster; query failures propagate, with no snapshot fallback."""
         result = await db.execute(
             select(Agent)
             .where(Agent.is_active.is_(True))

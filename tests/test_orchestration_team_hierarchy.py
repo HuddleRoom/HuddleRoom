@@ -2385,6 +2385,8 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
         if decision.decision_key == "team_hierarchy:approval"
     )
 
+    captured_input = copy.deepcopy(original.input_snapshot)
+    captured_status = original.status
     await db_session.commit()  # This request reads committed hierarchy fixture state.
     response = await client.post(
         _answer_url(test_project.id, goal.id, original_approval.id),
@@ -2396,6 +2398,11 @@ async def test_hierarchy_change_request_reruns_then_fresh_approval_completes_sam
     fresh = await service.get_current(db_session, goal.id, "team_hierarchy")
     assert fresh.id != original.id
     assert original.superseded_by_id == fresh.id
+    assert original.status == captured_status
+    assert original.input_snapshot["fingerprint"] == captured_input["fingerprint"]
+    assert original.input_snapshot["capture"] == captured_input["capture"]
+    assert original.input_snapshot["rerun_intent"]["source_decision_id"] == str(original_approval.id)
+    assert fresh.input_snapshot["fingerprint"] == captured_input["fingerprint"]
     revision = fresh.outputs["revision_context"]
     assert revision["source_process_id"] == str(original.id)
     assert revision["source_decision_id"] == str(original_approval.id)
@@ -3042,6 +3049,7 @@ async def test_orchestrated_process_version_bump_alone_is_silently_absorbed(
     refreshed = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
     assert refreshed.id == current.id
     assert refreshed.process_version == PROCESS_VERSION
+    assert refreshed.input_snapshot["fingerprint"] == old_formula_fingerprint
     warnings = await OrchestrationWarningService().list_warnings(db_session, goal.id, active_only=True)
     assert [w for w in warnings if w.warning_type == "team_hierarchy_stale_inputs"] == []
 
@@ -3075,6 +3083,7 @@ async def test_orchestrated_process_version_bump_does_not_absorb_real_drift(
     refreshed = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
     assert refreshed.id == current.id
     assert refreshed.process_version == PROCESS_VERSION
+    assert refreshed.input_snapshot["fingerprint"] == old_formula_fingerprint
     warnings = await OrchestrationWarningService().list_warnings(db_session, goal.id, active_only=True)
     stale_warnings = [w for w in warnings if w.warning_type == "team_hierarchy_stale_inputs"]
     assert len(stale_warnings) == 1

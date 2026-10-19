@@ -40,7 +40,12 @@ from huddleroom.services.orchestration_agent_review_service import (
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_llm_decision_adapter import _full_completion_error, _safe_completion_error
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
-from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_process_service import (
+    OrchestrationProcessService,
+    effective_input_fingerprint,
+    capture_input_fingerprint,
+    set_effective_input_fingerprint,
+)
 from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper, PROFILES
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
 
@@ -717,10 +722,15 @@ class AgentDefinitionReviewProcess:
                     "error": current.outputs["_lm_retry"].get("error")}
 
         _assignments, targets, fingerprint = await self._review_inputs(db, goal, run)
+        if current is not None:
+            capture_input_fingerprint(
+                current, fingerprint, PROCESS_VERSION,
+                allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
+            )
         coverage_fingerprint = self._coverage_fingerprint(goal, targets)
         proposal_decisions = await self._proposal_decisions(db, goal.id)
         stored_fingerprint = (
-            current.input_snapshot.get("fingerprint")
+            effective_input_fingerprint(current)
             if current is not None and isinstance(current.input_snapshot, dict)
             else None
         )
@@ -734,7 +744,7 @@ class AgentDefinitionReviewProcess:
         ):
             # The only drift is this process's own approved text, applied
             # roster-first after the goal lock was released: re-stamp.
-            current.input_snapshot = {**current.input_snapshot, "fingerprint": fingerprint}
+            set_effective_input_fingerprint(current, fingerprint, PROCESS_VERSION, "approved_definitions")
             stored_fingerprint = fingerprint
             await db.flush()
         if (
@@ -839,6 +849,7 @@ class AgentDefinitionReviewProcess:
                 "process_version": PROCESS_VERSION,
             }
             if pure_version_bump:
+                set_effective_input_fingerprint(current, fingerprint, PROCESS_VERSION, "formula_upgrade")
                 current.outputs = {
                     **(current.outputs or {}),
                     "fingerprint": fingerprint,
@@ -860,7 +871,7 @@ class AgentDefinitionReviewProcess:
             return self._summary("completed")
 
         stored_fingerprint = (
-            current.input_snapshot.get("fingerprint")
+            effective_input_fingerprint(current)
             if current is not None and isinstance(current.input_snapshot, dict)
             else None
         )
@@ -911,6 +922,7 @@ class AgentDefinitionReviewProcess:
                 coverage_fingerprint is not None
                 and current.outputs.get("coverage_fingerprint") == coverage_fingerprint
             ):
+                set_effective_input_fingerprint(current, fingerprint, PROCESS_VERSION, "covered_workload")
                 current.outputs = {**(current.outputs or {}), "fingerprint": fingerprint}
                 await db.flush()
                 return self._summary("completed")

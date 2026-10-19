@@ -1622,7 +1622,7 @@ async def test_concurrent_rerun_last_keeps_exactly_one_current_row(concurrent_se
 
     goal = await _make_goal(session1, project)
     run = await _make_run(session1, goal)
-    await _seed_terminal(session1, goal.id, "goal_definition", run.id)
+    original = await _seed_terminal(session1, goal.id, "goal_definition", run.id)
     await session1.commit()
 
     svc = OrchestrationDebugService()
@@ -1643,6 +1643,15 @@ async def test_concurrent_rerun_last_keeps_exactly_one_current_row(concurrent_se
         )
     ).scalars().all()
     assert len(current_rows) == 1
+    await session1.refresh(original)
+    assert original.superseded_by_id is not None
+    assert original.superseded_by_id != original.id
+    assert original.status == "completed"
+    rows = (await session1.scalars(select(OrchestrationProcessRun).where(
+        OrchestrationProcessRun.goal_id == goal.id,
+        OrchestrationProcessRun.process_type == "goal_definition",
+    ))).all()
+    assert all(row.superseded_by_id != row.id for row in rows)
 
 
 # 10. Side-effect boundary

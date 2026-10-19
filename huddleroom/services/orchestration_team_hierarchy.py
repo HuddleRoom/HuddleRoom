@@ -26,7 +26,14 @@ from huddleroom.services.orchestration_agent_review_service import Orchestration
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_goal_definition import requires_independent_verification
 from huddleroom.services.orchestration_memory_service import OrchestrationMemoryService
-from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_process_service import (
+    OrchestrationProcessService,
+    effective_input_fingerprint,
+    capture_input_fingerprint,
+    set_effective_input_fingerprint,
+    request_process_rerun,
+    pending_rerun_intent,
+)
 from huddleroom.services.orchestration_roster_mapper import (
     PROFILES,
     WEAK_FIT_THRESHOLD,
@@ -40,22 +47,10 @@ from huddleroom.services.orchestration_llm_decision_adapter import _safe_complet
 
 PROCESS_TYPE = "team_hierarchy"
 PROCESS_VERSION = 2
-# Sentinel input_snapshot fingerprints used internally to force a real
-# rerun in _advance_orchestrated's mismatch branch -- both mark a
-# deliberate continuation of a decision the human is already mid-way
-# through resolving (one proposal answered, or the fully-resolved hierarchy
-# failed validation), not background input drift. Never the item-3
-# one-time-suggestion path.
+# Legacy names retained for imported fixtures; new writes use explicit rerun intent.
 PROPOSAL_RESOLUTION_RERUN_SENTINEL = "rerun after proposal resolution"
 RESOLVED_VALIDATION_FAILED_RERUN_SENTINEL = "rerun after resolved hierarchy validation failed"
 HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL = "rerun after hierarchy changes requested"
-INTERNAL_RERUN_SENTINELS = frozenset(
-    {
-        PROPOSAL_RESOLUTION_RERUN_SENTINEL,
-        RESOLVED_VALIDATION_FAILED_RERUN_SENTINEL,
-        HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL,
-    }
-)
 APPROVAL_DECISION_KEY = "team_hierarchy:approval"
 MEMORY_SECTION_KEY = "team_hierarchy"
 MEMORY_TOC_ORDER = 40
@@ -388,6 +383,11 @@ class TeamHierarchyProcess:
 
         proposal = await self.build_proposal(db, goal, run)
         fingerprint = self._fingerprint(goal, proposal)
+        if current is not None:
+            capture_input_fingerprint(
+                current, fingerprint, PROCESS_VERSION,
+                allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
+            )
         if current is not None and current.status == "completed" and current.process_version != PROCESS_VERSION:
             # The trivial-tier fingerprint formula (goal + proposal) never
             # hashed agent-snapshot fields, so this version bump can't have
@@ -408,7 +408,7 @@ class TeamHierarchyProcess:
             return self._summary("completed")
 
         stored_fingerprint = (
-            current.input_snapshot.get("fingerprint")
+            effective_input_fingerprint(current)
             if current is not None and isinstance(current.input_snapshot, dict)
             else None
         )
@@ -509,7 +509,7 @@ class TeamHierarchyProcess:
             if current.status not in ("running", "waiting_decision"):
                 return self._summary(current.status)
         elif not stored_fingerprint:
-            current.input_snapshot = {"fingerprint": fingerprint}
+            set_effective_input_fingerprint(current, fingerprint, PROCESS_VERSION, "input_initialized")
             await db.flush()
 
         agent_definition_review_skipped = await self._agent_definition_review_was_skipped(
@@ -651,6 +651,11 @@ class TeamHierarchyProcess:
     ) -> dict:
         payload = await self._analysis_input(db, goal)
         input_fingerprint = self._semantic_fingerprint(self._strip_volatile(payload))
+        if current is not None:
+            capture_input_fingerprint(
+                current, input_fingerprint, PROCESS_VERSION,
+                allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
+            )
         if current is not None and current.status in {"running", "waiting_decision"}:
             reserved = await self._apply_reserved_agents(db, goal, run, current)
             if reserved:
@@ -662,16 +667,17 @@ class TeamHierarchyProcess:
                 input_fingerprint = self._semantic_fingerprint(self._strip_volatile(payload))
             snapshot = current.input_snapshot or {}
             unstamped = reserved - set(snapshot.get("stamped_agent_ids") or ())
-            if unstamped and snapshot.get("fingerprint") != input_fingerprint and snapshot.get(
-                "fingerprint"
-            ) == self._semantic_fingerprint(self._strip_volatile({**payload, "agents": [
-                agent for agent in payload["agents"] if agent["id"] not in unstamped
-            ]})):
+            if (
+                unstamped
+                and effective_input_fingerprint(current) != input_fingerprint
+                and effective_input_fingerprint(current) == self._semantic_fingerprint(self._strip_volatile({
+                    **payload, "agents": [agent for agent in payload["agents"] if agent["id"] not in unstamped],
+                }))
+            ):
                 # The only drift is the agents this process's approvals created
                 # roster-first after the goal lock was released: re-stamp.
-                current.input_snapshot = {
-                    **snapshot, "fingerprint": input_fingerprint, "stamped_agent_ids": sorted(reserved),
-                }
+                set_effective_input_fingerprint(current, input_fingerprint, PROCESS_VERSION, "approved_agents")
+                current.input_snapshot = {**current.input_snapshot, "stamped_agent_ids": sorted(reserved)}
                 await db.flush()
         if current is not None and current.status == "completed" and current.process_version != PROCESS_VERSION:
             # A PROCESS_VERSION bump absorbs a fingerprint-*formula* change
@@ -685,14 +691,14 @@ class TeamHierarchyProcess:
                 self._strip_volatile(payload, extra_fields=())
             )
             stored_fingerprint = (
-                current.input_snapshot.get("fingerprint")
+                effective_input_fingerprint(current)
                 if isinstance(current.input_snapshot, dict)
                 else None
             )
             pure_version_bump = stored_fingerprint == old_formula_fingerprint
             current.process_version = PROCESS_VERSION
             if pure_version_bump:
-                current.input_snapshot = {"fingerprint": input_fingerprint}
+                set_effective_input_fingerprint(current, input_fingerprint, PROCESS_VERSION, "formula_upgrade")
             # else: genuine drift co-occurring with the version bump -- the
             # version is bumped now so it isn't rechecked every tick, but the
             # stored fingerprint is left stale so the normal stale-inputs
@@ -701,7 +707,7 @@ class TeamHierarchyProcess:
             await db.flush()
         if (
             current is not None and current.status == "completed"
-            and current.input_snapshot.get("fingerprint") == input_fingerprint
+            and effective_input_fingerprint(current) == input_fingerprint
             and current.outputs.get("approval") in {"approve", "approve_with_documented_gaps", RECOVERY_APPROVAL}
         ):
             return self._summary("completed")
@@ -748,13 +754,12 @@ class TeamHierarchyProcess:
             )
         elif (
             current.status == "waiting_decision"
-            and current.input_snapshot.get("fingerprint") != input_fingerprint
-            and current.input_snapshot.get("fingerprint") not in INTERNAL_RERUN_SENTINELS
+            and effective_input_fingerprint(current) != input_fingerprint
+            and not pending_rerun_intent(current)
         ):
             # Stale inputs while a decision is pending: park stays parked,
             # one-time suggestion instead of cancel+restart (item 3). The
-            # sentinel marker (deliberate batch-continuation rerun, not
-            # background drift) is excluded and falls through below.
+            # explicit continuation intent is excluded and falls through below.
             if run.phase in ("baseline", "ready"):
                 await self.warning_service.suggest_stale_inputs(
                     db,
@@ -765,10 +770,10 @@ class TeamHierarchyProcess:
                     run_id=run.id,
                 )
             return self._summary("waiting_decision")
-        elif current.input_snapshot.get("fingerprint") != input_fingerprint and (
+        elif (effective_input_fingerprint(current) != input_fingerprint or pending_rerun_intent(current)) and (
             manual
             or run.phase == "baseline"
-            or current.input_snapshot.get("fingerprint") in INTERNAL_RERUN_SENTINELS
+            or pending_rerun_intent(current)
         ):
             await self._cancel_pending_for_run(db, goal.id, current.id)
             revision_context = (current.outputs or {}).get("revision_context")
@@ -882,10 +887,11 @@ class TeamHierarchyProcess:
 
         if created_by_ref:
             await self._apply_reserved_agents(db, goal, run, current)
-            current.input_snapshot = {
-                "fingerprint": self._semantic_fingerprint(self._strip_volatile(await self._analysis_input(db, goal))),
-                "stamped_agent_ids": sorted(created_by_ref.values()),
-            }
+            set_effective_input_fingerprint(
+                current, self._semantic_fingerprint(self._strip_volatile(await self._analysis_input(db, goal))),
+                PROCESS_VERSION, "approved_agents",
+            )
+            current.input_snapshot = {**current.input_snapshot, "stamped_agent_ids": sorted(created_by_ref.values())}
 
         if len(proposal_decisions) == len(proposal_by_key) and all(
             decision.status == "answered" and decision.selected_option == "approve"
@@ -917,7 +923,7 @@ class TeamHierarchyProcess:
                 current.outputs = {**current.outputs, "retryable": False, "semantic_error": str(exc)}
                 current.outputs["resolved_validation_repair_attempted"] = True
                 await self._cancel_pending_for_run(db, goal.id, current.id)
-                current.input_snapshot = {"fingerprint": RESOLVED_VALIDATION_FAILED_RERUN_SENTINEL}
+                request_process_rerun(current, "resolved_validation_failed")
                 await db.flush()
                 return await self._advance_orchestrated(db, goal, run, current)
             approval = next((
@@ -948,7 +954,7 @@ class TeamHierarchyProcess:
                 outputs = {
                     **selected_proposal,
                     "proposal": selected_proposal,
-                    "fingerprint": current.input_snapshot["fingerprint"],
+                    "fingerprint": effective_input_fingerprint(current),
                     "approval": approval.selected_option,
                     "approval_decision_id": str(approval.id),
                     "accepted_responsibility_gap_ids": substantive_gap_ids,
@@ -982,7 +988,7 @@ class TeamHierarchyProcess:
                     replacement_outputs.pop("resolved_validation_retry_repair", None)
                 current.outputs = replacement_outputs
                 await self._cancel_pending_for_run(db, goal.id, current.id)
-                current.input_snapshot = {"fingerprint": HIERARCHY_CHANGES_REQUESTED_RERUN_SENTINEL}
+                request_process_rerun(current, "hierarchy_changes_requested", approval.id)
                 await db.flush()
                 return await self._advance_orchestrated(db, goal, run, current)
             if approval is None:

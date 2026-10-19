@@ -18,7 +18,10 @@ from huddleroom.services.orchestration_effectiveness_review import Effectiveness
 from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
 from huddleroom.services.orchestration_goal_definition import GoalDefinitionProcess
 from huddleroom.services.orchestration_manager_selection import ManagerSelectionProcess
-from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_process_service import (
+    OrchestrationProcessService,
+    copied_input_seed,
+)
 from huddleroom.services.orchestration_service import LLM_DECISION_RUN_STATUSES, OrchestrationService
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
 from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
@@ -336,7 +339,7 @@ class OrchestrationDebugService:
                         process_type=selected.process_type,
                         trigger_reason=f"human requested: rerun of {selected.process_type}",
                         run_id=run.id,
-                        input_snapshot=deepcopy(selected.input_snapshot),
+                        input_snapshot=copied_input_seed(selected),
                         process_version=selected.process_version,
                         supersede_waiting=selected.status == "waiting_decision",
                     )
@@ -375,7 +378,7 @@ class OrchestrationDebugService:
                         process_type=selected.process_type,
                         trigger_reason=f"human requested: rerun of {selected.process_type}",
                         run_id=run.id,
-                        input_snapshot=deepcopy(selected.input_snapshot),
+                        input_snapshot=copied_input_seed(selected),
                         process_version=selected.process_version,
                     )
                     process_summary = await self._advance(db, goal, run, selected.process_type)
@@ -459,7 +462,7 @@ class OrchestrationDebugService:
             process_type=process_run.process_type,
             trigger_reason=f"human requested: rerun of {process_run.process_type}",
             run_id=run.id,
-            input_snapshot=deepcopy(process_run.input_snapshot),
+            input_snapshot=copied_input_seed(process_run),
             process_version=process_run.process_version,
             supersede_waiting=True,
         )

@@ -3208,3 +3208,25 @@ def test_c3_all_eight_static_verifier_argument_models_reject_arbitrary_predicate
         arguments[invalid] = "status == completed"
     with pytest.raises(ValueError):
         TypeAdapter(_VERIFIER_MODELS[verifier]).validate_python(arguments)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected,passed", [("b" * 64, True), (SHA256, False)])
+async def test_g4_recovery_verifies_effective_comparison_without_rewriting_capture(
+    db_session, test_project, expected, passed
+):
+    rows = await _c3_context(db_session, test_project)
+    process = OrchestrationProcessRun(
+        goal_id=rows["goal"].id, run_id=rows["run"].id, process_type="team_hierarchy",
+        status="completed", trigger_reason="accepted",
+        input_snapshot={"fingerprint": SHA256, "effective_comparison": {"fingerprint": "b" * 64}},
+    )
+    db_session.add(process)
+    await db_session.flush()
+    arguments = {"goal_id": str(rows["goal"].id), "process_id": str(process.id),
+                 "expected_fingerprint": expected}
+    result = await RecoveryToolRegistry().verify(
+        db_session, rows["proposal"], _c3_check("process.completed", arguments)
+    )
+    assert (result.status == "passed") is passed
+    assert process.input_snapshot["fingerprint"] == SHA256

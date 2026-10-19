@@ -2165,6 +2165,7 @@ async def test_process_version_bump_alone_is_silently_absorbed(db_session, revie
     await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
     await _advance(db_session, review_goal, review_run)
     first = await _current_process(db_session, review_goal)
+    captured_input = dict(first.input_snapshot)
     first.process_version = PROCESS_VERSION - 1
     await db_session.flush()
 
@@ -2173,6 +2174,8 @@ async def test_process_version_bump_alone_is_silently_absorbed(db_session, revie
 
     assert second.id == first.id
     assert second.process_version == PROCESS_VERSION
+    assert second.input_snapshot["fingerprint"] == captured_input["fingerprint"]
+    assert second.input_snapshot["capture"] == captured_input["capture"]
     warnings = (
         await db_session.execute(
             select(OrchestrationWarning).where(OrchestrationWarning.active.is_(True))
@@ -2193,6 +2196,7 @@ async def test_process_version_bump_does_not_absorb_real_drift(db_session, revie
     await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
     await _advance(db_session, review_goal, review_run)
     first = await _current_process(db_session, review_goal)
+    captured_input = dict(first.input_snapshot)
     first.process_version = PROCESS_VERSION - 1
     await db_session.flush()
 
@@ -2204,6 +2208,8 @@ async def test_process_version_bump_does_not_absorb_real_drift(db_session, revie
 
     assert second.id == first.id
     assert second.process_version == PROCESS_VERSION
+    assert second.input_snapshot["fingerprint"] == captured_input["fingerprint"]
+    assert second.input_snapshot["capture"] == captured_input["capture"]
     warnings = (
         await db_session.execute(
             select(OrchestrationWarning).where(OrchestrationWarning.active.is_(True))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -14,6 +15,86 @@ from huddleroom.models.orchestration_process import (
 )
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_linkage import check_goal_linkage
+
+
+_LEGACY_RERUN_REASONS = {
+    "rerun after proposal resolution": "proposal_resolution",
+    "rerun after resolved hierarchy validation failed": "resolved_validation_failed",
+    "rerun after hierarchy changes requested": "hierarchy_changes_requested",
+}
+
+
+def effective_input_fingerprint(process: OrchestrationProcessRun) -> str | None:
+    """Comparison identity; captured input is never rewritten by a restamp."""
+    snapshot = process.input_snapshot or {}
+    comparison = snapshot.get("effective_comparison")
+    value = comparison.get("fingerprint") if isinstance(comparison, dict) else snapshot.get("fingerprint")
+    return value if isinstance(value, str) and value not in _LEGACY_RERUN_REASONS else None
+
+
+def capture_input_fingerprint(
+    process: OrchestrationProcessRun, fingerprint: str, formula_version: int, *, allow_initialize: bool = True,
+) -> None:
+    snapshot = dict(process.input_snapshot or {})
+    if "capture" not in snapshot:
+        original = snapshot.get("fingerprint")
+        legacy_reason = _LEGACY_RERUN_REASONS.get(original) if isinstance(original, str) else None
+        if legacy_reason:
+            snapshot["capture"] = {"source": "legacy_first_observed", "formula_version": process.process_version,
+                                   "original_available": False}
+            snapshot["rerun_intent"] = {"reason": legacy_reason, "source_process_id": str(process.id),
+                                        "source_decision_id": None}
+        elif original is not None:
+            snapshot["capture"] = {"source": "legacy_first_observed", "formula_version": process.process_version,
+                                   "original_available": False}
+        elif not allow_initialize:
+            snapshot["capture"] = {"source": "legacy_first_observed", "formula_version": process.process_version,
+                                   "original_available": False}
+        else:
+            snapshot["fingerprint"] = fingerprint
+            snapshot["capture"] = {"source": "captured", "formula_version": formula_version,
+                                   "original_available": True}
+            if (snapshot.get("effective_comparison") or {}).get("source") == "copied_seed":
+                snapshot["effective_comparison"] = {
+                    "fingerprint": fingerprint, "formula_version": formula_version, "source": "derived",
+                    "reason": "actual_input_captured", "source_refs": snapshot["effective_comparison"].get("source_refs", {}),
+                }
+    process.input_snapshot = snapshot
+
+
+def set_effective_input_fingerprint(
+    process: OrchestrationProcessRun, fingerprint: str, formula_version: int, reason: str,
+    *, source: str = "derived", source_refs: dict | None = None,
+) -> None:
+    if source != "copied_seed":
+        capture_input_fingerprint(process, fingerprint, formula_version, allow_initialize=False)
+    process.input_snapshot = {**(process.input_snapshot or {}), "effective_comparison": {
+        "fingerprint": fingerprint, "formula_version": formula_version, "source": source,
+        "reason": reason, "source_refs": source_refs or {},
+    }}
+
+
+def request_process_rerun(process: OrchestrationProcessRun, reason: str, source_decision_id=None) -> None:
+    snapshot = dict(process.input_snapshot or {})
+    process.input_snapshot = {**snapshot, "rerun_intent": {
+        "reason": reason, "source_process_id": str(process.id),
+        "source_decision_id": str(source_decision_id) if source_decision_id is not None else None,
+    }}
+
+
+def pending_rerun_intent(process: OrchestrationProcessRun) -> bool:
+    intent = (process.input_snapshot or {}).get("rerun_intent")
+    return isinstance(intent, dict) and not intent.get("consumed_by_process_id")
+
+
+def copied_input_seed(process: OrchestrationProcessRun) -> dict:
+    if process.process_type not in {"team_hierarchy", "agent_definition_review"}:
+        return deepcopy(process.input_snapshot or {})
+    fingerprint = effective_input_fingerprint(process)
+    return {"effective_comparison": {
+        "fingerprint": fingerprint, "formula_version": process.process_version, "source": "copied_seed",
+        "reason": "debug_rerun", "source_refs": {"process_id": str(process.id)},
+    }}
 
 
 class OrchestrationProcessService:
@@ -68,8 +149,12 @@ class OrchestrationProcessService:
 
     async def start_process(self, db, goal_id, **kwargs):
         from huddleroom.services.orchestration_answer_receipts import _application, record_current_answer_effect
-        previous = await self.get_current(db, goal_id, kwargs["process_type"]) if _application.get() is not None else None
+        previous = await self.get_current(db, goal_id, kwargs["process_type"])
         row = await self._start_process_impl(db, goal_id, **kwargs)
+        if previous is not None and previous.id != row.id and pending_rerun_intent(previous):
+            previous.input_snapshot = {**previous.input_snapshot, "rerun_intent": {
+                **previous.input_snapshot["rerun_intent"], "consumed_by_process_id": str(row.id),
+            }}
         if _application.get() is not None and (previous is None or previous.id != row.id):
             await record_current_answer_effect(db, f"source_successor:{row.process_type}", "process", row.id)
             previous_ids = list(await db.scalars(select(OrchestrationProcessRun.id).where(
@@ -113,6 +198,12 @@ class OrchestrationProcessService:
             trigger_reason=trigger_reason,
             input_snapshot=input_snapshot or {},
         )
+        if isinstance(input_snapshot, dict) and isinstance(input_snapshot.get("fingerprint"), str):
+            capture_input_fingerprint(row, input_snapshot["fingerprint"], process_version)
+            row.input_snapshot = {**row.input_snapshot, "capture": {
+                "source": "captured", "formula_version": process_version, "original_available": True,
+            }}
+        input_snapshot = row.input_snapshot
         db.add(row)
         try:
             await db.flush()

@@ -48,7 +48,10 @@ from huddleroom.services.orchestration_agent_definition_analyzer import redact_s
 from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
 from huddleroom.services.orchestration_goal_definition import goal_objective_with_clarifications
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess, resolved_proposal_exclusions_from_decisions, select_plan_author
-from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_process_service import (
+    OrchestrationProcessService,
+    effective_input_fingerprint,
+)
 from huddleroom.services.orchestration_linkage import check_goal_linkage
 from huddleroom.services.orchestration_wake_when import normalize_wake_when
 
@@ -473,7 +476,7 @@ class RecoveryToolRegistry:
         def process_value(process: OrchestrationProcessRun) -> dict[str, Any]:
             outputs = process.outputs if isinstance(process.outputs, dict) else {}
             value = row_fields(process, "id", "goal_id", "run_id", "process_type", "status", "superseded_by_id")
-            value["fingerprint"] = (process.input_snapshot or {}).get("fingerprint")
+            value["fingerprint"] = effective_input_fingerprint(process)
             for key in ("fingerprint", "coverage_fingerprint", "hierarchy_fingerprint", "target_ids", "review_ids",
                         "source_agent_review_process_id", "eligibility", "assignments", "role_to_agent", "hierarchy",
                         "documented_gaps", "approval", "approval_decision_id", "responsibility_coverage",
@@ -877,7 +880,7 @@ class RecoveryToolRegistry:
                         current = await OrchestrationProcessService().get_current(db, goal.id, row.process_type)
                         passed = (row.superseded_by_id is None and current is not None and current.id == row.id
                                   and (arguments.expected_fingerprint is None
-                                       or (row.input_snapshot or {}).get("fingerprint") == arguments.expected_fingerprint))
+                                       or effective_input_fingerprint(row) == arguments.expected_fingerprint))
                 else:  # warning.resolved is goal-scoped across runs.
                     row = await db.get(OrchestrationWarning, arguments.warning_id)
                     evidence.append(self._verification_evidence(check, "warning", row, arguments.warning_id))
@@ -1210,10 +1213,10 @@ class RecoveryToolRegistry:
         expected_fps = sealed_fingerprints.get(str(goal.id))
         return (expected_fps is not None and expected_fps == {"coverage": coverage_fp, "hierarchy": hierarchy_fp}
                 and definition.outputs.get("fingerprint") == definition_fp
-                and (definition.input_snapshot or {}).get("fingerprint") == definition_fp
+                and effective_input_fingerprint(definition) == definition_fp
                 and definition.outputs.get("coverage_fingerprint") == coverage_fp
                 and hierarchy.outputs.get("fingerprint") == hierarchy_fp
-                and (hierarchy.input_snapshot or {}).get("fingerprint") == hierarchy_fp)
+                and effective_input_fingerprint(hierarchy) == hierarchy_fp)
 
     async def _receipt_live_wait(self, db: AsyncSession, receipt: ToolReceiptV1,
                                  goal: OrchestrationGoal, run: OrchestrationRun) -> Any:

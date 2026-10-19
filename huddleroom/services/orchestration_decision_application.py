@@ -23,7 +23,11 @@ from huddleroom.services.orchestration_recovery_presenter import (
     GAP_PREFIX, is_recovery_decision, present_decision_response, present_decision_responses,
 )
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
-from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_process_service import (
+    OrchestrationProcessService,
+    effective_input_fingerprint,
+    request_process_rerun,
+)
 from huddleroom.services.orchestration_service import OrchestrationService
 from huddleroom.services.orchestration_team_hierarchy import TeamHierarchyProcess
 from huddleroom.services.orchestration_team_hierarchy_analyzer import canonical_agent_create
@@ -247,7 +251,7 @@ async def validate_ordinary_submission(db, goal, decisions, submission, answers)
             raise HTTPException(409, "team hierarchy proposal is no longer current")
         hierarchy = TeamHierarchyProcess()
         fingerprint = hierarchy._semantic_fingerprint(hierarchy._strip_volatile(await hierarchy._analysis_input(db, goal)))
-        if current.input_snapshot.get("fingerprint") != fingerprint:
+        if effective_input_fingerprint(current) != fingerprint:
             stale = HTTPException(409, "team hierarchy proposal inputs changed")
             # The accepting owner persists the rerun suggestion after rolling this rejection back.
             stale.stale_inputs = {"goal_id": goal.id, "process_run_id": current.id, "run_id": current.run_id}
@@ -280,9 +284,8 @@ async def validate_ordinary_submission(db, goal, decisions, submission, answers)
                     # The answer application will roster-create this reserved
                     # agent. A revision/provisional coverage needs one successor
                     # to rejudge its actual accepted definition.
-                    from huddleroom.services.orchestration_team_hierarchy import PROPOSAL_RESOLUTION_RERUN_SENTINEL
                     current.outputs = {**(current.outputs or {}), "resolved_validation_repair_attempted": True}
-                    current.input_snapshot = {"fingerprint": PROPOSAL_RESOLUTION_RERUN_SENTINEL}
+                    request_process_rerun(current, "proposal_resolution", decision.id)
             answer["answer_reason"] = json.dumps(metadata, sort_keys=True)
 
 

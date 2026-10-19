@@ -465,12 +465,13 @@ async def drain_answer_applications(db, run_id):
                             with application_context(action_id):
                                 if source.process_type == "team_hierarchy":
                                     from huddleroom.services.orchestration_team_hierarchy import (
-                                        TeamHierarchyProcess, PROPOSAL_RESOLUTION_RERUN_SENTINEL,
+                                        TeamHierarchyProcess,
                                     )
                                     if any(item["selected_option"] in {"edit", "reject"}
                                            for item in submission["answers"]):
                                         await TeamHierarchyProcess()._cancel_pending_for_run(db, goal_id, source.id)
-                                        source.input_snapshot = {"fingerprint": PROPOSAL_RESOLUTION_RERUN_SENTINEL}
+                                        from huddleroom.services.orchestration_process_service import request_process_rerun
+                                        request_process_rerun(source, "proposal_resolution")
                                 await OrchestrationDebugService().advance_process(db, goal, run, source.process_type)
                                 await db.refresh(action)
                                 effects = dict((action.dispatch_contract or {}).get("effects", {}))

@@ -123,7 +123,7 @@ from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
 from huddleroom.services.orchestration_capacity import (
     activate_ready, available_slots, dependency_counts, queued_tasks, rank_queued, root_goal_id,
 )
-from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+from huddleroom.services.orchestration_process_service import OrchestrationProcessService, effective_input_fingerprint
 from huddleroom.services.orchestration_llm_decision_adapter import LLMDecisionAdapter, OrchestrationDecisionAdapter
 from huddleroom.services.orchestration_memory_preface import OrchestrationMemoryPrefaceBuilder
 from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper
@@ -6696,7 +6696,7 @@ class OrchestrationService:
         """Identity of one blocked baseline process run, as named by a baseline-repair admission."""
         # Outputs (gates, decisions) carry the failure itself, so a changed failure is a different gate.
         value = {"id": str(process.id), "process_type": process.process_type, "status": process.status,
-                 "input_fingerprint": (process.input_snapshot or {}).get("fingerprint"), "outputs": process.outputs}
+                 "input_fingerprint": effective_input_fingerprint(process), "outputs": process.outputs}
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
 
     async def _baseline_readiness_reason(
