@@ -196,7 +196,7 @@ class AgentDefinitionSemanticAnalyzer:
             "for the supplied goal. The structured agent is the reviewed configuration for this request; "
             "project, goal and preparation prose is unversioned background and must not override it. "
             "This snapshot does not establish live current settings or the reviewer's invocation runtime/model. "
-            "An unspecified or native-default model remains unknown/default. "
+            "An unspecified or native-default model remains unspecified/default. "
             "Judge description and persona/system_prompt explicitly. Identify concrete "
             "weaknesses. For improvement_proposed, provide constrained proposed_description and proposed_persona: both "
             "must be non-empty, role-specific, generic, differ from the candidate fields, and contain no goal or project "

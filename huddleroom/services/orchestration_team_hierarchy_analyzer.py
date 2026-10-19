@@ -427,7 +427,7 @@ class TeamHierarchyAnalyzer:
                 "runtime and model. Project, goal and preparation prose is unversioned background and must not "
                 "override that roster. Reviewed definition snapshots are historical review evidence; they do not "
                 "override current roster settings or establish the runtime/model used by an earlier call. "
-                "An unspecified or native-default model remains unknown/default. For every "
+                "An unspecified or native-default model remains unspecified/default. For every "
                 "new agent, design a complete AgentCreate-compatible definition. Its required keys: "
                 f"{required_agent_create_keys}; allowed keys: {allowed_agent_create_keys}; defaulted AgentCreate "
                 "fields may be omitted. Include a role-specific "
