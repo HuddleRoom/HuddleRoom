@@ -287,6 +287,7 @@ class G2G4(L1):
 
     def __init__(self, sc: G2G4Scenario):
         super().__init__(sc)
+        self.claude_released: list[int] = []
         agent_ids = _live_agent_ids(sc)
         self.ids = sc.ids = {**sc.ids, **agent_ids}
         self.checks = {key: {"status": "not_run", "evidence": []} for key in CHECKS}
@@ -403,11 +404,10 @@ class G2G4(L1):
         stray = {tool: [inv.ordinal for inv in shim.invocations()
                         if inv.exec_at is not None and inv.ordinal not in released[tool]]
                  for tool, shim in self.sc.shims.items()}
-        claude_execution = [inv.ordinal for inv in self.claude.invocations() if inv.exec_at is not None]
         implementation = [task["id"] for task in self.sc.oracle.tasks(self.goal_id)
                           if ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function") == "implementation"]
-        if any(stray.values()) or claude_execution or implementation:
-            raise AssertionError(f"unexpected execution={stray}; implementation_claude={claude_execution}; implementation_tasks={implementation}")
+        if any(stray.values()) or implementation:
+            raise AssertionError(f"unexpected execution={stray}; implementation_tasks={implementation}")
 
     def drive_codex(self, timeout: float, done, why: str):
         end = time.monotonic() + timeout
@@ -696,7 +696,46 @@ class G2G4(L1):
     def inspect_plan(self) -> None:
         if self._git("rev-parse", "HEAD").strip() != self.workspace_head or self._git("status", "--porcelain") or (self.sc.run_dir.workspace / "PLAN.md").exists():
             raise AssertionError("planner changed the workspace")
-        decisions = [d for d in self.sc.oracle.decisions(self.goal_id) if d["status"] == "pending" and str(d["decision_key"]).startswith("roadmap_plan:")]
+        def plan_decisions():
+            found = [d for d in self.sc.oracle.decisions(self.goal_id)
+                     if d["status"] == "pending" and str(d["decision_key"]).startswith("roadmap_plan:")]
+            return found or None
+
+        def work_function(task: dict):
+            return ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function")
+
+        def verifier_only() -> bool:
+            tasks = self.sc.oracle.tasks(self.goal_id)
+            if any(work_function(task) == "implementation" for task in tasks):
+                return False
+            active = [task for task in tasks if task.get("status") in ("ready", "in_progress")]
+            return bool(active) and all(work_function(task) in ("planning", "review", "validation") for task in active)
+
+        decisions = None
+        end = time.monotonic() + 600
+        while time.monotonic() < end:
+            self.guard()
+            decisions = plan_decisions()
+            if decisions:
+                break
+            if not self._executing():
+                control = [item for item in self._held(self.codex) if not any(".match." in gate for gate in item.gates)]
+                if control:
+                    self.release_one(self.codex, "plan review work", ordinal=control[0].ordinal)
+                elif self._held(self.claude) and verifier_only():
+                    held = self._held(self.claude)[0]
+                    inv = self.release_one(self.claude, "plan review verifier", ordinal=held.ordinal)
+                    if inv is not None:
+                        active = [task for task in self.sc.oracle.tasks(self.goal_id)
+                                  if task.get("status") in ("ready", "in_progress")]
+                        self.notes.setdefault("claude_releases", []).append({
+                            "ordinal": inv.ordinal,
+                            "active_tasks": [{"id": task["id"], "work_function": work_function(task)} for task in active],
+                        })
+            time.sleep(1)
+        decisions = decisions or []
+        if self._git("rev-parse", "HEAD").strip() != self.workspace_head or self._git("status", "--porcelain") or (self.sc.run_dir.workspace / "PLAN.md").exists():
+            raise AssertionError("planner or verifier changed the workspace")
         if len(decisions) != 1:
             raise AssertionError(f"expected one plan review decision, got {[d['decision_key'] for d in decisions]}")
         self.plan_decision = decisions[0]
