@@ -602,10 +602,23 @@ class G2G4(L1):
         self.sc.oracle_dump("planning-started")
 
     def planner(self) -> None:
-        tasks = self.passive(300, lambda: [task for task in self.sc.oracle.tasks(self.goal_id)
-            if ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function") == "planning"]
-            if len([task for task in self.sc.oracle.tasks(self.goal_id)
-                    if ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function") == "planning"]) == 1 else None)
+        def planning_tasks():
+            tasks = [task for task in self.sc.oracle.tasks(self.goal_id)
+                     if ((task.get("metadata") or {}).get("orchestration") or {}).get("work_function") == "planning"]
+            return tasks if len(tasks) == 1 else None
+
+        tasks = None
+        end = time.monotonic() + 300
+        while time.monotonic() < end:
+            self.guard()
+            tasks = planning_tasks()
+            if tasks:
+                break
+            if not self._executing():
+                control = [item for item in self._held(self.codex) if not any(".match." in gate for gate in item.gates)]
+                if control:
+                    self.release_one(self.codex, "orchestration start decision", ordinal=control[0].ordinal)
+            time.sleep(1)
         if tasks is None:
             raise AssertionError("expected exactly one planning task before selecting the planner invocation")
         task = tasks[0]
