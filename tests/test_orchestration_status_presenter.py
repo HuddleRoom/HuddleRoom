@@ -651,3 +651,64 @@ async def test_g5_terminal_goal_hides_leftover_running_process(db_session, test_
     assert workflow["process"] is None and workflow["task"] is None and workflow["occurred_at"] is None
     assert workflow["operation_summary"] == "Goal cancelled."
     assert result["status_line"]["current_state"]["summary"] == "Cancelled."
+
+
+async def _planned(db, project, agent, task_status, *, review, plan_status="requested", agent_id=True):
+    import json
+    goal, run = await _run(db, project)
+    request = OrchestrationAction(run_id=run.id, idempotency_key="plan-request", action_type="request_plan",
+                                  request={}, status="completed")
+    db.add(request); await db.flush()
+    task = await _task(db, project, agent, run, "Draft the plan")
+    task.status = task_status
+    task.metadata_ = {"orchestration": {"run_id": str(run.id), "action_id": str(request.id), "work_function": "planning"}}
+    artifact_id, digest = uuid.uuid4(), "a" * 64
+    identity = {"project_id": str(project.id), "goal_id": str(goal.id), "run_id": str(run.id),
+                "artifact_id": str(artifact_id), "planning_task_id": str(task.id), "planning_version": 1,
+                "winning_session_id": None, "provenance_hash": digest, "canonical_content_hash": digest,
+                "renderer_version": 1, "rendered_content_hash": digest, "review_cycle": 1}
+    run.plan_state = {"status": plan_status, "planning_task_id": str(task.id), "request_action_id": str(request.id),
+                      "plan_reviews": {str(artifact_id): {"identity": identity, "state": "ready", "markdown": "# Plan"}}}
+    if review:
+        d = _g5_decision(goal, run, "roadmap_plan:x", context=json.dumps({"plan_review_identity": identity}))
+        d.authority, d.authority_agent_id = "manager", (agent.id if agent_id else None)
+        db.add(d)
+    await db.flush()
+    return (await _detail(db, goal, run)).supervision
+
+
+async def test_done_planner_task_with_agent_plan_review_is_truthful(db_session, test_project, test_agent):
+    sup = await _planned(db_session, test_project, test_agent, "done", review=True)
+    workflow = sup.status_line.workflow
+    assert "not yet recorded" not in workflow.operation_summary and "result recorded" in workflow.operation_summary
+    assert f"awaits {test_agent.name} review" in workflow.operation_summary
+    assert (workflow.guidance.kind, workflow.guidance.label) == ("none", f"Awaiting {test_agent.name} review")
+    assert workflow.pending_decision_id is None and sup.condition == "waiting"
+
+
+async def test_running_planner_task_text_unchanged(db_session, test_project, test_agent):
+    sup = await _planned(db_session, test_project, test_agent, "in_progress", review=False)
+    assert sup.status_line.workflow.operation_summary == (
+        "Last recorded: planning requested (Draft the plan). Result not yet recorded; live activity unavailable.")
+
+
+async def test_done_planner_task_without_review_not_claimed_unrecorded(db_session, test_project, test_agent):
+    workflow = (await _planned(db_session, test_project, test_agent, "done", review=False)).status_line.workflow
+    assert "not yet recorded" not in workflow.operation_summary and "awaits" not in workflow.operation_summary
+
+
+async def test_revision_requested_and_unnamed_authority(db_session, test_project, test_agent):
+    sup = await _planned(db_session, test_project, test_agent, "done", review=True,
+                         plan_status="revision_requested", agent_id=False)
+    assert sup.status_line.workflow.guidance.label == "Awaiting manager review" and sup.condition == "waiting"
+
+
+async def test_no_review_keeps_condition_unknown(db_session, test_project, test_agent):
+    assert (await _planned(db_session, test_project, test_agent, "done", review=False)).condition == "unknown"
+
+
+async def test_review_pending_but_task_not_terminal_is_unchanged(db_session, test_project, test_agent):
+    sup = await _planned(db_session, test_project, test_agent, "in_progress", review=True)
+    workflow = sup.status_line.workflow
+    assert "Result not yet recorded" in workflow.operation_summary and "awaits" not in workflow.operation_summary
+    assert not workflow.guidance.label.startswith("Awaiting") and sup.condition == "unknown"

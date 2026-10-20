@@ -76,6 +76,31 @@ def _plan_review_current(decision: OrchestrationAuthorityDecision, run: Orchestr
     return record.state == "ready" and record.identity.model_dump(mode="json") == identity
 
 
+async def _agent_plan_review(db: AsyncSession, run: OrchestrationRun, project_id: uuid.UUID,
+                             goal_id: uuid.UUID, task_id: uuid.UUID) -> str | None:
+    """Reviewer ("<name or authority>") of a current pending non-human plan review of this planning task, else None."""
+    def of_task(d: OrchestrationAuthorityDecision) -> bool:
+        try:
+            return json.loads(d.context or "null")["plan_review_identity"]["planning_task_id"] == str(task_id)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    rows = (await db.scalars(select(OrchestrationAuthorityDecision).where(
+        OrchestrationAuthorityDecision.run_id == run.id, OrchestrationAuthorityDecision.status == "pending",
+        OrchestrationAuthorityDecision.authority != "human",
+        OrchestrationAuthorityDecision.decision_key.like("roadmap_plan:%"),
+    ).order_by(OrchestrationAuthorityDecision.id))).all()
+    row = next((d for d in rows if _plan_review_current(d, run) and of_task(d)), None)
+    if row is None:
+        return None
+    if row.authority_agent_id is not None:
+        ref = (await resolve_needs_you_references(db, project_id=project_id, requests=[
+            NeedsYouReferenceRequest("agent", row.authority_agent_id, goal_id)]))[0]
+        if ref.label:
+            return ref.label
+    return row.authority
+
+
 async def pending_owner_decisions(
     db: AsyncSession, *, goal: OrchestrationGoal, run: OrchestrationRun,
     decisions: Sequence[OrchestrationAuthorityDecision],
@@ -139,6 +164,12 @@ async def _operation(
             return {"phase": "planning", "summary": f"Planning was requested; planner task unavailable. {tail}"}
         reference = (await resolve_needs_you_references(
             db, project_id=goal.project_id, requests=[NeedsYouReferenceRequest("task", task.id, goal.id)]))[0]
+        if task.status in {"done", "failed", "cancelled"}:
+            who = await _agent_plan_review(db, run, goal.project_id, goal.id, task.id)
+            text = (f"Planner task finished ({reference.label or 'planner task'}); result recorded."
+                    if task.status == "done" else f"Planner task {task.status} ({reference.label or 'planner task'}).")
+            return {"phase": "planning", "task": reference, "occurred_at": request.created_at,
+                    "summary": text + (f" Plan review awaits {who} review." if who else ""), "awaiting": who}
         return {"phase": "planning", "task": reference, "occurred_at": request.created_at,
                 "summary": f"Last recorded: planning requested ({reference.label or 'planner task'}). "
                            f"Result not yet recorded; {tail[0].lower() + tail[1:]}"}
@@ -204,6 +235,8 @@ async def build_workflow_facts(
         guidance = guide("authorize_baseline", "Authorize baseline", reason="Baseline is not authorized.")
     elif condition == "needs_attention":
         guidance = guide("review_blocker", "Resolve current blocker")
+    elif operation.get("awaiting"):
+        guidance = guide("none", f"Awaiting {operation['awaiting']} review")
     elif condition == "waiting":
         guidance = guide("none", "Wait for scheduled check" if has_next_check else "Await recorded event")
     elif condition == "working":
@@ -395,6 +428,8 @@ async def build_orchestration_status_line(
             db, goal=goal, run=run, actions=actions, condition=condition, pending=pending,
             has_next_check=bool(selected and selected.next_check_at),
         )
+    if condition == "unknown" and workflow.guidance.kind == "none" and workflow.guidance.label.startswith("Awaiting "):
+        condition = "waiting"  # same awaiting-review fact that set the guidance label
     if current_kind == "unknown" and (workflow.process or workflow.task or workflow.phase == "planning"):
         current_summary = workflow.operation_summary
     return OrchestrationStatusLine(
