@@ -1,6 +1,7 @@
 """Read-only, project-scoped reference projection for Needs You surfaces."""
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -185,7 +186,7 @@ async def resolve_needs_you_references(
             continue
         if (record.identity.project_id == project_id and record.identity.goal_id == request.goal_id
                 and record.identity.run_id == run.id and record.identity.artifact_id == artifact.id):
-            labels[("artifact", artifact.id, run.id)] = (artifact.name, request.goal_id)
+            labels[("artifact", artifact.id, run.id)] = (f"Plan candidate v{record.identity.planning_version}", request.goal_id)
 
     return [
         NeedsYouReference(
@@ -212,6 +213,17 @@ def decision_reference_requests(
     ):
         if value is not None:
             requests.append(NeedsYouReferenceRequest(kind, value, decision.goal_id))
+    if decision.run_id is not None and str(decision.decision_key or "").startswith("roadmap_plan:"):
+        context = decision.context
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except ValueError:
+                context = None
+        identity = context.get("plan_review_identity") if isinstance(context, dict) else None
+        artifact_id = _uuid(identity.get("artifact_id")) if isinstance(identity, dict) else None
+        if artifact_id is not None:
+            requests.append(NeedsYouReferenceRequest("artifact", artifact_id, decision.goal_id, decision.run_id))
     if response.recovery is not None:
         if response.recovery.source_action_id is not None:
             requests.append(NeedsYouReferenceRequest("action", response.recovery.source_action_id, decision.goal_id))

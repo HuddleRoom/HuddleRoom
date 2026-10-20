@@ -138,7 +138,7 @@ async def test_review_handler_and_artifact_reference_require_current_bound_candi
         ],
     )
     labels = {(reference.id, reference.goal_id): reference.label for reference in references}
-    assert labels[(artifact.id, goal.id)] == artifact.name
+    assert labels[(artifact.id, goal.id)] == "Plan candidate v1"
     assert labels[(unresolved.id, goal.id)] is None
     assert labels[(foreign.id, goal.id)] is None
     wrong_goal = await resolve_needs_you_references(

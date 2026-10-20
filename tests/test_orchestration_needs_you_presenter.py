@@ -5,7 +5,9 @@ its production module exists. Direct resolver batching coverage is added in the
 green phase; the red phase must fail on missing response behavior, not imports.
 """
 
+import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event as sa_event
@@ -20,6 +22,7 @@ from huddleroom.models.task import Task
 from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
 from huddleroom.services.orchestration_needs_you_presenter import (
     NeedsYouReferenceRequest,
+    decision_reference_requests,
     resolve_needs_you_references,
     typed_blocker_reference_requests,
 )
@@ -187,7 +190,7 @@ async def test_artifact_reference_requires_matching_review_identity_artifact_id(
         ],
     )
     labels = {reference.id: reference.label for reference in resolved}
-    assert labels[bound.id] == bound.name
+    assert labels[bound.id] == "Plan candidate v1"
     assert labels[copied.id] is None
 
 
@@ -289,3 +292,29 @@ async def test_spr210_reference_projection_is_scoped_and_batched(client, db_sess
     assert warning_refs[("action", str(local_action.id))]["label"] == local_action.action_type
     assert warning_refs[("agent", str(agent.id))]["label"] == agent.name
     assert warning_refs[("task", str(local_task.id))]["label"] == local_task.title
+
+
+def _plan_decision(context, key="roadmap_plan:fp:review:h", run_id=True):
+    return SimpleNamespace(
+        goal_id=uuid.uuid4(), run_id=uuid.uuid4() if run_id else None, decision_key=key,
+        context=context, source_process_run_id=None, related_gate_id=None,
+        related_action_id=None, authority_agent_id=None,
+    )
+
+
+def test_roadmap_plan_decision_references_bound_artifact():
+    artifact_id = uuid.uuid4()
+    context = json.dumps({"plan_review_identity": {"artifact_id": str(artifact_id)}})
+    decision = _plan_decision(context)
+    response = SimpleNamespace(recovery=None)
+    requests = decision_reference_requests(decision, response)
+    assert NeedsYouReferenceRequest("artifact", artifact_id, decision.goal_id, decision.run_id) in requests
+    assert _plan_decision(context, key="other:x") and not [
+        r for r in decision_reference_requests(_plan_decision(context, key="other:x"), response) if r.kind == "artifact"
+    ]
+    assert not [r for r in decision_reference_requests(_plan_decision(context, run_id=False), response)
+                if r.kind == "artifact"]
+    for bad in (None, "", "{not json", "[]", {"plan_review_identity": "x"}, json.dumps({"plan_review_identity": {"artifact_id": "nope"}})):
+        assert [r.kind for r in decision_reference_requests(_plan_decision(bad), response)] == ["goal"]
+    dict_ctx = _plan_decision({"plan_review_identity": {"artifact_id": str(artifact_id)}})
+    assert any(r.kind == "artifact" for r in decision_reference_requests(dict_ctx, response))
