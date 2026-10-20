@@ -56,16 +56,25 @@ class StepError(RuntimeError):
     pass
 
 
+_PLACEHOLDER = re.compile(r"(?i)^(placeholder|changeme|changeit|dummy|example|test|secret|password|none|null|"
+                          r"x+|\*+|<.*>|your[-_].*|.*[-_]here)$")
+
+
+def _real_secret(k: str, v: str) -> bool:
+    """Secret-looking env var holding a plausible real value (not a short value or an obvious placeholder)."""
+    return bool(_SECRET_KEY.match(k)) and len(v) >= 12 and not _PLACEHOLDER.match(v)
+
+
 def _leaks(text: str) -> list[str]:
     """Names of secret-looking env vars whose value appears in text, or env-style secret keys in JSON text."""
-    bad = [k for k, v in os.environ.items() if _SECRET_KEY.match(k) and len(v) >= 8 and v in text]
+    bad = [k for k, v in os.environ.items() if _real_secret(k, v) and v in text]
     bad += [m for m in re.findall(r'"([A-Z0-9_]+)"\s*:', text) if _SECRET_KEY.match(m)]
     return bad
 
 
 def _scrub(text: str) -> str:
     for k, v in os.environ.items():
-        if _SECRET_KEY.match(k) and len(v) >= 8:
+        if _real_secret(k, v):
             text = text.replace(v, "[REDACTED]")
     return text
 

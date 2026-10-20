@@ -10,6 +10,13 @@ G2G4_GOAL_TEXT = (
 G2G4_GOAL_CONSTRAINTS = {
     "roster_policy": "Use only the supplied active roster. Do not propose or create agents; record uncovered responsibilities as gaps with no owner."
 }
+# G2G4 text plus one audience/tone paragraph (no new work or verbs): a long, multi-paragraph objective.
+G5G6_GOAL_TEXT = G2G4_GOAL_TEXT + "\n\n" + (
+    "Background: the readers are small open-source teams deciding whether to try the demo product. "
+    "They skim on phones between meetings, so the tone should stay plain, friendly and brief, with no "
+    "marketing hype, no invented customer quotes and no claims about real competitors. Prices are "
+    "illustrative placeholders only and carry no promise of future pricing or availability for anyone."
+)
 
 # Defaults only; override per run with the environment variables below. Names are not validated against a product list.
 # All agents run on the claude_code CLI (subscription login); bare model id, no provider prefix.
@@ -67,4 +74,17 @@ G2G4_ROSTER = (
      "system_prompt": "Review finished work against the request.",
      "capabilities": ["review"], "cli_runtime": "claude_code", "provider": "anthropic",
      "model": "claude-haiku-5-5", "reasoning_effort": "medium"},
+)
+
+# G2G4 without any manager candidate: live-manager is dropped, so manager selection has no agent with
+# management fit and recommends human_as_manager. live-analyst takes "requirements" (a planning-profile
+# capability that the management profile does not score), so planning still routes to it.
+# live-analyst also copies the manager's runtime fields because it owns planning here, and the live
+# planner checks expect a codex planner.
+_G2G4_MANAGER_RUNTIME = {k: v for k, v in G2G4_ROSTER[0].items()
+                         if k in ("cli_runtime", "provider", "model", "reasoning_effort")}
+G2G4_HUMAN_ROSTER = tuple(
+    {**spec, "capabilities": [*spec["capabilities"], "requirements"], **_G2G4_MANAGER_RUNTIME}
+    if spec["key"] == "analyst" else spec
+    for spec in G2G4_ROSTER if spec["key"] != "manager"
 )

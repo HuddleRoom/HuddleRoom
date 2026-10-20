@@ -234,6 +234,18 @@ def test_secret_scan(monkeypatch):
     assert "supersecretvalue123" not in dry_run._scrub("a supersecretvalue123")
 
 
+def test_secret_scan_ignores_placeholders_and_short_values(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "placeholder")
+    monkeypatch.setenv("OTHER_API_KEY", "your-key-here")
+    monkeypatch.setenv("SHORT_TOKEN", "abc12345")
+    text = "ordinary text: placeholder your-key-here abc12345"
+    assert dry_run._leaks(text) == []
+    assert dry_run._scrub(text) == text
+    monkeypatch.setenv("REAL_API_KEY", "sk-or-v1-0123456789abcdef")
+    assert dry_run._leaks("k sk-or-v1-0123456789abcdef") == ["REAL_API_KEY"]
+    assert "sk-or-v1" not in dry_run._scrub("k sk-or-v1-0123456789abcdef")
+
+
 # ---- stepped discovery (step 2b), stub shim/ledger/oracle
 
 class _SteppedWorld:

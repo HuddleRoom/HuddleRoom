@@ -5,8 +5,8 @@ from __future__ import annotations
 import httpx
 
 from tests.live_acceptance.fixtures import (
-    AGENT_EFFORT, AGENT_MODEL, CLI_RUNTIME, DEFAULT_GOAL_WEIGHT, DISCOVERY_ROSTER_KEYS, G2G4_ROSTER, PROVIDER,
-    ROSTER,
+    AGENT_EFFORT, AGENT_MODEL, CLI_RUNTIME, DEFAULT_GOAL_WEIGHT, DISCOVERY_ROSTER_KEYS, G2G4_HUMAN_ROSTER,
+    G2G4_ROSTER, PROVIDER, ROSTER,
 )
 from tests.live_acceptance.run_dir import RunDir, assert_isolated
 
@@ -20,12 +20,12 @@ def _post(base_url: str, path: str, body: dict) -> dict:
 def seed_minimal_roster(base_url: str, run_dir: RunDir, roster: str = "discovery",
                         blank_definition_key: str | None = "dev1") -> dict:
     """Create the project and CLI agents. roster 'discovery' = 3 agents, 'full' = all 4 ROSTER agents,
-    and 'g2g4' = the G2–G4 acceptance roster.
+    'g2g4' = the G2–G4 acceptance roster, and 'g2g4_human' = that roster without a manager candidate.
     The agent named by blank_definition_key gets empty description and system_prompt (None keeps all full).
     The server must be running on run_dir with auth disabled."""
-    if roster not in ("discovery", "full", "g2g4"):
+    if roster not in ("discovery", "full", "g2g4", "g2g4_human"):
         raise ValueError(f"unknown roster {roster!r}")
-    specs = list(G2G4_ROSTER) if roster == "g2g4" else [
+    specs = list(G2G4_ROSTER) if roster == "g2g4" else list(G2G4_HUMAN_ROSTER) if roster == "g2g4_human" else [
         s for s in ROSTER if roster == "full" or s["key"] in DISCOVERY_ROSTER_KEYS
     ]
     if blank_definition_key is not None and blank_definition_key not in {s["key"] for s in specs}:

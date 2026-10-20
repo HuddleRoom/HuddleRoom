@@ -114,7 +114,10 @@ test('approve-batch', async ({ page }) => {
       await approveBatch(page)
       result.checking_observed = await observesWithin(async () => (await checking(page).count()) > 0, 20_000, 50)
       await expect(saved).toBeVisible({ timeout: 30_000 })
-      await expect(saved.getByText('Application pending.')).toBeVisible({ timeout: 5_000 })
+      await expect(saved.getByText('Saved.').first()).toBeVisible({ timeout: 5_000 })
+      // Recorded, not asserted: legacy copy (no workflow) vs the G5 workflow line.
+      result.application_pending_text = (await saved.getByText('Application pending.').count()) > 0
+      result.workflow_saved_not_applied = (await page.getByText('Saved · not applied').count()) > 0
       await shot(page, 'saved-after-drop')
       result.saved_count = await saved.getByText('Saved.').count()
       // Recorded, not asserted: with the refetches failing the row only leaves once a later refetch succeeds.

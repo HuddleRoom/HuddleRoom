@@ -235,6 +235,13 @@ class Oracle:
     def decisions(self, goal_id: Any) -> list[dict[str, Any]]:
         return self._rows("orchestration_authority_decisions", ("goal_id = ?",), (_hex(goal_id),))
 
+    def goal_authority(self, goal_id: Any) -> dict[str, Any] | None:
+        """authority_model and manager columns of one goal (read-only; ids as stored)."""
+        row = self._conn.execute(
+            "SELECT authority_model, manager_agent_id, manager_user_id FROM orchestration_goals WHERE id = ?",
+            (_hex(goal_id),)).fetchone()
+        return dict(row) if row else None
+
     def process_runs(self, goal_id: Any = None, run_id: Any = None) -> list[dict[str, Any]]:
         if (goal_id is None) == (run_id is None):
             raise ValueError("pass exactly one of goal_id or run_id")

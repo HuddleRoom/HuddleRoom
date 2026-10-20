@@ -68,7 +68,14 @@ def _ledger_totals_readonly(path: Path) -> dict[str, dict[str, int]]:
     """Read an existing ledger without creating or repairing it."""
     if not path.exists() or not path.stat().st_size:
         return {"global": {"non_cached": 0, "cached": 0}}
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    rows = []
+    for i, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            if i != len(lines) - 1:  # only a torn trailing line is tolerated, as Ledger._rows does
+                raise
     used, _ = Ledger._sum(rows)
     totals = {scenario: {"non_cached": value[0], "cached": value[1]} for scenario, value in used.items()}
     totals["global"] = {"non_cached": sum(value[0] for value in used.values()),
@@ -106,6 +113,10 @@ def _live_agent_ids(sc: LiveScenario) -> dict[str, str]:
     ids = {}
     for name, key in names.items():
         matches = [item.get("id") for item in items if item.get("name") == name]
+        if name == "live-manager" and sc.roster == "g2g4_human":
+            if matches:
+                raise AssertionError("human-manager roster must not contain live-manager")
+            continue
         if len(matches) != 1 or not matches[0]:
             raise AssertionError(f"expected exactly one {name} agent, got {len(matches)}")
         ids[key] = matches[0]
@@ -118,6 +129,15 @@ class G2G4Scenario(LiveScenario):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.released_ordinals: dict[str, set[int]] = {"codex": set(), "claude": set()}
+        self.abandoned: dict[str, set[int]] = {"codex": set(), "claude": set()}
+
+    def abandon_dead(self) -> None:
+        """Deliberate restart with no live shim process: unsettled released/executing calls died with it."""
+        for tool, shim in self.shims.items():
+            if not shim.live_pids():
+                # only calls that never started executing; an executing-but-unsettled call is not abandoned
+                self.abandoned[tool] |= {inv.ordinal for inv in shim.invocations()
+                                         if inv.exec_at is None and inv.ordinal not in shim.settled_ordinals()}
 
     def _teardown(self, failed: bool = False) -> None:
         deadline = time.monotonic() + 300
@@ -125,7 +145,7 @@ class G2G4Scenario(LiveScenario):
             pending, executing = {}, {}
             for tool, shim in self.shims.items():
                 invocations = {inv.ordinal: inv for inv in shim.invocations()}
-                settled = shim.settled_ordinals()
+                settled = shim.settled_ordinals() | self.abandoned[tool]
                 released = []
                 for ordinal in self.released_ordinals[tool]:
                     inv = invocations.get(ordinal)
@@ -178,6 +198,11 @@ class G2G4(L1):
                            "retry_policy": {"automatic_retries": 0, "maximum": 1,
                                             "status": "not_exercised"}})
 
+    @property
+    def human_manager(self) -> bool:
+        """True for the explicit g2g4_human roster (no manager agent; the human is the manager)."""
+        return self.sc.roster == "g2g4_human"
+
     def pw(self, name: str, **env) -> dict:
         """Keep continuation UI evidence under its exclusive artifact directory."""
         out = self.sc.artifact_root / "playwright" / name
@@ -195,6 +220,14 @@ class G2G4(L1):
         receipt["_rc"], receipt["_dir"] = result.returncode, str(out)
         return receipt
 
+    def write_verdict(self) -> None:
+        try:  # spend.used must match the ledger at write time (read-only)
+            totals = _ledger_totals_readonly(self.sc.run_dir.spend)
+            self.notes["spend"] = {"used": totals["global"]["non_cached"], "totals": totals}
+        except (OSError, ValueError, KeyError):
+            pass
+        super().write_verdict()
+
     def _git(self, *args: str) -> str:
         return subprocess.run(["git", *args], cwd=self.sc.run_dir.workspace, check=True,
                               capture_output=True, text=True).stdout
@@ -202,6 +235,7 @@ class G2G4(L1):
     def _held(self, handle):
         return [inv for inv in handle.invocations()
                 if inv.exec_at is None and inv.gates and inv.ordinal not in self.sc.released_ordinals[handle.tool]
+                and inv.ordinal not in self.sc.abandoned[handle.tool]
                 and not inv.refused and not inv.timed_out]
 
     def _executing(self) -> dict:
@@ -296,6 +330,23 @@ class G2G4(L1):
                 return value
             time.sleep(1)
         return None
+
+    def adr_ready(self) -> bool:
+        """The run's agent_definition_review is waiting_decision and every decision it proposed is pending.
+        The ADR count is decided by the product/LLM, not the roster size; it is recorded as notes["adr_count"]."""
+        pending = [d for d in self.sc.oracle.decisions(self.goal_id) if d["status"] == "pending"]
+        unexpected = [str(d["decision_key"]) for d in pending if not str(d["decision_key"]).startswith("agent_definition_review")]
+        if unexpected:
+            raise AssertionError(f"Baseline needs user input before agent review batch: {', '.join(unexpected)}")
+        waiting = [p for p in self.sc.oracle.process_runs(run_id=self.run_id)
+                   if p["process_type"] == "agent_definition_review" and p["status"] == "waiting_decision"]
+        ids = ((waiting[-1].get("outputs") or {}).get("decision_ids") or []) if waiting else []
+        if not ids or not all(any(_same_uuid(d["id"], i) for d in pending) for i in ids) or len(pending) != len(ids):
+            return False
+        self.notes["adr_count"] = len(ids)
+        if len(ids) < 2:  # nondeterministic roster outcome (LLM proposed too few improvements), not a product defect
+            raise AssertionError(f"agent_definition_review proposed {len(ids)} decision(s); the batch checks need at least 2 (nondeterministic outcome, not a product defect)")
+        return True
 
     def eligibility(self) -> dict[str, list[str]]:
         outputs = next((self.sc.oracle.process_outputs(p["id"]) or {}
@@ -505,7 +556,10 @@ class G2G4(L1):
         argv = _argv(inv.args)
         sandbox = any(argv[index:index + 2] == ["--sandbox", "read-only"] for index in range(len(argv) - 1))
         self.planner_task, self.planner_inv = task["id"], inv
-        self.verify("planning_only", {"planner_owned_by_manager": _same_uuid(task.get("assigned_to"), self.ids["manager_id"]),
+        self.notes["planner_assigned_to"] = task.get("assigned_to")  # recorded; the human variant does not assert a manager
+        owner = {} if self.human_manager else {
+            "planner_owned_by_manager": _same_uuid(task.get("assigned_to"), self.ids["manager_id"])}
+        self.verify("planning_only", {**owner,
                                       "read_only_sandbox": sandbox,
                                       "planner_started_after_start": inv.started_at >= self.planning_started_at - 1}, task=task, args=argv,
                     matched_gates=[gate for gate in inv.gates if ".match." in gate])
@@ -514,6 +568,7 @@ class G2G4(L1):
         if paused["status"] != "paused" or self.sc.oracle.report_consumed_count(self.run_id, self.planner_task) != 0:
             raise AssertionError("planner must remain unconsumed while paused before release")
         self.sc.oracle_dump("planner-held-paused")
+        self.before_planner_release(inv)
         self.release_one(self.codex, "planner only", ordinal=inv.ordinal)
         sessions = self.passive(300, lambda: self.sc.oracle.sessions(self.planner_task)
             if len(self.sc.oracle.sessions(self.planner_task)) == 1
@@ -521,6 +576,13 @@ class G2G4(L1):
         if sessions is None or sessions[0]["status"] != "completed":
             raise AssertionError(f"planner did not complete exactly once: {sessions}")
         self.planner_session = sessions[0]
+        self.after_planner_complete()
+
+    def before_planner_release(self, inv) -> None:
+        """Extension point: runs while paused with the planner call still held."""
+
+    def after_planner_complete(self) -> None:
+        """Extension point: runs once the released planner session completed."""
 
     def restart_resume(self) -> None:
         run = self.sc.oracle.run_state(self.run_id)
@@ -536,6 +598,7 @@ class G2G4(L1):
             raise AssertionError(f"refusing SIGTERM while model CLI processes are alive: {live}")
         pre_restart_ordinals = {inv.ordinal for inv in self.codex.invocations()}
         self.sc.oracle_dump("planner-done-paused-pre-restart")
+        self.sc.abandon_dead()
         self.sc.sup.kill(signal.SIGTERM)
         for shim in self.sc.shims.values():
             shim.undeny()
@@ -661,6 +724,8 @@ class G2G4(L1):
         authority = str(self.plan_decision.get("authority") or "")
         self.notes["plan_approval_authority"] = {"authority": authority,
                                                  "authority_agent_id": self.plan_decision.get("authority_agent_id")}
+        if self.human_manager and authority != "human":
+            raise AssertionError(f"human-manager variant: plan approval authority must be human, got {authority!r}")
         if authority == "manager" and not _same_uuid(self.plan_decision.get("authority_agent_id"), self.ids["manager_id"]):
             raise AssertionError("plan approval authority agent is not the live manager")
         ui = self.pw_ok("inspect-plan", LIVE_ACCEPTANCE_PLAN_DECISION_TITLE=str(self.plan_decision.get("title") or ""),
@@ -793,7 +858,7 @@ class G2G4(L1):
                                             "no_implementation_task": not impl,
                                             "no_new_task_or_session": not new_tasks and not new_sessions,
                                             "codex_invocations_released": {inv.ordinal for inv in self.codex.invocations() if inv.exec_at is not None} <= self.sc.released_ordinals["codex"],
-                                            "no_claude_invocation": (not self.claude.invocations() if not manager else
+                                            "no_claude_invocation": (not self.claude.invocations() if not (manager or self.human_manager) else
                                                                      {inv.ordinal for inv in self.claude.invocations() if inv.exec_at is not None}
                                                                      <= set(self.claude_released))}, answered=answered, bindings=bindings)
         self.sc.oracle_dump("plan-approved")
@@ -859,15 +924,20 @@ def _complete_s(sc: G2G4Scenario, driver: G2G4, p1: dict) -> None:
     goal_detail = httpx.get(f"{sc.base_url}/api/v1/projects/{driver.project_id}/orchestration/goals/{driver.goal_id}", timeout=60)
     goal_detail.raise_for_status()
     persisted_goal = goal_detail.json().get("goal") or goal_detail.json()
+    human = sc.roster == "g2g4_human"
     conditions = {
         "validation_gap": any(row.get("work_function") == "validation" and row.get("status") == "gap" and not row.get("agent_ref") for row in coverage if isinstance(row, dict)),
-        "manager_owns_planning_or_management": any(item.get("work_function") in {"planning", "management"} and _same_uuid(item.get("agent_ref"), driver.ids["manager_id"]) for item in assignments),
+        **({"planning_or_management_owned": any(item.get("work_function") in {"planning", "management"} and item.get("agent_ref") for item in assignments)}
+           if human else
+           {"manager_owns_planning_or_management": any(item.get("work_function") in {"planning", "management"} and _same_uuid(item.get("agent_ref"), driver.ids["manager_id"]) for item in assignments)}),
         "assignment_owners_eligible": all(item.get("work_function") in eligibility.get(str(item.get("agent_ref")), []) for item in assignments),
         "alternate_eligible_owner": any(
             item.get("work_function") in eligibility.get(str(item.get("agent_ref")), []) and any(
                 not _same_uuid(agent_id, item.get("agent_ref")) and item.get("work_function") in functions
                 for agent_id, functions in eligibility.items()) for item in assignments),
-        "selected_manager": _same_uuid(persisted_goal.get("manager_agent_id"), driver.ids["manager_id"]),
+        **({"selected_human_manager": persisted_goal.get("authority_model") == "human_manager" and bool(persisted_goal.get("manager_user_id"))}
+           if human else
+           {"selected_manager": _same_uuid(persisted_goal.get("manager_agent_id"), driver.ids["manager_id"])}),
         "planning_mode_roadmap": persisted_goal.get("planning_mode") == "roadmap",
     }
     if not all(conditions.values()):
@@ -899,16 +969,7 @@ def _run_s(sc: G2G4Scenario) -> None:
     driver.notes, driver.checks, driver.steps = {"release_timeline": []}, {key: {"status": "not_run", "evidence": []} for key in CHECKS}, {}
     driver.p2 = driver.planner_task = driver.planner_inv = None
     driver.feedback = {}
-    def adr_ready() -> bool:
-        pending_decisions = [d for d in sc.oracle.decisions(driver.goal_id) if d["status"] == "pending"]
-        unexpected_keys = [str(d["decision_key"]) for d in pending_decisions
-                           if not str(d["decision_key"]).startswith("agent_definition_review")]
-        if unexpected_keys:
-            raise AssertionError(f"Baseline needs user input before agent review batch: {', '.join(unexpected_keys)}")
-        pending_adr = [d for d in pending_decisions if str(d["decision_key"]).startswith("agent_definition_review")]
-        return len(pending_adr) == 4
-
-    adr_ready = driver.drive_codex(300, adr_ready, "baseline review")
+    adr_ready = driver.drive_codex(300, driver.adr_ready, "baseline review")
     if not adr_ready:
         raise AssertionError("agent-definition reviews did not all reach pending")
     l1 = L1(sc)

@@ -3,7 +3,7 @@ import type { Locator, Page } from '@playwright/test'
 export const pauseGoal = (p: Page) => p.getByRole('button', { name: 'Pause goal' })
 export const confirmPause = (p: Page) => p.getByRole('button', { name: 'Confirm pause' })
 export const resumeGoal = (p: Page) => p.getByRole('button', { name: 'Resume goal' })
-export const continueBaseline = (p: Page) => p.getByRole('button', { name: 'Continue baseline' })
+export const continueBaseline = (p: Page) => p.getByRole('button', { name: /^(Continue baseline|Authorize (remaining )?baseline)$/ })
 export const startBaseline = (p: Page) => p.getByRole('button', { name: 'Start baseline' })
 export const savedAnswers = (p: Page) => p.getByRole('region', { name: 'Saved answers' })
 export const needsYouHeading = (p: Page) => p.getByRole('heading', { name: 'Needs you' })

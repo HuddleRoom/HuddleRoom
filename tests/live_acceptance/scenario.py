@@ -313,7 +313,7 @@ class LiveScenario:
         if self.snapshot_dir is None:
             self.ids = seed_minimal_roster(
                 self.sup.base_url, rd, roster=self.roster,
-                blank_definition_key=None if self.roster == "g2g4" else "dev1",
+                blank_definition_key=None if self.roster in ("g2g4", "g2g4_human") else "dev1",
             )
         self.oracle = oracle.Oracle(rd.db)
         oracle.snapshot(rd.db, rd.snapshots / "00-before.db")
