@@ -1279,6 +1279,9 @@ class TeamHierarchyProcess:
                         continue
                     assessment = assessments.get(agent_id, {}) if isinstance(assessments, dict) else {}
                     decision = accepted_decisions.get(agent_id)
+                    # A passing review that proposed no change creates no decision but is accepted.
+                    recovered = not assessments and bool((review_process.outputs or {}).get("recovery_provenance"))
+                    unchanged = assessment.get("status") == "approved"
                     reviews.append({
                         "review_id": str(review.id),
                         "source_process_id": str(review_process.id),
@@ -1297,6 +1300,12 @@ class TeamHierarchyProcess:
                         },
                         "accepted_decision_id": str(decision.id) if decision is not None else None,
                         "accepted_decision": decision.selected_option if decision is not None else None,
+                        "review_accepted": decision is not None or unchanged or recovered,
+                        "acceptance_basis": (
+                            "human_decision" if decision is not None
+                            else "review_passed_unchanged" if unchanged
+                            else "recovery_approved" if recovered else None
+                        ),
                     })
         agents = {agent["id"]: agent for agent in payload.get("agents", [])}
         for decision in decisions:
@@ -1336,6 +1345,8 @@ class TeamHierarchyProcess:
                 },
                 "accepted_decision_id": str(decision.id),
                 "accepted_decision": decision.selected_option,
+                "review_accepted": True,
+                "acceptance_basis": "human_decision",
             })
         payload["hierarchy_context"] = {
             "agent_reviews": reviews,

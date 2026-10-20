@@ -2286,6 +2286,99 @@ async def test_hierarchy_prompt_context_excludes_unaccepted_review_process_evide
     assert enriched["hierarchy_context"] == {"agent_reviews": [], "revision": None}
 
 
+@pytest.mark.asyncio
+async def test_hierarchy_prompt_context_marks_unchanged_passing_review_accepted_without_decision(
+    db_session, test_project, test_user
+):
+    goal, _run, _agents, review_process = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    process = TeamHierarchyProcess()
+    reviews = (await process.review_service.list_reviews(db_session, goal.id))[:3]
+    approved, unchanged, pending = reviews
+    for review in reviews:
+        review.source_process_run_id = review_process.id
+    statuses = ["improvement_proposed", "approved", "improvement_proposed"]
+    review_process.outputs = {
+        "review_ids": [str(review.id) for review in reviews],
+        "eligibility": {str(r.agent_id): r.approved_for_work_functions for r in reviews},
+        "semantic_assessments": {
+            str(r.agent_id): {"status": status, "reason": "r", "problems": []}
+            for r, status in zip(reviews, statuses)
+        },
+    }
+    flag_modified(review_process, "outputs")
+    service = OrchestrationAuthorityDecisionService()
+    for index, review in enumerate((approved, pending)):
+        decision = await service.create_pending(
+            db_session, goal.id, decision_key=f"agent_definition_review:{review.agent_id}",
+            title="t", question="q", authority="human", options=["approve", "reject", "edit"],
+            context=json.dumps({"agent_id": str(review.agent_id)}),
+            source_process_run_id=review_process.id,
+        )
+        if index == 0:
+            decision.status, decision.selected_option = "answered", "approve"
+    await db_session.flush()
+
+    enriched = await process._hierarchy_prompt_payload(
+        db_session, goal, await process._analysis_input(db_session, goal), None
+    )
+
+    by_agent = {item["agent_id"]: item for item in enriched["hierarchy_context"]["agent_reviews"]}
+    assert (by_agent[str(approved.agent_id)]["review_accepted"], by_agent[str(approved.agent_id)]["acceptance_basis"]) == (True, "human_decision")
+    entry = by_agent[str(unchanged.agent_id)]
+    assert entry["accepted_decision_id"] is None
+    assert (entry["review_accepted"], entry["acceptance_basis"]) == (True, "review_passed_unchanged")
+    assert entry["approved_work_functions"] == list(unchanged.approved_for_work_functions)
+    entry = by_agent[str(pending.agent_id)]
+    assert (entry["review_accepted"], entry["acceptance_basis"]) == (False, None)
+
+    # Rejected proposal: still not accepted.
+    decision = next(
+        d for d in await service.list_decisions(db_session, goal.id)
+        if d.decision_key.endswith(str(pending.agent_id))
+    )
+    decision.status, decision.selected_option = "answered", "reject"
+    await db_session.flush()
+    rejected = await process._hierarchy_prompt_payload(
+        db_session, goal, await process._analysis_input(db_session, goal), None
+    )
+    entry = next(i for i in rejected["hierarchy_context"]["agent_reviews"] if i["agent_id"] == str(pending.agent_id))
+    assert (entry["review_accepted"], entry["acceptance_basis"]) == (False, None)
+
+    # Approved recovery: empty assessments plus provenance.
+    review_process.outputs = {
+        **review_process.outputs, "semantic_assessments": {}, "recovery_provenance": {"proposal_id": "p"},
+    }
+    flag_modified(review_process, "outputs")
+    await db_session.flush()
+    recovered = await process._hierarchy_prompt_payload(
+        db_session, goal, await process._analysis_input(db_session, goal), None
+    )
+    entry = next(i for i in recovered["hierarchy_context"]["agent_reviews"] if i["agent_id"] == str(unchanged.agent_id))
+    assert (entry["review_accepted"], entry["acceptance_basis"]) == (True, "recovery_approved")
+
+
+def test_hierarchy_parser_accepts_coverage_by_unchanged_passing_review_without_decision_id():
+    request = _task1_analysis_request()
+    request["hierarchy_context"]["agent_reviews"][0].update(
+        accepted_decision_id=None, accepted_decision=None,
+        review_accepted=True, acceptance_basis="review_passed_unchanged",
+    )
+
+    result = parse_team_hierarchy_analysis(_task1_analysis_payload(), request)
+
+    assert result.responsibility_coverage[0]["evidence_ref"] == "agent_review:review-worker"
+
+
+def test_hierarchy_request_prompt_explains_review_accepted_evidence():
+    system = TeamHierarchyAnalyzer.build_request({})["messages"][0]["content"]
+
+    assert "review_accepted=true is accepted evidence" in system
+    assert "null accepted_decision_id" in system
+    assert "review_accepted=false is not accepted evidence" in system
+
+
 class FrozenHierarchyAnalyzer:
     def __init__(self):
         self.calls = 0
