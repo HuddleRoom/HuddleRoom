@@ -657,12 +657,28 @@ async def test_escalated_plan_authority_keeps_freeze_and_routes_human_answer_wit
     assert await service._advance_authorized_execution_once(db_session, goal, run) == {"step": "waiting_plan_authority"}
     assert calls == []
     await OrchestrationAuthorityDecisionService().answer_decision(
-        db_session, human, selected_option="approve", decided_by_user_id=test_user.id,
+        db_session, human, selected_option="approve", decided_by_user_id=goal.created_by_user_id,
     )
     result = await service._advance_authorized_execution_once(db_session, goal, run)
     await db_session.refresh(run)
-    # Applied deterministically (no LLM). Under agent_manager a human approval is, by existing
-    # _require_plan_approval design, not "from the selected authority", so it requires revision.
+    # Applied deterministically (no LLM). The escalated owner answer carries plan approval authority.
+    assert result["step"] == "plan_decision" and calls == []
+    assert "selected authority" not in (run.plan_state.get("revision_reason") or "")
+
+
+async def test_human_plan_approval_without_escalated_manager_row_is_rejected(
+    db_session, test_project, test_user, monkeypatch,
+):
+    service, goal, run, decision = await _pending_manager_wait(db_session, test_project, test_user)
+    decision.authority = "human"
+    decision.status = "answered"
+    decision.selected_option = "approve"
+    decision.decided_by_user_id = goal.created_by_user_id
+    await db_session.flush()
+    calls = _no_llm(service, monkeypatch)
+
+    result = await service._advance_authorized_execution_once(db_session, goal, run)
+    await db_session.refresh(run)
     assert result["step"] == "plan_revision_required" and calls == []
     assert "not from the selected authority" in run.plan_state["revision_reason"]
 

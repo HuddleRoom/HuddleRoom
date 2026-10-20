@@ -76,13 +76,15 @@ def test_none_action_raises_unrecorded():
         _pend(None)
 
 
-@pytest.mark.parametrize("landing", [True, False])
-def test_landing_only(monkeypatch, landing):
+@pytest.mark.parametrize("phase,authorized,landing", [
+    ("baseline", False, True), ("ready", False, True), ("ready", True, False), ("authorized", False, False),
+])
+def test_landing_only(monkeypatch, phase, authorized, landing):
     import huddleroom.services.orchestration_baseline_runtime as rt
     db = object()
-    op = SimpleNamespace(db=db, tick=landing)
+    op = SimpleNamespace(db=db, tick=True)
     monkeypatch.setattr(rt, "current_baseline_operation", lambda: op)
-    run = SimpleNamespace(phase="baseline", baseline_authorized=False)
+    run = SimpleNamespace(phase=phase, baseline_authorized=authorized)
     assert svc._landing_only(db, run) is landing
     monkeypatch.setattr(rt, "current_baseline_operation", lambda: None)
     assert svc._landing_only(db, run) is False

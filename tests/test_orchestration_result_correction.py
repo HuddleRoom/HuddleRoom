@@ -1794,6 +1794,30 @@ async def test_ready_phase_run_applies_pending_only_once_baseline_authorized(db_
 
 
 @pytest.mark.usefixtures("safe_effectiveness_review_continue")
+async def test_result_landing_in_ready_phase_pends_until_authorized(db_session, test_project, monkeypatch):
+    """A result landing before Start (phase="ready", unauthorized) pends like an unauthorized baseline."""
+    db = db_session
+    service, run, _gate, verifier = await _verifier_setup(db, test_project)
+    run.phase, run.baseline_authorized = "ready", False
+    await db.commit()
+    resumed = _record_resume(service, monkeypatch)
+    asks_before = await _ask_count(db, run.id)
+
+    await _complete(db, service, run, verifier, json.dumps({"status": "blocked", "notes": "No access."}), ingest=False)
+    await _ticks(db, service, run, 2)
+
+    [(action, _pending)] = await _pended(db, run.id, kind="verifier_owner_ask")
+    assert await _ask_count(db, run.id) == asks_before and resumed == []
+
+    run.baseline_authorized = True
+    await db.commit()
+    await _ticks(db, service, run, 2)
+
+    assert (await _settled(db, run.id, action))["outcome"] == "applied"
+    assert await _ask_count(db, run.id) == asks_before + 1
+
+
+@pytest.mark.usefixtures("safe_effectiveness_review_continue")
 async def test_poisoned_pendings_do_not_block_other_pendings_in_the_same_tick(db_session, test_project, monkeypatch):
     """M1: a malformed task_id settles stale; an effect raising a generic Exception stays pending; a valid
     pend after both still applies and the tick completes."""

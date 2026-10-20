@@ -8746,8 +8746,8 @@ class OrchestrationService:
 
     async def _sweep_result_corrections(self, db: AsyncSession, run: OrchestrationRun) -> None:
         """Re-enter open correction ledgers each tick: funding, resume, contract change, owner answer, failed task."""
-        if run.status != "running":
-            return
+        if run.status != "running" or self._pre_start_unauthorized(run):
+            return  # no correction dispatch before Start
         # ponytail: oldest 50 open ledgers per tick; page by cursor if a run ever holds more
         ledger = OrchestrationAction.request["result_correction"]
         markers = list(await db.scalars(select(OrchestrationAction).where(
@@ -9467,10 +9467,55 @@ class OrchestrationService:
                 .limit(1)
                 .execution_options(populate_existing=True)
             )
+            if not caller_owns_transaction:
+                await self._cancel_active_cli_sessions(db, goal, run)
+                await db.refresh(goal)
+                if run is not None:
+                    await db.refresh(run)
             await self._cancel_goal_no_commit(db, goal, run, cancelled_by=cancelled_by)
             if not caller_owns_transaction:
                 await db.commit()
         return goal, run
+
+    async def _cancel_active_cli_sessions(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun | None,
+    ) -> None:
+        """Cancel and commit active CLI sessions of the goal and its open descendants.
+
+        A CLI session cancel needs a write-free transaction on SQLite, so this must run before
+        any cancel writes. Sessions only: if the closeout fails afterwards the goal stays active
+        with cancelled sessions, and a retry repeats this as a no-op before the normal cancel.
+        """
+        pairs = [(goal, run)]
+        frontier = [goal.id]
+        while frontier:
+            children = list((await db.scalars(select(OrchestrationGoal).where(
+                OrchestrationGoal.parent_goal_id.in_(frontier),
+                OrchestrationGoal.status.not_in(("completed", "cancelled")),
+            ))).all())
+            for child in children:
+                pairs.append((child, await self.get_run_for_goal(db, child.project_id, child.id)))
+            frontier = [child.id for child in children]
+        session_ids = []
+        for pair_goal, pair_run in pairs:
+            if pair_run is None:
+                continue
+            for task in await self._orchestrated_tasks_for_run(
+                db, pair_run.id, statuses=["backlog", "ready", "in_progress", "blocked"]
+            ):
+                session_ids += list((await db.scalars(select(Session.id).where(
+                    Session.task_id == task.id,
+                    Session.status.in_(("pending", "running")),
+                    Session.adapter_type == "cli",
+                ))).all())
+        if not session_ids:
+            return
+        for session_id in session_ids:
+            await SessionService().cancel(db, session_id, sync_task=False)
+        await db.commit()
 
     async def _cancel_goal_no_commit(
         self,
@@ -14273,11 +14318,16 @@ class OrchestrationService:
         ]
 
     @staticmethod
+    def _pre_start_unauthorized(run) -> bool:
+        # Root runs stay baseline/ready until Start; child runs are born "authorized".
+        return not run.baseline_authorized and run.phase in ("baseline", "ready")
+
+    @staticmethod
     def _landing_only(db, run) -> bool:
         from huddleroom.services.orchestration_baseline_runtime import current_baseline_operation
         operation = current_baseline_operation()
         return bool(operation is not None and operation.db is db and operation.tick
-                    and run.phase == "baseline" and not run.baseline_authorized)
+                    and OrchestrationService._pre_start_unauthorized(run))
 
     def _pend_result_continuation(
         self, db, action, kind: str, task, session_id, input_version: Mapping[str, Any],
@@ -14450,7 +14500,7 @@ class OrchestrationService:
 
         # child runs are born phase="authorized"; a root run stays baseline/ready after Start (baseline_authorized flips),
         # so "unauthorized" is keyed on the flag, not phase alone
-        if ((not run.baseline_authorized and run.phase in ("baseline", "ready")) or run.status not in LLM_DECISION_RUN_STATUSES
+        if (self._pre_start_unauthorized(run) or run.status not in LLM_DECISION_RUN_STATUSES
                 or not owns_control_transaction(db)):
             return  # a non-owning caller leaves the pending for the owner's tick
         # ponytail: oldest 50 pending per tick; page by cursor if a run ever holds more

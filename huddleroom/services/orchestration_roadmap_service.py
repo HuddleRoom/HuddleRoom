@@ -857,11 +857,30 @@ class OrchestrationRoadmapService:
             if authorized_user is None or decision.decided_by_user_id != authorized_user:
                 raise HTTPException(status_code=409, detail="Roadmap plan approval is not from the selected authority")
         elif goal.authority_model == "agent_manager":
-            if goal.manager_agent_id is None or decision.decided_by_agent_id != goal.manager_agent_id:
+            # An escalated owner answer replaces the manager under the same decision_key.
+            manager_approved = goal.manager_agent_id is not None and decision.decided_by_agent_id == goal.manager_agent_id
+            if not manager_approved and not await self._is_owner_escalation_of_manager_decision(db, goal, run, decision):
                 raise HTTPException(status_code=409, detail="Roadmap plan approval is not from the selected authority")
         else:
             raise HTTPException(status_code=409, detail="Roadmap plan approval authority is invalid")
         return {"kind": "authority_decision", "id": str(decision.id)}
+
+    async def _is_owner_escalation_of_manager_decision(self, db, goal, run, decision) -> bool:
+        owner_id = goal.manager_user_id or goal.created_by_user_id
+        if (
+            decision.authority != "human" or owner_id is None or decision.decided_by_user_id != owner_id
+            or goal.manager_agent_id is None
+        ):
+            return False
+        return await db.scalar(select(OrchestrationAuthorityDecision.id).where(
+            OrchestrationAuthorityDecision.goal_id == goal.id,
+            OrchestrationAuthorityDecision.run_id == run.id,
+            OrchestrationAuthorityDecision.decision_key == decision.decision_key,
+            OrchestrationAuthorityDecision.status == "cancelled",
+            OrchestrationAuthorityDecision.authority != "human",
+            OrchestrationAuthorityDecision.authority_agent_id == goal.manager_agent_id,
+            OrchestrationAuthorityDecision.created_at <= decision.created_at,
+        ).limit(1)) is not None
 
     async def _dependencies_accepted(self, db, goal_id, run, version, dependencies) -> bool:
         for key in dependencies:
