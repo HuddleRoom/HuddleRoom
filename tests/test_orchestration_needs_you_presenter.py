@@ -318,3 +318,163 @@ def test_roadmap_plan_decision_references_bound_artifact():
         assert [r.kind for r in decision_reference_requests(_plan_decision(bad), response)] == ["goal"]
     dict_ctx = _plan_decision({"plan_review_identity": {"artifact_id": str(artifact_id)}})
     assert any(r.kind == "artifact" for r in decision_reference_requests(dict_ctx, response))
+
+
+async def _closeout_setup(db_session, project, *, snapshot="ok"):
+    from huddleroom.services.orchestration_needs_you_presenter import attach_warning_references
+
+    goal = OrchestrationGoal(
+        id=uuid.uuid4(), project_id=project.id, objective="Closeout goal",
+        success_criteria=[{"key": "done", "description": "Done"}],
+    )
+    run = OrchestrationRun(goal_id=goal.id, status="running")
+    db_session.add_all([goal, run])
+    await db_session.flush()
+    process = OrchestrationProcessRun(
+        goal_id=goal.id, run_id=run.id, process_type="authority_interview", status="waiting_decision",
+        trigger_reason="t", input_snapshot={}, outputs={},
+    )
+    gate = OrchestrationGate(
+        run_id=run.id, success_criterion_key="done", gate_type="work_completed", required_evidence={},
+    )
+    db_session.add_all([process, gate])
+    await db_session.flush()
+    action = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"closeout:{uuid.uuid4()}", action_type="create_delegation_task",
+        request={},
+    )
+    db_session.add(action)
+    await db_session.flush()
+    svc = OrchestrationWarningService()
+    source = await svc.create_warning(
+        db_session, goal.id, warning_type="recovery_blocked", severity="warning", message="src",
+        run_id=run.id, source_process_run_id=process.id, related_gate_id=gate.id, related_action_id=action.id,
+    )
+    diag = await svc.create_warning(
+        db_session, goal.id, warning_type="closeout_blocked", severity="warning", message="blocked",
+        run_id=run.id,
+    )
+    if snapshot == "ok":
+        run.supervision_state = {"closeout_attention": {
+            "warning_id": str(diag.id), "source_warning_ids": [str(source.id)]}}
+    elif snapshot == "stale":
+        run.supervision_state = {"closeout_attention": {
+            "warning_id": str(uuid.uuid4()), "source_warning_ids": [str(source.id)]}}
+    await db_session.flush()
+    return SimpleNamespace(
+        goal=goal, run=run, process=process, gate=gate, action=action,
+        source=source, diag=diag, svc=svc, attach=attach_warning_references,
+    )
+
+
+def _ref_keys(response):
+    return {(r.kind, r.id) for r in response.needs_you_references}
+
+
+@pytest.mark.asyncio
+async def test_closeout_diagnostic_gets_source_warning_references(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project)
+    out = await c.attach(db_session, project_id=test_project.id, warnings=[c.diag, c.source])
+    diag, source = out
+    assert _ref_keys(diag) == {
+        ("goal", c.goal.id), ("process", c.process.id), ("gate", c.gate.id), ("action", c.action.id),
+    }
+    assert _ref_keys(diag) == _ref_keys(source)
+
+
+@pytest.mark.asyncio
+async def test_closeout_diagnostic_ignores_foreign_project_source(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project)
+    foreign_project = Project(name="Foreign closeout project", description="private", config={})
+    db_session.add(foreign_project)
+    await db_session.flush()
+    fgoal = OrchestrationGoal(
+        id=uuid.uuid4(), project_id=foreign_project.id, objective="FOREIGN GOAL",
+        success_criteria=[{"key": "done", "description": "Done"}],
+    )
+    frun = OrchestrationRun(goal_id=fgoal.id, status="running")
+    db_session.add_all([fgoal, frun])
+    await db_session.flush()
+    fproc = OrchestrationProcessRun(
+        goal_id=fgoal.id, run_id=frun.id, process_type="foreign_proc", status="running",
+        trigger_reason="t", input_snapshot={}, outputs={},
+    )
+    db_session.add(fproc)
+    await db_session.flush()
+    foreign = await c.svc.create_warning(
+        db_session, fgoal.id, warning_type="recovery_blocked", severity="warning", message="f",
+        run_id=frun.id, source_process_run_id=fproc.id,
+    )
+    c.run.supervision_state = {"closeout_attention": {
+        "warning_id": str(c.diag.id), "source_warning_ids": [str(foreign.id)]}}
+    await db_session.flush()
+    [diag] = await c.attach(db_session, project_id=test_project.id, warnings=[c.diag])
+    assert _ref_keys(diag) == {("goal", c.goal.id)}
+    assert str(fproc.id) not in diag.model_dump_json() and "FOREIGN GOAL" not in diag.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_closeout_diagnostic_ignores_stale_snapshot(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project, snapshot="stale")
+    [diag] = await c.attach(db_session, project_id=test_project.id, warnings=[c.diag])
+    assert _ref_keys(diag) == {("goal", c.goal.id)}
+
+
+@pytest.mark.asyncio
+async def test_closeout_diagnostic_ignores_source_resolved_after_snapshot(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project)
+    await c.svc.resolve_warning(db_session, c.source, resolved_by="human:test", reason="fixed")
+    await db_session.flush()
+    [diag] = await c.attach(db_session, project_id=test_project.id, warnings=[c.diag])
+    assert _ref_keys(diag) == {("goal", c.goal.id)}
+    assert str(c.process.id) not in diag.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_closeout_diagnostic_ignores_missing_snapshot(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project, snapshot="none")
+    [diag] = await c.attach(db_session, project_id=test_project.id, warnings=[c.diag])
+    assert _ref_keys(diag) == {("goal", c.goal.id)}
+
+
+@pytest.mark.asyncio
+async def test_closeout_diagnostic_ignores_different_run_source(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project, snapshot="none")
+    # One run per goal, so "different run" = same goal with no run, or a sibling goal's run.
+    goal2 = OrchestrationGoal(
+        id=uuid.uuid4(), project_id=test_project.id, objective="Sibling goal",
+        success_criteria=[{"key": "done", "description": "Done"}],
+    )
+    run2 = OrchestrationRun(goal_id=goal2.id, status="running")
+    db_session.add_all([goal2, run2])
+    await db_session.flush()
+    gate2 = OrchestrationGate(
+        run_id=run2.id, success_criterion_key="done", gate_type="work_completed", required_evidence={},
+    )
+    db_session.add(gate2)
+    await db_session.flush()
+    sibling = await c.svc.create_warning(
+        db_session, goal2.id, warning_type="recovery_blocked", severity="warning", message="o",
+        run_id=run2.id, related_gate_id=gate2.id,
+    )
+    runless = await c.svc.create_warning(
+        db_session, c.goal.id, warning_type="recovery_blocked", severity="warning", message="r",
+        related_gate_id=c.gate.id,
+    )
+    c.run.supervision_state = {"closeout_attention": {
+        "warning_id": str(c.diag.id), "source_warning_ids": [str(sibling.id), str(runless.id)]}}
+    await db_session.flush()
+    [diag] = await c.attach(db_session, project_id=test_project.id, warnings=[c.diag])
+    assert _ref_keys(diag) == {("goal", c.goal.id)}
+
+
+@pytest.mark.asyncio
+async def test_non_closeout_warning_does_not_expand_even_with_snapshot(db_session, test_project):
+    c = await _closeout_setup(db_session, test_project)
+    c.run.supervision_state = {"closeout_attention": {
+        "warning_id": str(c.source.id), "source_warning_ids": [str(c.diag.id)]}}
+    await db_session.flush()
+    [src] = await c.attach(db_session, project_id=test_project.id, warnings=[c.source])
+    assert _ref_keys(src) == {
+        ("goal", c.goal.id), ("process", c.process.id), ("gate", c.gate.id), ("action", c.action.id),
+    }

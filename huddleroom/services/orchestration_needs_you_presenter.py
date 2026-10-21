@@ -24,6 +24,7 @@ from huddleroom.models.orchestration_process import (
     OrchestrationWarning,
 )
 from huddleroom.models.task import Task
+from huddleroom.services.orchestration_service import CLOSEOUT_BLOCKED_WARNING_TYPE
 from huddleroom.schemas.orchestration import (
     NeedsYouReference,
     NeedsYouReferenceKind,
@@ -296,13 +297,40 @@ async def attach_decision_references(
     ]
 
 
+async def _closeout_source_requests(
+    db: AsyncSession, warning: OrchestrationWarning,
+) -> list[NeedsYouReferenceRequest]:
+    """Expose the source warnings a closeout_blocked notice is waiting on."""
+    if warning.warning_type != CLOSEOUT_BLOCKED_WARNING_TYPE or warning.run_id is None:
+        return []
+    run = await db.get(OrchestrationRun, warning.run_id)
+    if run is None or run.goal_id != warning.goal_id:
+        return []
+    entry = (run.supervision_state or {}).get("closeout_attention")
+    if not isinstance(entry, dict) or entry.get("warning_id") != str(warning.id):
+        return []
+    ids = [i for i in map(_uuid, entry.get("source_warning_ids") or []) if i]
+    if not ids:
+        return []
+    rows = (await db.scalars(select(OrchestrationWarning).where(
+        OrchestrationWarning.id.in_(ids),
+        OrchestrationWarning.goal_id == warning.goal_id,
+        OrchestrationWarning.run_id == warning.run_id,
+        OrchestrationWarning.active.is_(True),
+    ))).all()
+    return [request for row in rows for request in warning_reference_requests(row)]
+
+
 async def attach_warning_references(
     db: AsyncSession,
     *,
     project_id: uuid.UUID,
     warnings: Sequence[OrchestrationWarning],
 ) -> list[OrchestrationWarningResponse]:
-    per_response = [warning_reference_requests(warning) for warning in warnings]
+    per_response = [
+        [*warning_reference_requests(warning), *await _closeout_source_requests(db, warning)]
+        for warning in warnings
+    ]
     await _expand_action_targets(db, project_id=project_id, per_response=per_response)
     resolved = await resolve_needs_you_references(
         db, project_id=project_id, requests=[request for requests in per_response for request in requests],

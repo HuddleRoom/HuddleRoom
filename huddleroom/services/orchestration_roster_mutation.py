@@ -119,8 +119,9 @@ def _coverage(goal: GoalRosterFingerprintInput, roster: CanonicalRosterState) ->
     targets = coverage_targets_from_projection(
         projection_goal,
         assignments,
-        active_agents=list(roster.agents) if goal.weight == "substantial" else [],
+        active_agents=list(roster.agents) if goal.weight in ("standard", "substantial") else [],
         manager=agents.get(goal.manager_agent_id),
+        required_functions=goal.required_work_functions,
     )
     if goal.covered_target_ids is not None:
         baseline = [
@@ -129,8 +130,9 @@ def _coverage(goal: GoalRosterFingerprintInput, roster: CanonicalRosterState) ->
         ]
         baseline_targets = coverage_targets_from_projection(
             projection_goal, baseline,
-            active_agents=list(roster.agents) if goal.weight == "substantial" else [],
+            active_agents=list(roster.agents) if goal.weight in ("standard", "substantial") else [],
             manager=agents.get(goal.manager_agent_id),
+            required_functions=goal.required_work_functions,
         )
         sanitized = [
             (task, agent, "" if action_tagged else work_function)
@@ -139,8 +141,9 @@ def _coverage(goal: GoalRosterFingerprintInput, roster: CanonicalRosterState) ->
         ]
         sanitized_targets = coverage_targets_from_projection(
             projection_goal, sanitized,
-            active_agents=list(roster.agents) if goal.weight == "substantial" else [],
+            active_agents=list(roster.agents) if goal.weight in ("standard", "substantial") else [],
             manager=agents.get(goal.manager_agent_id),
+            required_functions=goal.required_work_functions,
         )
         targets = AgentDefinitionReviewProcess._merge_coverage_targets(
             baseline_targets,

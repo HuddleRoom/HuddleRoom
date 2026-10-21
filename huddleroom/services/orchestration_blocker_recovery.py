@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -24,8 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import SessionTransactionOrigin
 
 from huddleroom.models.orchestration import (
-    ACTIVE_RUN_STATUSES, OrchestrationAction, OrchestrationDecision, OrchestrationGoal, OrchestrationRun,
-    OrchestrationWait,
+    ACTIVE_RUN_STATUSES, OrchestrationAction, OrchestrationDecision, OrchestrationGate, OrchestrationGoal,
+    OrchestrationRun, OrchestrationWait,
 )
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision, OrchestrationWarning
 from huddleroom.models.task import Task
@@ -78,6 +79,7 @@ _NOT_A_REFUSAL = (
 )
 _WRAPPER_TYPES = ("recovery_apply", "recovery_verify", "recovery_retry")
 _GAP_KEY_PREFIX = RECOVERY_GAP_DECISION_KEY_PREFIX
+logger = logging.getLogger(__name__)
 _WARNING_TYPE = registry_module.RECOVERY_WARNING_TYPE
 _WAIT_OWNER = "recovery"
 _FAILED_TASK_STATUSES = frozenset({"failed", "cancelled"})
@@ -425,7 +427,8 @@ class OrchestrationBlockerRecoveryService:
     async def _blocker_gone(self, db, run, trigger: RecoveryTriggerV1, trigger_action: OrchestrationAction) -> bool:
         """An eventless noop whose loop has since done real work, or an observed task failure whose task is no
         longer failed/blocked (e.g. the owner re-ran it), needs no diagnosis. A human-resolved lineage warning
-        retires a follow-up the same way."""
+        retires a follow-up the same way, as does a same-run gate failure whose gate is now accepted (the
+        lineage reconcile_resolved_warnings retires must not be re-diagnosed and its warning recreated)."""
         if (trigger_action.dispatch_contract or {}).get("supersedes_proposal_action_id"):
             lineage = (await db.scalars(select(OrchestrationWarning).where(
                 OrchestrationWarning.goal_id == run.goal_id, OrchestrationWarning.warning_type == _WARNING_TYPE,
@@ -439,11 +442,90 @@ class OrchestrationBlockerRecoveryService:
         if trigger.source_kind != "failed_action":
             return False
         source = await db.get(OrchestrationAction, trigger.source_id)
-        if (source is None or source.action_type != "failure_observed" or source.target_type != "task"
+        if (source is None or source.action_type != "failure_observed"
                 or not (source.request or {}).get("closes_when_task_healthy", True)):
+            return False
+        if source.target_type == "gate":
+            if (source.request or {}).get("gate_id") != str(source.target_id) or source.run_id != run.id:
+                return False
+            gate = await db.get(OrchestrationGate, source.target_id, populate_existing=True)
+            return gate is not None and gate.run_id == run.id and gate.status == "accepted"
+        if source.target_type != "task":
             return False
         task = await db.get(Task, source.target_id, populate_existing=True)
         return task is not None and task.status not in {"failed", "blocked"}
+
+    async def reconcile_resolved_warnings(self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun) -> int:
+        """Retire active blocker warnings whose exact observed failure has since cleared.
+
+        Only a same-run ``failed_action`` root trigger qualifies: its failure source must name a task that is now
+        ``done`` (for this run) or a gate that is now ``accepted``. Every other source stays for a human."""
+        # ponytail: no batch cursor; one warning per lineage keeps this scan small. Add one if counts grow.
+        warnings = (await db.scalars(select(OrchestrationWarning).where(
+            OrchestrationWarning.warning_type == _WARNING_TYPE, OrchestrationWarning.active.is_(True),
+            OrchestrationWarning.goal_id == goal.id, OrchestrationWarning.run_id == run.id,
+            OrchestrationWarning.related_action_id.is_not(None),
+        ).order_by(OrchestrationWarning.created_at, OrchestrationWarning.id))).all()
+        resolved = 0
+        for warning in warnings:
+            try:
+                cleared = await self._cleared_source(db, run, warning)
+            except (HTTPException, ValueError, TypeError, KeyError) as exc:
+                logger.warning("recovery warning reconciliation skipped warning %s: %s", warning.id, exc)
+                continue
+            if cleared is None:
+                continue
+            source_id, what = cleared
+            # Resolve errors propagate; the savepoint keeps a failed retirement from leaving partial writes.
+            async with db.begin_nested():
+                # A human may have resolved it since the scan: re-read so their attribution is never overwritten.
+                fresh = await db.get(OrchestrationWarning, warning.id, populate_existing=True)
+                if fresh is None or not fresh.active:
+                    continue
+                try:
+                    await OrchestrationWarningService().resolve_warning(
+                        db, warning, resolved_by="orchestrator:recovery",
+                        reason=f"Source failed_action {source_id} cleared: {what}",
+                    )
+                except ValueError:
+                    # Lost the race between the re-read and the atomic update: skip only if now inactive, else real error.
+                    fresh = await db.get(OrchestrationWarning, warning.id, populate_existing=True)
+                    if fresh is not None and fresh.active:
+                        raise
+                    continue
+            resolved += 1
+        return resolved
+
+    @staticmethod
+    async def _cleared_source(db: AsyncSession, run: OrchestrationRun, warning: OrchestrationWarning):
+        """(source action id, what cleared) when the warning's root trigger source is provably healthy, else None."""
+        root = await db.get(OrchestrationAction, warning.related_action_id)
+        if root is None or root.action_type != "recovery_trigger" or root.run_id != run.id:
+            return None
+        trigger = RecoveryTriggerV1.model_validate(root.request)
+        if trigger.source_kind != "failed_action" or trigger.run_id != run.id:
+            return None
+        source = await db.get(OrchestrationAction, trigger.source_id)
+        if (source is None or source.action_type != "failure_observed" or source.run_id != run.id
+                or not (source.request or {}).get("closes_when_task_healthy", True)):
+            return None
+        request = source.request or {}
+        if source.target_type == "task":
+            # ponytail: the no-session episode key (status:<status>) is reused, so retiring would hide a re-failure; left for manual resolution.
+            if not request.get("session_id") or request.get("task_id") != str(source.target_id):
+                return None
+            task = await db.get(Task, source.target_id, populate_existing=True)
+            owner_run = ((task.metadata_ or {}).get("orchestration") or {}).get("run_id") if task else None
+            # "done" is stricter than _blocker_gone (any non failed/blocked status) because retiring a warning is not reversible.
+            if task is not None and task.status == "done" and owner_run == str(run.id):
+                return source.id, "task completed"
+        elif source.target_type == "gate":
+            if request.get("gate_id") != str(source.target_id):
+                return None
+            gate = await db.get(OrchestrationGate, source.target_id, populate_existing=True)
+            if gate is not None and gate.run_id == run.id and gate.status == "accepted":
+                return source.id, "gate accepted"
+        return None
 
     @staticmethod
     async def _claim(db: AsyncSession, trigger_action: OrchestrationAction) -> bool:

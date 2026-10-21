@@ -1902,3 +1902,69 @@ it('SPR188 terminal recovery history is never a new human question', async () =>
     expect(textOf(live)).toBe('')
   } finally { view.cleanup() }
 })
+
+describe('SPR285 closeout_blocked diagnostic', () => {
+  const diag = (overrides: Partial<OrchestrationWarningRecord> = {}) => warning({
+    id: 'closeout-1', warning_type: 'closeout_blocked', severity: 'blocker', blocks_completion: false,
+    message: 'Goal completion is blocked: 2 causes remain.', ...overrides,
+  })
+  const source = (overrides: Partial<OrchestrationWarningRecord> = {}) => warning({
+    id: 'source-1', warning_type: 'recovery_blocked', severity: 'blocker', message: 'Recovery cannot proceed.',
+    related_gate_id: 'gate-ref', ...overrides,
+  })
+  const gateRef: NeedsYouReference = {
+    kind: 'gate', id: 'gate-ref', project_id: 'project-1', goal_id: 'goal-1', label: 'Verification gate',
+  }
+  const withRefs = (w: OrchestrationWarningRecord): OrchestrationWarningRecord => ({ ...w, needs_you_references: [gateRef] })
+  const criteriaByKey = new Map<string, string>()
+  const base = { run: run(), processes: [], checkpointItems: [], gates: [], criteriaByKey }
+
+  it('buildQueueRows emits an active diagnostic once and omits a resolved one', () => {
+    const rows = buildQueueRows({ ...base, warnings: [diag(), source()] })
+    expect(rows.filter((row) => row.key === 'warning:closeout-1')).toHaveLength(1)
+    expect(rows).toHaveLength(2)
+    const resolved = buildQueueRows({ ...base, warnings: [diag({ active: false, resolved_at: ISO.started }), source()] })
+    expect(resolved.map((row) => row.key)).toEqual(['warning:source-1'])
+  })
+
+  it('renders title, cause text, Resolve and no Acknowledge; source rows keep their own controls', async () => {
+    const view = await mountQueue({ warnings: [withRefs(diag()), withRefs(source())], needsYouReferences: [gateRef] })
+    try {
+      const text = textOutsideDetails(view.container)
+      expect(text).toContain('Completion is blocked')
+      expect(text).toContain('Goal completion is blocked: 2 causes remain.')
+      expect(text).toContain('Resolving this notice alone does not fix them')
+      expect(text).toContain('Address each listed cause. Closeout resumes automatically.')
+      expect(text).toContain('Recovery cannot proceed.')
+      expect(text).not.toContain('Reference unavailable')
+      const buttons = buttonsIn(view.container).map((node) => textOf(node))
+      expect(buttons.filter((label) => label === 'Resolve')).toHaveLength(2)
+      expect(buttons).not.toContain('Acknowledge')
+      expect(descendants(view.container).filter((node) => node.tagName === 'LI')).toHaveLength(2)
+    } finally { view.cleanup() }
+  })
+
+  it('shows source references on the diagnostic and reveals the source record', async () => {
+    const onRevealSource = vi.fn()
+    const view = await mountQueue({ warnings: [withRefs(diag())], needsYouReferences: [gateRef], gates: [gate({ id: 'gate-ref', status: 'open' })], onRevealSource })
+    try {
+      expect(textOutsideDetails(view.container)).toContain('Verification gate')
+      await act(async () => getButton(view.container, 'Verification gate').click())
+      expect(onRevealSource).toHaveBeenCalledWith({ kind: 'gate', id: 'gate-ref', goalId: 'goal-1' })
+    } finally { view.cleanup() }
+  })
+
+  it('Resolve opens the existing resolve form, and success moves focus to the next row', async () => {
+    const view = await mountQueue({ warnings: [diag({ created_at: '2026-08-05T10:00:00Z' }), source()] })
+    try {
+      await act(async () => getButton(view.container, 'Resolve').click())
+      await act(async () => getButton(view.container, 'Submit resolve').click())
+      expect(textOutsideDetails(view.container)).not.toContain('Completion is blocked')
+      expect(textOutsideDetails(view.container)).toContain('Recovery cannot proceed.')
+      expect(textOf(view.container.ownerDocument.activeElement!)).toBe('Resolve')
+      await act(async () => getButton(view.container, 'Resolve').click())
+      await act(async () => getButton(view.container, 'Submit resolve').click())
+      expect(view.container.ownerDocument.activeElement?.id).toBe('needs-you-queue-heading')
+    } finally { view.cleanup() }
+  })
+})

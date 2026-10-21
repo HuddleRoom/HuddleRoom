@@ -2359,6 +2359,107 @@ async def test_hierarchy_prompt_context_marks_unchanged_passing_review_accepted_
     assert (entry["review_accepted"], entry["acceptance_basis"]) == (True, "recovery_approved")
 
 
+class _CandidateReviewAnalyzer:
+    """Proposes an improvement for the implementer only; every other candidate passes unchanged."""
+
+    @staticmethod
+    def build_request(agent_snapshot, goal_snapshot, candidate_work_functions, project=None):
+        return {"agent": agent_snapshot, "goal": goal_snapshot, "candidate_work_functions": candidate_work_functions}
+
+    async def review_request(self, request, candidate_work_functions, *, project_id=None):
+        if request["agent"]["name"].startswith("implementer"):
+            return SemanticAgentAssessment(
+                "improvement_proposed", ("Persona lacks ownership.",), "Clearer ownership.",
+                tuple(candidate_work_functions), "Developer role responsible for implementation.",
+                "Implement scoped changes and report verification evidence.",
+            )
+        return SemanticAgentAssessment("approved", (), "Definition is actionable.", tuple(candidate_work_functions))
+
+
+def _candidate_coverage_payload(reviews_by_agent, agents):
+    """Covers implementation and review via real review ids; the other required functions are documented gaps."""
+    impl, reviewer = agents
+    entries = [
+        {"responsibility_id": f"{fn}-owner", "responsibility": f"Own {fn}.", "source_ref": "objective",
+         "work_function": fn, "agent_ref": str(agent.id), "status": "covered", "reason": "Accepted review approves it.",
+         "evidence_ref": f"agent_review:{reviews_by_agent[agent.id].id}"}
+        for fn, agent in (("implementation", impl), ("review", reviewer))
+    ] + [
+        {"responsibility_id": f"{fn}-gap", "responsibility": f"Own {fn}.", "source_ref": "objective",
+         "work_function": fn, "agent_ref": None, "status": "gap", "reason": "No accepted candidate.",
+         "evidence_ref": None}
+        for fn in ("planning", "summarization")
+    ]
+    return {
+        "proposed_agents": [],
+        "assignments": [{"work_function": fn, "agent_ref": str(agent.id)}
+                        for fn, agent in (("implementation", impl), ("review", reviewer))],
+        "reporting_lines": [{"agent_ref": str(agent.id), "reports_to": "manager"} for agent in (impl, reviewer)],
+        "documented_gaps": ["planning", "summarization"],
+        "rationale": "Candidates own what their accepted reviews approve.",
+        "self_review": "Checked references and coverage.",
+        "feedback_results": [],
+        "responsibility_coverage": entries,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["approve", "edit"])
+async def test_zero_task_candidate_reviews_become_hierarchy_coverage_evidence_only_after_acceptance(
+    db_session, test_project, test_user, option
+):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    goal = OrchestrationGoal(
+        project_id=test_project.id, objective="Implement the API and review the change",
+        success_criteria=[], constraints={}, weight="standard", authority_model="human_manager",
+        manager_user_id=test_user.id,
+    )
+    db_session.add(goal)
+    await db_session.flush()
+    run = OrchestrationRun(goal_id=goal.id)
+    impl = _agent("implementer-candidate", "developer", ["implementation"])
+    impl.description, impl.system_prompt = "Helps with code.", "Be useful."
+    impl.adapter_type, impl.cli_runtime = "cli", "codex"
+    impl.config = {"temperature": 0.2, "reasoning_effort": "medium", "tools": ["editor"]}
+    reviewer = _agent("code-reviewer", "reviewer", ["review"])
+    reviewer.description, reviewer.system_prompt = "Reviews changes for defects.", "Review diffs and report findings."
+    db_session.add_all([run, impl, reviewer])
+    await db_session.flush()
+    review_process = AgentDefinitionReviewProcess(analyzer=_CandidateReviewAnalyzer())
+    hierarchy = TeamHierarchyProcess()
+
+    first = await review_process.advance(db_session, goal, run)
+
+    # Before acceptance: the pending proposal keeps the review unresolved and unusable as evidence.
+    assert first["status"] == "waiting_decision"
+    rows = {r.agent_id: r for r in await OrchestrationAgentReviewService().list_reviews(db_session, goal.id)}
+    assert set(rows) == {impl.id, reviewer.id}
+    request = await hierarchy._hierarchy_prompt_payload(db_session, goal, await hierarchy._analysis_input(db_session, goal), None)
+    assert request["hierarchy_context"]["agent_reviews"] == []
+    with pytest.raises(ValueError, match="coverage evidence is not accepted for this work_function"):
+        parse_team_hierarchy_analysis(_candidate_coverage_payload(rows, (impl, reviewer)), request)
+
+    decision = (await OrchestrationAuthorityDecisionService().list_decisions(db_session, goal.id, status="pending"))[0]
+    reason = json.dumps({"description": "Developer role responsible for implementation.", "persona": "Implement scoped changes and report evidence."}) if option == "edit" else "ok"
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option=option, reason=reason, decided_by_user_id=test_user.id)
+    assert (await review_process.advance(db_session, goal, run))["status"] == "completed"
+
+    # After acceptance: both real review rows are accepted evidence and cover their responsibilities.
+    request = await hierarchy._hierarchy_prompt_payload(db_session, goal, await hierarchy._analysis_input(db_session, goal), None)
+    accepted = {item["agent_id"]: item for item in request["hierarchy_context"]["agent_reviews"]}
+    assert {item["review_id"] for item in accepted.values()} == {str(r.id) for r in rows.values()}
+    assert accepted[str(impl.id)]["acceptance_basis"] == "human_decision"
+    assert accepted[str(reviewer.id)]["acceptance_basis"] == "review_passed_unchanged"
+    result = parse_team_hierarchy_analysis(_candidate_coverage_payload(rows, (impl, reviewer)), request)
+    assert {c["evidence_ref"] for c in result.responsibility_coverage if c["status"] == "covered"} == {
+        f"agent_review:{rows[impl.id].id}", f"agent_review:{rows[reviewer.id].id}"}
+    assert result.documented_gaps == ("planning", "summarization")  # honest gaps, no approve_with_documented_gaps
+    assert goal.weight == "standard"
+    assert (await db_session.execute(select(func.count()).select_from(Task))).scalar_one() == 0  # nothing fabricated
+
+
 def test_hierarchy_parser_accepts_coverage_by_unchanged_passing_review_without_decision_id():
     request = _task1_analysis_request()
     request["hierarchy_context"]["agent_reviews"][0].update(

@@ -705,3 +705,457 @@ async def test_malformed_reported_blocker_evidence_refs_are_ignored_not_fatal(db
     # non-object refs neither crash the report nor split its lineage
     [trigger] = await _actions(db_session, run.id, "recovery_trigger")
     assert [(item.status, item.target_id) for item in reports] == [("completed", trigger.id)] * 2
+
+
+# --------------------------------------------------------------------------- SPR 284: resolved-warning reconciliation
+
+from huddleroom.models.orchestration import OrchestrationGate, OrchestrationGoal, OrchestrationRun  # noqa: E402
+from huddleroom.models.task import Task  # noqa: E402
+from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService  # noqa: E402
+from huddleroom.services.orchestration_warning_service import OrchestrationWarningService  # noqa: E402
+
+_MIRROR = "warning:{}"
+
+
+async def _reconcile(db, rows) -> int:
+    return await OrchestrationBlockerRecoveryService().reconcile_resolved_warnings(db, rows.goal, rows.run)
+
+
+async def _other_run(db, rows) -> OrchestrationRun:
+    goal = OrchestrationGoal(project_id=rows.goal.project_id, objective="Another goal", constraints={}, budget={},
+                             success_criteria=[{"key": "done", "description": "Done"}])
+    db.add(goal)
+    await db.flush()
+    other = OrchestrationRun(goal_id=goal.id)
+    db.add(other)
+    await db.flush()
+    return other
+
+
+async def _task(db, rows, status="failed", run_id="same") -> Task:
+    run_id = str(rows.run.id) if run_id == "same" else str(run_id)
+    task = Task(project_id=rows.task.project_id, title=f"work {uuid.uuid4().hex[:6]}", assigned_to=rows.planner.id,
+                status=status, metadata_={"orchestration": {"run_id": run_id}})
+    db.add(task)
+    await db.flush()
+    return task
+
+
+async def _gate(db, rows, status="failed", run_id=None) -> OrchestrationGate:
+    gate = OrchestrationGate(run_id=run_id or rows.run.id, success_criterion_key=f"k-{uuid.uuid4().hex[:8]}",
+                             gate_type="plan", status=status)
+    db.add(gate)
+    await db.flush()
+    return gate
+
+
+async def lineage(db, rows, *, target="task", subject=None, source_kind="failed_action", source_type="failure_observed",
+                  closes=True, source_run=None, trigger_run=None, warning_type="recovery_blocked", session=True,
+                  request_id=None):
+    """A real failed_action lineage: trigger -> failure_observed source (-> task/gate) -> blocker warning on the root."""
+    subject = subject or (await _task(db, rows) if target == "task" else await _gate(db, rows))
+    # producer shape (orchestration_service._task_recovery_trigger): task_id + session_id (None when no failed session)
+    request = ({"task_id": request_id or str(subject.id), "session_id": str(uuid.uuid4()) if session else None}
+               if target == "task" else {"gate_id": request_id or str(subject.id)})
+    if closes is not None:
+        request["closes_when_task_healthy"] = closes
+    source = OrchestrationAction(
+        run_id=source_run or rows.run.id, idempotency_key=f"seed:{uuid.uuid4()}:failure", action_type=source_type,
+        status="failed", request=request, error="boom", target_type=target, target_id=subject.id,
+    )
+    db.add(source)
+    await db.flush()
+    payload = trigger(rows, source_id=source.id, fingerprint=uuid.uuid4().hex + uuid.uuid4().hex).model_dump(mode="json")
+    payload["source_kind"] = source_kind
+    if trigger_run is not None:
+        payload["run_id"] = str(trigger_run)
+    root = OrchestrationAction(
+        run_id=rows.run.id, idempotency_key=f"seed:{uuid.uuid4()}:trigger", action_type="recovery_trigger",
+        status="completed", request=payload,
+    )
+    db.add(root)
+    await db.flush()
+    warning = await OrchestrationWarningService().create_warning(
+        db, rows.goal.id, warning_type=warning_type, severity="blocker", message="The blocker is still active.",
+        run_id=rows.run.id, related_action_id=root.id,
+    )
+    return SimpleNamespace(subject=subject, source=source, root=root, warning=warning)
+
+
+async def _fresh(db, warning):
+    await db.refresh(warning)
+    return warning
+
+
+def _mirrored(rows, warning) -> bool:
+    return _MIRROR.format(warning.id) in [b.get("kind") for b in rows.run.active_blockers or [] if isinstance(b, dict)]
+
+
+@pytest.mark.asyncio
+async def test_failed_task_later_done_retires_its_warning_with_provenance(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows)
+    assert _mirrored(rows, item.warning)
+    assert await _reconcile(db_session, rows) == 0  # still failed
+
+    item.subject.status = "done"
+    assert await _reconcile(db_session, rows) == 1
+
+    warning = await _fresh(db_session, item.warning)
+    assert not warning.active and warning.resolved_at is not None
+    assert warning.resolved_by == "orchestrator:recovery"
+    assert str(item.source.id) in warning.resolved_reason
+    assert not _mirrored(rows, warning)
+    assert (await db_session.get(type(warning), warning.id)) is not None  # row kept for audit
+
+    # Idempotent: a repeated pass changes neither attribution nor row count.
+    resolved_at, reason = warning.resolved_at, warning.resolved_reason
+    total = await db_session.scalar(select(func.count()).select_from(OrchestrationWarning))
+    assert await _reconcile(db_session, rows) == 0
+    await db_session.refresh(warning)
+    assert (warning.resolved_at, warning.resolved_reason, warning.resolved_by) == (
+        resolved_at, reason, "orchestrator:recovery")
+    assert await db_session.scalar(select(func.count()).select_from(OrchestrationWarning)) == total
+
+
+@pytest.mark.asyncio
+async def test_failed_gate_later_accepted_retires_its_warning(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, target="gate")
+    assert await _reconcile(db_session, rows) == 0
+    item.subject.status = "accepted"
+    assert await _reconcile(db_session, rows) == 1
+    warning = await _fresh(db_session, item.warning)
+    assert not warning.active and warning.resolved_by == "orchestrator:recovery"
+    assert str(item.source.id) in warning.resolved_reason and not _mirrored(rows, warning)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["in_progress", "cancelled", "failed", "backlog", "blocked", "ready"])
+async def test_task_not_done_keeps_warning(db_session, test_project, status):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, status=status))
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, item.warning)).active and _mirrored(rows, item.warning)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["open", "failed"])
+async def test_gate_not_accepted_keeps_warning(db_session, test_project, status):
+    rows = await seed(db_session, test_project)
+    try:
+        item = await lineage(db_session, rows, subject=await _gate(db_session, rows, status=status), target="gate")
+    except Exception as exc:  # a status outside the gate CHECK is not a representable state
+        pytest.skip(f"gate status {status!r} not representable: {exc}")
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_other_run_task_and_gate_do_not_retire(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    other = await _other_run(db_session, rows)
+    foreign_task = await lineage(db_session, rows, subject=await _task(db_session, rows, "done", run_id=other.id))
+    foreign_gate = await lineage(db_session, rows, target="gate",
+                                 subject=await _gate(db_session, rows, "accepted", run_id=other.id))
+    foreign_source = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), source_run=other.id)
+    foreign_trigger = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), trigger_run=other.id)
+    assert await _reconcile(db_session, rows) == 0
+    for item in (foreign_task, foreign_gate, foreign_source, foreign_trigger):
+        assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_unrelated_accepted_gate_or_different_done_task_does_not_retire(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    await _gate(db_session, rows, "accepted")        # unrelated accepted gate in the same run
+    await _task(db_session, rows, "done")            # unrelated done task in the same run
+    on_task = await lineage(db_session, rows)        # its own task is still failed
+    on_gate = await lineage(db_session, rows, target="gate")
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, on_task.warning)).active and (await _fresh(db_session, on_gate.warning)).active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closes", [False, 0])
+async def test_closes_when_task_healthy_false_keeps_warning(db_session, test_project, closes):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), closes=closes)
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_kind", ["reported_blocker", "eventless_noop", "planning_preflight"])
+async def test_non_failed_action_roots_stay_for_a_human(db_session, test_project, source_kind):
+    rows = await seed(db_session, test_project)
+    # Even with a healthy-looking done task behind the source id, only failed_action roots are provable.
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), source_kind=source_kind)
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["session", "action"])
+async def test_session_and_action_targets_stay_active(db_session, test_project, target):
+    rows = await seed(db_session, test_project)
+    done = await _task(db_session, rows, "done")
+    item = await lineage(db_session, rows, subject=done)
+    item.source.target_type = target  # a failure whose subject is not a task or gate has no health predicate
+    await db_session.flush()
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_non_failure_observed_source_stays_active(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), source_type="request_verification")
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_legacy_model_chosen_gate_warning_without_condition_stays(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    gate = await _gate(db_session, rows, "accepted")
+    legacy = await OrchestrationWarningService().create_warning(
+        db_session, rows.goal.id, warning_type="summary_gate_reconciliation_unavailable", severity="blocker",
+        message="No supported route reconciles the gate.", run_id=rows.run.id, related_gate_id=gate.id,
+    )
+    assert await _reconcile(db_session, rows) == 0
+    assert (await _fresh(db_session, legacy)).active and _mirrored(rows, legacy)
+
+
+@pytest.mark.asyncio
+async def test_non_recovery_warning_types_are_never_touched(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    # Same structural proof (done task) but not a recovery_blocked lineage: owner decisions/budget must stay.
+    kept = [await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), warning_type=kind)
+            for kind in ("budget_exhausted", "owner_decision", "permission_required")]
+    assert await _reconcile(db_session, rows) == 0
+    for item in kept:
+        assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_missing_deleted_and_malformed_linkage_never_aborts_the_pass(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    good = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    malformed = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    malformed.root.request = {"junk": True}
+    no_source = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    await db_session.delete(no_source.source)
+    no_task_subject = await _task(db_session, rows, "done")
+    no_task = await lineage(db_session, rows, subject=no_task_subject)
+    await db_session.delete(no_task_subject)
+    deleted_root = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    await db_session.delete(deleted_root.root)
+    unlinked = await OrchestrationWarningService().create_warning(
+        db_session, rows.goal.id, warning_type="recovery_blocked", severity="blocker", message="No linkage.",
+        run_id=rows.run.id)
+    last = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    await db_session.flush()
+
+    assert await _reconcile(db_session, rows) == 2  # good and last, whatever the order
+
+    for kept in (malformed, no_source, no_task, deleted_root):
+        assert (await _fresh(db_session, kept.warning)).active
+    assert (await _fresh(db_session, unlinked)).active
+    for done in (good, last):
+        assert not (await _fresh(db_session, done.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_many_recovery_warnings_all_reconciled_in_one_pass(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    cleared = [await lineage(db_session, rows, subject=await _task(db_session, rows, "done")) for _ in range(60)]
+    kept = [await lineage(db_session, rows, subject=await _task(db_session, rows, "failed")) for _ in range(5)]
+    assert await _reconcile(db_session, rows) == 60
+    for item in cleared:
+        assert not (await _fresh(db_session, item.warning)).active
+    for item in kept:
+        assert (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_manual_resolution_before_or_during_reconcile_is_not_overwritten(db_session, test_project, monkeypatch):
+    rows = await seed(db_session, test_project)
+    manual = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    # racing: a person resolves it after the scan, before the savepoint re-read (re-read skips it)
+    racing = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    # racing_at_retire: a person resolves it after the re-read, inside resolve_warning (ValueError path skips it)
+    racing_at_retire = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    clean = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    human = f"human:{uuid.uuid4()}"
+    await OrchestrationWarningService().resolve_warning(db_session, manual.warning, resolved_by=human, reason="by hand")
+
+    original_resolve = OrchestrationWarningService.resolve_warning
+    original_cleared = OrchestrationBlockerRecoveryService._cleared_source
+
+    async def human_resolves_after_scan(db, run, warning):
+        cleared = await original_cleared(db, run, warning)
+        if warning.id == racing.warning.id:
+            await original_resolve(OrchestrationWarningService(), db, warning, resolved_by=human, reason="by hand")
+        return cleared
+
+    async def human_wins_at_retire(self, db, warning, *, resolved_by, reason):
+        if warning.id == racing_at_retire.warning.id:
+            await original_resolve(self, db, warning, resolved_by=human, reason="by hand")
+        return await original_resolve(self, db, warning, resolved_by=resolved_by, reason=reason)
+
+    monkeypatch.setattr(OrchestrationBlockerRecoveryService, "_cleared_source", staticmethod(human_resolves_after_scan))
+    monkeypatch.setattr(OrchestrationWarningService, "resolve_warning", human_wins_at_retire)
+    # a human-won race is a benign skip: no exception, only the unraced lineage is retired
+    assert await _reconcile(db_session, rows) == 1
+    warning = await _fresh(db_session, manual.warning)
+    assert not warning.active and warning.resolved_by == human and warning.resolved_reason == "by hand"
+    for raced in (racing, racing_at_retire):
+        raced_warning = await _fresh(db_session, raced.warning)
+        assert not raced_warning.active and raced_warning.resolved_by == human
+        assert raced_warning.resolved_reason == "by hand"
+    assert not (await _fresh(db_session, clean.warning)).active
+    assert (await _fresh(db_session, clean.warning)).resolved_by == "orchestrator:recovery"
+
+
+@pytest.mark.asyncio
+async def test_no_session_task_failure_is_never_retired_but_session_task_is(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    # the no-session episode key (status:failed) is reused, so a later re-failure would be hidden
+    nosession = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), session=False)
+    withsession = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    assert await _reconcile(db_session, rows) == 1
+    assert (await _fresh(db_session, nosession.warning)).active and _mirrored(rows, nosession.warning)
+    assert not (await _fresh(db_session, withsession.warning)).active
+
+
+@pytest.mark.asyncio
+async def test_mismatched_request_target_id_is_not_retired(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    bad_task = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"), request_id=str(uuid.uuid4()))
+    bad_gate = await lineage(db_session, rows, target="gate", subject=await _gate(db_session, rows, "accepted"),
+                             request_id=str(uuid.uuid4()))
+    assert await _reconcile(db_session, rows) == 0
+    for item in (bad_task, bad_gate):
+        assert (await _fresh(db_session, item.warning)).active and _mirrored(rows, item.warning)
+
+
+@pytest.mark.asyncio
+async def test_two_passes_second_returns_zero_and_attribution_unchanged(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    assert await _reconcile(db_session, rows) == 1
+    first = await _fresh(db_session, item.warning)
+    snap = (first.resolved_at, first.resolved_by, first.resolved_reason)
+    assert await _reconcile(db_session, rows) == 0
+    second = await _fresh(db_session, item.warning)
+    assert (second.resolved_at, second.resolved_by, second.resolved_reason) == snap
+    assert not _mirrored(rows, second)
+
+
+@pytest.mark.asyncio
+async def test_pending_recovery_decision_in_same_lineage_is_left_open(db_session, test_project):
+    rows = await seed(db_session, test_project)
+    _svc, proposal = await propose(db_session, rows, ScriptedAnalyzer(draft(rows, verify_call(rows))))
+    decision = await decision_for(db_session, proposal)
+    assert decision.status == "pending"
+    # a separate cleared task-failure lineage in the same run
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    assert await _reconcile(db_session, rows) >= 1
+    assert not (await _fresh(db_session, item.warning)).active
+    await db_session.refresh(decision)
+    assert decision.status == "pending", "retiring a warning never answers or closes a recovery decision"
+
+
+@pytest.mark.asyncio
+async def test_resolve_error_propagates_and_savepoint_rolls_back(db_session, test_project, monkeypatch):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, subject=await _task(db_session, rows, "done"))
+    original = OrchestrationWarningService.resolve_warning
+
+    async def partial_then_boom(self, db, warning, *, resolved_by, reason):
+        await original(self, db, warning, resolved_by=resolved_by, reason=reason)  # partial work inside the savepoint
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(OrchestrationWarningService, "resolve_warning", partial_then_boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        await _reconcile(db_session, rows)
+    monkeypatch.undo()
+
+    await db_session.refresh(item.warning)
+    await db_session.refresh(rows.run)
+    assert item.warning.active and item.warning.resolved_at is None
+    assert _mirrored(rows, item.warning)
+
+
+# --------------------------------------------------------------------------- M1: gate source already accepted
+
+
+class _NoAnalysis:
+    calls = 0
+
+    async def analyze(self, *args, **kwargs):
+        raise AssertionError("a trigger whose gate is already accepted must not be analyzed")
+
+
+async def _reserved_trigger(db, item, *, follow_up: bool) -> OrchestrationAction:
+    if not follow_up:
+        item.root.status = "reserved"
+        await db.flush()
+        return item.root
+    follow = OrchestrationAction(
+        run_id=item.root.run_id, idempotency_key=f"seed:{uuid.uuid4()}:followup", action_type="recovery_trigger",
+        status="reserved", request=item.root.request,
+        dispatch_contract={"root_trigger_action_id": str(item.root.id), "attempt": 2,
+                           "supersedes_proposal_action_id": str(uuid.uuid4())},
+    )
+    db.add(follow)
+    await db.flush()
+    return follow
+
+
+async def _active_recovery_warnings(db, goal_id):
+    return (await db.scalars(select(OrchestrationWarning).where(
+        OrchestrationWarning.goal_id == goal_id, OrchestrationWarning.warning_type == "recovery_blocked",
+        OrchestrationWarning.active.is_(True)).execution_options(populate_existing=True))).all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("follow_up", [False, True], ids=["root_trigger", "follow_up_trigger"])
+async def test_accepted_gate_source_retires_warning_and_closes_trigger_without_analysis(
+    db_session, test_project, follow_up,
+):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, target="gate")
+    reserved = await _reserved_trigger(db_session, item, follow_up=follow_up)
+    item.subject.status = "accepted"
+
+    assert await _reconcile(db_session, rows) == 1  # tick order: reconcile, then diagnose reserved triggers
+    outcome = await OrchestrationBlockerRecoveryService(analyzer=_NoAnalysis()).diagnose(db_session, reserved.id)
+
+    assert outcome.status == "completed" and outcome.dispatch_contract["closed"] == "blocker_gone"
+    assert await _active_recovery_warnings(db_session, rows.goal.id) == []
+    assert not (await _fresh(db_session, item.warning)).active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("follow_up", [False, True], ids=["root_trigger", "follow_up_trigger"])
+async def test_gate_not_accepted_still_diagnoses_and_keeps_warning(db_session, test_project, follow_up):
+    rows = await seed(db_session, test_project)
+    item = await lineage(db_session, rows, target="gate")  # gate stays failed
+    reserved = await _reserved_trigger(db_session, item, follow_up=follow_up)
+    analyzer = ScriptedAnalyzer(draft(rows, verify_call(rows)))
+
+    assert await _reconcile(db_session, rows) == 0
+    outcome = await rediagnosed_trigger(db_session, analyzer, reserved)
+
+    assert analyzer.calls >= 1, outcome
+    assert (outcome.dispatch_contract or {}).get("closed") != "blocker_gone"
+    assert (await _fresh(db_session, item.warning)).active
+
+
+async def rediagnosed_trigger(db, analyzer, trigger_action):
+    try:
+        return await OrchestrationBlockerRecoveryService(analyzer=analyzer).diagnose(db, trigger_action.id)
+    except RecoveryDiagnosisFailed:
+        return trigger_action

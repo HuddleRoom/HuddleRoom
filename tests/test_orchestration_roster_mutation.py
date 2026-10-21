@@ -949,6 +949,8 @@ async def test_roster_change_invalidates_other_goal_with_existing_fingerprints(s
     assert goal_b.id in result.affected_goal_ids
     change_b = next(item for item in result.goal_fingerprints if item.goal_id == goal_b.id)
     assert change_b.before_hierarchy_fingerprint != change_b.after_hierarchy_fingerprint
+    # SPR 282: the new planner is a prospective candidate for the goal's required planning function.
+    assert change_b.before_coverage_fingerprint != change_b.after_coverage_fingerprint
     goal_b_hierarchy = await current_process(sessions, goal_b.id, "team_hierarchy")
     goal_b_review = await current_process(sessions, goal_b.id, "agent_definition_review")
     assert goal_b_hierarchy.status == rm.INVALIDATED_PROCESS_STATUS == "running"
@@ -967,6 +969,44 @@ async def test_roster_change_invalidates_other_goal_with_existing_fingerprints(s
     first_write = lock_tracer.events.index(lock_tracer.of("agent:write")[0])
     commit_at = lock_tracer.index(lambda e: e.kind == "commit", first_write)
     assert lock_tracer.index(lambda e: e.kind == "roster:release", first_write) > commit_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["definition", "deactivate"])
+async def test_standard_candidate_preview_coverage_equals_live_canonical_before_and_after(
+    sessions, tmp_path, approve_semantic_reviews, change
+):
+    """SPR 282: a zero-task standard goal's candidate is covered identically by preview and live queries."""
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    rm = roster_api()
+    review = AgentDefinitionReviewProcess()
+    async with sessions() as s:
+        project, _user = await seed_project_user(s, tmp_path)
+        goal, run = await seed_goal_run(s, project, goal_id=GOAL_HIGH)  # "Implement the API", no tasks
+        candidate = make_agent(name="impl-candidate")
+        s.add(candidate)
+        await s.flush()
+        await review.advance(s, goal, run)
+        stored = await OrchestrationProcessService().get_current(s, goal.id, "agent_definition_review")
+        covered = set(stored.outputs["target_ids"])
+        assert covered == {str(candidate.id)}
+        before = await review.current_coverage_fingerprint(s, goal, run, covered_target_ids=covered)
+        assert stored.outputs["coverage_fingerprint"] == before
+        state = dataclasses.replace(
+            canonical(candidate), **({"description": "Implements scoped changes and reports evidence."}
+                                     if change == "definition" else {"is_active": False}))
+        plan = await rm.preview_roster_delta(s, rm.ValidatedRosterDelta(updates=(state,)), origin_goal_id=None)
+        item = next(entry for entry in plan.goal_fingerprints if entry.goal_id == goal.id)
+        candidate.description, candidate.is_active = state.description, state.is_active
+        await s.flush()
+        after = await review.current_coverage_fingerprint(s, goal, run, covered_target_ids=covered)
+
+    assert item.before_coverage_fingerprint == before
+    assert item.after_coverage_fingerprint == after
+    assert before != after  # material candidate change: the accepted review needs a rerun
+    assert goal.id in plan.affected_goal_ids
+    assert stored.outputs["coverage_fingerprint"] == before  # preview never restamps accepted evidence
 
 
 # --------------------------------------------------------------------------- follow-up

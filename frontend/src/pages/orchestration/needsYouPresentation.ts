@@ -438,6 +438,14 @@ export function presentNeedsYouRow(row: QueueRow, references: readonly NeedsYouR
       ? 'Choose how to continue goal clarification.'
       : 'Review Details with a maintainer.'
     actionOwner = row.blocker.kind === 'goal_definition_clarification_limit' ? 'owner' : 'unknown'
+  } else if (row.warning.warning_type === 'closeout_blocked') {
+    candidate = 'Completion is blocked'
+    explanation = distinctCopy(
+      warningMessage(row.warning.message),
+      'The listed causes need action. Resolving this notice alone does not fix them; it returns until they are resolved.',
+    )
+    nextStep = 'Address each listed cause. Closeout resumes automatically.'
+    actionOwner = 'owner'
   } else {
     explanation = warningMessage(row.warning.message)
     nextStep = row.canAcknowledge ? 'Acknowledge this warning after reviewing it.' : 'Review and resolve this warning.'

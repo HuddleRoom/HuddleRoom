@@ -693,3 +693,33 @@ async def test_recovery_session_wait_fallback_gets_session_running(db_session, t
     assert await service._reconcile_conditions(db_session, run) == 1
     await db_session.refresh(warning)
     assert not warning.active and warning.resolved_by == "system"
+
+
+# --- SPR 284: a gate warning is retired only when it declared the gate_unverified condition ---
+
+
+async def test_gate_warning_retires_only_when_it_declared_the_condition(db_session, test_project):
+    service, goal, run, _agent, _task = await _setup(db_session, test_project)
+    gate = OrchestrationGate(run_id=run.id, success_criterion_key="done", gate_type="work_completed", status="accepted")
+    db_session.add(gate)
+    await db_session.flush()
+    kind = "summary_gate_reconciliation_unavailable"
+    typed = await _warn(service, db_session, run, "No route to reconcile.",
+                        {"condition": "gate_unverified", "subject": str(gate.id)}, kind)
+    # A second run-scoped warning of another type, same accepted gate, no condition: no structural proof.
+    bare = await _warn(service, db_session, run, "No route to reconcile (undeclared).", None, "gate_reconciliation_other")
+    bare.related_gate_id = gate.id
+    await db_session.flush()
+
+    await service._reconcile_conditions(db_session, run)
+    await db_session.refresh(typed)
+    await db_session.refresh(bare)
+    assert not typed.active and typed.resolved_by == "system"
+    assert bare.active
+
+    # The recovery pass never retires a model-chosen warning either, whatever the gate status.
+    from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+    assert await OrchestrationBlockerRecoveryService().reconcile_resolved_warnings(db_session, goal, run) == 0
+    await db_session.refresh(bare)
+    assert bare.active

@@ -189,6 +189,7 @@ def plan_kind_for(goal, run=None) -> str:
     return "roadmap" if getattr(goal, "goal_type", None) == "roadmap" else "implementation"
 FINAL_SUMMARY_GATE_KEY = "final_summary"
 FINAL_SUMMARY_GATE_TYPE = "final_summary_accepted"
+CLOSEOUT_BLOCKED_WARNING_TYPE = "closeout_blocked"
 ATTEMPT_SOURCE_TYPES = frozenset({"task", "session"})
 ATTEMPT_REJECTION_REASONS = frozenset(
     {"Rejected evidence from task", "Rejected evidence from session"}
@@ -1256,6 +1257,7 @@ class OrchestrationService:
     _VOLATILE_SUPERVISION_KEYS = frozenset({
         "at", "judgment_in_flight", "judgment_dirty", "judgment_failures",
         "last_event_id", "context_fingerprint", "last_pass", "judgment_claim_token",
+        "closeout_attention",
     })
 
     @staticmethod
@@ -2271,6 +2273,7 @@ class OrchestrationService:
         run.completed_at = completed_at
         run.active_blockers = []
         goal.status = "completed"
+        await self._sync_closeout_attention(db, goal, run, eligible=False)
         await emit_event_once(
             db,
             goal.project_id,
@@ -3651,6 +3654,11 @@ class OrchestrationService:
             await self._fail_reserved_action_for_current_flow(db, action, error)
             raise HTTPException(status_code=404, detail=error)
         warning_type = await self._require_stored_string(db, action, stored.get("warning_type"), "warning_type")
+        try:
+            self._reserved_warning_type(warning_type)  # replayed stored requests are re-checked
+        except HTTPException as exc:
+            await self._fail_reserved_action_for_current_flow(db, action, str(exc.detail))
+            raise
         severity = await self._require_stored_string(db, action, stored.get("severity"), "severity")
         message = await self._require_stored_string(db, action, stored.get("message"), "message")
         try:
@@ -5627,6 +5635,12 @@ class OrchestrationService:
             "reason": self._optional_string(self._json_object_or_empty(request).get("reason")),
         }
 
+    def _reserved_warning_type(self, value: Any) -> str:
+        warning_type = self._required_string(value, "warning_type")
+        if warning_type == CLOSEOUT_BLOCKED_WARNING_TYPE:
+            raise HTTPException(status_code=409, detail=f"warning_type '{CLOSEOUT_BLOCKED_WARNING_TYPE}' is reserved")
+        return warning_type
+
     def _canonical_record_warning_request(
         self, request: Any, *, run_id: uuid.UUID | None = None
     ) -> dict[str, Any]:
@@ -5641,7 +5655,7 @@ class OrchestrationService:
         warning_run_id = optional_id_values["run_id"] or run_id
         return {
             "action_type": "record_warning",
-            "warning_type": self._required_string(request_obj.get("warning_type"), "warning_type"),
+            "warning_type": self._reserved_warning_type(request_obj.get("warning_type")),
             "severity": self._required_string(request_obj.get("severity"), "severity"),
             "message": self._required_string(request_obj.get("message"), "message"),
             "run_id": str(warning_run_id) if warning_run_id is not None else None,
@@ -7329,9 +7343,12 @@ class OrchestrationService:
         unreleased_items = unreleased_plan_item_ids(run)
         if unreleased_items:
             raise HTTPException(status_code=409, detail="Accepted plan items are unreleased: " + ", ".join(unreleased_items))
-        active_warnings = await OrchestrationWarningService().list_warnings(
-            db, goal.id, active_only=True
-        )
+        # The code-owned diagnostic must never block the preflight it explains.
+        active_warnings = [
+            warning
+            for warning in await OrchestrationWarningService().list_warnings(db, goal.id, active_only=True)
+            if warning.warning_type != CLOSEOUT_BLOCKED_WARNING_TYPE
+        ]
         for warning in active_warnings:
             if warning.severity in ("blocker", "hard_stop"):
                 raise HTTPException(
@@ -7518,6 +7535,159 @@ class OrchestrationService:
             gates, evidence, goal, str(version.id) if version else None, accepted_plan_items(run.plan_state)
         )
         return all(manifest.get(key) for key in self._declared_success_criterion_keys(goal))
+
+    # (detail prefix, cause text); first match wins. Anything else is reported verbatim.
+    _CLOSEOUT_DETAIL_CAUSES = (
+        ("Unresolved meeting commitments", "meeting commitments must be fulfilled or resolved: {rest}"),
+        ("Accepted gate evidence is missing", "accepted evidence must be attached to every gate"),
+        ("Orchestration budget", "a budget decision is needed (resolving warnings will not help)"),
+        ("Final summary", "the final summary must be re-run"),
+    )
+
+    async def _closeout_attention_copy(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun,
+        blocking: Sequence[OrchestrationWarning], detail: str, gates: Sequence[OrchestrationGate],
+    ) -> str:
+        causes: list[str] = []
+        for label, group in (
+            ("Resolve", [w for w in blocking if w.severity in ("blocker", "hard_stop")]),
+            ("Acknowledge or Resolve", [w for w in blocking if w.severity not in ("blocker", "hard_stop")]),
+        ):
+            if group:
+                causes.append(f"{label}: " + ", ".join(sorted({w.warning_type for w in group})))
+        if detail.startswith("All orchestration gates must be accepted"):
+            bad = [g for g in gates if g.status == "failed"]
+            if bad:
+                names = ", ".join(sorted({g.gate_type for g in bad}))
+                causes.append(f"a gate failed: {names}")
+            elif not any(gate.gate_type == FINAL_SUMMARY_GATE_TYPE for gate in gates) and (
+                await self._run_ready_for_final_summary_request(db, goal, run)
+            ):
+                causes.append("the final summary could not be requested")
+            else:
+                causes.append(detail)
+        else:
+            for prefix, text in self._CLOSEOUT_DETAIL_CAUSES:
+                if detail.startswith(prefix):
+                    causes.append(text.format(rest=detail.partition(": ")[2]))
+                    break
+            else:
+                # Warning-derived details restate the first blocking warning already listed above.
+                if not (blocking and detail.startswith("Active ")):
+                    causes.append(detail)
+        return (
+            f"Goal closeout cannot start until these are resolved: {'; '.join(causes)}."
+        )
+
+    async def _retire_closeout_attention_on_early_return(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun
+    ) -> None:
+        await self._sync_closeout_attention(db, goal, run, eligible=False)
+        await db.flush()  # keep supervision_state before any later refresh/return
+
+    async def _retire_closeout_attention(
+        self, db: AsyncSession, goal: OrchestrationGoal, run: OrchestrationRun, reason: str,
+        *, keep: uuid.UUID | None = None,
+    ) -> None:
+        service = OrchestrationWarningService()
+        for warning in await service.list_warnings(db, goal.id, active_only=True):
+            if (
+                warning.warning_type == CLOSEOUT_BLOCKED_WARNING_TYPE
+                and warning.run_id == run.id
+                and warning.id != keep
+            ):
+                await service.resolve_warning(
+                    db, warning, resolved_by="orchestrator:closeout_attention", reason=reason
+                )
+
+    async def _sync_closeout_attention(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        run: OrchestrationRun,
+        *,
+        eligible: bool,
+    ) -> OrchestrationWarning | None:
+        """Keep exactly one active ``closeout_blocked`` blocker while an eligible run's closeout preflight fails.
+
+        Normal work never reaches this as eligible-and-failing for long: ``closeout_ready`` needs no active
+        tasks and no open gate, so an in-flight final summary is not diagnosed; a one-tick transient (summary
+        not yet requested) is absorbed by the two-tick streak for non-warning causes.
+        """
+        state = self._json_object_or_empty(run.supervision_state)
+        if not eligible:
+            await self._retire_closeout_attention(db, goal, run, "closeout no longer pending")
+            if "closeout_attention" in state:
+                run.supervision_state = {k: v for k, v in state.items() if k != "closeout_attention"}
+            return None
+        try:
+            await self._closeout_preconditions_manifest(db, goal, run)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            detail = str(exc.detail)
+        else:
+            await self._retire_closeout_attention(db, goal, run, "precondition cleared")
+            if "closeout_attention" in state:
+                run.supervision_state = {k: v for k, v in state.items() if k != "closeout_attention"}
+            return None
+        active = await OrchestrationWarningService().list_warnings(db, goal.id, active_only=True)
+        diags = [
+            w for w in active if w.warning_type == CLOSEOUT_BLOCKED_WARNING_TYPE and w.run_id == run.id
+        ]
+        # Same predicate as the manifest's warning loop.
+        blocking = [
+            w for w in active
+            if w.warning_type != CLOSEOUT_BLOCKED_WARNING_TYPE
+            and (w.severity in ("blocker", "hard_stop") or w.acknowledged_at is None)
+        ]
+        gates = await self._current_run_gates(db, run.id)
+        failed_gates = [g for g in gates if g.status == "failed"]
+        fingerprint = self._stable_hash({
+            "w": sorted([str(w.id), w.warning_type, w.severity] for w in blocking),
+            "d": detail,
+            "g": sorted([str(g.id), g.gate_type] for g in failed_gates),
+        })
+        entry = self._json_object_or_empty(state.get("closeout_attention"))
+        if not blocking and entry.get("fingerprint") != fingerprint:
+            # A pure precondition 409 may be a one-tick transient; diagnose it only on the second sighting.
+            pending = self._json_object_or_empty(entry.get("pending"))
+            ticks = int(pending.get("ticks", 0)) + 1 if pending.get("fingerprint") == fingerprint else 1
+            if ticks < 2:
+                run.supervision_state = {
+                    **state, "closeout_attention": {**entry, "pending": {"fingerprint": fingerprint, "ticks": ticks}},
+                }
+                return diags[0] if diags else None
+        current = None
+        if entry.get("fingerprint") == fingerprint:
+            current = next((w for w in diags if str(w.id) == entry.get("warning_id")), None) or (
+                diags[-1] if diags else None)
+        if current is not None:
+            await self._retire_closeout_attention(db, goal, run, "conditions changed", keep=current.id)
+            if entry.get("warning_id") != str(current.id):
+                run.supervision_state = {**state, "closeout_attention": {**entry, "warning_id": str(current.id)}}
+            return current
+        await self._retire_closeout_attention(db, goal, run, "conditions changed")
+        diag = await OrchestrationWarningService().create_warning(
+            db,
+            goal.id,
+            warning_type=CLOSEOUT_BLOCKED_WARNING_TYPE,
+            severity="blocker",
+            message=await self._closeout_attention_copy(db, goal, run, blocking, detail, gates),
+            run_id=run.id,
+        )
+        # create_warning mirrors blockers into run.active_blockers; the diagnostic must not block the pipeline.
+        self._remove_active_blocker_by_kind(run, f"warning:{diag.id}")
+        run.supervision_state = {
+            **state,
+            "closeout_attention": {
+                "fingerprint": fingerprint,
+                "warning_id": str(diag.id),
+                "source_warning_ids": sorted(str(w.id) for w in blocking),
+                "causes": [w.warning_type for w in blocking] or [detail],
+            },
+        }
+        return diag
 
     async def _ensure_final_summary_gate(
         self,
@@ -14968,6 +15138,8 @@ class OrchestrationService:
                             await EffectivenessReviewProcess().advance(db, goal, run)
                         )
                         await db.flush()
+                await self._sync_closeout_attention(db, goal, run, eligible=False)
+                await db.flush()
                 if not caller_owns_transaction:
                     await publish_baseline_transaction(db)
                 return self._tick_noop_result(
@@ -14978,6 +15150,7 @@ class OrchestrationService:
             await require_control_admission(db, run.id)
             await SessionService().redispatch_pending_orchestration(db, run.id)
             if await self._hard_stop_active(db, goal.id):
+                await self._retire_closeout_attention_on_early_return(db, goal, run)
                 return self._tick_noop_result(run)
 
             if goal.parent_goal_id is not None and self._json_object_or_empty(
@@ -15004,6 +15177,7 @@ class OrchestrationService:
                 }
 
             if self._has_active_blocker(run, "repeated_failure"):
+                await self._retire_closeout_attention_on_early_return(db, goal, run)
                 if not caller_owns_transaction:
                     await publish_baseline_transaction(db)
                 return self._tick_noop_result(run)
@@ -15013,6 +15187,7 @@ class OrchestrationService:
                 and blocker.get("kind") == "goal_definition_analyzer_error"
                 for blocker in run.active_blockers
             ):
+                await self._retire_closeout_attention_on_early_return(db, goal, run)
                 return self._tick_noop_result(run)
 
             if run.phase == "authorized" and await self._sync_budget_exhaustion_attention(db, goal, run):
@@ -15047,7 +15222,7 @@ class OrchestrationService:
                     dedup_key=f"orchestration.tick:run:{run_id}:cursor:{cursor_token}",
                 )
                 run.event_cursor = new_cursor
-                await db.flush()
+                await self._retire_closeout_attention_on_early_return(db, goal, run)
                 if not caller_owns_transaction:
                     await publish_baseline_transaction(db)
                 return {
@@ -15176,6 +15351,9 @@ class OrchestrationService:
             await self._reconcile_outcome_gate_acceptance(db, goal, run)
             gates_validated = await self.validate_open_gates(db, run.id)
             await self._reconcile_conditions(db, run)
+            from huddleroom.services.orchestration_blocker_recovery import OrchestrationBlockerRecoveryService
+
+            await OrchestrationBlockerRecoveryService().reconcile_resolved_warnings(db, goal, run)
             # Keep deterministic evidence ingestion above, but stop before any
             # recovery, review, release, or LLM work if accepted authority is bad.
             if (
@@ -15188,7 +15366,7 @@ class OrchestrationService:
                 except HTTPException as exc:
                     self._block_plan_integrity(goal, run, str(exc.detail))
             if self._has_active_blocker(run, "plan_criterion_integrity") or self._has_active_blocker(run, BUDGET_REQUIRED_CODE):
-                await db.flush()
+                await self._retire_closeout_attention_on_early_return(db, goal, run)
                 if not caller_owns_transaction:
                     await publish_baseline_transaction(db)
                 return self._tick_noop_result(run)
@@ -15247,6 +15425,21 @@ class OrchestrationService:
                 await db.flush()  # refresh below discards unflushed attribute writes (e.g. supervision_state)
                 await db.refresh(run)
                 await db.refresh(goal)
+
+            # Explain a stalled closeout before can_finish. The early returns above retire any diagnostic
+            # (a leftover one is stale advice); the top of the tick deliberately does not.
+            await self._sync_closeout_attention(
+                db, goal, run,
+                eligible=(
+                    local_liveness is not None
+                    and local_liveness["outcome"] == "closeout_ready"
+                    and baseline_ready
+                    and run.phase == "authorized"
+                    and run.status in LLM_DECISION_RUN_STATUSES
+                    and goal.status in {"active", "blocked"}
+                ),
+            )
+            await db.flush()  # later refresh(run) discards unflushed supervision_state
 
             can_finish = (
                 run.status in LLM_DECISION_RUN_STATUSES
@@ -15317,6 +15510,8 @@ class OrchestrationService:
                 and run.status == "completed"
                 and goal.status == "completed"
             )
+            if run_completed:
+                await self._sync_closeout_attention(db, goal, run, eligible=False)
 
             await self._start_released_tasks(db, goal, run)
 

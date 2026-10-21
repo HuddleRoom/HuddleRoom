@@ -1278,3 +1278,740 @@ async def test_closeout_decision_context_includes_only_applied_steering(
     assert steering["active_directions"][0]["request_id"] == str(ids["applied"])
     for status in ("superseded", "withdrawn", "pending", "needs_clarification"):
         assert f"directive-{status}" not in decision.context
+
+
+# --- SPR 285: persisted closeout diagnostic -------------------------------------------------------
+async def _active_warnings(db, goal_id, warning_type=None):
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    rows = await OrchestrationWarningService().list_warnings(db, goal_id, active_only=True)
+    return [w for w in rows if warning_type is None or w.warning_type == warning_type]
+
+
+async def _all_warnings(db, goal_id, warning_type):
+    from huddleroom.models.orchestration_process import OrchestrationWarning
+
+    return list((await db.execute(
+        select(OrchestrationWarning).where(
+            OrchestrationWarning.goal_id == goal_id, OrchestrationWarning.warning_type == warning_type
+        ).order_by(OrchestrationWarning.created_at, OrchestrationWarning.id)
+    )).scalars().all())
+
+
+async def _add_warning(db, goal, run, warning_type="test_blocker", severity="blocker", mirror=False):
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    return await OrchestrationWarningService().create_warning(
+        db, goal.id, warning_type=warning_type, severity=severity,
+        message=f"{warning_type} problem", run_id=run.id,
+    )
+
+
+async def _tick(db, service, run):
+    await db.flush()
+    await db.commit()
+    result = await service.tick(db, run.id)
+    await db.refresh(run)
+    return result
+
+
+@pytest.fixture
+async def blocked_closeout(db_session, completion_ready_goal, monkeypatch):
+    from huddleroom.models.artifact import Artifact
+    from huddleroom.schemas.orchestration import OrchestrationPlanItem
+
+    adopt_session(db_session)
+    service, goal, run = completion_ready_goal
+    artifact = Artifact(
+        project_id=goal.project_id, name="accepted-plan", artifact_type="plan",
+        metadata_={"kind": "implementation_plan"},
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    item = OrchestrationPlanItem(id="done", work_function="implementation", scope="Do it", deliverable="Done", success_criterion_keys=["done"])
+    from huddleroom.models.orchestration import OrchestrationGate
+    from huddleroom.models.task import Task
+
+    work = Task(project_id=goal.project_id, title="Do it", status="done", metadata_={})
+    db_session.add(work)
+    await db_session.flush()
+    gate_id = await db_session.scalar(
+        select(OrchestrationGate.id).where(
+            OrchestrationGate.run_id == run.id, OrchestrationGate.success_criterion_key == "plan_item:done"
+        )
+    )
+    run.plan_state = {
+        "expanded_items": [{"plan_item_id": "done", "task_id": str(work.id), "gate_id": str(gate_id)}],
+        "status": "accepted",
+        "accepted_artifact_id": str(artifact.id),
+        "accepted_plan_snapshot": service._accepted_plan_snapshot(artifact.id, [item]),
+    }
+    await stub_tick_baseline(monkeypatch)
+
+    async def no_release(*_args):
+        return 0
+
+    async def bound(*_args):
+        return True
+
+    monkeypatch.setattr(service, "_release_ready_work", no_release)
+    # The fixture's accepted work gate has no verifier session; its binding is not under test here.
+    monkeypatch.setattr(service, "_has_bound_outcome_verification_evidence", bound)
+    return service, goal, run
+
+
+@pytest.fixture
+def no_provider(monkeypatch):
+    """Any provider call during a tick fails the test; the diagnostic must be deterministic."""
+    import litellm
+
+    calls = []
+
+    async def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("provider call")
+
+    monkeypatch.setattr(litellm, "acompletion", forbidden)
+    return calls
+
+
+def _human():
+    return f"human:{uuid.uuid4()}"
+
+
+async def _resolve(db, warning, by=None, reason="fixed"):
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    await OrchestrationWarningService().resolve_warning(db, warning, resolved_by=by or _human(), reason=reason)
+    await db.flush()
+
+
+def _assert_types_only(message, *types):
+    import re
+
+    for warning_type in types:
+        assert warning_type in message
+    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", message)
+
+
+def _kinds(run):
+    return [b.get("kind") for b in run.active_blockers or [] if isinstance(b, dict)]
+
+
+@pytest.mark.asyncio
+async def test_blocker_warning_gets_one_actionable_closeout_diagnostic(db_session, blocked_closeout, no_provider):
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run, "test_blocker")
+
+    result = await _tick(db_session, service, run)
+
+    assert result["authorized_execution"]["outcome"] == "closeout_ready"
+    assert result["run_completed"] is False and result["goal_closeout_process"] is None
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert diag.severity == "blocker" and diag.run_id == run.id
+    _assert_types_only(diag.message, "test_blocker")
+    assert diag.message.startswith("Goal closeout cannot start until these are resolved:")
+    assert f"warning:{diag.id}" not in _kinds(run)
+    assert f"warning:{source.id}" in _kinds(run)
+    entry = run.supervision_state["closeout_attention"]
+    assert entry["warning_id"] == str(diag.id)
+    assert entry["source_warning_ids"] == [str(source.id)]  # ids live in state, never in the copy
+    assert goal.status == "active" and run.status == "running"
+    assert no_provider == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_ticks_keep_one_unchanged_diagnostic(db_session, blocked_closeout, no_provider):
+    service, goal, run = blocked_closeout
+    await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    (first,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    first_id = first.id
+
+    for _ in range(4):
+        await _tick(db_session, service, run)
+
+    (again,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert again.id == first_id
+    assert len(await _all_warnings(db_session, goal.id, "closeout_blocked")) == 1
+    assert _kinds(run).count(f"warning:{first_id}") == 0
+    assert no_provider == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ticks_create_a_single_diagnostic(
+    db_session, blocked_closeout, owned_session_factory, no_provider
+):
+    from tests.conftest import owned_session
+
+    service, goal, run = blocked_closeout
+    await _add_warning(db_session, goal, run)
+    await db_session.flush()
+    await db_session.commit()
+
+    async def tick_once():
+        async with owned_session(owned_session_factory) as db:
+            return await service.tick(db, run.id)
+
+    await asyncio.gather(tick_once(), tick_once())
+
+    assert len(await _all_warnings(db_session, goal.id, "closeout_blocked")) == 1
+    assert len(await _active_warnings(db_session, goal.id, "closeout_blocked")) == 1
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_never_blocks_its_own_preflight(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    assert len(await _active_warnings(db_session, goal.id, "closeout_blocked")) == 1
+    with pytest.raises(HTTPException, match="test_blocker"):
+        await service._closeout_preconditions_manifest(db_session, goal, run)
+
+    await _resolve(db_session, source)
+
+    manifest = await service._closeout_preconditions_manifest(db_session, goal, run)  # diagnostic still active
+    assert all(item["type"] != "closeout_blocked" for item in manifest["warning_disposition"])
+    assert len(await _active_warnings(db_session, goal.id, "closeout_blocked")) == 1
+
+
+@pytest.mark.asyncio
+async def test_manually_resolving_only_the_diagnostic_restores_it_next_tick(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+
+    await _resolve(db_session, diag)
+
+    await db_session.refresh(source)
+    assert source.active is True
+    assert await service._run_ready_for_completion(db_session, goal, run) is False
+    result = await _tick(db_session, service, run)
+    assert result["run_completed"] is False and goal.status == "active"
+    (restored,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert restored.id != diag.id
+    assert run.supervision_state["closeout_attention"]["warning_id"] == str(restored.id)
+    assert f"warning:{restored.id}" not in _kinds(run)
+
+
+@pytest.mark.asyncio
+async def test_resolving_the_cause_retires_diagnostic_and_closeout_still_needs_authority(
+    db_session, blocked_closeout, test_user
+):
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+
+    await _resolve(db_session, source)
+    result = await _tick(db_session, service, run)
+
+    await db_session.refresh(diag)
+    assert diag.active is False and diag.resolved_reason == "precondition cleared"
+    assert "closeout_attention" not in run.supervision_state
+    assert f"warning:{diag.id}" not in _kinds(run)
+    assert result["goal_closeout_process"]["status"] == "waiting_decision"  # closeout advances ...
+    assert result["run_completed"] is False and goal.status == "active"  # ... but is not self-authorized
+    decision = await db_session.get(
+        OrchestrationAuthorityDecision, uuid.UUID(result["goal_closeout_process"]["decision_id"])
+    )
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option="approve_completion", reason="ok", decided_by_user_id=test_user.id
+    )
+    done = await _tick(db_session, service, run)
+    assert done["run_completed"] is True
+    assert await _active_warnings(db_session, goal.id, "closeout_blocked") == []
+
+
+@pytest.mark.asyncio
+async def test_changed_blocker_set_replaces_the_diagnostic(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    first = await _add_warning(db_session, goal, run, "first_blocker")
+    await _tick(db_session, service, run)
+    (old,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    second = await _add_warning(db_session, goal, run, "second_blocker")
+
+    await _tick(db_session, service, run)
+
+    await db_session.refresh(old)
+    assert old.active is False and old.resolved_reason == "conditions changed"
+    (new,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert new.id != old.id
+    _assert_types_only(new.message, "first_blocker", "second_blocker")
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == sorted([str(first.id), str(second.id)])
+
+    await _resolve(db_session, first)  # shrinking the set is also a change
+    await _tick(db_session, service, run)
+    await db_session.refresh(new)
+    assert new.active is False and new.resolved_reason == "conditions changed"
+    (newest,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    _assert_types_only(newest.message, "second_blocker")
+    assert "first_blocker" not in newest.message
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == [str(second.id)]
+    assert len(await _all_warnings(db_session, goal.id, "closeout_blocked")) == 3
+
+
+@pytest.mark.asyncio
+async def test_cleared_cause_that_recurs_gets_a_fresh_diagnostic(db_session, blocked_closeout):
+    # Driven through the sync itself: a real clearing tick starts closeout, whose pending decision then
+    # (correctly) parks liveness in a wait instead of closeout_ready.
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run)
+    first = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+    assert first is not None and first.active
+    await _resolve(db_session, source)
+
+    assert await service._sync_closeout_attention(db_session, goal, run, eligible=True) is None
+
+    await db_session.refresh(first)
+    assert first.active is False and first.resolved_reason == "precondition cleared"
+    assert "closeout_attention" not in run.supervision_state
+    again = await _add_warning(db_session, goal, run)
+    second = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+    assert second is not None and second.id != first.id
+    _assert_types_only(second.message, "test_blocker")
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == [str(again.id)]
+    assert f"warning:{second.id}" not in _kinds(run)
+    assert len(await _active_warnings(db_session, goal.id, "closeout_blocked")) == 1
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_advisory_warning_says_acknowledge_or_resolve(db_session, blocked_closeout):
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    service, goal, run = blocked_closeout
+    advisory = await _add_warning(db_session, goal, run, "advisory_note", severity="warning")
+
+    await _tick(db_session, service, run)
+
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert "Acknowledge or Resolve" in diag.message and "advisory_note" in diag.message
+    assert diag.severity == "blocker"  # acknowledging the diagnostic must not masquerade as the fix
+    await OrchestrationWarningService().acknowledge_warning(db_session, advisory, acknowledged_by=_human())
+    await db_session.flush()
+    await _tick(db_session, service, run)
+    await db_session.refresh(diag)
+    assert diag.active is False and diag.resolved_reason == "precondition cleared"
+
+
+@pytest.mark.asyncio
+async def test_non_warning_conflict_is_diagnosed_only_on_second_eligible_tick(db_session, blocked_closeout):
+    from huddleroom.models.orchestration import OrchestrationEvidence
+
+    service, goal, run = blocked_closeout
+    rows = (await db_session.execute(
+        select(OrchestrationEvidence).where(OrchestrationEvidence.source_type == "verification")
+    )).scalars().all()
+    for row in rows:
+        await db_session.delete(row)  # accepted work gate loses its evidence: a pure non-warning 409
+    await db_session.flush()
+    with pytest.raises(HTTPException, match="Accepted gate evidence is missing"):
+        await service._closeout_preconditions_manifest(db_session, goal, run)
+
+    await _tick(db_session, service, run)
+    assert await _active_warnings(db_session, goal.id, "closeout_blocked") == []
+    await _tick(db_session, service, run)
+
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert "accepted evidence must be attached to every gate" in diag.message
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == []
+    await _tick(db_session, service, run)
+    await _tick(db_session, service, run)
+    (same,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert same.id == diag.id
+    assert len(await _all_warnings(db_session, goal.id, "closeout_blocked")) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_conflict_failure_propagates_and_creates_nothing(db_session, blocked_closeout, monkeypatch):
+    service, goal, run = blocked_closeout
+
+    async def boom(*_args):
+        raise HTTPException(status_code=500, detail="storage down")
+
+    monkeypatch.setattr(service, "_closeout_preconditions_manifest", boom)
+
+    with pytest.raises(HTTPException) as exc:
+        await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+
+    assert exc.value.status_code == 500
+    assert await _all_warnings(db_session, goal.id, "closeout_blocked") == []
+
+
+@pytest.mark.asyncio
+async def test_paused_run_retires_the_diagnostic_and_resume_restores_it(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+
+    run.status = "paused"
+    await _tick(db_session, service, run)
+
+    await db_session.refresh(diag)
+    assert diag.active is False and diag.resolved_reason == "closeout no longer pending"
+    assert "closeout_attention" not in (run.supervision_state or {})
+
+    run.status = "running"
+    await _tick(db_session, service, run)
+    (restored,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert restored.id != diag.id
+
+
+@pytest.mark.asyncio
+async def test_ineligible_sync_retires_obsolete_diagnostic(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+
+    assert await service._sync_closeout_attention(db_session, goal, run, eligible=False) is None
+
+    await db_session.refresh(diag)
+    assert diag.active is False and diag.resolved_reason == "closeout no longer pending"
+    assert "closeout_attention" not in run.supervision_state
+
+
+@pytest.mark.asyncio
+async def test_blocker_in_another_goal_creates_no_diagnostic_here(db_session, blocked_closeout, test_project):
+    service, goal, run = blocked_closeout
+    other_goal, other_run = await create_goal(db_session, test_project, weight="standard")
+    other_run.status, other_run.phase = "running", "authorized"
+    await _add_warning(db_session, other_goal, other_run, "other_goal_blocker")
+
+    result = await _tick(db_session, service, run)
+
+    assert await _all_warnings(db_session, goal.id, "closeout_blocked") == []
+    assert await _all_warnings(db_session, other_goal.id, "closeout_blocked") == []
+    assert result["goal_closeout_process"]["status"] == "waiting_decision"
+
+
+@pytest.mark.asyncio
+async def test_model_cannot_record_the_reserved_warning_type(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+
+    with pytest.raises(HTTPException) as exc:
+        await service.execute_record_warning_action(
+            db_session,
+            run.id,
+            {"action_type": "record_warning", "warning_type": "closeout_blocked", "severity": "warning", "message": "x"},
+            f"run:{run.id}:test:reserved",
+        )
+
+    assert exc.value.status_code == 409 and "reserved" in exc.value.detail
+    assert await _all_warnings(db_session, goal.id, "closeout_blocked") == []
+
+
+@pytest.mark.asyncio
+async def test_normal_completion_never_creates_a_closeout_diagnostic(db_session, blocked_closeout, test_user):
+    service, goal, run = blocked_closeout
+
+    first = await _tick(db_session, service, run)
+    decision = await db_session.get(
+        OrchestrationAuthorityDecision, uuid.UUID(first["goal_closeout_process"]["decision_id"])
+    )
+    await OrchestrationAuthorityDecisionService().answer_decision(
+        db_session, decision, selected_option="approve_completion", reason="ok", decided_by_user_id=test_user.id
+    )
+    second = await _tick(db_session, service, run)
+
+    assert second["run_completed"] is True and goal.status == "completed"
+    assert await _all_warnings(db_session, goal.id, "closeout_blocked") == []
+    assert "closeout_attention" not in (run.supervision_state or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["hard_stop", "budget_exhausted"])
+async def test_early_return_retires_diagnostic_and_leaves_source_untouched(
+    db_session, blocked_closeout, no_provider, cause
+):
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run, "test_blocker")
+    await _tick(db_session, service, run)
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+
+    if cause == "hard_stop":
+        await _add_warning(db_session, goal, run, "emergency", severity="hard_stop")
+    else:
+        run.budget_state = {"status": "exceeded"}
+    await _tick(db_session, service, run)
+
+    await db_session.refresh(diag)
+    await db_session.refresh(source)
+    assert diag.active is False and diag.resolved_reason == "closeout no longer pending"
+    assert "closeout_attention" not in (run.supervision_state or {})
+    assert await _active_warnings(db_session, goal.id, "closeout_blocked") == []
+    assert source.active is True
+    assert f"warning:{source.id}" in _kinds(run) and f"warning:{diag.id}" not in _kinds(run)
+    assert no_provider == []
+
+
+@pytest.mark.asyncio
+async def test_hard_stop_warning_is_in_the_blocking_set(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    hard = await _add_warning(db_session, goal, run, "emergency", severity="hard_stop")
+
+    diag = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+
+    assert diag is not None
+    _assert_types_only(diag.message, "emergency")
+    assert "Resolve: emergency" in diag.message
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == [str(hard.id)]
+
+
+@pytest.mark.asyncio
+async def test_warnings_and_unreleased_plan_items_are_both_named(db_session, blocked_closeout, monkeypatch):
+    from huddleroom.services import orchestration_progress_view
+
+    service, goal, run = blocked_closeout
+    await _add_warning(db_session, goal, run, "test_blocker")
+    monkeypatch.setattr(orchestration_progress_view, "unreleased_plan_item_ids", lambda _run: ["item-a", "item-b"])
+
+    diag = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+
+    assert "test_blocker" in diag.message
+    assert "Accepted plan items are unreleased: item-a, item-b" in diag.message
+
+
+@pytest.mark.asyncio
+async def test_failed_gate_without_final_gate_is_named_not_blamed_on_evidence(db_session, blocked_closeout):
+    from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
+
+    service, goal, run = blocked_closeout
+    gates = list((await db_session.execute(
+        select(OrchestrationGate).where(OrchestrationGate.run_id == run.id)
+    )).scalars())
+    for gate in gates:
+        if gate.gate_type == "final_summary":
+            for ev in (await db_session.execute(
+                select(OrchestrationEvidence).where(OrchestrationEvidence.gate_id == gate.id)
+            )).scalars():
+                await db_session.delete(ev)
+            await db_session.flush()
+            await db_session.delete(gate)
+        else:
+            gate.status = "failed"
+    await db_session.flush()
+    with pytest.raises(HTTPException, match="All orchestration gates must be accepted"):
+        await service._closeout_preconditions_manifest(db_session, goal, run)
+
+    assert await service._sync_closeout_attention(db_session, goal, run, eligible=True) is None  # streak tick 1
+    diag = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+
+    assert "a gate failed:" in diag.message and "work_completed" in diag.message
+    assert "lacks evidence" not in diag.message and "final summary could not be requested" not in diag.message
+
+
+@pytest.mark.asyncio
+async def test_replacing_failed_gate_changes_fingerprint_and_rediagnoses(db_session, blocked_closeout):
+    from huddleroom.models.orchestration import OrchestrationEvidence, OrchestrationGate
+
+    service, goal, run = blocked_closeout
+    gates = list((await db_session.execute(
+        select(OrchestrationGate).where(OrchestrationGate.run_id == run.id)
+    )).scalars())
+    failed_a = []
+    for gate in gates:
+        if gate.gate_type == "final_summary":
+            for ev in (await db_session.execute(
+                select(OrchestrationEvidence).where(OrchestrationEvidence.gate_id == gate.id)
+            )).scalars():
+                await db_session.delete(ev)
+            await db_session.flush()
+            await db_session.delete(gate)
+        else:
+            gate.status = "failed"
+            failed_a.append(gate)
+    await db_session.flush()
+
+    assert await service._sync_closeout_attention(db_session, goal, run, eligible=True) is None  # streak tick 1
+    old = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+    old_id = old.id
+    assert "work_completed" in old.message
+    old_fp = run.supervision_state["closeout_attention"]["fingerprint"]
+
+    for gate in failed_a:
+        gate.status = "accepted"  # A is no longer failed
+    db_session.add(OrchestrationGate(
+        run_id=run.id, success_criterion_key="plan_item:other", gate_type="other_check",
+        required_evidence={"success_criterion_keys": ["other"]}, status="failed",
+    ))
+    await db_session.flush()
+
+    await service._sync_closeout_attention(db_session, goal, run, eligible=True)  # streak tick 1 for new state
+    new = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+
+    assert run.supervision_state["closeout_attention"]["fingerprint"] != old_fp
+    assert new.id != old_id
+    assert "other_check" in new.message and "work_completed" not in new.message
+    (active,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert active.id == new.id
+    old_row = next(w for w in await _all_warnings(db_session, goal.id, "closeout_blocked") if w.id == old_id)
+    assert not old_row.active and "conditions changed" in (old_row.resolved_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_closeout_attention_state_does_not_change_decision_context_fingerprint(blocked_closeout):
+    service, _goal, run = blocked_closeout
+    base = {"mode": "x", "last_pass_at": "t1"}
+    with_entry = {**base, "closeout_attention": {"fingerprint": "f", "warning_id": "w", "source_warning_ids": ["a"]}}
+    assert service._stable_supervision_state(with_entry) == service._stable_supervision_state(base) == {"mode": "x"}
+
+
+@pytest.mark.asyncio
+async def test_replayed_reserved_warning_type_is_rejected_and_action_failed(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    key = f"run:{run.id}:test:replay-reserved"
+    await service.reserve_action(
+        db_session, run.id, key, "record_warning",
+        {"warning_type": "closeout_blocked", "severity": "blocker", "message": "forged"},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await service.execute_record_warning_action(
+            db_session, run.id,
+            {"action_type": "record_warning", "warning_type": "other", "severity": "warning", "message": "y"}, key,
+        )
+
+    assert exc.value.status_code == 409 and "reserved" in exc.value.detail
+    assert await _all_warnings(db_session, goal.id, "closeout_blocked") == []
+
+
+@pytest.mark.asyncio
+async def test_source_mirror_survives_diagnostic_retirement_and_pause(db_session, blocked_closeout):
+    service, goal, run = blocked_closeout
+    source = await _add_warning(db_session, goal, run)
+    await _tick(db_session, service, run)
+    assert f"warning:{source.id}" in _kinds(run)
+
+    run.status = "paused"
+    await _tick(db_session, service, run)
+    assert await _active_warnings(db_session, goal.id, "closeout_blocked") == []
+    assert source.active is True and f"warning:{source.id}" in _kinds(run)
+
+    run.status = "running"
+    await _tick(db_session, service, run)
+    assert f"warning:{source.id}" in _kinds(run)
+    assert len(await _active_warnings(db_session, goal.id, "closeout_blocked")) == 1
+
+
+# --- SPR 284 + 285: proven-cleared recovery warnings leave before closeout attention is evaluated -----------------
+
+
+async def _recovery_lineage(db, goal, run, *, task_status):
+    from huddleroom.models.task import Task
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    task = Task(project_id=goal.project_id, title="Retried work", status=task_status,
+                metadata_={"orchestration": {"run_id": str(run.id)}})
+    db.add(task)
+    await db.flush()
+    source = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"seed:{uuid.uuid4()}:failure", action_type="failure_observed", status="failed",
+        request={"task_id": str(task.id), "session_id": str(uuid.uuid4()), "closes_when_task_healthy": True},
+        error="boom",
+        target_type="task", target_id=task.id,
+    )
+    db.add(source)
+    await db.flush()
+    root = OrchestrationAction(
+        run_id=run.id, idempotency_key=f"seed:{uuid.uuid4()}:trigger", action_type="recovery_trigger", status="completed",
+        request={
+            "schema_version": 1, "goal_id": str(goal.id), "run_id": str(run.id), "source_kind": "failed_action",
+            "source_id": str(source.id), "blocker_code": "task_failed", "summary": "The task failed.",
+            "source_fingerprint": uuid.uuid4().hex + uuid.uuid4().hex, "retry_target": {"kind": "decision_loop"},
+        },
+    )
+    db.add(root)
+    await db.flush()
+    return await OrchestrationWarningService().create_warning(
+        db, goal.id, warning_type="recovery_blocked", severity="blocker", message="Recovery is blocked.",
+        run_id=run.id, related_action_id=root.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleared_recovery_warning_leaves_before_closeout_diagnostic_and_ambiguous_one_remains(
+    db_session, blocked_closeout, no_provider,
+):
+    service, goal, run = blocked_closeout
+    cleared = await _recovery_lineage(db_session, goal, run, task_status="done")
+    ambiguous = await _add_warning(db_session, goal, run, "summary_gate_reconciliation_unavailable")
+
+    await _tick(db_session, service, run)
+
+    await db_session.refresh(cleared)
+    assert not cleared.active and cleared.resolved_by == "orchestrator:recovery"
+    assert f"warning:{cleared.id}" not in _kinds(run)
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    entry = run.supervision_state["closeout_attention"]
+    assert entry["source_warning_ids"] == [str(ambiguous.id)]  # the cleared one is never a listed cause
+    _assert_types_only(diag.message, "summary_gate_reconciliation_unavailable")
+    assert "recovery_blocked" not in diag.message
+
+    await _resolve(db_session, ambiguous)  # supported manual resolution unlocks ordinary closeout
+    await _tick(db_session, service, run)
+    assert await _active_warnings(db_session, goal.id, "closeout_blocked") == []
+    assert f"warning:{ambiguous.id}" not in _kinds(run)
+    assert no_provider == []
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_lists_only_the_recovery_warning_that_is_not_proven_cleared(db_session, blocked_closeout, no_provider):
+    service, goal, run = blocked_closeout
+    cleared = await _recovery_lineage(db_session, goal, run, task_status="done")
+    still = await _recovery_lineage(db_session, goal, run, task_status="cancelled")
+
+    await _tick(db_session, service, run)
+
+    await db_session.refresh(cleared)
+    await db_session.refresh(still)
+    assert not cleared.active and still.active
+    (diag,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == [str(still.id)]
+    assert diag.run_id == run.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("points_at", ["older", "newer"])
+async def test_sync_keeps_the_state_pointed_diagnostic_and_rewrites_warning_id(
+    db_session, blocked_closeout, no_provider, points_at,
+):
+    """Two active diagnostics (dedupe/lost update): exactly the one named by state survives, state agrees, and the
+    presenter links it to its source warning."""
+    from huddleroom.services.orchestration_needs_you_presenter import attach_warning_references
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    service, goal, run = blocked_closeout
+    gate = (await service._current_run_gates(db_session, run.id))[0]
+    source = await OrchestrationWarningService().create_warning(
+        db_session, goal.id, warning_type="test_blocker", severity="blocker", message="src", run_id=run.id,
+        related_gate_id=gate.id,
+    )
+    await _tick(db_session, service, run)
+    (older,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    from huddleroom.models.orchestration_process import OrchestrationWarning
+
+    newer = OrchestrationWarning(  # bypasses create_warning's dedupe, as a lost update would
+        goal_id=goal.id, run_id=run.id, warning_type="closeout_blocked", severity="blocker",
+        message="duplicate diagnostic", active=True,
+    )
+    db_session.add(newer)
+    await db_session.flush()
+    service._remove_active_blocker_by_kind(run, f"warning:{newer.id}")
+    kept = older if points_at == "older" else newer
+    state = dict(run.supervision_state)
+    state["closeout_attention"] = {**state["closeout_attention"], "warning_id": str(kept.id)}
+    run.supervision_state = state
+    await db_session.flush()
+    assert len(await _active_warnings(db_session, goal.id, "closeout_blocked")) == 2
+
+    returned = await service._sync_closeout_attention(db_session, goal, run, eligible=True)
+
+    (only,) = await _active_warnings(db_session, goal.id, "closeout_blocked")
+    assert only.id == kept.id == returned.id
+    assert run.supervision_state["closeout_attention"]["warning_id"] == str(kept.id)
+    assert run.supervision_state["closeout_attention"]["source_warning_ids"] == [str(source.id)]
+    [response] = await attach_warning_references(db_session, project_id=goal.project_id, warnings=[only])
+    assert ("gate", gate.id) in {(r.kind, r.id) for r in response.needs_you_references}

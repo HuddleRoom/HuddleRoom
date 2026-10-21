@@ -409,8 +409,11 @@ async def test_unqualified_delegation_is_a_capability_gap(db_session, test_proje
     executables(monkeypatch, available=case != "missing_executable")
     spy_build_command(monkeypatch)
     agent = (cli_agent("claims", None, adapter_type="api", capabilities=("implementation", "shell"), tools=("bash",))
-             if case == "descriptive_api_agent" else cli_agent("fixer"))
+             if case == "descriptive_api_agent" else cli_agent("fixer", active=case != "not_accepted"))
     rows = await seed(db_session, test_project, agent=agent, eligible=case != "not_accepted")
+    if case == "not_accepted":
+        # Inactive during seeding so the SPR282 definition review does not auto-accept it; active at delegation time.
+        rows.agent.is_active = True
     if case == "missing_workspace":
         test_project.workspace_path = str(tmp_path / "gone")
     if case == "inactive":

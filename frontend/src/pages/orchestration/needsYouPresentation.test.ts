@@ -621,3 +621,35 @@ describe('SPR212 runtime answer receipt validation', () => {
     } as unknown as Parameters<typeof helpers.validateRuntimeAnswerReceipt>[2])).toBe('stale')
   })
 })
+
+describe('SPR285 closeout_blocked presentation', () => {
+  const closeoutRow = (message: string | null = 'Goal completion is blocked: 1 cause remains.'): QueueRow => ({
+    kind: 'warning', key: 'warning:closeout-1',
+    warning: warning({ id: 'closeout-1', warning_type: 'closeout_blocked', severity: 'blocker', message }),
+    process: undefined, canAcknowledge: false,
+  })
+
+  it('titles the diagnostic and explains that resolving it alone does not fix the causes', () => {
+    const result = helpers.presentNeedsYouRow(closeoutRow(), [])
+    expect(result.title).toBe('Completion is blocked')
+    expect(result.explanation).toContain('Goal completion is blocked: 1 cause remains.')
+    expect(result.explanation).toContain(
+      'The listed causes need action. Resolving this notice alone does not fix them; it returns until they are resolved.',
+    )
+    expect(result.nextStep).toBe('Address each listed cause. Closeout resumes automatically.')
+    expect(result.actionOwner).toBe('owner')
+    expect(`${result.title} ${result.explanation} ${result.nextStep}`).not.toContain('Reference unavailable')
+  })
+
+  it('does not duplicate the guidance when the server message is empty', () => {
+    const result = helpers.presentNeedsYouRow(closeoutRow(null), [])
+    expect(result.explanation.match(/Resolving this notice alone/g)).toHaveLength(1)
+  })
+
+  it('leaves other warning types on the generic copy', () => {
+    const result = helpers.presentNeedsYouRow(rowsByKind().warning, [])
+    expect(result.title).not.toBe('Completion is blocked')
+    expect(result.explanation).not.toContain('Resolving this notice alone')
+    expect(result.nextStep).not.toContain('Closeout resumes automatically')
+  })
+})

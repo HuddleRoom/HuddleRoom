@@ -1282,6 +1282,15 @@ async def test_trivial_review_process_completes_compressed_without_reviews_or_wa
     assert not (await db_session.execute(select(OrchestrationWarning))).scalars().all()
 
 
+IMPLEMENT_AND_REVIEW = "Implement the API and review the change"  # requires planning/implementation/review/summarization
+REVIEWER = dict(name="code-reviewer", role="reviewer", description="Reviews changes for defects.",
+                system_prompt="Review diffs and report findings.", capabilities=["review"])
+WRITER = dict(name="summary-writer", role="writer", description="Summarizes results.",
+              system_prompt="Write concise summaries.", capabilities=["summarization"])
+WEAK_FIT = dict(name="pasta-chef", role="cook", description="Cooks pasta.",
+                system_prompt="Cook.", capabilities=["cooking"])
+
+
 @pytest.mark.asyncio
 async def test_standard_reviews_manager_and_current_run_assignees_once_with_exact_warning_links(
     db_session, review_goal, review_run
@@ -1294,7 +1303,9 @@ async def test_standard_reviews_manager_and_current_run_assignees_once_with_exac
         system_prompt="Manage the team and edit files yourself.",
     )
     builder = await _persist_agent(db_session)
-    other_run_agent = await _persist_agent(db_session, name="other-run-agent")
+    reviewer = await _persist_agent(db_session, **REVIEWER)  # unassigned candidate for a required function
+    other_run_agent = await _persist_agent(db_session, **WEAK_FIT)  # other-run assignment alone adds nothing
+    review_goal.objective = IMPLEMENT_AND_REVIEW
     review_goal.authority_model = "agent_manager"
     review_goal.manager_agent_id = manager.id
     await _assign(db_session, review_goal.project_id, review_run.id, builder, "implementation")
@@ -1321,15 +1332,19 @@ async def test_standard_reviews_manager_and_current_run_assignees_once_with_exac
     warnings = list((await db_session.execute(select(OrchestrationWarning))).scalars())
     by_agent = {review.agent_id: review for review in reviews}
 
-    assert set(by_agent) == {manager.id, builder.id}
+    assert set(by_agent) == {manager.id, builder.id, reviewer.id}
+    assert by_agent[reviewer.id].proposed_work_functions == ["review"]
+    assert by_agent[reviewer.id].approved_for_work_functions == ["review"]
+    # SPR 282: the manager is reserved for management only; it is never a candidate for other required functions.
     assert by_agent[manager.id].proposed_work_functions == ["management"]
-    assert by_agent[manager.id].approved_for_work_functions == []
+    assert by_agent[manager.id].approved_for_work_functions == []  # manager overreach disqualifies management
     assert by_agent[builder.id].proposed_work_functions == ["implementation"]
     assert by_agent[builder.id].approved_for_work_functions == ["implementation"]
     assert {warning.source_agent_review_id for warning in warnings} == {by_agent[manager.id].id}
     assert all(warning.related_agent_id == manager.id for warning in warnings)
     assert current.outputs["eligibility"] == {
         str(builder.id): ["implementation"],
+        str(reviewer.id): ["review"],
         str(manager.id): [],
     }
     assert current.outputs["warning_ids"] == [str(warning.id) for warning in warnings]
@@ -1338,7 +1353,7 @@ async def test_standard_reviews_manager_and_current_run_assignees_once_with_exac
     first_fingerprint = current.outputs["fingerprint"]
     await _advance(db_session, review_goal, review_run)
     assert len((await db_session.execute(select(OrchestrationProcessRun))).scalars().all()) == 1
-    assert len((await db_session.execute(select(OrchestrationAgentReview))).scalars().all()) == 2
+    assert len((await db_session.execute(select(OrchestrationAgentReview))).scalars().all()) == 3
     assert len((await db_session.execute(select(OrchestrationWarning))).scalars().all()) == len(warnings)
     assert current.outputs["fingerprint"] == first_fingerprint
 
@@ -3337,6 +3352,7 @@ async def test_recovery_definition_snapshot_carries_forward_unchanged_eligibilit
     async with sessions() as s:
         definition_run = await cfg_current(s, seeded.goal_id, "agent_definition_review")
         outputs = definition_run.outputs
+        # SPR 282: an assignee is never widened to functions outside its assignments.
         assert outputs["eligibility"][str(seeded.implementer_id)] == ["implementation"]
         fresh = (await s.scalars(select(OrchestrationAgentReview).where(
             OrchestrationAgentReview.source_process_run_id == definition_run.id,
@@ -3350,7 +3366,7 @@ async def test_recovery_definition_snapshot_carries_forward_unchanged_eligibilit
             assert len(fresh) == 1
             implementer = await s.get(Agent, seeded.implementer_id)
             assert fresh[0].definition_snapshot == _Task8ReviewService()._build_snapshot(implementer)
-            assert fresh[0].approved_for_work_functions == ["implementation"]
+            assert fresh[0].approved_for_work_functions == ["implementation"]  # SPR 282: assignee not widened
             assert str(fresh[0].id) in outputs["review_ids"]
     assert flow.receipt.status == "applied"
 
@@ -3637,3 +3653,182 @@ async def test_stuck_legacy_row_with_genuine_input_drift_still_parks(
     assert action.error == "source_process_did_not_advance"
     await db_session.refresh(current)
     assert current.status == "waiting_decision"
+
+
+# --- SPR 282: prospective candidates are reviewed before any assignment exists ---
+
+
+async def _candidate_team(db_session):
+    return SimpleNamespace(
+        impl=await _persist_agent(db_session, name="impl-candidate"),
+        reviewer=await _persist_agent(db_session, **REVIEWER),
+        writer=await _persist_agent(db_session, **WRITER),
+    )
+
+
+async def _reviews_by_agent(db_session):
+    return {r.agent_id: r for r in (await db_session.execute(select(OrchestrationAgentReview))).scalars()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["agent_manager", "human_manager", "no_manager"])
+async def test_standard_zero_task_goal_reviews_every_applicable_candidate_pair(
+    db_session, review_goal, review_run, test_user, authority
+):
+    review_goal.objective = IMPLEMENT_AND_REVIEW
+    team = await _candidate_team(db_session)
+    expected = {team.impl.id: ["implementation"], team.reviewer.id: ["review"], team.writer.id: ["summarization"]}
+    if authority == "agent_manager":
+        manager = await _persist_agent(
+            db_session, name="manager", role="manager", description="Coordinates delivery.",
+            system_prompt="Manage the team and edit files yourself.", capabilities=["management"],
+        )
+        review_goal.manager_agent_id = manager.id
+        expected[manager.id] = ["management"]
+    elif authority == "human_manager":
+        review_goal.manager_user_id = test_user.id
+    review_goal.authority_model = authority
+
+    result = await _advance(db_session, review_goal, review_run)
+
+    by_agent = await _reviews_by_agent(db_session)
+    assert result["status"] == "completed"
+    assert {agent_id: r.proposed_work_functions for agent_id, r in by_agent.items()} == expected
+    current = await _current_process(db_session, review_goal)
+    assert set(current.outputs["target_ids"]) == {str(i) for i in expected}
+    expected_eligibility = {
+        str(team.impl.id): ["implementation"], str(team.reviewer.id): ["review"], str(team.writer.id): ["summarization"],
+    }
+    if authority == "agent_manager":
+        expected_eligibility[str(manager.id)] = []  # manager is a target but not eligible for any function
+    assert current.outputs["eligibility"] == expected_eligibility
+    assert (await db_session.execute(select(Task))).scalars().all() == []  # no assignment mutation
+
+
+@pytest.mark.asyncio
+async def test_standard_candidates_exclude_weak_fit_and_inactive_unassigned_but_keep_inactive_assignee(
+    db_session, review_goal, review_run
+):
+    review_goal.objective = IMPLEMENT_AND_REVIEW
+    # SPR 282: implementation is covered by the assignee, so only the uncovered "review" function yields candidates.
+    candidate = await _persist_agent(db_session, **REVIEWER)
+    weak = await _persist_agent(db_session, **WEAK_FIT)
+    retired = await _persist_agent(db_session, name="retired-impl", is_active=False)
+    retired_reviewer = await _persist_agent(db_session, **{**REVIEWER, "name": "retired-reviewer", "is_active": False})
+    assigned_retired = await _persist_agent(db_session, name="assigned-retired", is_active=False)
+    await _assign(db_session, review_goal.project_id, review_run.id, assigned_retired, "implementation")
+
+    await _advance(db_session, review_goal, review_run)
+
+    by_agent = await _reviews_by_agent(db_session)
+    assert set(by_agent) == {candidate.id, assigned_retired.id}
+    assert weak.id not in by_agent and retired.id not in by_agent and retired_reviewer.id not in by_agent
+    assert by_agent[candidate.id].proposed_work_functions == ["review"]
+    assert by_agent[assigned_retired.id].proposed_work_functions == ["implementation"]
+    warnings = list((await db_session.execute(select(OrchestrationWarning))).scalars())
+    inactive = [w for w in warnings if w.warning_type == "agent_review_inactive_assignee"]
+    assert [w.related_agent_id for w in inactive] == [assigned_retired.id]
+
+
+@pytest.mark.asyncio
+async def test_standard_unassigned_agent_is_candidate_only_for_uncovered_functions_and_assignee_never_widened(
+    db_session, review_goal, review_run
+):
+    review_goal.objective = IMPLEMENT_AND_REVIEW
+    builder = await _persist_agent(db_session, name="impl-candidate")  # unassigned; implementation is covered
+    reviewer = await _persist_agent(db_session, **REVIEWER)  # unassigned; review is uncovered
+    assignee = await _persist_agent(db_session, **{**WRITER, "name": "assigned-writer"})
+    # Assigned to implementation although it also fits summarization (uncovered): must not be widened.
+    await _assign(db_session, review_goal.project_id, review_run.id, assignee, "implementation")
+
+    await _advance(db_session, review_goal, review_run)
+
+    by_agent = await _reviews_by_agent(db_session)
+    assert by_agent[assignee.id].proposed_work_functions == ["implementation"]
+    assert by_agent[reviewer.id].proposed_work_functions == ["review"]
+    assert "implementation" not in by_agent[reviewer.id].proposed_work_functions
+    if builder.id in by_agent:  # may only be proposed for functions nobody covers
+        assert "implementation" not in by_agent[builder.id].proposed_work_functions
+
+
+def test_standard_projection_merges_manager_assignee_and_candidate_entries_once():
+    from huddleroom.services.orchestration_agent_definition_review import coverage_targets_from_projection
+
+    both = _agent(name="manager-builder")
+    reviewer = _agent(**REVIEWER)
+    weak = _agent(**WEAK_FIT)
+    goal = SimpleNamespace(weight="standard", authority_model="agent_manager")
+    task = SimpleNamespace(id=uuid.uuid4())
+
+    targets = coverage_targets_from_projection(
+        goal, [(task, both, "implementation")], active_agents=[both, reviewer, weak],
+        manager=both, required_functions=["planning", "implementation", "review", "implementation"],
+    )
+
+    by_id = {agent.id: (proposed, inactive) for agent, proposed, inactive in targets}
+    assert len(targets) == 2
+    assert by_id[both.id] == (["implementation", "management"], False)  # merged once, sorted, deduplicated
+    assert by_id[reviewer.id] == (["review"], False)
+    assert weak.id not in by_id
+    # Without required functions the policy is exactly the old manager/assignee-only one.
+    plain = coverage_targets_from_projection(goal, [(task, both, "implementation")], active_agents=[both, reviewer], manager=both)
+    assert [(a.id, p) for a, p, _i in plain] == [(both.id, ["implementation", "management"])]
+
+
+@pytest.mark.asyncio
+async def test_standard_candidate_review_repeat_evaluation_does_not_repeat_model_analysis(
+    db_session, review_goal, review_run
+):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    review_goal.objective = IMPLEMENT_AND_REVIEW
+    team = await _candidate_team(db_session)
+    analyzer = CountingApprover()
+    process = AgentDefinitionReviewProcess(analyzer=analyzer)
+
+    await process.advance(db_session, review_goal, review_run)
+    first = await _current_process(db_session, review_goal)
+    assert analyzer.calls == 3  # one genuine analysis per candidate agent
+    first_id, fingerprint = first.id, first.outputs["fingerprint"]
+    await process.advance(db_session, review_goal, review_run)
+    await process.advance(db_session, review_goal, review_run)
+
+    assert analyzer.calls == 3
+    assert (await _current_process(db_session, review_goal)).id == first_id
+    assert (await _current_process(db_session, review_goal)).outputs["fingerprint"] == fingerprint
+    assert len(await _reviews_by_agent(db_session)) == 3
+    assert team.reviewer.id in await _reviews_by_agent(db_session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["definition", "deactivate", "new_candidate"])
+async def test_standard_candidate_change_invalidates_coverage_and_is_never_restamped(
+    db_session, review_goal, review_run, change
+):
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    review_goal.objective = IMPLEMENT_AND_REVIEW
+    team = await _candidate_team(db_session)
+    await _advance(db_session, review_goal, review_run)
+    first = await _current_process(db_session, review_goal)
+    stored = first.outputs["coverage_fingerprint"]
+    assert stored == await _canonical_coverage(db_session, review_goal, review_run, first)
+
+    warnings_before = await OrchestrationWarningService().list_warnings(db_session, review_goal.id, active_only=True)
+    assert not any(w.warning_type == "agent_definition_review_stale_inputs" for w in warnings_before)
+    if change == "definition":
+        team.reviewer.system_prompt += " Changed instructions."
+    elif change == "deactivate":
+        team.reviewer.is_active = False
+    else:
+        await _persist_agent(db_session, name="late-impl-candidate")
+    await db_session.flush()
+
+    assert await _canonical_coverage(db_session, review_goal, review_run, first) != stored
+    await _advance(db_session, review_goal, review_run)
+    second = await _current_process(db_session, review_goal)
+    assert second.id == first.id  # no silent restamp or auto-rerun of genuinely stale evidence
+    assert second.outputs["coverage_fingerprint"] == stored
+    # The stale evidence is actually reported to the user as needing a rerun.
+    warnings = await OrchestrationWarningService().list_warnings(db_session, review_goal.id, active_only=True)
+    assert any(w.warning_type == "agent_definition_review_stale_inputs" for w in warnings)

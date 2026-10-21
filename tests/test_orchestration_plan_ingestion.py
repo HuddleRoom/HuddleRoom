@@ -198,6 +198,15 @@ async def _planning_run(db_session, project_id, *, roadmap_budget=None):
                                          success_criteria=[{"key": "plan"}], budget=roadmap_budget),
         )
         await _complete_goal_definition(db_session, goal, run)
+    # SPR282: definition review auto-targets the unassigned planner; restore "no accepted team".
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    current = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    current.outputs = {**(current.outputs or {}), "assignments": []}
+    team = (goal.orchestrator_context or {}).get("team")
+    if isinstance(team, dict) and team.get("assignments"):
+        goal.orchestrator_context = {**goal.orchestrator_context, "team": {**team, "assignments": []}}
+    await db_session.flush()
     action = await service.execute_request_plan_action(
         db_session, run_id=run.id, request=_plan_request(planner.id), idempotency_key=f"run:{run.id}:kind:request_plan"
     )

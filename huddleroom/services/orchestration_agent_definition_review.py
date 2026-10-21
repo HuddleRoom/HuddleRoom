@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -361,6 +362,7 @@ def coverage_targets_from_projection(
     active_agents: list[Agent] = (),
     manager: Agent | None = None,
     roster_mapper: OrchestrationRosterMapper | None = None,
+    required_functions: Sequence[str] = (),
 ) -> list[tuple[Agent, list[str], bool]]:
     """Build the coverage target payload without database access."""
     if goal.weight == "trivial":
@@ -376,6 +378,27 @@ def coverage_targets_from_projection(
         if goal.authority_model == "agent_manager" and manager is not None:
             agents[manager.id] = manager
             proposed_by_agent.setdefault(manager.id, set()).add("management")
+        if required_functions:
+            if roster_mapper is None:
+                roster_mapper = OrchestrationRosterMapper()
+            # Candidates are unassigned non-manager agents, only for required functions no assignee/manager already covers.
+            manager_added = goal.authority_model == "agent_manager" and manager is not None
+            covered = {work_function for _task, _agent, work_function in assignments if work_function}
+            reserved_ids = set(assigned_ids)
+            if manager_added:
+                covered.add("management")
+                reserved_ids.add(manager.id)
+            open_fns = [f for f in required_functions if f not in covered]
+            for agent in active_agents:
+                if agent.id in reserved_ids:
+                    continue
+                fns = [
+                    f for f in open_fns
+                    if not roster_mapper.score_agent_definition(agent, f).weak
+                ]
+                if fns:
+                    agents[agent.id] = agent
+                    proposed_by_agent.setdefault(agent.id, set()).update(fns)
     else:
         if roster_mapper is None:
             roster_mapper = OrchestrationRosterMapper()
@@ -1593,12 +1616,18 @@ class AgentDefinitionReviewProcess:
         )
         active = (
             list((await db.execute(select(Agent).where(Agent.is_active.is_(True)))).scalars())
-            if goal.weight == "substantial"
+            if goal.weight in ("standard", "substantial")
             else []
         )
+        # ponytail: local import avoids a module-level cycle with team_hierarchy
+        from huddleroom.services.orchestration_team_hierarchy import infer_required_work_functions
+
         return coverage_targets_from_projection(
             goal, assignments, active_agents=active, manager=manager,
             roster_mapper=self.roster_mapper,
+            required_functions=(
+                infer_required_work_functions(goal) if goal.weight == "standard" else ()
+            ),
         )
 
     @staticmethod
