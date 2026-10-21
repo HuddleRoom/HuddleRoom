@@ -159,7 +159,7 @@ def _assert_distribution_metadata(wheel: Path, sdist: Path) -> None:
     expected_name = project["name"]
     expected_version = project["version"]
     assert expected_name == "huddleroom"
-    assert expected_version == "0.1.0a1"
+    assert expected_version == "0.2.0b1"
     assert project["description"]
     assert project["readme"] == "README.md"
     assert project["urls"].get("Repository")
@@ -344,10 +344,10 @@ def _wheel_version(wheel: Path) -> str:
 
 
 def _next_release_version(version: str) -> str:
-    match = re.fullmatch(r"(\d+(?:\.\d+)*)(?:a(\d+))?", version)
+    match = re.fullmatch(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?", version)
     assert match, f"cannot derive a higher local release from {version!r}"
-    if match.group(2) is not None:
-        return f"{match.group(1)}a{int(match.group(2)) + 1}"
+    if match.group(3) is not None:
+        return f"{match.group(1)}{match.group(2)}{int(match.group(3)) + 1}"
     components = match.group(1).split(".")
     components[-1] = str(int(components[-1]) + 1)
     return ".".join(components)
@@ -605,9 +605,11 @@ def test_stop_server_rejects_sigterm_without_graceful_shutdown_marker():
     assert f"status {-signal.SIGTERM}" in message
 
 
-def test_next_release_version_supports_stable_and_alpha_versions():
+def test_next_release_version_supports_stable_and_prerelease_versions():
     assert _next_release_version("0.1.0") == "0.1.1"
     assert _next_release_version("0.1.0a1") == "0.1.0a2"
+    assert _next_release_version("0.2.0b1") == "0.2.0b2"
+    assert _next_release_version("1.0.0rc1") == "1.0.0rc2"
 
 
 def test_distribution_contains_runtime_files_and_installs(tmp_path):

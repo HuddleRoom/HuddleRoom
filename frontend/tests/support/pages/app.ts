@@ -1,4 +1,4 @@
-import { expect, type Page } from '@playwright/test'
+import { expect, type Locator, type Page } from '@playwright/test'
 
 export interface DashboardOptions {
   expectProjectSwitcher?: boolean
@@ -115,4 +115,21 @@ export async function closeDialog(page: Page, name: RegExp | string): Promise<vo
   await expect(dialog).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(dialog).toBeHidden()
+}
+
+// Opens the right-rail Ask tab and returns the rail. The rail is persistent at
+// >=1280px; below that it is an overlay toggled by the "Activity" strip button.
+export async function openAskRail(page: Page): Promise<Locator> {
+  const rail = page.locator('.agent-activity-panel-container')
+  if (!(await rail.isVisible())) await page.getByRole('button', { name: 'Activity', exact: true }).click()
+  await expect(rail).toBeVisible()
+  const askTab = rail.getByRole('tab', { name: 'Ask', exact: true })
+  if ((await askTab.getAttribute('aria-selected')) !== 'true') await askTab.click()
+  await expect(rail.getByRole('heading', { name: 'Conversation with the orchestrator' })).toBeVisible()
+  return rail
+}
+
+export async function sendRailMessage(rail: Locator, text: string): Promise<void> {
+  await rail.getByRole('textbox', { name: 'Message the orchestrator' }).fill(text)
+  await rail.getByRole('button', { name: 'Send', exact: true }).click()
 }

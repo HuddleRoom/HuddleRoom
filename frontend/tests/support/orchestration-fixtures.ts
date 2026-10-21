@@ -20,6 +20,9 @@ import type {
 } from '../../src/lib/types'
 import { gotoDashboard, selectSeedProject } from './pages/app'
 
+// Operator user id: backend `actor_id` / `/auth/me` id are UUIDs.
+const OPERATOR_ID = '00000000-0000-4000-8000-0000000000aa'
+
 export const goal = {
   id: 'goal-release',
   project_id: 'project-route-value',
@@ -53,6 +56,7 @@ export const run = {
   goal_id: goal.id,
   status: 'blocked',
   event_cursor: 42,
+  control_version: 1,
   plan_state: {
     status: 'accepted',
     planning_task_id: 'task-plan',
@@ -425,8 +429,12 @@ export async function interceptOrchestration(
   let conversationGets = 0
   const completedConversationResponses = new Set<string>()
   let investigationCompleted = false
-  let conversationRequest: { client_request_id: string; content: string } | null = null
-  const conversationRequests: Array<{ client_request_id: string; content: string }> = []
+  type ConversationRequest = {
+    client_request_id: string; content: string; context_goal_id?: string | null
+    receipt?: { operation: string; status: string; message: string }
+  }
+  let conversationRequest: ConversationRequest | null = null
+  const conversationRequests: ConversationRequest[] = []
   const conversationFeedback = new Map<string, OrchestrationConversationFeedback>()
   let failNextFeedback = false
   let proposalStatus: OrchestrationSteeringProposal['status'] = 'proposed'
@@ -440,7 +448,7 @@ export async function interceptOrchestration(
     proposals: [],
   }
   const scenarioRequests: Array<{ method: string; pathname: string }> = []
-  const conversationHistories: Array<{ items: unknown[]; total: number; omitted: number; allowance: { enabled: boolean; limit: number; used: number; remaining: number } }> = []
+  const conversationHistories: Array<{ items: unknown[]; total: number; omitted: number; allowance: unknown; goal_allowances: unknown; steering: unknown }> = []
   const conversationAnswer = 'The release is blocked pending independent validation.'
   const steeringProposal = (): OrchestrationSteeringProposal => ({
     proposal_id: 'proposal-steered', response_id: 'conversation-response-1', status: proposalStatus,
@@ -450,6 +458,7 @@ export async function interceptOrchestration(
     promoted_request_id: proposalStatus === 'promoted' ? 'request-steered' : null,
     created_at: '2026-09-16T09:00:01Z', updated_at: '2026-09-16T09:00:03Z',
   })
+  if (proposal) steeringLedger.proposals = [steeringProposal()]
   const conversationSourceReference = `huddleroom/services/${'release-validation-source-'.repeat(8)}.py#L10-L14`
   page.on('request', (request) => {
     const url = new URL(request.url())
@@ -475,16 +484,15 @@ export async function interceptOrchestration(
     created_at: '2026-09-14T09:00:01Z', updated_at: '2026-09-14T09:00:03Z',
     private_provider_payload: 'must-not-render',
   })
-  const conversationTurn = (request: NonNullable<typeof conversationRequest>, sequence: number) => {
+  const conversationTurn = (request: ConversationRequest, sequence: number) => {
     const responseId = `conversation-response-${sequence}`
     const turnInvestigation = investigation ? conversationInvestigation() : null
     const completed = turnInvestigation?.status === 'completed' || completedConversationResponses.has(responseId)
     const answer = turnInvestigation?.report?.findings ?? (completed ? conversationAnswer : null)
     const feedback = conversationFeedback.get(responseId) ?? null
-    const actorId = 'human:operator'
+    const actorId = OPERATOR_ID
     return {
       ...(turnInvestigation ? { investigation: turnInvestigation } : {}),
-      ...(proposal && conversationRequest ? { proposed_steering: steeringProposal() } : {}),
       message_id: `conversation-message-${sequence}`, response_id: responseId,
       client_request_id: request.client_request_id, sequence, actor_id: actorId,
       content: request.content, message_created_at: '2026-09-14T09:00:00Z',
@@ -498,7 +506,7 @@ export async function interceptOrchestration(
         sources: [{ source: 'goal', status: 'included', freshness_at: '2026-09-14T09:00:00Z', available: 1, included: 1, omitted: 0, truncated: false, references: ['goal-release'] }],
       },
       feedback,
-      feedback_eligible: actorId === 'human:operator' && completed && Boolean(answer?.trim()) && feedback === null,
+      feedback_eligible: actorId === OPERATOR_ID &&completed && Boolean(answer?.trim()) && feedback === null,
       dossier: 'must-not-render', provider_payload: 'must-not-render', reservation: { reserved_tokens: 999 },
     }
   }
@@ -508,6 +516,7 @@ export async function interceptOrchestration(
   let rejectNextCancel = true
   let rejectNextOverride = true
   const requests = { pause: 0, cancel: 0, override: 0 }
+  const pauseReceipts = new Map<string, unknown>()
   let releaseCancelRejection = () => {}
   const cancelRejection = new Promise<void>((resolve) => {
     releaseCancelRejection = resolve
@@ -558,6 +567,91 @@ export async function interceptOrchestration(
       },
     })
   })
+  // Right-rail project chat (Ask tab). Turns reuse the goal-conversation fixtures
+  // (answer / feedback / investigation) wrapped in the project-chat envelope.
+  const chatTurn = (request: ConversationRequest, sequence: number) => {
+    const turn = conversationTurn(request, sequence)
+    return {
+      id: `chat-turn-${sequence}`, client_request_id: request.client_request_id, actor_id: OPERATOR_ID, content: request.content,
+      answer: turn.answer, status: turn.status, created_at: '2026-09-14T09:00:00Z',
+      context_goal_id: request.context_goal_id ?? null, historical: false, source_references: [], citations: [], error: null,
+      goal_turn: turn, actions: [],
+      receipts: request.receipt ? [{
+        action_id: `action-chat-${sequence}`, project_id: 'project', goal_id: goal.id, run_id: run.id, error_code: null, ...request.receipt,
+      }] : [],
+    }
+  }
+  const submitSteering = (directive: string, supersedes: string | null = null, sourceProposal: string | null = null) => {
+    const record: OrchestrationSteeringRequest = {
+      request_id: `request-steered-${steeringLedger.requests.length + 1}`, client_request_id: crypto.randomUUID(),
+      sequence: steeringLedger.requests.length + 1, directive, target_type: 'goal', target_id: goal.id,
+      scope: 'run', lifetime: 'remaining_current_run', impact_summary: 'Validation runs before other unstarted work.',
+      source_proposal_id: sourceProposal, supersedes_request_id: supersedes, status: 'pending', reason_code: 'submitted',
+      submitted_at: '2026-09-16T09:00:02Z', considered_at: null, finished_at: null, updated_at: '2026-09-16T09:00:02Z',
+      transitions: [{ status: 'pending', reason_code: 'submitted', actor: OPERATOR_ID, created_at: '2026-09-16T09:00:02Z' }], result_action_ids: [],
+    }
+    steeringLedger.requests.push(record)
+    steeringLedger.inbox_version += 1
+    return record
+  }
+  await page.route('**/api/v1/projects/*/orchestration/chat', async (route) => {
+    const request = route.request()
+    if (request.method() === 'GET') {
+      conversationGets += 1
+      const history = {
+        items: conversationRequests.map((item, index) => chatTurn(item, index + 1)), total: conversationRequests.length, omitted: 0,
+        allowance: { enabled: false, unlimited: true }, goal_allowances: {}, steering: { [goal.id]: steeringLedger },
+      }
+      conversationHistories.push(history)
+      await route.fulfill({ json: history })
+      return
+    }
+    if (request.method() === 'POST') {
+      const body = await request.postDataJSON() as ConversationRequest
+      // The rail turns ledger buttons into plain chat instructions; the mocked
+      // control plane interprets the same phrases the real one would.
+      const withdraw = body.content.match(/^Withdraw steering request (\S+)$/)
+      const dismiss = body.content.match(/^Dismiss proposal (\S+)$/)
+      const promote = body.content.match(/^Promote steering proposal (\S+)$/)
+      let receipt: ConversationRequest['receipt']
+      if (withdraw) {
+        const record = steeringLedger.requests.find((item) => item.request_id === withdraw[1])
+        if (record?.status === 'pending') {
+          record.status = 'withdrawn'; record.reason_code = 'withdrawn_by_operator'; record.finished_at = '2026-09-16T09:00:03Z'
+          record.transitions.push({ status: 'withdrawn', reason_code: record.reason_code, actor: OPERATOR_ID, created_at: record.finished_at })
+          steeringLedger.inbox_version += 1
+          receipt = { operation: 'withdraw_steering', status: 'completed', message: 'Direction withdrawn.' }
+        } else receipt = { operation: 'withdraw_steering', status: 'failed', message: 'Only pending requests may be withdrawn.' }
+      } else if (dismiss) {
+        proposalStatus = 'dismissed'
+        steeringLedger.proposals = [steeringProposal()]
+        receipt = { operation: 'dismiss_steering', status: 'completed', message: 'Proposal dismissed.' }
+      } else if (promote) {
+        proposalStatus = 'promoted'
+        steeringLedger.proposals = [steeringProposal()]
+        submitSteering('Prioritize validation before other unstarted work.', null, promote[1])
+        receipt = { operation: 'submit_steering', status: 'pending', message: 'Direction queued for the current run.' }
+      } else if (/^(Prioritize|Hold|Replace|Overlap)/.test(body.content)) {
+        const prior = body.content.startsWith('Replace') ? steeringLedger.requests.find((item) => item.status === 'applied') : undefined
+        if (prior) {
+          prior.status = 'superseded'; prior.reason_code = 'superseded_by_explicit_request'; prior.finished_at = '2026-09-16T09:00:04Z'
+          prior.transitions.push({ status: 'superseded', reason_code: prior.reason_code, actor: OPERATOR_ID, created_at: prior.finished_at })
+        }
+        const record = submitSteering(body.content, prior?.request_id ?? null)
+        if (body.content.startsWith('Overlap')) { record.status = 'needs_clarification'; record.reason_code = 'needs_clarification' }
+        receipt = { operation: 'submit_steering', status: 'pending', message: 'Direction queued for the current run.' }
+      }
+      conversationRequest = { ...body, receipt }
+      conversationRequests.push(conversationRequest)
+      await route.fulfill({ json: chatTurn(conversationRequest, conversationRequests.length) })
+      return
+    }
+    await route.fallback()
+  })
+  // Answers are bound to the acting user; pin it so the mocked receipts match.
+  await page.route('**/api/v1/auth/me', (route) => route.fulfill({
+    json: { id: OPERATOR_ID, email: 'operator@example.test', display_name: 'Operator', role: 'admin', is_active: true, created_at: '2026-07-01T00:00:00Z' },
+  }))
   await page.route('**/api/v1/projects/*/orchestration/goals**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -574,7 +668,7 @@ export async function interceptOrchestration(
     if (suffix === `/${goal.id}/conversation`) {
       if (request.method() === 'GET') {
         conversationGets += 1
-        const history = { items: conversationRequests.map((item, index) => conversationTurn(item, index + 1)), total: conversationRequests.length, omitted: 0, allowance: { enabled: true, limit: 500, used: 200, remaining: 300 }, steering: steeringLedger }
+        const history = { items: conversationRequests.map((item, index) => conversationTurn(item, index + 1)), total: conversationRequests.length, omitted: 0, allowance: { enabled: true, limit: 500, used: 200, remaining: 300 }, goal_allowances: {}, steering: steeringLedger }
         conversationHistories.push(history)
         await route.fulfill({ json: history })
         return
@@ -616,7 +710,7 @@ export async function interceptOrchestration(
         const prior = steeringLedger.requests.find((item) => item.request_id === payload.supersedes_request_id)
         if (prior) {
           prior.status = 'superseded'; prior.reason_code = 'superseded_by_explicit_request'; prior.finished_at = '2026-09-16T09:00:04Z'
-          prior.transitions.push({ status: 'superseded', reason_code: prior.reason_code, actor: 'human:operator', created_at: prior.finished_at })
+          prior.transitions.push({ status: 'superseded', reason_code: prior.reason_code, actor: OPERATOR_ID, created_at: prior.finished_at })
         }
       }
       const status: OrchestrationSteeringRequest['status'] = applied ? 'applied' : overlaps ? 'needs_clarification' : 'pending'
@@ -627,7 +721,7 @@ export async function interceptOrchestration(
         supersedes_request_id: payload.supersedes_request_id, status, reason_code: status === 'pending' ? 'submitted' : status,
         submitted_at: '2026-09-16T09:00:02Z', considered_at: status === 'pending' ? null : '2026-09-16T09:00:04Z',
         finished_at: status === 'pending' ? null : '2026-09-16T09:00:04Z', updated_at: '2026-09-16T09:00:04Z',
-        transitions: [{ status, reason_code: status === 'pending' ? 'submitted' : status, actor: 'human:operator', created_at: '2026-09-16T09:00:02Z' }], result_action_ids: [],
+        transitions: [{ status, reason_code: status === 'pending' ? 'submitted' : status, actor: OPERATOR_ID, created_at: '2026-09-16T09:00:02Z' }], result_action_ids: [],
       }
       steeringLedger.requests.push(requestRecord)
       steeringLedger.inbox_version += 1
@@ -644,7 +738,7 @@ export async function interceptOrchestration(
         return
       }
       requestRecord.status = 'withdrawn'; requestRecord.reason_code = 'withdrawn_by_operator'; requestRecord.finished_at = '2026-09-16T09:00:03Z'
-      requestRecord.transitions.push({ status: 'withdrawn', reason_code: requestRecord.reason_code, actor: 'human:operator', created_at: requestRecord.finished_at })
+      requestRecord.transitions.push({ status: 'withdrawn', reason_code: requestRecord.reason_code, actor: OPERATOR_ID, created_at: requestRecord.finished_at })
       steeringLedger.inbox_version += 1
       await route.fulfill({ json: requestRecord })
       return
@@ -706,11 +800,34 @@ export async function interceptOrchestration(
       }
       const decision: OrchestrationAuthorityDecisionRecord = {
         ...baselineState.decisions[index], status: 'answered', selected_option: payload.selected_option,
-        reason: payload.reason, decided_by_user_id: 'human:operator', decided_at: '2026-07-29T12:00:00Z',
+        reason: payload.reason, decided_by_user_id: OPERATOR_ID, decided_at: '2026-07-29T12:00:00Z',
         overrides_recommendation: payload.selected_option !== baselineState.decisions[index].recommendation,
       }
       baselineState.decisions[index] = decision
-      await route.fulfill({ json: { decision } })
+      // The app only trusts an answer that comes back with a receipt echoing the
+      // exact submission it built (actor, decision contract, run).
+      const reviewed = baselineState.decisions[index]
+      const actor = OPERATOR_ID
+      const contracts = [{
+        id: reviewed.id, key: reviewed.decision_key, options: reviewed.options,
+        authority: reviewed.authority, authority_agent_id: reviewed.authority_agent_id ?? '',
+        source_process_run_id: reviewed.source_process_run_id ?? '', run_id: reviewed.run_id ?? '',
+        contract_version: reviewed.contract_version ?? null,
+      }]
+      const submission = {
+        kind: 'single', actor_user_id: actor, decision_ids: [reviewed.id],
+        source_process_run_id: reviewed.source_process_run_id ?? null, run_id: state.run?.id ?? null,
+        answers: [{
+          decision_id: reviewed.id, selected_option: payload.selected_option, reason: payload.reason?.trim() || null,
+          contract_version: reviewed.contract_version ?? null, edited_agent: null,
+        }],
+        contracts,
+      }
+      await route.fulfill({ json: { decision, answer_receipt: {
+        action_id: `action-answer-${reviewed.id}`, decision_ids: [reviewed.id], actor_user_id: actor,
+        source_process_run_id: submission.source_process_run_id, run_id: submission.run_id,
+        submission, contracts, application_state: 'applied', reason: null,
+      } } })
       return
     }
     const skip = suffix.match(new RegExp(`^/${goal.id}/processes/([^/]+)/skip$`))
@@ -724,7 +841,7 @@ export async function interceptOrchestration(
       }
       const payload = await request.postDataJSON() as { reason: string }
       const process: OrchestrationProcessRunRecord = {
-        ...baselineState.processes[index], status: 'skipped', skipped_by: 'human:operator', override_reason: payload.reason,
+        ...baselineState.processes[index], status: 'skipped', skipped_by: OPERATOR_ID, override_reason: payload.reason,
         completed_at: '2026-07-29T12:00:00Z', updated_at: '2026-07-29T12:00:00Z',
       }
       baselineState.processes[index] = process
@@ -736,15 +853,31 @@ export async function interceptOrchestration(
       await route.fulfill({ json: process })
       return
     }
-    if (request.method() === 'POST' && suffix === `/${goal.id}/pause`) {
+    // Pause is a versioned request: POST pause-control returns a receipt, and
+    // the receipt can be re-read by request id (GET pause-control/{id}).
+    if (request.method() === 'POST' && suffix === `/${goal.id}/pause-control`) {
       requests.pause += 1
       if (deferLifecycle.includes('pause')) await lifecycleResponses.pause
       if (rejectLifecycle === 'pause') {
         await route.fulfill({ status: 409, json: { detail: 'Pause was rejected.' } })
         return
       }
+      const body = await request.postDataJSON() as { run_id: string; expected_control_version: number; request_id: string }
+      const version = body.expected_control_version + 1
       state = withActiveBlockers(detail('paused', 'paused', supervisionFor('paused')))
-      await route.fulfill({ json: state })
+      if (state.run) state.run.control_version = version
+      const receipt = {
+        project_id: url.pathname.split('/')[4], goal_id: goal.id, run_id: body.run_id, request_id: body.request_id,
+        accepted_at: '2026-07-15T13:00:00Z', accepted_control_version: version, current_control_version: version,
+        state: 'applied', goal_status: 'paused', run_status: 'paused',
+      }
+      pauseReceipts.set(body.request_id, receipt)
+      await route.fulfill({ json: receipt })
+      return
+    }
+    const pauseReceiptMatch = suffix.match(new RegExp(`^/${goal.id}/pause-control/([^/]+)$`))
+    if (request.method() === 'GET' && pauseReceiptMatch) {
+      await route.fulfill({ json: pauseReceipts.get(pauseReceiptMatch[1]) ?? null })
       return
     }
     if (request.method() === 'POST' && suffix === `/${goal.id}/resume`) {
@@ -753,7 +886,11 @@ export async function interceptOrchestration(
         await route.fulfill({ status: 409, json: { detail: 'Resume was rejected.' } })
         return
       }
+      // Resuming advances the run's control version past any pause receipt.
+      const resumedVersion = (state.run?.control_version ?? 0) + 1
       state = withActiveBlockers(detail('active', 'running', supervisionFor('working')))
+      if (state.run) state.run.control_version = resumedVersion
+      for (const [id, receipt] of pauseReceipts) pauseReceipts.set(id, { ...(receipt as object), state: 'resumed', current_control_version: resumedVersion })
       await route.fulfill({ json: state })
       return
     }
@@ -805,11 +942,11 @@ export async function interceptOrchestration(
     const payload = await request.postDataJSON() as { reason: string }
     const warning: OrchestrationWarningRecord = kind === 'acknowledge'
       ? {
-        ...baselineState.warnings[index], acknowledged_by: 'human:operator', acknowledged_at: '2026-07-29T12:00:00Z',
+        ...baselineState.warnings[index], acknowledged_by: OPERATOR_ID, acknowledged_at: '2026-07-29T12:00:00Z',
         blocks_completion: false, updated_at: '2026-07-29T12:00:00Z',
       }
       : {
-        ...baselineState.warnings[index], active: false, resolved_by: 'human:operator', resolved_reason: payload.reason,
+        ...baselineState.warnings[index], active: false, resolved_by: OPERATOR_ID, resolved_reason: payload.reason,
         resolved_at: '2026-07-29T12:00:00Z', blocks_completion: false, updated_at: '2026-07-29T12:00:00Z',
       }
     baselineState.warnings[index] = warning

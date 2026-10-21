@@ -378,17 +378,20 @@ describe('orchestration API', () => {
 
   it('goal detail polling respects WS connection state', () => {
     const goal = useOrchestrationGoal('project-1', 'goal-1') as unknown as {
-      refetchInterval: () => number | false
+      refetchInterval: (query: { state: { data?: { run?: Record<string, unknown> } } }) => number | false
       staleTime: number
     }
+    const idle = { state: { data: undefined } }
+    const baseline = { state: { data: { run: { phase: 'baseline', baseline_authorized: true, status: 'running' } } } }
 
     // Test disconnected state (default mock)
-    expect(goal.refetchInterval()).toBe(10_000)
+    expect(goal.refetchInterval(idle)).toBe(10_000)
     expect(goal.staleTime).toBe(10_000)
 
     // Test connected state
     vi.mocked(useWSStore.getState).mockReturnValue({ connected: true })
-    expect(goal.refetchInterval()).toBe(false)
+    expect(goal.refetchInterval(idle)).toBe(false)
+    expect(goal.refetchInterval(baseline)).toBe(2000)
   })
 
   it('uses a disabled, goal-scoped conversation query that polls only active turns', () => {

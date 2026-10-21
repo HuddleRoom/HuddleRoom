@@ -1,4 +1,4 @@
-name: Publish alpha release
+name: Publish prerelease
 
 on:
   release:
@@ -11,13 +11,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate alpha prerelease
+      - name: Validate prerelease
         env:
           PRERELEASE: ${{ github.event.release.prerelease }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           test "$PRERELEASE" = true
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+a[0-9]+$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(a|b|rc)[0-9]+$ ]]
 
       - name: Check out released tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

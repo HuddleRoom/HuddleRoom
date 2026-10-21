@@ -1,6 +1,6 @@
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type Page } from '@playwright/test'
-import { ROUTES, SEED, gotoDashboard, openRoute, selectSeedProject } from './support/pages/app'
+import { ROUTES, SEED, gotoDashboard, openAskRail, openRoute, selectSeedProject, sendRailMessage } from './support/pages/app'
 import { interceptOrchestration, openOrchestrationGoal } from './support/orchestration-fixtures'
 
 // Serious/critical only — moderate/minor violations are tracked separately
@@ -78,43 +78,35 @@ test.describe('axe a11y — zero serious/critical violations', () => {
   test('goal-detail', async ({ page }) => {
     await interceptOrchestration(page)
     await openOrchestrationGoal(page)
-    await expect(page.locator('section[aria-label="Conversation"]')).toBeVisible()
+    // The orchestrator conversation lives in the right-rail Ask tab.
+    await openAskRail(page)
     await expectNoBlockingViolations(page, 'goal-detail')
   })
 
-  // The merged steering + feedback UI (ConversationPanel) only renders its
-  // richest controls — feedback radios, a pending steering ledger row, the
-  // steering directive textarea/selects, and the Withdraw/Replace buttons —
-  // once a message has been answered and a direction submitted. Drive both
-  // through the UI against the mocked orchestration harness so axe sees the
-  // real DOM those controls produce, not just their resting/empty state.
+  // The rail's richest controls — the response-feedback group, a pending
+  // steering ledger row with its Withdraw button — only render once a message
+  // has been answered and a direction submitted. Drive both through the UI
+  // against the mocked orchestration harness so axe sees the real DOM those
+  // controls produce, not just their resting/empty state.
   test('goal-detail with a pending feedback prompt and a steering ledger row', async ({ page }) => {
     await page.clock.install({ time: new Date('2026-09-16T09:00:00Z') })
     const harness = await interceptOrchestration(page, { steering: true })
     await openOrchestrationGoal(page)
-    const conversation = page.locator('section[aria-label="Conversation"]')
-    const steeringDialog = page.getByRole('dialog')
+    const rail = await openAskRail(page)
 
-    await conversation.getByLabel('Advisory message').fill('What is the current release risk?')
-    await conversation.getByRole('button', { name: 'Send message' }).click()
-    await expect(conversation).toContainText('What is the current release risk?')
+    await sendRailMessage(rail, 'What is the current release risk?')
+    await expect(rail).toContainText('What is the current release risk?')
     harness.completeConversation('conversation-response-1')
-    await page.clock.fastForward(2_000)
-    const feedback = conversation.getByRole('region', { name: 'Feedback for message 1' })
+    await page.clock.fastForward(5_000)
+    const feedback = rail.getByLabel('Response feedback')
     await expect(feedback.getByRole('button', { name: 'Needs work' })).toBeVisible()
-    // Open the Needs-work reason group so the native radios (min-h-11 rows)
-    // are actually in the DOM for axe, not just the initial two buttons.
-    await feedback.getByRole('button', { name: 'Needs work' }).click()
-    await expect(feedback.getByRole('radio', { name: 'Did not answer' })).toBeVisible()
+    await expect(feedback.getByLabel('Feedback reason')).toBeVisible()
 
-    await conversation.getByRole('button', { name: 'Steer work' }).click()
-    await steeringDialog.getByLabel('Steering directive').fill('Prioritize validation before other unstarted work.')
-    await steeringDialog.getByLabel('Expected impact').fill('Validation runs before other unstarted work.')
-    await steeringDialog.getByRole('button', { name: 'Submit steering' }).click()
+    await sendRailMessage(rail, 'Prioritize validation before other unstarted work.')
     // Only confirm the a11y-relevant controls rendered — axe runs against
     // this steering + feedback UI, not against a specific status string.
-    await expect(conversation.getByRole('button', { name: /Withdraw|Replace/ })).toBeVisible()
-    await expect(feedback.getByRole('radio', { name: 'Did not answer' })).toBeVisible()
+    await expect(rail.getByRole('button', { name: 'Withdraw direction' })).toBeVisible()
+    await expect(feedback.getByLabel('Feedback reason')).toBeVisible()
 
     await expectNoBlockingViolations(page, 'goal-detail with steering ledger + pending feedback')
   })

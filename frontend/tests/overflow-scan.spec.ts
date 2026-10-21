@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { SEED, gotoDashboard, selectSeedProject } from './support/pages/app'
+import { SEED, gotoDashboard, openAskRail, selectSeedProject, sendRailMessage } from './support/pages/app'
 import { interceptOrchestration, openOrchestrationGoal } from './support/orchestration-fixtures'
 
 // Phase 11: no route may cause horizontal page scroll at any of these widths.
@@ -67,7 +67,10 @@ test.describe('overflow scan — no horizontal scroll at any breakpoint', () => 
     test(`goal detail @ ${width}px`, async ({ page }) => {
       await interceptOrchestration(page)
       await openOrchestrationGoal(page)
-      await expect(page.locator('section[aria-label="Conversation"]')).toBeVisible()
+      await page.setViewportSize({ width, height: HEIGHT })
+      // The conversation lives in the right-rail Ask tab (an overlay below 1280px);
+      // scan with it open.
+      await openAskRail(page)
       await assertNoOverflow(page, 'goal detail', width)
     })
 
@@ -99,33 +102,26 @@ test.describe('overflow scan — no horizontal scroll at any breakpoint', () => 
     })
   }
 
-  // Goal detail with the steering ledger + compose form + feedback fieldset
-  // visible (ConversationPanel's richest state) — checked at the two
-  // narrowest breakpoints only, per Phase 11 scope.
+  // Goal detail with the rail's steering ledger + feedback group visible (the
+  // Ask tab's richest state) — checked at the two narrowest breakpoints only,
+  // per Phase 11 scope.
   for (const width of [768, 390] as const) {
     test(`goal detail with steering ledger + feedback @ ${width}px`, async ({ page }) => {
       await page.clock.install({ time: new Date('2026-09-16T09:00:00Z') })
       const harness = await interceptOrchestration(page, { steering: true })
       await openOrchestrationGoal(page)
-      const conversation = page.locator('section[aria-label="Conversation"]')
+      await page.setViewportSize({ width, height: HEIGHT })
+      const rail = await openAskRail(page)
 
-      await conversation.getByLabel('Advisory message').fill('What is the current release risk?')
-      await conversation.getByRole('button', { name: 'Send message' }).click()
-      await expect(conversation).toContainText('What is the current release risk?')
+      await sendRailMessage(rail, 'What is the current release risk?')
+      await expect(rail).toContainText('What is the current release risk?')
       harness.completeConversation('conversation-response-1')
-      await page.clock.fastForward(2_000)
-      const feedback = conversation.getByRole('region', { name: 'Feedback for message 1' })
+      await page.clock.fastForward(5_000)
+      const feedback = rail.getByLabel('Response feedback')
       await expect(feedback.getByRole('button', { name: 'Needs work' })).toBeVisible()
-      await feedback.getByRole('button', { name: 'Needs work' }).click()
-      await expect(feedback.getByRole('radio', { name: 'Did not answer' })).toBeVisible()
 
-      await conversation.getByRole('button', { name: 'Steer work' }).click()
-      // The steering compose is a portal Dialog (outside the Conversation
-      // section) — scope its controls to the dialog, not `conversation`.
-      const steeringDialog = page.getByRole('dialog')
-      await steeringDialog.getByLabel('Steering directive').fill('Prioritize validation before other unstarted work.')
-      await steeringDialog.getByLabel('Expected impact').fill('Validation runs before other unstarted work.')
-      await expect(steeringDialog.getByLabel('Steering directive')).toBeVisible()
+      await sendRailMessage(rail, 'Prioritize validation before other unstarted work.')
+      await expect(rail.getByRole('button', { name: 'Withdraw direction' })).toBeVisible()
 
       await assertNoOverflow(page, 'goal detail with steering', width)
     })

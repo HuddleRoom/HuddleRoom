@@ -1,45 +1,42 @@
 import { expect, test } from '@playwright/test'
-import { gotoDashboard, selectSeedProject } from './support/pages/app'
+import { gotoDashboard, openAskRail, selectSeedProject } from './support/pages/app'
 import { interceptOrchestration } from './support/orchestration-fixtures'
 
-// T7.1 — "Ask the orchestrator" rail e2e. Mocks the advisor endpoints (no
+// T7.1 — "Ask the orchestrator" rail e2e. Mocks the project chat endpoint (no
 // real LLM). The rail is persistent only at >=1280px (P0.1), so this uses
-// the project's default 1440x900 viewport.
-test('rail Ask tab: ask a question, get a cited answer, allowance decrements', async ({ page }) => {
-  const limit = 1000
-  let remaining = limit
-  const items: Array<{
-    id: string
-    question: string
-    answer: string | null
-    citations: Array<{ type: string; id: string; label: string; goal_id?: string }>
-    off_topic: boolean
-    status: string
-    created_at: string
-  }> = []
+// the project's default 1440x900 viewport. The conversation allowance was
+// retired, so there is no remaining-allowance readout to assert any more.
+test('rail Ask tab: ask a question and get a cited answer with working citation links', async ({ page }) => {
+  const items: Array<Record<string, unknown>> = []
 
   await interceptOrchestration(page)
 
-  await page.route('**/api/v1/projects/*/orchestration/conversation', async (route) => {
+  await page.route('**/api/v1/projects/*/orchestration/chat', async (route) => {
     const request = route.request()
     if (request.method() === 'GET') {
       await route.fulfill({
-        json: { items, allowance: { enabled: true, unlimited: false, limit, remaining } },
+        json: { items, total: items.length, omitted: 0, allowance: { enabled: false, unlimited: true }, goal_allowances: {}, steering: {} },
       })
       return
     }
     if (request.method() === 'POST') {
-      const body = request.postDataJSON() as { content: string }
-      remaining -= 1
+      const body = request.postDataJSON() as { content: string; client_request_id: string }
       const turn = {
         id: `turn-${items.length + 1}`,
-        question: body.content,
+        client_request_id: body.client_request_id,
+        content: body.content,
         answer: 'Two goals are active; the release goal is blocked on independent validation.',
         citations: [
           { type: 'goal', id: 'goal-1', label: 'Goal: Ship the release' },
           { type: 'decision', id: 'decision-request-verification', goal_id: 'goal-release', label: 'Decision: Request independent validation' },
         ],
-        off_topic: false,
+        source_references: [],
+        context_goal_id: null,
+        historical: false,
+        goal_turn: null,
+        actions: [],
+        receipts: [],
+        error: null,
         status: 'completed',
         created_at: '2026-09-18T08:00:00Z',
       }
@@ -53,20 +50,15 @@ test('rail Ask tab: ask a question, get a cited answer, allowance decrements', a
   await gotoDashboard(page)
   await selectSeedProject(page)
 
-  const rail = page.locator('.agent-activity-panel-container')
-  await expect(rail.getByRole('tab', { name: 'Ask' })).toBeVisible()
-  await rail.getByRole('tab', { name: 'Ask' }).click()
-
-  const composer = rail.getByRole('textbox', { name: 'Ask the orchestrator' })
+  const rail = await openAskRail(page)
+  const composer = rail.getByRole('textbox', { name: 'Message the orchestrator' })
   await expect(composer).toBeVisible()
-  await expect(rail.getByText('Allowance: 1000 remaining of 1000')).toBeVisible()
 
   await composer.fill('What is the state of my project?')
   await composer.press('Control+Enter')
 
   await expect(rail.getByText('Two goals are active; the release goal is blocked on independent validation.')).toBeVisible()
   await expect(rail.getByRole('link', { name: 'Goal: Ship the release' })).toHaveAttribute('href', '/dashboard/orchestration/goal-1')
-  await expect(rail.getByText('Allowance: 999 remaining of 1000')).toBeVisible()
 
   await rail.getByRole('link', { name: 'Decision: Request independent validation' }).click()
   await expect(page).toHaveURL('/dashboard/orchestration/goal-release#decision-decision-request-verification')

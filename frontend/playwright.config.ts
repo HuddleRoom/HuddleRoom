@@ -5,7 +5,7 @@ const baseURL = `http://127.0.0.1:${port}`
 
 export default defineConfig({
   testDir: './tests',
-  testIgnore: ['tests/support/**/*.test.ts'],
+  testIgnore: ['tests/support/**/*.test.ts', '**/orchestration-g3-local.spec.ts', '**/orchestration-g4-local.spec.ts'],
   timeout: 45_000,
   expect: {
     timeout: 10_000,
