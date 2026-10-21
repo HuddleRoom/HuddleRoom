@@ -852,32 +852,22 @@ async def test_launch_revalidation_failure_terminalizes_running_session(test_eng
         launch.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_unsupported_planning_runtime_writes_no_control_files(test_engine, tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-    async with session_factory() as db:
-        project = Project(name=f"Project-{uuid.uuid4()}", workspace_path=str(workspace), config={})
-        agent = Agent(
-            name=f"agent-{uuid.uuid4()}", role="reviewer", provider="openai", model="gpt-4o-mini",
-            adapter_type="cli", capabilities=[], config={"cli_runtime": "claude_code"},
-        )
-        db.add_all([project, agent])
-        await db.flush()
-        session = Session(agent_id=agent.id, project_id=project.id, adapter_type="cli", status="pending", metadata_={})
-        db.add(session)
-        await db.commit()
+def test_claude_planning_only_builds_plan_mode_command(tmp_path):
+    cmd = CliAdapter._build_command(
+        "claude_code", "task", {}, tmp_path, tmp_path / "task.md", planning_only=True,
+    )
+    assert cmd[:3] == ["claude", "--permission-mode", "plan"]
+    assert "--dangerously-skip-permissions" not in cmd
 
-        from huddleroom.services.session_service import SessionService
-        monkeypatch.setattr(SessionService, "runtime_execution_policy", AsyncMock(return_value=True))
-        with patch.object(CliAdapter, "_setup_sandbox") as setup:
-            await CliAdapter().run(session.id, db)
 
-        await db.refresh(session)
-        assert session.status == "failed"
-        assert session.error == "unsupported_planning_runtime: claude_code"
-        setup.assert_not_called()
+def test_claude_planning_only_with_existing_session_resumes_in_plan_mode(tmp_path):
+    cmd = CliAdapter._build_command(
+        "claude_code", "x", {}, tmp_path, tmp_path / "t.md",
+        existing_session_id="abcdef12-3456", planning_only=True,
+    )
+    assert cmd[cmd.index("--permission-mode") + 1] == "plan"
+    assert cmd[cmd.index("--resume") + 1] == "abcdef12-3456"
+    assert "--dangerously-skip-permissions" not in cmd
 
 
 @pytest.mark.asyncio

@@ -492,6 +492,7 @@ const AUTHORIZATION_REASON_LABELS: Record<string, string> = {
   external_write_not_granted: 'external writes are not granted',
   live_send_not_granted: 'live sends are not granted',
   workspace_mutation_exceeds_policy: 'the task asks for more workspace access than the goal allows',
+  execution_scope_required: 'only planning was authorized',
 }
 
 export const authorizationReasonLabel = (code: string): string =>

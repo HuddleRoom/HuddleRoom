@@ -213,12 +213,12 @@ class CliAdapter:
         cli_runtime: str, task_content: str, agent_config: dict, workspace: Path, task_path: Path,
         *, existing_session_id: str | None = None, model: str | None = None, planning_only: bool = False,
     ) -> list[str] | None:
-        if planning_only and cli_runtime != "codex":
-            raise RuntimeError(f"unsupported_planning_runtime: {cli_runtime}")
         effort = (agent_config or {}).get("reasoning_effort")
         effort = effort if isinstance(effort, str) and effort in (CLI_EFFORTS - {"max"} if cli_runtime == "codex" else CLI_EFFORTS) else None
         if cli_runtime == "claude_code":
-            cmd = ["claude", "--dangerously-skip-permissions", "--print", "--verbose"]
+            # ponytail: planning-only uses claude's read-only plan mode instead of skipping permissions.
+            perm = ["--permission-mode", "plan"] if planning_only else ["--dangerously-skip-permissions"]
+            cmd = ["claude", *perm, "--print", "--verbose"]
             if model:
                 cmd += ["--model", model]
             if effort:

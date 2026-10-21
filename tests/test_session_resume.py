@@ -803,22 +803,6 @@ async def test_codex_planning_resume_fallback_keeps_read_only_policy(test_engine
 
 
 @pytest.mark.asyncio
-async def test_planning_cli_rejects_unsupported_runtime_before_launch(test_engine, tmp_path, monkeypatch):
-    """Planning-only work cannot silently use an unrestricted CLI runtime."""
-    from huddleroom.services.session_service import SessionService
-
-    monkeypatch.setattr(
-        SessionService, "runtime_execution_policy", AsyncMock(return_value=True),
-    )
-    argvs, _kwargs, session, _started = await _run_scripted(
-        test_engine, tmp_path, "claude_code", [],
-    )
-
-    assert argvs == []
-    assert session.status == "failed"
-    assert session.error == "unsupported_planning_runtime: claude_code"
-
-
 @pytest.mark.asyncio
 async def test_onecli_resume_reuses_safe_child_environment(test_engine, tmp_path, monkeypatch):
     """Resuming cannot restore extras that bypass the selected OneCLI wrapper."""

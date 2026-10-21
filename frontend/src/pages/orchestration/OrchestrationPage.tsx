@@ -1730,11 +1730,17 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
           ) : null}
 
           {pausedReason && pausedOn?.required_decision ? (
-            <Callout variant="warning" className="mt-2">
-              {pausedOn.required_decision === 'start'
-                ? `Work is paused until you start again: ${pausedReason}.`
-                : `Work is paused: ${pausedReason}. Needed: ${requiredDecisionLabel(pausedOn.required_decision)}.`}
-            </Callout>
+            pausedOn.reason_code === 'execution_scope_required' ? (
+              <Callout variant="info" className="mt-2">
+                {`Plan only — implementation needs your go-ahead. Needed: ${requiredDecisionLabel(pausedOn.required_decision)}.`}
+              </Callout>
+            ) : (
+              <Callout variant="warning" className="mt-2">
+                {pausedOn.required_decision === 'start'
+                  ? `Work is paused until you start again: ${pausedReason}.`
+                  : `Work is paused: ${pausedReason}. Needed: ${requiredDecisionLabel(pausedOn.required_decision)}.`}
+              </Callout>
+            )
           ) : null}
 
         </div>
@@ -1798,7 +1804,7 @@ function GoalDetailView({ projectId, goalId }: { projectId: string; goalId: stri
               <Button
                 ref={startButton}
                 size="sm"
-                variant="secondary"
+                variant="primary"
                 className="min-h-11"
                 disabled={globalBusy}
                 onClick={() => {

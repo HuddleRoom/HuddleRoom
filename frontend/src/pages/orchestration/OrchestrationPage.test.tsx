@@ -919,6 +919,26 @@ describe('OrchestrationPage', () => {
       expect(html).not.toContain('Start work')
     })
 
+    it('shows an info note instead of a warning when only planning was authorized', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      state.detail = authorized({ reason_code: 'execution_scope_required', required_decision: 'upgrade_execution' })
+      const html = renderToStaticMarkup(<OrchestrationPage />)
+      expect(html).toContain('Plan only — implementation needs your go-ahead. Needed: ')
+      expect(html).not.toContain('Work is paused')
+    })
+
+    it('still shows the paused warning for a non-scope reason code', async () => {
+      state.activeProjectId = 'project-1'
+      state.goalId = 'goal-1'
+      const { OrchestrationPage } = await import('./OrchestrationPage')
+      state.detail = authorized({ reason_code: 'budget_exhausted', required_decision: 'increase_budget' })
+      const html = renderToStaticMarkup(<OrchestrationPage />)
+      expect(html).toContain('Work is paused')
+      expect(html).not.toContain('Plan only')
+    })
+
     it('shows no prompt when the run is allowed', async () => {
       state.activeProjectId = 'project-1'
       state.goalId = 'goal-1'
