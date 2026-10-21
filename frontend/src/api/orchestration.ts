@@ -445,6 +445,13 @@ export function answerOrchestrationDecision(
   )
 }
 
+export function retryAnswerApplication(projectId: string, goalId: string, actionId: string) {
+  return apiFetch<OrchestrationAnswerReceipt>(
+    `${root(projectId)}/${goalId}/answer-applications/${actionId}/retry`,
+    { method: 'POST' },
+  )
+}
+
 export function answerAgentDefinitionReviewBatch(
   projectId: string,
   goalId: string,
@@ -867,6 +874,14 @@ export function useAuthorizeOrchestrationBaseline(projectId: string | null) {
   return useMutation({
     mutationFn: ({ goalId }: { goalId: string }) => authorizeOrchestrationBaseline(projectId!, goalId),
     onMutate: ({ goalId }) => { void invalidateGoalAndBaseline(queryClient, projectId, goalId) },
+    onSettled: (_data, _error, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
+  })
+}
+
+export function useRetryAnswerApplication(projectId: string | null) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ goalId, actionId }: { goalId: string; actionId: string }) => retryAnswerApplication(projectId!, goalId, actionId),
     onSettled: (_data, _error, { goalId }) => invalidateGoalAndBaseline(queryClient, projectId, goalId),
   })
 }

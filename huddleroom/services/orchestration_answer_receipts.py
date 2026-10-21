@@ -341,23 +341,26 @@ def acceptance_owns(db, request_owns_transaction=False):
                             and root.origin == SessionTransactionOrigin.AUTOBEGIN)
 
 
-async def retry_answer_application(db, application_id):
+async def retry_answer_application(db, application_id, *, goal_id=None, request_owns_transaction=False):
     """Explicitly requeue one failed saved obligation after its native guards pass."""
-    owns = acceptance_owns(db)
+    owns = acceptance_owns(db, request_owns_transaction)
     try:
-        return await _retry_answer_application(db, application_id, owns=owns)
+        return await _retry_answer_application(db, application_id, owns=owns, goal_id=goal_id)
     except BaseException:
         if owns:
             await db.rollback()
         raise
 
 
-async def _retry_answer_application(db, application_id, *, owns):
+async def _retry_answer_application(db, application_id, *, owns, goal_id=None):
     from huddleroom.services.orchestration_baseline_runtime import (
         require_baseline_available, require_control_admission, BaselinePaused,
     )
     action = await db.get(OrchestrationAction, application_id)
     if action is None or action.action_type != "apply_authority_answer":
+        raise HTTPException(404, "Answer application not found")
+    run0 = await db.get(OrchestrationRun, action.run_id)
+    if run0 is None or (goal_id is not None and run0.goal_id != goal_id):
         raise HTTPException(404, "Answer application not found")
     await acquire_control_writer(db, action.run_id)
     await db.refresh(action)
@@ -367,30 +370,46 @@ async def _retry_answer_application(db, application_id, *, owns):
         await require_control_admission(db, run.id)
     except BaselinePaused:
         raise HTTPException(409, "Orchestration admission paused") from None
+    if action.status != "failed":  # completed/reserved/other: nothing to requeue
+        response = receipt(action)
+        if owns:
+            await db.commit()
+        return response
     source_id = action.request["submission"].get("source_process_run_id")
     if source_id:
         source = await db.get(OrchestrationProcessRun, uuid.UUID(source_id), populate_existing=True)
         effects = (action.dispatch_contract or {}).get("effects", {})
         completed = f"complete_process:{source_id}" in effects
         successor = effects.get(f"source_successor:{source.process_type}") if source else None
-        linked_successor = await db.get(OrchestrationProcessRun, uuid.UUID(successor["target_id"])) if successor else None
+        try:
+            linked_successor = await db.get(OrchestrationProcessRun, uuid.UUID(successor["target_id"])) if successor else None
+        except (ValueError, TypeError, KeyError):
+            linked_successor = None  # malformed effect: no proven successor
         if (source is None or source.run_id != run.id or source.goal_id != run.goal_id
                 or (source.superseded_by_id is not None and not completed
                     and (linked_successor is None or linked_successor.run_id != run.id
                          or linked_successor.goal_id != run.goal_id
                          or source.superseded_by_id != linked_successor.id))):
             raise HTTPException(409, "Answer source process changed")
-        if completed:
+        # A still-waiting/running source is never marked applied here; the drain re-judges it.
+        # A terminal source alone is not proof the answer's effects ran; the drain re-runs advance_process.
+        applied = (completed
+                   or (source.superseded_by_id is not None and linked_successor is not None
+                       and source.superseded_by_id == linked_successor.id))
+        if applied:
             action.status = "completed"
             action.dispatch_contract = {**(action.dispatch_contract or {}), "application_state": "applied", "reason": None}
+            action.error = None
             from datetime import datetime, timezone
             for decision_id in action.request["submission"]["decision_ids"]:
                 decision = await db.get(OrchestrationAuthorityDecision, uuid.UUID(decision_id))
-                decision.continuation_applied_at = decision.continuation_applied_at or datetime.now(timezone.utc)
+                if decision is not None:
+                    decision.continuation_applied_at = decision.continuation_applied_at or datetime.now(timezone.utc)
     if action.status == "failed":
         action.status = "reserved"
         action.dispatch_contract = {**(action.dispatch_contract or {}), "application_state": "pending", "reason": None}
-        await db.flush()
+        action.error = None
+    await db.flush()
     response = receipt(action)
     if owns:
         await db.commit()
@@ -549,7 +568,6 @@ async def drain_answer_applications(db, run_id):
         except Exception as exc:
             if not owns:
                 raise  # An external caller alone decides the outcome of its transaction.
-            await db.rollback()
             from huddleroom.services.orchestration_llm_decision_adapter import _safe_completion_error
             if isinstance(exc, HTTPException):
                 reason = str(exc.detail)[:1000]
@@ -559,15 +577,28 @@ async def drain_answer_applications(db, run_id):
             else:
                 reason = _safe_completion_error(exc)
                 retryable = isinstance(exc, OperationalError) and any(s in str(exc).lower() for s in ("locked", "busy"))  # e.g. "database is locked": retry on next drain
-            await acquire_control_writer(db, run_id)
-            action = await db.get(OrchestrationAction, action_id, populate_existing=True)
-            if action.status != "completed":
-                action.dispatch_contract = {**(action.dispatch_contract or {}),
-                    "application_state": "pending" if retryable else "failed", "reason": reason}
-                action.status = "reserved" if retryable else "failed"
-                if not retryable:
-                    action.error = reason
-            await db.commit()
+            try:
+                await db.rollback()
+                await acquire_control_writer(db, run_id)
+                action = await db.get(OrchestrationAction, action_id, populate_existing=True)
+                if action is not None and action.status != "completed":
+                    action.dispatch_contract = {**(action.dispatch_contract or {}),
+                        "application_state": "pending" if retryable else "failed", "reason": reason}
+                    action.status = "reserved" if retryable else "failed"
+                    if not retryable:
+                        action.error = reason
+                await db.commit()
+            except Exception:
+                # ponytail: an unrecorded non-retryable failure stays reserved and is re-attempted next drain
+                # (bounded per tick); upgrade path: record failures in a separate bookkeeping session.
+                logger.exception("Could not record answer application failure for action %s", action_id)
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.exception("Rollback failed after answer application bookkeeping error")
+                result.pending.append(action_id)
+                result.reasons[str(action_id)] = reason
+                continue
             (result.pending if retryable else result.failed).append(action_id)
             result.reasons[str(action_id)] = reason
         if owns:

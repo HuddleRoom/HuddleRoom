@@ -1368,3 +1368,271 @@ async def test_spr231_exact_accept_rejects_invalid_cardinality_before_callbacks_
             assert await fresh.scalar(select(func.count()).select_from(EventLog).where(
                 EventLog.dedup_key == f"authority.decision_resolved:{decision_id}")) == 0
         assert await fresh.scalar(select(func.count()).select_from(OrchestrationAction)) == 0
+
+
+async def _failed_not_advanced(sessions, tmp_path, monkeypatch):
+    """Saved answer whose drain failed with source_process_did_not_advance (source still waiting)."""
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+    calls = []
+
+    async def stalled(*_args, **_kwargs):
+        calls.append(1)
+        return {"status": "waiting_decision"}
+
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", stalled)
+    async with sessions() as submitting:
+        accepted = await application.answer_decision(
+            submitting, project.id, goal.id, decision.id,
+            OrchestrationDecisionAnswerRequest(selected_option="approve", reason="Reconcile later"), user)
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    return project, user, goal, run, source, decision, accepted.answer_receipt.action_id, calls
+
+
+async def _retry(sessions, action_id, **kwargs):
+    async with sessions() as db:
+        receipt = await application.retry_answer_application(db, action_id, **kwargs)
+        await db.commit()
+        return receipt
+
+
+async def test_retry_requeues_then_drain_reconciles_source_that_later_completed(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    project, user, goal, run, source, decision, action_id, calls = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    async with sessions() as db:
+        (await db.get(OrchestrationProcessRun, source.id)).status = "completed"
+        await db.commit()
+    receipt = await _retry(sessions, action_id, goal_id=goal.id)
+    assert receipt.application_state == "pending"
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, action_id)).status == "reserved"
+    async with sessions() as consumer:
+        drained = await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert drained.applied == [action_id] and len(calls) == 2
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, action_id)
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+        assert action.status == "completed" and action.dispatch_contract["application_state"] == "applied"
+        assert action.dispatch_contract["reason"] is None and action.error is None
+        assert saved.continuation_applied_at is not None
+
+
+async def test_retry_requeues_skipped_source_instead_of_applying(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    project, user, goal, run, source, decision, action_id, _ = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    async with sessions() as db:
+        (await db.get(OrchestrationProcessRun, source.id)).status = "skipped"
+        await db.commit()
+    receipt = await _retry(sessions, action_id, goal_id=goal.id)
+    assert receipt.application_state == "pending"
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, action_id)).status == "reserved"
+        assert (await fresh.get(OrchestrationAuthorityDecision, decision.id)).continuation_applied_at is None
+
+
+async def test_retry_rejects_non_answer_action(sessions, tmp_path, monkeypatch):
+    project, user, goal, run, source, decision, action_id, _ = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    async with sessions() as db:
+        other = OrchestrationAction(run_id=run.id, idempotency_key=f"other-{uuid.uuid4()}",
+                                    action_type="something_else", request={}, status="failed")
+        db.add(other)
+        await db.flush()
+        other_id = other.id
+        await db.commit()
+    with pytest.raises(HTTPException) as error:
+        await _retry(sessions, other_id, goal_id=goal.id)
+    assert error.value.status_code == 404
+
+
+async def test_retry_keeps_guard_for_source_that_has_not_advanced(sessions, tmp_path, monkeypatch):
+    project, user, goal, run, source, decision, action_id, calls = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    receipt = await _retry(sessions, action_id, goal_id=goal.id)
+    assert receipt.application_state == "pending"
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, action_id)
+        assert action.status == "reserved" and action.error is None
+    async with sessions() as consumer:
+        drained = await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert drained.failed == [action_id] and len(calls) == 2
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, action_id)
+        saved = await fresh.get(OrchestrationAuthorityDecision, decision.id)
+        assert action.status == "failed" and action.error == "source_process_did_not_advance"
+        assert saved.continuation_applied_at is None
+
+
+async def test_retry_is_idempotent_on_completed_answer(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    project, user, goal, run, source, decision, action_id, _ = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    async with sessions() as db:
+        (await db.get(OrchestrationProcessRun, source.id)).status = "completed"
+        await db.commit()
+    await _retry(sessions, action_id)
+    async with sessions() as consumer:
+        await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    again = await _retry(sessions, action_id, goal_id=goal.id)
+    assert again.application_state == "applied"
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, action_id)).status == "completed"
+
+
+async def test_retry_applies_proven_linked_successor(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+    project, user, goal, run, source, decision, action_id, _ = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    async with sessions() as db:
+        successor = await OrchestrationProcessService().start_process(
+            db, goal.id, process_type=source.process_type, trigger_reason="revision",
+            run_id=run.id, supersede_waiting=True)
+        action = await db.get(OrchestrationAction, action_id)
+        action.dispatch_contract = {**action.dispatch_contract, "effects": {
+            **action.dispatch_contract.get("effects", {}),
+            f"source_successor:{source.process_type}": {"target_type": "process", "target_id": str(successor.id)}}}
+        assert (await db.get(OrchestrationProcessRun, source.id)).superseded_by_id == successor.id
+        await db.commit()
+    receipt = await _retry(sessions, action_id, goal_id=goal.id)
+    assert receipt.application_state == "applied"
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, action_id)).status == "completed"
+
+
+async def test_retry_rejects_other_goal(sessions, tmp_path, monkeypatch):
+    project, user, goal, run, source, decision, action_id, _ = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    with pytest.raises(HTTPException) as error:
+        await _retry(sessions, action_id, goal_id=uuid.uuid4())
+    assert error.value.status_code == 404
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, action_id)).status == "failed"
+
+
+async def _retry_client(sessions, user):
+    from httpx import ASGITransport, AsyncClient
+    from huddleroom.main import create_app
+    from huddleroom.database import get_db
+    from huddleroom.dependencies import get_current_user
+    app = create_app()
+
+    async def request_db():
+        async with sessions() as db:  # no commit here: the endpoint itself must commit
+            yield db
+
+    app.dependency_overrides[get_db] = request_db
+    if user is not None:
+        async def actor():
+            return user
+        app.dependency_overrides[get_current_user] = actor
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+async def test_retry_endpoint_commits_and_guards(sessions, tmp_path, monkeypatch):
+    from huddleroom.models.orchestration_process import OrchestrationProcessRun
+    project, user, goal, run, source, decision, action_id, _ = await _failed_not_advanced(
+        sessions, tmp_path, monkeypatch)
+    base = f"/api/v1/projects/{project.id}/orchestration/goals"
+    url = f"{base}/{goal.id}/answer-applications/{action_id}/retry"
+    from huddleroom.config import settings
+    with monkeypatch.context() as auth:
+        auth.setattr(settings, "auth_enabled", True)
+        async with await _retry_client(sessions, None) as anonymous:
+            assert (await anonymous.post(url)).status_code == 401
+    async with sessions() as fresh:
+        assert (await fresh.get(OrchestrationAction, action_id)).status == "failed"
+    async with await _retry_client(sessions, user) as client:
+        other = await client.post(f"{base}/{uuid.uuid4()}/answer-applications/{action_id}/retry")
+        assert other.status_code == 404
+        async with sessions() as db:
+            run_row = await db.get(OrchestrationRun, run.id)
+            run_row.pause_requested = True
+            await db.commit()
+        paused = await client.post(url)
+        assert paused.status_code == 409
+        async with sessions() as db:
+            run_row = await db.get(OrchestrationRun, run.id)
+            run_row.pause_requested = False
+            (await db.get(OrchestrationProcessRun, source.id)).status = "completed"
+            await db.commit()
+        ok = await client.post(url)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["application_state"] == "pending"
+    async with sessions() as fresh:
+        action = await fresh.get(OrchestrationAction, action_id)
+        assert action.status == "reserved" and action.dispatch_contract["application_state"] == "pending"
+
+
+async def _two_reserved_failing(sessions, tmp_path, monkeypatch):
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    project, user, goal, run, source, decision = await _spr231_committed_ordinary(sessions, tmp_path)
+    async with sessions() as db:
+        actions = [OrchestrationAction(
+            run_id=run.id, idempotency_key=f"answer-{uuid.uuid4()}", action_type="apply_authority_answer",
+            request={"submission": {"decision_ids": [], "source_process_run_id": str(source.id)}},
+            status="reserved", dispatch_contract={"application_state": "pending"}) for _ in range(2)]
+        db.add_all(actions)
+        await db.flush()
+        ids = {a.id for a in actions}
+        await db.commit()
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", boom)
+    return run, ids
+
+
+async def test_drain_survives_failure_while_recording_failure(sessions, tmp_path, monkeypatch):
+    from huddleroom.services import orchestration_answer_receipts as receipts
+    run, ids = await _two_reserved_failing(sessions, tmp_path, monkeypatch)
+    real_acquire, raised = receipts.acquire_control_writer, []
+    from huddleroom.services.orchestration_debug_service import OrchestrationDebugService
+    state = {"failed_apply": False}
+
+    async def boom(*_args, **_kwargs):
+        state["failed_apply"] = True
+        raise RuntimeError("model exploded")
+
+    async def acquire_once(db, run_id):
+        if state["failed_apply"] and not raised:
+            raised.append(1)
+            raise RuntimeError("bookkeeping exploded")
+        return await real_acquire(db, run_id)
+
+    monkeypatch.setattr(OrchestrationDebugService, "advance_process", boom)
+    monkeypatch.setattr(receipts, "acquire_control_writer", acquire_once)
+    async with sessions() as consumer:
+        result = await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert raised == [1]
+    assert len(result.pending) == 1 and len(result.failed) == 1
+    assert set(result.pending + result.failed) == ids and set(result.reasons) == {str(i) for i in ids}
+
+
+async def test_drain_survives_rollback_failure_in_handler(sessions, tmp_path, monkeypatch):
+    run, ids = await _two_reserved_failing(sessions, tmp_path, monkeypatch)
+    from sqlalchemy.ext.asyncio import AsyncSession
+    real_rollback, raised = AsyncSession.rollback, []
+
+    async def flaky_rollback(self):
+        if not raised:
+            raised.append(1)
+            raise RuntimeError("rollback exploded")
+        return await real_rollback(self)
+
+    monkeypatch.setattr(AsyncSession, "rollback", flaky_rollback)
+    async with sessions() as consumer:
+        result = await application.drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    assert raised == [1]
+    assert len(result.pending) == 1 and len(result.failed) == 1
+    assert set(result.pending + result.failed) == ids and set(result.reasons) == {str(i) for i in ids}

@@ -30,6 +30,7 @@ const api = vi.hoisted(() => ({
   run: { isPending: false, mutate: vi.fn() },
   rerun: { isPending: false, mutate: vi.fn() },
   retry: { isPending: false, mutate: vi.fn() },
+  retryApplication: { isPending: false, mutate: vi.fn() },
   authorize: { isPending: false, mutate: vi.fn() },
   debugStep: { isPending: false, mutate: vi.fn() },
   debugRerun: { isPending: false, mutate: vi.fn() },
@@ -65,6 +66,7 @@ vi.mock('@/api/orchestration', async (importOriginal) => ({
   useRunOrchestrationBaselineStep: () => api.run,
   useRerunOrchestrationBaselineStep: () => api.rerun,
   useRetryOrchestrationBaselineStep: () => api.retry,
+  useRetryAnswerApplication: () => api.retryApplication,
   useAuthorizeOrchestrationBaseline: () => api.authorize,
   // Retained while the D3 component replaces the debug-only controls.
   useStepOrchestrationBaseline: () => api.debugStep,
@@ -4054,6 +4056,20 @@ it('m2 workflow present: another answer pending on the server leaves local recei
     await act(async () => { getButton(view.container, 'Accept: approve').click(); await Promise.resolve() })
     const saved = descendants(view.container).find((n) => n.getAttribute('aria-label') === 'Saved answers')!
     expect(textOf(saved)).toBe('Saved.')
+  } finally { view.cleanup() }
+})
+
+it.each(['pending', 'applied', 'failed', 'blocked'] as const)('shows Retry application only for failed/blocked workflow application (%s)', async (state) => {
+  const statusLine = { workflow: { phase_label: 'Baseline', operation_summary: 'Op', guidance: { kind: 'none', label: '', reason: null, decision_id: null }, additional_pending_count: 0, additional_application_count: 0,
+    application: { action_id: 'act-1', decision_ids: ['d'], state, reason: null } } } as unknown as ComponentProps<typeof BaselineDashboard>['statusLine']
+  const view = await mountDashboard({ statusLine })
+  try {
+    const buttons = descendants(view.container).filter((n) => textOf(n) === 'Retry application')
+    if (state === 'failed' || state === 'blocked') {
+      expect(buttons.length).toBe(1)
+      await act(async () => { getButton(view.container, 'Retry application').click(); await Promise.resolve() })
+      expect(api.retryApplication.mutate).toHaveBeenCalledWith({ goalId: goal().id, actionId: 'act-1' }, expect.anything())
+    } else expect(buttons.length).toBe(0)
   } finally { view.cleanup() }
 })
 

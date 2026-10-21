@@ -290,6 +290,14 @@ describe('orchestration API', () => {
     }])
   })
 
+  it('POSTs the answer-application retry route', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okJson({}))
+    vi.stubGlobal('fetch', fetchMock)
+    await orchestrationApi.retryAnswerApplication('project-1', 'goal-1', 'action-1')
+    expect(fetchMock.mock.calls[0][0]).toContain('/projects/project-1/orchestration/goals/goal-1/answer-applications/action-1/retry')
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST')
+  })
+
   it('keeps ordinary reason JavaScript trimming unchanged', async () => {
     const fetchMock = vi.fn().mockResolvedValue(okJson({}))
     vi.stubGlobal('fetch', fetchMock)

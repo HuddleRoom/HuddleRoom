@@ -11,6 +11,7 @@ import {
   useAnswerAgentDefinitionReviewBatch,
   useAnswerOrchestrationDecision,
   useAuthorizeOrchestrationBaseline,
+  useRetryAnswerApplication,
   useBaselineDashboard,
   useOrchestrationHealth,
   useResolveOrchestrationWarning,
@@ -633,6 +634,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, statusLine, ga
   const rerun = useRerunOrchestrationBaselineStep(projectId)
   const retry = useRetryOrchestrationBaselineStep(projectId)
   const authorize = useAuthorizeOrchestrationBaseline(projectId)
+  const retryApplication = useRetryAnswerApplication(projectId)
   const dashboard = useBaselineDashboard(projectId, goalId, runStep.isPending || rerun.isPending || retry.isPending || authorize.isPending)
   const localGeneration = useRef(0)
   const generation = () => getMutationGeneration?.() ?? localGeneration.current
@@ -1392,6 +1394,11 @@ export function BaselineDashboard({ projectId, goalId, goal, run, statusLine, ga
     })
   }
 
+  const retryApplicationButton = (actionId: string | null | undefined, state: string) => actionId && (state === 'failed' || state === 'blocked')
+    ? <Button type="button" variant="secondary" className="ml-2 min-h-11" disabled={retryApplication.isPending}
+      onClick={() => retryApplication.mutate({ goalId, actionId }, { onSuccess: (receipt) => onMessage(`Application ${receipt.application_state}${receipt.reason ? `: ${receipt.reason}` : '.'}`), onError: (error) => onMessage(actionError(error)) })}>Retry application</Button>
+    : null
+
   return <div data-testid="baseline-dashboard" className="flex min-w-0 flex-col gap-4">
     <TeamHierarchyStatus decisions={decisions} reviews={dashboard.agentReviews.data ?? []} process={processes.find((process) => process.process_type === 'team_hierarchy' && !process.superseded_by_id)} />
     <ProcessChain processes={processes} processState={processState} selectedProcessType={effectiveProcessType} onSelect={setSelectedProcessType} goal={goal} checkpointItems={checkpointItems} run={run} statusLine={statusLine} onAuthorize={authorizeBaseline} chainPending={mutationBusy || runStep.isPending || rerun.isPending || retry.isPending} authorizePending={authorize.isPending} authorizeError={authorizeError} />
@@ -1399,6 +1406,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, statusLine, ga
       {savedAnswers.length > 0 && <section aria-label="Saved answers" className="mb-3 space-y-2">{savedAnswers.map((receipt) => <p key={receipt.action_id ?? receipt.decision_ids.join(':')} className="break-words rounded border border-huddleroom-border p-3 text-sm">
         <strong>Saved.</strong> {statusLine?.workflow ? (!statusLine.workflow.application && receipt.application_state === 'applied' ? 'Application complete.' : null) : receipt.application_state === 'pending' ? 'Application pending.'
           : receipt.application_state === 'failed' || receipt.application_state === 'blocked' ? `Application ${receipt.application_state}${receipt.reason ? `: ${receipt.reason}` : '.'}` : 'Application complete.'}
+        {!statusLine?.workflow && retryApplicationButton(receipt.action_id, receipt.application_state)}
       </p>)}</section>}
       {checkingAnswer && <div className="mb-3 rounded border border-huddleroom-border p-3 text-sm">
         <p>Checking saved answer… Your frozen draft is retained.</p>
@@ -1406,7 +1414,7 @@ export function BaselineDashboard({ projectId, goalId, goal, run, statusLine, ga
       </div>}
       {statusLine?.workflow && <p className="mb-2 min-w-0 break-words text-sm text-huddleroom-text-secondary">
         {statusLine.workflow.phase_label} · {statusLine.workflow.operation_summary}
-        {workflowApplicationText(statusLine.workflow) && <> · {workflowApplicationText(statusLine.workflow)}</>}
+        {workflowApplicationText(statusLine.workflow) && <> · {workflowApplicationText(statusLine.workflow)}{retryApplicationButton(statusLine.workflow.application?.action_id, statusLine.workflow.application?.state ?? '')}</>}
         {statusLine.workflow.guidance.kind !== 'none' && <> · Next: {workflowGuidanceText(statusLine.workflow)}</>}
       </p>}
       <NeedsYouQueue

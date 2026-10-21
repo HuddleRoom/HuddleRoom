@@ -406,6 +406,18 @@ async def test_g5_unapplied_answer_needing_baseline_authorization_points_to_auth
     assert (guidance["kind"], guidance["label"]) == ("authorize_baseline", "Authorize remaining baseline")
 
 
+async def test_g5_completed_answer_is_not_listed_as_unapplied(db_session, test_project):
+    from huddleroom.services.orchestration_status_presenter import _unapplied_answers
+    goal, run = await _run(db_session, test_project)
+    answered = _g5_decision(goal, run, "saved", status="answered", selected_option="yes")
+    db_session.add(answered); await db_session.flush()
+    done = _g5_answer(run, [answered], status="completed", application_state="applied", reason=None)
+    pending = _g5_answer(run, [answered], application_state="pending", reason=None)
+    db_session.add_all([done, pending]); await db_session.flush()
+    assert _unapplied_answers([done]) == []
+    assert len(_unapplied_answers([done, pending])) == 1
+
+
 async def test_g5_stale_plan_review_decision_is_not_selected(db_session, test_project):
     import json
     goal, run = await _run(db_session, test_project)

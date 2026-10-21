@@ -9,6 +9,7 @@ from huddleroom.dependencies import get_current_user
 from huddleroom.models.orchestration_process import OrchestrationAuthorityDecision
 from huddleroom.models.user import User
 from huddleroom.schemas.orchestration import (
+    AnswerReceipt,
     OrchestrationAgentDefinitionReviewBatchAnswerRequest,
     OrchestrationAgentDefinitionReviewBatchAnswerResponse,
     OrchestrationAuthorityDecisionResponse,
@@ -133,6 +134,15 @@ async def cancel_decision(
         return await _present_one(db, await decision_service.cancel_decision(db, decision, reason=data.reason))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/goals/{goal_id}/answer-applications/{action_id}/retry", response_model=AnswerReceipt)
+async def retry_answer_application(project_id: uuid.UUID, goal_id: uuid.UUID, action_id: uuid.UUID,
+                                   _: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    await _goal_or_404(db, project_id, goal_id)
+    # Requeue only; the next tick drains (same as answer submission).
+    return await decision_application.retry_answer_application(
+        db, action_id, goal_id=goal_id, request_owns_transaction=True)
 
 
 @router.get("/goals/{goal_id}/decisions/{decision_id}", response_model=OrchestrationDecisionAnswerResponse)
