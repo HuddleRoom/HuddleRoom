@@ -721,13 +721,21 @@ class AgentDefinitionReviewProcess:
             return {**self._summary(current.status), "retryable": True,
                     "error": current.outputs["_lm_retry"].get("error")}
 
-        _assignments, targets, fingerprint = await self._review_inputs(db, goal, run)
+        assignments, targets, fingerprint = await self._review_inputs(db, goal, run)
         if current is not None:
             capture_input_fingerprint(
                 current, fingerprint, PROCESS_VERSION,
                 allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
             )
-        coverage_fingerprint = self._coverage_fingerprint(goal, targets)
+        # Coverage a completed row is judged against: its own covered ids
+        # (empty when absent, as in the readiness gate), not the current targets.
+        accepted_coverage = None
+        if current is not None and current.status == "completed":
+            accepted_ids = (current.outputs or {}).get("target_ids")
+            accepted_coverage = await self._coverage_fingerprint_for(
+                db, goal, assignments,
+                {str(x) for x in accepted_ids} if isinstance(accepted_ids, list) else set(),
+            )
         proposal_decisions = await self._proposal_decisions(db, goal.id)
         stored_fingerprint = (
             effective_input_fingerprint(current)
@@ -739,7 +747,7 @@ class AgentDefinitionReviewProcess:
             and current.status == "waiting_decision"
             and stored_fingerprint != fingerprint
             and stored_fingerprint == self._fingerprint(
-                goal, _assignments, self._targets_before_answers(targets, current, proposal_decisions)
+                goal, assignments, self._targets_before_answers(targets, current, proposal_decisions)
             )
         ):
             # The only drift is this process's own approved text, applied
@@ -793,10 +801,15 @@ class AgentDefinitionReviewProcess:
                     return self._summary("waiting_decision")
             if current.status == "waiting_decision":
                 await self.process_service.resume_process(db, current)
-            _assignments, refreshed_targets, refreshed_fingerprint = await self._review_inputs(
+            assignments, refreshed_targets, refreshed_fingerprint = await self._review_inputs(
                 db, goal, run
             )
-            refreshed_coverage = self._coverage_fingerprint(goal, refreshed_targets)
+            refreshed_ids = (current.outputs or {}).get("target_ids")
+            if not isinstance(refreshed_ids, list):
+                refreshed_ids = [str(agent.id) for agent, _, _ in refreshed_targets]
+            refreshed_coverage = await self._coverage_fingerprint_for(
+                db, goal, assignments, {str(x) for x in refreshed_ids}
+            )
             current.outputs = {
                 **(current.outputs or {}),
                 "fingerprint": refreshed_fingerprint,
@@ -811,20 +824,28 @@ class AgentDefinitionReviewProcess:
             and (current.outputs or {}).get("deterministic_policy") != DETERMINISTIC_POLICY
         ):
             await self._refresh_deterministic_eligibility(db, goal, run, current, proposal_decisions)
-        legacy_missing_coverage_fingerprint = (
+        stored_cov = current.outputs.get("coverage_fingerprint") if current is not None else None
+        legacy_coverage_restamp = (
             current is not None
             and current.status == "completed"
             and current.process_version == PROCESS_VERSION
-            and current.outputs.get("fingerprint") == fingerprint
-            and current.outputs.get("coverage_fingerprint") is None
+            and stored_cov != accepted_coverage
+            and (
+                (stored_cov is None and current.outputs.get("fingerprint") == fingerprint)
+                # Equality proves the full reviewed targets are unchanged; the
+                # fingerprint check on the fast path still decides freshness.
+                or stored_cov == self._coverage_fingerprint(goal, targets)
+            )
         )
-        if legacy_missing_coverage_fingerprint:
-            # Pre-coverage-fingerprint legacy row backfilling a field that
-            # didn't exist yet: silently re-stamp, no warning/rerun. Falls
-            # through to the normal fast path below, which will now match.
+        if legacy_coverage_restamp:
+            # Legacy row with no coverage fingerprint yet (backfill), or one
+            # stored with the old full-target formula that the current state
+            # still matches exactly: silently re-stamp, no warning/rerun.
+            # Anything else stays stale. Falls through to the normal fast
+            # path below, which will now match.
             current.outputs = {
                 **(current.outputs or {}),
-                "coverage_fingerprint": coverage_fingerprint,
+                "coverage_fingerprint": accepted_coverage,
             }
             await db.flush()
         elif (
@@ -836,12 +857,17 @@ class AgentDefinitionReviewProcess:
             # deploy. Recompute what the OLD formula (full SNAPSHOT_FIELDS)
             # would have produced against CURRENT state -- only if that
             # matches what's stored is this a pure formula change.
-            old_formula_fingerprint = self._fingerprint(goal, _assignments, targets, fields=SNAPSHOT_FIELDS)
+            old_formula_fingerprint = self._fingerprint(goal, assignments, targets, fields=SNAPSHOT_FIELDS)
             old_formula_coverage = self._coverage_fingerprint(goal, targets, fields=SNAPSHOT_FIELDS)
+            stored_ids = (current.outputs or {}).get("target_ids")
+            if not isinstance(stored_ids, list):
+                stored_ids = []
+            old_canonical_coverage = await self._coverage_fingerprint_for(
+                db, goal, assignments, {str(x) for x in stored_ids}, fields=SNAPSHOT_FIELDS
+            )
             stored_fp = current.outputs.get("fingerprint")
-            stored_cov = current.outputs.get("coverage_fingerprint")
             pure_version_bump = stored_fp == old_formula_fingerprint and (
-                stored_cov is None or stored_cov == old_formula_coverage
+                stored_cov is None or stored_cov in (old_formula_coverage, old_canonical_coverage)
             )
             current.process_version = PROCESS_VERSION
             current.outputs = {
@@ -853,7 +879,7 @@ class AgentDefinitionReviewProcess:
                 current.outputs = {
                     **(current.outputs or {}),
                     "fingerprint": fingerprint,
-                    "coverage_fingerprint": coverage_fingerprint,
+                    "coverage_fingerprint": accepted_coverage,
                 }
             # else: genuine drift co-occurring with the version bump -- the
             # version is bumped now so it isn't rechecked every tick, but the
@@ -866,7 +892,7 @@ class AgentDefinitionReviewProcess:
             and current.status == "completed"
             and current.process_version == PROCESS_VERSION
             and current.outputs.get("fingerprint") == fingerprint
-            and current.outputs.get("coverage_fingerprint") == coverage_fingerprint
+            and current.outputs.get("coverage_fingerprint") == accepted_coverage
         ):
             return self._summary("completed")
 
@@ -919,8 +945,8 @@ class AgentDefinitionReviewProcess:
             # (manual) rerun restarts the review. Execution-time task assignments move _fingerprint (task ids) but
             # not coverage_fingerprint; re-stamp the fingerprint silently.
             if (
-                coverage_fingerprint is not None
-                and current.outputs.get("coverage_fingerprint") == coverage_fingerprint
+                accepted_coverage is not None
+                and current.outputs.get("coverage_fingerprint") == accepted_coverage
             ):
                 set_effective_input_fingerprint(current, fingerprint, PROCESS_VERSION, "covered_workload")
                 current.outputs = {**(current.outputs or {}), "fingerprint": fingerprint}
@@ -966,7 +992,10 @@ class AgentDefinitionReviewProcess:
 
         loads = await self.roster_mapper.loads_by_agent(db, goal.project_id) if targets else {}
         current.outputs = {**(current.outputs or {}), "fingerprint": fingerprint}
-        checkpoint = self._retry_checkpoint(current, goal, targets, loads, coverage_fingerprint)
+        review_coverage = await self._coverage_fingerprint_for(
+            db, goal, assignments, {str(agent.id) for agent, _, _ in targets}
+        )
+        checkpoint = self._retry_checkpoint(current, goal, targets, loads, review_coverage)
         result = await self._run_retry_checkpoint(db, goal, run, current, checkpoint)
         if result is not None:
             return result
@@ -1473,37 +1502,48 @@ class AgentDefinitionReviewProcess:
         """Return material review coverage, excluding assignment identity and count."""
         assignments, targets, _fingerprint = await self._review_inputs(db, goal, run)
         if covered_target_ids is None:
-            coverage_targets = targets
-        else:
-            baseline_assignments = [
-                assignment
-                for assignment in assignments
-                if not self._assignment_action_id(assignment[0])
-            ]
-            coverage_targets = await self._targets(db, goal, baseline_assignments)
-            # Plan/delegation-action assignments must never contribute a work
-            # function to coverage (only baseline assignments may). But an agent
-            # that was reviewed and covered, and now only appears via an
-            # action-tagged assignment (its baseline assignment was replaced),
-            # must stay represented in coverage_targets -- otherwise it drops out
-            # of the payload and trips a false readiness 409. Strip the
-            # work_function on action-tagged assignments instead of excluding
-            # them, so the agent's presence/definition_snapshot survive the merge
-            # without importing the action's work_function.
-            sanitized_assignments = [
-                (task, agent, "" if self._assignment_action_id(task) else work_function)
-                for task, agent, work_function in assignments
-            ]
-            sanitized_targets = await self._targets(db, goal, sanitized_assignments)
-            coverage_targets = self._merge_coverage_targets(
-                coverage_targets,
-                [
-                    target
-                    for target in sanitized_targets
-                    if str(target[0].id) in covered_target_ids
-                ],
-            )
-        return self._coverage_fingerprint(goal, coverage_targets)
+            return self._coverage_fingerprint(goal, targets)
+        return await self._coverage_fingerprint_for(db, goal, assignments, covered_target_ids)
+
+    async def _coverage_fingerprint_for(
+        self,
+        db: AsyncSession,
+        goal: OrchestrationGoal,
+        assignments: list[tuple[Task, Agent, str]],
+        covered_target_ids: set[str],
+        *,
+        fields: tuple[str, ...] = FINGERPRINT_SNAPSHOT_FIELDS,
+    ) -> str:
+        """Canonical coverage formula over already-loaded assignments."""
+        baseline_assignments = [
+            assignment
+            for assignment in assignments
+            if not self._assignment_action_id(assignment[0])
+        ]
+        coverage_targets = await self._targets(db, goal, baseline_assignments)
+        # Plan/delegation-action assignments must never contribute a work
+        # function to coverage (only baseline assignments may). But an agent
+        # that was reviewed and covered, and now only appears via an
+        # action-tagged assignment (its baseline assignment was replaced),
+        # must stay represented in coverage_targets -- otherwise it drops out
+        # of the payload and trips a false readiness 409. Strip the
+        # work_function on action-tagged assignments instead of excluding
+        # them, so the agent's presence/definition_snapshot survive the merge
+        # without importing the action's work_function.
+        sanitized_assignments = [
+            (task, agent, "" if self._assignment_action_id(task) else work_function)
+            for task, agent, work_function in assignments
+        ]
+        sanitized_targets = await self._targets(db, goal, sanitized_assignments)
+        coverage_targets = self._merge_coverage_targets(
+            coverage_targets,
+            [
+                target
+                for target in sanitized_targets
+                if str(target[0].id) in covered_target_ids
+            ],
+        )
+        return self._coverage_fingerprint(goal, coverage_targets, fields=fields)
 
     @staticmethod
     def _merge_coverage_targets(

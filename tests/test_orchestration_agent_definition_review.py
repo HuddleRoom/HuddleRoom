@@ -2153,6 +2153,195 @@ async def test_tick_backfills_legacy_completed_audit_missing_coverage_fingerprin
     assert second.outputs["coverage_fingerprint"]
 
 
+async def _reviewed_with_action_task(db_session, goal, run):
+    """Baseline task + action-owned planning task exist BEFORE the review runs."""
+    agent = await _persist_agent(db_session)
+    baseline = await _assign(db_session, goal.project_id, run.id, agent, "implementation")
+    db_session.add(
+        Task(
+            project_id=goal.project_id,
+            title="plan action task",
+            assigned_to=agent.id,
+            metadata_={
+                "orchestration": {
+                    "run_id": str(run.id),
+                    "action_id": str(uuid.uuid4()),
+                    "work_function": "planning",
+                }
+            },
+        )
+    )
+    await db_session.flush()
+    from tests.conftest import complete_baseline_processes
+
+    await complete_baseline_processes(db_session, goal, run)
+    return agent, baseline, await _current_process(db_session, goal)
+
+
+async def _stale_warnings(db_session):
+    return [
+        w
+        for w in (await db_session.execute(select(OrchestrationWarning))).scalars().all()
+        if w.warning_type == "agent_definition_review_stale_inputs"
+    ]
+
+
+async def _canonical_coverage(db_session, goal, run, process_row):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    return await AgentDefinitionReviewProcess().current_coverage_fingerprint(
+        db_session, goal, run, covered_target_ids=set(process_row.outputs["target_ids"])
+    )
+
+
+async def _gate(db_session, goal):
+    from huddleroom.services.orchestration_service import OrchestrationService
+
+    await OrchestrationService()._ensure_baseline_processes_ready(db_session, goal.id)
+
+
+@pytest.mark.asyncio
+async def test_coverage_fingerprint_agrees_with_gate_when_action_task_in_reviewed_state(
+    db_session, review_goal, review_run
+):
+    _agent_row, _baseline, first = await _reviewed_with_action_task(
+        db_session, review_goal, review_run
+    )
+    first_id = first.id
+    assert first.status == "completed"
+    assert first.outputs["coverage_fingerprint"] == await _canonical_coverage(
+        db_session, review_goal, review_run, first
+    )
+    await _gate(db_session, review_goal)
+
+    result = await _advance(db_session, review_goal, review_run)
+
+    assert result["status"] == "completed"
+    assert (await _current_process(db_session, review_goal)).id == first_id
+    assert await _stale_warnings(db_session) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["definition", "work_function", "reassign"])
+async def test_material_change_after_review_with_action_task_still_invalidates(
+    db_session, review_goal, review_run, change
+):
+    agent, baseline, first = await _reviewed_with_action_task(db_session, review_goal, review_run)
+    stored = first.outputs["coverage_fingerprint"]
+
+    if change == "definition":
+        agent.system_prompt = (agent.system_prompt or "") + " Changed instructions."
+    elif change == "work_function":
+        baseline.metadata_ = {
+            "orchestration": {**baseline.metadata_["orchestration"], "work_function": "testing"}
+        }
+    else:
+        other = await _persist_agent(db_session, name="other-agent")
+        baseline.assigned_to = other.id
+    await db_session.flush()
+
+    assert await _canonical_coverage(db_session, review_goal, review_run, first) != stored
+    with pytest.raises(HTTPException) as exc_info:
+        await _gate(db_session, review_goal)
+    assert exc_info.value.status_code == 409
+
+
+async def _legacy_full_formula_state(db_session, goal, run):
+    from huddleroom.services.orchestration_agent_definition_review import AgentDefinitionReviewProcess
+
+    agent, _baseline, first = await _reviewed_with_action_task(db_session, goal, run)
+    canonical = first.outputs["coverage_fingerprint"]
+    process = AgentDefinitionReviewProcess()
+    legacy = process._coverage_fingerprint(goal, (await process._review_inputs(db_session, goal, run))[1])
+    assert legacy != canonical  # action-owned planning is in the full formula only
+    first.outputs = {**first.outputs, "coverage_fingerprint": legacy}
+    await db_session.flush()
+    return agent, first, canonical, legacy
+
+
+@pytest.mark.asyncio
+async def test_legacy_full_formula_coverage_is_restamped_when_state_unchanged(
+    db_session, review_goal, review_run
+):
+    _agent_row, first, canonical, _legacy = await _legacy_full_formula_state(
+        db_session, review_goal, review_run
+    )
+    first_id = first.id
+
+    result = await _advance(db_session, review_goal, review_run)
+    second = await _current_process(db_session, review_goal)
+
+    assert result["status"] == "completed"
+    assert second.id == first_id
+    assert second.outputs["coverage_fingerprint"] == canonical
+    assert await _stale_warnings(db_session) == []
+    await _gate(db_session, review_goal)
+
+
+@pytest.mark.asyncio
+async def test_legacy_full_formula_coverage_not_restamped_when_definition_changed(
+    db_session, review_goal, review_run
+):
+    agent, first, canonical, legacy = await _legacy_full_formula_state(
+        db_session, review_goal, review_run
+    )
+    agent.system_prompt = (agent.system_prompt or "") + " Changed instructions."
+    await db_session.flush()
+
+    await _advance(db_session, review_goal, review_run)
+    second = await _current_process(db_session, review_goal)
+
+    current = await _canonical_coverage(db_session, review_goal, review_run, second)
+    assert second.outputs["coverage_fingerprint"] == legacy
+    assert second.outputs["coverage_fingerprint"] != current
+    with pytest.raises(HTTPException) as exc_info:
+        await _gate(db_session, review_goal)
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_action_only_new_agent_after_completion_keeps_review_coverage_green(
+    db_session, review_goal, review_run
+):
+    _agent_row, _baseline, first = await _reviewed_with_action_task(db_session, review_goal, review_run)
+    first_id = first.id
+    newcomer = await _persist_agent(db_session, name="action-only-agent")
+    db_session.add(
+        Task(
+            project_id=review_goal.project_id,
+            title="action only",
+            assigned_to=newcomer.id,
+            metadata_={
+                "orchestration": {
+                    "run_id": str(review_run.id),
+                    "action_id": str(uuid.uuid4()),
+                    "work_function": "planning",
+                }
+            },
+        )
+    )
+    await db_session.flush()
+
+    # Review coverage gate stays green. (The full readiness gate is not used here:
+    # a new roster member legitimately stales team_hierarchy, a separate process.)
+    assert await _canonical_coverage(db_session, review_goal, review_run, first) == first.outputs[
+        "coverage_fingerprint"
+    ]
+    result = await _advance(db_session, review_goal, review_run)
+
+    assert result["status"] == "completed"
+    assert (await _current_process(db_session, review_goal)).id == first_id
+    review_rows = (
+        await db_session.execute(
+            select(OrchestrationProcessRun).where(
+                OrchestrationProcessRun.process_type == "agent_definition_review"
+            )
+        )
+    ).scalars().all()
+    assert len(review_rows) == 1
+    # A one-time stale-inputs suggestion is expected (new roster member); never a rerun.
+
+
 @pytest.mark.asyncio
 async def test_process_version_bump_alone_is_silently_absorbed(db_session, review_goal, review_run):
     """A pure PROCESS_VERSION bump (fingerprint *formula* changed, e.g.
