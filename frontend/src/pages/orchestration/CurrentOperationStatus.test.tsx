@@ -257,3 +257,26 @@ describe('CurrentOperationStatus workflow facts', () => {
     expect(markup({ ...props(status), pendingDirection: { ...dir, id: 'other' } })).not.toContain('Ship it?')
   })
 })
+
+describe('CurrentOperationStatus terminal goals', () => {
+  const staleWait = () => {
+    const status = line()
+    status.attention_summary = { ...status.attention_summary!, summary: 'Work is waiting. Reason unknown.' }
+    status.workflow = wf({ phase: 'completed', phase_label: 'Completed', operation_summary: 'Goal completed.' })
+    return status
+  }
+  it.each(['completed', 'cancelled'] as const)('hides the stale waiting line for a %s goal', (condition) => {
+    const html = markup({ ...props(staleWait()), condition })
+    expect(html).toContain('Phase: Completed')
+    expect(html).toContain('Goal completed.')
+    expect(html).not.toContain('Work is waiting')
+    expect(html).not.toContain('Who can unblock')
+    expect(html).not.toContain('Next check')
+  })
+  it('keeps the waiting line for a non-terminal waiting goal', () => {
+    const html = markup({ ...props(staleWait()), condition: 'waiting' })
+    expect(html).toContain('Work is waiting. Reason unknown.')
+    expect(html).toContain('Who can unblock: Unknown.')
+    expect(html).toContain('Next check:')
+  })
+})

@@ -110,6 +110,7 @@ export function CurrentOperationStatus({ statusLine, pendingDirection = null, co
   const nextCheck = attention ? validTime(attention.next_check_at) : null
   const freshness = validTime(dataUpdatedAt)
   const badge = BADGES[condition]
+  const terminal = condition === 'completed' || condition === 'cancelled'
   const workflow = statusLine.workflow
   const application = workflow ? workflowApplicationText(workflow) : null
   return <section aria-labelledby="current-operation-title" className="min-w-0 rounded-md border border-huddleroom-border bg-huddleroom-surface p-4 break-words">
@@ -145,7 +146,7 @@ export function CurrentOperationStatus({ statusLine, pendingDirection = null, co
         {activity.subject && <>Subject: <Reference reference={activity.subject} activeProjectId={activeProjectId} onRevealSource={onRevealSource} /></>}
         {activity.state === 'reported_active' && <> · Reported active at <Time value={activity.observed_at} /></>}
       </p>)}
-      {attention && <p className="min-w-0">{attention.summary}{' '}
+      {attention && !terminal && <p className="min-w-0">{attention.summary}{' '}
         {attention.subject && <>Subject: <Reference reference={attention.subject} activeProjectId={activeProjectId} onRevealSource={onRevealSource} />{' · '}</>}
         {' '}Who can unblock: {attention.unblock_actor_label || 'Unknown'}.{' '}
         {attention.kind === 'waiting' && <>Next check: {nextCheck ? <>{nextCheck.getTime() < Date.now() ? 'Scheduled check passed; current result unknown. ' : ''}<Time value={attention.next_check_at} /></> : 'Unknown'}</>}
