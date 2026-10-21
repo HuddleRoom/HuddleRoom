@@ -33,6 +33,13 @@ describe('Record', () => {
     expect(html).toContain('width:64px')
   })
 
+  it('lets long unbroken keys wrap inside the key column instead of overflowing', () => {
+    const html = renderToStaticMarkup(<Record rows={[{ key: 'plan_item:implement_booking_app', value: 'Pending' }]} keyWidth={140} />)
+    const dtClass = /<dt class="([^"]*)"/.exec(html)?.[1] ?? ''
+    expect(dtClass).toContain('min-w-0')
+    expect(dtClass).toContain('[overflow-wrap:anywhere]')
+  })
+
   it('uses the minimum label typography token for record keys', () => {
     const html = renderToStaticMarkup(<Record rows={[{ key: 'Role', value: 'Reviewer' }]} />)
     expect(html).toContain('text-label')
