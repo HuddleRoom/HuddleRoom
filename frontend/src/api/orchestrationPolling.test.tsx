@@ -34,4 +34,58 @@ describe('useOrchestrationGoal polling', () => {
       client.clear()
     }
   })
+
+  it('polls every two seconds while an authorized baseline run is in progress', async () => {
+    vi.useFakeTimers()
+    vi.resetModules()
+    vi.stubGlobal('window', { document: {} })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ run: { phase: 'baseline', baseline_authorized: true, status: 'running' } }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query')
+    const { useOrchestrationGoal } = await import('./orchestration')
+    function Probe() {
+      useOrchestrationGoal('project-1', 'goal-1')
+      return null
+    }
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const view = await mountWithTestDom(() => <QueryClientProvider client={client}><Probe /></QueryClientProvider>, act)
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      fetchMock.mockClear()
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/v1/projects/project-1/orchestration/goals/goal-1',
+        expect.objectContaining({ headers: { 'Content-Type': 'application/json' } }),
+      )
+    } finally {
+      view.cleanup()
+      client.clear()
+    }
+  })
+
+  it('does not poll at two seconds for an authorized baseline run that is blocked', async () => {
+    vi.useFakeTimers()
+    vi.resetModules()
+    vi.stubGlobal('window', { document: {} })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ run: { phase: 'baseline', baseline_authorized: true, status: 'blocked' } }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query')
+    const { useOrchestrationGoal } = await import('./orchestration')
+    function Probe() {
+      useOrchestrationGoal('project-1', 'goal-1')
+      return null
+    }
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const view = await mountWithTestDom(() => <QueryClientProvider client={client}><Probe /></QueryClientProvider>, act)
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      fetchMock.mockClear()
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      view.cleanup()
+      client.clear()
+    }
+  })
 })

@@ -591,7 +591,13 @@ export function useOrchestrationGoal(
     queryKey: ['orchestration-goal', projectId, goalId],
     queryFn: () => fetchOrchestrationGoal(projectId!, goalId!),
     enabled: !!projectId && !!goalId,
-    refetchInterval: () => (useWSStore.getState().connected ? false : 10_000),
+    refetchInterval: (query) => {
+      const run = query.state.data?.run
+      // Baseline steps run in the background tick without WS events; poll until the run leaves baseline.
+      // ponytail: still polls while a running baseline waits on human answers; add a backend step-change event if load matters.
+      if (run?.phase === 'baseline' && run.baseline_authorized && run.status === 'running') return 2000
+      return useWSStore.getState().connected ? false : 10_000
+    },
     staleTime: 10_000,
   })
 }

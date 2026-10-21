@@ -635,7 +635,9 @@ export function BaselineDashboard({ projectId, goalId, goal, run, statusLine, ga
   const retry = useRetryOrchestrationBaselineStep(projectId)
   const authorize = useAuthorizeOrchestrationBaseline(projectId)
   const retryApplication = useRetryAnswerApplication(projectId)
-  const dashboard = useBaselineDashboard(projectId, goalId, runStep.isPending || rerun.isPending || retry.isPending || authorize.isPending)
+  // Baseline steps run in the background tick without WS events; poll while a running authorized baseline advances.
+  // ponytail: still polls while a running baseline waits on human answers; add a backend step-change event if load matters.
+  const dashboard = useBaselineDashboard(projectId, goalId, runStep.isPending || rerun.isPending || retry.isPending || authorize.isPending || (run?.phase === 'baseline' && !!run?.baseline_authorized && run?.status === 'running'))
   const localGeneration = useRef(0)
   const generation = () => getMutationGeneration?.() ?? localGeneration.current
   function beginMutation(owner: BaselineMutationOwner) {
