@@ -206,7 +206,7 @@ def test_cli_defaults_bind_to_localhost_on_port_8000(monkeypatch):
     assert result.exit_code == 0, result.output
     assert run.call_args.args == ("huddleroom.main:app",)
     assert run.call_args.kwargs["host"] == "127.0.0.1"
-    assert run.call_args.kwargs["port"] == 8000
+    assert run.call_args.kwargs["port"] == 9256
     assert run.call_args.kwargs["reload"] is False
 
 

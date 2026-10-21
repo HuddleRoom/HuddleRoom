@@ -18,7 +18,7 @@ after the first PyPI release is published; until then, install a built local whe
 pipx install huddleroom
 huddleroom setup       # required guided backend/configuration step
 huddleroom serve
-# open http://127.0.0.1:8000/dashboard/
+# open http://127.0.0.1:9256/dashboard/
 ```
 
 `serve` applies pending migrations before it starts and never prompts. It is valid
@@ -29,7 +29,7 @@ idempotent diagnostic command for running the same migrations manually.
 
 New installations store their database, workspace, and optional configuration in
 `~/.huddleroom`. An existing `./huddleroom.db`, legacy `./rally.db`, or
-`./workspace` is retained when present. HuddleRoom binds to `127.0.0.1:8000` by
+`./workspace` is retained when present. HuddleRoom binds to `127.0.0.1:9256` by
 default. The scheduler (APScheduler) and API server share one process. Docker,
 PostgreSQL, Redis, and authentication are unsupported in this release.
 
@@ -232,7 +232,7 @@ they never include API keys or response bodies.
 
 ## API Overview
 
-Base URL: `http://127.0.0.1:8000/api/v1`
+Base URL: `http://127.0.0.1:9256/api/v1`
 
 Authentication is not supported in the initial public release. All endpoints are open to
 anyone who can reach the server, so bind it to `127.0.0.1`.
@@ -277,7 +277,7 @@ DELETE /knowledge/{id}                     Delete item
 
 ```
 
-Interactive docs: `http://127.0.0.1:8000/docs`
+Interactive docs: `http://127.0.0.1:9256/docs`
 
 ---
 
@@ -506,7 +506,7 @@ restarts only after an API-requested successful graceful shutdown. Direct ASGI,
 `--reload`, and PostgreSQL/Celery launches return 503 without stopping.
 
 ```sh
-curl -X POST http://localhost:8000/api/system/restart -H 'X-HuddleRoom-Confirm: restart'
+curl -X POST http://localhost:9256/api/system/restart -H 'X-HuddleRoom-Confirm: restart'
 ```
 
 202 acknowledges the request before shutdown; it does not promise completion.

@@ -20,7 +20,7 @@ allow_api_reset = false
 # Raw database download: enable only behind authenticated access, with direct access restricted.
 allow_db_export = false
 auth_enabled = false
-api_base_url = "http://localhost:8000"
+api_base_url = "http://localhost:9256"
 # Omit this to use ~/.huddleroom/workspace (or an existing local workspace).
 # workspace_dir = "workspace"
 

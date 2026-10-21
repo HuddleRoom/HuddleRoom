@@ -167,7 +167,7 @@ class Settings(BaseSettings):
     allow_api_reset: bool = False
     allow_db_export: bool = False
     auth_enabled: bool = False
-    api_base_url: str = "http://localhost:8000"
+    api_base_url: str = "http://localhost:9256"
     embedding_model: str = "text-embedding-3-small"
     workspace_dir: str = Field(default_factory=_default_workspace_dir)
     orchestration_model: str = "openai/gpt-6.1-sol"
