@@ -474,3 +474,48 @@ async def test_decision_context_open_gates_exclude_adhoc_gates(db_session, test_
     context = await OrchestrationService()._decision_context(db_session, goal, run)
 
     assert [g["gate_type"] for g in context["open_gates"]] == ["work_completed"]
+
+
+async def test_pause_control_state_in_force_then_resumed_with_resume_action(db_session, test_project):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    service = OrchestrationService()
+    await service.pause_goal(db_session, test_project.id, goal.id)
+    await db_session.flush()
+    builder = OrchestrationSupervisionContextBuilder()
+
+    paused = await builder.build(db_session, goal, run)
+    pause = next(a for a in paused["actions"] if a["action_type"] == "pause_control")
+    assert paused["run"]["pause_requested"] is True
+    assert pause["control_state"] == "in_force"
+
+    await service.resume_goal(db_session, test_project.id, goal.id)
+    await db_session.flush()
+    resumed = await builder.build(db_session, goal, run)
+    kinds = [a["action_type"] for a in resumed["actions"]]
+    pause = resumed["actions"][kinds.index("pause_control")]
+    assert resumed["run"]["pause_requested"] is False
+    assert resumed["run"]["control_version"] == pause["dispatch_contract"]["control_version"] + 1
+    assert pause["control_state"] == "resumed"
+    assert kinds.index("resume_control") > kinds.index("pause_control")
+
+
+async def test_resume_clears_pause_run_blocker_keeps_task_failure_blocker(db_session, test_project):
+    goal, run = await _goal_and_run(db_session, test_project.id)
+    service = OrchestrationService()
+    task_blocker = {"kind": "repeated_failure", "task_id": str(uuid.uuid4()), "reason": "needs human"}
+    run.active_blockers = [{"kind": "repeated_failure", "reason": "Honor the pause"}, task_blocker]
+    db_session.add(OrchestrationAction(
+        run_id=run.id, action_type="pause_run", status="completed",
+        idempotency_key="pause-run-1", request={"reason": "Honor the pause"},
+    ))
+    await db_session.flush()
+    await service.pause_goal(db_session, test_project.id, goal.id)
+    builder = OrchestrationSupervisionContextBuilder()
+    before = await builder.build(db_session, goal, run)
+    assert next(a for a in before["actions"] if a["action_type"] == "pause_run")["control_state"] == "in_force"
+
+    await service.resume_goal(db_session, test_project.id, goal.id)
+    await db_session.flush()
+    assert run.active_blockers == [task_blocker]
+    after = await builder.build(db_session, goal, run)
+    assert next(a for a in after["actions"] if a["action_type"] == "pause_run")["control_state"] == "resumed"

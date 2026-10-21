@@ -9420,6 +9420,22 @@ class OrchestrationService:
                 run.status = "running"
                 run.pause_requested = False
                 run.control_version += 1
+                # pause_run's repeated_failure blocker has no task_id (task-failure ones do and need a human decision).
+                run.active_blockers = [
+                    b for b in run.active_blockers
+                    if not (isinstance(b, Mapping) and b.get("kind") == "repeated_failure" and "task_id" not in b)
+                ]
+                db.add(OrchestrationAction(
+                    run_id=run.id, action_type="resume_control", status="completed",
+                    idempotency_key=f"run:{run.id}:resume:{run.control_version}",
+                    target_type="orchestration_goal", target_id=goal_id,
+                    request={
+                        "goal_id": str(goal_id), "run_id": str(run.id),
+                        "resumed_control_version": run.control_version,
+                        "resumed_at": _utcnow().isoformat(),
+                        "note": "Owner resumed; earlier pauses (pause_control and pause_run) are no longer in force.",
+                    },
+                ))
             await db.flush()
             # Committed with the status change; the worker ticks after commit, never here.
             await emit_event_once(

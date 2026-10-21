@@ -129,11 +129,12 @@ class OrchestrationSupervisionContextBuilder:
         # Keep every unverified claim visible; only settled memory is bounded.
         memory = [row for row in memory_rows if row.fact_status == "unverified"]
         memory.extend([row for row in memory_rows if row.fact_status == "accepted"][:8])
+        last_resume_at = max((a.created_at for a in actions if a.action_type == "resume_control"), default=None)
         snapshot = {
             "goal": _row(goal, "id", "objective", "status", "goal_type", "success_criteria", "constraints"),
-            "run": _row(run, "id", "goal_id", "status", "phase", "plan_state", "budget_state", "active_blockers"),
+            "run": _row(run, "id", "goal_id", "status", "phase", "pause_requested", "control_version", "plan_state", "budget_state", "active_blockers"),
             "contracts": [{"action_id": str(row.id), "status": row.status, "contract": deepcopy(row.dispatch_contract)} for row in actions if row.dispatch_contract],
-            "actions": [self._action_row(row, required, full_reports) for row in actions],
+            "actions": [self._action_row(row, required, full_reports, run, last_resume_at) for row in actions],
             "tasks": [_row(row, "id", "title", "status", "assigned_to", "depends_on", "metadata_", *_TIMESTAMPS_FULL) for row in tasks],
             "sessions": [_row(row, "id", "task_id", "agent_id", "status", "error", "origin", "created_at", "started_at") for row in sessions],
             "meetings": [_row(row, "id", "source_task_id", "title", "status", "meeting_type", "created_at", "updated_at") for row in meetings],
@@ -163,7 +164,7 @@ class OrchestrationSupervisionContextBuilder:
         return snapshot
 
     @staticmethod
-    def _action_row(row, required: set[str], full_reports: bool) -> dict:
+    def _action_row(row, required: set[str], full_reports: bool, run: OrchestrationRun, last_resume_at=None) -> dict:
         out = _row(row, "id", "action_type", "status", "request", "dispatch_contract", "budget_ledger", "error", "created_at", "updated_at")
         request = out["request"]
         if (
@@ -171,6 +172,12 @@ class OrchestrationSupervisionContextBuilder:
             and isinstance(request.get("report"), dict) and str(request.get("task_id")) not in required
         ):
             out["request"] = {**request, "report": concise_report(request["report"])}
+        if row.action_type == "pause_control" and isinstance(request, dict):
+            # Same rule as orchestration_control._receipt: a later resume bumps control_version.
+            resumed = not run.pause_requested or run.control_version != request.get("accepted_control_version")
+            out["control_state"] = "resumed" if resumed else "in_force"
+        elif row.action_type == "pause_run":
+            out["control_state"] = "resumed" if last_resume_at and last_resume_at >= row.created_at else "in_force"
         return out
 
     async def build_for_provider(self, db: AsyncSession, goal, run: OrchestrationRun, *, string_limit: int = 4000) -> dict:
