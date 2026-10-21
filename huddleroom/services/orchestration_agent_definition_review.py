@@ -44,6 +44,7 @@ from huddleroom.services.orchestration_process_service import (
     OrchestrationProcessService,
     effective_input_fingerprint,
     capture_input_fingerprint,
+    may_initialize_capture,
     set_effective_input_fingerprint,
 )
 from huddleroom.services.orchestration_roster_mapper import OrchestrationRosterMapper, PROFILES
@@ -725,7 +726,7 @@ class AgentDefinitionReviewProcess:
         if current is not None:
             capture_input_fingerprint(
                 current, fingerprint, PROCESS_VERSION,
-                allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
+                allow_initialize=may_initialize_capture(current),
             )
         # Coverage a completed row is judged against: its own covered ids
         # (empty when absent, as in the readiness gate), not the current targets.
@@ -742,6 +743,10 @@ class AgentDefinitionReviewProcess:
             if current is not None and isinstance(current.input_snapshot, dict)
             else None
         )
+        recorded = (current.outputs or {}).get("fingerprint") if current is not None else None
+        if stored_fingerprint is None and current is not None and current.status == "waiting_decision" and isinstance(recorded, str):
+            # Recorded reviewed input; no captured original is claimed.
+            stored_fingerprint = recorded
         if (
             current is not None
             and current.status == "waiting_decision"

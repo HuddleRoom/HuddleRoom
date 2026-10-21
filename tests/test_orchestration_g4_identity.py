@@ -135,3 +135,16 @@ async def test_g4_current_roster_query_failure_never_returns_history():
     db.execute.side_effect = RuntimeError("current unavailable")
     with pytest.raises(RuntimeError, match="current unavailable"):
         await OrchestrationRosterMapper().current_active_agents(db)
+
+
+@pytest.mark.parametrize("status,outputs,snapshot,expected", [
+    ("running", {}, {}, True),
+    ("running", {"transcript": "retained"}, {}, False),
+    ("waiting_decision", {}, {}, False),
+    ("completed", {}, {}, False),
+    ("waiting_decision", {"x": 1}, {"effective_comparison": {"fingerprint": "seed", "source": "copied_seed"}}, True),
+])
+def test_may_initialize_capture(status, outputs, snapshot, expected):
+    row = _process(snapshot)
+    row.status, row.outputs = status, outputs
+    assert service.may_initialize_capture(row) is expected

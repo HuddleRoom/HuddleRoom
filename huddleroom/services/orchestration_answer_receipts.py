@@ -439,6 +439,7 @@ async def drain_answer_applications(db, run_id):
                         action.dispatch_contract = {**(action.dispatch_contract or {}),
                             "application_state": "blocked", "reason": "source_process_missing"}
                         action.status = "failed"
+                        action.error = "source_process_missing"
                         return
                     if source is not None and source.process_type in SUPPORTED_PROCESS_TYPES:
                         source_id_value = source.id
@@ -456,6 +457,7 @@ async def drain_answer_applications(db, run_id):
                                 action.dispatch_contract = {**(action.dispatch_contract or {}),
                                     "application_state": "blocked", "reason": "source_process_superseded"}
                                 action.status = "failed"
+                                action.error = "source_process_superseded"
                                 return
                         if (
                             not linked_successor
@@ -523,6 +525,7 @@ async def drain_answer_applications(db, run_id):
                             action.dispatch_contract = {**(action.dispatch_contract or {}),
                                 "application_state": "blocked", "reason": "source_process_did_not_advance"}
                             action.status = "failed"
+                            action.error = "source_process_did_not_advance"
                             return
                     action.dispatch_contract = {**(action.dispatch_contract or {}), "application_state": "applied"}
                     action.status = "completed"
@@ -562,6 +565,8 @@ async def drain_answer_applications(db, run_id):
                 action.dispatch_contract = {**(action.dispatch_contract or {}),
                     "application_state": "pending" if retryable else "failed", "reason": reason}
                 action.status = "reserved" if retryable else "failed"
+                if not retryable:
+                    action.error = reason
             await db.commit()
             (result.pending if retryable else result.failed).append(action_id)
             result.reasons[str(action_id)] = reason

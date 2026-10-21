@@ -41,7 +41,7 @@ _APPLICATION_REASONS = {
     "database is locked": "The database was busy; it will be retried.",
     "source_process_missing": "The step that asked is missing.",
     "source_process_superseded": "The step that asked was replaced.",
-    "source_process_did_not_advance": "The step that asked did not advance.",
+    "source_process_did_not_advance": "The step that asked did not advance; its inputs may have changed. Rerun the step to continue.",
 }
 
 

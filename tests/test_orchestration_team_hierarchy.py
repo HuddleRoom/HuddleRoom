@@ -4331,3 +4331,41 @@ async def test_hierarchy_completion_guard_blocks_ineligible_assignment_only(db_s
     assert hierarchy.status == "running"
     assert await guard(db_session, goal, run, hierarchy, bad) is True
     assert hierarchy.status == "waiting_decision"
+
+
+@pytest.mark.asyncio
+async def test_manual_start_hierarchy_row_captures_input_fingerprint(
+    db_session, test_project, test_user
+):
+    from huddleroom.services.orchestration_team_hierarchy import PROCESS_VERSION
+
+    goal, run, agents, _review = await _lifecycle_goal(
+        db_session, test_project, test_user, weight="substantial"
+    )
+    started = await OrchestrationProcessService().start_process(
+        db_session, goal.id, process_type="team_hierarchy", trigger_reason="manual",
+        run_id=run.id, process_version=PROCESS_VERSION,
+    )
+    assert started.input_snapshot == {}
+
+    class Analyzer:
+        async def review(self, payload, project=None, *, project_id=None):
+            refs = [str(agents[f].id) for f in ("planning", "implementation", "validation", "summarization")]
+            return TeamHierarchyAnalysis(
+                proposed_agents=(),
+                assignments=tuple(
+                    {"work_function": f, "agent_ref": str(agents[f].id)}
+                    for f in ("planning", "implementation", "validation", "summarization")
+                ),
+                reporting_lines=tuple({"agent_ref": ref, "reports_to": "manager"} for ref in refs),
+                documented_gaps=(),
+                rationale="Existing roster covers every function.",
+                self_review="Checked coverage and producer/reviewer separation.",
+            )
+
+    await TeamHierarchyProcess(analyzer=Analyzer()).advance(db_session, goal, run)
+
+    current = await OrchestrationProcessService().get_current(db_session, goal.id, "team_hierarchy")
+    assert current.id == started.id
+    assert current.input_snapshot["capture"]["source"] == "captured"
+    assert isinstance(current.input_snapshot["fingerprint"], str) and current.input_snapshot["fingerprint"]

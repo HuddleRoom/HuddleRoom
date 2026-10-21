@@ -30,6 +30,7 @@ from huddleroom.services.orchestration_process_service import (
     OrchestrationProcessService,
     effective_input_fingerprint,
     capture_input_fingerprint,
+    may_initialize_capture,
     set_effective_input_fingerprint,
     request_process_rerun,
     pending_rerun_intent,
@@ -402,7 +403,7 @@ class TeamHierarchyProcess:
         if current is not None:
             capture_input_fingerprint(
                 current, fingerprint, PROCESS_VERSION,
-                allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
+                allow_initialize=may_initialize_capture(current),
             )
         if current is not None and current.status == "completed" and current.process_version != PROCESS_VERSION:
             # The trivial-tier fingerprint formula (goal + proposal) never
@@ -670,7 +671,7 @@ class TeamHierarchyProcess:
         if current is not None:
             capture_input_fingerprint(
                 current, input_fingerprint, PROCESS_VERSION,
-                allow_initialize=(current.input_snapshot or {}).get("effective_comparison", {}).get("source") == "copied_seed",
+                allow_initialize=may_initialize_capture(current),
             )
         if current is not None and current.status in {"running", "waiting_decision"}:
             reserved = await self._apply_reserved_agents(db, goal, run, current)

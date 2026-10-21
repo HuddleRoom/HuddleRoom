@@ -552,6 +552,7 @@ async def test_spr248_stalled_source_blocks_saved_answer_without_continuation_ti
         assert action.status == "failed"
         assert action.dispatch_contract["application_state"] == "blocked"
         assert action.dispatch_contract["reason"] == "source_process_did_not_advance"
+        assert action.error == "source_process_did_not_advance"
         assert saved.continuation_applied_at is None
         assert (await fresh.get(OrchestrationProcessRun, source.id)).status == "waiting_decision"
 

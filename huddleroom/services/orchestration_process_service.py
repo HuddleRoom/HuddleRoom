@@ -62,6 +62,12 @@ def capture_input_fingerprint(
     process.input_snapshot = snapshot
 
 
+def may_initialize_capture(process: OrchestrationProcessRun) -> bool:
+    # A fresh running row is about to be reviewed on exactly these inputs.
+    return (((process.input_snapshot or {}).get("effective_comparison") or {}).get("source") == "copied_seed"
+            or (process.status == "running" and not process.outputs))
+
+
 def set_effective_input_fingerprint(
     process: OrchestrationProcessRun, fingerprint: str, formula_version: int, reason: str,
     *, source: str = "derived", source_refs: dict | None = None,

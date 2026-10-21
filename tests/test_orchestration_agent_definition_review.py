@@ -3499,3 +3499,141 @@ async def test_old_policy_unapproved_drift_reruns_semantic_review_once_and_grant
 
     await process.advance(db_session, review_goal, review_run, manual=True)
     assert analyzer.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# SPR 283: a manually started (empty input_snapshot) review captures its input
+# fingerprint, so approving its proposal does not stale-park the source row.
+# ---------------------------------------------------------------------------
+async def _manual_start_pending_proposal(db_session, review_goal, review_run):
+    from huddleroom.services.orchestration_agent_definition_review import (
+        AgentDefinitionReviewProcess, PROCESS_VERSION,
+    )
+    from huddleroom.services.orchestration_process_service import OrchestrationProcessService
+
+    agents = [await _persist_agent(
+        db_session, id=uuid.UUID(f"00000000-0000-0000-0000-0000000002{index:02d}"),
+        name=f"agent-{index}", description="Original description.", system_prompt="Original persona.",
+    ) for index in range(2)]
+    for agent in agents:
+        await _assign(db_session, review_goal.project_id, review_run.id, agent, "implementation")
+    service = OrchestrationProcessService()
+    prerequisite = await service.start_process(
+        db_session, review_goal.id, process_type="manager_selection",
+        trigger_reason="test prerequisite", run_id=review_run.id,
+    )
+    await service.complete_process(db_session, prerequisite)
+    started = await service.start_process(
+        db_session, review_goal.id, process_type="agent_definition_review",
+        trigger_reason="manual", run_id=review_run.id, process_version=PROCESS_VERSION,
+    )
+    assert started.input_snapshot == {}
+    process = AgentDefinitionReviewProcess(analyzer=ThreeProposalAnalyzer())
+    assert (await process.advance(db_session, review_goal, review_run, manual=True))["status"] == "waiting_decision"
+    decisions = await OrchestrationAuthorityDecisionService().list_decisions(
+        db_session, review_goal.id, status="pending"
+    )
+    assert len(decisions) == 2
+    return agents, process, await _current_process(db_session, review_goal), decisions
+
+
+async def _approve_all_and_drain(client, db_session, test_engine, test_project, goal, run, decisions):
+    from huddleroom.services.orchestration_decision_application import drain_answer_applications
+
+    run.baseline_authorized = True
+    await db_session.commit()
+    response = await client.post(_batch_answer_url(test_project.id, goal.id), json={"answers": [
+        {"decision_id": str(d.id), "selected_option": "approve"} for d in decisions
+    ]})
+    assert response.status_code == 200, response.text
+    action_id = uuid.UUID(response.json()["answer_receipt"]["action_id"])
+    await db_session.commit()
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as consumer:
+        result = await drain_answer_applications(consumer, run.id)
+        await consumer.commit()
+    return action_id, result
+
+
+@pytest.mark.asyncio
+async def test_manual_start_review_captures_fingerprint_and_approval_completes(
+    client, db_session, test_engine, test_project, review_goal, review_run
+):
+    agents, _process, current, decisions = await _manual_start_pending_proposal(
+        db_session, review_goal, review_run
+    )
+    assert current.input_snapshot["capture"]["source"] == "captured"
+    assert current.input_snapshot["fingerprint"] == current.outputs["fingerprint"]
+
+    action_id, result = await _approve_all_and_drain(
+        client, db_session, test_engine, test_project, review_goal, review_run, decisions
+    )
+
+    assert result.applied == [action_id] and result.failed == []
+    action = await db_session.get(OrchestrationAction, action_id)
+    await db_session.refresh(action)
+    assert action.status == "completed" and action.error is None
+    await db_session.refresh(current)
+    assert current.status == "completed"
+    for decision in decisions:
+        await db_session.refresh(decision)
+        assert decision.continuation_applied_at is not None
+    for index, agent in enumerate(agents):
+        await db_session.refresh(agent)
+        assert agent.description == f"Proposed description {index + 1}."
+
+
+async def _legacy_shape(db_session, current):
+    current.input_snapshot = {"capture": {
+        "source": "legacy_first_observed", "formula_version": current.process_version,
+        "original_available": False,
+    }}
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_stuck_legacy_waiting_row_recovers_from_recorded_output_fingerprint(
+    client, db_session, test_engine, test_project, review_goal, review_run
+):
+    _agents, _process, current, decisions = await _manual_start_pending_proposal(
+        db_session, review_goal, review_run
+    )
+    await _legacy_shape(db_session, current)
+
+    action_id, result = await _approve_all_and_drain(
+        client, db_session, test_engine, test_project, review_goal, review_run, decisions
+    )
+
+    assert result.applied == [action_id] and result.failed == []
+    await db_session.refresh(current)
+    assert current.status == "completed"
+    assert current.input_snapshot["effective_comparison"]["reason"] == "approved_definitions"
+    assert current.input_snapshot["capture"]["original_available"] is False
+    assert "fingerprint" not in current.input_snapshot
+
+
+@pytest.mark.asyncio
+async def test_stuck_legacy_row_with_genuine_input_drift_still_parks(
+    client, db_session, test_engine, test_project, review_goal, review_run
+):
+    agents, _process, current, decisions = await _manual_start_pending_proposal(
+        db_session, review_goal, review_run
+    )
+    await _legacy_shape(db_session, current)
+    # Unrelated reviewed input changes: another target's description is edited out of band.
+    agents[1].description = "Edited elsewhere by a person."
+    await db_session.commit()
+
+    action_id, result = await _approve_all_and_drain(
+        client, db_session, test_engine, test_project, review_goal, review_run, decisions
+    )
+
+    assert result.applied == []
+    assert result.failed == [action_id]
+    assert result.reasons[str(action_id)] == "source_process_did_not_advance"
+    action = await db_session.get(OrchestrationAction, action_id)
+    await db_session.refresh(action)
+    assert action.status == "failed"
+    assert action.error == "source_process_did_not_advance"
+    await db_session.refresh(current)
+    assert current.status == "waiting_decision"
