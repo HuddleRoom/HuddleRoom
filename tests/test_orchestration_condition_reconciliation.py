@@ -80,10 +80,18 @@ def test_reconcile_time_action_context_blocks_owner_decisions(kw):
     assert is_reconcilable(stored, action_kind="record_warning", category="other")
 
 
+def test_decision_pending_only_reconciles_warnings():
+    raw = {"condition": "decision_pending", "subject": T1}
+    assert not is_reconcilable(raw, action_kind="ask_human", category="x")
+    assert is_reconcilable(raw, action_kind="record_warning", category="x")
+
+
 # --- Reconciliation through the real record/ask actions, ingestion and ticks ---
 
 import json  # noqa: E402
 from datetime import timedelta  # noqa: E402
+
+from fastapi import HTTPException  # noqa: E402
 
 from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
@@ -620,3 +628,68 @@ async def test_spr208_cursor_is_bounded_persistent_and_wraps_after_deleted_tied_
     assert calls == {"warnings": 50, "questions": 50}
     await db_session.refresh(run)
     assert run.supervision_state["preserved"] == {"key": "value"}
+
+
+async def test_authority_decision_wait_fallback_warning_clears_when_answered(db_session, test_project):
+    from huddleroom.services.orchestration_authority_service import OrchestrationAuthorityDecisionService
+
+    service, goal, run, _agent, _task = await _setup(db_session, test_project)
+    decision = await _ask(service, db_session, run, "Ship the release?")
+    supervision = service.supervision
+    await supervision.reconcile_local(db_session, goal, run)
+    wait = next(w for w in await db_session.scalars(select(OrchestrationWait).where(OrchestrationWait.run_id == run.id))
+                if (w.owner or {}).get("type") == "authority_decision")
+    wait.due_recheck_at = _utcnow() - timedelta(seconds=1)
+    fired = await supervision.reconcile_local(db_session, goal, run)
+    assert fired["outcome"] == "due_fallback"
+    fallback = await db_session.get(OrchestrationAction, uuid.UUID(fired["action_id"]))
+    assert fallback.request["condition"] == {"condition": "decision_pending", "subject": str(decision.id)}
+    warning = await db_session.get(OrchestrationWarning, fallback.target_id)
+
+    await service._reconcile_conditions(db_session, run)
+    await db_session.refresh(warning)
+    assert warning.active
+    with pytest.raises(HTTPException) as closeout:
+        await service._closeout_preconditions_manifest(db_session, goal, run)
+    assert closeout.value.status_code == 409
+
+    await OrchestrationAuthorityDecisionService().cancel_decision(db_session, decision, reason="Answered elsewhere.")
+    assert await service._reconcile_conditions(db_session, run) == 1
+    await db_session.refresh(warning)
+    assert not warning.active and warning.resolved_by == "system"
+    # Closeout still refuses (unrelated gates), but no longer for the cleared warning.
+    with pytest.raises(HTTPException) as closeout_after:
+        await service._closeout_preconditions_manifest(db_session, goal, run)
+    assert "warning" not in str(closeout_after.value.detail).lower()
+
+
+async def test_recovery_session_wait_fallback_gets_session_running(db_session, test_project, owned_session_factory):
+    adopt_session(db_session)
+    service, goal, run, agent, task = await _setup(db_session, test_project)
+    task.status = "in_progress"
+    running = Session(
+        project_id=task.project_id, task_id=task.id, agent_id=agent.id, adapter_type="api", status="running",
+        input_context={}, origin="orchestrator",
+        metadata_={"orchestration": {"action_id": task.metadata_["orchestration"]["action_id"]}},
+    )
+    db_session.add(running)
+    await db_session.flush()
+    # A recovery-service session wait names only the session, never the task.
+    db_session.add(OrchestrationWait(
+        run_id=run.id, wait_key=f"recovery:session:{running.id}", owner={"type": "session", "id": str(running.id)},
+        awaited_event={"event_type": "session.completed", "matcher": {}},
+        due_recheck_at=_utcnow() - timedelta(seconds=1), fallback={"action_type": "attention", "reason": "live"},
+    ))
+    await db_session.flush()
+    fired = await service.supervision.reconcile_local(db_session, goal, run)
+    assert fired["outcome"] == "due_fallback"
+    fallback = await db_session.get(OrchestrationAction, uuid.UUID(fired["action_id"]))
+    assert fallback.request["condition"] == {"condition": "session_running", "subject": str(task.id)}
+    warning = await db_session.get(OrchestrationWarning, fallback.target_id)
+    assert warning.active
+
+    running.status, running.ended_at = "completed", _utcnow()
+    await db_session.flush()
+    assert await service._reconcile_conditions(db_session, run) == 1
+    await db_session.refresh(warning)
+    assert not warning.active and warning.resolved_by == "system"

@@ -66,7 +66,8 @@ from huddleroom.schemas.orchestration import (
 from huddleroom.schemas.orchestration_recovery import BaselineRepairAdmissionV1, CorrectiveDisposition
 from huddleroom.services.orchestration_work_report import CANONICAL_WORK_REPORT_SCHEMA
 from huddleroom.services.orchestration_condition import (
-    GATE_UNVERIFIED, PLAN_MISSING, SESSION_RUNNING, VALID_RESULT_MISSING, ConditionError, is_reconcilable, validate_condition,
+    DECISION_PENDING, GATE_UNVERIFIED, PLAN_MISSING, SESSION_RUNNING, VALID_RESULT_MISSING, ConditionError, is_reconcilable,
+    validate_condition,
 )
 from huddleroom.services.orchestration_artifact_identity import (
     CONFIRMED_MISSING, PERMISSION_DENIED, UNINSPECTABLE, bind_artifacts, cited_artifact_ids, one_line, recheck_binding,
@@ -11239,6 +11240,9 @@ class OrchestrationService:
             subject_id = uuid.UUID(subject)
         except ValueError:
             return False
+        if condition == DECISION_PENDING:
+            decision = await db.get(OrchestrationAuthorityDecision, subject_id)
+            return decision is not None and decision.run_id == run.id and decision.status != "pending"
         if condition == GATE_UNVERIFIED:
             gate = await db.get(OrchestrationGate, subject_id)
             return gate is not None and gate.run_id == run.id and gate.status == "accepted"

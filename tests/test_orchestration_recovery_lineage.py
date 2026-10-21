@@ -437,6 +437,57 @@ async def test_capability_provided_answer_rediagnoses_with_a_reset_budget(db_ses
     assert await flow.svc.project_status(db_session, escalation) == "unsupported"
 
 
+async def _resolve_escalated_lineage_warning(db, rows, user, monkeypatch, resolved_by):
+    from huddleroom.services.orchestration_recovery_registry import RECOVERY_WARNING_TYPE
+    from huddleroom.services.orchestration_warning_service import OrchestrationWarningService
+
+    analyzer = ScriptedAnalyzer(
+        draft(rows, verify_call(rows)), draft(rows, verify_call(rows, "review")), draft(rows, retry_task_call(rows)),
+        draft(rows, reassign_call(rows)),
+    )
+    flow, escalation = await _escalated(db, rows, user, monkeypatch, analyzer)
+    (gap_decision,) = [row for row in await recovery_decisions(db, rows.goal.id, status_="pending")
+                       if row.related_action_id == escalation.id]
+    (warning,) = (await db.scalars(select(OrchestrationWarning).where(
+        OrchestrationWarning.goal_id == rows.goal.id, OrchestrationWarning.warning_type == RECOVERY_WARNING_TYPE,
+        OrchestrationWarning.active.is_(True)))).all()
+    await OrchestrationWarningService().resolve_warning(
+        db, warning, resolved_by=resolved_by, reason="The blocker was cleared outside recovery.")
+    calls_before = analyzer.calls
+    follow_up = await flow.svc.answer_capability_gap(db, gap_decision, user_id=user.id)
+    outcome = await flow.svc.diagnose(db, follow_up.id)
+    return analyzer, calls_before, outcome
+
+
+@pytest.mark.asyncio
+async def test_human_resolved_lineage_warning_closes_the_capability_answer_followup(
+    db_session, test_project, test_user, monkeypatch,
+):
+    from huddleroom.services.orchestration_recovery_registry import RECOVERY_WARNING_TYPE
+
+    rows = await seed(db_session, test_project)
+    analyzer, calls_before, outcome = await _resolve_escalated_lineage_warning(
+        db_session, rows, test_user, monkeypatch, resolved_by=f"human:{test_user.id}")
+
+    assert outcome.dispatch_contract["closed"] == "blocker_gone"
+    assert analyzer.calls == calls_before, "a human-resolved lineage warning retires the follow-up without analysis"
+    active = await db_session.scalars(select(OrchestrationWarning).where(
+        OrchestrationWarning.goal_id == rows.goal.id, OrchestrationWarning.warning_type == RECOVERY_WARNING_TYPE,
+        OrchestrationWarning.active.is_(True)))
+    assert active.all() == []
+    assert await recovery_decisions(db_session, rows.goal.id, status_="pending") == []
+
+
+@pytest.mark.asyncio
+async def test_system_resolved_lineage_warning_still_rediagnoses(db_session, test_project, test_user, monkeypatch):
+    rows = await seed(db_session, test_project)
+    analyzer, calls_before, outcome = await _resolve_escalated_lineage_warning(
+        db_session, rows, test_user, monkeypatch, resolved_by="orchestrator:recovery")
+
+    assert analyzer.calls == calls_before + 1, "a system-resolved warning does not retire the follow-up"
+    assert outcome.request.get("calls"), outcome.request
+
+
 @pytest.mark.asyncio
 async def test_unanswered_capability_gap_cannot_be_rediagnosed(db_session, test_project):
     from huddleroom.schemas.orchestration_recovery import CapabilityGapAssessmentV1

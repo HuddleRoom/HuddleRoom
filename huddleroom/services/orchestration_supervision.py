@@ -742,11 +742,20 @@ class OrchestrationSupervisionService:
                         sibling.status, sibling.cleared_at = "cleared", now
             fallback = dict(wait.fallback or {})
             owner = wait.owner or {}
-            # A session wait's warning carries the condition it stood for, so it clears when the session ends.
-            condition = (
-                {"condition": {"condition": "session_running", "subject": str(owner["task_id"])}}
-                if owner.get("type") == "session" and owner.get("task_id") else {}
-            )
+            # A session or decision wait's warning carries the condition it stood for, so it clears when that ends.
+            condition = {}
+            if owner.get("type") == "session":
+                task_id = owner.get("task_id")
+                if task_id is None:
+                    try:
+                        session = await db.get(Session, uuid.UUID(str(owner.get("id"))))
+                    except ValueError:
+                        session = None
+                    task_id = session.task_id if session is not None else None
+                if task_id:
+                    condition = {"condition": {"condition": "session_running", "subject": str(task_id)}}
+            elif owner.get("type") == "authority_decision" and owner.get("decision_id"):
+                condition = {"condition": {"condition": "decision_pending", "subject": str(owner["decision_id"])}}
             action = await (
                 self.orchestration.execute_noop_action(
                     db, run.id,

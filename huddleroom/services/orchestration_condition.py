@@ -8,8 +8,9 @@ SESSION_RUNNING = "session_running"
 VALID_RESULT_MISSING = "valid_result_missing"
 PLAN_MISSING = "plan_missing"
 GATE_UNVERIFIED = "gate_unverified"
+DECISION_PENDING = "decision_pending"
 
-CONDITIONS = frozenset({SESSION_RUNNING, VALID_RESULT_MISSING, PLAN_MISSING, GATE_UNVERIFIED})
+CONDITIONS = frozenset({SESSION_RUNNING, VALID_RESULT_MISSING, PLAN_MISSING, GATE_UNVERIFIED, DECISION_PENDING})
 
 # Owner decisions (including every owner-escalation category) are never auto-cancelled,
 # whatever condition they declare.
@@ -81,8 +82,11 @@ def is_reconcilable(
     category, e.g. ``budget_exhausted``); either being an owner decision blocks it.
     """
     try:
-        validate_condition(raw)
+        normalized = validate_condition(raw)
     except ConditionError:
+        return False
+    # decision_pending is internal: it may only auto-resolve warnings, never cancel questions.
+    if normalized["condition"] == DECISION_PENDING and action_kind != "record_warning":
         return False
     return not any(
         isinstance(v, str) and v.strip().lower() in OWNER_DECISION_SUBJECTS

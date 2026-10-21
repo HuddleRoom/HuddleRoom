@@ -424,7 +424,16 @@ class OrchestrationBlockerRecoveryService:
 
     async def _blocker_gone(self, db, run, trigger: RecoveryTriggerV1, trigger_action: OrchestrationAction) -> bool:
         """An eventless noop whose loop has since done real work, or an observed task failure whose task is no
-        longer failed/blocked (e.g. the owner re-ran it), needs no diagnosis."""
+        longer failed/blocked (e.g. the owner re-ran it), needs no diagnosis. A human-resolved lineage warning
+        retires a follow-up the same way."""
+        if (trigger_action.dispatch_contract or {}).get("supersedes_proposal_action_id"):
+            lineage = (await db.scalars(select(OrchestrationWarning).where(
+                OrchestrationWarning.goal_id == run.goal_id, OrchestrationWarning.warning_type == _WARNING_TYPE,
+                OrchestrationWarning.related_action_id == UUID(self._root_id(trigger_action)),
+            ).order_by(OrchestrationWarning.created_at.desc(), OrchestrationWarning.id.desc()))).all()
+            latest = lineage[0] if lineage else None
+            if latest is not None and not any(row.active for row in lineage) and (latest.resolved_by or "").startswith("human:"):
+                return True
         if trigger.source_kind == "eventless_noop":
             return await self._decision_loop_progressed(db, run.id, trigger_action.created_at)
         if trigger.source_kind != "failed_action":
