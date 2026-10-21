@@ -379,6 +379,10 @@ class GoalCloseoutProcess:
         if current.status == "running":
             if decision is None:
                 authority, authority_agent_id = await self._signoff_authority(db, goal)
+                # Local import: orchestration_steering imports orchestration_service, which imports this module.
+                from huddleroom.services.orchestration_steering import OrchestrationSteeringService
+
+                steering = await OrchestrationSteeringService().context_snapshot(db, goal, run)
                 decision = await self.decision_service.create_pending(
                     db,
                     goal.id,
@@ -397,6 +401,7 @@ class GoalCloseoutProcess:
                             "criterion_evidence": preconditions["criterion_evidence"],
                             "accepted_risks": preconditions["warning_disposition"],
                             "overridden_gates": preconditions["overridden_gates"],
+                            **({"steering": steering} if steering else {}),
                         }
                     ),
                     recommendation="approve_completion",

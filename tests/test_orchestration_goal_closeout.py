@@ -1239,3 +1239,42 @@ async def test_preliminary_evidence_never_makes_closeout_ready_until_final_verif
 
     await accepted_gate({})
     assert await service._run_ready_for_final_summary_request(db_session, goal, run) is True
+
+
+@pytest.mark.asyncio
+async def test_closeout_decision_context_includes_only_applied_steering(
+    db_session, test_project, test_agent, test_user, monkeypatch
+):
+    from huddleroom.config import settings
+    from huddleroom.models.orchestration_steering import OrchestrationSteeringRequest
+    from huddleroom.services.orchestration_goal_closeout import GoalCloseoutProcess
+
+    monkeypatch.setattr(settings, "orchestration_conversation_steering_enabled", True)
+    goal, run = await create_goal(db_session, test_project, weight="substantial")
+    goal.authority_model = "agent_manager"
+    goal.manager_agent_id = test_agent.id
+    ids = {}
+    for sequence, status in enumerate(
+        ["applied", "superseded", "withdrawn", "pending", "needs_clarification"], start=1
+    ):
+        request = OrchestrationSteeringRequest(
+            id=uuid.uuid4(), goal_id=goal.id, actor_id=test_user.id, client_request_id=uuid.uuid4(),
+            sequence=sequence, submitted_run_id=run.id, directive=f"directive-{status}",
+            target_type="goal", target_id=str(goal.id), scope="goal", lifetime="future_runs",
+            impact_summary="x", status=status, reason_code="submitted",
+            contract_version="none", plan_version="none",
+        )
+        db_session.add(request)
+        ids[status] = request.id
+    await db_session.flush()
+
+    await GoalCloseoutProcess().advance(
+        db_session, goal, run, preconditions=completion_manifest_fixture(run)
+    )
+    decision = (await pending_decisions(db_session, goal.id))[0]
+    steering = json.loads(decision.context)["steering"]
+
+    assert [d["directive"] for d in steering["active_directions"]] == ["directive-applied"]
+    assert steering["active_directions"][0]["request_id"] == str(ids["applied"])
+    for status in ("superseded", "withdrawn", "pending", "needs_clarification"):
+        assert f"directive-{status}" not in decision.context
