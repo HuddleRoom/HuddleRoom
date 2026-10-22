@@ -22,6 +22,13 @@ from huddleroom.services.cli_streaming import (
 )
 
 
+@pytest.fixture
+def db_session(autobegin_db_session):
+    """Override: these tests drive runner code that commits mid-turn."""
+    return autobegin_db_session
+
+
+
 def context():
     return InvocationContext(
         uuid4(), "agent", "agent-1", "Agent", "cli_main", "task", "test-runtime"

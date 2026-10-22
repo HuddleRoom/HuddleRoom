@@ -79,7 +79,8 @@ class MeetingOutcomeService:
         def parse_action_items_json(raw: str) -> list[dict]:
             match = re.search(r"\[.*\]", raw, re.DOTALL)
             if not match:
-                return []  # No JSON found is legitimate (no action items)
+                # Truncated/empty replies must retry; only a real [] means "no items"
+                raise ValueError("Action items reply contains no JSON array")
             try:
                 return json.loads(match.group(0))
             except json.JSONDecodeError as exc:
@@ -115,7 +116,7 @@ class MeetingOutcomeService:
                     },
                 ],
                 "temperature": 0.0,
-                "max_tokens": 800,
+                "max_tokens": 4000,
             }
 
             # Create invocation context for action items extraction
@@ -660,7 +661,7 @@ class MeetingOutcomeService:
             if (description := self._decision_to_action_description(decision.chosen_option))
         ]
         review_complete = bool(pending_events and len(completed_events) >= len(pending_events))
-        if suggestions and not action_items and not review_complete:
+        if decisions and not action_items and not review_complete:
             reviewer_kind = "orchestrator"
             reviewer_id: str | None = None
             if meeting.organizer_agent_id:

@@ -285,6 +285,19 @@ async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
             await session.rollback()
 
 
+@pytest_asyncio.fixture
+async def autobegin_db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
+    """Like db_session but autobegin, for code that commits mid-flow.
+
+    Test modules opt in with `db_session = autobegin_db_session`-style overrides; committed
+    rows are wiped by clean_test_database.
+    """
+    session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
+        await session.rollback()
+
+
 @pytest.fixture
 def owned_session_factory(test_engine, monkeypatch):
     """Factory bound to the test engine; also replaces the service's AsyncSessionLocal."""

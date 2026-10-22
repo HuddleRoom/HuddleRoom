@@ -277,9 +277,11 @@ async def submit_human_turn(
         raise HTTPException(status_code=400, detail="Meeting is not active")
 
     count_result = await db.execute(
-        select(func.count(MeetingTurn.id)).where(MeetingTurn.meeting_id == meeting_id)  # pylint: disable=not-callable
+        select(func.coalesce(func.max(MeetingTurn.turn_number), 0) + 1).where(
+            MeetingTurn.meeting_id == meeting_id
+        )
     )
-    turn_number = (count_result.scalar_one() or 0) + 1
+    turn_number = count_result.scalar_one()
 
     current_item = await _svc.get_current_agenda_item(db=db, meeting_id=meeting_id)
     await ProjectService().require_runnable_project(db, meeting.project_id)
@@ -288,7 +290,7 @@ async def submit_human_turn(
         meeting_id=meeting_id,
         agenda_item_id=current_item.id if current_item else None,
         turn_number=turn_number,
-        round_number=current_item.current_round if current_item else 1,
+        round_number=(current_item.current_round + 1) if current_item else 1,
         speaker_user_id=current_user.id,
         content=body.content,
         references=body.references,

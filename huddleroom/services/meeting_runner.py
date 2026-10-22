@@ -64,6 +64,18 @@ def _extract_reasoning(response) -> str:
     return ""
 
 
+def _control_models_for(agent, litellm_model: str) -> list[str]:
+    """Models to try for a meeting-control call made on behalf of an agent.
+
+    CLI-adapter models are not litellm models, so those agents use only the control model.
+    """
+    control_model = MeetingIntelligenceService._control_model()
+    models = [] if getattr(agent, "adapter_type", None) == "cli" else [litellm_model]
+    if control_model not in models:
+        models.append(control_model)
+    return models
+
+
 class MeetingRunner:
     _VALIDATION_NOTE_PREFIX = "validation_error:"
 
@@ -193,6 +205,9 @@ class MeetingRunner:
                     )
                 except Exception as exc:
                     logger.warning("Failed to emit trace request event: %s", exc)
+
+            # Release the SQLite write lock before the slow LLM call.
+            await db.commit()
 
             try:
                 raw_content = await run_tool_loop(
@@ -342,6 +357,7 @@ class MeetingRunner:
                 raw_content[:200],
             )
 
+        turn_number = await self._next_turn_number(db, meeting.id)
         turn = MeetingTurn(
             meeting_id=meeting.id,
             agenda_item_id=item.id if item else None,
@@ -459,6 +475,9 @@ class MeetingRunner:
                 agenda_question=item.question if item else None,
             )
 
+        # Release the SQLite write lock before the slow CLI call.
+        await db.commit()
+
         try:
             try:
                 raw_content, new_session_id_from_run, latency_ms = await run_turn(
@@ -551,6 +570,7 @@ class MeetingRunner:
             )
 
         cli_runtime = agent.config.get("cli_runtime", agent.cli_runtime or "claude_code")
+        turn_number = await self._next_turn_number(db, meeting.id)
         turn = MeetingTurn(
             meeting_id=meeting.id,
             agenda_item_id=item.id if item else None,
@@ -813,14 +833,14 @@ class MeetingRunner:
                 from huddleroom.models.agent import Agent as AgentModel
                 organizer = await db.get(AgentModel, meeting.organizer_agent_id)
                 if organizer:
-                    selection = await self._organizer_agent_select(db, meeting, organizer)
-                    granted_id = selection.get("next_speaker_id") if selection else None
                     eligible = self._eligible_participants_for_turn(
                         meeting=meeting,
                         participants=participants,
                         spoke_this_round=await self._spoke_this_round(db, meeting, item, participants),
                         agent_roles=await self._agent_roles(db, participants),
                     )
+                    selection = await self._organizer_agent_select(db, meeting, organizer, eligible)
+                    granted_id = selection.get("next_speaker_id") if selection else None
                     if granted_id and granted_id in eligible:
                         meeting.pending_grant_agent_id = uuid.UUID(granted_id)
                         await db.flush()
@@ -830,6 +850,14 @@ class MeetingRunner:
                         fallback = eligible[0]
                         meeting.pending_grant_agent_id = uuid.UUID(fallback)
                         await db.flush()
+                        if selection:
+                            selection = {
+                                **selection,
+                                "overridden": True,
+                                "requested_speaker_id": granted_id,
+                                "next_speaker_id": fallback,
+                                "reason": "Organizer's pick was not eligible this round; next eligible participant chosen.",
+                            }
                         return fallback, selection
             # Human organizer or no grant yet — wait
             return None, None
@@ -922,11 +950,12 @@ class MeetingRunner:
         return candidates
 
     async def _next_turn_number(self, db: AsyncSession, meeting_id: uuid.UUID) -> int:
-        count_fn = func.count(MeetingTurn.id)  # pylint: disable=not-callable
         result = await db.execute(
-            select(count_fn).where(MeetingTurn.meeting_id == meeting_id)
+            select(func.coalesce(func.max(MeetingTurn.turn_number), 0) + 1).where(
+                MeetingTurn.meeting_id == meeting_id
+            )
         )
-        return (result.scalar_one() or 0) + 1
+        return result.scalar_one()
 
     async def _turn_count_for_item(
         self, db: AsyncSession, meeting_id: uuid.UUID, item_id: uuid.UUID
@@ -1029,7 +1058,7 @@ class MeetingRunner:
         return None
 
     async def _organizer_agent_select(
-        self, db: AsyncSession, meeting: Meeting, organizer
+        self, db: AsyncSession, meeting: Meeting, organizer, eligible: list[str] | None = None
     ) -> dict | None:
         """Run LLM for agent organizer to select next speaker. Returns dict with next_speaker_id, reason, messages, raw_response."""
         transcript = await self._ctx.format_transcript(db=db, meeting_id=meeting.id)
@@ -1039,7 +1068,7 @@ class MeetingRunner:
             lines = [f"- Agent {s.agent_id}: {s.message or 'wants to speak'}" for s in pending_signals]
             signals_text = "\nPENDING SPEAK SIGNALS:\n" + "\n".join(lines)
 
-        participants = meeting.participant_agent_ids
+        participants = eligible if eligible else meeting.participant_agent_ids
         participant_names: dict[str, str] = {}
         for aid_str in participants:
             try:
@@ -1069,17 +1098,6 @@ class MeetingRunner:
             "operation": "Choose next speaker for meeting",
             "title": meeting.title,
         }
-        organizer_invocation_ctx = InvocationContext(
-            meeting.project_id,
-            actor_kind="agent",
-            actor_id=str(organizer.id),
-            actor_label=organizer.name,
-            invocation_kind="api",
-            operation="meeting_speaker_selection",
-            model_or_runtime=model,
-            request_prompt=organizer_request_prompt,
-        )
-        organizer_invocation = AgentResponseInvocation(organizer_invocation_ctx)
 
         # Load project context for preamble
         from huddleroom.models.project import Project
@@ -1096,7 +1114,7 @@ class MeetingRunner:
 
         system_message_base = (
             "You are a meeting orchestrator. Your only job is to select the next speaker. "
-            "You may select any participant including yourself. "
+            "You may select any listed participant (yourself included, if listed). "
             "Respond with valid JSON and nothing else: "
             '{"next_speaker_id": "<exact uuid from the list>", "reason": "<one sentence>"}'
         )
@@ -1117,10 +1135,7 @@ class MeetingRunner:
                 ),
             },
         ]
-        _FALLBACK_ORCHESTRATION_MODEL = "openai/gpt-6.1-sol"
-        models_to_try = [litellm_model]
-        if litellm_model != _FALLBACK_ORCHESTRATION_MODEL:
-            models_to_try.append(_FALLBACK_ORCHESTRATION_MODEL)
+        models_to_try = _control_models_for(organizer, litellm_model)
 
         def _parse_organizer_json(raw: str) -> dict:
             """Parse organizer selection JSON from raw response, raising ValueError on failure."""
@@ -1133,6 +1148,19 @@ class MeetingRunner:
             return json.loads(m.group(0))
 
         for attempt_model in models_to_try:
+            attempt_provider, attempt_model_name = MeetingIntelligenceService._split_model_name(attempt_model)
+            organizer_invocation = AgentResponseInvocation(
+                InvocationContext(
+                    meeting.project_id,
+                    actor_kind="agent",
+                    actor_id=str(organizer.id),
+                    actor_label=organizer.name,
+                    invocation_kind="api",
+                    operation="meeting_speaker_selection",
+                    model_or_runtime=attempt_model_name,
+                    request_prompt=organizer_request_prompt,
+                )
+            )
             # Try with increasing max_tokens if empty response
             for token_attempt in range(2):
                 max_tokens = 2000 * (2 ** token_attempt)  # 2000, then 4000
@@ -1151,7 +1179,7 @@ class MeetingRunner:
                                         "kind": "organizer_selection",
                                         "messages": messages,
                                         "model": attempt_model,
-                                        "provider": provider,
+                                        "provider": attempt_provider,
                                         "max_tokens": max_tokens,
                                         "organizer_agent_id": str(organizer.id),
                                     },
@@ -1160,6 +1188,9 @@ class MeetingRunner:
                             )
                         except Exception as exc:
                             logger.warning("Failed to emit trace request event: %s", exc)
+
+                    # Release the SQLite write lock before the slow LLM call.
+                    await db.commit()
 
                     # Holder for response object (needed for usage/reasoning extraction)
                     resp_holder: dict = {}
@@ -1217,7 +1248,7 @@ class MeetingRunner:
                                         "kind": "organizer_selection",
                                         "raw_response": raw,
                                         "model": attempt_model,
-                                        "provider": provider,
+                                        "provider": attempt_provider,
                                         "max_tokens": max_tokens,
                                         "finish_reason": finish_reason,
                                         "prompt_tokens": prompt_tokens,
@@ -1292,19 +1323,9 @@ class MeetingRunner:
             model = getattr(agent, "model", None) or "gpt-6.1-sol"
             litellm_model = build_litellm_model_name(provider, model)
 
-            # Create invocation context for signal probe
             probe_request_prompt = {"operation": "Decide whether to contribute"}
-            probe_invocation_ctx = InvocationContext(
-                meeting.project_id,
-                actor_kind="agent",
-                actor_id=str(agent.id),
-                actor_label=agent.name,
-                invocation_kind="api",
-                operation="meeting_signal_probe",
-                model_or_runtime=model,
-                request_prompt=probe_request_prompt,
-            )
-            probe_invocation = AgentResponseInvocation(probe_invocation_ctx)
+            probe_models = _control_models_for(agent, litellm_model)
+            litellm_model = probe_models[-1]  # label for the error event if the loop never runs
 
             try:
                 probe_messages = [
@@ -1317,19 +1338,38 @@ class MeetingRunner:
                         ),
                     },
                 ]
-                async with probe_invocation.call(messages=probe_messages) as call:
-                    resp = await asyncio.wait_for(
-                        call.complete(
-                            litellm.acompletion,
-                            {
-                                "model": litellm_model,
-                                "messages": probe_messages,
-                                "temperature": 0.0,
-                                "max_tokens": 60,
-                            },
-                        ),
-                        timeout=_LLM_CALL_TIMEOUT_SECONDS,
+                for i, litellm_model in enumerate(probe_models):
+                    # Create invocation context for signal probe, labelled with the model actually called
+                    probe_invocation = AgentResponseInvocation(
+                        InvocationContext(
+                            meeting.project_id,
+                            actor_kind="agent",
+                            actor_id=str(agent.id),
+                            actor_label=agent.name,
+                            invocation_kind="api",
+                            operation="meeting_signal_probe",
+                            model_or_runtime=MeetingIntelligenceService._split_model_name(litellm_model)[1],
+                            request_prompt=probe_request_prompt,
+                        )
                     )
+                    try:
+                        async with probe_invocation.call(messages=probe_messages) as call:
+                            resp = await asyncio.wait_for(
+                                call.complete(
+                                    litellm.acompletion,
+                                    {
+                                        "model": litellm_model,
+                                        "messages": probe_messages,
+                                        "temperature": 0.0,
+                                        "max_tokens": 60,
+                                    },
+                                ),
+                                timeout=_LLM_CALL_TIMEOUT_SECONDS,
+                            )
+                        break
+                    except Exception:
+                        if i == len(probe_models) - 1:
+                            raise
                 answer_raw = (resp.choices[0].message.content or "").strip()
                 answer = answer_raw.upper()
                 signaled = answer.startswith("YES")

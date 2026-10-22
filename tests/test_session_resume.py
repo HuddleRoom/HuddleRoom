@@ -24,6 +24,13 @@ from huddleroom.models.task import Task
 FAKE_API_KEY = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
 
 
+@pytest.fixture
+def db_session(autobegin_db_session):
+    """Override: these tests drive runner code that commits mid-turn."""
+    return autobegin_db_session
+
+
+
 @pytest.mark.asyncio
 async def test_legacy_root_outcome_resume_preserves_spend_headroom_and_elapsed(
     db_session, test_project, test_agent, monkeypatch,

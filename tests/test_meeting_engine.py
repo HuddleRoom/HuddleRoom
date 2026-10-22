@@ -58,6 +58,13 @@ def patch_streaming_acompletion(
         yield
 
 
+@pytest.fixture
+def db_session(autobegin_db_session):
+    """Override: these tests drive runner code that commits mid-turn."""
+    return autobegin_db_session
+
+
+
 @pytest.mark.asyncio
 async def test_context_service_builds_initial_package(db_session, test_project, test_agent):
     from huddleroom.services.meeting_service import MeetingService

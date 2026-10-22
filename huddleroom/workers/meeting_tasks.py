@@ -389,6 +389,8 @@ async def _run_meeting_turn_tail(db, runner, svc, meeting, project_svc, meeting_
     item = await svc.get_current_agenda_item(db=db, meeting_id=meeting.id)
     if item:
         await project_svc.require_runnable_project(db, meeting.project_id)
+        # Release the SQLite write lock before evaluation makes LLM calls.
+        await db.commit()
         await runner.evaluate_round_if_complete(db=db, meeting=meeting, item=item)
     current_item = await svc.get_current_agenda_item(db=db, meeting_id=meeting.id)
 

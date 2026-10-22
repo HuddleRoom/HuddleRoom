@@ -488,7 +488,8 @@ async def test_run_turn_self_enqueues_next_turn_when_meeting_stays_active(db_ses
                     mock_dispatch.side_effect = lambda *_args, **_kwargs: call_order.append("dispatch")
                     await run_meeting_turn_async(str(meeting.id))
 
-    assert call_order == ["commit", "dispatch"]
+    # extra commit releases the DB write lock before round evaluation; dispatch stays last
+    assert call_order == ["commit", "commit", "dispatch"]
     mock_dispatch.assert_called_once_with(str(meeting.id), meeting.project_id)
 
 
@@ -542,7 +543,8 @@ async def test_run_turn_retries_when_no_turn_is_produced(
                     mock_dispatch.side_effect = lambda *_args, **_kwargs: call_order.append("dispatch")
                     await run_meeting_turn_async(str(meeting.id))
 
-    assert call_order == ["commit", "dispatch"]
+    # extra commit releases the DB write lock before round evaluation; dispatch stays last
+    assert call_order == ["commit", "commit", "dispatch"]
     mock_dispatch.assert_called_once_with(str(meeting.id), meeting.project_id)
 
 
@@ -1339,12 +1341,12 @@ async def test_finalize_meeting_blocks_only_when_followup_missing(
         outcome, "write_knowledge_items", new_callable=AsyncMock
     ) as write_knowledge, patch.object(outcome, "resolve_graph_run", new_callable=AsyncMock) as resolve_graph_run:
         result = await outcome.finalize_meeting(db=db_session, meeting=meeting)
-        if scenario == "missing_followup":
+        if scenario in {"missing_followup", "non_action_decision"}:
             assert result[0] is False
             assert result[1] is not None
             assert await outcome.finalize_meeting(db=db_session, meeting=meeting) == (False, None)
 
-    if scenario == "missing_followup":
+    if scenario in {"missing_followup", "non_action_decision"}:
         event = result[1]
         assert meeting.status == "concluding"
         assert event.event_type == "meeting_final_pass"
@@ -1353,7 +1355,9 @@ async def test_finalize_meeting_blocks_only_when_followup_missing(
             "reviewer_id": str(test_agent.id),
             "decisions_made": True,
             "decisions_clear": True,
-            "suggested_action_items": ["Implement Redis cache"],
+            "suggested_action_items": (
+                [] if scenario == "non_action_decision" else ["Implement Redis cache"]
+            ),
         }
         events = (
             await db_session.execute(
@@ -2421,3 +2425,60 @@ async def test_no_hasattr_guards_consensus_check_count(db_session, test_project,
             await runner.evaluate_round_if_complete(db=db_session, meeting=meeting, item=item)
 
     assert item.consensus_check_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extract_action_items_without_json_array_is_retried(
+    db_session, test_project, test_agent
+):
+    from huddleroom.models.meeting import MeetingActionItem
+    from huddleroom.services import meeting_outcome
+    from huddleroom.services.meeting_outcome import MeetingOutcomeService
+
+    meeting = await _add_final_review_meeting(
+        db_session, test_project, organizer_agent_id=test_agent.id
+    )
+    replies = iter(
+        ["", '[{"description": "Implement Redis cache", "assignee_agent_name": null}]']
+    )
+
+    async def fake_repair(completion, request, parse, **_kwargs):
+        assert request["max_tokens"] == 4000
+        for raw in replies:
+            try:
+                return parse(raw)
+            except ValueError:
+                continue
+        raise AssertionError("no valid reply")
+
+    outcome = MeetingOutcomeService()
+    with patch.object(meeting_outcome, "complete_with_repair", new=fake_repair), patch.object(
+        outcome, "_format_transcript", new=AsyncMock(return_value="Dev: I will do it")
+    ):
+        created = await outcome.extract_action_items(db=db_session, meeting=meeting)
+    assert [item.description for item in created] == ["Implement Redis cache"]
+    assert isinstance(created[0], MeetingActionItem)
+
+
+@pytest.mark.asyncio
+async def test_extract_action_items_real_empty_array_parses(db_session, test_project):
+    from huddleroom.services import meeting_outcome
+    from huddleroom.services.meeting_outcome import MeetingOutcomeService
+
+    meeting = await _add_final_review_meeting(db_session, test_project)
+    parsed = []
+
+    async def fake_repair(completion, request, parse, **_kwargs):
+        parsed.append(parse("[]"))
+        with pytest.raises(ValueError):
+            parse("no array here")
+        return parsed[0]
+
+    outcome = MeetingOutcomeService()
+    with patch.object(meeting_outcome, "complete_with_repair", new=fake_repair), patch.object(
+        outcome, "_format_transcript", new=AsyncMock(return_value="Dev: hi")
+    ), patch.object(
+        outcome, "_fallback_action_items", new_callable=AsyncMock, return_value=[]
+    ):
+        await outcome.extract_action_items(db=db_session, meeting=meeting)
+    assert parsed == [[]]
