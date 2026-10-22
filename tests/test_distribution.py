@@ -159,7 +159,7 @@ def _assert_distribution_metadata(wheel: Path, sdist: Path) -> None:
     expected_name = project["name"]
     expected_version = project["version"]
     assert expected_name == "huddleroom"
-    assert expected_version == "0.2.0b1"
+    assert expected_version == "0.2.0b2"
     assert project["description"]
     assert project["readme"] == "README.md"
     assert project["urls"].get("Repository")
