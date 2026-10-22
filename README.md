@@ -51,26 +51,6 @@ rm -rf ~/.huddleroom
 
 Legacy `RALLY_*` settings remain accepted for one release. They are deprecated; switch to `HUDDLEROOM_*` before the next release. The installed command is `huddleroom`.
 
-### Upgrading (protocol → graph vocabulary)
-
-HuddleRoom 2.0 renames the "protocol" concept to "graph" throughout the platform for alignment with industry standards (ADK 2.0, MS Agent Framework, LangGraph). The database migrates automatically via alembic 048 on `huddleroom serve`; no manual steps are required.
-
-If you have custom YAML workflow definitions in `workspace/protocols/`:
-- Rename the directory to `workspace/graphs/`
-- Convert YAML keys in each file:
-  - `states:` → `nodes:`
-  - `initial_state:` → `start_node:`
-  - `terminal_states:` → `terminal_nodes:`
-  - Per-node `transitions:` → `edges:`
-  - `action_type: update_protocol_context` → `update_graph_context`
-- Update template variables in action values:
-  - `{{protocol_instance.X}}` → `{{graph_run.X}}`
-  - `{{protocol_instance_id}}` → `{{graph_run_id}}`
-  - `{{protocol_name}}` → `{{graph_name}}`
-  - `{{current_state}}` → `{{current_node}}`
-
-The REST API has changed: `/protocols` and `/protocol-instances` are replaced by `/graphs` and `/graph-runs` with no backward-compatible aliases. Update any client integrations accordingly.
-
 ### Develop from source
 
 The published-package flow above is for users. Contributors who need a checkout
@@ -382,9 +362,7 @@ provider.
 
 These runtimes have workspace access rather than an HuddleRoom-enforced
 sandbox. Give an agent only a workspace it may change. Live verification used
-Copilot CLI 1.0.89, OpenCode 1.18.33, and pi 0.84.1. An environment configured
-with OpenRouter through `onecli` is supported for that verification, but is not
-a HuddleRoom product requirement.
+Copilot CLI 1.0.89, OpenCode 1.18.33, and pi 0.84.1.
 
 Each runtime is requested to emit JSON output. HuddleRoom streams readable
 stdout updates, saves the final parsed output and runtime session ID when one
@@ -488,20 +466,13 @@ LICENSE                     # AGPL-3.0-or-later license
 
 HuddleRoom is licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). See [LICENSE](LICENSE). If you run a modified version as a network service, the AGPL requires you to offer its source to its users.
 
-Conversation questions and read-only investigations have unlimited application admission.
-Usage accounting, execution budgets, spending authorization, and provider limits still apply.
-The legacy `orchestration_conversation_allowance_tokens` and
-`orchestration_advisor_allowance_tokens` settings (including environment aliases) are
-deprecated no-ops accepted for configuration compatibility. Historical allowance failures
-remain visible; send a new message to ask again.
-
 ### Optional development backend restart API
 
 Backend restarts are disabled by default. Set `allow_api_reset = true` in
 `~/.huddleroom/config.toml`, or `HUDDLEROOM_ALLOW_API_RESET=true` in the environment
 or `.env` (environment overrides config). Launch `huddleroom serve` without
-`--reload`, using SQLite local workers. Rally root `make serve` includes
-`--reload`, so instead run `.venv/bin/huddleroom serve` from `HuddleRoom/`. This starts a small supervisor which
+`--reload`, using SQLite local workers. `make serve` includes `--reload`, so run
+`huddleroom serve` directly instead. This starts a small supervisor which
 restarts only after an API-requested successful graceful shutdown. Direct ASGI,
 `--reload`, and PostgreSQL/Celery launches return 503 without stopping.
 
@@ -523,7 +494,7 @@ can reach the enabled endpoint to restart. Protect tunnels/remote exposure
 separately. Browser Origin must match the request origin; nonbrowser requests
 without Origin are permitted. No extra reset login or token is required.
 
-From a browser already admitted by your tunnel, open `/docs`, expand
+From a browser that can reach the server, open `/docs`, expand
 `POST /api/system/restart`, choose **Try it out**, enter `restart` in
 `X-HuddleRoom-Confirm`, and execute. Disabled mode returns 404; unsupported launch
 modes return 503. There is no separate reset login or UI.
@@ -533,7 +504,7 @@ modes return 503. There is no separate reset login or UI.
 Database export is disabled by default and independent of backend restart.
 Set `allow_db_export = true` in `~/.huddleroom/config.toml` or
 `HUDDLEROOM_ALLOW_DB_EXPORT=true` in the environment / `.env` (environment wins).
-Enable it only behind your **authenticated ngrok tunnel**, with direct backend
+Enable it only behind an **authenticated tunnel or proxy**, with direct backend
 access restricted. The endpoint adds no separate login/token: when application
 authentication is disabled, anyone who can reach it can download the database.
 
