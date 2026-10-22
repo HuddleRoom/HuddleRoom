@@ -28,7 +28,7 @@ provider credential when those operations run. `huddleroom init-db` remains an
 idempotent diagnostic command for running the same migrations manually.
 
 New installations store their database, workspace, and optional configuration in
-`~/.huddleroom`. An existing `./huddleroom.db`, legacy `./rally.db`, or
+`~/.huddleroom`. An existing `./huddleroom.db` or
 `./workspace` is retained when present. HuddleRoom binds to `127.0.0.1:9256` by
 default. The scheduler (APScheduler) and API server share one process. Docker,
 PostgreSQL, Redis, and authentication are unsupported in this release.
@@ -48,8 +48,6 @@ configuration. Remove that data only when it is no longer needed:
 ```bash
 rm -rf ~/.huddleroom
 ```
-
-Legacy `RALLY_*` settings remain accepted for one release. They are deprecated; switch to `HUDDLEROOM_*` before the next release. The installed command is `huddleroom`.
 
 ### Develop from source
 
@@ -102,8 +100,7 @@ cp config.toml.example ~/.huddleroom/config.toml
 ```
 
 The working directory's `.env` remains supported. Its application settings use the
-`HUDDLEROOM_` prefix; legacy `RALLY_` names remain accepted for one release with a
-deprecation warning. Values resolve in this order: explicit `Settings(...)` values,
+`HUDDLEROOM_` prefix. Values resolve in this order: explicit `Settings(...)` values,
 process environment, `.env`, `~/.huddleroom/config.toml`, then built-in defaults.
 Provider credentials can be in either file or the process environment and use the
 same process environment, `.env`, TOML precedence.
@@ -307,8 +304,7 @@ Calls an LLM via litellm. Assembles context from task, knowledge base, and chann
 ### CLI Adapter (`adapter_type: "cli"`)
 
 Spawns a subprocess in the project's workspace. It writes `task.md` and
-`huddleroom_context.json` under `.huddleroom/` (or the one-release legacy
-`.rally/` directory) and captures the runtime output.
+`huddleroom_context.json` under `.huddleroom/` and captures the runtime output.
 
 ```json
 {
@@ -342,7 +338,7 @@ Supported `cli_runtime` values: `claude_code`, `codex`, `aider`, `copilot`,
   `config.reasoning_effort`: `low`, `medium`, `high`, `xhigh`, `max`; `codex`
   does not accept `max`). Only `claude_code` and `codex` use it.
 - **Provider** is not set for CLI agents: the agent form hides it and stores the runtime name (for example `claude_code`).
-- `custom` scripts receive `HUDDLEROOM_*` and `RALLY_*` environment variables
+- `custom` scripts receive `HUDDLEROOM_*` environment variables
   (`SESSION_ID`, `TASK_ID`, `AGENT_ID`, `PROJECT_ID`, `API_BASE`) and find
   `huddleroom_context.json` in the workspace's `.huddleroom/` directory.
 
